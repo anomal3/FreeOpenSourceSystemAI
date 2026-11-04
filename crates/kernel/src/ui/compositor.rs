@@ -406,6 +406,33 @@ impl Compositor {
         }
     }
 
+    /// Куда окно разворачивается (05.11): на ПК — вся рабочая область, на
+    /// телефоне — «на весь экран», от края до края между строкой состояния
+    /// и полоской жеста.
+    #[must_use]
+    pub fn app_area(&self) -> Rect {
+        let width = self.screen.width();
+        if !theme::is_mobile() {
+            return Rect::new(0, 0, width, self.app_bottom().max(0) as u32);
+        }
+        let top = mini_ui::paint::Ctx::scaled(self.scale).px(theme::M_STATUS_H) as i32;
+        Rect::new(0, top, width, self.app_bottom().saturating_sub(top).max(1) as u32)
+    }
+
+    /// Окно телефона обычного размера: на поле [`theme::M_INSET`] от краёв,
+    /// от строки состояния до полоски жеста (то, что [`Self::app_area`]
+    /// разворачивает «на весь экран»).
+    #[must_use]
+    pub fn mobile_rect(&self) -> Rect {
+        let ctx = mini_ui::paint::Ctx::scaled(self.scale);
+        let top = ctx.px(theme::M_STATUS_H + theme::M_INSET) as i32;
+        let inset = ctx.px(theme::M_INSET);
+        let w = self.screen.width().saturating_sub(inset * 2).max(1);
+        let bottom = self.app_bottom().max(1) as u32;
+        let h = bottom.saturating_sub(top.max(0) as u32).max(1);
+        Rect::new(inset as i32, top, w, h)
+    }
+
     /// Программа на экране телефона: тогда внизу полоска жеста, а не док.
     ///
     /// Всплывающие окна не в счёт — они часть формы. Свёрнутое окно в полёте к
@@ -531,8 +558,11 @@ impl Compositor {
     #[must_use]
     pub fn popup_rect(&self, owner: App, anchor: (i32, i32), w: u32, h: u32) -> Option<Rect> {
         let owner = self.windows.iter().find(|window| window.app == owner)?;
-        let x = owner.rect.x.saturating_add(anchor.0);
-        let y = (owner.rect.y + owner.bar() as i32).saturating_add(anchor.1);
+        // От угла пикселей владельца: в рамке стола (телефон) они стоят по
+        // центру окна, а не под самым заголовком.
+        let (ox, oy) = owner.content_origin();
+        let x = ox.saturating_add(anchor.0);
+        let y = oy.saturating_add(anchor.1);
         // В пределах экрана, а не формы: ради этого всплывающие окна и стали
         // окнами стола. Не влезающее сдвигается внутрь экрана.
         let max_x = (self.screen.width() as i32 - w as i32).max(0);
@@ -633,8 +663,12 @@ impl Compositor {
         if hit != Hit::Body || !window.is_program() {
             return None;
         }
-        let top = window.rect.y + window.bar() as i32;
-        Some((window.app, x - window.rect.x, y - top))
+        // Поле вокруг пикселей в рамке стола (телефон, 05.11) — не программы.
+        if window.fit && !window.on_pixels(x, y) {
+            return None;
+        }
+        let (lx, ly) = window.program_local(x, y);
+        Some((window.app, lx, ly))
     }
 
     /// Окно ядра (не программы) под точкой — для колеса мыши (фаза 69b).
@@ -747,7 +781,7 @@ impl Compositor {
     #[must_use]
     pub fn program_point(&self, app: App, x: i32, y: i32) -> Option<(i32, i32)> {
         let window = self.windows.iter().find(|window| window.app == app)?;
-        Some((x - window.rect.x, y - window.rect.y - window.bar() as i32))
+        Some(window.program_local(x, y))
     }
 
     /// Где стоит окно программы.
@@ -1666,13 +1700,21 @@ impl Compositor {
         let Some(index) = self.index_of(app) else {
             return false;
         };
-        let width = self.screen.width();
-        let bottom = self.app_bottom();
+        let mut area = self.app_area();
+        // Терминал под открытой клавиатурой телефона — до неё: развёрнутый
+        // иначе спрятал бы под ней приглашение (клавиатура ужимает его только
+        // при появлении и уходе, см. [`Self::sync_keyboard`]).
+        if theme::is_mobile() && app == App::Terminal {
+            if let Some(keyboard) = self.keyboard.as_ref().filter(|keyboard| keyboard.is_visible()) {
+                let bottom = keyboard.rect.y.saturating_sub(mini_ui::paint::Ctx::scaled(self.scale).px(keyboard::GAP) as i32);
+                area.h = bottom.saturating_sub(area.y).max(1) as u32;
+            }
+        }
         let Some(window) = self.windows.get_mut(index) else {
             return false;
         };
         let before = window.rect;
-        if !window.toggle_maximize(width, bottom) {
+        if !window.toggle_maximize(area) {
             return false;
         }
         let after = window.rect;
@@ -2214,7 +2256,29 @@ impl Compositor {
     /// ноль — не открылся.
     pub fn open_switcher(&mut self) -> usize {
         self.close_tray();
-        if self.open_tray(true) { self.recent_minimized().len() } else { 0 }
+        // С 05.11 — карточки со снимками самих окон, а не строки листа:
+        // свёрнутое окно хранит поверхность, она и уменьшается.
+        let mut minimized: Vec<&Window> =
+            self.windows.iter().filter(|window| window.minimized && !window.popup).collect();
+        minimized.sort_by(|a, b| b.minimized_at_ms.cmp(&a.minimized_at_ms));
+        let cards: Vec<tray::Card> = minimized
+            .iter()
+            .map(|window| tray::Card {
+                app: window.app,
+                title: alloc::string::String::from(window.caption()),
+                art: window.icon_art(),
+                shot: window.surface(),
+            })
+            .collect();
+        let count = cards.len();
+        self.tray = Sheet::cards(self.screen.width(), self.screen.height(), self.scale, &cards);
+        drop(cards);
+        let Some(rect) = self.tray.as_ref().map(|sheet| sheet.rect) else {
+            // Экран мал для карточек — прежний лист строк.
+            return if self.open_tray(true) { self.recent_minimized().len() } else { 0 };
+        };
+        self.mark_layer(rect);
+        count
     }
 
     /// Собрать лист свёрнутых окон.
@@ -3120,7 +3184,17 @@ impl Compositor {
         self.icons.set_area(bottom);
         self.icons.reload();
         let bottom = self.app_bottom();
+        // Развёрнутое на телефоне окно («на весь экран», 05.11) и после
+        // смены режима — во весь новый экран, а не прежнего размера.
+        let area = theme::is_mobile().then(|| self.app_area());
         for window in self.windows.iter_mut() {
+            if let Some(area) = area.filter(|_| window.is_maximized() && !window.popup) {
+                if window.resize(area.w, area.h) {
+                    window.rect.x = area.x;
+                    window.rect.y = area.y;
+                    continue;
+                }
+            }
             let fit_w = window.rect.w.min(width);
             let fit_h = window.rect.h.min(bottom.max(1) as u32);
             if (fit_w, fit_h) != (window.rect.w, window.rect.h) {

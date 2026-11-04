@@ -406,6 +406,13 @@ pub struct Window {
     pub born: u64,
     /// Кнопка заголовка под указателем (72b): подсвечена, крестик — красным.
     hot: Option<Hit>,
+    /// Рамку окна программы выбирает стол, а не размер её пикселей (телефон,
+    /// 05.11): окно во весь экран, а пиксели лежат в нём по центру — или от
+    /// угла со срезанным лишним, если программа нарисовала больше экрана
+    /// (NetSurf просит 800×600 на экране шириной 720). Программе, которая
+    /// умеет менять размер, уходит просьба [`user_abi::WIN_RESIZE`], и её
+    /// ответ заполняет рамку целиком.
+    pub fit: bool,
 }
 
 /// Счётчик для [`Window::born`].
@@ -563,7 +570,68 @@ impl Window {
             tab_titles: Vec::new(),
             born: BORN.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             hot: None,
+            fit: false,
         }
+    }
+
+    /// Окно программы на телефоне (05.11): рамку держит стол, пиксели ложатся
+    /// в неё как есть (см. [`Self::fit`]). `restore` — куда вернуть окно
+    /// кнопкой «на весь экран», если оно открыто развёрнутым.
+    pub fn fit_frame(&mut self, restore: Option<Rect>, focused: bool) {
+        if !self.is_program() || self.popup {
+            return;
+        }
+        self.fit = true;
+        self.restore = restore;
+        self.redraw_content();
+        self.draw_decorations(focused);
+        self.damage = Rect::new(0, 0, self.rect.w, self.rect.h);
+    }
+
+    /// Где в поверхности окна лежит угол пикселей программы.
+    ///
+    /// Обычно — сразу под заголовком. В рамке, которую держит стол
+    /// ([`Self::fit`]), — по центру области содержимого; пиксели больше неё
+    /// стоят от её угла, и лишнее срезается при переносе. Всё — насыщающими
+    /// действиями: окно шире экрана на телефоне с проверкой переполнений
+    /// иначе остановило бы ядро на вычитании.
+    fn pixels_at(&self) -> (i32, i32) {
+        let area = content_area(&self.surface, self.bar());
+        match &self.content {
+            Content::Program(view) if self.fit => {
+                let dx = area.w.saturating_sub(view.pixels.width()) / 2;
+                let dy = area.h.saturating_sub(view.pixels.height()) / 2;
+                (area.x.saturating_add(dx as i32), area.y.saturating_add(dy as i32))
+            }
+            _ => (area.x, area.y),
+        }
+    }
+
+    /// Угол пикселей программы на экране: от него считаются её координаты
+    /// указателя и места её всплывающих окон.
+    #[must_use]
+    pub fn content_origin(&self) -> (i32, i32) {
+        let (x, y) = self.pixels_at();
+        (self.rect.x.saturating_add(x), self.rect.y.saturating_add(y))
+    }
+
+    /// Точка экрана в координатах пикселей программы — в том числе за их
+    /// краем (захваченному окну нужна и такая).
+    #[must_use]
+    pub fn program_local(&self, x: i32, y: i32) -> (i32, i32) {
+        let (ox, oy) = self.content_origin();
+        (x.saturating_sub(ox), y.saturating_sub(oy))
+    }
+
+    /// Лежит ли точка экрана на пикселях программы. Поле вокруг них в рамке
+    /// стола ([`Self::fit`]) — не её: щелчок туда ей не уходит.
+    #[must_use]
+    pub fn on_pixels(&self, x: i32, y: i32) -> bool {
+        let Content::Program(view) = &self.content else {
+            return false;
+        };
+        let (lx, ly) = self.program_local(x, y);
+        view.pixels.bounds().contains(lx, ly)
     }
 
     /// Высота полосы заголовка при заданном масштабе.
@@ -601,7 +669,9 @@ impl Window {
         let asked = view.asked;
         let stale = asked.is_some_and(|size| size != answer)
             && view.events.iter().any(|event| event.kind == user_abi::WIN_RESIZE);
-        let (w, h) = if stale {
+        // Рамку, которую держит стол (телефон, [`Self::fit`]), пиксели не
+        // меняют: ответ ложится в неё по центру или срезается.
+        let (w, h) = if stale || self.fit {
             (self.rect.w, self.rect.h)
         } else {
             (answer.0, answer.1 + self.bar())
@@ -621,7 +691,7 @@ impl Window {
         // Развёрнутое окно помнит, куда вернуться, пока размер ему выбирает
         // стол. Размер, который программа выбрала сама, не спросясь, — это уже
         // не развёрнутое окно, и возвращать его некуда.
-        if asked.is_none() {
+        if asked.is_none() && !self.fit {
             self.restore = None;
         }
         self.redraw_content();
@@ -658,6 +728,23 @@ impl Window {
         self.redraw_content();
         self.draw_decorations(focused);
         self.damage = Rect::new(0, 0, self.rect.w, self.rect.h);
+        // Рамка стола (телефон, 05.11): программа, сказавшая «умею», сразу
+        // получает просьбу заполнить её — так окно открывается во весь экран.
+        if resizable && self.fit {
+            let (w, h) = (self.rect.w, self.rect.h.saturating_sub(self.bar()));
+            if (w, h) != (self.program_size().0, self.program_size().1) {
+                self.ask_resize(w, h);
+            }
+        }
+    }
+
+    /// Размер пикселей программы; у окна ядра — ноль.
+    #[must_use]
+    pub fn program_size(&self) -> (u32, u32) {
+        match &self.content {
+            Content::Program(view) => (view.pixels.width(), view.pixels.height()),
+            _ => (0, 0),
+        }
     }
 
     /// Попросить программу перерисоваться в новом размере содержимого.
@@ -687,6 +774,12 @@ impl Window {
     /// при изменении размера: их содержимое рисует себя от области заново.
     pub fn retitle(&mut self) -> bool {
         let title = self.bar();
+        // Рамка стола размер держит: пересобирается поверхность того же
+        // размера, а программе уходит новая высота содержимого.
+        if self.fit {
+            let (w, h) = (self.rect.w, self.rect.h);
+            return self.rebuild(w, h);
+        }
         if let Content::Program(view) = &self.content {
             let h = view.pixels.height() + title;
             let w = self.rect.w;
@@ -737,11 +830,11 @@ impl Window {
     /// Кнопка «свернуть» в координатах поверхности.
     ///
     /// Места кнопок считаются справа налево: закрыть — нулевое, развернуть —
-    /// первое, свернуть — второе. На телефоне «развернуть» не рисуется, и
-    /// свернуть занимает освободившееся первое место, а не остаётся на своём:
-    /// иначе между двумя кнопками зияет пустой квадрат там, где была третья.
+    /// первое, свернуть — второе. С 05.11 так и на телефоне: там «развернуть»
+    /// — «на весь экран», от края до края между строкой состояния и полоской
+    /// жеста.
     fn minimize_button(&self) -> Rect {
-        self.title_button(if theme::is_mobile() { 1 } else { 2 })
+        self.title_button(2)
     }
 
     /// Уголок изменения размера в координатах поверхности.
@@ -802,10 +895,9 @@ impl Window {
                 }
             }
         }
-        // Кнопки «развернуть» на телефоне нет: окно там и так во весь экран, и
-        // разворачивать его некуда. Проверка снята вместе с самой кнопкой —
-        // иначе место, где её нарисовали бы, продолжало бы нажиматься.
-        if !theme::is_mobile() && self.maximize_button().contains(local.0, local.1) {
+        // На телефоне это «на весь экран» (05.11): окно встаёт от края до края,
+        // окно программы получает просьбу заполнить его.
+        if self.maximize_button().contains(local.0, local.1) {
             return Some(Hit::Maximize);
         }
         if self.minimize_button().contains(local.0, local.1) {
@@ -834,7 +926,7 @@ impl Window {
         // Уголок проверяется после заголовка: у окна ростом с полосу заголовка
         // они пересекаются, и таскать такое окно важнее, чем тянуть его за
         // размер.
-        if self.resizable() && self.resize_grip().contains(local.0, local.1) {
+        if self.resizable() && !self.fit && self.resize_grip().contains(local.0, local.1) {
             return Some(Hit::Resize(EDGE_RIGHT | EDGE_BOTTOM));
         }
         Some(Hit::Body)
@@ -879,7 +971,8 @@ impl Window {
     fn draw_grip(&mut self) {
         // Окно без рамки растягивают по просьбе программы, а не за уголок —
         // точки легли бы поверх её рисунка.
-        if !self.resizable() || self.frameless {
+        // Рамку стола на телефоне (`fit`) не тянут вовсе: её размер — экран.
+        if !self.resizable() || self.frameless || self.fit {
             return;
         }
         let ctx = self.ctx();
@@ -967,12 +1060,7 @@ impl Window {
         // Знак «развернуть» меняется вместе с состоянием: развёрнутое окно
         // предлагает вернуть прежний размер, и одинаковый значок в обоих
         // случаях означал бы, что человек нажимает наугад.
-        let restore_icon = if self.restore.is_some() { Icon::Restore } else { Icon::Maximize };
-        // Кнопки заголовка. На телефоне «развернуть» не рисуется вовсе: окно и
-        // так во весь экран, разворачивать его некуда, а кнопка, которая ничего
-        // не меняет, — это обещание, которого система не держит.
-        let mobile = theme::is_mobile();
-        let _ = (restore_icon, mobile);
+        // На телефоне «развернуть» — «на весь экран» (05.11).
         self.paint_title_buttons(focused);
 
         // Заголовок кончается там, где начинаются кнопки: подпись, заехавшая
@@ -1031,14 +1119,11 @@ impl Window {
         let fill = ctx.flat(if focused { p.tb1 } else { p.tb2 });
         let restore_icon = if self.restore.is_some() { Icon::Restore } else { Icon::Maximize };
         let glyph = ctx.px(10);
-        for (button, icon, hit, only_desktop) in [
-            (self.minimize_button(), Icon::Minimize, Hit::Minimize, false),
-            (self.maximize_button(), restore_icon, Hit::Maximize, true),
-            (self.close_button(), Icon::Close, Hit::Close, false),
+        for (button, icon, hit) in [
+            (self.minimize_button(), Icon::Minimize, Hit::Minimize),
+            (self.maximize_button(), restore_icon, Hit::Maximize),
+            (self.close_button(), Icon::Close, Hit::Close),
         ] {
-            if theme::is_mobile() && only_desktop {
-                continue;
-            }
             let hot = self.hot == Some(hit);
             let (plate, ink) = match (hot, hit) {
                 (true, Hit::Close) => (p.bad, Color::rgb(0xFF, 0xFF, 0xFF)),
@@ -1527,6 +1612,7 @@ impl Window {
             return;
         }
         let area = content_area(&self.surface, self.bar());
+        let at = self.pixels_at();
         let ctx = self.ctx();
         // Содержимое рисуется поверх прежнего, и заливка обязательна: список,
         // ставший короче, иначе оставил бы под собой хвост предыдущего.
@@ -1540,8 +1626,14 @@ impl Window {
             // программы бывает меньше области содержимого, и без заливки по
             // краям осталось бы то, что лежало там прежде.
             Content::Program(view) => {
+                // Пиксели больше области (окно шире экрана в рамке стола)
+                // срезаются по ней: заголовок и обводку они не задевают.
                 let whole = view.pixels.bounds();
-                self.surface.blit_from(&view.pixels, (area.x, area.y), whole);
+                let placed = Rect::new(at.0, at.1, whole.w, whole.h).intersect(&area);
+                if !placed.is_empty() {
+                    let src = Rect::new(placed.x - at.0, placed.y - at.1, placed.w, placed.h);
+                    self.surface.blit_from(&view.pixels, (placed.x, placed.y), src);
+                }
             }
         }
         self.damage = self.damage.union(&area);
@@ -1826,6 +1918,9 @@ impl Window {
             // новой рамке как есть. Отвечает она [`user_abi::SYS_WINRESIZE`] —
             // сама, стоя внутри вызова, то есть память меняется у неё на глазах.
             Content::Program(view) if view.resizable => {}
+            // Рамку стола (телефон, 05.11) менять можно и не умеющей программе:
+            // её пиксели остаются прежними и встают в новую рамку по центру.
+            Content::Program(_) if self.fit => {}
             Content::Program(_) => return false,
         }
 
@@ -1835,7 +1930,7 @@ impl Window {
         self.redraw_content();
         self.draw_decorations(false);
         self.damage = Rect::new(0, 0, w, h);
-        if self.is_program() {
+        if self.is_program() && self.resizable() {
             self.ask_resize(w, h.saturating_sub(self.bar()));
         }
         true
@@ -1852,7 +1947,10 @@ impl Window {
     /// Возвращает `true`, если состояние изменилось. Прежний прямоугольник
     /// запоминается целиком, вместе с местом: развёрнутое окно, вернувшееся не
     /// туда, откуда его развернули, выглядит как потерянное.
-    pub fn toggle_maximize(&mut self, screen_w: u32, work_bottom: i32) -> bool {
+    ///
+    /// `area` — куда разворачивать: на ПК вся рабочая область от верха
+    /// экрана, на телефоне — от строки состояния до полоски жеста.
+    pub fn toggle_maximize(&mut self, area: Rect) -> bool {
         match self.restore.take() {
             Some(rect) => {
                 let (x, y) = (rect.x, rect.y);
@@ -1866,12 +1964,11 @@ impl Window {
             }
             None => {
                 let previous = self.rect;
-                let height = work_bottom.max(0) as u32;
-                if !self.resize(screen_w, height) {
+                if !self.resize(area.w, area.h) {
                     return false;
                 }
-                self.rect.x = 0;
-                self.rect.y = 0;
+                self.rect.x = area.x;
+                self.rect.y = area.y;
                 self.restore = Some(previous);
                 true
             }
@@ -1941,15 +2038,22 @@ impl Window {
             return;
         };
         let content = content_area(&self.surface, self.bar());
+        let origin = self.pixels_at();
         let whole = view.pixels.bounds();
         let src = area.unwrap_or(whole).intersect(&whole);
         if src.is_empty() {
             return;
         }
-        let at = (content.x + src.x, content.y + src.y);
+        // Срезается по области содержимого: в рамке стола пиксели бывают
+        // больше окна (05.11), и копия иначе легла бы на обводку.
+        let copied = Rect::new(origin.0.saturating_add(src.x), origin.1.saturating_add(src.y), src.w, src.h)
+            .intersect(&content);
+        if copied.is_empty() {
+            return;
+        }
+        let src = Rect::new(copied.x - origin.0, copied.y - origin.1, copied.w, copied.h);
         let resizable = view.resizable;
-        self.surface.blit_from(&view.pixels, at, src);
-        let copied = Rect::new(at.0, at.1, src.w, src.h);
+        self.surface.blit_from(&view.pixels, (copied.x, copied.y), src);
         // Уголок размера лежит поверх содержимого, и копия пикселей его
         // стирает. Рисуется заново только тогда, когда копия его задела.
         if resizable && !copied.intersect(&self.resize_grip()).is_empty() {

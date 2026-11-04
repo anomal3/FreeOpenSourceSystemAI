@@ -1027,13 +1027,7 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
     // же; читать нечего — в четверти экрана помещается три строки. Все
     // мобильные системы пришли к одному и тому же, и пришли не от вкуса.
     if theme::is_mobile() {
-        let ctx = mini_ui::paint::Ctx::scaled(desktop.scale());
-        let top = ctx.px(theme::M_STATUS_H + theme::M_INSET) as i32;
-        let inset = ctx.px(theme::M_INSET);
-        let w = width.saturating_sub(inset * 2).max(1);
-        let work = desktop.app_bottom().max(1) as u32;
-        let h = work.saturating_sub(top.max(0) as u32).max(1);
-        return Rect::new(inset as i32, top, w, h);
+        return desktop.mobile_rect();
     }
 
     match app {
@@ -2520,8 +2514,8 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                             kprintln!("  terminal    : copied {} chars", selection.chars().count());
                             *CLIPBOARD.lock() = selection;
                         }
-                    } else if window.is_program() {
-                        let local = (x - window.rect.x, y - window.rect.y - window.bar() as i32);
+                    } else if window.is_program() && (!window.fit || window.on_pixels(x, y)) {
+                        let local = window.program_local(x, y);
                         window.push_event(WinEvent { kind: user_abi::WIN_MODS, code: program_mods(crate::input::modifiers()) as u32, x: 0, y: 0 });
                         window.push_event(WinEvent {
                             kind: WIN_POINTER,
@@ -3314,12 +3308,15 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                 let changed = match app.and_then(|app| desktop.find(app)) {
                     // Окно программы получает щелчок событием, а не
                     // перерисовкой: что нарисовать в ответ, решает она.
+                    // Поле вокруг пикселей в рамке стола (телефон, 05.11) —
+                    // ничьё: щелчок туда программе не уходит.
+                    Some(window) if window.is_program() && window.fit && !window.on_pixels(x, y) => false,
                     Some(window) if window.is_program() => {
                         // Координаты переводятся в систему поверхности: окно
                         // двигают по столу, и программа, считающая в экранных,
                         // промахивалась бы мимо собственных кнопок всякий раз,
                         // когда окно сдвинули.
-                        let local = (x - window.rect.x, y - window.rect.y - window.bar() as i32);
+                        let local = window.program_local(x, y);
                         // Единица — левая кнопка; правая приходит двойкой из
                         // разбора правой кнопки ниже. Перед нажатием —
                         // модификаторы (Ctrl+щелчок в «Файлах», 02.11).
@@ -4884,23 +4881,37 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         let full_h = if framed { h.saturating_add(Window::title_height(scale)) } else { h };
         let screen = desktop.screen_width();
         let work = desktop.app_bottom().max(1) as u32;
-        let rect = Rect::new(
-            ((screen.saturating_sub(w)) / 2) as i32,
-            ((work.saturating_sub(full_h)) / 2) as i32,
-            w,
-            full_h,
-        );
+        // На телефоне окно программы открывается во весь экран, как у Android
+        // (05.11): рамку держит стол, пиксели лежат в ней по центру или
+        // срезаны (NetSurf просит 800×600 на экране шириной 720), а умеющей
+        // менять размер программе уходит просьба заполнить рамку. Кнопка «на
+        // весь экран» возвращает окно к обычному размеру телефона.
+        let mobile = theme::is_mobile();
+        let rect = if mobile {
+            desktop.app_area()
+        } else {
+            Rect::new(
+                ((screen.saturating_sub(w)) / 2) as i32,
+                ((work.saturating_sub(full_h)) / 2) as i32,
+                w,
+                full_h,
+            )
+        };
         let mut window =
             Window::program(app, rect, scale, title, pixels).ok_or(WindowError::NoMemory)?;
         window.art = Some(art);
         window.group = group;
         desktop.pointer_idle();
-        // Заголовок нарисован при создании окна, до значка — перерисовать.
-        if framed {
-            window.draw_decorations(true);
-        }
         if !framed {
             window.frameless = true;
+        }
+        if mobile {
+            window.fit_frame(Some(desktop.mobile_rect()), true);
+            kprintln!("  desktop     : '{title}' {w}x{h} fills the screen at {}x{}", rect.w, rect.h);
+        } else if framed {
+            // Заголовок нарисован при создании окна, до значка — перерисовать.
+            window.draw_decorations(true);
+        } else {
             window.redraw_content();
         }
         desktop.push(window);

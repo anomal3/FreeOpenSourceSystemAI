@@ -1746,9 +1746,10 @@ pub const ALL: &[Scenario] = &[
             // Сворачивание: окно улетает в стопку, клавиатура уходит, док
             // возвращается уже со стопкой. Снимок в полёте — на удачу: снимок
             // экрана монитором занимает время, сравнимое с самим полётом.
-            // Кнопка «свернуть» телефона крупнее настольной и стоит первой слева
-            // от закрытия; прицел `Minimize` считает по раскладке ПК.
-            Step::Aim(Aim::Point(570, 164)),
+            // Кнопка «свернуть» телефона крупнее настольной; с 05.11 между ней
+            // и закрытием — «на весь экран», как на ПК. Прицел `Minimize`
+            // считает по раскладке ПК.
+            Step::Aim(Aim::Point(462, 164)),
             Step::Click,
             Step::Await("desktop     : minimized 'Terminal'", 15_000),
             Step::Wait(60),
@@ -1787,6 +1788,20 @@ pub const ALL: &[Scenario] = &[
             Step::Await("keyboard    : shown", 15_000),
             Step::Wait(1000),
             Step::Shot("06-restored"),
+            // «На весь экран» в заголовке (05.11): терминал встаёт от края до
+            // края под строкой состояния, низом — до клавиатуры; вторым
+            // нажатием (кнопка теперь у правого края экрана) — обратно.
+            Step::Aim(Aim::Point(554, 164)),
+            Step::Click,
+            Step::Await("desktop     : resized 'Terminal'", 15_000),
+            Step::Await("window      : 'Terminal' at 0,92 720x", 15_000),
+            Step::Wait(1000),
+            Step::Shot("06a-fullscreen"),
+            Step::Aim(Aim::Point(582, 114)),
+            Step::Click,
+            Step::Await("desktop     : resized 'Terminal'", 15_000),
+            Step::Await("window      : 'Terminal' at 28,120 664x950", 15_000),
+            Step::Wait(1000),
             // Домой — жестом (04.11, как у iPhone): палец у самого низа, под
             // клавиатурой (полоска жеста 1560..1600), ведут вверх и отпускают.
             // Окно уходит в стопку тем же полётом, что и кнопкой.
@@ -1859,8 +1874,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : switched forward from 'Terminal' to 'Settings'", 15_000),
             Step::Await("keyboard    : hidden", 15_000),
             // Вверх и задержать — переключатель программ: «Параметры» уходят в
-            // стопку, над доком лист с обеими программами (первыми — ушедшие
-            // последними). Нажатие на карточку «Параметров» возвращает их.
+            // стопку, над доком карточки обеих программ со снимками их окон
+            // (05.11), по две в ряд; первая — ушедшая последней (карточка
+            // 60..348 × 636..1288 на 720x1600). Нажатие на карточку
+            // «Параметров» возвращает их.
             Step::Aim(Aim::Point(360, 1590)),
             Step::Press,
             Step::Aim(Aim::Point(360, 1520)),
@@ -1871,7 +1888,7 @@ pub const ALL: &[Scenario] = &[
             Step::Release,
             Step::Wait(1000),
             Step::Shot("08e-switcher"),
-            Step::Aim(Aim::Point(300, 996)),
+            Step::Aim(Aim::Point(204, 962)),
             Step::Click,
             Step::Await("desktop     : restored 'Settings'", 15_000),
             Step::Await("desktop     : restore flight of 'Settings': ", 15_000),
@@ -1910,6 +1927,24 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : open zoom of 'Program': ", 15_000),
             Step::Wait(1500),
             Step::Shot("11-gallery"),
+            // Окно программы на телефоне открывается во весь экран (05.11):
+            // рамка от строки состояния до полоски жеста, пиксели витрины
+            // (своего размера, менять его она не умеет) — по центру.
+            Step::Expect("fills the screen at 720x1468"),
+            Step::Expect("window      : 'Примеры' at 0,92 720x1468"),
+            // «На весь экран» у развёрнутого — обратно к обычному окну
+            // телефона, и снова во весь экран.
+            Step::Aim(Aim::Point(582, 114)),
+            Step::Click,
+            Step::Await("desktop     : resized 'Примеры'", 15_000),
+            Step::Await("window      : 'Примеры' at 28,120 664x1440", 15_000),
+            Step::Wait(1000),
+            Step::Shot("11b-gallery-window"),
+            Step::Aim(Aim::Point(554, 164)),
+            Step::Click,
+            Step::Await("desktop     : resized 'Примеры'", 15_000),
+            Step::Await("window      : 'Примеры' at 0,92 720x1468", 15_000),
+            Step::Wait(1000),
             // Вверх выше двух пятых экрана — переключатель сразу, без
             // задержки. Карточку витрины смахивают вверх — программа
             // закрывается.
@@ -1922,10 +1957,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : app switcher opened with 2 app(s)", 15_000),
             Step::Wait(1000),
             Step::Shot("12-switcher-gallery"),
-            Step::Aim(Aim::Point(300, 996)),
+            Step::Aim(Aim::Point(204, 962)),
             Step::Press,
-            Step::Aim(Aim::Point(300, 900)),
-            Step::Aim(Aim::Point(300, 800)),
+            Step::Aim(Aim::Point(204, 860)),
+            Step::Aim(Aim::Point(204, 700)),
             Step::Release,
             Step::Await("swiped away", 15_000),
             Step::Wait(2000),

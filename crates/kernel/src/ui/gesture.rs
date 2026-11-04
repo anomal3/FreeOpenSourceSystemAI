@@ -57,7 +57,10 @@ pub fn bar_height(scale: u32) -> u32 {
 #[must_use]
 pub fn pill(screen_w: u32, screen_h: u32, scale: u32) -> Rect {
     let ctx = Ctx::scaled(scale);
-    let (w, h) = (ctx.px(theme::M_HOME_W), ctx.px(theme::M_HOME_H));
+    // Всегда лёжа (05.11): не шире трети экрана и не толще четверти своей
+    // длины — на узком экране или крупном масштабе пилюля не встанет торчком.
+    let w = ctx.px(theme::M_HOME_W).min(screen_w / 3).max(4);
+    let h = ctx.px(theme::M_HOME_H).min(w / 4).max(1);
     let y = screen_h as i32 - ctx.px(8) as i32 - h as i32;
     Rect::new((screen_w as i32 - w as i32) / 2, y, w, h)
 }
