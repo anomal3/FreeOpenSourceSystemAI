@@ -523,6 +523,20 @@ fn parse_beacon(packet: &[u8]) -> Option<Network> {
     Some(Network { ssid, bssid, channel, rsn })
 }
 
+/// Сеть в журнал: имя, канал, точка и её RSN — короткими строками (`oem
+/// log` обрезает длинные). По RSN разбирают отказы ассоциации (коды 41, 43).
+fn log_network(net: &Network) {
+    let b = net.bssid;
+    crate::kprintln!("  wlan        : '{}' ch {} {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", net.ssid, net.channel, b[0], b[1], b[2], b[3], b[4], b[5]);
+    for row in net.rsn.chunks(16) {
+        let mut hex = String::new();
+        for byte in row {
+            hex.push_str(&alloc::format!("{byte:02x}"));
+        }
+        crate::kprintln!("  wlan        :   rsn {hex}");
+    }
+}
+
 /// BSS уже активирован (пустая команда и `BSS_ACTIVATE` — один раз).
 static ACTIVATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -567,7 +581,7 @@ fn scan_pass(found: &mut Vec<Network>) -> Result<bool, &'static str> {
         while let Some(packet) = receive(RX_DATA, 5)? {
             if let Some(net) = parse_beacon(&packet) {
                 if !found.iter().any(|known| known.bssid == net.bssid) {
-                    crate::kprintln!("  wlan        : '{}' ch {}", net.ssid, net.channel);
+                    log_network(&net);
                     found.push(net);
                 }
             }
@@ -580,7 +594,7 @@ fn scan_pass(found: &mut Vec<Network>) -> Result<bool, &'static str> {
             if kind & 0xe00f == 0xe001 {
                 if let Some(net) = parse_beacon(&event) {
                     if !found.iter().any(|known| known.bssid == net.bssid) {
-                        crate::kprintln!("  wlan        : '{}' ch {}", net.ssid, net.channel);
+                        log_network(&net);
                         found.push(net);
                     }
                 } else if !dumped {
@@ -890,11 +904,35 @@ fn station_rsn(ap: &[u8]) -> Result<(Vec<u8>, GroupCipher), &'static str> {
 }
 
 /// Подключиться к сети: `password` пустой — открытая сеть.
+///
+/// У сети бывает несколько точек (MARK69 — две на одном канале): отказала
+/// одна — пробуем следующую.
 pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> {
-    let net = networks().into_iter().find(|net| net.ssid == ssid).ok_or("network not in the last scan")?;
+    let candidates: Vec<Network> = networks().into_iter().filter(|net| net.ssid == ssid).collect();
+    let mut last = "network not in the last scan";
+    for net in candidates.iter() {
+        log_network(net);
+        match connect_bss(net, password) {
+            Ok(report) => return Ok(report),
+            Err(err) => {
+                crate::kprintln!("  wlan        : {err}");
+                last = err;
+            }
+        }
+    }
+    Err(last)
+}
+
+fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static str> {
+    let ssid = net.ssid.as_str();
     let (bssid, channel) = (net.bssid, net.channel);
     let secure = !password.is_empty();
     let (rsn_ie, group) = if secure { station_rsn(&net.rsn)? } else { (Vec::new(), GroupCipher { algorithm: 0, key_len: 0 }) };
+    let mut hex = String::new();
+    for byte in rsn_ie.iter() {
+        hex.push_str(&alloc::format!("{byte:02x}"));
+    }
+    crate::kprintln!("  wlan        : our rsn {hex}");
     let mut report = Vec::new();
     activate()?;
 
