@@ -234,14 +234,46 @@ pub fn setup_dma() -> Result<Vec<String>, &'static str> {
     Ok(alloc::vec![alloc::format!("rings at {phys:#x} ({} KiB), GLO_CFG {cfg:08x}", DMA_SIZE / 1024)])
 }
 
+/// Кольцо передачи — одно на команды прошивки и кадры данных (04.11): их
+/// кладут разные задачи, и без замка две записи в один слот портили кольцо.
+/// Замок — только на запись слота и индекса, ждать под ним нельзя.
+static TX_LOCK: SpinLock<()> = SpinLock::new(());
+
 /// Положить пакет в передающее кольцо и дождаться, пока блок его заберёт.
 fn transmit(ring: u32, packet: &[u8]) -> Result<(), &'static str> {
+    let slot = enqueue(ring, packet, false)?;
+    let started = crate::time::uptime_ns();
+    // Забран — когда блок ушёл со слота (за ним могли положить ещё).
+    while read(tx_reg(ring, 12))? as usize % TX_SLOTS == slot {
+        if crate::time::uptime_ns().wrapping_sub(started) > 500_000_000 {
+            return Err("Wi-Fi block did not take the packet from the ring");
+        }
+        core::hint::spin_loop();
+    }
+    Ok(())
+}
+
+/// Положить пакет и не ждать — для кадров данных: сетевая задача держит
+/// замок сети, и ожидание под ним 04.11 повесило телефон целиком (браузер
+/// слал кадры, блок их не забирал, по полсекунды на каждый с закрытыми
+/// прерываниями). Места нет — `Err`, кадр повторит TCP.
+fn transmit_nowait(ring: u32, packet: &[u8]) -> Result<(), &'static str> {
+    enqueue(ring, packet, true).map(|_| ())
+}
+
+/// Записать пакет в следующий слот кольца; номер слота. `need_room` —
+/// отказать, если кольцо полно.
+fn enqueue(ring: u32, packet: &[u8], need_room: bool) -> Result<usize, &'static str> {
     let (virt, phys) = dma()?;
     let index = TX_RINGS.iter().position(|r| *r == ring).ok_or("unknown ring")?;
     if packet.len() > BUF {
         return Err("packet larger than a ring buffer");
     }
+    let _guard = TX_LOCK.lock();
     let cpu = read(tx_reg(ring, 8))? as usize % TX_SLOTS;
+    if need_room && (cpu + 1) % TX_SLOTS == read(tx_reg(ring, 12))? as usize % TX_SLOTS {
+        return Err("transmit ring full");
+    }
     let buf = virt + tx_buf_off(index) + cpu * BUF;
     // SAFETY: буфер слота — в нашей памяти DMA, длина проверена.
     unsafe { core::ptr::copy_nonoverlapping(packet.as_ptr(), buf as *mut u8, packet.len()) };
@@ -254,14 +286,7 @@ fn transmit(ring: u32, packet: &[u8]) -> Result<(), &'static str> {
     dcache(desc, 16);
     let next = ((cpu + 1) % TX_SLOTS) as u32;
     write(tx_reg(ring, 8), next)?;
-    let started = crate::time::uptime_ns();
-    while read(tx_reg(ring, 12))? != next {
-        if crate::time::uptime_ns().wrapping_sub(started) > 500_000_000 {
-            return Err("Wi-Fi block did not take the packet from the ring");
-        }
-        core::hint::spin_loop();
-    }
-    Ok(())
+    Ok(cpu)
 }
 
 /// Забрать следующий принятый пакет из кольца, если он есть к сроку.
@@ -1374,7 +1399,7 @@ fn ethernet_in(packet: &[u8], bssid: &[u8; 6]) -> Option<Vec<u8>> {
 }
 
 fn dump(packet: &[u8], why: &str) {
-    if DUMPED.fetch_add(1, Ordering::Relaxed) >= 6 {
+    if DUMPED.fetch_add(1, Ordering::Relaxed) >= 10 {
         return;
     }
     crate::kprintln!("  wlan        : rx {why}, {} B", packet.len());
@@ -1390,6 +1415,32 @@ fn dump(packet: &[u8], why: &str) {
 /// Wi-Fi как сетевая карта.
 pub struct Card {
     stats: crate::net::card::Stats,
+    /// Принятые пакеты по кольцам и от нашей точки — для сводки в журнал.
+    seen_data: u64,
+    seen_event: u64,
+    seen_ours: u64,
+    /// Когда печаталась сводка (мс).
+    summary_at: u64,
+}
+
+impl Card {
+    /// Раз в 10 с — сводка: на аппарате по ней видно, где рвётся путь.
+    fn summary(&mut self) {
+        let now = crate::time::uptime_ms();
+        if now.saturating_sub(self.summary_at) < 10_000 {
+            return;
+        }
+        self.summary_at = now;
+        crate::kprintln!(
+            "  wlan        : tx {} ({} dropped), rx data {} event {} ours {}, to stack {}",
+            self.stats.tx_frames,
+            self.stats.tx_dropped,
+            self.seen_data,
+            self.seen_event,
+            self.seen_ours,
+            self.stats.rx_frames
+        );
+    }
 }
 
 impl crate::net::card::Card for Card {
@@ -1410,14 +1461,23 @@ impl crate::net::card::Card for Card {
         if frame.len() > crate::net::card::FRAME_MAX {
             return Err(CardError::TooLong(frame.len()));
         }
-        match send_frame(eapol_txd(frame.len()), frame) {
+        let mut packet = Vec::with_capacity(32 + frame.len() + 3);
+        packet.extend_from_slice(&eapol_txd(frame.len()));
+        packet.extend_from_slice(frame);
+        while packet.len() % 4 != 0 {
+            packet.push(0);
+        }
+        match transmit_nowait(TX_CMD, &packet) {
             Ok(()) => {
                 self.stats.tx_frames += 1;
                 self.stats.tx_bytes += frame.len() as u64;
                 Ok(())
             }
-            Err(_) => {
+            Err(err) => {
                 self.stats.tx_dropped += 1;
+                if self.stats.tx_dropped <= 5 || self.stats.tx_dropped % 100 == 0 {
+                    crate::kprintln!("  wlan        : frame not sent ({err}), {} dropped so far", self.stats.tx_dropped);
+                }
                 Err(CardError::Busy)
             }
         }
@@ -1427,11 +1487,21 @@ impl crate::net::card::Card for Card {
         if RADIO_BUSY.load(Ordering::Relaxed) || !is_ready() {
             return None;
         }
+        self.summary();
         for ring in [RX_DATA, RX_EVENT] {
             // Кольцо событий — только пока есть что брать: события после
             // подключения стеку не нужны, но и копиться им незачем.
             let Some((_, bssid)) = CONNECTED.lock().clone() else { return None };
             while let Ok(Some(packet)) = receive(ring, 0) {
+                if ring == RX_DATA {
+                    self.seen_data += 1;
+                } else {
+                    self.seen_event += 1;
+                }
+                let from_ours = packet.windows(6).any(|w| w == bssid);
+                if from_ours {
+                    self.seen_ours += 1;
+                }
                 match ethernet_in(&packet, &bssid) {
                     Some(ethernet) if ethernet.len() <= frame.len() && ethernet.len() >= 14 => {
                         if DUMPED.load(Ordering::Relaxed) < 2 {
@@ -1444,10 +1514,11 @@ impl crate::net::card::Card for Card {
                     }
                     Some(_) => self.stats.rx_dropped += 1,
                     None => {
-                        // В журнал — только кадры своей точки: чужие шифрованные
-                        // рассылки разбирать и не надо.
-                        let from_ours = packet.windows(6).any(|w| w == bssid);
-                        if ring == RX_DATA && from_ours {
+                        // В журнал — только кадры своей точки (из любого кольца):
+                        // чужие шифрованные рассылки разбирать и не надо.
+                        // Маяки своей точки (каждые 100 мс) — мимо журнала.
+                        let beacon = frame_in(&packet, 0x80).is_some();
+                        if from_ours && !beacon {
                             self.stats.rx_dropped += 1;
                             dump(&packet, "not understood");
                         }
@@ -1492,5 +1563,11 @@ pub fn attach() {
     if ATTACHED.swap(true, Ordering::Relaxed) {
         return;
     }
-    crate::net::attach_wifi(alloc::boxed::Box::new(Card { stats: crate::net::card::Stats::default() }));
+    crate::net::attach_wifi(alloc::boxed::Box::new(Card {
+        stats: crate::net::card::Stats::default(),
+        seen_data: 0,
+        seen_event: 0,
+        seen_ours: 0,
+        summary_at: 0,
+    }));
 }
