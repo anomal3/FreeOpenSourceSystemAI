@@ -72,6 +72,8 @@ impl Ring {
             let chunk = bytes.len().min(room);
             self.bytes[at..at + chunk].copy_from_slice(&bytes[..chunk]);
             self.written += chunk as u64;
+            // Зеркало для следующей загрузки (телефон, см. `crate::lastlog`).
+            crate::lastlog::mirror(at, &bytes[..chunk], self.written);
             bytes = &bytes[chunk..];
         }
     }
@@ -145,4 +147,12 @@ pub fn read(from: u64, out: &mut [u8]) -> (usize, u64) {
         at += 1;
     }
     (count, at)
+}
+
+/// Дать заглянуть в кольцо под его замком: так заводится зеркало
+/// [`crate::lastlog`]. Пока замок взят, новых строк нет, и зеркало начинает
+/// ровно с того, что в кольце уже лежит.
+pub fn with_ring(f: impl FnOnce(&[u8; CAPACITY], u64)) {
+    let ring = RING.lock();
+    f(&ring.bytes, ring.written);
 }

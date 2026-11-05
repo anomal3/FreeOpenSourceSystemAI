@@ -57,6 +57,7 @@ mod io_events;
 mod irq;
 mod crashlog;
 mod klog;
+mod lastlog;
 mod latency;
 #[cfg(target_arch = "x86_64")]
 mod linux;
@@ -264,6 +265,7 @@ fn take_over_memory(info: &BootInfo) {
     // Участок под снимок паники занимается до первого же выданного кадра:
     // таблицы страниц ниже легли бы поверх снимка прошлой загрузки.
     crashlog::claim();
+    lastlog::claim();
 
     let space: Option<Result<arch::KernelSpace, arch::SpaceError>> =
         mm::frame::with(|frames| arch::build_kernel_address_space(info, frames));
@@ -323,6 +325,8 @@ fn take_over_memory(info: &BootInfo) {
 
     // Прямое отображение и куча есть — снимок прошлой загрузки можно прочитать.
     crashlog::recover();
+    // Журнал прошлой загрузки телефона и зеркало этой (см. `lastlog`).
+    lastlog::attach();
 }
 
 /// Убедиться, что фреймбуфер пережил переключение на собственные таблицы.

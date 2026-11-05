@@ -47,7 +47,9 @@ enum State {
     /// ядро печатает и во время выдачи — опрос устройств, сеть, оболочка. Без
     /// неё `oem log` не кончился бы никогда, потому что журнал прирастал бы
     /// ровно настолько, насколько его успели прочитать.
-    Log { at: u64, until: u64 },
+    ///
+    /// `last` — журнал прошлой загрузки (`oem lastlog`, см. [`crate::lastlog`]).
+    Log { at: u64, until: u64, last: bool },
     /// Отдаёт заранее сложенные строки ответа: какую следующей.
     Lines { at: u8 },
     /// Ведёт синтетический жест: концы, очередной шаг и когда его подать.
@@ -160,8 +162,8 @@ impl Fastboot {
             return;
         }
 
-        if let State::Log { at, until } = self.state {
-            self.continue_log(at, until);
+        if let State::Log { at, until, last } = self.state {
+            self.continue_log(at, until, last);
             return;
         }
 
@@ -322,8 +324,12 @@ impl Fastboot {
             self.continue_lines(0);
         } else if text == "oem log" || text == "oem klog" {
             let (at, until) = (klog::oldest(), klog::written());
-            self.state = State::Log { at, until };
-            self.continue_log(at, until);
+            self.state = State::Log { at, until, last: false };
+            self.continue_log(at, until, false);
+        } else if text == "oem lastlog" || text.starts_with("oem lastlog ") {
+            self.lastlog(text["oem lastlog".len()..].trim());
+        } else if text == "oem wdt" || text.starts_with("oem wdt ") {
+            self.wdt(text["oem wdt".len()..].trim());
         } else if matches!(text, "reboot-bootloader" | "reboot-fastboot") {
             // С 03.11 — туда, куда просят: метка `RTC_PDN1_FAST_BOOT` в часах
             // PMIC (так делает Android на `reboot bootloader`), и LK открывает
@@ -332,6 +338,7 @@ impl Fastboot {
             match crate::arch::aarch64::mtk_regs::mark_fastboot() {
                 Ok(pdn1) => {
                     crate::kprintln!("  fastboot    : next boot into the bootloader, RTC_PDN1 {pdn1:#06x}");
+                    crate::lastlog::mark_clean();
                     self.reboot_after_reply = true;
                     self.respond(b"OKAY", "");
                 }
@@ -341,6 +348,9 @@ impl Fastboot {
                 }
             }
         } else if matches!(text, "reboot" | "oem reboot") {
+            // Метку «в fastboot», поставленную при старте ради сторожевого
+            // таймера, — снять (05.11), иначе LK откроет fastboot.
+            crate::arch::aarch64::mtk::prepare_clean_reboot();
             // Обычная загрузка — в Android.
             self.reboot_after_reply = true;
             self.respond(b"OKAY", "");
@@ -1000,6 +1010,74 @@ impl Fastboot {
         self.line_count += 1;
     }
 
+    /// `oem lastlog [смещение | info]` (05.11) — журнал прошлой загрузки, той,
+    /// что кончилась сбросом (см. [`crate::lastlog`]): весь; с байта
+    /// `смещение` от начала сохранённого (продолжить оборванную выдачу); или
+    /// сводка строками `INFO`.
+    fn lastlog(&mut self, arg: &str) {
+        let Some(info) = crate::lastlog::previous() else {
+            self.respond(b"FAIL", "no log from a previous boot");
+            return;
+        };
+        if arg == "info" {
+            self.line_count = 0;
+            let text = alloc::format!(
+                "boot #{}: {} bytes written, {} kept",
+                info.boot,
+                info.written,
+                info.written - info.oldest()
+            );
+            self.say(text.as_bytes());
+            let text = alloc::format!("last line at {}.{:03} s", info.last_ms / 1000, info.last_ms % 1000);
+            self.say(text.as_bytes());
+            let text: &[u8] = if info.clean {
+                b"clean reboot"
+            } else {
+                b"no clean reboot: watchdog or forced reset?"
+            };
+            self.say(text);
+            let text = alloc::format!("{} bytes do not look like text", info.odd);
+            self.say(text.as_bytes());
+            self.state = State::Lines { at: 0 };
+            self.continue_lines(0);
+            return;
+        }
+        let skip = if arg.is_empty() {
+            0
+        } else if let Ok(skip) = arg.parse::<u64>() {
+            skip
+        } else {
+            self.respond(b"FAIL", "usage: oem lastlog [offset | info]");
+            return;
+        };
+        let at = info.oldest().saturating_add(skip).min(info.written);
+        self.state = State::Log { at, until: info.written, last: true };
+        self.continue_log(at, info.written, true);
+    }
+
+    /// `oem wdt [on | off | status]` (05.11) — сторожевой таймер TOPRGU (см.
+    /// `mtk::watchdog_arm`): включить, выключить вместе с меткой «в fastboot»,
+    /// посмотреть. Ответ — строками `INFO`, как у `oem mem`.
+    fn wdt(&mut self, arg: &str) {
+        use crate::arch::aarch64::mtk;
+        let result = match arg {
+            "" | "status" => Ok(()),
+            "on" => mtk::watchdog_enable(true),
+            "off" => mtk::watchdog_enable(false),
+            _ => Err("usage: oem wdt [on | off | status]"),
+        };
+        if let Err(err) = result {
+            self.respond(b"FAIL", err);
+            return;
+        }
+        self.line_count = 0;
+        for text in mtk::watchdog_report() {
+            self.say(text.as_bytes());
+        }
+        self.state = State::Lines { at: 0 };
+        self.continue_lines(0);
+    }
+
     /// Сложить байты шестнадцатеричными парами, по столько на строку, сколько
     /// влезает в пакет.
     fn say_bytes(&mut self, bytes: &[u8]) {
@@ -1151,7 +1229,7 @@ impl Fastboot {
     }
 
     /// Отдать следующую строку журнала — или закончить выдачу.
-    fn continue_log(&mut self, at: u64, until: u64) {
+    fn continue_log(&mut self, at: u64, until: u64, last: bool) {
         if at >= until {
             self.state = State::Idle;
             self.respond(b"OKAY", "");
@@ -1162,7 +1240,11 @@ impl Fastboot {
         // во время самой выдачи, — в том числе те, которые печатает выдача.
         let mut line = [0u8; TEXT];
         let room = usize::try_from(until - at).unwrap_or(TEXT).min(TEXT);
-        let (count, next) = klog::read(at, &mut line[..room]);
+        let (count, next) = if last {
+            crate::lastlog::read_previous(at, &mut line[..room])
+        } else {
+            klog::read(at, &mut line[..room])
+        };
         if count == 0 {
             self.state = State::Idle;
             self.respond(b"OKAY", "");
@@ -1185,7 +1267,7 @@ impl Fastboot {
         };
         let len = trim_end(&line[..len]);
 
-        self.state = State::Log { at: next, until };
+        self.state = State::Log { at: next, until, last };
 
         self.out[..4].copy_from_slice(b"INFO");
         self.out[4..4 + len].copy_from_slice(&line[..len]);

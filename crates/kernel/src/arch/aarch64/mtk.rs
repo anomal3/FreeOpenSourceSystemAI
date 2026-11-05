@@ -4,6 +4,8 @@
 //! производителю не привязано. Здесь — два исключения, и оба выяснены на
 //! аппарате, а не выведены рассуждением.
 
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use fdt::Fdt;
 
 /// Ключ в старших битах регистра режима сторожевого таймера.
@@ -97,15 +99,226 @@ pub fn present() -> bool {
 /// перезагрузка отсюда невозможна, и притворяться иначе не стоит.
 pub fn reboot() -> bool {
     let base = WATCHDOG_BASE.load(core::sync::atomic::Ordering::Relaxed);
-    if base == 0 || !super::mtk_touch::map_device_page(base) {
+    if base == 0 {
         return false;
     }
-    // SAFETY: адрес из дерева, окно только что отображено как память
-    // устройства. Возврата из этой записи не предполагается.
-    unsafe {
-        ((base as usize + WATCHDOG_SWRST) as *mut u32).write_volatile(WATCHDOG_SWRST_KEY);
+    // Через общее окно регистров (`mtk_regs::write32`), а не своим
+    // отображением страницы (05.11): ту же страницу TOPRGU отображают и другие
+    // — сброс блока связи (`0x10007018`), сторожевой таймер ниже, — а второе
+    // отображение той же страницы ядро отвергает, и перезагрузка молча не
+    // случилась бы. Возврата из удавшейся записи не предполагается.
+    super::mtk_regs::write32(base + WATCHDOG_SWRST as u64, WATCHDOG_SWRST_KEY)
+}
+
+// ---------------------------------------------------------------------------
+// Сторожевой таймер как страховка от зависания (05.11)
+// ---------------------------------------------------------------------------
+//
+// NetSurf вешал телефон целиком: экран стоит, USB молчит, паники нет, выход —
+// зажать кнопки, и журнал при этом пропадал. Теперь таймер TOPRGU, погашенный
+// при входе ([`disable_watchdog`]), снова включается, когда заработала задача
+// кнопки питания, и она же пинает его каждые 5–30 мс. Встал планировщик или
+// прерывания — пинков нет, и через [`WATCHDOG_SECONDS`] машина сбрасывается
+// сама; метка «в fastboot» в часах PMIC, поставленная перед включением,
+// отправляет LK в fastboot, а не в MIUI, и журнал зависшей загрузки остаётся в
+// памяти ([`crate::lastlog`]).
+//
+// Пинать из обработчика прерывания таймера нельзя нарочно: машина с живыми
+// прерываниями, но вставшим планировщиком — тоже зависшая. Числа — из
+// `mtk_wdt.c` (Linux), одни на всё семейство.
+
+const WDT_MODE: u64 = 0x00;
+const WDT_LENGTH: u64 = 0x04;
+const WDT_RESTART: u64 = 0x08;
+const WDT_STATUS: u64 = 0x0c;
+const WDT_NONRST: u64 = 0x20;
+const WDT_NONRST2: u64 = 0x24;
+/// Биты `WDT_MODE`: разрешение; внешний вывод сброса (к PMIC); прерывание
+/// вместо сброса; двойной режим (сначала прерывание, потом сброс).
+const WDT_MODE_EN: u32 = 1 << 0;
+const WDT_MODE_EXRST_EN: u32 = 1 << 2;
+const WDT_MODE_IRQ_EN: u32 = 1 << 3;
+const WDT_MODE_DUAL_EN: u32 = 1 << 6;
+/// Ключ в младших битах `WDT_LENGTH` и сдвиг самого срока.
+const WDT_LENGTH_KEY: u32 = 0x08;
+const WDT_LENGTH_SHIFT: u32 = 5;
+/// Единица срока — 512 тактов часов 32 кГц, 1/64 секунды; поле в 11 бит,
+/// предел около 32 с.
+const WDT_UNITS_PER_SECOND: u32 = 64;
+const WDT_LENGTH_MAX: u32 = 0x7ff;
+const WDT_RESTART_KEY: u32 = 0x1971;
+
+/// Срок, после которого непнутый таймер сбрасывает машину.
+///
+/// В сотни раз больше шага задачи кнопки и всё равно меньше, чем человек
+/// смотрит на замёрзший экран, прежде чем зажать кнопки сам. Самое долгое
+/// законное ожидание — удержание журнала загрузки на 30 с (`hold_boot_log`) —
+/// идёт до запуска планировщика, когда таймер ещё погашен.
+pub const WATCHDOG_SECONDS: u32 = 20;
+
+/// Включать ли таймер (`oem wdt off` снимает).
+static WATCHDOG_WANTED: AtomicBool = AtomicBool::new(true);
+/// Таймер включён нами и пинается.
+static WATCHDOG_ON: AtomicBool = AtomicBool::new(false);
+/// Задача кнопки питания работает — пинать есть кому.
+static WATCHDOG_KICKER: AtomicBool = AtomicBool::new(false);
+static WATCHDOG_KICKS: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_LAST_KICK_MS: AtomicU64 = AtomicU64::new(0);
+
+fn watchdog_reg(offset: u64) -> Option<u64> {
+    let base = WATCHDOG_BASE.load(Ordering::Relaxed);
+    (base != 0).then_some(base + offset)
+}
+
+/// Завести таймер на `seconds` секунд и разрешить его.
+fn watchdog_start(seconds: u32) -> bool {
+    use super::mtk_regs::{read32, write32};
+    let (Some(mode_reg), Some(length_reg), Some(restart_reg)) =
+        (watchdog_reg(WDT_MODE), watchdog_reg(WDT_LENGTH), watchdog_reg(WDT_RESTART))
+    else {
+        return false;
+    };
+    let Some(mode) = read32(mode_reg) else {
+        return false;
+    };
+    let length = seconds.saturating_mul(WDT_UNITS_PER_SECOND).clamp(1, WDT_LENGTH_MAX);
+    // Сначала срок и пинок, потом разрешение: иначе таймер пошёл бы со сроком,
+    // оставленным загрузчиком.
+    if !(write32(length_reg, (length << WDT_LENGTH_SHIFT) | WDT_LENGTH_KEY)
+        && write32(restart_reg, WDT_RESTART_KEY))
+    {
+        return false;
     }
+    // Без прерывания и без двойного режима — сразу сброс: прерывание таймера
+    // обработать некому. Без внешнего вывода — так же, как `reboot` выше:
+    // сброс внутри SoC, PMIC питание с памяти не снимает, и журнал выживает.
+    let mode = (mode & 0xff & !(WDT_MODE_IRQ_EN | WDT_MODE_DUAL_EN | WDT_MODE_EXRST_EN))
+        | WDT_MODE_EN
+        | WATCHDOG_KEY;
+    if !write32(mode_reg, mode) {
+        return false;
+    }
+    WATCHDOG_LAST_KICK_MS.store(crate::time::uptime_ms(), Ordering::Relaxed);
+    WATCHDOG_ON.store(true, Ordering::Release);
     true
+}
+
+/// Запретить таймер.
+fn watchdog_stop() -> bool {
+    use super::mtk_regs::{read32, write32};
+    WATCHDOG_ON.store(false, Ordering::Release);
+    let Some(mode_reg) = watchdog_reg(WDT_MODE) else {
+        return false;
+    };
+    let Some(mode) = read32(mode_reg) else {
+        return false;
+    };
+    write32(mode_reg, (mode & 0xff & !WDT_MODE_EN) | WATCHDOG_KEY)
+}
+
+/// Пнуть таймер. Зовёт задача кнопки питания на каждом шаге.
+pub fn watchdog_kick() {
+    if !WATCHDOG_ON.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(reg) = watchdog_reg(WDT_RESTART)
+        && super::mtk_regs::write32(reg, WDT_RESTART_KEY)
+    {
+        WATCHDOG_KICKS.fetch_add(1, Ordering::Relaxed);
+        WATCHDOG_LAST_KICK_MS.store(crate::time::uptime_ms(), Ordering::Relaxed);
+    }
+}
+
+/// Задача кнопки питания заработала: поставить метку «в fastboot» и включить
+/// таймер.
+///
+/// Метка — первой, и без неё таймер не включается: сброс, попавший в MIUI,
+/// стоит человеку `adb reboot bootloader`, а журналу — жизни (Android
+/// переписывает память). LK снимает метку сам, когда открывает по ней
+/// fastboot; перезагрузка по просьбе человека снимает её перед сбросом
+/// ([`prepare_clean_reboot`]).
+pub fn watchdog_arm() {
+    WATCHDOG_KICKER.store(true, Ordering::Release);
+    if !WATCHDOG_WANTED.load(Ordering::Relaxed) {
+        return;
+    }
+    match super::mtk_regs::mark_fastboot() {
+        Ok(pdn1) => {
+            crate::kprintln!("  watchdog    : RTC fastboot mark set (RTC_PDN1 {pdn1:#06x}): a reset lands in fastboot");
+        }
+        Err(err) => {
+            crate::kprintln!("  watchdog    : cannot set the RTC fastboot mark ({err:?}); watchdog stays off");
+            return;
+        }
+    }
+    if watchdog_start(WATCHDOG_SECONDS) {
+        crate::kprintln!("  watchdog    : on, {WATCHDOG_SECONDS} s, kicked by the power key task (`oem wdt off` stops it)");
+    } else {
+        crate::kprintln!("  watchdog    : TOPRGU does not answer; watchdog stays off");
+    }
+}
+
+/// `oem wdt on | off`: включить вместе с меткой «в fastboot» или выключить
+/// вместе с ней.
+pub fn watchdog_enable(on: bool) -> Result<(), &'static str> {
+    if on {
+        if !WATCHDOG_KICKER.load(Ordering::Acquire) {
+            return Err("power key task not running: nothing would kick it");
+        }
+        super::mtk_regs::mark_fastboot().map_err(|_| "cannot set the RTC fastboot mark")?;
+        WATCHDOG_WANTED.store(true, Ordering::Relaxed);
+        if !watchdog_start(WATCHDOG_SECONDS) {
+            return Err("TOPRGU does not answer");
+        }
+        crate::kprintln!("  watchdog    : on by fastboot");
+    } else {
+        WATCHDOG_WANTED.store(false, Ordering::Relaxed);
+        if !watchdog_stop() {
+            return Err("TOPRGU does not answer");
+        }
+        super::mtk_regs::clear_fastboot().map_err(|_| "watchdog off, but the RTC fastboot mark stays")?;
+        crate::kprintln!("  watchdog    : off by fastboot");
+    }
+    Ok(())
+}
+
+/// Строки для `oem wdt`: состояние, регистры TOPRGU и метка в часах.
+pub fn watchdog_report() -> alloc::vec::Vec<alloc::string::String> {
+    use alloc::format;
+    let read = |offset| watchdog_reg(offset).and_then(super::mtk_regs::read32).unwrap_or(0xffff_ffff);
+    let ago = crate::time::uptime_ms().saturating_sub(WATCHDOG_LAST_KICK_MS.load(Ordering::Relaxed));
+    let mut lines = alloc::vec::Vec::new();
+    lines.push(format!(
+        "wdt {}, {WATCHDOG_SECONDS} s, {} kicks, last {ago} ms ago",
+        if WATCHDOG_ON.load(Ordering::Relaxed) { "on" } else { "off" },
+        WATCHDOG_KICKS.load(Ordering::Relaxed),
+    ));
+    lines.push(format!("mode {:#x} length {:#x}", read(WDT_MODE), read(WDT_LENGTH)));
+    lines.push(format!(
+        "status {:#x} nonrst {:#x} {:#x}",
+        read(WDT_STATUS),
+        read(WDT_NONRST),
+        read(WDT_NONRST2)
+    ));
+    lines.push(match super::mtk_regs::fastboot_marked() {
+        Ok((set, pdn1)) => format!(
+            "rtc fastboot mark {} (RTC_PDN1 {pdn1:#06x})",
+            if set { "set" } else { "clear" }
+        ),
+        Err(err) => format!("RTC_PDN1 unreadable: {err:?}"),
+    });
+    lines
+}
+
+/// Перед перезагрузкой по просьбе человека: снять метку «в fastboot»
+/// (поставленную при старте ради таймера) — машина уходит в обычную загрузку,
+/// как и раньше, — и отметить журнал чистым: следующая загрузка скажет
+/// «clean reboot», а не «watchdog?».
+pub fn prepare_clean_reboot() {
+    if let Err(err) = super::mtk_regs::clear_fastboot() {
+        crate::kprintln!("  watchdog    : cannot clear the RTC fastboot mark ({err:?}); the reboot may land in fastboot");
+    }
+    crate::lastlog::mark_clean();
 }
 
 /// Ширина и высота панели `dandelion`. См. [`super::fdt_boot::DEFAULT_SCREEN`].

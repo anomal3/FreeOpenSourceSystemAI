@@ -373,8 +373,11 @@ pub fn powerkey_task() {
         return;
     };
     crate::kprintln!("  powerkey    : watching TOPSTATUS bit 1, released = {}", idle != 0);
+    // Эта же задача пинает сторожевой таймер (05.11, `mtk::watchdog_arm`).
+    super::mtk::watchdog_arm();
     let mut down = false;
     loop {
+        super::mtk::watchdog_kick();
         // Пока гудит мотор — шаг мельче: отклик клавиши длится десятки мс.
         let until = VIBRATE_UNTIL_MS.load(core::sync::atomic::Ordering::Relaxed);
         crate::sched::sleep_ms(if until != 0 { 5 } else { 30 });
@@ -424,6 +427,25 @@ fn rtc_commit() -> Result<(), PwrapError> {
 /// Поставить метку «следующая загрузка — в fastboot». Возвращает прочитанное
 /// после записи значение `RTC_PDN1`.
 pub fn mark_fastboot() -> Result<u16, PwrapError> {
+    set_fastboot(true)
+}
+
+/// Снять метку (05.11). Ядро ставит её при каждом старте ради сторожевого
+/// таймера (`mtk::watchdog_arm`), и перезагрузка по просьбе человека обязана
+/// её убрать — иначе вместо обычной загрузки открылся бы fastboot. LK,
+/// открыв fastboot по метке, снимает её сам.
+pub fn clear_fastboot() -> Result<u16, PwrapError> {
+    set_fastboot(false)
+}
+
+/// Стоит ли метка сейчас, и всё значение `RTC_PDN1`.
+pub fn fastboot_marked() -> Result<(bool, u16), PwrapError> {
+    let pdn1 = pmic_read(RTC_PDN1)?;
+    Ok((pdn1 & RTC_PDN1_FAST_BOOT != 0, pdn1))
+}
+
+/// Поставить или снять метку. Возвращает `RTC_PDN1`, прочитанный после.
+fn set_fastboot(on: bool) -> Result<u16, PwrapError> {
     // Снять защиту записи часов (`RTC_PROT`: 0x586A, 0x9136): `rtc_mark_fast`
     // у Xiaomi этого не делает, но там часы к тому мигу уже открыты — у нас
     // такой уверенности нет.
@@ -432,8 +454,11 @@ pub fn mark_fastboot() -> Result<u16, PwrapError> {
     pmic_write(RTC_PROT, 0x9136)?;
     rtc_commit()?;
     let pdn1 = pmic_read(RTC_PDN1)?;
-    pmic_write(RTC_PDN1, pdn1 | RTC_PDN1_FAST_BOOT)?;
-    rtc_commit()?;
+    let wanted = if on { pdn1 | RTC_PDN1_FAST_BOOT } else { pdn1 & !RTC_PDN1_FAST_BOOT };
+    if wanted != pdn1 {
+        pmic_write(RTC_PDN1, wanted)?;
+        rtc_commit()?;
+    }
     pmic_read(RTC_PDN1)
 }
 
