@@ -207,6 +207,11 @@ impl Fastboot {
         } else if text == "oem touchdump" {
             self.state = State::Dump { offset: 0 };
             self.continue_dump(0);
+        } else if let Some(rest) = text.strip_prefix("oem overlay ") {
+            let on = rest.trim() == "on";
+            crate::console::OVERLAY.store(on, core::sync::atomic::Ordering::Relaxed);
+            crate::kprintln!("  overlay     : kernel log over the screen {}", if on { "on" } else { "off" });
+            self.respond(b"OKAY", "");
         } else if let Some(rest) = text.strip_prefix("oem ram ") {
             // Одно слово ОЗУ по физическому адресу через прямое отображение
             // (05.11): обходом по одному адресу на команду ищем память, чтение

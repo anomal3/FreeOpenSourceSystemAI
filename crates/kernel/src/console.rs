@@ -902,6 +902,61 @@ const fn encode(format: PixelFormat, (r, g, b): (u8, u8, u8)) -> u32 {
 const OPAQUE: u32 = 0xFF00_0000;
 
 static CONSOLE: SpinLock<Option<Console>> = SpinLock::new(None);
+
+/// Отладка на аппарате (05.11): последние строки журнала — прямо поверх
+/// экрана стола, мимо композитора. Телефон, повисший целиком (NetSurf),
+/// оставляет на экране последний кадр — а с этим режимом и последние строки
+/// ядра, которые можно прочитать глазами. Включает `oem overlay on`.
+pub static OVERLAY: AtomicBool = AtomicBool::new(false);
+const OV_ROWS: usize = 12;
+const OV_COLS: usize = 88;
+
+struct Overlay {
+    lines: [[u8; OV_COLS]; OV_ROWS],
+    next: usize,
+    cur: [u8; OV_COLS],
+    len: usize,
+}
+
+static OV: SpinLock<Overlay> =
+    SpinLock::new(Overlay { lines: [[b' '; OV_COLS]; OV_ROWS], next: 0, cur: [b' '; OV_COLS], len: 0 });
+
+impl Write for Overlay {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for ch in s.chars() {
+            if ch == '\n' {
+                self.lines[self.next] = self.cur;
+                self.next = (self.next + 1) % OV_ROWS;
+                self.cur = [b' '; OV_COLS];
+                self.len = 0;
+            } else if self.len < OV_COLS {
+                self.cur[self.len] = if (0x20..0x7F).contains(&(ch as u32)) { ch as u8 } else { b'?' };
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Дописать строку в полосу поверх экрана и перерисовать полосу.
+fn overlay_print(args: fmt::Arguments<'_>) {
+    let Some(mut ov) = OV.try_lock() else {
+        return;
+    };
+    let _ = ov.write_fmt(args);
+    let painter = CONSOLE.try_lock().and_then(|console| console.as_ref().map(|console| console.fb));
+    let Some(mut painter) = painter else {
+        return;
+    };
+    painter.top = 100;
+    let cols = (painter.width.saturating_sub(MARGIN * 2) / (GLYPH_W * painter.scale)).min(OV_COLS as u32);
+    for row in 0..OV_ROWS {
+        let line = ov.lines[(ov.next + row) % OV_ROWS];
+        for col in 0..cols {
+            painter.draw_cell(col, row as u32, (u16::from(INK_OK) << 8) | u16::from(line[col as usize]));
+        }
+    }
+}
 static READY: AtomicBool = AtomicBool::new(false);
 
 /// Инициализировать экранную консоль. Возвращает `true`, если экран доступен.
@@ -990,6 +1045,9 @@ pub fn enable_scroll() -> bool {
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {
     if !READY.load(Ordering::Acquire) {
+        if OVERLAY.load(Ordering::Relaxed) {
+            overlay_print(args);
+        }
         return;
     }
     let Some(mut console) = CONSOLE.try_lock() else {
