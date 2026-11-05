@@ -1465,6 +1465,16 @@ impl Card {
             self.seen_ours,
             self.stats.rx_frames
         );
+        // Указатели колец приёма (CPU — наш, DMA — блока): застрявшее
+        // кольцо видно по ним, а не по счётчикам.
+        let idx = |ring: u32, field: u64| read(rx_reg(ring, field)).unwrap_or(u32::MAX);
+        crate::kprintln!(
+            "  wlan        : rings data cpu {} dma {}, event cpu {} dma {}",
+            idx(RX_DATA, 8),
+            idx(RX_DATA, 12),
+            idx(RX_EVENT, 8),
+            idx(RX_EVENT, 12)
+        );
     }
 }
 
