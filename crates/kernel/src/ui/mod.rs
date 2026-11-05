@@ -4986,11 +4986,26 @@ pub fn commit_window(task: u32, slot: u32, area: Option<Rect>) -> Result<(), Win
             return Err(WindowError::NoWindow);
         };
         window.commit(area);
-        desktop.present();
+        // Кадр — не чаще раза в [`COMMIT_FRAME_MS`] (05.11): NetSurf сообщает
+        // о каждом нарисованном куске страницы, и пересборка экрана на каждое
+        // сообщение под замком стола на телефоне съедала всё — экран, касания
+        // и USB стояли минутами. Отложенное соберёт ближайший кадр стола.
+        let now = crate::time::uptime_ms();
+        let last = LAST_COMMIT_FRAME.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= COMMIT_FRAME_MS {
+            LAST_COMMIT_FRAME.store(now, Ordering::Relaxed);
+            desktop.present();
+        } else {
+            set_animating(true);
+        }
         Ok(())
     })
     .unwrap_or_else(|| Err(unavailable()))
 }
+
+/// Когда кадр собирался по сообщению программы (мс) и как часто можно.
+static LAST_COMMIT_FRAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const COMMIT_FRAME_MS: u64 = 16;
 
 /// Начать перетаскивание окна программы (фаза 71i, `xdg_toplevel.move`):
 /// программа без рамки стола, нажав кнопку на своей полосе заголовка, просит
