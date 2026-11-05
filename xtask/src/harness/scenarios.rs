@@ -4469,6 +4469,54 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "ntp",
+        about: "Неверные часы прошивки служба dhcp поправляет по SNTP сразу после аренды (05.11.2026).",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // Часы машины — 2020 год: так выглядит севшая батарейка CMOS, и это
+        // единственный способ под QEMU получить время, которое обязано быть
+        // переведено. Телефон (времени нет вовсе) идёт той же веткой: оба
+        // случая служба видит как «времени до 2025 года не бывает».
+        //
+        // Сценарию нужен выход хоста в интернет: slirp отдаёт UDP наружу как
+        // есть, а шлюз 10.0.2.2 (хост) NTP не отвечает — служба обязана
+        // дойти до публичных серверов.
+        extra: &["-rtc", "base=2020-01-01T00:00:00"],
+        steps: &[
+            Step::Await("from the firmware = 2020-01-01", BOOT),
+            Step::Await("network     : virtio-net", BOOT),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 90_000),
+            // Время пришло из сети и сошлось с часами хоста — а не просто
+            // «что-то напечатано».
+            Step::Clock("ntp         : ", 10, 90_000),
+            Step::Expect("UTC; moved by +"),
+            // И система живёт по нему: `date` берёт уже новое основание.
+            Step::Wait(2_000),
+            Step::Line("date"),
+            Step::Await("  local  ", 15_000),
+            Step::Clock("epoch  ", 10, 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "iso",
         about: "Система грузится с загрузочного ISO — того же файла, что отдают человеку.",
         target: Target::Iso,

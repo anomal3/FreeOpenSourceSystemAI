@@ -1546,6 +1546,21 @@ pub const CLIP_GET: usize = 2;
 /// Самый длинный текст буфера обмена.
 pub const CLIP_MAX: usize = 4 * 1024 * 1024;
 
+/// Перевести часы (05.11.2026): `(адрес Timespec, адрес строки источника,
+/// длина) -> 0`.
+///
+/// [`Timespec`] — время суток **сейчас**, секунды эпохи Unix и наносекунды;
+/// строка — откуда оно (сервер NTP), для журнала, не длиннее
+/// [`SETCLOCK_SOURCE_MAX`]. Только root: часы общие для всей машины, и по ним
+/// проверяются сертификаты. Время раньше [`SETCLOCK_EARLIEST`] или позже 2200
+/// года — отказ [`ERR_LIMIT`]: такое отвечает только сломанный сервер.
+pub const SYS_SETCLOCK: usize = 86;
+/// Самая длинная строка источника у [`SYS_SETCLOCK`].
+pub const SETCLOCK_SOURCE_MAX: usize = 96;
+/// Раньше этого момента (2025-01-01 00:00:00 UTC) [`SYS_SETCLOCK`] часы не
+/// ставит.
+pub const SETCLOCK_EARLIEST: u64 = 1_735_689_600;
+
 /// Размер буфера вывода [`SYS_KERNEL_COMMAND`].
 pub const KERNEL_COMMAND_OUT: usize = 64 * 1024;
 
@@ -2563,6 +2578,7 @@ mod tests {
         assert_eq!(SYS_FDCTL, 81);
         assert_eq!((FDCTL_NONBLOCK, FDCTL_FLAGS, FD_NONBLOCK), (1, 2, 1));
         assert_eq!(SYS_SOUND, 82);
+        assert_eq!(SYS_SETCLOCK, 86);
         assert_eq!((SOUND_WRITE, SOUND_DRAIN, SOUND_RATE, SOUND_CHANNELS), (1, 2, 48_000, 2));
         assert_eq!((PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC), (0, 1, 2, 4));
         assert_eq!((MAP_HUGE, MAP_LAZY, MAP_JIT), (1, 2, 4));
@@ -2599,7 +2615,7 @@ mod tests {
             SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_DEVICE_OPEN, SYS_DEVICE_MAP, SYS_DEVICE_WAIT,
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
-            SYS_SOUND,
+            SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(

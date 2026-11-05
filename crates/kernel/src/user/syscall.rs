@@ -197,6 +197,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_LIVE_KEYS => live_keys(a0, a1),
         user_abi::SYS_KERNEL_COMMAND => kernel_command(a0, a1, a2),
         user_abi::SYS_CLIPBOARD => clipboard(a0, a1, a2),
+        // 05.11.2026: время из сети (SNTP службы `dhcp`).
+        user_abi::SYS_SETCLOCK => setclock(a0, a1, a2),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -1653,6 +1655,47 @@ fn clock(kind: usize, out: usize) -> i64 {
 
     // SAFETY: адрес проверен на выравнивание и на запись.
     unsafe { core::ptr::write(out as *mut Timespec, value) };
+    0
+}
+
+/// `setclock(Timespec, источник, длина) -> 0` (05.11.2026): перевести часы.
+///
+/// Просит служба `dhcp`, получив ответ SNTP. Только root: часы общие, и по
+/// ним проверяются сертификаты. Решение «переводить ли» — у службы; здесь
+/// только границы, за которыми ответ сервера заведомо сломан.
+fn setclock(at: usize, source: usize, len: usize) -> i64 {
+    /// 2200 год: дальше — не время, а мусор в поле ответа.
+    const LATEST: u64 = 7_258_118_400;
+
+    if !super::credentials().is_root() {
+        return ERR_PERMISSION;
+    }
+    if at % align_of::<Timespec>() != 0
+        || !space::user_can(at, size_of::<Timespec>(), PageFlags::READ)
+    {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: адрес проверен на выравнивание и на чтение.
+    let value = unsafe { core::ptr::read(at as *const Timespec) };
+    if value.nanos >= 1_000_000_000 {
+        return ERR_BAD_ADDRESS;
+    }
+    if value.seconds < user_abi::SETCLOCK_EARLIEST || value.seconds > LATEST {
+        return user_abi::ERR_LIMIT;
+    }
+    if len > user_abi::SETCLOCK_SOURCE_MAX {
+        return ERR_BAD_ADDRESS;
+    }
+    let mut buffer = [0u8; MAX_PATH];
+    let name = if len == 0 {
+        "an unnamed source"
+    } else {
+        match copy_path(source, len, &mut buffer) {
+            Ok(name) => name,
+            Err(err) => return err,
+        }
+    };
+    time::set_wall_clock(value.seconds, value.nanos, name);
     0
 }
 

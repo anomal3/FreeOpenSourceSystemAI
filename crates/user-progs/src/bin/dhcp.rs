@@ -30,9 +30,22 @@
 //! адресу, которого у неё ещё нет. Флаг просит сервер отвечать
 //! широковещательно, и именно так делают все клиенты, у которых нет отдельного
 //! пути для «сырых» кадров.
+//!
+//! # Время из сети (05.11.2026)
+//!
+//! Получив адрес, служба заодно узнаёт время — SNTP (RFC 4330), см. модуль
+//! [`ntp`]. Здесь, а не отдельной службой: только эта программа знает, когда
+//! адрес появился и какой у сети шлюз и сервер NTP (опция 42). Нужно это
+//! телефону: часов PMIC ядро ещё не читает, а HTTPS без даты не проверит ни
+//! одного сертификата.
 
 #![no_std]
 #![no_main]
+
+// Путь — в подкаталог: файл прямо в `src/bin` Cargo счёл бы отдельной
+// программой.
+#[path = "dhcp/ntp.rs"]
+mod ntp;
 
 use user_progs::{
     Line, NetConfig, NetInfo, bind, close, close_socket, config_path, connect, error, exit,
@@ -67,6 +80,9 @@ const OPT_SUBNET_MASK: u8 = 1;
 const OPT_ROUTER: u8 = 3;
 /// Опция: серверы имён.
 const OPT_DNS: u8 = 6;
+/// Опция: серверы NTP (05.11.2026) — первый из них служба спросит о времени
+/// раньше шлюза и публичных серверов.
+const OPT_NTP: u8 = 42;
 /// Опция: запрашиваемый адрес.
 const OPT_REQUESTED_IP: u8 = 50;
 /// Опция: срок аренды в секундах.
@@ -147,11 +163,26 @@ pub extern "C" fn _start() -> ! {
     mac(&mut line, info.mac);
     line.end();
 
+    let mut clock = ntp::Schedule::new();
     loop {
         match lease(&info) {
             Some(lease) => {
                 apply(&lease);
-                sleep_ms(renew_after(lease.seconds));
+                clock.adopt(lease.gateway, lease.ntp);
+                // До продления аренды служба не спит одним куском, а
+                // просыпается и к сроку часов: SNTP идёт между продлениями.
+                let renew_at = uptime_ms() + renew_after(lease.seconds);
+                loop {
+                    let now = uptime_ms();
+                    if now >= renew_at {
+                        break;
+                    }
+                    if clock.due(now) {
+                        clock.sync();
+                        continue;
+                    }
+                    sleep_ms(renew_at.min(clock.next_at()) - now);
+                }
                 error("dhcp: renewing the lease\n");
             }
             None => {
@@ -201,6 +232,8 @@ struct Lease {
     netmask: u32,
     gateway: u32,
     dns: u32,
+    /// Сервер NTP из опции 42; ноль — сеть его не назвала.
+    ntp: u32,
     seconds: u32,
     server: u32,
 }
@@ -331,7 +364,7 @@ fn build(
         packet,
         at,
         OPT_PARAMETER_LIST,
-        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS],
+        &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS, OPT_NTP],
     );
     packet[at] = OPT_END;
     at + 1
@@ -366,6 +399,7 @@ fn parse(message: &[u8], xid: u32) -> Option<(Lease, u8)> {
         netmask: 0,
         gateway: 0,
         dns: 0,
+        ntp: 0,
         seconds: 0,
         server: 0,
     };
@@ -394,6 +428,7 @@ fn parse(message: &[u8], xid: u32) -> Option<(Lease, u8)> {
             // маршрутов у нас всё равно одна строка.
             (OPT_ROUTER, len) if len >= 4 => lease.gateway = be32(value),
             (OPT_DNS, len) if len >= 4 => lease.dns = be32(value),
+            (OPT_NTP, len) if len >= 4 => lease.ntp = be32(value),
             (OPT_LEASE_TIME, 4) => lease.seconds = be32(value),
             (OPT_SERVER_ID, 4) => lease.server = be32(value),
             _ => {}

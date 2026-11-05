@@ -1960,6 +1960,27 @@ pub fn clock(kind: usize) -> Option<Timespec> {
     (result == 0).then_some(out)
 }
 
+/// Перевести часы системы (05.11.2026, `SYS_SETCLOCK`). Только root.
+///
+/// `at` — время суток **сейчас**; `source` — откуда оно, для журнала ядра
+/// (длиннее [`user_abi::SETCLOCK_SOURCE_MAX`] обрезается). Ответ — ноль или
+/// код отказа.
+pub fn set_clock(at: &Timespec, source: &str) -> i64 {
+    let mut len = source.len().min(user_abi::SETCLOCK_SOURCE_MAX);
+    while !source.is_char_boundary(len) {
+        len -= 1;
+    }
+    // SAFETY: структура и строка живут в памяти программы, длина — их.
+    unsafe {
+        syscall(
+            user_abi::SYS_SETCLOCK,
+            core::ptr::from_ref(at) as usize,
+            source.as_ptr() as usize,
+            len,
+        )
+    }
+}
+
 /// Время работы в миллисекундах по монотонным часам.
 ///
 /// Обёртка над [`clock`] для тех, кому нужна разность двух показаний, а не

@@ -19,13 +19,21 @@
 //!
 //! * **Часы уходят ровно настолько, насколько врёт таймер.** Сверять их не с
 //!   чем: второго источника времени в системе нет.
-//! * **Перевести часы нечем.** Команды `date -s` не существует, потому что
-//!   записать результат некуда — обратной дороги к `SetTime` после выхода из
-//!   boot services нет.
+//! * **Записать время обратно в часы платы нечем.** Команды `date -s` не
+//!   существует: обратной дороги к `SetTime` после выхода из boot services
+//!   нет.
 //!
 //! Когда прошивка часов не отдала, время суток остаётся **неизвестным**, и
 //! система так и говорит. Это принципиально: выдуманная дата разошлась бы по
 //! меткам файлов, и отличить её потом было бы не по чему.
+//!
+//! # Время из сети (05.11.2026)
+//!
+//! Второй источник всё же появился — SNTP. Служба `dhcp`, получив адрес,
+//! спрашивает время у сервера NTP и отдаёт его ядру вызовом `SYS_SETCLOCK`
+//! ([`set_wall_clock`]). Ради телефона: часов PMIC ядро ещё не читает, а
+//! HTTPS без даты не проверит ни одного сертификата. Переводится только
+//! точка отсчёта в памяти; часы платы остаются какими были.
 //!
 //! # Часовой пояс
 //!
@@ -39,7 +47,7 @@
 //! появится база часовых поясов: правило перехода — свойство страны и года, а
 //! не числа в конфигурационном файле.
 
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
 
 use calendar::DateTime;
 
@@ -54,15 +62,28 @@ const CONFIG: &str = "system.cfg";
 /// с носителя — то есть из-за границы доверия.
 const CONFIG_LIMIT: usize = 8 * 1024;
 
-/// Секунды эпохи Unix на момент, когда время стало известно. `0` — неизвестно.
-static BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
-
-/// Сколько на тот момент показывал счётчик времени работы.
+/// Время суток в наносекундах эпохи Unix минус время работы в наносекундах:
+/// `время суток = это + uptime_ns()`. [`UNKNOWN`] — времени суток система не
+/// знает.
 ///
-/// Хранится потому, что между запуском таймера и чтением `BootInfo` проходит
-/// не ноль: ядро успевает разобрать карту памяти и поднять кучу. Без этой
+/// Одно число, а не пара «секунды эпохи + время работы, когда они стали
+/// известны», как было до 05.11. Пару нельзя переписать разом: часы,
+/// переводимые на ходу (SNTP), на миг собирались бы из новой половины и
+/// старой, и читатель между двумя записями видел бы время, ушедшее на годы.
+/// Одно атомарное слово переписывается целиком.
+///
+/// Точка отсчёта ставится в момент, когда время стало известно, а не при
+/// запуске таймера: между ними проходит не ноль (карта памяти, куча), и без
 /// поправки все часы системы отставали бы на это время навсегда.
-static EPOCH_AT_UPTIME_MS: AtomicU64 = AtomicU64::new(0);
+static REALTIME_BASE_NS: AtomicI64 = AtomicI64::new(UNKNOWN);
+
+/// [`REALTIME_BASE_NS`]: «времени суток нет». Не ноль: ноль — законное
+/// значение (часы, поставленные в 1970 год ровно при запуске), а такого
+/// основания не бывает.
+const UNKNOWN: i64 = i64::MIN;
+
+/// Наносекунд в секунде.
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 /// Смещение местного времени от UTC в минутах.
 static OFFSET_MINUTES: AtomicI32 = AtomicI32::new(0);
@@ -188,12 +209,8 @@ pub fn vdso_clock() -> Option<(u64, u64, u64, Option<i64>)> {
 
 /// Время суток в наносекундах минус время работы: `realtime = это + uptime_ns`.
 fn realtime_base_ns() -> Option<i64> {
-    let epoch = BOOT_EPOCH.load(Ordering::Acquire);
-    if epoch == 0 {
-        return None;
-    }
-    let at_ms = EPOCH_AT_UPTIME_MS.load(Ordering::Relaxed);
-    Some(epoch as i64 * 1_000_000_000 - at_ms as i64 * 1_000_000)
+    let base = REALTIME_BASE_NS.load(Ordering::Acquire);
+    (base != UNKNOWN).then_some(base)
 }
 
 /// Время суток в наносекундах эпохи Unix — тем же счётом, что у vDSO (у
@@ -419,9 +436,12 @@ pub fn adopt_boot_clock(seconds: u64, sampled_at: u64) {
         0
     };
 
+    // Секунды прошивки целые, поэтому и время суток «сейчас» целое: доли
+    // отбрасываются так же, как отбрасывались до 05.11, — расхождение со
+    // стендом в пределах секунды законно (см. сценарий `clock`).
     let seconds = seconds + elapsed_ms / 1000;
-    EPOCH_AT_UPTIME_MS.store(uptime_ms(), Ordering::Relaxed);
-    BOOT_EPOCH.store(seconds, Ordering::Release);
+    let base = seconds as i64 * NANOS_PER_SECOND - (uptime_ms() as i64) * 1_000_000;
+    REALTIME_BASE_NS.store(base, Ordering::Release);
     #[cfg(target_arch = "x86_64")]
     crate::linux::vdso::refresh();
     // Метка у этой строки своя, и это не косметика: стенд берёт число, стоящее
@@ -443,12 +463,41 @@ pub fn adopt_boot_clock(seconds: u64, sampled_at: u64) {
 /// Текущее время в секундах эпохи Unix, UTC. `None`, если часов не было.
 #[must_use]
 pub fn now_unix() -> Option<u64> {
-    let epoch = BOOT_EPOCH.load(Ordering::Acquire);
-    if epoch == 0 {
-        return None;
+    realtime_ns().map(|ns| ns / NANOS_PER_SECOND as u64)
+}
+
+/// Перевести часы: сейчас — `seconds` секунд и `nanos` наносекунд эпохи Unix
+/// (05.11.2026, `SYS_SETCLOCK`). `source` — откуда время, для журнала.
+///
+/// Кому и когда переводить, решает служба (`dhcp`, по ответу SNTP), а не
+/// ядро: ядро не знает, какому серверу верить, и не ходит в сеть само. Ядро
+/// отвечает за одно — чтобы перевод был **целым**: основание меняется одной
+/// записью (см. [`REALTIME_BASE_NS`]), vDSO программ Linux узнаёт о нём тут
+/// же, а журнал говорит, на сколько сдвинулись часы, — перевод, о котором
+/// молчат, неотличим от часов, которые сами ушли.
+pub fn set_wall_clock(seconds: u64, nanos: u32, source: &str) {
+    let wanted = i128::from(seconds) * i128::from(NANOS_PER_SECOND) + i128::from(nanos);
+    // До 2262 года наносекунды эпохи помещаются в i64; границы проверяет
+    // вызов, здесь — последняя страховка.
+    let Ok(wanted) = i64::try_from(wanted) else {
+        return;
+    };
+    let before = realtime_base_ns();
+    let base = wanted - uptime_ns() as i64;
+    REALTIME_BASE_NS.store(base, Ordering::Release);
+    #[cfg(target_arch = "x86_64")]
+    crate::linux::vdso::refresh();
+
+    // Число — сразу за меткой, как у строки `clock`: стенд сверяет его с
+    // часами хоста. Метка своя, не `clock`: там стенд ждёт время прошивки.
+    let date = DateTime::from_unix(seconds as i64);
+    match before {
+        None => kprintln!("  ntp         : {seconds} s from {source} = {date} UTC; the date was unknown"),
+        Some(old) => {
+            let moved_ms = (base - old) / 1_000_000;
+            kprintln!("  ntp         : {seconds} s from {source} = {date} UTC; moved by {moved_ms:+} ms");
+        }
     }
-    let elapsed_ms = uptime_ms().saturating_sub(EPOCH_AT_UPTIME_MS.load(Ordering::Relaxed));
-    Some(epoch + elapsed_ms / 1000)
 }
 
 /// То же число, но в виде, в котором его хранит ext2: 32 бита, ноль при
