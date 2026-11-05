@@ -665,11 +665,13 @@ fn scan_pass(found: &mut Vec<Network>) -> Result<bool, &'static str> {
 
 /// Наш адрес (локально назначенный) — тот же, что в `BSS_ACTIVATE`.
 const OWN_MAC: [u8; 6] = [0x02, 0xf0, 0x55, 0x41, 0x69, 0x01];
-/// Место в таблице станций прошивки: точка доступа — 1, широковещательная
-/// запись BSS — 0 (её завёл `BSS_ACTIVATE`).
+/// Место в таблице станций (WTBL): широковещательная запись BSS — 4, точка
+/// доступа — 5, как раздаёт драйвер gen4m (`privacy.c`: записи 0–3 —
+/// для BIP/IGTK, `ucStartIDX = 4`). До 05.11 было 0 и 1: групповой ключ
+/// ложился в запись BIP.
 const AP_STA_INDEX: u8 = 0;
-const AP_WLAN: u8 = 1;
-const BMC_WLAN: u8 = 0;
+const AP_WLAN: u8 = 5;
+const BMC_WLAN: u8 = 4;
 
 /// Подключение: имя сети и что сделано — для «Параметров».
 static CONNECTED: SpinLock<Option<(String, [u8; 6])>> = SpinLock::new(None);
@@ -1463,6 +1465,14 @@ impl crate::net::card::Card for Card {
         }
         let mut packet = Vec::with_capacity(32 + frame.len() + 3);
         packet.extend_from_slice(&eapol_txd(frame.len()));
+        // Шифрует кадр бит PF (DW3, бит 1) дескриптора, а не запись WTBL
+        // (gen4m `nic_txd_v1_compose`): без него после установки ключей
+        // кадры уходили открытым текстом, и точка их отбрасывала (05.11 —
+        // DHCP без ответа). Широковещательное у станции тоже идёт точке
+        // одиночным кадром — тем же личным ключом.
+        if KEYS.lock().is_some() {
+            packet[12] |= 0x02;
+        }
         packet.extend_from_slice(frame);
         while packet.len() % 4 != 0 {
             packet.push(0);
