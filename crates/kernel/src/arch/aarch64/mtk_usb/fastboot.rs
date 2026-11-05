@@ -207,6 +207,21 @@ impl Fastboot {
         } else if text == "oem touchdump" {
             self.state = State::Dump { offset: 0 };
             self.continue_dump(0);
+        } else if let Some(rest) = text.strip_prefix("oem ram ") {
+            // Одно слово ОЗУ по физическому адресу через прямое отображение
+            // (05.11): обходом по одному адресу на команду ищем память, чтение
+            // которой вешает аппарат (защищённая область, не названная
+            // загрузчиком), — ответ приходит до следующего адреса.
+            match crate::arch::aarch64::mtk_regs::parse_number(rest.trim()) {
+                Some(phys) if (0x4000_0000..0xC000_0000).contains(&phys) && phys % 8 == 0 => {
+                    let virt = (crate::mm::PHYS_MAP_BASE as u64 + phys) as *const u64;
+                    // SAFETY: адрес — в ОЗУ телефона, которое целиком в прямом
+                    // отображении; чтение и есть проверка.
+                    let value = unsafe { virt.read_volatile() };
+                    self.respond(b"OKAY", &alloc::format!("{phys:#x} = {value:#018x}"));
+                }
+                _ => self.respond(b"FAIL", "usage: oem ram <hex phys in 0x40000000..0xc0000000, 8-aligned>"),
+            }
         } else if let Some(rest) = text.strip_prefix("oem peek ") {
             self.peek(rest);
         } else if let Some(rest) = text.strip_prefix("oem poke ") {
