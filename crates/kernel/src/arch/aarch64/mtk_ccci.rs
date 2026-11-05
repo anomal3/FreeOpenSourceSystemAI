@@ -796,6 +796,11 @@ fn rpc_answer(op: u32, params: &[Vec<u8>]) -> Vec<Vec<u8>> {
     }
 }
 
+/// Не сообщать модему датчик вставки SIM (см. `0x4005`). Выключено: «SIM
+/// не видна» 06.11 было оттого, что карта стояла во втором слоте, а `ttyC0`
+/// без CMUX — это протокол 1 (слот 1).
+const NO_HOTPLUG: bool = false;
+
 /// Ответы RPC из одних чисел по 4 байта.
 fn rpc_answer_ints(op: u32, params: &[Vec<u8>]) -> Vec<i32> {
     const FS_NO_OP: i32 = -1;
@@ -806,6 +811,10 @@ fn rpc_answer_ints(op: u32, params: &[Vec<u8>]) -> Vec<i32> {
         // <n 10000> (мкс → мс), dedicated <n 0>, src_pin <n n+1>,
         // sockettype <n 0>. Полярность и чувствительность из 8
         // (IRQ_TYPE_LEVEL_LOW): (8 & 5) != 0 и (8 & 3) != 0 — обе 0.
+        // Опыт 06.11: с ответами по дереву модем считал SIM1 вынутой (VSIM1 не
+        // включал). Без узла датчика — как на платах без горячей вставки —
+        // модем должен опрашивать карту сам.
+        0x4005 if NO_HOTPLUG => alloc::vec![QUERY_STRING, QUERY_STRING],
         0x4005 if params.len() >= 3 => {
             let name = String::from_utf8_lossy(&params[0]).to_ascii_uppercase();
             let sim = if name.starts_with("MD1_SIM1_HOT_PLUG_EINT") {
