@@ -11,3 +11,6 @@
 /firmware/novatek/*.bin
 # Прошивки блока связи телефона (Wi-Fi/BT, MT6765 CONNSYS) — так же чужие.
 /firmware/connsys/
+# Разделы модема, снятые с eMMC телефона (`oem emmc part`): чужая прошивка
+# и NVRAM этого аппарата с IMEI и калибровкой радио — никуда не выкладывать.
+/firmware/modem/

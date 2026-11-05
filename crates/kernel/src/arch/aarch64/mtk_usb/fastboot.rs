@@ -64,6 +64,10 @@ enum State {
 /// шестнадцатеричными парами не влезают в один пакет и занимают две строки.
 const LINES: usize = 8;
 
+/// Больше блоков eMMC за одну `oem emmc read/part` не снимается: 16 МиБ в
+/// куче (её 64 МиБ, свободно около 36).
+const EMMC_CHUNK: u64 = 32768;
+
 /// Сколько шагов в синтетическом жесте и как часто они подаются.
 const DRAG_STEPS: u32 = 20;
 const DRAG_STEP_NS: u64 = 15_000_000;
@@ -274,6 +278,8 @@ impl Fastboot {
                 }
                 Err(err) => self.respond(b"FAIL", err),
             }
+        } else if text == "oem emmc" || text.starts_with("oem emmc ") {
+            self.emmc(text["oem emmc".len()..].trim());
         } else if text == "oem consys" || text.starts_with("oem consys ") {
             self.consys(text.trim_start_matches("oem consys").trim());
         } else if let Some(rest) = text.strip_prefix("oem i2cw ") {
@@ -751,6 +757,153 @@ impl Fastboot {
         } else {
             self.state = State::Idle;
             self.respond(b"OKAY", "");
+        }
+    }
+
+    /// eMMC по кабелю (05.11), только чтение (`mtk_msdc`):
+    ///
+    /// | команда | что делает |
+    /// |---|---|
+    /// | `oem emmc` | состояние контроллера и карты, поля EXT_CSD |
+    /// | `oem emmc gpt` | таблица разделов текстом в `get_staged` |
+    /// | `oem emmc read <lba> <n>` | блоки как есть в `get_staged` |
+    /// | `oem emmc part <имя> [<с блока> [<блоков>]]` | кусок раздела в `get_staged` |
+    ///
+    /// Числа — как у `oem peek` (шестнадцатеричные, `#` — десятичное). За раз
+    /// — не больше [`EMMC_CHUNK`] блоков: снимок лежит в куче целиком, большой
+    /// раздел снимается кусками (`oem emmc part md1img #0 #32768`, потом
+    /// `#32768 #32768` и так далее).
+    /// Одна строка `INFO` и `OKAY`: текст при самом `OKAY` у команд `oem`
+    /// программа `fastboot` не печатает.
+    fn say_done(&mut self, text: &str) {
+        self.line_count = 0;
+        self.say(text.as_bytes());
+        self.state = State::Lines { at: 0 };
+        self.continue_lines(0);
+    }
+
+    fn emmc(&mut self, arg: &str) {
+        use crate::arch::aarch64::mtk_msdc as emmc;
+        use crate::arch::aarch64::mtk_regs::parse_number;
+
+        let mut words = arg.split_whitespace();
+        match words.next() {
+            None | Some("info") => match emmc::info() {
+                Ok(info) => {
+                    self.line_count = 0;
+                    self.say(
+                        alloc::format!(
+                            "MSDC_CFG {:08x} SDC_CFG {:08x} card {:08x}",
+                            info.msdc_cfg, info.sdc_cfg, info.card_status
+                        )
+                        .as_bytes(),
+                    );
+                    self.say(
+                        alloc::format!(
+                            "{} sectors = {} MiB, EXT_CSD rev {}",
+                            info.sectors,
+                            info.sectors / 2048,
+                            info.rev
+                        )
+                        .as_bytes(),
+                    );
+                    self.say(
+                        alloc::format!(
+                            "partition_config {:02x} boot {} KiB x2",
+                            info.partition_config, info.boot_size_kib
+                        )
+                        .as_bytes(),
+                    );
+                    self.say(
+                        alloc::format!(
+                            "hs_timing {:02x} bus_width {:02x} card_type {:02x}",
+                            info.hs_timing, info.bus_width, info.card_type
+                        )
+                        .as_bytes(),
+                    );
+                    self.state = State::Lines { at: 0 };
+                    self.continue_lines(0);
+                }
+                Err(err) => self.respond(b"FAIL", &alloc::format!("emmc: {err:?}")),
+            },
+            Some("gpt") => {
+                let started = crate::time::uptime_ms();
+                match emmc::gpt_text() {
+                    Ok(text) => {
+                        let lines = text.lines().count();
+                        self.staged.clear();
+                        self.staged.extend_from_slice(text.as_bytes());
+                        let ms = crate::time::uptime_ms() - started;
+                        self.say_done(
+                            &alloc::format!("{lines} partitions in {ms} ms, get_staged"),
+                        );
+                    }
+                    Err(err) => self.respond(b"FAIL", &alloc::format!("emmc: {err:?}")),
+                }
+            }
+            Some(what @ ("read" | "part")) => {
+                let range = if what == "read" {
+                    let lba = words.next().and_then(parse_number);
+                    let count = words.next().and_then(parse_number);
+                    match (lba, count) {
+                        (Some(lba), Some(count)) => Ok((lba, count, u64::MAX)),
+                        _ => Err(alloc::string::String::from("usage: oem emmc read <lba> <blocks>")),
+                    }
+                } else {
+                    match words.next() {
+                        None => Err(alloc::string::String::from(
+                            "usage: oem emmc part <name> [<from block> [<blocks>]]",
+                        )),
+                        Some(name) => match emmc::find(name) {
+                            Ok(part) => {
+                                let from = words.next().and_then(parse_number).unwrap_or(0);
+                                let total = part.blocks();
+                                let count = words
+                                    .next()
+                                    .and_then(parse_number)
+                                    .unwrap_or(EMMC_CHUNK)
+                                    .min(total.saturating_sub(from));
+                                if from >= total {
+                                    Err(alloc::format!("{name}: {total} blocks, nothing from {from}"))
+                                } else {
+                                    Ok((part.first + from, count, total))
+                                }
+                            }
+                            Err(err) => Err(alloc::format!("emmc: {name}: {err:?}")),
+                        },
+                    }
+                };
+                match range {
+                    Ok((_, count, _)) if count == 0 || count > EMMC_CHUNK => {
+                        self.respond(b"FAIL", &alloc::format!("1..={EMMC_CHUNK} blocks at a time"));
+                    }
+                    Ok((lba, count, total)) => {
+                        let started = crate::time::uptime_ms();
+                        self.staged.clear();
+                        self.staged.shrink_to_fit();
+                        match emmc::read_blocks(lba, count, &mut self.staged) {
+                            Ok(()) => {
+                                let ms = (crate::time::uptime_ms() - started).max(1);
+                                let kib_s = count * 512 * 1000 / 1024 / ms;
+                                let of = if total == u64::MAX {
+                                    alloc::string::String::new()
+                                } else {
+                                    alloc::format!(" of {total}")
+                                };
+                                self.say_done(
+                                    &alloc::format!("{count}{of} blocks, {ms} ms, {kib_s} KiB/s"),
+                                );
+                            }
+                            Err(err) => {
+                                self.staged.clear();
+                                self.respond(b"FAIL", &alloc::format!("emmc: {err:?}"));
+                            }
+                        }
+                    }
+                    Err(text) => self.respond(b"FAIL", &text),
+                }
+            }
+            Some(_) => self.respond(b"FAIL", "usage: oem emmc [info | gpt | read <lba> <n> | part <name> ...]"),
         }
     }
 
