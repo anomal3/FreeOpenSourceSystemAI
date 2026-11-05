@@ -999,9 +999,34 @@ pub fn autostart_task() {
 static CALL: SpinLock<(u8, String)> = SpinLock::new((0, String::new()));
 /// Ждём ответа на свой `AT+CLCC`; `.1` — пришла ли в нём строка `+CLCC`.
 static CLCC_WAIT: SpinLock<(bool, bool)> = SpinLock::new((false, false));
+/// Последний `RING`/`+CRING`/`+CLIP` (мс) и начало набора (мс).
+static LAST_RING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DIAL_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Входящий считается законченным, если звонок не повторялся столько (модем
+/// шлёт `+CRING` раз в 4 с).
+const RING_GONE_MS: u64 = 9000;
+/// Пустой `AT+CLCC` в первые столько мс набора — ещё не значит отбой.
+const DIAL_GRACE_MS: u64 = 5000;
+/// Когда звонилка последний раз спрашивала состояние (мс): она спрашивает
+/// раз в 0,5 с, значит, если давно, — окна нет.
+static PHONE_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Входящий, а звонилка не открыта — открыть её.
+fn open_phone_for_incoming() {
+    let now = crate::time::uptime_ms();
+    if now.saturating_sub(PHONE_SEEN.load(Ordering::Acquire)) < 2000 {
+        return;
+    }
+    PHONE_SEEN.store(now, Ordering::Release); // не запускать дважды подряд
+    match crate::user::spawn("/bin/phone", crate::user::session::credentials()) {
+        Ok(id) => crate::kprintln!("  call        : incoming, opened /bin/phone as {id}"),
+        Err(err) => crate::kprintln!("  call        : incoming, cannot open /bin/phone: {err}"),
+    }
+}
 
 fn set_call(state: u8, number: Option<&str>) {
     let mut call = CALL.lock();
+    let became_incoming = call.0 != state && state == user_abi::CALL_INCOMING;
     if call.0 != state {
         crate::kprintln!("  call        : state {} -> {state}", call.0);
     }
@@ -1011,17 +1036,23 @@ fn set_call(state: u8, number: Option<&str>) {
     } else if state == user_abi::CALL_IDLE {
         call.1.clear();
     }
+    drop(call);
+    if became_incoming {
+        open_phone_for_incoming();
+    }
 }
 
 /// Строка AT про вызов: `RING`, `+CLIP`, `+CLCC`, `NO CARRIER`…
 fn call_from_at(line: &str) {
     use user_abi::*;
     if line == "RING" || line.starts_with("+CRING") {
+        LAST_RING.store(crate::time::uptime_ms(), Ordering::Release);
         if CALL.lock().0 == CALL_IDLE {
             set_call(CALL_INCOMING, None);
         }
     } else if let Some(rest) = line.strip_prefix("+CLIP:") {
         let number = rest.split(',').next().unwrap_or("").trim().trim_matches('"');
+        LAST_RING.store(crate::time::uptime_ms(), Ordering::Release);
         let state = CALL.lock().0;
         set_call(if state == CALL_IDLE { CALL_INCOMING } else { state }, Some(number));
     } else if let Some(rest) = line.strip_prefix("+CLCC:") {
@@ -1047,8 +1078,14 @@ fn call_from_at(line: &str) {
             wait.0 = false;
             if !wait.1 {
                 drop(wait);
-                // Ответ на `AT+CLCC` без единой строки — вызовов нет.
-                if CALL.lock().0 != CALL_IDLE {
+                // Ответ на `AT+CLCC` без единой строки — вызовов нет. Но
+                // модем MTK не показывает в `CLCC` звонящий входящий (06.11:
+                // из-за этого окно «Входящий» гасло через секунду), а в первые
+                // секунды набора — ещё не начатый исходящий.
+                let state = CALL.lock().0;
+                let dialing_young = state == CALL_DIALING
+                    && crate::time::uptime_ms().saturating_sub(DIAL_AT.load(Ordering::Acquire)) < DIAL_GRACE_MS;
+                if state != CALL_IDLE && state != CALL_INCOMING && !dialing_young {
                     set_call(CALL_IDLE, None);
                 }
             }
@@ -1063,6 +1100,12 @@ fn call_tick(last: &mut u64) {
         return;
     }
     let now = crate::time::uptime_ms();
+    // Входящий, который перестал звонить (положили на той стороне, а `NO
+    // CARRIER` не пришёл), — закончить.
+    if state == user_abi::CALL_INCOMING && now.saturating_sub(LAST_RING.load(Ordering::Acquire)) > RING_GONE_MS {
+        set_call(user_abi::CALL_IDLE, None);
+        return;
+    }
     if now - *last < 1000 {
         return;
     }
@@ -1073,6 +1116,7 @@ fn call_tick(last: &mut u64) {
 
 /// Для звонилки: состояние и номер.
 pub fn call_state() -> (u8, String) {
+    PHONE_SEEN.store(crate::time::uptime_ms(), Ordering::Release);
     if STAGE.load(Ordering::Acquire) < 2 || !AT_READY.load(Ordering::Acquire) {
         return (user_abi::CALL_NO_MODEM, String::new());
     }
@@ -1087,6 +1131,7 @@ pub fn dial(number: &str) -> Result<(), String> {
     if CALL.lock().0 != user_abi::CALL_IDLE {
         return Err(String::from("a call is already on"));
     }
+    DIAL_AT.store(crate::time::uptime_ms(), Ordering::Release);
     at_send(&format!("ATD{number};"))?;
     note(format!("dial {number}"));
     set_call(user_abi::CALL_DIALING, Some(number));
