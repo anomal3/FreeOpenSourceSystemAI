@@ -4998,6 +4998,7 @@ pub fn commit_window(task: u32, slot: u32, area: Option<Rect>) -> Result<(), Win
             desktop.present();
         } else {
             set_animating(true);
+            crate::sched::wake_input();
         }
         Ok(())
     })
