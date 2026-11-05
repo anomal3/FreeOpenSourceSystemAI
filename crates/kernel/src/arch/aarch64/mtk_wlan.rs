@@ -1062,6 +1062,28 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
     Err(last)
 }
 
+/// После ассоциации: радио всегда на связи и принимает всё, что нам
+/// (05.11). Без этого прошивка после подключения засыпала до маяков —
+/// точка придерживала кадры для спящей станции, а опроса мы не шлём, — и
+/// данные то шли, то нет (DHCP без ответа через раз).
+///
+/// * `CMD_ID_POWER_SAVE_MODE` (0x05, `CMD_PS_PROFILE`): BSS 0, профиль 0 —
+///   `CONTINUOUS_ACTIVE` (CAM);
+/// * `CMD_ID_SET_RX_FILTER` (0x0A, `CMD_RX_PACKET_FILTER`): свои кадры,
+///   групповые, все групповые и широковещательные (биты 0–3).
+fn awake_and_listen() {
+    let profile = [0u8, 0, 0, 0];
+    if let Err(err) = wifi_command(0x05, true, &profile) {
+        crate::kprintln!("  wlan        : power save off refused: {err}");
+    }
+    let mut filter = [0u8; 68];
+    filter[..4].copy_from_slice(&0x0fu32.to_le_bytes());
+    if let Err(err) = wifi_command(0x0a, true, &filter) {
+        crate::kprintln!("  wlan        : rx filter refused: {err}");
+    }
+    crate::kprintln!("  wlan        : power save off (CAM), rx filter directed+multicast+broadcast");
+}
+
 /// `CH_PRIVILEGE`: взять канал на 4 с (`release` — вернуть).
 fn privilege(channel: u8, release: bool) -> [u8; 24] {
     let mut privilege = [0u8; 24];
@@ -1165,6 +1187,7 @@ fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static st
     bss_info(ssid, &bssid, channel, secure)?;
     sta_rec(&bssid, 2, aid, true)?;
     let _ = wait_fw_event(0x0c, 500);
+    awake_and_listen();
 
     if secure {
         report.extend(handshake(ssid, password, &bssid, &rsn_ie, group, wpa1)?);
