@@ -1421,6 +1421,8 @@ extern "C" fn task_start(slot: usize) -> ! {
 /// для [`preempt_point`]. Лока не берёт вовсе: всё, что трогает, принадлежит
 /// своему процессору (см. [`SLICE_LEFT`]).
 pub fn on_timer_tick() {
+    // Бегущая полоса экрана загрузки — и до планировщика: тик уже идёт.
+    crate::console::splash_tick();
     if !RUNNING.load(Ordering::Relaxed) {
         return;
     }

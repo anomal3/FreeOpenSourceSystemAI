@@ -65,8 +65,8 @@ const INK_FAIL: u8 = 2;
 const INK_DIM: u8 = 3;
 const INK_WHITE: u8 = 4;
 
-/// Сколько этапов (`---- имя ----`) у обычной загрузки — по ним идёт полоса.
-const STAGES: u32 = 12;
+/// Шаг бегущей полосы, мс.
+const MARQUEE_MS: u64 = 70;
 /// Логотип над полосой загрузки: тот же, что у «Пуска» (RGBA, `FIMG`).
 static LOGO: &[u8] = include_bytes!("../../../assets/logo/fossai-logo.fimg");
 /// Сколько знаков строки журнала копится до перевода строки.
@@ -141,8 +141,10 @@ pub struct Console {
     /// Экран загрузки (04.11): сверху логотип, FOSSAI и полоса, снизу журнал
     /// строками `[  OK  ]` / `[FAIL]`. Снимается паникой и вводом.
     splash: bool,
-    /// Пройдено этапов загрузки — заполнение полосы.
+    /// Шаг бегущей полосы загрузки.
     stage: u32,
+    /// Когда полоса делала шаг (мс).
+    stage_at: u64,
     /// Верх полосы загрузки.
     bar_y: u32,
     format: PixelFormat,
@@ -324,9 +326,11 @@ impl Painter {
         }
     }
 
-    /// Полоса загрузки как у Windows XP: рамка и синие сегменты, `done` из
-    /// `total`.
-    fn progress(&self, y: u32, width: u32, height: u32, done: u32, total: u32, format: PixelFormat) {
+    /// Полоса загрузки как у Windows XP в стиле Marquee: три синих сегмента
+    /// бегут по рамке слева направо и уходят за край, `phase` — их шаг.
+    /// Заполнение по этапам казалось зависшим (05.11): этапов мало, а между
+    /// ними — секунды.
+    fn progress(&self, y: u32, width: u32, height: u32, phase: u32, format: PixelFormat) {
         let x0 = self.width.saturating_sub(width) / 2;
         let frame = encode(format, (0x4A, 0x55, 0x68));
         let track = encode(format, (0x0A, 0x10, 0x20));
@@ -343,8 +347,15 @@ impl Painter {
         let gap = (seg_w / 3).max(1);
         let inner = width.saturating_sub(pad * 2);
         let segments = inner / (seg_w + gap);
-        let lit = (segments * done.min(total) / total.max(1)).min(segments);
-        for index in 0..lit {
+        const RUN: u32 = 3;
+        // Группа въезжает слева и уходит вправо целиком: шагов на круг на
+        // `RUN` больше, чем сегментов.
+        let head = phase % (segments + RUN).max(1);
+        for back in 0..RUN {
+            // `head - back` — сегмент группы; за краями полосы не рисуется.
+            let Some(index) = head.checked_sub(back).filter(|index| *index < segments) else {
+                continue;
+            };
             let sx = x0 + pad + index * (seg_w + gap);
             for row in 0..seg_h {
                 // Сверху светлее, к низу темнее — объём, как у XP.
@@ -423,13 +434,9 @@ impl Console {
             return None;
         }
 
-        let scale = if fb.width >= 1600 {
-            3
-        } else if fb.width >= 1024 {
-            2
-        } else {
-            1
-        };
+        // Крупнее, чем было (05.11: журнал загрузки на телефоне читался с
+        // трудом): телефон 720 — вдвое, ПК от 1200 — втрое.
+        let scale = if fb.width >= 1200 { 3 } else { 2 };
         let cell_w = GLYPH_W * scale;
         let cell_h = GLYPH_H * scale;
         let usable_w = fb.width.saturating_sub(MARGIN * 2);
@@ -471,6 +478,7 @@ impl Console {
             full_rows: rows,
             splash: false,
             stage: 0,
+            stage_at: 0,
             bar_y: 0,
             format: fb.format,
             line: [0; LINE_MAX],
@@ -555,7 +563,7 @@ impl Console {
 
     fn draw_progress(&self) {
         let (y, width, height) = self.bar_geometry();
-        self.fb.progress(y, width, height, self.stage, STAGES, self.format);
+        self.fb.progress(y, width, height, self.stage, self.format);
     }
 
     /// Строка журнала пришла целиком: разобрать и положить в ячейки.
@@ -574,11 +582,9 @@ impl Console {
             }
         };
         match shape(&line[..len]) {
-            Shape::Stage => {
-                self.stage += 1;
-                self.draw_progress();
-                return;
-            }
+            // Этап — просто строка журнала: полоса бежит сама, от таймера
+            // ([`splash_tick`]).
+            Shape::Stage => return,
             Shape::Tagged { tag, text, failed } => {
                 put(self, b"[", INK);
                 if failed {
@@ -1108,6 +1114,30 @@ pub fn _print(args: fmt::Arguments<'_>) {
 /// главное, **не ждёт**: опоздавший просто уходит, а его грязь докрасит тот,
 /// кто уже внутри.
 static PAINTING: AtomicBool = AtomicBool::new(false);
+
+/// Шаг бегущей полосы экрана загрузки — из тика таймера (не чаще
+/// [`MARQUEE_MS`]). Без ожиданий: замок занят — шаг пропускается.
+pub fn splash_tick() {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(mut guard) = CONSOLE.try_lock() else {
+        return;
+    };
+    let Some(console) = guard.as_mut() else {
+        return;
+    };
+    if !console.splash {
+        return;
+    }
+    let now = crate::time::uptime_ms();
+    if now.saturating_sub(console.stage_at) < MARQUEE_MS {
+        return;
+    }
+    console.stage_at = now;
+    console.stage = console.stage.wrapping_add(1);
+    console.draw_progress();
+}
 
 /// Перенести на экран то, что печать уже записала в текст.
 ///
