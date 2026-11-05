@@ -286,6 +286,20 @@ impl Fastboot {
             self.synth_drag(rest);
         } else if let Some(rest) = text.strip_prefix("oem t") {
             self.touch_command(rest);
+        } else if let Some(rest) = text.strip_prefix("oem ping ") {
+            // Сеть по кабелю (05.11): имя — через DNS ядра, затем эхо ICMP.
+            let target = rest.trim();
+            let address = match crate::net::ipv4::Ipv4::parse(target) {
+                Some(ip) => Ok(ip),
+                None => crate::net::resolve(target, 3000),
+            };
+            match address {
+                Ok(ip) => match crate::net::ping(ip, 1, 3000) {
+                    Ok(ms) => self.respond(b"OKAY", &alloc::format!("{target} = {ip}: reply in {ms} ms")),
+                    Err(err) => self.respond(b"FAIL", &alloc::format!("{target} = {ip}: no reply ({err:?})")),
+                },
+                Err(err) => self.respond(b"FAIL", &alloc::format!("{target}: DNS failed ({err:?})")),
+            }
         } else if text == "oem shot" {
             self.stage_screen();
         } else if text == "upload" {

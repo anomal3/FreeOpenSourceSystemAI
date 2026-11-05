@@ -298,7 +298,7 @@ pub fn netsurf_files(arch: crate::arch::Arch) -> Result<Vec<(String, Vec<u8>)>> 
 /// толщина полос прокрутки в точках.
 /// 175 % резало строки встроенным растровым шрифтом — 140 % ещё помещается.
 const PHONE_CHOICES: &str =
-    "scale:140\nfb_toolbar_size:56\nfb_furniture_size:34\nca_bundle:/opt/netsurf/share/netsurf/ca-bundle.pem\n";
+    "scale:140\nfb_toolbar_size:56\nfb_furniture_size:34\nfb_osk:1\nca_bundle:/opt/netsurf/share/netsurf/ca-bundle.pem\n";
 
 pub fn build(options: &Options) -> Result<PathBuf> {
     let kernel = match &options.kernel {
