@@ -199,6 +199,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_CLIPBOARD => clipboard(a0, a1, a2),
         // 05.11.2026: время из сети (SNTP службы `dhcp`).
         user_abi::SYS_SETCLOCK => setclock(a0, a1, a2),
+        user_abi::SYS_MODEM => modem(a0, a1, a2),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -1656,6 +1657,54 @@ fn clock(kind: usize, out: usize) -> i64 {
     // SAFETY: адрес проверен на выравнивание и на запись.
     unsafe { core::ptr::write(out as *mut Timespec, value) };
     0
+}
+
+
+/// `SYS_MODEM` (06.11.2026): звонилка. Номер — не длиннее 32 знаков.
+fn modem(op: usize, ptr: usize, len: usize) -> i64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::arch::mtk_ccci as ccci;
+        match op {
+            user_abi::MODEM_STATUS => {
+                let (state, number) = ccci::call_state();
+                let n = number.len().min(len).min(32);
+                if n > 0 {
+                    if !space::user_can(ptr, n, PageFlags::WRITE) {
+                        return ERR_BAD_ADDRESS;
+                    }
+                    // SAFETY: диапазон проверен на запись.
+                    unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, n) }
+                        .copy_from_slice(&number.as_bytes()[..n]);
+                }
+                i64::from(state) | ((n as i64) << 8)
+            }
+            user_abi::MODEM_DIAL => {
+                if len == 0 || len > 32 || !space::user_can(ptr, len, PageFlags::READ) {
+                    return ERR_BAD_ADDRESS;
+                }
+                // SAFETY: диапазон проверен на чтение.
+                let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+                let Ok(number) = core::str::from_utf8(bytes) else { return ERR_BAD_PATH };
+                match ccci::dial(number) {
+                    Ok(()) => 0,
+                    Err(_) => user_abi::ERR_UNSUPPORTED,
+                }
+            }
+            user_abi::MODEM_ANSWER | user_abi::MODEM_HANGUP => {
+                match ccci::answer_or_hangup(op == user_abi::MODEM_ANSWER) {
+                    Ok(()) => 0,
+                    Err(_) => user_abi::ERR_UNSUPPORTED,
+                }
+            }
+            _ => ERR_BAD_ADDRESS,
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (op, ptr, len);
+        user_abi::ERR_UNSUPPORTED
+    }
 }
 
 /// `setclock(Timespec, источник, длина) -> 0` (05.11.2026): перевести часы.

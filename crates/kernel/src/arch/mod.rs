@@ -189,6 +189,9 @@ pub use aarch64::input;
 pub use aarch64::mtk_consys;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::mtk_wlan;
+/// Модем (06.11): звонилке — через `SYS_MODEM`.
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::mtk_ccci;
 
 /// Зажечь или погасить подсветку экрана, если машина это умеет (03.11).
 ///

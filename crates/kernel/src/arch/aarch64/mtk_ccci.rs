@@ -699,6 +699,7 @@ fn handle(q: usize, packet: &[u8]) {
                     AT_READY.store(true, Ordering::Release);
                 }
                 cellular_from_at(line);
+                call_from_at(line);
             }
             let mut link = LINK.lock();
             link.at_text.push_str(&text);
@@ -909,13 +910,13 @@ fn radio_tick(started: &mut bool, last: &mut u64) {
             bars: 0,
             roaming: false,
         });
-        for cmd in ["ATE0\r", "AT+CMEE=2\r", "AT+CREG=2\r", "AT+CEREG=2\r", "AT+CFUN=1\r"] {
+        for cmd in ["ATE0\r", "AT+CMEE=2\r", "AT+CREG=2\r", "AT+CEREG=2\r", "AT+CLIP=1\r", "AT+CRC=1\r", "AT+CFUN=1\r"] {
             let _ = send_data(Q_AT, CH_UART2_TX, cmd.as_bytes());
         }
         *last = now;
         return;
     }
-    if now - *last >= 10_000 {
+    if now - *last >= 10_000 && CALL.lock().0 == user_abi::CALL_IDLE {
         *last = now;
         for cmd in ["AT+CSQ\r", "AT+COPS?\r", "AT+CPIN?\r"] {
             let _ = send_data(Q_AT, CH_UART2_TX, cmd.as_bytes());
@@ -926,9 +927,10 @@ fn radio_tick(started: &mut bool, last: &mut u64) {
 /// Опрос звонков модема раз в 10 мс.
 fn service_task() {
     let mut exception = 0;
-    let (mut radio_started, mut radio_last) = (false, 0u64);
+    let (mut radio_started, mut radio_last, mut call_last) = (false, 0u64, 0u64);
     loop {
         radio_tick(&mut radio_started, &mut radio_last);
+        call_tick(&mut call_last);
         let rch = sram32(CCIF_RCHNUM);
         if rch != 0 {
             write32(CCIF_ACK, rch & 0xffff);
@@ -949,6 +951,155 @@ fn service_task() {
         }
         crate::sched::sleep_ms(10);
     }
+}
+
+/// Запуск модема при загрузке (06.11): то же, что `oem md power`, `pll`,
+/// `go`, `hs` по кабелю. Ждёт HS1 до 10 с.
+pub fn autostart_task() {
+    use super::mtk_md;
+    // Дать загрузиться столу и USB: модем не к спеху.
+    crate::sched::sleep_ms(3000);
+    let steps: [(&str, fn() -> Result<Vec<String>, String>); 3] =
+        [("power", mtk_md::power_on), ("pll", mtk_md::pll), ("go", mtk_md::go)];
+    for (name, step) in steps {
+        if let Err(err) = step() {
+            crate::kprintln!("  modem       : {name} failed: {err}");
+            return;
+        }
+    }
+    let start = crate::time::uptime_ms();
+    while sram32(CCIF_RCHNUM) & (1 << CH_SRAM) == 0 {
+        if crate::time::uptime_ms() - start > 10_000 {
+            crate::kprintln!("  modem       : no HS1 in 10 s");
+            return;
+        }
+        crate::sched::sleep_ms(50);
+    }
+    match answer_hs1() {
+        Ok(lines) => crate::kprintln!("  modem       : HS1 answered ({})", lines.join("; ")),
+        Err(err) => crate::kprintln!("  modem       : HS1 failed: {err}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Вызов (06.11): состояние для звонилки (`SYS_MODEM`)
+// ---------------------------------------------------------------------------
+
+/// Состояние вызова (`user_abi::CALL_*`) и номер собеседника.
+static CALL: SpinLock<(u8, String)> = SpinLock::new((0, String::new()));
+/// Ждём ответа на свой `AT+CLCC`; `.1` — пришла ли в нём строка `+CLCC`.
+static CLCC_WAIT: SpinLock<(bool, bool)> = SpinLock::new((false, false));
+
+fn set_call(state: u8, number: Option<&str>) {
+    let mut call = CALL.lock();
+    if call.0 != state {
+        crate::kprintln!("  call        : state {} -> {state}", call.0);
+    }
+    call.0 = state;
+    if let Some(n) = number {
+        call.1 = String::from(n);
+    } else if state == user_abi::CALL_IDLE {
+        call.1.clear();
+    }
+}
+
+/// Строка AT про вызов: `RING`, `+CLIP`, `+CLCC`, `NO CARRIER`…
+fn call_from_at(line: &str) {
+    use user_abi::*;
+    if line == "RING" || line.starts_with("+CRING") {
+        if CALL.lock().0 == CALL_IDLE {
+            set_call(CALL_INCOMING, None);
+        }
+    } else if let Some(rest) = line.strip_prefix("+CLIP:") {
+        let number = rest.split(',').next().unwrap_or("").trim().trim_matches('"');
+        let state = CALL.lock().0;
+        set_call(if state == CALL_IDLE { CALL_INCOMING } else { state }, Some(number));
+    } else if let Some(rest) = line.strip_prefix("+CLCC:") {
+        // id,dir,stat,mode,mpty,"number",type — stat: 0 разговор, 1 удержан,
+        // 2 набор, 3 звонит у собеседника, 4 входящий, 5 ожидает.
+        let f: Vec<&str> = rest.split(',').map(str::trim).collect();
+        let stat = f.get(2).and_then(|s| s.parse::<u8>().ok()).unwrap_or(9);
+        let number = f.get(5).map(|s| s.trim_matches('"'));
+        let state = match stat {
+            0 | 1 => CALL_ACTIVE,
+            2 => CALL_DIALING,
+            3 => CALL_ALERTING,
+            4 | 5 => CALL_INCOMING,
+            _ => return,
+        };
+        CLCC_WAIT.lock().1 = true;
+        set_call(state, number);
+    } else if matches!(line, "NO CARRIER" | "BUSY" | "NO ANSWER" | "NO DIALTONE") {
+        set_call(CALL_IDLE, None);
+    } else if line == "OK" {
+        let mut wait = CLCC_WAIT.lock();
+        if wait.0 {
+            wait.0 = false;
+            if !wait.1 {
+                drop(wait);
+                // Ответ на `AT+CLCC` без единой строки — вызовов нет.
+                if CALL.lock().0 != CALL_IDLE {
+                    set_call(CALL_IDLE, None);
+                }
+            }
+        }
+    }
+}
+
+/// Раз в секунду во время вызова — `AT+CLCC` (состояние на той стороне).
+fn call_tick(last: &mut u64) {
+    let state = CALL.lock().0;
+    if state == user_abi::CALL_IDLE || STAGE.load(Ordering::Acquire) < 2 {
+        return;
+    }
+    let now = crate::time::uptime_ms();
+    if now - *last < 1000 {
+        return;
+    }
+    *last = now;
+    *CLCC_WAIT.lock() = (true, false);
+    let _ = send_data(Q_AT, CH_UART2_TX, b"AT+CLCC\r");
+}
+
+/// Для звонилки: состояние и номер.
+pub fn call_state() -> (u8, String) {
+    if STAGE.load(Ordering::Acquire) < 2 || !AT_READY.load(Ordering::Acquire) {
+        return (user_abi::CALL_NO_MODEM, String::new());
+    }
+    CALL.lock().clone()
+}
+
+/// Набрать номер (`ATD<номер>;` — голосовой вызов).
+pub fn dial(number: &str) -> Result<(), String> {
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit() || matches!(c, '+' | '*' | '#')) {
+        return Err(String::from("bad number"));
+    }
+    if CALL.lock().0 != user_abi::CALL_IDLE {
+        return Err(String::from("a call is already on"));
+    }
+    at_send(&format!("ATD{number};"))?;
+    note(format!("dial {number}"));
+    set_call(user_abi::CALL_DIALING, Some(number));
+    Ok(())
+}
+
+/// Принять входящий (`ATA`) или положить трубку (`ATH`).
+pub fn answer_or_hangup(answer: bool) -> Result<(), String> {
+    at_send(if answer { "ATA" } else { "ATH" })?;
+    if !answer {
+        set_call(user_abi::CALL_IDLE, None);
+    }
+    Ok(())
+}
+
+/// Отправить строку AT без ожидания ответа (для звонилки).
+pub fn at_send(command: &str) -> Result<(), String> {
+    if STAGE.load(Ordering::Acquire) < 2 {
+        return Err(String::from("modem not READY"));
+    }
+    let mut text = String::from(command);
+    text.push('\r');
+    send_data(Q_AT, CH_UART2_TX, text.as_bytes())
 }
 
 // ---------------------------------------------------------------------------

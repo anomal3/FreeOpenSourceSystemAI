@@ -136,6 +136,19 @@ pub fn spawn_input_services() {
         if let Err(err) = crate::sched::spawn_daemon("powerkey", mtk_regs::powerkey_task) {
             crate::kprintln!("  spawn power key service failed: {err}");
         }
+        // Модем (06.11): при обычной загрузке LK кладёт образ в резерв
+        // `md_mem_usage` — тогда запустить его, как `oem md power/pll/go/hs`.
+        // При загрузке через recovery резерва нет — модема тоже.
+        let md_loaded = unsafe { device_tree() }
+            .and_then(|fdt| fdt.nodes().find(|node| node.name.contains("md_mem_usage")).map(|_| ()))
+            .is_some();
+        if md_loaded {
+            if let Err(err) = crate::sched::spawn_daemon("modem-up", mtk_ccci::autostart_task) {
+                crate::kprintln!("  spawn modem start failed: {err}");
+            }
+        } else {
+            crate::kprintln!("  modem       : no md_mem_usage reserve (recovery boot?) - modem stays off");
+        }
     }
 
     if !mtk_touch::present() {

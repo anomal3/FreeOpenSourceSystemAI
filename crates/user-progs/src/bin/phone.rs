@@ -8,10 +8,11 @@
 //!
 //! # Что делает вызов
 //!
-//! Пока — честно говорит, что модема у системы ещё нет, и пишет номер в
-//! журнал (`phone: call <номер> asked; no modem yet`). Звонить будет драйвер
-//! модема MT6765 (прошивка `md1img`, канал CCCI, команда `ATD<номер>;`) —
-//! он следующий в плане после Wi-Fi, и эта кнопка станет его входом.
+//! С 06.11 — звонит: `SYS_MODEM` → ядро (`mtk_ccci`) шлёт модему
+//! `ATD<номер>;`, `ATA`, `ATH` и ведёт состояние по его сообщениям (`RING`,
+//! `+CLIP`, `+CLCC`, `NO CARRIER`). Окно раз в полсекунды спрашивает
+//! состояние: набор, «звонит», разговор с таймером, входящий — с кнопками
+//! «принять» (зелёная) и «положить» (красная).
 
 #![no_std]
 #![no_main]
@@ -46,6 +47,11 @@ const KEYS: [[(char, &str); 3]; 4] = [
 
 struct Phone {
     number: String,
+    /// Состояние вызова (`user_abi::CALL_*`) и номер собеседника.
+    call_state: u8,
+    peer: String,
+    /// Когда начался разговор (мс монотонных часов).
+    talk_since: u64,
     /// Что сказать под номером (после попытки вызова).
     note: &'static str,
     /// Нажатая клавиша — подсветка до следующего такта.
@@ -102,12 +108,56 @@ impl Phone {
     }
 
     fn call(&mut self) {
+        match self.call_state {
+            user_abi::CALL_INCOMING => {
+                user_progs::modem_answer_or_hangup(true);
+                return;
+            }
+            user_abi::CALL_IDLE => {}
+            user_abi::CALL_NO_MODEM => {
+                self.note = "Модем ещё не готов";
+                return;
+            }
+            _ => {
+                self.hang_up();
+                return;
+            }
+        }
         if self.number.is_empty() {
             self.note = "Наберите номер";
             return;
         }
-        println(&alloc::format!("phone: call {} asked; no modem yet", self.number));
-        self.note = "Модем ещё не подключён — звонить пока нечем";
+        let r = user_progs::modem_dial(&self.number);
+        println(&alloc::format!("phone: dial {} -> {r}", self.number));
+        if r == 0 {
+            self.call_state = user_abi::CALL_DIALING;
+            self.peer = self.number.clone();
+        } else {
+            self.note = "Не удалось набрать номер";
+        }
+    }
+
+    fn hang_up(&mut self) {
+        user_progs::modem_answer_or_hangup(false);
+        self.call_state = user_abi::CALL_IDLE;
+    }
+
+    fn in_call(&self) -> bool {
+        !matches!(self.call_state, user_abi::CALL_IDLE | user_abi::CALL_NO_MODEM)
+    }
+
+    /// Строка под номером: что сейчас с вызовом.
+    fn status_text(&self) -> String {
+        match self.call_state {
+            user_abi::CALL_DIALING => String::from("Вызов…"),
+            user_abi::CALL_ALERTING => String::from("Звонит…"),
+            user_abi::CALL_ACTIVE => {
+                let s = user_progs::monotonic_ms().saturating_sub(self.talk_since) / 1000;
+                alloc::format!("Разговор {:02}:{:02}", s / 60, s % 60)
+            }
+            user_abi::CALL_INCOMING => String::from("Входящий вызов"),
+            _ => String::from(self.note),
+        }
     }
 }
 
@@ -118,17 +168,25 @@ impl App for Phone {
         let plan = Plan::new(ctx, area);
 
         // Номер — крупно; длинный — мельче, чтобы поместился целиком.
-        let shown = if self.number.is_empty() { "" } else { self.number.as_str() };
+        let shown = if self.in_call() && !self.peer.is_empty() {
+            self.peer.as_str()
+        } else if self.number.is_empty() {
+            ""
+        } else {
+            self.number.as_str()
+        };
         let role = if ctx.face(Role::Heading).width(shown) + ctx.px(8) < plan.number.w { Role::Heading } else { Role::Title };
         let base = plan.number.y + (plan.number.h as i32 - i32::from(ctx.face(role).line)) / 2;
-        if self.number.is_empty() {
-            paint::text_centered(ctx, s, Role::Body, plan.number, "Введите номер", p.ink4);
+        if shown.is_empty() {
+            let hint = if self.call_state == user_abi::CALL_INCOMING { "Номер скрыт" } else { "Введите номер" };
+            paint::text_centered(ctx, s, Role::Body, plan.number, hint, p.ink4);
         } else {
             let w = ctx.face(role).width(shown);
             paint::text(ctx, s, role, plan.number.x + (plan.number.w as i32 - w as i32) / 2, base, shown, p.ink);
         }
-        if !self.note.is_empty() {
-            paint::text_centered(ctx, s, Role::Caption, plan.note, self.note, p.ink3);
+        let status = self.status_text();
+        if !status.is_empty() {
+            paint::text_centered(ctx, s, Role::Caption, plan.note, &status, p.ink3);
         }
 
         for (row, line) in KEYS.iter().enumerate() {
@@ -155,10 +213,19 @@ impl App for Phone {
         // шрифте нет).
         let call = plan.call;
         let (cx, cy, r) = (call.x + call.w as i32 / 2, call.y + call.h as i32 / 2, call.w / 2);
-        draw::circle(s, cx, cy, r, Color::rgb(0x2E, 0xB8, 0x5C), 255);
+        let red = Color::rgb(0xE5, 0x3E, 0x3E);
+        let green = Color::rgb(0x2E, 0xB8, 0x5C);
+        // Идёт вызов — на месте вызова красная «положить»; входящий — зелёная
+        // «принять» там же и красная «положить» справа.
+        let calling = self.in_call() && self.call_state != user_abi::CALL_INCOMING;
+        draw::circle(s, cx, cy, r, if calling { red } else { green }, 255);
         draw_handset(ctx, s, cx, cy, r);
-        // Стирание — только когда есть что стирать.
-        if !self.number.is_empty() {
+        if self.call_state == user_abi::CALL_INCOMING {
+            let e = plan.erase;
+            let (ex, ey, er) = (e.x + e.w as i32 / 2, e.y + e.h as i32 / 2, e.w / 2);
+            draw::circle(s, ex, ey, er, red, 255);
+            draw_handset(ctx, s, ex, ey, er);
+        } else if !self.number.is_empty() && !self.in_call() {
             // «⌫» линиями: стрелка-ярлык влево и крестик в нём.
             let e = plan.erase;
             let (ex, ey) = (e.x + e.w as i32 / 2, e.y + e.h as i32 / 2);
@@ -182,6 +249,7 @@ impl App for Phone {
     fn key(&mut self, code: u32) -> bool {
         match code {
             ENTER => self.call(),
+            ESCAPE if self.in_call() => self.hang_up(),
             BACKSPACE => self.erase(),
             ESCAPE => {
                 self.number.clear();
@@ -210,6 +278,10 @@ impl App for Phone {
             self.call();
             return true;
         }
+        if plan.erase.contains(x, y) && self.call_state == user_abi::CALL_INCOMING {
+            self.hang_up();
+            return true;
+        }
         if plan.erase.contains(x, y) && !self.number.is_empty() {
             self.erase();
             return true;
@@ -218,7 +290,21 @@ impl App for Phone {
     }
 
     fn tick(&mut self, _info: &SysInfo) -> bool {
-        self.pressed.take().is_some()
+        let before = (self.call_state, self.peer.clone());
+        let (state, peer) = user_progs::modem_status();
+        if state == user_abi::CALL_ACTIVE && self.call_state != user_abi::CALL_ACTIVE {
+            self.talk_since = user_progs::monotonic_ms();
+        }
+        self.call_state = state;
+        if !peer.is_empty() {
+            self.peer = peer;
+        }
+        if !self.in_call() {
+            self.peer.clear();
+        }
+        // Таймер разговора — перерисовка каждый такт.
+        let changed = before != (self.call_state, self.peer.clone()) || self.call_state == user_abi::CALL_ACTIVE;
+        self.pressed.take().is_some() || changed
     }
 
     fn quits_on_q(&self) -> bool {
@@ -241,5 +327,12 @@ pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), info.screen_w.max(1), info.screen_h.max(1));
     let width = (380 * scale).min(info.screen_w);
     let height = (640 * scale).min(info.screen_h.saturating_sub(80 * scale)).max(420);
-    app::run(&SPEC, &info, (width, height), |_, _| Phone { number: String::new(), note: "", pressed: None })
+    app::run(&SPEC, &info, (width, height), |_, _| Phone {
+        number: String::new(),
+        call_state: user_abi::CALL_NO_MODEM,
+        peer: String::new(),
+        talk_since: 0,
+        note: "",
+        pressed: None,
+    })
 }

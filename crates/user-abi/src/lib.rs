@@ -1561,6 +1561,31 @@ pub const SETCLOCK_SOURCE_MAX: usize = 96;
 /// ставит.
 pub const SETCLOCK_EARLIEST: u64 = 1_735_689_600;
 
+/// Сотовый модем (06.11.2026): `(операция, адрес, длина) -> ответ`.
+///
+/// [`MODEM_STATUS`] — состояние вызова ([`CALL_IDLE`]…) в младшем байте,
+/// номер собеседника — в буфер `(адрес, длина)`, его длина — в битах 8..16;
+/// [`MODEM_DIAL`] — набрать номер из `(адрес, длина)` (цифры, `+*#`);
+/// [`MODEM_ANSWER`], [`MODEM_HANGUP`] — принять, положить. Без модема —
+/// [`ERR_UNSUPPORTED`].
+pub const SYS_MODEM: usize = 87;
+pub const MODEM_STATUS: usize = 0;
+pub const MODEM_DIAL: usize = 1;
+pub const MODEM_ANSWER: usize = 2;
+pub const MODEM_HANGUP: usize = 3;
+/// Вызова нет (модем готов).
+pub const CALL_IDLE: u8 = 0;
+/// Набор: ATD ушёл, сеть ещё не ответила.
+pub const CALL_DIALING: u8 = 1;
+/// У собеседника звонит.
+pub const CALL_ALERTING: u8 = 2;
+/// Разговор.
+pub const CALL_ACTIVE: u8 = 3;
+/// Входящий звонит у нас.
+pub const CALL_INCOMING: u8 = 4;
+/// Модема нет или он не готов.
+pub const CALL_NO_MODEM: u8 = 0xFF;
+
 /// Размер буфера вывода [`SYS_KERNEL_COMMAND`].
 pub const KERNEL_COMMAND_OUT: usize = 64 * 1024;
 
@@ -2615,7 +2640,7 @@ mod tests {
             SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_DEVICE_OPEN, SYS_DEVICE_MAP, SYS_DEVICE_WAIT,
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
-            SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK,
+            SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK, SYS_MODEM,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(

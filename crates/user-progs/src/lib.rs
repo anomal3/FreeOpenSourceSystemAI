@@ -1960,6 +1960,32 @@ pub fn clock(kind: usize) -> Option<Timespec> {
     (result == 0).then_some(out)
 }
 
+/// Состояние вызова и номер собеседника (06.11.2026, `SYS_MODEM`).
+/// Состояние — `user_abi::CALL_*`; без модема — `CALL_NO_MODEM`.
+pub fn modem_status() -> (u8, alloc::string::String) {
+    let mut buf = [0u8; 32];
+    // SAFETY: буфер живёт в памяти программы, длина — его.
+    let r = unsafe { syscall(user_abi::SYS_MODEM, user_abi::MODEM_STATUS, buf.as_mut_ptr() as usize, buf.len()) };
+    if r < 0 {
+        return (user_abi::CALL_NO_MODEM, alloc::string::String::new());
+    }
+    let n = ((r >> 8) as usize & 0xff).min(buf.len());
+    ((r & 0xff) as u8, alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+/// Набрать номер (`SYS_MODEM`, `MODEM_DIAL`). Ноль — набор начат.
+pub fn modem_dial(number: &str) -> i64 {
+    // SAFETY: строка живёт в памяти программы, длина — её.
+    unsafe { syscall(user_abi::SYS_MODEM, user_abi::MODEM_DIAL, number.as_ptr() as usize, number.len()) }
+}
+
+/// Принять входящий (`true`) или положить трубку (`false`).
+pub fn modem_answer_or_hangup(answer: bool) -> i64 {
+    let op = if answer { user_abi::MODEM_ANSWER } else { user_abi::MODEM_HANGUP };
+    // SAFETY: без указателей.
+    unsafe { syscall(user_abi::SYS_MODEM, op, 0, 0) }
+}
+
 /// Перевести часы системы (05.11.2026, `SYS_SETCLOCK`). Только root.
 ///
 /// `at` — время суток **сейчас**; `source` — откуда оно, для журнала ядра
