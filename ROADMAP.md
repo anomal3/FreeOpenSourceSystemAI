@@ -11580,6 +11580,26 @@ MD1; значения добыты из дерева Mayuri-Chan `android_kernel
 канале 0, ответ runtime data, HS2; разбор `ccci_tag_mem` (заголовки тегов по
 76 байт: `name[64]`, `data_offset`, `data_size`, `next_tag_offset`;
 `modem_info_v2` — u64 база `0x9FFF0000`, размер `0x988`, версия 3, 18 тегов).
+**M4 начато (05.11, ночь): HS1 пройден, модем шлёт запросы FS и RPC.**
+Управление на 6293 идёт **через CCIF, не CLDMA** (CLDMA — только мобильный
+интернет): `mtk_ccci.rs`, `oem md hs | link | log | at <cmd>`. Звонок
+`BUSY=1<<ch; TCHNUM=ch`, приём `RCHNUM`/`ACK`; SRAM 512 Б с `0x10209100`:
+dl_header + `md_query_ap_feature` (HS1 от модема: `reserved 0x5555FFFF`,
+признак 0 «обязательно», 1..34 «по желанию») → up_header (`0x102091F0`) +
+`ap_query_md_feature_v2_1` (`0x10209200`) и звонок 15. Runtime data (64
+записей, 23 признака включено, 760 байт) — в общей памяти `0x7800E800`.
+Кольца: 8 очередей подряд с `0x78028000` (`0xEE0000EE`, rx/tx control,
+данные, `0xFF0000FF`; пакет `0xAABBAABB len … 0xCCDDEEFF×2`) + кольца
+исключений в `CCISM_MCU_EXP`. **Грабли:** первый ответ — модем в assert
+(`ccismcore_ccci.c`, строка ~222; отчёт в `0x78000000` «CCCIEDBG»): в
+`CCIF_SHARE_MEMORY` надо давать **суммарный размер колец** `0xB0140`
+(Linux `ccism->size = total_smem_size`), а не размер области 721 КиБ, и
+строить кольца исключений. После правки — FS-запрос `op 0x100E` с путём
+`Z:\` (UTF-16) и RPC `op 0x4005` (EINT_ATTR) по кругу на наш NO_OP. **Дальше:**
+ответы RPC по `mt6765.dts` (EINT/GPIO/ADC — номера из узлов `md_*`, как
+`port_rpc.c`), служба FS вместо `ccci_fsd` (NVRAM из снятого `nvdata`, ext4
+только чтение, формат FS-команд — из `ccci_fsd`/MTK), затем HS2, `AT`.
+Исходники eccci на ПК: рабочая папка `ccci_src/`.
 **Индикатор сотовой связи (05.11, Роман: <указать, есть сеть или нет и в
 какой сети — 4G, 3G>).** `crate::cellular` — служба (нет модема / нет SIM /
 поиск / экстренные / зарегистрирован), тип сети из AcT (`from_act`: 0,1 2G;

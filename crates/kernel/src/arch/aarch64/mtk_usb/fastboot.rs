@@ -302,14 +302,23 @@ impl Fastboot {
             }
         } else if text == "oem md" || text.starts_with("oem md ") {
             // Модем (05.11, M3): `oem md [status | power | pll | go | off]`.
-            use crate::arch::aarch64::mtk_md;
-            let result = match text["oem md".len()..].trim() {
+            // M4: `hs` (ответ на HS1), `link` (CCIF и стадия), `log`,
+            // `at <команда>` (после HS2).
+            use crate::arch::aarch64::{mtk_ccci, mtk_md};
+            let arg = text["oem md".len()..].trim();
+            let result = match arg {
                 "" | "status" => Ok(mtk_md::status()),
                 "power" => mtk_md::power_on(),
                 "pll" => mtk_md::pll(),
                 "go" => mtk_md::go(),
                 "off" => mtk_md::off(),
-                _ => Err(alloc::string::String::from("usage: oem md [status | power | pll | go | off]")),
+                "hs" => mtk_ccci::answer_hs1(),
+                "link" => Ok(mtk_ccci::status()),
+                "log" => Ok(mtk_ccci::log()),
+                _ if arg.starts_with("at ") => mtk_ccci::at(arg[3..].trim()),
+                _ => Err(alloc::string::String::from(
+                    "usage: oem md [status|power|pll|go|off|hs|link|log|at <cmd>]",
+                )),
             };
             match result {
                 Ok(lines) => {
