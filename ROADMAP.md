@@ -11545,6 +11545,22 @@ ROM модема — неизвестно), затем питание MD; (Б) �
 `firmware/stock/`, возврат — `fastboot flash boot`), но MIUI на это время не
 грузится. Копии заводских `boot`, `dtbo`, `vbmeta*`, `lk`, `lk2`, `logo` — в
 `firmware/stock/` (в `.gitignore`).
+**Путь Б выбран (Роман 05.11): наш образ — в разделе `boot`.** `fastboot
+flash boot build\phone-boot.img` + `fastboot reboot` (обычная загрузка, то же
+одно нажатие питания). Возврат MIUI: `fastboot flash boot
+firmware\stock\boot.bin` (Android boot v2, sha256 `0165dae9…`). **LK при
+обычной загрузке модем загрузил:** `md_mem_usage` `0x8E000000`+256 МиБ (в ОЗУ
+по `0x8E000000` — ровно `md1rom` с флеша, сверено `oem dump`),
+`ap_md_nc_smem` `0x78000000`+0x170000, `ap_md_c_smem` `0x7C000000`+0x1600000,
+`ccci_tag_mem` `0x9FFF0000` (теги `hdr_tbl_inf`, `md_mpu_inf`, `smem_layout`,
+`ccb_info`, `retrieve`…), `ccci,modem_info_v2 = <0xff9f 0 0x88090000 0
+0x3000000 0x12000000 0x1000000 …>`; копия — `firmware/modem/lk-normal.dtb`.
+Ядро эти резервы соблюдает (`fdt : reserved …` в журнале). Поправлено:
+`reserved_spans` брал все узлы глубины 2 во всём дереве (сотни строк
+<dynamic reserved> в журнале, чужие `reg` — в <занятое>), теперь только детей
+`/reserved-memory`. Значит загрузку, подпись и MPU сделал LK; дальше M3 —
+только питание MD и `let_md_go` (значения регистров добираются из
+`eccci/mt6765`).
 **Индикатор сотовой связи (05.11, Роман: <указать, есть сеть или нет и в
 какой сети — 4G, 3G>).** `crate::cellular` — служба (нет модема / нет SIM /
 поиск / экстренные / зарегистрирован), тип сети из AcT (`from_act`: 0,1 2G;

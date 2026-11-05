@@ -360,7 +360,20 @@ fn reserved_spans(fdt: &Fdt<'_>, taken: &mut [Span; MAX_TAKEN], mut count: usize
     let address_cells = parent.property_u64("#address-cells").unwrap_or(2) as usize;
     let size_cells = parent.property_u64("#size-cells").unwrap_or(2) as usize;
 
-    for node in fdt.nodes().filter(|node| node.depth == parent.depth + 1) {
+    // Только дети самого `/reserved-memory` (05.11): раньше брались все узлы
+    // этой глубины во всём дереве — журнал забивали сотни «dynamic reserved»
+    // (выводы, камеры, частоты), а `reg` чужих узлов ложился в «занятое».
+    // Узлы идут по порядку документа: дети — сразу за родителем, пока глубина
+    // больше его.
+    let mut inside = false;
+    let children = fdt.nodes().filter(|node| {
+        if node.depth <= parent.depth {
+            inside = node.depth == parent.depth && node.name == parent.name;
+            return false;
+        }
+        inside && node.depth == parent.depth + 1
+    });
+    for node in children {
         let mut any = false;
         for region in node.reg(address_cells, size_cells) {
             any = true;
