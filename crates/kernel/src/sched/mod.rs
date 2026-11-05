@@ -1480,14 +1480,37 @@ fn watch_tick() {
         }
     }
     let rate = core::str::from_utf8(&cdigits[cat..]).unwrap_or("?");
+    // Где стоял процессор, когда пришёл тик: адрес возврата прерывания и
+    // уровень (EL0 — программа, EL1 — ядро). По адресу ядра функция находится
+    // `llvm-addr2line` по ELF ядра телефона.
+    #[cfg(target_arch = "aarch64")]
+    let (elr, spsr): (u64, u64) = {
+        let elr: u64;
+        let spsr: u64;
+        // SAFETY: чтение системных регистров в обработчике прерывания.
+        unsafe {
+            core::arch::asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
+            core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr, options(nomem, nostack));
+        }
+        (elr, spsr)
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let (elr, spsr): (u64, u64) = (0, 0);
+    let mut hex = [0u8; 16];
+    for (index, slot) in hex.iter_mut().enumerate() {
+        let nibble = (elr >> ((15 - index) * 4)) & 0xf;
+        *slot = if nibble < 10 { b'0' + nibble as u8 } else { b'a' + (nibble - 10) as u8 };
+    }
+    let pc = core::str::from_utf8(&hex).unwrap_or("?");
+    let level = if spsr & 0xc == 0 { " EL0 " } else { " EL1 " };
     let cpu = smp::cpu();
     let idle = ON_IDLE[cpu].load(Ordering::Relaxed);
     match SCHED.try_lock() {
         Some(sched) => {
             let name = sched.tasks[sched.current()].as_ref().map_or("none", |task| task.name);
-            crate::console::overlay_note(&["t", seconds, " ", name, if idle { " idle" } else { "" }, " c", rate]);
+            crate::console::overlay_note(&["t", seconds, " ", name, if idle { " idle" } else { "" }, " c", rate, level, pc]);
         }
-        None => crate::console::overlay_note(&["t", seconds, " SCHED LOCKED c", rate]),
+        None => crate::console::overlay_note(&["t", seconds, " SCHED LOCKED c", rate, level, pc]),
     }
 }
 
