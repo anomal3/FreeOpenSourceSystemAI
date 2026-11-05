@@ -300,6 +300,28 @@ impl Fastboot {
                 }
                 _ => self.respond(b"FAIL", "usage: oem cell <service 0..4> <AcT 0..7> <bars 0..4> [r]"),
             }
+        } else if text == "oem md" || text.starts_with("oem md ") {
+            // Модем (05.11, M3): `oem md [status | power | pll | go | off]`.
+            use crate::arch::aarch64::mtk_md;
+            let result = match text["oem md".len()..].trim() {
+                "" | "status" => Ok(mtk_md::status()),
+                "power" => mtk_md::power_on(),
+                "pll" => mtk_md::pll(),
+                "go" => mtk_md::go(),
+                "off" => mtk_md::off(),
+                _ => Err(alloc::string::String::from("usage: oem md [status | power | pll | go | off]")),
+            };
+            match result {
+                Ok(lines) => {
+                    self.line_count = 0;
+                    for line in &lines {
+                        self.say(line.as_bytes());
+                    }
+                    self.state = State::Lines { at: 0 };
+                    self.continue_lines(0);
+                }
+                Err(err) => self.respond(b"FAIL", &err),
+            }
         } else if text == "oem fdt" {
             self.stage_fdt();
         } else if let Some(rest) = text.strip_prefix("oem dump ") {

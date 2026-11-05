@@ -136,6 +136,18 @@ remap + отпустить MCU), только больше: общая памя�
 
 ### 1.5 Включение питания и запуск (последовательность из драйвера) [src]
 
+> **05.11: проверено на аппарате, точные значения — в
+> `crates/kernel/src/arch/aarch64/mtk_md.rs`** (`oem md power/pll/go`, MD
+> вышел на boot stats `54430007 53320000`). Поправки к тексту ниже:
+> адреса `0x2xxxxxxx` — физические адреса AP (окно bank2), не «MD-вид»;
+> `vmd1_pmic_setting_on` на MT6357 только ставит VMODEM 0,8 В (`0x15AA`),
+> VSRAM_MD нет; boot vector/key на MT6765 не пишутся — только
+> `MD_BOOT_VECTOR_EN = 1`. Смещения infracfg: `AP2MD_DUMMY` `0x370` б.0,
+> `MD2PERI` — `PROTECTEN_1` (`0x250`, sta `0x258`, set/clr `0x2A8/0x2AC`) б.6,
+> `PERI2MD` — `PROTECTEN` (`0x220`, sta `0x228`, set/clr `0x2A0/0x2A4`) б.7,
+> `MD_SRCCLKENA` `0xF0C`. SPM: `MD1_PWR_CON` `0x320`, `PWR_STATUS` `0x180/184`
+> б.0, `MD_SRAM_ISO_CON` `0x394`, `MD_EXTRA_PWR_CON` `0x398`.
+
 `md_cd_start()`: (первый раз) remap MD-регистров, IRQ MD_WDT/CCIF0,
 очистка smem → `ccci_md_hif_start(1)` (клоки CLDMA/CCIF, сброс CCIF HW,
 сброс CLDMA) → **`md_cd_power_on`** → `md_cd_let_md_go` → включить IRQ WDT →

@@ -8,6 +8,7 @@ pub mod mtk;
 pub mod mtk_i2c;
 pub mod mtk_consys;
 pub mod mtk_msdc;
+pub mod mtk_md;
 pub mod mtk_wlan;
 pub mod mtk_regs;
 pub mod mtk_spi;

@@ -11561,6 +11561,25 @@ firmware\stock\boot.bin` (Android boot v2, sha256 `0165dae9…`). **LK при
 `/reserved-memory`. Значит загрузку, подпись и MPU сделал LK; дальше M3 —
 только питание MD и `let_md_go` (значения регистров добираются из
 `eccci/mt6765`).
+**M3 сделано (05.11, поздно): модем запущен.** `mtk_md.rs`, команды `oem md
+[status | power | pll | go | off]` — по шагам ядра Linux (`md_sys1_platform.c`
+`md_cd_power_on`/`md1_pll_init`/`md_cd_let_md_go`, `clk-mt6765-pg.c` MTCMOS
+MD1; значения добыты из дерева Mayuri-Chan `android_kernel_xiaomi_mt6765`
+`10-alps`, оно же у MiCode). Регистры `0x2xxxxxxx` (`MD_BOOT_VECTOR_EN`
+`0x20000024`, `MD_RGU` `0x200F0100`, PLL `0x20140000`, CLKSW `0x20150000`) —
+**физические адреса AP** (окно bank2), а не <вид MD>; окно `oem peek`
+`0x2000_0000..0x2060_0000`; читать только при включённом домене и снятой
+защите PERI2MD (после `go` чтение даёт мусор `0x62930000`). До: `MD1_PWR_CON`
+`0x112`, защита `PROTECTEN` биты 3,4,7, `PROTECTEN_1` бит 6, VMODEM уже
+включён LK (0,8 В), такты CCIF/CLDMA открыты. `power`: домен за 1 мкс,
+`PWR_CON` `0xD`; `pll`: метка `0x62930000`; `go`: **через 50 мс
+`MD1_CFG` boot stats `54430007 53320000`** и стоят — MD, видимо, ждёт AP
+(HS1 по CLDMA). Не сделано: хвост SRAM CCIF (`0x7274626E` + адрес/размер
+отладочной smem, MD-вид), `clk_buf_set_by_flightmode`. **Дальше M4:** CLDMA
+(`0x10014000` AO, `0x1021B000` PD) и CCIF0 (`0x10209000`), кольца GPD, HS1 в
+канале 0, ответ runtime data, HS2; разбор `ccci_tag_mem` (заголовки тегов по
+76 байт: `name[64]`, `data_offset`, `data_size`, `next_tag_offset`;
+`modem_info_v2` — u64 база `0x9FFF0000`, размер `0x988`, версия 3, 18 тегов).
 **Индикатор сотовой связи (05.11, Роман: <указать, есть сеть или нет и в
 какой сети — 4G, 3G>).** `crate::cellular` — служба (нет модема / нет SIM /
 поиск / экстренные / зарегистрирован), тип сети из AcT (`from_act`: 0,1 2G;
