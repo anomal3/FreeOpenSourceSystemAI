@@ -115,6 +115,7 @@ pub fn claim_adapters() {
 /// virtio-gpu картинка лежит в обычной памяти, и хосту надо сказать, что в ней
 /// изменилось, — композитор зовёт это после каждого собранного прямоугольника.
 pub fn flush(x: i32, y: i32, w: u32, h: u32) {
+    crate::console::overlay_redraw(y, h);
     crate::virtio::gpu::flush(x, y, w, h);
     // VMSVGA в режиме SVGA показывает изменённое тоже по команде (фаза 68h).
     #[cfg(target_arch = "x86_64")]

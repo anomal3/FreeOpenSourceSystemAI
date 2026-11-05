@@ -944,11 +944,30 @@ fn overlay_print(args: fmt::Arguments<'_>) {
         return;
     };
     let _ = ov.write_fmt(args);
+    draw_overlay(&ov);
+}
+
+/// Стол перерисовал кусок экрана: если он задел полосу журнала — вернуть её
+/// поверх (иначе последний кадр зависшего телефона её затирал, 05.11).
+pub fn overlay_redraw(y: i32, h: u32) {
+    if !OVERLAY.load(Ordering::Relaxed) || y > (OV_TOP + OV_ROWS as u32 * GLYPH_H * 2) as i32 || y + h as i32 <= OV_TOP as i32 {
+        return;
+    }
+    let Some(ov) = OV.try_lock() else {
+        return;
+    };
+    draw_overlay(&ov);
+}
+
+/// Верх полосы журнала, в точках.
+const OV_TOP: u32 = 100;
+
+fn draw_overlay(ov: &Overlay) {
     let painter = CONSOLE.try_lock().and_then(|console| console.as_ref().map(|console| console.fb));
     let Some(mut painter) = painter else {
         return;
     };
-    painter.top = 100;
+    painter.top = OV_TOP;
     let cols = (painter.width.saturating_sub(MARGIN * 2) / (GLYPH_W * painter.scale)).min(OV_COLS as u32);
     for row in 0..OV_ROWS {
         let line = ov.lines[(ov.next + row) % OV_ROWS];
