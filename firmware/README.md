@@ -44,7 +44,7 @@ fastboot reboot-bootloader            (ждать, пока getvar product = dan
 certutil -hashfile firmware\stock\boot.bin SHA256
     должно быть 0165dae97cc4719ce647fe8d715886c783dcc8121b153273eb0fe525dbd1cfc5
 fastboot flash boot firmware\stock\boot.bin
-fastboot reboot                       (одно нажатие питания на предупреждении)
+fastboot reboot                       (предупреждение о подписи уходит само)
 ```
 
 Наша система остаётся в разделе `recovery`: `fastboot reboot recovery`.
