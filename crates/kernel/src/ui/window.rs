@@ -245,6 +245,9 @@ pub enum Hit {
     Minimize,
     /// Кнопка «развернуть» — она же «вернуть прежний размер».
     Maximize,
+    /// Кнопка клавиатуры в заголовке окна программы на телефоне (05.11):
+    /// показать или спрятать экранную клавиатуру для этого окна.
+    Keyboard,
     /// Край или угол окна: за него окно тянут за размер. Какие стороны
     /// двигаются — [`EDGE_LEFT`] и прочие (01.11: раньше — только правый
     /// нижний уголок).
@@ -413,6 +416,14 @@ pub struct Window {
     /// умеет менять размер, уходит просьба [`user_abi::WIN_RESIZE`], и её
     /// ответ заполняет рамку целиком.
     pub fit: bool,
+    /// Человек попросил для этого окна экранную клавиатуру (кнопка в
+    /// заголовке, телефон, 05.11): пока окно активно, клавиатура видна, а
+    /// окно стоит над ней. Снимается вторым нажатием и уходом фокуса (см.
+    /// `Compositor::sync_keyboard`).
+    pub keyboard: bool,
+    /// Низ окна поднят над клавиатурой (05.11): когда она уйдёт, стол вернёт
+    /// его к полоске жеста (`Compositor::lift_program_windows`).
+    pub lifted: bool,
 }
 
 /// Счётчик для [`Window::born`].
@@ -571,6 +582,8 @@ impl Window {
             born: BORN.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             hot: None,
             fit: false,
+            keyboard: false,
+            lifted: false,
         }
     }
 
@@ -837,6 +850,36 @@ impl Window {
         self.title_button(2)
     }
 
+    /// Есть ли у окна кнопка клавиатуры: у окна программы на телефоне (05.11).
+    /// Клавиатуру стол сам показывает только терминалу и полям «Параметров»
+    /// — когда программа ждёт текста, он не знает, и спрашивают человека.
+    fn has_keyboard_button(&self) -> bool {
+        theme::is_mobile() && self.is_program() && !self.popup && !self.frameless
+    }
+
+    /// Кнопка клавиатуры — четвёртая справа, левее «свернуть».
+    fn keyboard_button(&self) -> Rect {
+        self.title_button(3)
+    }
+
+    /// Самая левая кнопка заголовка: до неё доходит подпись.
+    fn leftmost_button(&self) -> Rect {
+        if self.has_keyboard_button() { self.keyboard_button() } else { self.minimize_button() }
+    }
+
+    /// Нажать или отжать кнопку клавиатуры: перерисовать кнопки.
+    pub fn set_keyboard(&mut self, on: bool, focused: bool) {
+        if self.keyboard == on {
+            return;
+        }
+        self.keyboard = on;
+        if self.has_keyboard_button() {
+            self.paint_title_buttons(focused);
+            let row = self.leftmost_button().union(&self.close_button());
+            self.damage = self.damage.union(&row);
+        }
+    }
+
     /// Уголок изменения размера в координатах поверхности.
     fn resize_grip(&self) -> Rect {
         Rect::new(
@@ -902,6 +945,9 @@ impl Window {
         }
         if self.minimize_button().contains(local.0, local.1) {
             return Some(Hit::Minimize);
+        }
+        if self.has_keyboard_button() && self.keyboard_button().contains(local.0, local.1) {
+            return Some(Hit::Keyboard);
         }
         let title_bottom = Self::title_height(self.scale) as i32;
         if local.1 < title_bottom {
@@ -1066,7 +1112,7 @@ impl Window {
         // Заголовок кончается там, где начинаются кнопки: подпись, заехавшая
         // под крестик, читается как ошибка отрисовки.
         let text_x = badge.right() + ctx.px(8) as i32;
-        let room = (self.minimize_button().x - ctx.px(12) as i32 - text_x).max(0) as u32;
+        let room = (self.leftmost_button().x - ctx.px(12) as i32 - text_x).max(0) as u32;
         // Вкладки в заголовке: подпись — только имя программы перед ними.
         let tabs_here = !self.tab_order.is_empty() && !theme::is_mobile();
         let room = if tabs_here { ctx.face(Role::Body).width(self.app.caption()).min(room) } else { room };
@@ -1119,14 +1165,18 @@ impl Window {
         let fill = ctx.flat(if focused { p.tb1 } else { p.tb2 });
         let restore_icon = if self.restore.is_some() { Icon::Restore } else { Icon::Maximize };
         let glyph = ctx.px(10);
-        for (button, icon, hit) in [
+        let keyboard = self.has_keyboard_button().then(|| (self.keyboard_button(), Icon::Keyboard, Hit::Keyboard));
+        for (button, icon, hit) in keyboard.into_iter().chain([
             (self.minimize_button(), Icon::Minimize, Hit::Minimize),
             (self.maximize_button(), restore_icon, Hit::Maximize),
             (self.close_button(), Icon::Close, Hit::Close),
-        ] {
+        ]) {
             let hot = self.hot == Some(hit);
+            // Нажатая кнопка клавиатуры — цветом акцента: видно, что
+            // клавиатура открыта для этого окна.
             let (plate, ink) = match (hot, hit) {
                 (true, Hit::Close) => (p.bad, Color::rgb(0xFF, 0xFF, 0xFF)),
+                (_, Hit::Keyboard) if self.keyboard => (p.acc, Color::rgb(0xFF, 0xFF, 0xFF)),
                 (true, _) => (p.btnhov.over(fill), p.ink),
                 (false, _) => (fill, if focused { p.ink2 } else { p.ink4 }),
             };
@@ -1146,7 +1196,7 @@ impl Window {
     /// Подсветить кнопку заголовка под указателем (`None` — никакую).
     /// Перерисовываются только кнопки и обводка окна над ними.
     pub fn set_hot(&mut self, hot: Option<Hit>, focused: bool) {
-        let hot = hot.filter(|hit| matches!(hit, Hit::Close | Hit::Maximize | Hit::Minimize));
+        let hot = hot.filter(|hit| matches!(hit, Hit::Close | Hit::Maximize | Hit::Minimize | Hit::Keyboard));
         if self.hot == hot || self.popup || self.frameless {
             return;
         }
@@ -1157,7 +1207,7 @@ impl Window {
         let bounds = self.surface.bounds();
         let edge = if focused { p.line3 } else { p.line2 };
         draw::rounded_stroke(&mut self.surface, bounds, ctx.px(theme::R_WINDOW), edge.color, edge.alpha);
-        let row = self.minimize_button().union(&self.close_button());
+        let row = self.leftmost_button().union(&self.close_button());
         self.damage = self.damage.union(&row);
     }
 

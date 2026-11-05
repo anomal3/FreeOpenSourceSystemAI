@@ -342,6 +342,12 @@ pub fn task() {
     session::close_all();
 }
 
+/// Когда первая вкладка последний раз взяла клавишу из очереди стола — в том
+/// числе ту, что стол отдал окну программы (05.11): набор в адресной строке
+/// NetSurf — тоже человек за машиной, и сеанс без ввода не кончается посреди
+/// него.
+static LAST_KEY_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Следующая клавиша оболочки. Первая вкладка (`primary`) разбирает весь
 /// ввод стола и раздаёт клавиши видимой вкладке; остальные читают только
 /// свою очередь.
@@ -351,6 +357,7 @@ fn next_key(primary: bool, me: usize) -> Option<KeyEvent> {
     }
     loop {
         let event = input::next_event()?;
+        LAST_KEY_MS.store(time::uptime_ms(), core::sync::atomic::Ordering::Relaxed);
         let Some(event) = ui::dispatch(event) else {
             continue;
         };
@@ -550,7 +557,8 @@ fn run(primary: bool) {
         // клавиатура есть и у гостя стенда, а сценарий ею как раз и набирает.
         // Метку ставит загрузчик по файлу на разделе, который собирает стенд
         // (см. `boot_info::BOOT_UNATTENDED`).
-        if primary && crate::unattended() && time::uptime_ms().saturating_sub(idle_since) >= IDLE_TIMEOUT_SECONDS * 1000 {
+        let last_input = idle_since.max(LAST_KEY_MS.load(core::sync::atomic::Ordering::Relaxed));
+        if primary && crate::unattended() && time::uptime_ms().saturating_sub(last_input) >= IDLE_TIMEOUT_SECONDS * 1000 {
             sprintln!();
             sprintln!("  no input for {IDLE_TIMEOUT_SECONDS} s, finishing the session");
             ui::set_cursor(false);

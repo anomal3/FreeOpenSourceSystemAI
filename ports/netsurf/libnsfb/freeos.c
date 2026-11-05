@@ -44,13 +44,25 @@ struct freeos_priv {
     bool touch;
     bool held;
     bool scrolling;
-    int press_x, press_y, last_y;
+    /* Палец от левого края вправо — «назад» (05.11), как в браузерах
+     * телефонов: такой жест не прокручивает и не щёлкает. */
+    bool swiping;
+    int press_x, press_y, last_x, last_y;
 };
 
 /* Сколько точек пальцем — один щелчок колеса и с какого сдвига нажатие
  * становится прокруткой. */
 #define SCROLL_STEP 28
 #define SCROLL_SLOP 14
+
+/* Жест «назад»: начало не дальше `BACK_EDGE` точек от левого края, путь
+ * вправо не короче `BACK_SWIPE`. NetSurf ловит управляющий код
+ * `FREEOS_CONTROL_BACK` в своём цикле событий (`ports/netsurf/freeos.patch`,
+ * `frontends/framebuffer/gui.c`) — кнопка «назад» его окна, но без касания
+ * панели и независимо от того, где фокус ввода. */
+#define BACK_EDGE 24
+#define BACK_SWIPE 100
+#define FREEOS_CONTROL_BACK 0x4241
 
 /* Формат точки окна — один на машину; `freeos_screen` говорит какой. */
 static enum nsfb_format_e window_format(void)
@@ -282,8 +294,10 @@ static void translate(struct freeos_priv *priv, const struct freeos_win_event *e
         if (priv->touch && mouse_button(event->code) == NSFB_KEY_MOUSE_1) {
             priv->held = true;
             priv->scrolling = false;
+            priv->swiping = false;
             priv->press_x = event->x;
             priv->press_y = event->y;
+            priv->last_x = event->x;
             priv->last_y = event->y;
             break;
         }
@@ -293,6 +307,14 @@ static void translate(struct freeos_priv *priv, const struct freeos_win_event *e
     case FREEOS_WIN_RELEASE:
         if (priv->touch && priv->held && mouse_button(event->code) == NSFB_KEY_MOUSE_1) {
             priv->held = false;
+            if (priv->swiping) {
+                if (event->x - priv->press_x >= BACK_SWIPE || priv->last_x - priv->press_x >= BACK_SWIPE) {
+                    out.type = NSFB_EVENT_CONTROL;
+                    out.value.controlcode = (enum nsfb_control_e)FREEOS_CONTROL_BACK;
+                    push(priv, &out);
+                }
+                break;
+            }
             if (!priv->scrolling) {
                 /* Тап: нажатие и отпускание в точке касания. */
                 move_to(priv, priv->press_x, priv->press_y);
@@ -306,8 +328,20 @@ static void translate(struct freeos_priv *priv, const struct freeos_win_event *e
         break;
     case FREEOS_WIN_MOVE:
         if (priv->touch && priv->held) {
+            int dx = event->x - priv->press_x;
             int dy = event->y - priv->press_y;
-            if (!priv->scrolling && (dy > SCROLL_SLOP || dy < -SCROLL_SLOP)) {
+            int ady = dy < 0 ? -dy : dy;
+            priv->last_x = event->x;
+            if (priv->swiping) {
+                break;
+            }
+            /* У левого края палец, ушедший вправо больше, чем вбок по
+             * вертикали, — жест «назад», а не прокрутка. */
+            if (!priv->scrolling && priv->press_x < BACK_EDGE && dx > SCROLL_SLOP && dx > ady) {
+                priv->swiping = true;
+                break;
+            }
+            if (!priv->scrolling && ady > SCROLL_SLOP && (priv->press_x >= BACK_EDGE || ady >= dx)) {
                 priv->scrolling = true;
             }
             if (priv->scrolling) {

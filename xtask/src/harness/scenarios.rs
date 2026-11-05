@@ -5618,12 +5618,62 @@ pub const ALL: &[Scenario] = &[
             // молчит 20 с и закрывает сеанс — ждать дольше нельзя.
             Step::Wait(6_000),
             Step::Painted("02-netsurf"),
-            // Касание адресной строки — встроенная клавиатура NetSurf
-            // (`fb_osk`, 05.11): адрес на телефоне набирать больше нечем.
+            // Кнопка клавиатуры в заголовке (05.11) — четвёртая справа, левее
+            // «свернуть»: клавиатура системы для окна программы, окно встаёт
+            // над ней, браузер получает WIN_RESIZE и раскладывается заново.
+            Step::Aim(Aim::Point(398, 123)),
+            Step::Click,
+            Step::Await("desktop     : keyboard asked for 'NetSurf'", 15_000),
+            Step::Await("desktop     : 'NetSurf' above the keyboard at ", 15_000),
+            Step::Await("keyboard    : shown", 15_000),
+            Step::Wait(2_500),
+            Step::Shot("02b-keyboard"),
+            // Адресная строка: касание ставит в неё курсор; прежний адрес
+            // стирается настоящей клавиатурой (End и ⌫), начало нового — тоже
+            // ею, а «credits» — касаниями клавиш экранной: буквы обязаны
+            // дойти до строки так же, как с USB.
             Step::Aim(Aim::Point(400, 183)),
             Step::Click,
+            Step::Wait(1_000),
+            Step::Key("end"),
+            Step::Repeat("backspace", 60),
+            Step::Type("file:///opt/netsurf/share/netsurf/"),
+            Step::Aim(Aim::Point(295, 1420)),
+            Step::Click,
+            Step::Aim(Aim::Point(263, 1240)),
+            Step::Click,
+            Step::Aim(Aim::Point(199, 1240)),
+            Step::Click,
+            Step::Aim(Aim::Point(231, 1330)),
+            Step::Click,
+            Step::Aim(Aim::Point(519, 1240)),
+            Step::Click,
+            Step::Aim(Aim::Point(327, 1240)),
+            Step::Click,
+            Step::Aim(Aim::Point(167, 1330)),
+            Step::Click,
+            Step::Type(".html"),
+            Step::Wait(1_500),
+            Step::Shot("02c-typed"),
+            // ↵ экранной клавиатуры — переход по набранному адресу.
+            Step::Aim(Aim::Point(613, 1509)),
+            Step::Click,
+            Step::Wait(4_000),
+            Step::Shot("02d-credits"),
+            // Жест «назад»: палец от левого края вправо (freeos.c) — снова
+            // страница приветствия.
+            Step::Stroke(&[(4, 700), (40, 702), (90, 705), (160, 706), (240, 708)]),
+            Step::Release,
+            Step::Wait(4_000),
+            Step::Shot("02e-back"),
+            // Второе касание кнопки — клавиатура уходит, окно опускается.
+            Step::Aim(Aim::Point(398, 123)),
+            Step::Click,
+            Step::Await("desktop     : keyboard dismissed for 'NetSurf'", 15_000),
+            Step::Await("desktop     : 'NetSurf' back from the keyboard at ", 15_000),
+            Step::Await("keyboard    : hidden", 15_000),
             Step::Wait(2_500),
-            Step::Shot("02b-osk"),
+            Step::Shot("02f-keyboard-off"),
             // Касание страницы — как пальцем: браузер обязан остаться живым.
             Step::Aim(Aim::Point(360, 1200)),
             Step::Click,

@@ -34,3 +34,104 @@ diff -ru a/utils/config.h b/utils/config.h
  
  #define HAVE_REGEX
  #if (defined(__serenity__))
+diff -ru a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+--- a/frontends/framebuffer/gui.c	2026-11-05 14:03:49.418987869 +0000
++++ b/frontends/framebuffer/gui.c	2026-11-05 14:04:10.216672982 +0000
+@@ -611,6 +611,23 @@
+ 	return true;
+ }
+ 
++static void fb_update_back_forward(struct gui_window *gw);
++
++/* FreeOS: the libnsfb surface reports a back swipe (finger from the left
++ * edge to the right) as this control code, see src/surface/freeos.c. */
++#define FREEOS_CONTROL_BACK 0x4241
++
++static void freeos_history_back(void)
++{
++	struct gui_window *gw = window_list;
++
++	if (gw == NULL || gw->bw == NULL)
++		return;
++	if (browser_window_back_available(gw->bw))
++		browser_window_history_back(gw->bw, false);
++	fb_update_back_forward(gw);
++}
++
+ static void framebuffer_run(void)
+ {
+ 	nsfb_event_t event;
+@@ -632,6 +649,9 @@
+ 			if ((event.type == NSFB_EVENT_CONTROL) &&
+ 			    (event.value.controlcode ==  NSFB_CONTROL_QUIT))
+ 				fb_complete = true;
++			if ((event.type == NSFB_EVENT_CONTROL) &&
++			    ((int)event.value.controlcode == FREEOS_CONTROL_BACK))
++				freeos_history_back();
+ 		}
+ 
+ 		fbtk_redraw(fbtk);
+@@ -1231,6 +1251,54 @@
+  *                       string to disable the bar..
+  * 
+  */
++/* FreeOS: toolbar icons follow a tall toolbar (the phone asks for 56 px).
++ * Bitmaps are stretched to the button height but keep their own width, so
++ * on a tall toolbar they became thin slivers; here each one is enlarged by
++ * a whole factor (nearest pixel) once, before the toolbar is laid out. */
++static void freeos_scale_bitmap(struct fbtk_bitmap *image, int k)
++{
++	uint32_t *src = (uint32_t *)image->pixdata;
++	uint32_t *dst;
++	int x, y;
++
++	dst = malloc((size_t)image->width * k * image->height * k * 4);
++	if (dst == NULL)
++		return;
++	for (y = 0; y < image->height * k; y++)
++		for (x = 0; x < image->width * k; x++)
++			dst[y * image->width * k + x] =
++				src[(y / k) * image->width + x / k];
++	image->pixdata = (uint8_t *)dst;
++	image->width *= k;
++	image->height *= k;
++}
++
++static void freeos_scale_toolbar(int room)
++{
++	static bool done = false;
++	struct fbtk_bitmap *images[] = {
++		&left_arrow, &right_arrow, &reload, &stop_image,
++		&history_image, &left_arrow_g, &right_arrow_g, &reload_g,
++		&stop_image_g, &history_image_g, &throbber0, &throbber1,
++		&throbber2, &throbber3, &throbber4, &throbber5, &throbber6,
++		&throbber7, &throbber8,
++	};
++	size_t i;
++	int k;
++
++	if (done)
++		return;
++	done = true;
++	k = room / left_arrow.height;
++	if (k > 3)
++		k = 3;
++	if (k < 2)
++		return;
++	NSLOG(netsurf, INFO, "toolbar icons scaled %dx", k);
++	for (i = 0; i < sizeof(images) / sizeof(images[0]); i++)
++		freeos_scale_bitmap(images[i], k);
++}
++
+ static fbtk_widget_t *
+ create_toolbar(struct gui_window *gw, 
+ 	       int toolbar_height, 
+@@ -1252,6 +1320,8 @@
+ 
+ 	NSLOG(netsurf, INFO, "Using toolbar layout %s", toolbar_layout);
+ 
++	freeos_scale_toolbar(toolbar_height - 2 * padding);
++
+ 	itmtype = toolbar_layout;
+ 
+ 	/* check for the toolbar being disabled */

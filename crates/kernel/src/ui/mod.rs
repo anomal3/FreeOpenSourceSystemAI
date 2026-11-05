@@ -3276,6 +3276,14 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                     }
                 }
             }
+            // Клавиатура для окна программы (телефон, 05.11): видна, пока окно
+            // активно; окно встаёт над ней (см. `Compositor::sync_keyboard`).
+            Hit::Keyboard => {
+                if let Some(app) = app {
+                    let on = desktop.toggle_window_keyboard(app);
+                    kprintln!("  desktop     : keyboard {} for '{}'", if on { "asked" } else { "dismissed" }, name_of(desktop, app));
+                }
+            }
             Hit::Resize(edges) => {
                 if let Some(app) = app {
                     desktop.set_resize_drag(app, edges);

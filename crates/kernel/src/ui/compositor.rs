@@ -1704,7 +1704,9 @@ impl Compositor {
         // Терминал под открытой клавиатурой телефона — до неё: развёрнутый
         // иначе спрятал бы под ней приглашение (клавиатура ужимает его только
         // при появлении и уходе, см. [`Self::sync_keyboard`]).
-        if theme::is_mobile() && app == App::Terminal {
+        // Так же окно программы, которому клавиатуру открыли кнопкой (05.11).
+        let lifted = self.windows.get(index).is_some_and(|window| window.keyboard);
+        if theme::is_mobile() && (app == App::Terminal || lifted) {
             if let Some(keyboard) = self.keyboard.as_ref().filter(|keyboard| keyboard.is_visible()) {
                 let bottom = keyboard.rect.y.saturating_sub(mini_ui::paint::Ctx::scaled(self.scale).px(keyboard::GAP) as i32);
                 area.h = bottom.saturating_sub(area.y).max(1) as u32;
@@ -2419,13 +2421,26 @@ impl Compositor {
     /// Вместе с клавиатурой меняется высота окна терминала: низ окна встаёт над
     /// клавиатурой, а когда она уходит — возвращается к доку. Иначе нижние
     /// строки терминала, то есть строка ввода, оказались бы под клавишами.
+    ///
+    /// Окну программы клавиатуру открывают кнопкой в заголовке (05.11): стол
+    /// не знает, ждёт ли программа текста. Пока такое окно активно, клавиатура
+    /// видна, а окно стоит над ней (см. [`Self::lift_program_windows`]); ушёл
+    /// фокус — просьба снимается.
     pub fn sync_keyboard(&mut self) -> Option<bool> {
-        let keyboard = self.keyboard.as_ref()?;
+        self.keyboard.as_ref()?;
+        let focused = self.focused_app();
+        for window in self.windows.iter_mut().filter(|window| window.keyboard && Some(window.app) != focused) {
+            window.set_keyboard(false, false);
+            crate::kprintln!("  desktop     : keyboard released by '{}'", window.caption());
+        }
+        let program_typing = self.windows.get(self.focus).is_some_and(|window| window.keyboard && !window.minimized);
         // И «Параметры» с открытым полем ввода — пароль Wi-Fi (03.11).
-        let settings_typing = self.focused_app() == Some(App::Settings)
+        let settings_typing = focused == Some(App::Settings)
             && self.windows.iter().any(|window| window.app == App::Settings && window.wants_text());
-        let want = self.focused_app() == Some(App::Terminal) || self.start_focused() || settings_typing;
+        let want = focused == Some(App::Terminal) || self.start_focused() || settings_typing || program_typing;
+        let keyboard = self.keyboard.as_ref()?;
         if keyboard.is_visible() == want {
+            self.lift_program_windows();
             return None;
         }
         let rect = keyboard.rect;
@@ -2472,7 +2487,70 @@ impl Compositor {
                 }
             }
         }
+        self.lift_program_windows();
         Some(want)
+    }
+
+    /// Кнопка клавиатуры в заголовке окна программы (телефон, 05.11): открыть
+    /// клавиатуру для окна или убрать. Возвращает новое состояние; само
+    /// появление и сдвиг окна — на ближайшем кадре ([`Self::sync_keyboard`]).
+    pub fn toggle_window_keyboard(&mut self, app: App) -> bool {
+        let focus = self.focus;
+        let Some(index) = self.index_of(app) else {
+            return false;
+        };
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        let on = !window.keyboard;
+        window.set_keyboard(on, index == focus);
+        on
+    }
+
+    /// Окна программ над клавиатурой (05.11): активное окно, которому её
+    /// открыли, встаёт низом над ней, как терминал, — умеющая менять размер
+    /// программа получает [`user_abi::WIN_RESIZE`] и раскладывается заново.
+    /// Клавиатура ушла или окно её отпустило — низ возвращается к полоске
+    /// жеста. Свёрнутое окно ждёт: его размер меняется, когда оно вернётся.
+    ///
+    /// Каждый кадр, но дёшево: размер меняется, только когда низ окна не там.
+    fn lift_program_windows(&mut self) {
+        let gap = mini_ui::paint::Ctx::scaled(self.scale).px(keyboard::GAP) as i32;
+        let above = self
+            .keyboard
+            .as_ref()
+            .filter(|keyboard| keyboard.is_visible())
+            .map(|keyboard| keyboard.rect.y - gap);
+        let free = self.app_bottom();
+        let focus = self.focus;
+        for index in 0..self.windows.len() {
+            let Some(window) = self.windows.get_mut(index) else {
+                continue;
+            };
+            if window.minimized || !window.fit {
+                continue;
+            }
+            let bottom = match (window.keyboard && index == focus, above) {
+                (true, Some(top)) => top,
+                _ if window.lifted => free,
+                _ => continue,
+            };
+            let before = window.rect;
+            if before.bottom() == bottom {
+                window.lifted = bottom != free;
+                continue;
+            }
+            let height = (bottom - before.y).max(1) as u32;
+            if !window.resize(before.w, height) {
+                continue;
+            }
+            window.lifted = bottom != free;
+            window.draw_decorations(index == focus);
+            let after = window.rect;
+            let app = window.app;
+            crate::kprintln!("  desktop     : '{}' {} the keyboard at {}x{}", window.caption(), if window.lifted { "above" } else { "back from" }, after.w, after.h);
+            self.note_moved(app, before, after);
+        }
     }
 
     /// Довести отложенное изменение размера — палец отпустили.
