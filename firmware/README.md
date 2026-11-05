@@ -26,3 +26,25 @@ cargo xtask phone-firmware
 Команда кладёт сюда четыре файла по 118 784 байта из открытого хранилища
 прошивочных двоичных файлов этого аппарата. Без них ядро собирается и работает,
 но тачскрина на телефоне не будет — журнал скажет об этом прямо.
+
+## Разделы модема (`modem/`) и заводские копии (`stock/`)
+
+Сняты с eMMC телефона командой `fastboot oem emmc part <раздел>` (05.11).
+`modem/` — `md1img`, `nvdata`, `nvram`, `protect1/2`, `proinfo` и др.: в них
+IMEI и калибровка радио этого аппарата, никуда не выкладывать. `stock/` —
+заводские `boot`, `dtbo`, `vbmeta*`, `lk`, `lk2`, `logo`.
+
+### Вернуть MIUI
+
+С 05.11 **наш образ записан в раздел `boot`** (так LK загружает модем), и MIUI
+не запускается. Вернуть заводской `boot`:
+
+```
+fastboot reboot-bootloader            (ждать, пока getvar product = dandelion)
+certutil -hashfile firmware\stock\boot.bin SHA256
+    должно быть 0165dae97cc4719ce647fe8d715886c783dcc8121b153273eb0fe525dbd1cfc5
+fastboot flash boot firmware\stock\boot.bin
+fastboot reboot                       (одно нажатие питания на предупреждении)
+```
+
+Наша система остаётся в разделе `recovery`: `fastboot reboot recovery`.
