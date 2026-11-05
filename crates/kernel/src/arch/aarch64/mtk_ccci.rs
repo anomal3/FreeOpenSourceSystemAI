@@ -131,10 +131,21 @@ static LINK: SpinLock<Link> = SpinLock::new(Link { tx_seq: [0; 128], at_text: St
 fn note(text: String) {
     crate::kprintln!("  ccci        : {text}");
     let mut link = LINK.lock();
-    if link.log.len() >= 64 {
+    if link.log.len() >= 512 {
         link.log.remove(0);
     }
-    link.log.push(text);
+    let stamp = crate::time::uptime_ms();
+    link.log.push(format!("{stamp:>8} {text}"));
+}
+
+/// Весь журнал обмена текстом (`oem md logall` → `get_staged`).
+pub fn log_text() -> String {
+    let mut text = String::new();
+    for line in &LINK.lock().log {
+        text.push_str(line);
+        text.push('\n');
+    }
+    text
 }
 
 // ---------------------------------------------------------------------------
@@ -633,13 +644,17 @@ fn handle(q: usize, packet: &[u8]) {
         }
         CH_RPC_RX => {
             let op = le32(packet, 16);
-            note(format!("rpc op {op:#x} ({} bytes), answering NO_OP", packet.len()));
+            let params = rpc_params(packet);
+            let answer = rpc_answer(op, &params);
+            note(format!("rpc op {op:#x} {} -> {answer:?}", rpc_describe(&params)));
             let mut reply = Vec::new();
             reply.extend_from_slice(&packet[..16]);
             reply.extend_from_slice(&(op | RPC_RESP).to_le_bytes());
-            reply.extend_from_slice(&1u32.to_le_bytes());
-            reply.extend_from_slice(&4u32.to_le_bytes());
-            reply.extend_from_slice(&(-1i32).to_le_bytes());
+            reply.extend_from_slice(&(answer.len() as u32).to_le_bytes());
+            for value in &answer {
+                reply.extend_from_slice(&4u32.to_le_bytes());
+                reply.extend_from_slice(&value.to_le_bytes());
+            }
             let len = reply.len() as u32;
             let h = header(0, len, CH_RPC_TX, reserved);
             reply[..16].copy_from_slice(&h);
@@ -659,12 +674,74 @@ fn handle(q: usize, packet: &[u8]) {
         }
         CH_FS_RX => {
             let mut hex = String::new();
-            for b in packet.iter().skip(16).take(24) {
+            for b in packet.iter().skip(16).take(96) {
                 let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));
             }
             note(format!("fs request {} bytes: {hex}", packet.len()));
         }
         _ => note(format!("q{q} ch {channel} msg {d1:#x} {} bytes", packet.len())),
+    }
+}
+
+/// Параметры запроса RPC (`rpc_buffer`: op, para_num, затем {len, данные
+/// с выравниванием до 4}).
+fn rpc_params(packet: &[u8]) -> Vec<Vec<u8>> {
+    let count = le32(packet, 20).min(6) as usize;
+    let mut at = 24;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let len = le32(packet, at) as usize;
+        at += 4;
+        let Some(data) = packet.get(at..at + len) else { break };
+        out.push(data.to_vec());
+        at += (len + 3) & !3;
+    }
+    out
+}
+
+fn rpc_describe(params: &[Vec<u8>]) -> String {
+    let mut text = String::new();
+    for p in params {
+        if p.len() > 4 && p.iter().take(p.len() - 1).all(|b| b.is_ascii_graphic() || *b == 0) {
+            text.push_str(String::from_utf8_lossy(p).trim_end_matches('\0'));
+        } else {
+            let _ = core::fmt::Write::write_fmt(&mut text, format_args!("{:#x}", le32(p, 0)));
+        }
+        text.push(' ');
+    }
+    text
+}
+
+/// Ответ RPC: значения параметров по 4 байта (`port_rpc.c`).
+fn rpc_answer(op: u32, params: &[Vec<u8>]) -> Vec<i32> {
+    const FS_NO_OP: i32 = -1;
+    const QUERY_STRING: i32 = -11; // ERR_SIM_HOT_PLUG_QUERY_STRING
+    match op {
+        // IPC_RPC_GET_EINT_ATTR_OP: имя узла, ?, тип. Значения — из
+        // `md1_sim{1,2}_hot_plug_eint` дерева LK: interrupts <n 8>, debounce
+        // <n 10000> (мкс → мс), dedicated <n 0>, src_pin <n n+1>,
+        // sockettype <n 0>. Полярность и чувствительность из 8
+        // (IRQ_TYPE_LEVEL_LOW): (8 & 5) != 0 и (8 & 3) != 0 — обе 0.
+        0x4005 if params.len() >= 3 => {
+            let name = String::from_utf8_lossy(&params[0]).to_ascii_uppercase();
+            let sim = if name.starts_with("MD1_SIM1_HOT_PLUG_EINT") {
+                0
+            } else if name.starts_with("MD1_SIM2_HOT_PLUG_EINT") {
+                1
+            } else {
+                return alloc::vec![QUERY_STRING, QUERY_STRING];
+            };
+            let value = match le32(&params[2], 0) {
+                0 => sim,      // номер EINT
+                1 => 10,       // дребезг, мс
+                2 | 3 => 0,    // полярность, чувствительность
+                4 | 5 => 0,    // тип гнезда, выделенный
+                6 => sim + 1,  // исходный вывод
+                _ => return alloc::vec![-12, -12], // QUERY_TYPE
+            };
+            alloc::vec![0, value]
+        }
+        _ => alloc::vec![FS_NO_OP],
     }
 }
 

@@ -300,6 +300,11 @@ impl Fastboot {
                 }
                 _ => self.respond(b"FAIL", "usage: oem cell <service 0..4> <AcT 0..7> <bars 0..4> [r]"),
             }
+        } else if text == "oem md logall" {
+            let log = crate::arch::aarch64::mtk_ccci::log_text();
+            self.staged.clear();
+            self.staged.extend_from_slice(log.as_bytes());
+            self.say_done(&alloc::format!("{} bytes of modem log staged", log.len()));
         } else if text == "oem md" || text.starts_with("oem md ") {
             // Модем (05.11, M3): `oem md [status | power | pll | go | off]`.
             // M4: `hs` (ответ на HS1), `link` (CCIF и стадия), `log`,
