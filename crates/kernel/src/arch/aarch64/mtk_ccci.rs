@@ -145,6 +145,12 @@ pub static VOICE_AUTO: AtomicBool = AtomicBool::new(true);
 
 fn note(text: String) {
     crate::kprintln!("  ccci        : {text}");
+    note_quiet(text);
+}
+
+/// В журнал обмена (`oem md logall`), мимо журнала ядра: запросов FS у
+/// модема сотни на каждую загрузку (06.11 они вытесняли весь журнал ядра).
+fn note_quiet(text: String) {
     let mut link = LINK.lock();
     if link.log.len() >= 2048 {
         link.log.remove(0);
@@ -717,7 +723,7 @@ fn handle(q: usize, packet: &[u8]) {
         CH_FS_RX => {
             let (replies, text) = super::mtk_ccci_fs::handle(packet);
             if !text.is_empty() {
-                note(text);
+                note_quiet(text);
             }
             for (data0, slot, payload) in replies {
                 let mut out = Vec::with_capacity(16 + payload.len());

@@ -393,6 +393,39 @@ impl Fastboot {
             self.i2c(rest, true);
         } else if let Some(rest) = text.strip_prefix("oem i2c ") {
             self.i2c(rest, false);
+        } else if let Some(rest) = text.strip_prefix("oem key ") {
+            // Клавиша по кабелю: `oem key <enter|backspace|end|home|delete> [n]`.
+            use crate::input::KeyCode;
+            let mut words = rest.split_whitespace();
+            let code = match words.next().unwrap_or("") {
+                "enter" => Some(KeyCode::Enter),
+                "backspace" => Some(KeyCode::Backspace),
+                "end" => Some(KeyCode::End),
+                "home" => Some(KeyCode::Home),
+                "delete" => Some(KeyCode::Delete),
+                _ => None,
+            };
+            let count = words.next().and_then(|n| n.parse::<u32>().ok()).unwrap_or(1).min(200);
+            match code {
+                Some(code) => {
+                    for _ in 0..count {
+                        crate::input::post(code, true);
+                        crate::input::post(code, false);
+                    }
+                    self.respond(b"OKAY", "");
+                }
+                None => self.respond(b"FAIL", "usage: oem key <enter|backspace|end|home|delete> [n]"),
+            }
+        } else if let Some(rest) = text.strip_prefix("oem type ") {
+            // Набрать текст в окно с фокусом (06.11): `oem type <текст>`;
+            // `oem type \n` — Enter. Тем же путём, что экранная клавиатура.
+            if rest == "\\n" {
+                crate::input::post(crate::input::KeyCode::Enter, true);
+                crate::input::post(crate::input::KeyCode::Enter, false);
+            } else {
+                crate::ui::type_text(rest, false);
+            }
+            self.respond(b"OKAY", "");
         } else if let Some(rest) = text.strip_prefix("oem tap ") {
             self.synth_tap(rest);
         } else if let Some(rest) = text.strip_prefix("oem drag ") {

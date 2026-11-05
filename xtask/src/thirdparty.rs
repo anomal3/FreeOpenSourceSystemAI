@@ -191,7 +191,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 23] = [
+const PROJECTS: [Project; 24] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -556,8 +556,22 @@ const PROJECTS: [Project; 23] = [
         how: Autotools::plain(&["--with-hiscores-path="], &["AR={triple}-ar"]),
         installs: &["bin/sopwith"],
     },
+    // JPEG для NetSurf (06.11): классическая libjpeg IJG — autotools, без
+    // CMake (libjpeg-turbo собирается только им). Картинки на сайтах почти
+    // все JPEG; раньше места не было — образ телефона упирался в 25 МиБ
+    // recovery, теперь он в `boot`. Лицензия IJG (BSD-подобная); хеш снят с
+    // архива 06.11.2026, совпадает с опубликованным для v9f.
+    Project {
+        name: "libjpeg",
+        version: "9f",
+        url: "https://www.ijg.org/files/jpegsrc.v9f.tar.gz",
+        sha256: "04705c110cb2469caa79fb71fba3d7bf834914706e9641a4589485c1f832565b",
+        unpacked: "jpeg-9f",
+        how: Autotools::plain(&["--disable-shared"], &[]),
+        installs: &["lib/libjpeg.a", "include/jpeglib.h"],
+    },
     // Лёгкий браузер (начато 03.11): NetSurf с фронтендом framebuffer на
-    // libnsfb, сеть — curl выше, PNG — libpng выше, BMP и GIF — свои
+    // libnsfb, сеть — curl выше, PNG — libpng выше, JPEG — libjpeg выше, BMP и GIF — свои
     // библиотеки NetSurf. Без JavaScript. GPL-2.0 (браузер), MIT (библиотеки).
     // Хеш опубликованного рядом нет — снят с архива 03.11.2026.
     Project {

@@ -2711,7 +2711,7 @@ fn launch_target(desktop: &mut Compositor, target: start::Target) {
 /// ещё раз, обратно. Раскладку сочетание переключает там же, где знак
 /// получается из кода, — у того, кто разбирает очередь, по порядку событий, —
 /// поэтому переключение не обгоняет знаки и не отстаёт от них.
-fn type_text(text: &str, capital: bool) {
+pub(crate) fn type_text(text: &str, capital: bool) {
     use crate::input::{self, KeyCode};
     let tap = |code: KeyCode, shift: bool| {
         if shift {

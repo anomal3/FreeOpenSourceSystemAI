@@ -169,10 +169,10 @@ pub fn build(source: &Path, work: &Path, arch: Arch) -> Result<()> {
         "NETSURF_USE_OPENSSL=NO",
         "NETSURF_USE_NSLOG=NO",
         // Чего в наборе нет: SVG (libsvgtiny тянет свой gperf-разбор), спрайты
-        // RISC OS, JPEG, WebP, JPEG XL, PDF.
+        // RISC OS, WebP, JPEG XL, PDF. JPEG — с 06.11 (libjpeg набора).
         "NETSURF_USE_NSSVG=NO",
         "NETSURF_USE_ROSPRITE=NO",
-        "NETSURF_USE_JPEG=NO",
+        "NETSURF_USE_JPEG=YES",
         "NETSURF_USE_WEBP=NO",
         "NETSURF_USE_JPEGXL=NO",
         "NETSURF_USE_HARU_PDF=NO",
