@@ -284,13 +284,21 @@ pub fn netsurf_files(arch: crate::arch::Arch) -> Result<Vec<(String, Vec<u8>)>> 
     // мобильной навигации»): NetSurf читает `Choices` из своих ресурсов.
     // Страница крупнее, панель и полосы прокрутки толще.
     files.push((String::from("opt/netsurf/share/netsurf/Choices"), PHONE_CHOICES.as_bytes().to_vec()));
+    // Корневые сертификаты Mozilla (curl.se/ca/cacert.pem, MPL 2.0): без них
+    // https не открывался ни один сайт — «Problem with the SSL CA cert»
+    // (05.11). Путь — в `PHONE_CHOICES` (`ca_bundle`).
+    let bundle = crate::paths::workspace_root().join("assets/ca/cacert.pem");
+    if bundle.is_file() {
+        files.push((String::from("opt/netsurf/share/netsurf/ca-bundle.pem"), std::fs::read(bundle)?));
+    }
     Ok(files)
 }
 
 /// `Choices` NetSurf для телефона: масштаб в процентах, высота панели и
 /// толщина полос прокрутки в точках.
 /// 175 % резало строки встроенным растровым шрифтом — 140 % ещё помещается.
-const PHONE_CHOICES: &str = "scale:140\nfb_toolbar_size:56\nfb_furniture_size:34\n";
+const PHONE_CHOICES: &str =
+    "scale:140\nfb_toolbar_size:56\nfb_furniture_size:34\nca_bundle:/opt/netsurf/share/netsurf/ca-bundle.pem\n";
 
 pub fn build(options: &Options) -> Result<PathBuf> {
     let kernel = match &options.kernel {
