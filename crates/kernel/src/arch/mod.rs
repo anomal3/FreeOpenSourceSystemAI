@@ -203,6 +203,17 @@ pub fn backlight(on: bool) {
     let _ = on;
 }
 
+/// Телефон ли это (MediaTek, ядро `xtask phone`).
+#[must_use]
+pub fn is_phone() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::mtk::present()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    false
+}
+
 /// Коротко прогудеть вибромотором (отклик клавиш), если он есть.
 pub fn vibrate(ms: u32) {
     #[cfg(target_arch = "aarch64")]

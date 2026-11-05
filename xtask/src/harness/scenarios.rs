@@ -5545,7 +5545,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
-        memory: "",
+        memory: "2048M",
         extra: &[],
         steps: &[
             Step::Await("display     : 720x1600 set at start", BOOT),
