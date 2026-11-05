@@ -950,7 +950,7 @@ fn overlay_print(args: fmt::Arguments<'_>) {
 /// Стол перерисовал кусок экрана: если он задел полосу журнала — вернуть её
 /// поверх (иначе последний кадр зависшего телефона её затирал, 05.11).
 pub fn overlay_redraw(y: i32, h: u32) {
-    if !OVERLAY.load(Ordering::Relaxed) || y > (OV_TOP + OV_ROWS as u32 * GLYPH_H * 2) as i32 || y + h as i32 <= OV_TOP as i32 {
+    if !OVERLAY.load(Ordering::Relaxed) || y > (OV_TOP + OV_ROWS as u32 * GLYPH_H * 2 + 8) as i32 || y + h as i32 <= OV_TOP as i32 {
         return;
     }
     let Some(ov) = OV.try_lock() else {
@@ -984,6 +984,8 @@ fn draw_overlay(ov: &Overlay) {
         return;
     };
     painter.top = OV_TOP;
+    // Крупно: строки читают с фотографии экрана.
+    painter.scale = 2;
     let cols = (painter.width.saturating_sub(MARGIN * 2) / (GLYPH_W * painter.scale)).min(OV_COLS as u32);
     for row in 0..OV_ROWS {
         let line = ov.lines[(ov.next + row) % OV_ROWS];

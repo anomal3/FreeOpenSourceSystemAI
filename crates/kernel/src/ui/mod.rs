@@ -4986,6 +4986,7 @@ pub fn commit_window(task: u32, slot: u32, area: Option<Rect>) -> Result<(), Win
             return Err(WindowError::NoWindow);
         };
         window.commit(area);
+        COMMITS.fetch_add(1, Ordering::Relaxed);
         // Кадр — не чаще раза в [`COMMIT_FRAME_MS`] (05.11): NetSurf сообщает
         // о каждом нарисованном куске страницы, и пересборка экрана на каждое
         // сообщение под замком стола на телефоне съедала всё — экран, касания
@@ -5002,6 +5003,9 @@ pub fn commit_window(task: u32, slot: u32, area: Option<Rect>) -> Result<(), Win
     })
     .unwrap_or_else(|| Err(unavailable()))
 }
+
+/// Сколько раз программы сообщали о нарисованном (для отладочной полосы).
+pub static COMMITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Когда кадр собирался по сообщению программы (мс) и как часто можно.
 static LAST_COMMIT_FRAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

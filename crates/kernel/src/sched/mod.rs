@@ -1466,14 +1466,28 @@ fn watch_tick() {
         }
     }
     let seconds = core::str::from_utf8(&digits[at..]).unwrap_or("?");
+    static SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let commits = crate::ui::COMMITS.load(Ordering::Relaxed);
+    let mut per = commits.saturating_sub(SEEN.swap(commits, Ordering::Relaxed));
+    let mut cdigits = [0u8; 20];
+    let mut cat = cdigits.len();
+    loop {
+        cat -= 1;
+        cdigits[cat] = b'0' + (per % 10) as u8;
+        per /= 10;
+        if per == 0 {
+            break;
+        }
+    }
+    let rate = core::str::from_utf8(&cdigits[cat..]).unwrap_or("?");
     let cpu = smp::cpu();
     let idle = ON_IDLE[cpu].load(Ordering::Relaxed);
     match SCHED.try_lock() {
         Some(sched) => {
             let name = sched.tasks[sched.current()].as_ref().map_or("none", |task| task.name);
-            crate::console::overlay_note(&["  tick ", seconds, " s: on cpu '", name, if idle { "' (idle)" } else { "'" }]);
+            crate::console::overlay_note(&["t", seconds, " ", name, if idle { " idle" } else { "" }, " c", rate]);
         }
-        None => crate::console::overlay_note(&["  tick ", seconds, " s: scheduler lock held"]),
+        None => crate::console::overlay_note(&["t", seconds, " SCHED LOCKED c", rate]),
     }
 }
 
