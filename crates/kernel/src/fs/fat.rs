@@ -354,19 +354,53 @@ struct Volume {
     device: Box<dyn BlockDevice>,
     geometry: Geometry,
     cache: SpinLock<SectorCache>,
-    /// Где остановились прошлые чтения файлов: первый кластер файла, номер
-    /// кластера в цепочке и сам кластер (04.11).
+    /// Карты цепочек крупных файлов, последняя нужная — в конце (05.11).
     ///
-    /// Без этого каждое чтение шло по цепочке от начала файла: программа в
+    /// Без них каждое чтение шло по цепочке от начала файла: программа в
     /// 4,7 МиБ на RAM-диске с кластером 512 байт подгружалась страницами, и
-    /// страница в конце файла стоила девяти тысяч шагов по FAT — NetSurf на
-    /// телефоне запускался минуту и вешал систему. Том только для чтения:
-    /// цепочки не меняются, и подсказка не устаревает.
-    hints: SpinLock<[(u32, u64, u32); HINTS]>,
+    /// страница в конце файла стоила девяти тысяч шагов по FAT. Подсказка
+    /// «где остановилось прошлое чтение» (04.11) помогала только чтению
+    /// вперёд, а страницы программы подгружаются вразнобой: запуск NetSurf
+    /// всё равно делал ~870 тыс. шагов на ~600 чтений — полторы тысячи на
+    /// страницу. На телефоне каждый промах кеша секторов FAT — это 64
+    /// некешируемых чтения RAM-диска. Том только для чтения: цепочки не
+    /// меняются, и карта не устаревает.
+    maps: SpinLock<Vec<Arc<ChainMap>>>,
 }
 
-/// Сколько файлов помнят место последнего чтения.
-const HINTS: usize = 8;
+/// Сколько карт цепочек держит том.
+const MAPS: usize = 16;
+
+/// Файлы не длиннее стольких кластеров читаются обходом: шагов немного, а
+/// карта на каждый мелкий файл только вытесняла бы карты крупных.
+const MAP_MIN_CLUSTERS: u64 = 64;
+
+/// Потолок кусков в карте. Образы, собранные `xtask`, кладут файл одним
+/// куском; раздробленнее этого файл читается обходом, как раньше.
+const MAP_MAX_RUNS: usize = 1024;
+
+/// Цепочка файла кусками подряд идущих кластеров.
+struct ChainMap {
+    /// Первый кластер файла — им карта и опознаётся.
+    start: u32,
+    /// Номер кластера в файле, с которого начинается кусок, его первый
+    /// кластер на томе и длина в кластерах; по возрастанию номера.
+    runs: Vec<(u64, u32, u32)>,
+}
+
+impl ChainMap {
+    /// Кластер тома под номером `index` в файле и сколько кластеров куска
+    /// осталось от него (включая его самого). `None` — за концом цепочки.
+    fn locate(&self, index: u64) -> Option<(u32, u32)> {
+        let at = self.runs.partition_point(|(first, _, _)| *first <= index).checked_sub(1)?;
+        let (first, cluster, len) = self.runs[at];
+        let into = index - first;
+        if into >= u64::from(len) {
+            return None;
+        }
+        Some((cluster + into as u32, len - into as u32))
+    }
+}
 
 impl Volume {
     /// Прочитать подряд идущие секторы тома прямо в `buf`, мимо кеша.
@@ -523,26 +557,23 @@ impl Volume {
 
         let cluster_bytes = u64::from(self.geometry.cluster_bytes);
         let target = offset / cluster_bytes;
-        // Начать с запомненного места, если оно не дальше нужного.
-        let hint = self.hints.lock().iter().copied().find(|(start, index, _)| *start == start_cluster && start_cluster != 0 && *index <= target);
-        let (mut chain, from) = match hint {
-            Some((_, index, cluster)) => (self.chain(cluster)?, index),
-            None => (self.chain(start_cluster)?, 0),
-        };
-        for _ in from..target {
+        let clusters = size.div_ceil(cluster_bytes);
+
+        // Крупный файл — по карте его цепочки: место в файле переводится в
+        // кластер без обхода FAT, а подряд идущие кластеры читаются одним
+        // куском (05.11, см. [`ChainMap`]).
+        if clusters > MAP_MIN_CLUSTERS {
+            if let Some(map) = self.chain_map(start_cluster, clusters)? {
+                return self.read_mapped(&map, offset, &mut dst[..want]);
+            }
+        }
+
+        let mut chain = self.chain(start_cluster)?;
+        for _ in 0..target {
             if chain.step()?.is_none() {
                 // Цепочка короче, чем обещает размер в записи каталога.
                 return Err(VfsError::Corrupt);
             }
-        }
-        if let Some(cluster) = chain.next {
-            let mut hints = self.hints.lock();
-            let slot = hints.iter().position(|(start, _, _)| *start == start_cluster).unwrap_or_else(|| {
-                // Самый старый — первый: сдвинуть и занять последний.
-                hints.rotate_left(1);
-                HINTS - 1
-            });
-            hints[slot] = (start_cluster, target, cluster);
         }
 
         let mut within = (offset % cluster_bytes) as usize;
@@ -557,6 +588,116 @@ impl Volume {
             within = 0;
         }
         Ok(done)
+    }
+
+    /// Прочитать `dst.len()` байт файла с `offset` по карте его цепочки.
+    /// Вызывающий уже обрезал `dst` по размеру файла.
+    fn read_mapped(&self, map: &ChainMap, offset: u64, dst: &mut [u8]) -> VfsResult<usize> {
+        let cluster_bytes = u64::from(self.geometry.cluster_bytes);
+        let mut index = offset / cluster_bytes;
+        let mut within = (offset % cluster_bytes) as usize;
+        let mut done = 0usize;
+        while done < dst.len() {
+            // Цепочка короче, чем обещает размер в записи каталога.
+            let (cluster, run) = map.locate(index).ok_or(VfsError::Corrupt)?;
+            let span = (run as usize).saturating_mul(self.geometry.cluster_bytes as usize) - within;
+            let take = core::cmp::min(span, dst.len() - done);
+            self.read_in_run(cluster, run, within, &mut dst[done..done + take])?;
+            done += take;
+            // Кусок дочитан до конца либо кончился запрос — во втором случае
+            // цикл и так выходит.
+            index += u64::from(run);
+            within = 0;
+        }
+        Ok(done)
+    }
+
+    /// Прочитать кусок внутри `run` подряд идущих кластеров, начиная с
+    /// `cluster`: их секторы тоже идут подряд.
+    fn read_in_run(&self, cluster: u32, run: u32, offset: usize, dst: &mut [u8]) -> VfsResult<()> {
+        let last = cluster.checked_add(run.saturating_sub(1)).ok_or(VfsError::Corrupt)?;
+        if run == 0 || last > self.geometry.max_cluster {
+            return Err(VfsError::Corrupt);
+        }
+        let cluster_bytes = self.geometry.cluster_bytes as usize;
+        if offset + dst.len() > run as usize * cluster_bytes {
+            return Err(VfsError::OutOfBounds);
+        }
+        // Внутри одного кластера — обычный путь с краями через кеш; дальше —
+        // кластер за кластером того же куска, но без шагов по FAT.
+        let mut done = 0usize;
+        let mut at = offset;
+        while done < dst.len() {
+            let index = (at / cluster_bytes) as u32;
+            let within = at % cluster_bytes;
+            let take = core::cmp::min(cluster_bytes - within, dst.len() - done);
+            self.read_in_cluster(cluster + index, within, &mut dst[done..done + take])?;
+            done += take;
+            at += take;
+        }
+        Ok(())
+    }
+
+    /// Карта цепочки файла с первым кластером `start` и длиной `clusters`
+    /// кластеров: из запаса, а нет — построенная одним обходом и положенная
+    /// туда. `None` — цепочка так раздроблена, что карта вышла бы больше
+    /// [`MAP_MAX_RUNS`]: такой файл читается обходом, как раньше.
+    fn chain_map(&self, start: u32, clusters: u64) -> VfsResult<Option<Arc<ChainMap>>> {
+        {
+            let mut maps = self.maps.lock();
+            if let Some(at) = maps.iter().position(|map| map.start == start) {
+                // Свежая — в конец: вытесняется та, что дольше не нужна.
+                let map = maps.remove(at);
+                maps.push(map.clone());
+                return Ok(Some(map));
+            }
+        }
+
+        // Обход — без замка: это тысячи обращений к FAT, а замок запрещает
+        // прерывания. Два потока, построившие карту одного файла разом,
+        // получат одинаковые карты, и в запас ляжет одна.
+        let mut runs: Vec<(u64, u32, u32)> = Vec::new();
+        let mut chain = self.chain(start)?;
+        let mut index = 0u64;
+        while index < clusters {
+            let Some(cluster) = chain.step()? else {
+                // Цепочка короче размера: карта — сколько есть, отказ —
+                // при чтении за её концом.
+                break;
+            };
+            match runs.last_mut() {
+                Some((_, first, len)) if first.checked_add(*len) == Some(cluster) => *len += 1,
+                _ => {
+                    if runs.len() == MAP_MAX_RUNS {
+                        return Ok(None);
+                    }
+                    runs.try_reserve(1).map_err(|_| VfsError::OutOfMemory)?;
+                    runs.push((index, cluster, 1));
+                }
+            }
+            index += 1;
+        }
+        // Только про крупные файлы (программы): по строке видно, что чтение
+        // пошло по карте и сколько в ней кусков.
+        if index >= 1024 {
+            crate::kprintln!("  fat         : chain map of {index} clusters in {} run(s)", runs.len());
+        }
+        let map = Arc::new(ChainMap { start, runs });
+
+        // Вытесненная карта освобождается после замка, а место под новую
+        // заведено при монтировании: под замком куча не трогается.
+        let evicted = {
+            let mut maps = self.maps.lock();
+            if maps.iter().any(|known| known.start == start) {
+                None
+            } else {
+                let evicted = if maps.len() == MAPS { Some(maps.remove(0)) } else { None };
+                maps.push(map.clone());
+                evicted
+            }
+        };
+        drop(evicted);
+        Ok(Some(map))
     }
 
     /// Обойти записи каталога, начиная с кластера `start`.
@@ -913,7 +1054,9 @@ impl Fat32 {
         let geometry = Geometry::parse(&boot, device.block_count())?;
         let cache = SectorCache::new(geometry.bytes_per_sector as usize)?;
 
-        Ok(Self { volume: Arc::new(Volume { device, geometry, cache: SpinLock::new(cache), hints: SpinLock::new([(0, 0, 0); HINTS]) }) })
+        let mut maps = Vec::new();
+        maps.try_reserve_exact(MAPS).map_err(|_| VfsError::OutOfMemory)?;
+        Ok(Self { volume: Arc::new(Volume { device, geometry, cache: SpinLock::new(cache), maps: SpinLock::new(maps) }) })
     }
 
     /// Разобранная геометрия тома — для диагностики при загрузке.

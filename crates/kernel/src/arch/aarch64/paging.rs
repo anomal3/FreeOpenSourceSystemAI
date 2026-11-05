@@ -1505,7 +1505,7 @@ pub fn build_kernel_address_space(
 
     let mut space = PageTables::new(alloc)?;
 
-    map_physical_memory(&mut space, &info.memory_map, alloc)?;
+    map_physical_memory(&mut space, &info.memory_map, &info.initrd, alloc)?;
     map_kernel_image(&mut space, info, alloc)?;
     map_devices(&mut space, info, alloc)?;
     map_heap(&mut space, alloc)?;
@@ -1518,8 +1518,16 @@ pub fn build_kernel_address_space(
 fn map_physical_memory(
     space: &mut PageTables,
     map: &MemoryMap,
+    initrd: &boot_info::Initrd,
     alloc: &mut impl FrameAllocator,
 ) -> Result<(), MapError> {
+    // Страницы образа RAM-диска: он лежит в обычном ОЗУ, хоть и помечен
+    // занятым.
+    let initrd_pages = if initrd.size == 0 {
+        (0, 0)
+    } else {
+        (initrd.base & !(PAGE_SIZE as u64 - 1), initrd.base.saturating_add(initrd.size).next_multiple_of(PAGE_SIZE as u64))
+    };
     if map.ptr == 0 || map.len == 0 {
         crate::kprintln!("WARNING: empty memory map, nothing to identity-map");
         return Ok(());
@@ -1564,8 +1572,18 @@ fn map_physical_memory(
         // Reserved — это прошивка и MMIO. Normal-память процессору позволено
         // читать спекулятивно, а спекулятивное чтение регистра устройства
         // имеет побочные эффекты; Device-семантика такое чтение запрещает.
+        //
+        // Кроме образа RAM-диска (05.11): это обычное ОЗУ, и Device-память там
+        // означала, что каждые восемь байт файла — отдельное некешируемое
+        // обращение к шине. QEMU разницы не видит (под TCG Device-память
+        // читается так же быстро), а телефон видел: NetSurf с RAM-диска
+        // подгружался страницами, и каждая стоила сотен таких обращений плюс
+        // обход FAT по таким же секторам. Регион должен лежать внутри образа
+        // целиком — чужое занятое рядом остаётся Device.
         let flags = if region.kind == KIND_FRAMEBUFFER {
             KERNEL_FRAMEBUFFER
+        } else if region.kind == KIND_RESERVED && region.start >= initrd_pages.0 && end <= initrd_pages.1 {
+            KERNEL_DATA
         } else if region.kind == KIND_RESERVED {
             KERNEL_DEVICE
         } else {

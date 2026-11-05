@@ -723,9 +723,16 @@ const BOOT: u64 = 180_000;
 pub fn screen_for(name: &str) -> Option<&'static str> {
     match name {
         // Экран телефона: форма машины и масштаб стола считаются от него.
-        "mobile" => Some("720x1600"),
+        "mobile" | "mobile-netsurf" => Some("720x1600"),
         _ => None,
     }
+}
+
+/// Сценарий грузится с RAM-диском телефона (05.11): облегчённая копия, как у
+/// `xtask phone --lean`, с NetSurf в `/opt/netsurf` (`harness::phone_ramdisk`).
+#[must_use]
+pub fn phone_ramdisk(name: &str) -> bool {
+    matches!(name, "mobile-netsurf")
 }
 
 /// Что стенд стирает с раздела состояния перед загрузкой: пути от корня
@@ -5514,6 +5521,70 @@ pub const ALL: &[Scenario] = &[
             // Страница ошибки вместо страницы — значит, не скачалась или не
             // разобралась (так выглядел отказ `iconv`).
             Step::Absent("Loading 'about:query/fetcherror'"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "mobile-netsurf",
+        about: "NetSurf на экране телефона 720x1600 (05.11): RAM-диск как у телефона, браузер с значка «Браузер» на домашнем экране, страница приветствия, снимок, закрытие.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: true,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::Aarch64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("display     : 720x1600 set at start", BOOT),
+            Step::Await("keyboard    : shown", BOOT),
+            Step::Await(PROMPT, BOOT),
+            Step::Wait(1500),
+            // Терминал, открытый при загрузке, — в стопку, как в `mobile`.
+            Step::Aim(Aim::Point(462, 164)),
+            Step::Click,
+            Step::Await("desktop     : minimized 'Terminal'", 15_000),
+            Step::Await("desktop     : minimize flight of 'Terminal': ", 15_000),
+            Step::Wait(1000),
+            Step::Shot("01-home"),
+            // «Браузер» — второй значок домашнего экрана; открывается во весь
+            // экран, и браузер растягивает себя под рамку (WIN_RESIZE).
+            Step::Aim(Aim::Point(277, 550)),
+            Step::Click,
+            Step::Await("desktop     : started '/opt/netsurf/bin/netsurf'", 30_000),
+            Step::Await("desktop     : opened 'NetSurf' for ", 60_000),
+            Step::Await("desktop     : 'NetSurf' is resizable", 30_000),
+            // Страница приветствия (по умолчанию) с логотипом PNG; оболочка
+            // молчит 20 с и закрывает сеанс — ждать дольше нельзя.
+            Step::Wait(6_000),
+            Step::Painted("02-netsurf"),
+            // Касание страницы — как пальцем: браузер обязан остаться живым.
+            Step::Aim(Aim::Point(360, 1200)),
+            Step::Click,
+            Step::Wait(2_000),
+            Step::Shot("03-tapped"),
+            // Крестик в заголовке телефона.
+            Step::Aim(Aim::Point(674, 123)),
+            Step::Click,
+            Step::Await("/opt/netsurf/bin/netsurf: exited with code 0", 30_000),
+            // Самый долгий участок с закрытыми прерываниями — в журнал.
+            Step::Line("tasks"),
+            Step::Await("  latency    :", 15_000),
+            // Крупные файлы RAM-диска читаются по карте цепочки, а не обходом
+            // FAT на каждую страницу (05.11; NetSurf — 4,7 МиБ одним куском).
+            Step::Expect("fat         : chain map of "),
             Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],

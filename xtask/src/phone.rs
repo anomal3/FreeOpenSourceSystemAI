@@ -224,7 +224,7 @@ const STOCK_VBMETA_AT: u64 = 25_812_992;
 /// обязан уместиться до [`STOCK_VBMETA_AT`] вместе с ядром. Ядро берёт длину
 /// диска у загрузчика (`fdt_boot::initrd`), так что короткий образ ему не помеха.
 /// Чужой RAM-диск (заводской cpio) остаётся как есть: у него нет подписи 55 AA.
-fn trim_volume(mut bytes: Vec<u8>) -> Vec<u8> {
+pub fn trim_volume(mut bytes: Vec<u8>) -> Vec<u8> {
     const BLOCK: usize = 64 * 1024;
     if bytes.len() < 512 || bytes[510..512] != [0x55, 0xaa] || bytes.len() % BLOCK != 0 {
         return bytes;
@@ -242,7 +242,7 @@ fn trim_volume(mut bytes: Vec<u8>) -> Vec<u8> {
 /// диска), проверочные программы, которым на телефоне делать нечего, и
 /// крупные необязательные шрифты Блокнота (Inter, JetBrains Mono и DejaVu
 /// Sans/Mono остаются; по умолчанию он пишет встроенным).
-const LEAN_SKIP: &[&str] = &[
+pub const LEAN_SKIP: &[&str] = &[
     "bin/mono",
     "usr/lib/mono",
     "bin/dotnet",
@@ -261,6 +261,27 @@ const LEAN_SKIP: &[&str] = &[
     "usr/share/fonts/fossai/IBMPlexMono-Regular.ttf",
     "usr/share/fonts/fossai/SourceCodePro.ttf",
 ];
+
+/// NetSurf (04.11) для RAM-диска телефона — из sysroot сборки, как ставит его
+/// пакет: в RAM-диск ПК он не входит (`GAMES` — только носитель установки), а
+/// носителя у телефона нет. Пусто, если браузер не собран. Тем же набором
+/// стенд собирает RAM-диск сценария `mobile-netsurf` — как у телефона.
+pub fn netsurf_files(arch: crate::arch::Arch) -> Result<Vec<(String, Vec<u8>)>> {
+    let sysroot = crate::cbuild::sysroot(arch);
+    let browser = sysroot.join("bin/netsurf");
+    let mut files = Vec::new();
+    if !browser.is_file() {
+        return Ok(files);
+    }
+    files.push((String::from("opt/netsurf/bin/netsurf"), std::fs::read(&browser)?));
+    if let Ok(dir) = std::fs::read_dir(sysroot.join("share/netsurf")) {
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            files.push((format!("opt/netsurf/share/netsurf/{name}"), std::fs::read(entry.path())?));
+        }
+    }
+    Ok(files)
+}
 
 pub fn build(options: &Options) -> Result<PathBuf> {
     let kernel = match &options.kernel {
@@ -297,28 +318,18 @@ pub fn build(options: &Options) -> Result<PathBuf> {
                     }
                 }
             }
-            // NetSurf (04.11) — из sysroot сборки, как ставит его пакет: в
-            // RAM-диск ПК он не входит (`GAMES` — только носитель установки), а
-            // носителя у телефона нет.
-            let sysroot = crate::cbuild::sysroot(crate::arch::Arch::Aarch64);
-            let browser = sysroot.join("bin/netsurf");
-            if browser.is_file() {
-                extra.push((String::from("opt/netsurf/bin/netsurf"), std::fs::read(&browser)?));
-                if let Ok(dir) = std::fs::read_dir(sysroot.join("share/netsurf")) {
-                    for entry in dir.flatten() {
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        extra.push((format!("opt/netsurf/share/netsurf/{name}"), std::fs::read(entry.path())?));
-                    }
-                }
-                say!("браузер NetSurf: /opt/netsurf/bin/netsurf");
-            } else {
-                say!("NetSurf не собран ({}) — браузера на телефоне не будет: cargo xtask thirdparty netsurf", browser.display());
-            }
             if extra.is_empty() {
                 say!("прошивок блока связи нет в firmware/connsys/ — Wi-Fi на аппарате не загрузится");
             } else {
                 say!("прошивки блока связи: {} файл(ов) в /lib/firmware/connsys", extra.len());
             }
+            let browser = netsurf_files(crate::arch::Arch::Aarch64)?;
+            if browser.is_empty() {
+                say!("NetSurf не собран — браузера на телефоне не будет: cargo xtask thirdparty netsurf");
+            } else {
+                say!("браузер NetSurf: /opt/netsurf/bin/netsurf");
+            }
+            extra.extend(browser);
             let dropped = crate::initrd::lean_copy(ramdisk, &path, LEAN_SKIP, &extra)?;
             say!("RAM-диск облегчён: {} МиБ выброшено ({})", dropped / (1024 * 1024), LEAN_SKIP.join(", "));
             lean = Options { ramdisk: Some(path), ..options.clone() };

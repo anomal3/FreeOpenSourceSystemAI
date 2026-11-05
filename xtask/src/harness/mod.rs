@@ -3030,6 +3030,33 @@ fn forget_on_state(disk_path: &std::path::Path, paths: &[&str]) -> Result<()> {
     fs.finish()
 }
 
+/// RAM-диск как у телефона (05.11): та же облегчённая копия, что собирает
+/// `xtask phone --lean` (без Mono и тяжёлых проверочных программ), и NetSurf в
+/// `/opt/netsurf` — тем же набором файлов. Ложится в ESP вместо обычного
+/// `initrd.img`, со временем правки в начале эпохи: следующий сценарий увидит
+/// его устаревшим (`util::copy_file_if_stale`) и вернёт обычный образ.
+fn phone_ramdisk(built: &build::Built, esp: &std::path::Path) -> Result<()> {
+    let Some(full) = built.initrd() else {
+        bail!("сценарию с RAM-диском телефона нужен собранный initrd");
+    };
+    let extra = crate::phone::netsurf_files(built.arch)?;
+    if extra.is_empty() {
+        bail!("NetSurf не собран под {} — собрать: cargo xtask thirdparty --only netsurf", built.arch.name());
+    }
+    let dst = esp.join(crate::arch::INITRD_ESP_FILE);
+    crate::initrd::lean_copy(full, &dst, crate::phone::LEAN_SKIP, &extra)?;
+    // Хвост из нулей отрезается, как в образе телефона: ядро берёт длину
+    // диска у загрузчика, и том длиннее диска — тоже часть сходства.
+    let trimmed = crate::phone::trim_volume(std::fs::read(&dst)?);
+    std::fs::write(&dst, &trimmed)?;
+    std::fs::File::options()
+        .write(true)
+        .open(&dst)?
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)?;
+    say!("ESP: RAM-диск как у телефона, с NetSurf в /opt/netsurf -> {}", dst.display());
+    Ok(())
+}
+
 /// Носители машины для сценария.
 fn prepare_drives(
     scenario: &Scenario,
@@ -3042,6 +3069,9 @@ fn prepare_drives(
             let esp = qemu::prepare_esp(built, true)?;
             if let Some(mode) = scenarios::screen_for(scenario.name) {
                 qemu::request_screen(&esp, mode)?;
+            }
+            if scenarios::phone_ramdisk(scenario.name) {
+                phone_ramdisk(built, &esp)?;
             }
             // Ключ для входа в живую систему (фаза 68o) — там же, где его
             // положил бы человек: `\FREEOS\authorized_keys` на томе загрузки.
