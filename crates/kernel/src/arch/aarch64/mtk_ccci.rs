@@ -128,16 +128,21 @@ struct Link {
     tx_seq: [u16; 128],
     /// Принятые строки AT (последние).
     at_text: String,
+    /// Недособранная строка AT.
+    at_line: String,
     /// Журнал пакетов для `oem md log`.
     log: Vec<String>,
 }
 
-static LINK: SpinLock<Link> = SpinLock::new(Link { tx_seq: [0; 128], at_text: String::new(), log: Vec::new() });
+static LINK: SpinLock<Link> =
+    SpinLock::new(Link { tx_seq: [0; 128], at_text: String::new(), at_line: String::new(), log: Vec::new() });
+/// Модем сказал `+EIND: 128` — AT-порт готов.
+static AT_READY: AtomicBool = AtomicBool::new(false);
 
 fn note(text: String) {
     crate::kprintln!("  ccci        : {text}");
     let mut link = LINK.lock();
-    if link.log.len() >= 512 {
+    if link.log.len() >= 2048 {
         link.log.remove(0);
     }
     let stamp = crate::time::uptime_ms();
@@ -673,7 +678,28 @@ fn handle(q: usize, packet: &[u8]) {
         }
         CH_UART2_RX => {
             let text = String::from_utf8_lossy(&packet[16.min(packet.len())..]).into_owned();
-            note(format!("AT <- {}", text.trim()));
+            // Модем шлёт и по символу (эхо), и строками: журнал и индикатор —
+            // по целым строкам.
+            let lines: Vec<String> = {
+                let mut link = LINK.lock();
+                link.at_line.push_str(&text);
+                let mut done = Vec::new();
+                while let Some(at) = link.at_line.find(['\r', '\n']) {
+                    let line: String = link.at_line[..at].trim().into();
+                    link.at_line.drain(..=at);
+                    if !line.is_empty() {
+                        done.push(line);
+                    }
+                }
+                done
+            };
+            for line in &lines {
+                note(format!("AT <- {line}"));
+                if line.starts_with("+EIND: 128") {
+                    AT_READY.store(true, Ordering::Release);
+                }
+                cellular_from_at(line);
+            }
             let mut link = LINK.lock();
             link.at_text.push_str(&text);
             if link.at_text.len() > 4096 {
@@ -803,10 +829,97 @@ fn rpc_answer_ints(op: u32, params: &[Vec<u8>]) -> Vec<i32> {
     }
 }
 
+/// Обновить индикатор сотовой связи (`crate::cellular`) по строке AT:
+/// `+CREG/+CEREG/+CGREG: [n,]stat[,lac,ci[,act]]`, `+CSQ: rssi,ber`,
+/// `+COPS: mode[,format,"oper",act]`, `+CPIN`/`+ESIMS` — SIM.
+fn cellular_from_at(line: &str) {
+    use crate::cellular::{self, Radio, Service};
+    let mut state = cellular::get();
+    let nums = |rest: &str| -> Vec<i64> {
+        rest.split(',').map(|f| f.trim().trim_matches('"')).map(|f| f.parse::<i64>().unwrap_or(-1)).collect()
+    };
+    if let Some(rest) = line
+        .strip_prefix("+CREG:")
+        .or_else(|| line.strip_prefix("+CEREG:"))
+        .or_else(|| line.strip_prefix("+CGREG:"))
+    {
+        let f = nums(rest);
+        // Ответ на запрос — «n,stat[,"lac","ci",act]»: второе поле — число;
+        // незапрошенное — «stat[,"lac","ci",act]»: второе поле в кавычках или
+        // его нет.
+        let quoted = rest.split(',').nth(1).is_some_and(|f| f.trim().starts_with('"'));
+        let (stat, act) = if f.len() >= 2 && !quoted {
+            (f[1], f.get(4).copied())
+        } else {
+            (f[0], f.get(3).copied())
+        };
+        state.service = match stat {
+            1 | 5 => Service::Registered,
+            2 => Service::Searching,
+            3 => Service::Emergency,
+            _ => if state.service == Service::NoSim { Service::NoSim } else { Service::Searching },
+        };
+        state.roaming = stat == 5;
+        if let Some(act) = act.filter(|a| *a >= 0) {
+            state.radio = Radio::from_act(act as u32);
+        }
+    } else if let Some(rest) = line.strip_prefix("+CSQ:") {
+        let f = nums(rest);
+        if let Some(rssi) = f.first() {
+            state.bars = cellular::bars_from_csq(*rssi as u32);
+        }
+    } else if let Some(rest) = line.strip_prefix("+COPS:") {
+        let f = nums(rest);
+        if let Some(act) = f.get(3).filter(|a| **a >= 0) {
+            state.radio = Radio::from_act(*act as u32);
+        }
+    } else if line.starts_with("+CPIN: READY") || line == "+ESIMS: 1" {
+        if state.service == Service::NoSim || state.service == Service::NoModem {
+            state.service = Service::Searching;
+        }
+    } else if line == "+ESIMS: 0" || line == "+CME ERROR: 10" {
+        state.service = Service::NoSim;
+    } else {
+        return;
+    }
+    cellular::set(state);
+}
+
+/// После READY: включить радио и регистрацию с сообщениями; дальше раз в
+/// 10 с спрашивать уровень и сеть — индикатор в строке состояния.
+fn radio_tick(started: &mut bool, last: &mut u64) {
+    if STAGE.load(Ordering::Acquire) < 2 || !AT_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let now = crate::time::uptime_ms();
+    if !*started {
+        *started = true;
+        crate::cellular::set(crate::cellular::State {
+            service: crate::cellular::Service::Searching,
+            radio: crate::cellular::Radio::Unknown,
+            bars: 0,
+            roaming: false,
+        });
+        for cmd in ["ATE0\r", "AT+CMEE=2\r", "AT+CREG=2\r", "AT+CEREG=2\r", "AT+CFUN=1\r"] {
+            let _ = send_data(Q_AT, CH_UART2_TX, cmd.as_bytes());
+        }
+        *last = now;
+        return;
+    }
+    if now - *last >= 10_000 {
+        *last = now;
+        for cmd in ["AT+CSQ\r", "AT+COPS?\r", "AT+CPIN?\r"] {
+            let _ = send_data(Q_AT, CH_UART2_TX, cmd.as_bytes());
+        }
+    }
+}
+
 /// Опрос звонков модема раз в 10 мс.
 fn service_task() {
     let mut exception = 0;
+    let (mut radio_started, mut radio_last) = (false, 0u64);
     loop {
+        radio_tick(&mut radio_started, &mut radio_last);
         let rch = sram32(CCIF_RCHNUM);
         if rch != 0 {
             write32(CCIF_ACK, rch & 0xffff);
