@@ -1633,6 +1633,7 @@ impl Window {
                 if !placed.is_empty() {
                     let src = Rect::new(placed.x - at.0, placed.y - at.1, placed.w, placed.h);
                     self.surface.blit_from(&view.pixels, (placed.x, placed.y), src);
+                    make_opaque(&mut self.surface, placed);
                 }
             }
         }
@@ -2054,6 +2055,7 @@ impl Window {
         let src = Rect::new(copied.x - origin.0, copied.y - origin.1, copied.w, copied.h);
         let resizable = view.resizable;
         self.surface.blit_from(&view.pixels, (copied.x, copied.y), src);
+        make_opaque(&mut self.surface, copied);
         // Уголок размера лежит поверх содержимого, и копия пикселей его
         // стирает. Рисуется заново только тогда, когда копия его задела.
         if resizable && !copied.intersect(&self.resize_grip()).is_empty() {
@@ -2158,6 +2160,26 @@ fn grid_area(surface: &Surface, scale: u32, strip: bool) -> Rect {
     // телефона.
     let top = Window::title_height(scale) + if strip && theme::is_mobile() { ctx.px(STRIP_H) } else { 0 };
     content_area(surface, top).shrink(ctx.px(4))
+}
+
+/// Сделать точки прямоугольника непрозрачными (старший байт — 0xFF).
+///
+/// У телефона кадровый буфер — слой наложения, и старший байт точки там —
+/// непрозрачность: ноль значит «прозрачно», то есть чёрный экран. Программы на
+/// C пишут XRGB, где этот байт — «всё равно» и обычно ноль: NetSurf на
+/// телефоне стоял чёрным, хотя страница была в буфере (05.11). Окно
+/// программы непрозрачно всегда.
+fn make_opaque(surface: &mut Surface, rect: Rect) {
+    let rect = rect.intersect(&surface.bounds());
+    if rect.is_empty() {
+        return;
+    }
+    let (x0, x1) = (rect.x as usize, rect.x as usize + rect.w as usize);
+    for y in rect.y as u32..rect.y as u32 + rect.h {
+        for pixel in &mut surface.row_mut(y)[x0..x1] {
+            *pixel |= 0xFF00_0000;
+        }
+    }
 }
 
 fn content_area(surface: &Surface, top: u32) -> Rect {
