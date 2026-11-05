@@ -124,6 +124,8 @@ pub unsafe fn describe(
     let mut taken_count = 0;
 
     taken_count = reserved_spans(&fdt, &mut taken, taken_count);
+    // SAFETY: `dtb` — то же дерево, что разобрано выше; заголовок проверен.
+    taken_count = unsafe { memreserve_spans(dtb, blob_len(&fdt), &mut taken, taken_count) };
     // Само дерево: затереть его означало бы затереть описание машины по ходу
     // чтения.
     taken_count = add_span(
@@ -259,7 +261,7 @@ impl Span {
 ///
 /// У телефона их с десяток: модем, доверенная среда, кадровый буфер, само
 /// дерево, образ ядра. Двадцать четыре — вдвое больше, чем видно на аппарате.
-const MAX_TAKEN: usize = 24;
+const MAX_TAKEN: usize = 64;
 
 /// Добавить кусок, округлив его наружу до целых страниц.
 ///
@@ -359,9 +361,63 @@ fn reserved_spans(fdt: &Fdt<'_>, taken: &mut [Span; MAX_TAKEN], mut count: usize
     let size_cells = parent.property_u64("#size-cells").unwrap_or(2) as usize;
 
     for node in fdt.nodes().filter(|node| node.depth == parent.depth + 1) {
+        let mut any = false;
         for region in node.reg(address_cells, size_cells) {
+            any = true;
+            crate::kprintln!(
+                "  fdt         : reserved {:#011x}..{:#011x} {}",
+                region.address,
+                region.address.saturating_add(region.size),
+                node.name
+            );
             count = add_span(taken, count, region.address, region.size, MemoryKind::Reserved);
         }
+        // Узел без `reg` — «выдели где-нибудь» (`size`, `alloc-ranges`): так
+        // его выделяет ядро Linux, а не загрузчик. Мы его не выделяем, но в
+        // журнал — чтобы на аппарате было видно, чего ждала прошивка (04.11).
+        if !any {
+            let size = node.property_u64("size").unwrap_or(0);
+            crate::kprintln!("  fdt         : dynamic reserved {} of {size:#x} bytes (not reserved by us)", node.name);
+        }
+    }
+    count
+}
+
+/// Блок `/memreserve/` в заголовке дерева: пары «адрес, длина» до нулевой.
+///
+/// Загрузчики MediaTek кладут туда области доверенной среды и ATF (04.11:
+/// NetSurf, первая программа на телефоне, которой нужно много памяти подряд,
+/// вешал аппарат мгновенно — вероятнее всего, получив кадры чужой
+/// защищённой памяти; запись туда вешает шину без паники).
+///
+/// # Safety
+///
+/// `dtb` указывает на отображённое дерево длиной `len`.
+unsafe fn memreserve_spans(dtb: *const u8, len: u64, taken: &mut [Span; MAX_TAKEN], mut count: usize) -> usize {
+    let read_be = |at: u64, width: u64| -> Option<u64> {
+        if at.checked_add(width)? > len {
+            return None;
+        }
+        let mut value = 0u64;
+        for index in 0..width {
+            // SAFETY: в пределах дерева — проверено выше.
+            value = (value << 8) | u64::from(unsafe { dtb.add((at + index) as usize).read() });
+        }
+        Some(value)
+    };
+    let Some(mut at) = read_be(16, 4) else {
+        return count;
+    };
+    for _ in 0..64 {
+        let (Some(address), Some(size)) = (read_be(at, 8), read_be(at + 8, 8)) else {
+            break;
+        };
+        if address == 0 && size == 0 {
+            break;
+        }
+        crate::kprintln!("  fdt         : memreserve {:#011x}..{:#011x}", address, address.saturating_add(size));
+        count = add_span(taken, count, address, size, MemoryKind::Reserved);
+        at += 16;
     }
     count
 }
