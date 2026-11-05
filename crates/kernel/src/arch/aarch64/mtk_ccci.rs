@@ -96,6 +96,8 @@ const CH_SYSTEM_TX: u16 = 3;
 const CH_UART2_RX: u16 = 10;
 const CH_UART2_TX: u16 = 12;
 const CH_FS_RX: u16 = 14;
+const CH_FS_TX: u16 = 15;
+const Q_FS: usize = 4;
 const CH_RPC_RX: u16 = 32;
 const CH_RPC_TX: u16 = 33;
 const Q_CONTROL: usize = 0;
@@ -111,7 +113,11 @@ const RPC_RESP: u32 = 0xFFFF_0000;
 
 /// Признаки, которые AP поддерживает (как `config_ap_side_feature` для 6293
 /// без SCP, PHY_CAP, UDC и 32K_LESS): 2 — обязательно, 1 — не поддерживаем.
-const AP_MUST: &[u8] = &[0, 1, 2, 5, 7, 8, 9, 10, 11, 12, 15, 16, 17, 18, 19, 20, 25, 26, 27, 28, 30];
+/// Без CCB (15), DHL_RAW (16) и MD_CONSYS (30), хоть у Linux они и
+/// включены: их раскладка в кэшируемой памяти зависит от `ccb_configs`, которых
+/// у нас нет, и с выдуманными размерами модем падал в assert
+/// `ccci_shm_bm.c:734` (05.11). Модем объявляет их «по желанию».
+const AP_MUST: &[u8] = &[0, 1, 2, 5, 7, 8, 9, 10, 11, 12, 17, 18, 19, 20, 25, 26, 27, 28];
 const AP_OPTIONAL: &[u8] = &[13, 32];
 
 /// Готово ли: 0 — нет, 1 — ответ на HS1 отдан, 2 — HS2 пришёл (READY).
@@ -652,8 +658,11 @@ fn handle(q: usize, packet: &[u8]) {
             reply.extend_from_slice(&(op | RPC_RESP).to_le_bytes());
             reply.extend_from_slice(&(answer.len() as u32).to_le_bytes());
             for value in &answer {
-                reply.extend_from_slice(&4u32.to_le_bytes());
-                reply.extend_from_slice(&value.to_le_bytes());
+                reply.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                reply.extend_from_slice(value);
+                while reply.len() % 4 != 0 {
+                    reply.push(0);
+                }
             }
             let len = reply.len() as u32;
             let h = header(0, len, CH_RPC_TX, reserved);
@@ -673,11 +682,18 @@ fn handle(q: usize, packet: &[u8]) {
             }
         }
         CH_FS_RX => {
-            let mut hex = String::new();
-            for b in packet.iter().skip(16).take(96) {
-                let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+            let (replies, text) = super::mtk_ccci_fs::handle(packet);
+            if !text.is_empty() {
+                note(text);
             }
-            note(format!("fs request {} bytes: {hex}", packet.len()));
+            for (data0, slot, payload) in replies {
+                let mut out = Vec::with_capacity(16 + payload.len());
+                out.extend_from_slice(&header(data0, 16 + payload.len() as u32, CH_FS_TX, slot));
+                out.extend_from_slice(&payload);
+                if let Err(err) = ring_send(Q_FS, &out) {
+                    note(format!("fs reply: {err}"));
+                }
+            }
         }
         _ => note(format!("q{q} ch {channel} msg {d1:#x} {} bytes", packet.len())),
     }
@@ -712,8 +728,50 @@ fn rpc_describe(params: &[Vec<u8>]) -> String {
     text
 }
 
-/// Ответ RPC: значения параметров по 4 байта (`port_rpc.c`).
-fn rpc_answer(op: u32, params: &[Vec<u8>]) -> Vec<i32> {
+/// Ответ RPC — параметры (`port_rpc.c`, для `0x400F` — `ccci_rpcd.c`).
+fn rpc_answer(op: u32, params: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let ints = |v: Vec<i32>| v.into_iter().map(|x| x.to_le_bytes().to_vec()).collect();
+    match op {
+        // IPC_RPC_DTSI_QUERY_OP: {u8 req, u8 index, char name[64]} → [0],
+        // {u32 value; char str[64]}, по умолчанию всё 0x0F. Значения — из
+        // `/md_attr_node` дерева LK.
+        0x400E => {
+            let name = params.first().map_or(String::new(), |p| {
+                String::from_utf8_lossy(p.get(2..).unwrap_or(&[])).trim_end_matches('\0').into()
+            });
+            let mut out = alloc::vec![0x0Fu8; 68];
+            let value = match name.as_str() {
+                "mediatek,md_product_name_model_id" => Some(0x0F0F_0F0Fu32),
+                "mediatek,md_drdi_rf_set_idx" => Some(9),
+                _ => None,
+            };
+            if let Some(v) = value {
+                out[..4].copy_from_slice(&v.to_le_bytes());
+            }
+            alloc::vec![0i32.to_le_bytes().to_vec(), out]
+        }
+        // IPC_RPC_QUERY_AP_SYS_PROPERTY (у Android — `ccci_rpcd`): [длина
+        // значения], [значение\0]; неизвестное — пустая строка.
+        0x400F => {
+            let name = params.first().map_or(String::new(), |p| String::from_utf8_lossy(p).trim_end_matches('\0').into());
+            let value = match name.as_str() {
+                "ro.product.device" | "ro.product.name" | "ro.build.product" => "dandelion",
+                "ro.product.model" => "Redmi 9C",
+                "ro.product.brand" | "ro.product.manufacturer" => "Xiaomi",
+                "ro.boot.hwc" => "Global",
+                "ro.boot.hwversion" => "1.39.1",
+                _ => "",
+            };
+            let mut text = value.as_bytes().to_vec();
+            text.push(0);
+            alloc::vec![(value.len() as i32).to_le_bytes().to_vec(), text]
+        }
+        _ => ints(rpc_answer_ints(op, params)),
+    }
+}
+
+/// Ответы RPC из одних чисел по 4 байта.
+fn rpc_answer_ints(op: u32, params: &[Vec<u8>]) -> Vec<i32> {
     const FS_NO_OP: i32 = -1;
     const QUERY_STRING: i32 = -11; // ERR_SIM_HOT_PLUG_QUERY_STRING
     match op {

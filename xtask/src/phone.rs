@@ -216,6 +216,8 @@ fn mtk_wrap(payload: &[u8], name: &str) -> Vec<u8> {
 /// Поймано 17.09 первым образом с initrd в 44 МиБ; снимается только заливкой
 /// заводского `recovery.img`.
 const STOCK_VBMETA_AT: u64 = 25_812_992;
+/// Раздел `boot` этого аппарата — 131072 блока по 512 (`oem emmc gpt`).
+const BOOT_PARTITION: u64 = 64 << 20;
 
 /// Обрезать образ тома по последнему непустому блоку.
 ///
@@ -350,6 +352,33 @@ pub fn build(options: &Options) -> Result<PathBuf> {
                 say!("браузер NetSurf: /opt/netsurf/bin/netsurf");
             }
             extra.extend(browser);
+            // Файлы модема (05.11): NVRAM этого аппарата, распакованные 7-Zip
+            // из снятых разделов (`firmware/modem/<раздел>.d/md`, в хранилище
+            // нет — IMEI и калибровка). Ядро отдаёт их модему по CCCI FS
+            // (`mtk_ccci_fs`): Z: — nvdata, X: — protect1 (protect_f), Y: —
+            // protect2 (protect_s).
+            let modem = paths::workspace_root().join("firmware/modem");
+            let mut modem_count = 0;
+            for (part, drive) in [("nvdata", "Z"), ("protect1", "X"), ("protect2", "Y")] {
+                let root = modem.join(format!("{part}.d/md"));
+                let mut stack = vec![(root.clone(), String::new())];
+                while let Some((dir, rel)) = stack.pop() {
+                    let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        let sub = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+                        if entry.path().is_dir() {
+                            stack.push((entry.path(), sub));
+                        } else {
+                            extra.push((format!("lib/modem/fs/{drive}/{sub}"), std::fs::read(entry.path())?));
+                            modem_count += 1;
+                        }
+                    }
+                }
+            }
+            if modem_count > 0 {
+                say!("файлы модема (NVRAM): {modem_count} в /lib/modem/fs");
+            }
             let dropped = crate::initrd::lean_copy(ramdisk, &path, LEAN_SKIP, &extra)?;
             say!("RAM-диск облегчён: {} МиБ выброшено ({})", dropped / (1024 * 1024), LEAN_SKIP.join(", "));
             lean = Options { ramdisk: Some(path), ..options.clone() };
@@ -359,7 +388,15 @@ pub fn build(options: &Options) -> Result<PathBuf> {
     };
 
     let image = pack(&kernel, options)?;
-    if image.len() as u64 > STOCK_VBMETA_AT {
+    // С 05.11 образ пишется в раздел `boot` (64 МиБ, там LK грузит модем):
+    // предел recovery — предупреждение, отказ — только если не влезает в boot.
+    if image.len() as u64 > STOCK_VBMETA_AT && image.len() as u64 <= BOOT_PARTITION {
+        say!(
+            "образ {} байт длиннее {} — только для раздела boot (fastboot flash boot), НЕ для recovery",
+            image.len(),
+            STOCK_VBMETA_AT
+        );
+    } else if image.len() as u64 > STOCK_VBMETA_AT {
         bail!(
             "образ {} байт длиннее {} байт: он затрёт блок подписи заводского recovery,              и загрузчик упадёт (lk_crash) — на этом и на всех следующих образах, пока              не прошит заводской recovery.img",
             image.len(),

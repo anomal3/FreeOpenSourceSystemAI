@@ -11600,6 +11600,22 @@ dl_header + `md_query_ap_feature` (HS1 от модема: `reserved 0x5555FFFF`,
 `port_rpc.c`), служба FS вместо `ccci_fsd` (NVRAM из снятого `nvdata`, ext4
 только чтение, формат FS-команд — из `ccci_fsd`/MTK), затем HS2, `AT`.
 Исходники eccci на ПК: рабочая папка `ccci_src/`.
+**06.11, ночь — модем READY и отвечает на AT.** Служба FS (`mtk_ccci_fs.rs`,
+вместо `ccci_fsd`; протокол — `ccci_fsd.c` v2.3, зеркало
+`Komodo-begonia/vendor_mediatek-opensource` ветка 12): файлы в памяти,
+грузятся из `/lib/modem/fs/{Z,X,Y}` — это распакованные 7-Zip разделы
+`nvdata`, `protect1`, `protect2` (382 файла, 1 МиБ; `xtask phone` кладёт
+их из `firmware/modem/*.d/md`, образ 26,7 МиБ — **только для boot**, предел
+recovery снят до предупреждения). Грабли по порядку: `OPEN` каталога должен
+проходить (иначе assert `nvram_drval_fat.c`); выключить CCB/DHL_RAW/MD_CONSYS
+(assert `ccci_shm_bm.c:734` — раскладка CCB неизвестна); RPC `0x400E`
+(DTSI_QUERY: `md_drdi_rf_set_idx` 9, `md_product_name_model_id` 0x0F0F0F0F из
+`/md_attr_node`) и `0x400F` (`ro.product.device` = `dandelion`, формат
+`ccci_rpcd.c`) — без них assert `custom_nvram_sec.c`. Итог: ~120 FS-запросов
+(CMPT_READ калибровки и IMEI, запись NVD_DATA, каталог BACKUP), HS2, `+EIND:
+128`, `oem md at`: `ATI` → `MOLY.LR12A.R3.MP.V134.1.P69`, `AT+EGMR=0,7` —
+IMEI из NVRAM, `AT+CFUN=1` → поиск сети (`+CREG: 2`), но `+CPIN` — `CME ERROR
+10`, `+ESIMS: 0` — SIM не видна. Скрипты: `phone\md-hs.cmd`, `phone\at.cmd`.
 **Индикатор сотовой связи (05.11, Роман: <указать, есть сеть или нет и в
 какой сети — 4G, 3G>).** `crate::cellular` — служба (нет модема / нет SIM /
 поиск / экстренные / зарегистрирован), тип сети из AcT (`from_act`: 0,1 2G;

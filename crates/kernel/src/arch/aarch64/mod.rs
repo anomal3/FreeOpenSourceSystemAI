@@ -10,6 +10,7 @@ pub mod mtk_consys;
 pub mod mtk_msdc;
 pub mod mtk_md;
 pub mod mtk_ccci;
+pub mod mtk_ccci_fs;
 pub mod mtk_wlan;
 pub mod mtk_regs;
 pub mod mtk_spi;
