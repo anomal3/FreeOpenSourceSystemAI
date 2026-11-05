@@ -625,6 +625,19 @@ pub fn set_timezone(minutes: i32) -> Result<(), crate::vfs::VfsError> {
     Ok(())
 }
 
+/// Пояс от сотовой сети (NITZ, 06.11.2026): применить сразу, записать в
+/// `/etc/system.cfg`, если получится (на телефоне файла может не быть —
+/// RAM-диск, — тогда пояс живёт до перезагрузки и придёт от сети снова).
+pub fn adopt_network_timezone(minutes: i32) {
+    if OFFSET_MINUTES.load(Ordering::Relaxed) == minutes {
+        return;
+    }
+    if set_timezone(minutes).is_err() {
+        OFFSET_MINUTES.store(minutes, Ordering::Relaxed);
+    }
+    kprintln!("  timezone    : UTC{} from the cellular network", offset_text());
+}
+
 /// Пояса, которые окно предлагает выбрать, в минутах от UTC.
 ///
 /// Список, а не свободный ввод, и не база IANA: базы часовых поясов в системе

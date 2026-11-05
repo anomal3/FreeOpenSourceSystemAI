@@ -704,6 +704,7 @@ fn handle(q: usize, packet: &[u8]) {
                 }
                 cellular_from_at(line);
                 call_from_at(line);
+                time_from_at(line);
             }
             let mut link = LINK.lock();
             link.at_text.push_str(&text);
@@ -915,7 +916,7 @@ fn radio_tick(started: &mut bool, last: &mut u64) {
             bars: 0,
             roaming: false,
         });
-        for cmd in ["ATE0\r", "AT+CMEE=2\r", "AT+CREG=2\r", "AT+CEREG=2\r", "AT+CLIP=1\r", "AT+CRC=1\r", "AT+CFUN=1\r"] {
+        for cmd in ["ATE0\r", "AT+CMEE=2\r", "AT+CREG=2\r", "AT+CEREG=2\r", "AT+CLIP=1\r", "AT+CRC=1\r", "AT+CTZR=2\r", "AT+CFUN=1\r"] {
             let _ = send_data(Q_AT, CH_UART2_TX, cmd.as_bytes());
         }
         *last = now;
@@ -1155,6 +1156,70 @@ pub fn send_pcm_msg(data1: u32) -> Result<(), String> {
     }
     note(format!("speech -> {data1:#010x}"));
     ring_send(Q_CONTROL, &header(MAGIC, data1, CH_PCM_TX, 0))
+}
+
+
+// ---------------------------------------------------------------------------
+// Время из сети (NITZ, 06.11)
+// ---------------------------------------------------------------------------
+
+/// Пояс в четвертях часа со знаком (`"+12"`, `-08`) → минуты.
+fn quarters(text: &str) -> Option<i32> {
+    let t = text.trim().trim_matches('"');
+    let (sign, digits) = match t.as_bytes().first()? {
+        b'-' => (-1, &t[1..]),
+        b'+' => (1, &t[1..]),
+        _ => (1, t),
+    };
+    let q: i32 = digits.trim().parse().ok()?;
+    (q.abs() <= 56).then_some(sign * q * 15)
+}
+
+/// `+CTZV: tz`, `+CTZE: tz,dst[,time]` — пояс; `+CCLK: "yy/MM/dd,hh:mm:ss±zz"`
+/// — местное время сети. По поясу — часовой пояс системы и запрос часов, по
+/// часам — время, если своего нет или оно ушло больше чем на 2 минуты.
+fn time_from_at(line: &str) {
+    let (minutes, stamp) = if let Some(rest) = line.strip_prefix("+CTZE:") {
+        // tz,dst,"yyyy/MM/dd,hh:mm:ss" — время местное (сверено 06.11: сеть
+        // дала 02:09 при 22:09 UTC и поясе +16 четвертей).
+        let mut parts = rest.splitn(3, ',');
+        let tz = parts.next().and_then(quarters);
+        let _dst = parts.next();
+        (tz, parts.next().map(|t| String::from(t.trim().trim_matches('"'))))
+    } else if let Some(rest) = line.strip_prefix("+CTZV:") {
+        (rest.split(',').next().and_then(quarters), None)
+    } else if let Some(rest) = line.strip_prefix("+CCLK:") {
+        // "yy/MM/dd,hh:mm:ss±zz" — тоже местное; нули — модем не знает.
+        let t = rest.trim().trim_matches('"');
+        let split = t.rfind(['+', '-']).filter(|at| *at > 8).unwrap_or(t.len());
+        (quarters(&t[split..]).or(Some(crate::time::offset_minutes())), Some(String::from(&t[..split])))
+    } else {
+        return;
+    };
+    let Some(minutes) = minutes else { return };
+    if !line.starts_with("+CCLK") {
+        crate::time::adopt_network_timezone(minutes);
+    }
+    let Some(stamp) = stamp else { return };
+    let (date, time) = stamp.split_once(',').unwrap_or(("", ""));
+    let d: Vec<i64> = date.split('/').filter_map(|x| x.trim().parse().ok()).collect();
+    let c: Vec<i64> = time.split(':').filter_map(|x| x.trim().parse().ok()).collect();
+    let ([yy, mo, dd], [hh, mi, ss]) = (d.as_slice(), c.as_slice()) else { return };
+    let year = if *yy < 100 { 2000 + yy } else { *yy };
+    if year < 2025 || !(1..=12).contains(mo) || !(1..=31).contains(dd) {
+        return; // модем ещё не знает времени
+    }
+    let days = calendar::days_from_civil(year, *mo as u8, *dd as u8);
+    let utc = days * 86_400 + hh * 3600 + mi * 60 + ss - i64::from(minutes) * 60;
+    if utc <= 0 {
+        return;
+    }
+    let utc = utc as u64;
+    let off = crate::time::now_unix().map(|now| now.abs_diff(utc));
+    if off.is_none_or(|o| o > 120) {
+        note(format!("network time {stamp} (UTC{:+} min), clock was off by {off:?} s", minutes));
+        crate::time::set_wall_clock(utc, 0, "the cellular network (NITZ)");
+    }
 }
 
 /// Отправить строку AT без ожидания ответа (для звонилки).
