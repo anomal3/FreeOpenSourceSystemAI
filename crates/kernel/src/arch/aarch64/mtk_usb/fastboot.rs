@@ -278,6 +278,57 @@ impl Fastboot {
                 }
                 Err(err) => self.respond(b"FAIL", err),
             }
+        } else if let Some(rest) = text.strip_prefix("oem cell ") {
+            // Подставить состояние сотовой связи (05.11) — проверить
+            // индикатор, пока модема нет: `oem cell <служба 0..4> <AcT> <полоски> [r]`.
+            use crate::cellular::{self, Radio, Service, State};
+            let mut words = rest.split_whitespace();
+            let mut num = || words.next().and_then(|w| w.parse::<u32>().ok());
+            match (num(), num(), num()) {
+                (Some(service), Some(act), Some(bars)) => {
+                    let service = match service {
+                        1 => Service::NoSim,
+                        2 => Service::Searching,
+                        3 => Service::Emergency,
+                        4 => Service::Registered,
+                        _ => Service::NoModem,
+                    };
+                    let roaming = rest.split_whitespace().nth(3) == Some("r");
+                    cellular::set(State { service, radio: Radio::from_act(act), bars: bars.min(4) as u8, roaming });
+                    // Строку перерисует стол: `cellular::generation` — в её отпечатке.
+                    self.respond(b"OKAY", "");
+                }
+                _ => self.respond(b"FAIL", "usage: oem cell <service 0..4> <AcT 0..7> <bars 0..4> [r]"),
+            }
+        } else if text == "oem fdt" {
+            self.stage_fdt();
+        } else if let Some(rest) = text.strip_prefix("oem dump ") {
+            // Кусок ОЗУ в `get_staged` (05.11): искать в резерве модема образ,
+            // если его уже положил LK. Защищённая (EMI MPU) память может
+            // повесить аппарат — тогда выручит сторожевой таймер.
+            use crate::arch::aarch64::mtk_regs::parse_number;
+            let mut words = rest.split_whitespace();
+            match (words.next().and_then(parse_number), words.next().and_then(parse_number)) {
+                (Some(phys), Some(len))
+                    if phys % 8 == 0
+                        && (1..=16 << 20).contains(&len)
+                        && phys >= 0x4000_0000
+                        && phys + len <= 0xC000_0000 =>
+                {
+                    self.staged.clear();
+                    self.staged.shrink_to_fit();
+                    if self.staged.try_reserve_exact(len as usize).is_err() {
+                        self.respond(b"FAIL", "no memory");
+                    } else {
+                        let base = (crate::mm::PHYS_MAP_BASE as u64 + phys) as *const u8;
+                        // SAFETY: участок — в ОЗУ телефона, отображённом целиком.
+                        let bytes = unsafe { core::slice::from_raw_parts(base, len as usize) };
+                        self.staged.extend_from_slice(bytes);
+                        self.say_done(&alloc::format!("{len:#x} bytes from {phys:#x} staged"));
+                    }
+                }
+                _ => self.respond(b"FAIL", "usage: oem dump <phys> <len up to 0x1000000>"),
+            }
         } else if text == "oem emmc" || text.starts_with("oem emmc ") {
             self.emmc(text["oem emmc".len()..].trim());
         } else if text == "oem consys" || text.starts_with("oem consys ") {
@@ -758,6 +809,33 @@ impl Fastboot {
             self.state = State::Idle;
             self.respond(b"OKAY", "");
         }
+    }
+
+    /// `oem fdt` (05.11): дерево устройств, которое дал LK, — целиком в
+    /// `get_staged`. LK дописывает в него на ходу то, чего нет в файле
+    /// `dandelion-stock.dtb`: резервы памяти (модем, smem), `chosen`, `atag,*`.
+    /// Читается через прямое отображение ОЗУ: адрес от LK физический.
+    fn stage_fdt(&mut self) {
+        let phys = crate::arch::aarch64::device_tree_address();
+        if !(0x4000_0000..0xC000_0000).contains(&phys) {
+            self.respond(b"FAIL", &alloc::format!("no device tree in RAM ({phys:#x})"));
+            return;
+        }
+        let base = (crate::mm::PHYS_MAP_BASE as u64 + phys) as *const u8;
+        // SAFETY: адрес — в ОЗУ телефона, отображённом целиком; заголовок
+        // FDT — 40 байт, размер проверяется до чтения остального.
+        let head = unsafe { core::slice::from_raw_parts(base, 8) };
+        let magic = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+        let size = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
+        if magic != 0xd00d_feed || !(40..=4 << 20).contains(&size) {
+            self.respond(b"FAIL", &alloc::format!("not an FDT at {phys:#x}: magic {magic:#x} size {size}"));
+            return;
+        }
+        // SAFETY: как выше; размер — из заголовка, не больше 4 МиБ.
+        let blob = unsafe { core::slice::from_raw_parts(base, size) };
+        self.staged.clear();
+        self.staged.extend_from_slice(blob);
+        self.say_done(&alloc::format!("FDT at {phys:#x}, {size} bytes staged"));
     }
 
     /// eMMC по кабелю (05.11), только чтение (`mtk_msdc`):

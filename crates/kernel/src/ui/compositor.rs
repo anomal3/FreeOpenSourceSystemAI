@@ -1852,6 +1852,8 @@ impl Compositor {
             }
             // И Wi-Fi: значок появляется, когда он включился.
             text.push_str(&alloc::format!(" w{}", crate::wifi::generation()));
+            // И сотовая связь (05.11): полоски и тип сети.
+            text.push_str(&alloc::format!(" c{}", crate::cellular::generation()));
             if text != self.status_text {
                 self.status_text = text;
                 let bar = super::statusbar::bounds(self.screen.width(), self.scale);

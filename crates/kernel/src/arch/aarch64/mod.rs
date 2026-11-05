@@ -35,6 +35,12 @@ pub fn set_device_tree(dtb: u64) {
     DEVICE_TREE.store(dtb, core::sync::atomic::Ordering::Release);
 }
 
+/// Адрес дерева, как его дал загрузчик (на телефоне — физический), или 0.
+#[must_use]
+pub fn device_tree_address() -> u64 {
+    DEVICE_TREE.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Разобрать запомненное дерево, если оно есть.
 ///
 /// # Safety

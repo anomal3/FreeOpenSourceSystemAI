@@ -131,12 +131,17 @@ pub fn draw(back: &mut Surface, band: Rect, dy: i32, screen_w: u32, scale: u32) 
         x -= ctx.px(9) as i32;
     }
 
-    // Сеть: четыре полоски 3 шириной, высотой 5, 8, 11 и 14, по низу.
+    // Сотовая сеть (`crate::cellular`, 05.11): четыре полоски 3 шириной,
+    // высотой 5, 8, 11 и 14, по низу; яркие — по уровню сигнала. Нет сети —
+    // все тусклые и крестик у правого края; есть — левее подпись типа сети
+    // (4G, 3G, H, E, 2G), в роуминге — с `R`.
+    let cell = crate::cellular::get();
     let bottom = mid + ctx.px(14) as i32 / 2;
     let heights = [5u32, 8, 11, 14];
     let step = ctx.px(3 + 2) as i32;
     let bars_w = step * 4 - ctx.px(2) as i32;
     let bars_x = x - bars_w;
+    let lit = if cell.in_service() { cell.bars as usize } else { 0 };
     for (index, h) in heights.iter().enumerate() {
         let rect = Rect::new(
             bars_x + step * index as i32,
@@ -144,9 +149,28 @@ pub fn draw(back: &mut Surface, band: Rect, dy: i32, screen_w: u32, scale: u32) 
             ctx.px(3),
             ctx.px(*h),
         );
-        draw::rounded(back, rect, ctx.px(1), p.ink, 77);
+        draw::rounded(back, rect, ctx.px(1), p.ink, if index < lit { 255 } else { 77 });
     }
-    x = bars_x - ctx.px(9) as i32;
+    if !cell.in_service() {
+        // Крестик 6 на 6 в правом нижнем углу полосок.
+        let s = ctx.px(6) as i32;
+        let (cx, cy) = (x - s / 2, bottom - s / 2);
+        let w = ctx.px(1).max(1) + 1;
+        draw::line(back, (cx - s / 2, cy - s / 2), (cx + s / 2, cy + s / 2), w, p.ink, 255);
+        draw::line(back, (cx - s / 2, cy + s / 2), (cx + s / 2, cy - s / 2), w, p.ink, 255);
+    }
+    x = bars_x - ctx.px(6) as i32;
+    if cell.in_service() && !cell.radio.label().is_empty() {
+        let label = if cell.roaming {
+            alloc::format!("{} R", cell.radio.label())
+        } else {
+            alloc::string::String::from(cell.radio.label())
+        };
+        x -= face.width(&label) as i32;
+        paint::text(ctx, back, Role::Mono, x, y, &label, p.ink);
+        x -= ctx.px(6) as i32;
+    }
+    x -= ctx.px(3) as i32;
 
     // Галочка вверх: здесь открывается шторка (нажатием на строку).
     let chevron = ctx.px(15);

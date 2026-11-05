@@ -67,6 +67,7 @@ mod net;
 mod pci;
 mod battery;
 mod wifi;
+mod cellular;
 mod power;
 mod print;
 mod random;
