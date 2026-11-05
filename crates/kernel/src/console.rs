@@ -959,6 +959,22 @@ pub fn overlay_redraw(y: i32, h: u32) {
     draw_overlay(&ov);
 }
 
+/// Строка в полосу из обработчика прерывания: без кучи и без чужих замков
+/// (только `try_lock` полосы и консоли), куски склеиваются здесь.
+pub fn overlay_note(parts: &[&str]) {
+    if !OVERLAY.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(mut ov) = OV.try_lock() else {
+        return;
+    };
+    for part in parts {
+        let _ = ov.write_str(part);
+    }
+    let _ = ov.write_str("\n");
+    draw_overlay(&ov);
+}
+
 /// Верх полосы журнала, в точках.
 const OV_TOP: u32 = 100;
 

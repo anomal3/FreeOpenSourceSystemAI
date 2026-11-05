@@ -1431,12 +1431,49 @@ pub fn on_timer_tick() {
     if ON_IDLE[cpu].load(Ordering::Relaxed) {
         IDLE_TICKS[cpu].fetch_add(1, Ordering::Relaxed);
     }
+    watch_tick();
     let left = SLICE_LEFT[cpu].load(Ordering::Relaxed).saturating_sub(1);
     if left == 0 {
         SLICE_LEFT[cpu].store(SLICE_TICKS, Ordering::Relaxed);
         NEED_RESCHED[cpu].store(true, Ordering::Relaxed);
     } else {
         SLICE_LEFT[cpu].store(left, Ordering::Relaxed);
+    }
+}
+
+/// Отладка телефона (05.11): раз в секунду из тика — какая задача на
+/// процессоре, в полосу поверх экрана (`oem overlay on`). Зависший стол
+/// оставляет её на последнем кадре: видно, кто держит процессор.
+fn watch_tick() {
+    static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if !crate::console::OVERLAY.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = crate::time::uptime_ms();
+    if now.saturating_sub(LAST.load(Ordering::Relaxed)) < 1000 {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    let mut value = now / 1000;
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let seconds = core::str::from_utf8(&digits[at..]).unwrap_or("?");
+    let cpu = smp::cpu();
+    let idle = ON_IDLE[cpu].load(Ordering::Relaxed);
+    match SCHED.try_lock() {
+        Some(sched) => {
+            let name = sched.tasks[sched.current()].as_ref().map_or("none", |task| task.name);
+            crate::console::overlay_note(&["  tick ", seconds, " s: on cpu '", name, if idle { "' (idle)" } else { "'" }]);
+        }
+        None => crate::console::overlay_note(&["  tick ", seconds, " s: scheduler lock held"]),
     }
 }
 
