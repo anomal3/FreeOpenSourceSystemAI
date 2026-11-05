@@ -280,8 +280,17 @@ pub fn netsurf_files(arch: crate::arch::Arch) -> Result<Vec<(String, Vec<u8>)>> 
             files.push((format!("opt/netsurf/share/netsurf/{name}"), std::fs::read(entry.path())?));
         }
     }
+    // Настройки под палец (05.11, Роман: «управление не очень удобное для
+    // мобильной навигации»): NetSurf читает `Choices` из своих ресурсов.
+    // Страница крупнее, панель и полосы прокрутки толще.
+    files.push((String::from("opt/netsurf/share/netsurf/Choices"), PHONE_CHOICES.as_bytes().to_vec()));
     Ok(files)
 }
+
+/// `Choices` NetSurf для телефона: масштаб в процентах, высота панели и
+/// толщина полос прокрутки в точках.
+/// 175 % резало строки встроенным растровым шрифтом — 140 % ещё помещается.
+const PHONE_CHOICES: &str = "scale:140\nfb_toolbar_size:56\nfb_furniture_size:34\n";
 
 pub fn build(options: &Options) -> Result<PathBuf> {
     let kernel = match &options.kernel {

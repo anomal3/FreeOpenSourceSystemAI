@@ -38,7 +38,19 @@ struct freeos_priv {
     nsfb_event_t queue[8];
     int head;
     int count;
+    /* Палец (05.11): экран стоит портретом — это телефон, и нажатие левой
+     * кнопки откладывается до отпускания. Палец поехал по вертикали — это
+     * прокрутка колесом, а не щелчок и не выделение текста. */
+    bool touch;
+    bool held;
+    bool scrolling;
+    int press_x, press_y, last_y;
 };
+
+/* Сколько точек пальцем — один щелчок колеса и с какого сдвига нажатие
+ * становится прокруткой. */
+#define SCROLL_STEP 28
+#define SCROLL_SLOP 14
 
 /* Формат точки окна — один на машину; `freeos_screen` говорит какой. */
 static enum nsfb_format_e window_format(void)
@@ -83,6 +95,11 @@ static int freeos_initialise(nsfb_t *nsfb)
         return -1;
     }
     freeos_window_style(priv->id, FREEOS_WIN_STYLE_RESIZABLE);
+    {
+        /* Портретный экран — телефон: касания пальцем (см. `struct freeos_priv`). */
+        uint32_t width = 0, height = 0, pixel = 0;
+        priv->touch = freeos_screen(&width, &height, &pixel) == 0 && height > width;
+    }
     nsfb->surface_priv = priv;
     nsfb->ptr = surface;
     nsfb->linelen = nsfb->width * 4;
@@ -262,14 +279,55 @@ static void translate(struct freeos_priv *priv, const struct freeos_win_event *e
         break;
     }
     case FREEOS_WIN_POINTER:
+        if (priv->touch && mouse_button(event->code) == NSFB_KEY_MOUSE_1) {
+            priv->held = true;
+            priv->scrolling = false;
+            priv->press_x = event->x;
+            priv->press_y = event->y;
+            priv->last_y = event->y;
+            break;
+        }
         move_to(priv, event->x, event->y);
         push_key(priv, NSFB_EVENT_KEY_DOWN, mouse_button(event->code));
         break;
     case FREEOS_WIN_RELEASE:
+        if (priv->touch && priv->held && mouse_button(event->code) == NSFB_KEY_MOUSE_1) {
+            priv->held = false;
+            if (!priv->scrolling) {
+                /* Тап: нажатие и отпускание в точке касания. */
+                move_to(priv, priv->press_x, priv->press_y);
+                push_key(priv, NSFB_EVENT_KEY_DOWN, NSFB_KEY_MOUSE_1);
+                push_key(priv, NSFB_EVENT_KEY_UP, NSFB_KEY_MOUSE_1);
+            }
+            break;
+        }
         move_to(priv, event->x, event->y);
         push_key(priv, NSFB_EVENT_KEY_UP, mouse_button(event->code));
         break;
     case FREEOS_WIN_MOVE:
+        if (priv->touch && priv->held) {
+            int dy = event->y - priv->press_y;
+            if (!priv->scrolling && (dy > SCROLL_SLOP || dy < -SCROLL_SLOP)) {
+                priv->scrolling = true;
+            }
+            if (priv->scrolling) {
+                /* Палец вниз — страница к началу (колесо «от себя»). */
+                int clicks = 0;
+                while (event->y - priv->last_y >= SCROLL_STEP && clicks < 3) {
+                    push_key(priv, NSFB_EVENT_KEY_DOWN, NSFB_KEY_MOUSE_4);
+                    push_key(priv, NSFB_EVENT_KEY_UP, NSFB_KEY_MOUSE_4);
+                    priv->last_y += SCROLL_STEP;
+                    clicks++;
+                }
+                while (priv->last_y - event->y >= SCROLL_STEP && clicks < 3) {
+                    push_key(priv, NSFB_EVENT_KEY_DOWN, NSFB_KEY_MOUSE_5);
+                    push_key(priv, NSFB_EVENT_KEY_UP, NSFB_KEY_MOUSE_5);
+                    priv->last_y -= SCROLL_STEP;
+                    clicks++;
+                }
+            }
+            break;
+        }
         move_to(priv, event->x, event->y);
         break;
     case FREEOS_WIN_WHEEL: {
