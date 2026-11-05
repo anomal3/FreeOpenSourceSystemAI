@@ -300,6 +300,26 @@ impl Fastboot {
                 }
                 _ => self.respond(b"FAIL", "usage: oem cell <service 0..4> <AcT 0..7> <bars 0..4> [r]"),
             }
+        } else if text == "oem audio" || text.starts_with("oem audio ") {
+            // Голос (06.11): `oem audio [status | on | wide | off | auto on|off]`.
+            use crate::arch::aarch64::{mtk_audio, mtk_ccci};
+            let lines = match text["oem audio".len()..].trim() {
+                "on" => mtk_audio::voice_on(false),
+                "wide" => mtk_audio::voice_on(true),
+                "off" => mtk_audio::voice_off(),
+                "auto on" | "auto off" => {
+                    let on = text.ends_with("on");
+                    mtk_ccci::VOICE_AUTO.store(on, core::sync::atomic::Ordering::Release);
+                    alloc::vec![alloc::format!("voice follows calls: {on}")]
+                }
+                _ => mtk_audio::status(),
+            };
+            self.line_count = 0;
+            for line in &lines {
+                self.say(line.as_bytes());
+            }
+            self.state = State::Lines { at: 0 };
+            self.continue_lines(0);
         } else if text == "oem md logall" {
             let log = crate::arch::aarch64::mtk_ccci::log_text();
             self.staged.clear();

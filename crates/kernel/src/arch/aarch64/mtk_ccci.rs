@@ -97,6 +97,8 @@ const CH_UART2_RX: u16 = 10;
 const CH_UART2_TX: u16 = 12;
 const CH_FS_RX: u16 = 14;
 const CH_FS_TX: u16 = 15;
+const CH_PCM_RX: u16 = 4;
+const CH_PCM_TX: u16 = 5;
 const Q_FS: usize = 4;
 const CH_RPC_RX: u16 = 32;
 const CH_RPC_TX: u16 = 33;
@@ -138,6 +140,8 @@ static LINK: SpinLock<Link> =
     SpinLock::new(Link { tx_seq: [0; 128], at_text: String::new(), at_line: String::new(), log: Vec::new() });
 /// Модем сказал `+EIND: 128` — AT-порт готов.
 static AT_READY: AtomicBool = AtomicBool::new(false);
+/// Включать голос само по ходу вызова (`oem audio auto on|off`).
+pub static VOICE_AUTO: AtomicBool = AtomicBool::new(true);
 
 fn note(text: String) {
     crate::kprintln!("  ccci        : {text}");
@@ -708,6 +712,7 @@ fn handle(q: usize, packet: &[u8]) {
                 link.at_text.drain(..cut);
             }
         }
+        CH_PCM_RX => note(format!("speech <- {d1:#010x} param {reserved:#x} ({} bytes)", packet.len())),
         CH_FS_RX => {
             let (replies, text) = super::mtk_ccci_fs::handle(packet);
             if !text.is_empty() {
@@ -928,9 +933,14 @@ fn radio_tick(started: &mut bool, last: &mut u64) {
 fn service_task() {
     let mut exception = 0;
     let (mut radio_started, mut radio_last, mut call_last) = (false, 0u64, 0u64);
+    let mut voice_on = false;
     loop {
         radio_tick(&mut radio_started, &mut radio_last);
         call_tick(&mut call_last);
+        if VOICE_AUTO.load(Ordering::Acquire) {
+            let state = CALL.lock().0;
+            super::mtk_audio::follow_call(state, &mut voice_on);
+        }
         let rch = sram32(CCIF_RCHNUM);
         if rch != 0 {
             write32(CCIF_ACK, rch & 0xffff);
@@ -1090,6 +1100,16 @@ pub fn answer_or_hangup(answer: bool) -> Result<(), String> {
         set_call(user_abi::CALL_IDLE, None);
     }
     Ok(())
+}
+
+/// Сообщение речи модему по каналу 5 (`ccci_aud`, очередь 0): заголовок
+/// без данных, `data0 = 0xFFFFFFFF`, `data1 = id << 16 | param`.
+pub fn send_pcm_msg(data1: u32) -> Result<(), String> {
+    if STAGE.load(Ordering::Acquire) < 2 {
+        return Err(String::from("modem not READY"));
+    }
+    note(format!("speech -> {data1:#010x}"));
+    ring_send(Q_CONTROL, &header(MAGIC, data1, CH_PCM_TX, 0))
 }
 
 /// Отправить строку AT без ожидания ответа (для звонилки).
