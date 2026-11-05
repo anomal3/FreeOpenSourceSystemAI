@@ -1044,10 +1044,14 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
     for net in candidates.iter() {
         log_network(net);
         let result = connect_bss(net, password);
-        // Канал вернуть прошивке при любом исходе: невозвращённый держит её
+        // После отказа канал вернуть прошивке: невозвращённый держит её
         // занятой, и следующая попытка получала «did not grant the channel»
-        // (04.11, после первого же отказа точки).
-        let _ = wifi_command(0x1c, true, &privilege(net.channel, true));
+        // (04.11). После удачи — нет (05.11): параметров канала точки
+        // (`BSS_RLM_PARAM`) мы прошивке не даём, и, вернув право, она уводила
+        // радио с канала — кадры данных переставали приходить.
+        if result.is_err() {
+            let _ = wifi_command(0x1c, true, &privilege(net.channel, true));
+        }
         match result {
             Ok(report) => {
                 attach();
