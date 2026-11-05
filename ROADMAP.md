@@ -11519,7 +11519,15 @@ fastboot: `oem emmc` (сводка), `oem emmc gpt` (43 раздела текс�
 МиБ), `super` 4,5 ГиБ, `userdata` 13385728 (23 ГиБ). Снятие кусками —
 `emmc-dump.ps1` в рабочей папке; снятое — в `firmware/modem/` (в
 `.gitignore`: IMEI и калибровка радио этого аппарата — не выкладывать).
-Дальше: разбор `md1img` (M2 `docs/gsm-bringup.md`), `oem fdt` — резерв
+**M1b/M2 сделаны (05.11):** сняты `md1img`, `nvdata`, `nvram`, `nvcfg`,
+`protect1/2`, `proinfo`, `md_udc` (~300 МиБ за 3 мин). `md1img` — 23 части
+(`md1img.py` в рабочей папке): `md1rom` 22,2 МиБ, `md1drdi` 3,8 МиБ,
+`md1dsp` 6,6 МиБ (у каждой `cert1`/`cert2` — подпись), фильтры журнала,
+`md1_mddb`, `md1_file_map`. `CHECK_HEADER` в конце `md1rom`: verno 6,
+платформа `MT6765_S00`, сборка `MOLY.LR12A.R3.MP.V134.1.P69` (2022-06-17),
+**`mem_size` 0x7E00000 = 126 МиБ** (столько нужно резерва под MD),
+`md_img_size` 0x1964000, `bind_sys_id` 1.
+Дальше: `oem fdt` — резерв
 памяти модема от LK (M1a); для eMMC — CMD18 и DMA (скорость), потом
 отдельным решением запись в свой раздел (настройки, `/etc/wifi.cfg`).
 
