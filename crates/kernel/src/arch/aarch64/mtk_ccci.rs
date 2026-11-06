@@ -1079,11 +1079,14 @@ fn call_from_at(line: &str) {
         set_call(state, number);
     } else if let Some(rest) = line.strip_prefix("+EAIC:") {
         // Входящий ждёт одобрения AP (06.11: без него `ATA` — `+CME ERROR:
-        // 100`, как у RIL MTK): `+EAIC: id,"номер",тип,режим,seq` →
+        // 100`, как у RIL MTK): `+EAIC: id,"номер",тип,режим,seq,…` →
         // `AT+EAIC=0,id,seq` (0 — принять к показу).
         let f: Vec<&str> = rest.split(',').map(str::trim).collect();
         let id = f.first().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
-        let seq = f.last().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        // `id,"номер",тип,режим,seq,…` — seq пятым полем (06.11 на живом
+        // вызове: `+EAIC: 1,"7929…",145,0,3,,,0`; одобрение с последним полем
+        // вместо seq модем не принимал и через 10 с сбрасывал вызов).
+        let seq = f.get(4).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
         let number = f.get(1).map(|v| v.trim_matches('"')).unwrap_or("");
         let _ = at_send(&format!("AT+EAIC=0,{id},{seq}"));
         note(format!("incoming call {id} from {number} approved (seq {seq})"));
