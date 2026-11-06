@@ -922,7 +922,7 @@ fn radio_tick(started: &mut bool, last: &mut u64) {
             bars: 0,
             roaming: false,
         });
-        for cmd in ["ATE0\r", "AT+CMEE=2\r", "AT+CREG=2\r", "AT+CEREG=2\r", "AT+CLIP=1\r", "AT+CRC=1\r", "AT+CTZR=2\r", "AT+CFUN=1\r"] {
+        for cmd in ["ATE0\r", "AT+CMEE=2\r", "AT+CREG=2\r", "AT+CEREG=2\r", "AT+CLIP=1\r", "AT+CRC=1\r", "AT+CTZR=2\r", "AT+EAIC=2\r", "AT+ECPI=4294967295\r", "AT+CFUN=1\r"] {
             let _ = send_data(Q_AT, CH_UART2_TX, cmd.as_bytes());
         }
         *last = now;
@@ -1077,6 +1077,35 @@ fn call_from_at(line: &str) {
         };
         CLCC_WAIT.lock().1 = true;
         set_call(state, number);
+    } else if let Some(rest) = line.strip_prefix("+EAIC:") {
+        // Входящий ждёт одобрения AP (06.11: без него `ATA` — `+CME ERROR:
+        // 100`, как у RIL MTK): `+EAIC: id,"номер",тип,режим,seq` →
+        // `AT+EAIC=0,id,seq` (0 — принять к показу).
+        let f: Vec<&str> = rest.split(',').map(str::trim).collect();
+        let id = f.first().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
+        let seq = f.last().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        let number = f.get(1).map(|v| v.trim_matches('"')).unwrap_or("");
+        let _ = at_send(&format!("AT+EAIC=0,{id},{seq}"));
+        note(format!("incoming call {id} from {number} approved (seq {seq})"));
+        LAST_RING.store(crate::time::uptime_ms(), Ordering::Release);
+        set_call(CALL_INCOMING, Some(number));
+    } else if let Some(rest) = line.strip_prefix("+ECPI:") {
+        // Ход вызова MTK: id,тип,…,"номер",… — 0 входящий (setup), 2 звонит
+        // у собеседника, 6 соединено, 130 исходящий набор, 133 разъединено.
+        let f: Vec<&str> = rest.split(',').map(str::trim).collect();
+        let kind = f.get(1).and_then(|v| v.parse::<u32>().ok()).unwrap_or(999);
+        let number = f.get(6).map(|v| v.trim_matches('"')).filter(|n| !n.is_empty());
+        match kind {
+            0 => {
+                LAST_RING.store(crate::time::uptime_ms(), Ordering::Release);
+                set_call(CALL_INCOMING, number);
+            }
+            130 => set_call(CALL_DIALING, number),
+            2 => set_call(CALL_ALERTING, number),
+            6 => set_call(CALL_ACTIVE, number),
+            133 => set_call(CALL_IDLE, None),
+            _ => {}
+        }
     } else if matches!(line, "NO CARRIER" | "BUSY" | "NO ANSWER" | "NO DIALTONE") {
         set_call(CALL_IDLE, None);
     } else if line == "OK" {
