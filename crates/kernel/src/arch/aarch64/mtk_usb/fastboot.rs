@@ -393,6 +393,12 @@ impl Fastboot {
             self.i2c(rest, true);
         } else if let Some(rest) = text.strip_prefix("oem i2c ") {
             self.i2c(rest, false);
+        } else if let Some(rest) = text.strip_prefix("oem callui ") {
+            // Проверка окна звонилки без звонка (06.11): `oem callui <0..4> [номер]`.
+            let mut words = rest.split_whitespace();
+            let state = words.next().and_then(|w| w.parse::<u8>().ok()).unwrap_or(0);
+            crate::arch::aarch64::mtk_ccci::fake_call(state, words.next().unwrap_or(""));
+            self.respond(b"OKAY", "");
         } else if let Some(rest) = text.strip_prefix("oem key ") {
             // Клавиша по кабелю: `oem key <enter|backspace|end|home|delete> [n]`.
             use crate::input::KeyCode;

@@ -1121,6 +1121,14 @@ fn call_tick(last: &mut u64) {
     let _ = send_data(Q_AT, CH_UART2_TX, b"AT+CLCC\r");
 }
 
+/// Подставить состояние вызова для проверки окна (`oem callui`) — модему
+/// ничего не уходит. Голос по такому «вызову» не включается.
+pub fn fake_call(state: u8, number: &str) {
+    VOICE_AUTO.store(false, Ordering::Release);
+    LAST_RING.store(crate::time::uptime_ms() + 60_000, Ordering::Release);
+    set_call(state, Some(number));
+}
+
 /// Для звонилки: состояние и номер.
 pub fn call_state() -> (u8, String) {
     PHONE_SEEN.store(crate::time::uptime_ms(), Ordering::Release);
