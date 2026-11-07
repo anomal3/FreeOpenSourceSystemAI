@@ -26,10 +26,16 @@ fn main() {
     });
     println!("jsprobe: global");
 
-    let cases: [(&str, i32); 3] = [
+    let cases: [(&str, i32); 4] = [
         ("1 + 1", 2),
         ("let s = 0; for (let i = 1; i <= 100; i++) s += i; s", 5050),
         ("[3, 1, 2].sort().map(x => x * 10).reduce((a, b) => a + b) + JSON.parse('{\"a\": 4}').a", 64),
+        // Intl (ICU4X): разделитель тысяч по локали и сравнение по-немецки.
+        (
+            "(new Intl.NumberFormat('en-US').format(1234.5) === '1,234.5' ? 1 : 0) + \
+             (['z', 'ä', 'a'].sort(new Intl.Collator('de').compare).join('') === 'aäz' ? 2 : 0)",
+            3,
+        ),
     ];
     let mut ok = true;
     for (n, (src, want)) in cases.iter().enumerate() {

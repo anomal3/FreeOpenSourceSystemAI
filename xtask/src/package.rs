@@ -235,6 +235,10 @@ fn servo(arch: Arch) -> Result<Option<Vec<u8>>> {
     servo.field("about", "движок браузера Servo (в работе): проверка SpiderMonkey");
     let data = fs::read(&jsprobe).with_context(|| format!("не удалось прочитать {}", jsprobe.display()))?;
     servo.file(&Entry { path: String::from("bin/jsprobe"), mode: 0o755, uid: 0, gid: 0, data });
+    // Авторство и лицензии (N8): MPL-2.0 и Unicode требуют, чтобы уведомление
+    // ехало вместе с двоичным файлом.
+    let notice = include_bytes!("../../ports/browser/NOTICE.md").to_vec();
+    servo.file(&Entry { path: String::from("share/NOTICE.md"), mode: 0o644, uid: 0, gid: 0, data: notice });
     Ok(Some(servo.finish()))
 }
 

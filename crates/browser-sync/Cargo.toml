@@ -1,0 +1,19 @@
+[package]
+name = "browser-sync"
+description = "Browser sync core (ROADMAP N10): per-device append-only op logs with hybrid logical clocks, last-writer-wins merge with tombstones, snapshots and tombstone GC over a pluggable file store."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Зависимостей нет намеренно: ядро синхронизации — чистая логика над строками,
+# и оно же потом пойдёт в программы ОС на `no_std` («то же для состояния ОС»:
+# стол, значки, темы, пароли Wi-Fi). Сеть (GitHub Contents API, WebDAV) и
+# шифрование паролей — снаружи, за типажом `Store`.
+
+[lints]
+workspace = true
+
+[features]
+# `DirStore` — хранилище в каталоге файловой системы (нужен `std`).
+std = []

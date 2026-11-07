@@ -6954,7 +6954,8 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run /bin/pkg remove servo"),
             Step::Wait(3_000),
             Step::Line("run /bin/pkg install /media/servo-0.1.fpk"),
-            Step::Await("pkg: installed servo 0.1, 1 file(s)", 120_000),
+            // jsprobe и NOTICE.md (авторство, N8).
+            Step::Await("pkg: installed servo 0.1, 2 file(s)", 120_000),
             Step::Line("run /opt/servo/bin/jsprobe"),
             Step::Await("jsprobe: engine", 60_000),
             Step::Await("jsprobe: runtime", 60_000),
@@ -6962,6 +6963,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("jsprobe: case 0 = Some(2)", 60_000),
             Step::Await("jsprobe: case 1 = Some(5050)", 60_000),
             Step::Await("jsprobe: case 2 = Some(64)", 60_000),
+            // Intl: NumberFormat и Collator (ICU4X).
+            Step::Await("jsprobe: case 3 = Some(3)", 60_000),
             Step::Await("jsprobe: ok", 30_000),
             Step::Await("exited with code 0", 30_000),
             Step::Absent("jsprobe: FAIL"),

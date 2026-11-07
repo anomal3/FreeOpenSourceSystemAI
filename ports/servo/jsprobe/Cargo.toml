@@ -12,7 +12,8 @@ publish = false
 # mozjs_sys подменяется копией с ОС freeos (build/servo/mozjs_sys-*,
 # правки — ports/servo/mozjs/freeos.patch); без JIT, как у Servo без js_jit.
 [dependencies]
-mozjs = { version = "=0.26.13", default-features = false, features = ["libz-sys"] }
+# `intl` — как у Servo (ICU4X на Rust внутри mozjs_sys).
+mozjs = { version = "=0.26.13", default-features = false, features = ["libz-sys", "intl"] }
 
 [profile.release]
 panic = "abort"

@@ -52,6 +52,20 @@ index dff149b..b6cc2b0 100755
              return ("-fvisibility=hidden", "-fvisibility-inlines-hidden")
          return (
              "-I%s/system_wrappers" % os.path.join(env.dist),
+diff --git a/mozjs/intl/icu/source/common/putilimp.h b/mozjs/intl/icu/source/common/putilimp.h
+index 03f588a..3ce07f1 100644
+--- a/mozjs/intl/icu/source/common/putilimp.h
++++ b/mozjs/intl/icu/source/common/putilimp.h
+@@ -119,6 +119,9 @@ typedef size_t uintptr_t;
+ #   define U_TIMEZONE timezone
+ #elif defined(__UCLIBC__)
+     // uClibc does not have __timezone or _timezone.
++#elif defined(__freeos__)
++    // FreeOS: picolibc defines _NEWLIB_VERSION but exports POSIX `timezone`.
++#   define U_TIMEZONE timezone
+ #elif defined(_NEWLIB_VERSION)
+ #   define U_TIMEZONE _timezone
+ #elif defined(__GLIBC__)
 diff --git a/mozjs/js/src/gc/Memory.cpp b/mozjs/js/src/gc/Memory.cpp
 index 76dad23..b9317ba 100644
 --- a/mozjs/js/src/gc/Memory.cpp

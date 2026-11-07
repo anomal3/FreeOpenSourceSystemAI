@@ -6,6 +6,7 @@ members = [
     "crates/boot-bare",
     "crates/boot-info",
     "crates/boot-uefi",
+    "crates/browser-sync",
     "crates/btrfs",
     "crates/calendar",
     "crates/clr-meta",
