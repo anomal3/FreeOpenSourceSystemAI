@@ -11274,8 +11274,54 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   17 с). Цена —
   размер: jsprobe 10 → 31 МБ (данные ICU всех локалей; урезать набор
   локалей — потом, когда будет весь Servo и станет видно общий вес).
-  **Осталось из N4:** JIT потом; freetype/harfbuzz/fontconfig,
-  `aws-lc-sys`/ring, `rusqlite`.
+  **Остальные C/C++-зависимости — 08.11.** Разбор дерева `servo 0.8.0`
+  без фич (аналитик): кроме mozjs нужны `harfbuzz-sys` 0.8 (bundled),
+  `freetype-sys` 0.23 (+libpng; у servo-fonts закрыт cfg по ОС — подключать
+  прямо с `bundled`), `fontsan` 0.7 (OTS+lz4, фича `wuff`), `aws-lc-sys`
+  0.47 (rustls в servo-net прибит к aws-lc — ring не выбрать), `libsqlite3-sys`
+  0.36 bundled (servo-net, servo-storage), `zstd-sys`, `libz-sys`;
+  fontconfig **не нужен** (у Linux он через dlopen; для FreeOS — свой
+  `font_list` обходом каталогов, как у Android). Проверка — `ports/servo/
+  depsprobe` (`build-depsprobe.sh <арх>` в Docker) в пакете `servo`,
+  сценарий `servo-deps`: HarfBuzz раскладывает «Hello, мир! office» шрифтом
+  DejaVu (18 знаков → 16 глифов: лигатура ffi), FreeType рисует «Ж» 32 px,
+  OTS пропускает DejaVu и отвергает мусор, zlib/zstd, aws-lc (sha256,
+  getentropy, AES-256-GCM, ECDSA P-256, TLS 1.3 в rustls через петлю),
+  SQLite в памяти и файлом в /home/roman, обход /usr/share/fonts (12 файлов).
+  Что пришлось поправить: **libc** — типы pthread видны из `<sys/types.h>`
+  (как требует POSIX; aws-lc объявляет `pthread_rwlock_t` в публичном
+  заголовке): `libc/freeos/include/sys/_pthreadtypes.h`, подключается из
+  `pthread.h` и через `machine/types.h` (штатный крючок picolibc);
+  `chown/lchown/fchown` — ENOSYS, как `chmod` (SQLite зовёт `fchown`).
+  **Сборка** — `CXXSTDLIB_<цель>=c++` (крейт `cc` для неизвестной ОС берёт
+  libstdc++), `CFLAGS_<цель>=-D_DEFAULT_SOURCE` (aws-lc собирает с
+  `-std=c11`, picolibc тогда прячет `sigaction`; Linux aws-lc сам даёт
+  `_XOPEN_SOURCE=700`), на aarch64 `-DOPENSSL_STATIC_ARMCAP` (возможности
+  CPU aws-lc спрашивает у ОС — getauxval/elf_aux_info; у нас — из флагов
+  компилятора: NEON, AES/SHA программно), `LIBZ_SYS_STATIC=1`,
+  `AWS_LC_SYS_NO_JITTER_ENTROPY=1`, SQLite без расширений (нет dlopen).
+  **aws-lc-sys** — копия крейта с одной правкой (`ports/servo/builder/
+  patch-crates.sh`): на «прочих» ОС он читает `/dev/urandom`, а у родных
+  программ `/dev` нет (он только в слое Linux) — freeos поставлен к ОС с
+  `getentropy()` (FreeBSD/OpenBSD/macOS), как mozjs.
+  **SQLite в файле:** VFS по умолчанию («unix») берёт блокировки
+  `fcntl(F_SETLK)`, а у ядра их нет (ENOSYS) → `SQLITE_IOERR_LOCK` (3850).
+  Со встроенным VFS `unix-none` (без блокировок) база пишется и читается
+  заново. Профиль браузера — один процесс (Servo без multiprocess), так что
+  для Servo это годится: сделать `unix-none` VFS по умолчанию
+  (`-DSQLITE_EXTRA_INIT=…` + `sqlite3_vfs_register(find("unix-none"), 1)`)
+  или блокировки в ядре — решить при сборке servo-net/servo-storage.
+  Пакет `servo` получил `permissions = windows files net` (без `net` даже
+  `bind` на 127.0.0.1 — EACCES). **Итог — зелёный на x86_64 (14 с) и
+  aarch64 (18 с)**: TLS 1.3 через петлю 160/92 мс, ECDSA P-256 48/18 мс,
+  depsprobe 9,5/8,8 МБ; `servo-js`, `cthreads`, `rust-std` после правок libc
+  — зелёные.
+  **Осталось из N4:** JIT потом; HWCAP для aarch64 (AES/SHA в железе);
+  блокировки файлов (`fcntl`/`flock`) в ядре или `unix-none` по умолчанию;
+  `/dev/urandom`/`/dev/null` для родных программ — подумать (чужой код ждёт
+  их чаще, чем хотелось бы). Дальше — N5 (swgl) и сборка самого `servo`
+  (`cargo check` с подменами: servo-fonts/fonts-traits + свой `font_list`,
+  gaol под cfg, `ipc-channel` `force-inprocess`, `getrandom` 0.4).
 - **N5 — swgl-рендер.** Сначала **на хосте Linux** (быстрые итерации): свой
   `RenderingContext` на `swgl::Context`, страница → PNG; `webgl` выкл.
   Затем то же под `*-unknown-freeos`.

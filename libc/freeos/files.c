@@ -515,6 +515,32 @@ int fchmod(int fd, mode_t mode) {
     return -1;
 }
 
+/* Владельца тоже (N4: SQLite зовёт `fchown` для журнала, если запущен от
+ * root, и отказ пропускает — без символа программа не компонуется). */
+int chown(const char *path, uid_t owner, gid_t group) {
+    (void)path;
+    (void)owner;
+    (void)group;
+    errno = ENOSYS;
+    return -1;
+}
+
+int lchown(const char *path, uid_t owner, gid_t group) {
+    (void)path;
+    (void)owner;
+    (void)group;
+    errno = ENOSYS;
+    return -1;
+}
+
+int fchown(int fd, uid_t owner, gid_t group) {
+    (void)fd;
+    (void)owner;
+    (void)group;
+    errno = ENOSYS;
+    return -1;
+}
+
 int utimes(const char *path, const struct timeval times[2]) {
     (void)path;
     (void)times;

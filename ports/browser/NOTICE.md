@@ -20,6 +20,15 @@ https://github.com/anomal3/FreeOpenSourceSystemAI
 | **ICU4X** (обёртки Intl в `mozjs_sys`) | © Unicode, Inc. и участники | Unicode-3.0 |
 | **egui** | © Emil Ernerfeldt и участники | MIT или Apache-2.0 |
 | **zlib** (`libz-sys`) | © Jean-loup Gailly, Mark Adler | Zlib |
+| **HarfBuzz** (`harfbuzz-sys`) | © HarfBuzz contributors | MIT («Old MIT») |
+| **FreeType** (`freetype-sys`) | © The FreeType Project | FTL (BSD-подобная, с упоминанием) или GPL-2.0 — берём FTL |
+| **libpng** (в FreeType) | © Contributing Authors and Group 42, Inc. | libpng License |
+| **OTS** — OpenType Sanitizer (`fontsan`) | © The Chromium Authors | BSD-3-Clause |
+| **LZ4** (в `fontsan`) | © Yann Collet | BSD-2-Clause |
+| **AWS-LC** (`aws-lc-sys`, `aws-lc-rs`) | © Amazon.com, Inc.; © Google (BoringSSL); © OpenSSL Project | Apache-2.0 / ISC / OpenSSL |
+| **rustls** | © rustls contributors | Apache-2.0 / ISC / MIT |
+| **SQLite** (`libsqlite3-sys`) | авторы SQLite | общественное достояние |
+| **Zstandard** (`zstd-sys`) | © Meta Platforms, Inc. | BSD-3-Clause |
 
 Правки FreeOS в SpiderMonkey (ОС `freeos` в сборке, `getentropy()` для
 случайности, видимость символов) лежат открыто в
@@ -29,6 +38,8 @@ MPL-2.0, что и исправленные файлы.
 Текст MPL-2.0: https://mozilla.org/MPL/2.0/
 Текст Unicode License v3: https://www.unicode.org/license.txt
 
-Список пополняется вместе с зависимостями движка (шрифты — FreeType,
-HarfBuzz, Fontconfig; хранилище — SQLite; TLS — rustls и его
-криптопровайдер): каждая новая библиотека в пакете `servo` — строка здесь.
+Правка FreeOS в AWS-LC (случайность через `getentropy()`) делается при
+сборке — `ports/servo/builder/patch-crates.sh`.
+
+Список пополняется вместе с зависимостями движка: каждая новая библиотека
+в пакете `servo` — строка здесь.

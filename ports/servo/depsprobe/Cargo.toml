@@ -1,0 +1,30 @@
+[package]
+name = "depsprobe"
+version = "0.1.0"
+edition = "2021"
+description = "N4: C/C++-зависимости Servo на FreeOS — HarfBuzz, FreeType, OTS (fontsan), aws-lc (rustls), SQLite, zstd, zlib"
+publish = false
+
+# Отдельный workspace: собирается в контейнере fossai-builder
+# (ports/servo/builder/build-probe.sh depsprobe <арх>) целью <арх>-unknown-freeos.
+[workspace]
+
+# Те же крейты и фичи, что тянет servo 0.8 (servo-fonts, webrender,
+# servo-net, servo-storage). freetype-sys у servo-fonts закрыт cfg по ОС —
+# здесь он подключён прямо, с `bundled` (FreeType и libpng из исходников).
+[dependencies]
+harfbuzz-sys = { version = "0.8", default-features = false, features = ["bundled"] }
+freetype-sys = { version = "0.23", features = ["bundled"] }
+libz-sys = { version = "1.1", default-features = false, features = ["static", "libc"] }
+fontsan = { version = "0.7", default-features = false, features = ["libz-sys", "wuff"] }
+aws-lc-rs = { version = "1.17", default-features = false, features = ["aws-lc-sys"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+zstd = { version = "0.13", default-features = false }
+
+[profile.release]
+panic = "abort"
+debug = false
+codegen-units = 16
+strip = true

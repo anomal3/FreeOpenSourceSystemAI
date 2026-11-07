@@ -233,8 +233,18 @@ fn servo(arch: Arch) -> Result<Option<Vec<u8>>> {
     let mut servo = Builder::new(Kind::Package, "servo", "0.1");
     servo.field("summary", "Servo browser engine for FreeOS (in progress): SpiderMonkey check");
     servo.field("about", "движок браузера Servo (в работе): проверка SpiderMonkey");
+    // Как у NetSurf: окна, файлы (база SQLite, кеш), сеть (TLS через петлю у
+    // depsprobe — без `net` даже bind на 127.0.0.1 отказан). `jit` — когда
+    // SpiderMonkey пойдёт с JIT (N12).
+    servo.field("permissions", "windows files net");
     let data = fs::read(&jsprobe).with_context(|| format!("не удалось прочитать {}", jsprobe.display()))?;
     servo.file(&Entry { path: String::from("bin/jsprobe"), mode: 0o755, uid: 0, gid: 0, data });
+    // Остальные C/C++-зависимости движка (HarfBuzz, FreeType, OTS, aws-lc,
+    // SQLite, zstd) — `build-depsprobe.sh`; нет — пакет и без неё.
+    if let Some(deps) = crate::ruststd::linux_host_program("depsprobe", arch) {
+        let data = fs::read(&deps).with_context(|| format!("не удалось прочитать {}", deps.display()))?;
+        servo.file(&Entry { path: String::from("bin/depsprobe"), mode: 0o755, uid: 0, gid: 0, data });
+    }
     // Авторство и лицензии (N8): MPL-2.0 и Unicode требуют, чтобы уведомление
     // ехало вместе с двоичным файлом.
     let notice = include_bytes!("../../ports/browser/NOTICE.md").to_vec();

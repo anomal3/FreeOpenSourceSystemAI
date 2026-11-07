@@ -30,63 +30,15 @@
 #include <sched.h>
 #include <stddef.h>
 #include <sys/_sigset.h>
+#include <sys/types.h>
 #include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct freeos_thread *pthread_t;
-
-/* `stackaddr` — низ стека; заполняет только `pthread_getattr_np` (стеки
- * выделяет ядро, свой стек потоку не передать). */
-typedef struct {
-    size_t stacksize;
-    int detachstate;
-    void *stackaddr;
-} pthread_attr_t;
-
-/* Слово `state` — то, на чём спят: 0 свободен, 1 занят, 2 занят и кто-то ждёт. */
-typedef struct {
-    unsigned int state;
-    int type;
-    pthread_t owner;
-    unsigned int count;
-} pthread_mutex_t;
-
-typedef struct {
-    int type;
-} pthread_mutexattr_t;
-
-/* `seq` растёт на каждом сигнале; ждущий спит, пока оно то, что он видел. */
-typedef struct {
-    unsigned int seq;
-    int clock;
-} pthread_cond_t;
-
-typedef struct {
-    int clock;
-} pthread_condattr_t;
-
-typedef struct {
-    pthread_mutex_t lock;
-    pthread_cond_t readable;
-    pthread_cond_t writable;
-    int readers;
-    int writer;
-    int waiting_writers;
-} pthread_rwlock_t;
-
-typedef struct {
-    int unused;
-} pthread_rwlockattr_t;
-
-typedef unsigned int pthread_key_t;
-
-/* 0 — не звали, 1 — идёт, 2 — сделано. */
-typedef struct {
-    unsigned int state;
-} pthread_once_t;
+/* Сами типы — в <sys/_pthreadtypes.h>: их видит и <sys/types.h> (POSIX). */
+#include <sys/_pthreadtypes.h>
 
 #define PTHREAD_CREATE_JOINABLE 0
 #define PTHREAD_CREATE_DETACHED 1
