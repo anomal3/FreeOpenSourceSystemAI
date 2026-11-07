@@ -11204,6 +11204,36 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   `js_jit` выкл.; JIT потом через `MAP_JIT` + RW↔RX), freetype, harfbuzz,
   fontconfig (уже есть), `aws-lc-sys` (или фича на `ring`), `rusqlite`
   bundled; `jemalloc` — выкл. (наш malloc).
+  **Ход (07.11):** Linux-хост сборки — Docker на ПК (WSL только у Docker
+  Desktop; `C:\Program Files\Docker\Docker\resources\bin\docker.exe`):
+  образ `fossai-builder` (`ports/servo/builder/Dockerfile`: Debian 13,
+  LLVM 22 apt.llvm.org, Rust `nightly-2026-08-11` = тот же 12c36e25, что на
+  ПК), окружение `. /work/ports/servo/builder/freeos-env.sh x86_64` +
+  `freeos_build <крейт>`; `rstd/rtokio/rtls` в нём собираются. Перед
+  этим на ПК должен отработать xtask (`cargo xtask test -s rust-std`) —
+  он готовит `build/rust-std/src` и `patches.toml` (env переписывает пути
+  на /work). Грабли: `rust-toolchain.toml` = «nightly» → в контейнере
+  `RUSTUP_TOOLCHAIN` закреплён; хостовый `cc` = clang образа.
+  **Разбор mozjs (аналитик, 07.11):** `servo` 0.8 → `servo-script` 0.8 →
+  `mozjs =0.26.13` (`default-features=false`, фичи `intl`,`libz-sys`) →
+  `mozjs_sys =153.6.0-1` (SpiderMonkey ESR 153). У `servo` выключить
+  `default-features` (там `js_jit` и `multiprocess`). `mozjs_sys/build.rs`
+  → `make -f makefile.cargo` → `configure` (python); без `jit` —
+  `--disable-jit` (JS_CODEGEN_NONE, сигнальные обработчики wasm выпадают).
+  Биндинги — bindgen на лету (libclang; `BINDGEN_EXTRA_CLANG_ARGS_<цель>`
+  с `--target`, sysroot, `-isystem` libc++). `CXXSTDLIB=c++`,
+  `-stdlib=libc++` в CXXFLAGS, `HOST_CC/CXX`. **configure падает на
+  неизвестной ОС** (`split_triplet`: «Unknown OS»). Образец — форк Redox
+  `github.com/willnode/mozjs` ветка `redox-0.26.4` (коммит 7410d6de):
+  ОС в `build/moz.configure/init.configure` (split_triplet, XP_REDOX),
+  `python/mozbuild/mozbuild/configure/constants.py` (OS/Kernel/макрос),
+  обход проверки ядра компилятора в `toolchain.configure`; `#ifdef` в
+  gc/Memory.cpp (decommit, getrusage), PosixThread.cpp
+  (pthread_setname_np/prctl), TaggedAnonymousMemory.cpp, RandomNum.cpp,
+  TimeStamp_posix.cpp (sys/syscall.h), NativeStack.cpp, PlatformMutex.h,
+  jsglue.cpp (malloc_usable_size), CharacterEncoding.cpp (mbsinit). План:
+  форк `mozjs_sys` 153.6.0-1 с ОС `freeos` (как Redox, без притворства
+  Linux), подмена через patches.toml, проба `JS_Init` + `Evaluate("1+1")`.
 - **N5 — swgl-рендер.** Сначала **на хосте Linux** (быстрые итерации): свой
   `RenderingContext` на `swgl::Context`, страница → PNG; `webgl` выкл.
   Затем то же под `*-unknown-freeos`.
