@@ -16,3 +16,4 @@
 /firmware/modem/
 # Копии заводских разделов телефона (boot, dtbo, vbmeta) — для возврата.
 /firmware/stock/
+/photos
