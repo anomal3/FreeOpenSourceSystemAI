@@ -11159,6 +11159,20 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   Проверка — сценарий `rust-std`: `println!`, `std::thread` + `Mutex` +
   `Condvar`, `std::fs`, `TcpStream` к `httpd` стенда, `Instant`, паника с
   раскруткой. Потом — перевод одной нашей программы с `no_std` на `std`.
+  **x86_64 — сделано 07.11 (acf78ac):** `ports/rust-std` + `xtask::ruststd`,
+  цель `env=newlib` (picolibc — потомок newlib; в списках `std` FreeOS
+  стоит рядом с Horizon), модуль `libc` снят с заголовков пробой
+  `sizeof`/`offsetof`/констант (≈950), `/bin/rstd`, сценарий `rust-std`
+  зелёный: потоки, `Mutex`/`Condvar`/`RwLock`, `thread_local`, `HashMap`
+  (getentropy), время, чтение файлов, TCP через 127.0.0.1. Попутно в libc:
+  `__errno()`, `bind` на `127.0.0.0/8`, `IP_TTL`/`IP_TOS`/`IPV6_*_MEMBERSHIP`.
+  Грабли: cargo не пересобирает зависимости `-Zbuild-std` по правке
+  исходника (xtask стирает `build/rust-std/target` при смене штампа);
+  `-lfreeos` обязан стоять перед `-lc` (замки picolibc). **Осталось:**
+  aarch64 (спека есть, не гонялась); запись в файлы — сценарий на
+  установленном диске (корень живой системы только для чтения);
+  `std::process` (сейчас «unsupported»), раскрутка паники (`panic=abort`),
+  `current_exe`.
 - **N3 — экосистема.** `[patch.crates-io]` форков (`libc`, `mio`,
   `socket2`, `getrandom`, `parking_lot_core`, `memmap2`, `surfman` — только
   чтобы собрался); проверка — `tokio` (rt-multi-thread) и `rustls` клиент.
