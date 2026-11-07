@@ -34,8 +34,22 @@ use anyhow::{bail, Context, Result};
 use crate::arch::Arch;
 use crate::{cbuild, java, paths, util};
 
-/// Программы на `std`, которые едут в `/bin`.
-pub const PROGRAMS: [&str; 1] = ["rstd"];
+/// Программы на `std`, которые едут в `/bin`: `rstd` — сама `std`,
+/// `rtokio` — асинхронная экосистема (tokio/mio/socket2, N3).
+pub const PROGRAMS: [&str; 2] = ["rstd", "rtokio"];
+
+/// Крейты экосистемы, которым нужна ветка под FreeOS (N3). Правка одна и та
+/// же: рядом с каждым `target_os = "redox"` встаёт `"freeos"` — Redox тоже
+/// минимальный unix на своей libc, и его ветки (pipe вместо eventfd, без
+/// SO_* сверх POSIX) подходят нам почти дословно. Исключение — selector
+/// `mio`: у Redox epoll, у нас его нет, поэтому `mio` собирается в
+/// официальном режиме `poll()` (`--cfg mio_unsupported_force_poll_poll`).
+/// Версии закреплены, хеши — `cksum` с index.crates.io (07.11.2026).
+const LIKE_REDOX: &[(&str, &str, &str)] = &[
+    ("mio", "1.2.4", "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"),
+    ("socket2", "0.6.5", "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"),
+    ("tokio", "1.54.1", "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"),
+];
 
 /// Версия `libc`, которой собирается `std` этого тулчейна (`library/Cargo.lock`).
 const LIBC_VERSION: &str = "0.2.189";
@@ -74,6 +88,24 @@ pub fn build_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
     let target_dir = root().join("target");
     let triple = format!("{}-unknown-freeos", arch.name());
 
+    // Библиотеки набора cargo не отслеживает: новая `libfreeos.a` (правка
+    // `libc/freeos` + `cargo xtask sdk`) не перекомпоновала бы программы, чей
+    // исходник не менялся. Готовые программы старше набора — стираются.
+    let newest_lib = ["libfreeos.a", "libc.a", "libunwind.a", "crt0.o"]
+        .iter()
+        .filter_map(|name| fs::metadata(lib.join(name)).and_then(|m| m.modified()).ok())
+        .max();
+    let out = target_dir.join(&triple).join("release");
+    for name in PROGRAMS {
+        let program = out.join(name);
+        let built = fs::metadata(&program).and_then(|m| m.modified()).ok();
+        if let (Some(built), Some(newest)) = (built, newest_lib) {
+            if newest > built {
+                let _ = fs::remove_file(&program);
+            }
+        }
+    }
+
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.current_dir(ports().join("check"))
@@ -84,7 +116,10 @@ pub fn build_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
         .arg("--target")
         .arg(target_spec(arch))
         .arg("--target-dir")
-        .arg(&target_dir);
+        .arg(&target_dir)
+        // Подмена libc и крейтов экосистемы на поправленные копии.
+        .arg("--config")
+        .arg(root().join("src/patches.toml"));
     // Пути — с прямой косой: RUSTFLAGS режется по пробелам, а `\` в пути
     // Windows lld понимает и так и так.
     let slash = |p: &Path| p.display().to_string().replace('\\', "/");
@@ -92,7 +127,8 @@ pub fn build_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
     cmd.env(
         "RUSTFLAGS",
         format!(
-            "-L {lib_s} -C link-arg=-T{lib_s}/freeos-cxx.ld -C link-arg={lib_s}/crt0.o -C strip=debuginfo"
+            "-L {lib_s} -C link-arg=-T{lib_s}/freeos-cxx.ld -C link-arg={lib_s}/crt0.o -C strip=debuginfo \
+             --cfg mio_unsupported_force_poll_poll"
         ),
     )
     .env_remove("CARGO_ENCODED_RUSTFLAGS")
@@ -152,8 +188,22 @@ fn prepare() -> Result<PathBuf> {
     patch_std(&library)?;
 
     let libc = src.join("libc");
-    unpack_libc(&libc)?;
+    unpack_crate("libc", LIBC_VERSION, LIBC_SHA256, &libc)?;
     patch_libc(&libc)?;
+
+    let slash = |p: &Path| p.display().to_string().replace('\\', "/");
+    let mut patches = format!("[patch.crates-io]\nlibc = {{ path = \"{}\" }}\n", slash(&libc));
+    for (name, version, sha) in LIKE_REDOX {
+        let dir = src.join(format!("{name}-{version}"));
+        unpack_crate(name, version, sha, &dir)?;
+        let sites = next_to_redox(&dir)?;
+        say!("{name} {version}: freeos рядом с redox в {sites} местах");
+        if *name == "mio" {
+            patch_mio(&dir)?;
+        }
+        patches += &format!("{name} = {{ path = \"{}\" }}\n", slash(&dir));
+    }
+    fs::write(src.join("patches.toml"), patches)?;
 
     fs::write(&stamp, want)?;
     Ok(library)
@@ -297,12 +347,62 @@ fn patch_std(library: &Path) -> Result<()> {
 
 // ── libc ────────────────────────────────────────────────────────────────────
 
-fn unpack_libc(dest: &Path) -> Result<()> {
+/// `mio` у Redox оставляет сокеты **блокирующими**: Redox нет ни в списке
+/// `socket(SOCK_NONBLOCK)`, ни в списке `accept4(SOCK_NONBLOCK)`. С таким
+/// сокетом рантайм tokio засыпает в первом же `read`/`accept` (N3,
+/// 07.11.2026, разобрано сценарием `rust-std`: все `F_GETFL` без
+/// `O_NONBLOCK`). У нас есть и `SOCK_NONBLOCK`, и `accept4` — freeos
+/// ставится в оба списка рядом с Linux.
+fn patch_mio(dir: &Path) -> Result<()> {
+    let unix = dir.join("src/sys/unix");
+    replace(
+        &unix.join("net.rs"),
+        "        target_os = \"cygwin\",\n    ))]\n    let socket_type = socket_type | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;",
+        "        target_os = \"cygwin\",\n        target_os = \"freeos\",\n    ))]\n    let socket_type = socket_type | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;",
+    )?;
+    replace(
+        &unix.join("tcp.rs"),
+        "        target_os = \"cygwin\",\n        target_os = \"nuttx\",\n    ))]\n    let stream = {\n        syscall!(accept4(",
+        "        target_os = \"cygwin\",\n        target_os = \"nuttx\",\n        target_os = \"freeos\",\n    ))]\n    let stream = {\n        syscall!(accept4(",
+    )?;
+    // …и убрать из второй ветки (BSD: accept без флагов, «режим наследуется
+    // от слушающего»), куда freeos попал рядом с Redox: она стоит ниже и
+    // затеняла бы `accept4`.
+    replace(
+        &unix.join("tcp.rs"),
+        "        target_os = \"macos\",\n        target_os = \"redox\", target_os = \"freeos\",",
+        "        target_os = \"macos\",\n        target_os = \"redox\",",
+    )?;
+    Ok(())
+}
+
+/// Поставить `target_os = "freeos"` рядом с каждым `target_os = "redox"`.
+fn next_to_redox(dir: &Path) -> Result<usize> {
+    let mut files = Vec::new();
+    collect_files(dir, &mut files)?;
+    let mut sites = 0;
+    for file in files.into_iter().filter(|f| f.extension().is_some_and(|x| x == "rs")) {
+        let text = fs::read_to_string(&file)?;
+        let n = text.matches("target_os = \"redox\"").count();
+        if n > 0 {
+            sites += n;
+            fs::write(&file, text.replace("target_os = \"redox\"", "target_os = \"redox\", target_os = \"freeos\""))?;
+        }
+    }
+    if sites == 0 {
+        bail!("{}: ни одного target_os = \"redox\" — версия сменилась, сверить", dir.display());
+    }
+    Ok(sites)
+}
+
+/// Скачать крейт с crates.io (кеш — `build/toolchain/thirdparty/rust-std`),
+/// сверить SHA-256 и развернуть в `dest`.
+fn unpack_crate(name: &str, version: &str, sha: &str, dest: &Path) -> Result<()> {
     let cache = crate::sdk::root().join("thirdparty/rust-std");
     fs::create_dir_all(&cache)?;
-    let file = cache.join(format!("libc-{LIBC_VERSION}.crate"));
-    if !file.is_file() || sha256(&file)? != LIBC_SHA256 {
-        let url = format!("https://static.crates.io/crates/libc/libc-{LIBC_VERSION}.crate");
+    let file = cache.join(format!("{name}-{version}.crate"));
+    if !file.is_file() || sha256(&file)? != sha {
+        let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
         say!("> curl {url}");
         let status = Command::new("curl")
             .args(["--location", "--fail", "--silent", "--show-error", "--output"])
@@ -314,11 +414,11 @@ fn unpack_libc(dest: &Path) -> Result<()> {
             bail!("не скачался {url} ({status})");
         }
         let got = sha256(&file)?;
-        if got != LIBC_SHA256 {
-            bail!("хеш libc не тот: {got}, ожидался {LIBC_SHA256}");
+        if got != sha {
+            bail!("хеш {name} {version} не тот: {got}, ожидался {sha}");
         }
     }
-    let prefix = format!("libc-{LIBC_VERSION}/");
+    let prefix = format!("{name}-{version}/");
     let mut err = None;
     java::stream_tar(&file, |_| true, |name, item| {
         if err.is_some() {

@@ -44,6 +44,17 @@ pub type __fd_mask = c_ulong;
 // libc/freeos/include/sys/filio.h (not in the generated set)
 pub const FIONREAD: c_ulong = 0x541B;
 pub const FIONBIO: c_ulong = 0x5421;
+// poll.h: these bits are accepted and ignored by libc/freeos poll() (Linux
+// numbers); mio asks for them next to POLLIN/POLLOUT.
+pub const POLLRDNORM: c_short = 0x040;
+pub const POLLRDBAND: c_short = 0x080;
+pub const POLLWRNORM: c_short = 0x100;
+pub const POLLWRBAND: c_short = 0x200;
+
+// Peer credentials of a unix socket (tokio asks; getsockopt answers
+// ENOPROTOOPT). Linux number and layout.
+pub const SO_PEERCRED: c_int = 17;
+
 // libc/freeos/include/netinet/in.h, added for std (Linux numbers)
 pub const IP_TOS: c_int = 1;
 pub const IP_TTL: c_int = 2;
@@ -192,6 +203,12 @@ s! {
     pub struct winsize {
         pub ws_row: c_ushort,
         pub ws_col: c_ushort,
+    }
+
+    pub struct ucred {
+        pub pid: crate::pid_t,
+        pub uid: crate::uid_t,
+        pub gid: crate::gid_t,
     }
 
     pub struct sched_param {
@@ -463,6 +480,8 @@ extern "C" {
         flg: c_int,
     ) -> c_int;
     pub fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
+    pub fn sendmsg(fd: c_int, msg: *const msghdr, flags: c_int) -> ssize_t;
+    pub fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t;
     pub fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int;
     pub fn sched_yield() -> c_int;
     pub fn memrchr(cx: *const c_void, c: c_int, n: size_t) -> *mut c_void;

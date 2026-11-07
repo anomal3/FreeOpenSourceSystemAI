@@ -11176,6 +11176,23 @@ WebRender на wgpu (не существует), softpipe (слишком мед
 - **N3 — экосистема.** `[patch.crates-io]` форков (`libc`, `mio`,
   `socket2`, `getrandom`, `parking_lot_core`, `memmap2`, `surfman` — только
   чтобы собрался); проверка — `tokio` (rt-multi-thread) и `rustls` клиент.
+  **tokio — сделано 07.11:** `xtask::ruststd` качает с crates.io (хеш
+  сверяется) `mio` 1.2.4, `socket2` 0.6.5, `tokio` 1.54.1, ставит
+  `freeos` рядом с каждым `redox` и подменяет их через `--config
+  build/rust-std/src/patches.toml` (вместе с `libc`); `mio` — в режиме
+  `poll()` (`--cfg mio_unsupported_force_poll_poll`, будильник — pipe).
+  `/bin/rtokio`: таймер, задачи + mpsc, 4 асинхронных TCP-клиента через
+  петлю — зелёный на current_thread, multi_thread x1 и x2, x86_64 и
+  aarch64. **Грабли:** у Redox в `mio` сокеты блокирующие (нет ни в списке
+  `socket(SOCK_NONBLOCK)`, ни в `accept4`) — рантайм засыпал в первом
+  `read`; freeos поставлен в оба списка как у Linux (`patch_mio`). Найдено
+  дампом `tasks` (ожидание `io_events` выглядит как «waiting on an address»
+  с ключом-адресом ядра) и `F_GETFL` сокетов. В `rstd` добавлены проверки
+  `poll()` (pipe из другого потока, срок, принятый сокет), неблокирующих
+  `accept4`/`connect`/`read` и нагрузка Mutex+Condvar (100 000 сообщений).
+  **Осталось из N3:** `rustls` (нужен `ring` или `aws-lc` — C/asm через
+  `cc` нашим набором), `getrandom`/`parking_lot_core`/`memmap2` — по мере
+  того, как их потянут.
 - **N4 — C/C++-зависимости Servo.** `mozjs-sys` (сначала без JIT —
   `js_jit` выкл.; JIT потом через `MAP_JIT` + RW↔RX), freetype, harfbuzz,
   fontconfig (уже есть), `aws-lc-sys` (или фича на `ring`), `rusqlite`

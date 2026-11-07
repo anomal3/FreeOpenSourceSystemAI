@@ -2,12 +2,18 @@
 name = "rstd"
 version = "0.1.0"
 edition = "2021"
-description = "Проверка std Rust на FreeOS (цель <арх>-unknown-freeos): потоки, файлы, время, сеть"
+description = "Проверка std Rust и экосистемы на FreeOS (цель <арх>-unknown-freeos): rstd — std, rtokio — tokio/mio/socket2"
 publish = false
 
 # Отдельный workspace: собирается своей целью и своим -Zbuild-std
 # (`cargo xtask` → `xtask::ruststd`), а не вместе с остальными крейтами.
 [workspace]
+
+# mio, socket2, tokio подменяются поправленными копиями (xtask::ruststd,
+# `--config build/rust-std/src/patches.toml`).
+[dependencies]
+libc = "0.2"
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
 
 [profile.release]
 panic = "abort"
