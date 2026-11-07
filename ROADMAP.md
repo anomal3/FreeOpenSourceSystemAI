@@ -11100,112 +11100,120 @@ Servo; Proton/DXVK — позже, когда будет видеокарта.
 
 Блокнот через Wine работает (фаза 71j), но Wine и Proton — гигантские вехи,
 и они уходят **после**:
-1. **Servo** — браузер на ПК, затем попробовать на телефоне (кандидат — Zervo,
-   см. «Записано на потом (Роман 04.11)»). NetSurf убираем, Chromium заменит
-   Servo.
+1. **Servo — нативно** (не через слой Linux): сначала `std` Rust для FreeOS,
+   потом Servo + swgl, своя оболочка по образцу Zervo — см. «Браузер на
+   Servo — НАТИВНО». NetSurf и Chromium потом убираем.
 2. **Локальная LLM** (llama.cpp — порт начат в фазе 70d; маленькая модель).
 3. **Wine и Proton** — по TODO ниже.
 
-## Браузер на Servo — план внедрения (07.11.2026)
+## Браузер на Servo — НАТИВНО (план пересмотрен 07.11.2026)
 
-**Что есть снаружи (проверено 07.11).**
-- **Servo** с 13.04.2026 публикуется на crates.io крейтом `servo` (0.1.0 →
-  0.8.0 от 07.11.2026): ежемесячные выпуски (API может ломаться) и ветка
-  **LTS раз в полгода** (только исправления безопасности). Встраивание:
-  `ServoBuilder`, `WebView`/`WebViewDelegate`, `RenderingContext` —
-  `WindowRenderingContext` (окно, EGL), `OffscreenRenderingContext`,
-  `SoftwareRenderingContext::new(size)` (программный GL через surfman,
-  Mesa surfaceless, кадр забирается `read_to_image`). Рисует WebRender
-  (нужен GL 3 / GLES 3), JS — SpiderMonkey (mozjs, C++), видео — GStreamer
-  (по желанию). servoshell на crates.io не выходит.
-- **Zervo** (github.com/Goddv/Zervo): MPL-2.0 (файл LICENSE — текст MPL без
-  строки копирайта; автор — Goddv), Rust 2024, `rust-version = 1.97`,
-  оболочка на egui 0.34 + egui_glow + winit 0.30, Servo **с crates.io**
-  (`servo = "0.5.0"`, без git). Один автор, 147 коммитов, последний —
-  23.08.2026 (с тех пор Servo ушёл на 0.6–0.8). Есть: боковая панель,
-  вкладки, рабочие пространства, избранное, история, новая вкладка, темы,
-  загрузки. Нет: расширений, синхронизации, профилей, подстановки паролей;
-  потоковое видео не работает. **Тонкость:** Zervo требует патч движка
-  `patches/servo/0001-embedder-file-downloads.patch` (загрузки, уведомления,
-  переименование `MouseButton`) — по docs/SERVO.md «пока выпуск не несёт
-  переименование, крейт с реестра Zervo не собирает вовсе». Пароли — через
-  системную связку ключей (у нас её нет). Своего механизма обновления нет.
+Роман 07.11: не через слой Linux, а родной программой; сначала `std` Rust,
+брать готовое с GitHub; оболочку — свою, по образцу Zervo.
 
-**Вывод по Zervo.** Подходит как **основа оболочки** (MPL, Rust, egui —
-то же, что нам нужно, движок с crates.io), но не как готовый продукт:
-форк, догнать Servo 0.5 → текущий, убрать лишнее (обои/«вибранси»/связка
-ключей), добавить наше (обновление движка, интеграция со столом). Запасной
-и проверочный путь — **servoshell** из того же выпуска Servo: он всегда
-совместим с движком, им первым и проверяем, что Servo вообще живёт у нас.
+### Что уже есть у нас (проверено по коду 07.11)
+- **Потоки есть:** ядро — `SYS_THREAD_CREATE/EXIT`, `SYS_SET_TLS`,
+  `SYS_FUTEX_WAIT/WAKE` (docs/ABI.md); libc — настоящие `pthread_*`,
+  мьютексы, condvar, rwlock, ключи TLS (`libc/freeos/threads.c`), picolibc
+  собрана с `-Dsingle-thread=false` и TLS (`xtask/src/cbuild.rs`).
+- **libc++/libc++abi/libunwind** (LLVM 22, фаза 70d), CMake-набор
+  `build/toolchain/<арх>-freeos.cmake`, fontconfig/freetype (порт Mono).
+- `mmap` с `MAP_JIT`, `mprotect` (W^X: RW↔RX можно, RWX — нет), `poll`,
+  сокеты TCP/UDP, `getaddrinfo`, `SYS_RANDOM`, часы.
+- **Нет:** `std` Rust (программы — `no_std` на `*-unknown-none`), сигналов,
+  `fork/exec` (есть `spawn`), `dlopen` (заглушка), `MAP_FIXED`,
+  `O_NONBLOCK`/`O_APPEND` (ENOSYS), сокетов в `poll`, epoll, OpenGL.
 
-**Лицензия и авторство (обязательно).**
-- Форк в `ports/browser/` (или отдельный репозиторий, подмодуль), файл
-  `LICENSE` — MPL-2.0 без изменений; заголовки MPL в файлах Zervo не
-  трогаем, в изменённых файлах — те же заголовки.
-- `NOTICE.md` и окно «О программе» в браузере: «Основано на Zervo — © Goddv,
-  https://github.com/Goddv/Zervo, MPL-2.0. Движок Servo — © The Servo
-  Project Developers, https://servo.org, MPL-2.0. Текст лицензии:
-  https://mozilla.org/MPL/2.0/». Ссылка на исходники нашего форка там же
-  (MPL требует доступность исходников изменённых файлов).
-- То же — строкой в «Параметры → О системе → Сторонние компоненты».
+### Что берём готовое
+| Что | Откуда | Зачем |
+|---|---|---|
+| Схема цели Rust | Redox (`target_os=redox`, relibc), **Managarm** (`managarm_mlibc.rs`: `families=["unix"]`, `has_thread_local`) | `std` идёт по готовой ветке `sys/pal/unix` с правками `cfg`, а не своим `pal` с нуля |
+| Образец своего `pal` (если unix-путь упрётся) | Motor OS (`x86_64-unknown-motor`, в upstream с 1.92, PR #147000), Hermit | |
+| Крейт `libc` | форк rust-lang/libc + модуль `unix/freeos` (типы из заголовков picolibc + `libc/freeos`) | основа всей экосистемы |
+| `mio`, `socket2`, `getrandom`, `parking_lot_core`, `memmap2` | `[patch.crates-io]` — добавить `freeos` в `cfg` (бэкенд `mio` — `poll`) | |
+| Многопроцессность Servo | выключить: `servo` без `multiprocess`, `ipc-channel` с `force-inprocess` | только потоки, без `fork` |
+| Рисование страниц без GPU | **swgl** 0.70 (crates.io, MPL-2.0) — программный GL из Firefox («Software WebRender»); `webrender` 0.70.1 feature `sw_compositor`; `swgl::Context` реализует `gleam::Gl` | C++20 без libc++ и потоков — ложится на нашу picolibc; Mesa+LLVM не нужны |
+| Интерфейс оболочки | **egui** 0.34 + `egui_software_backend` (MIT/Apache) — egui в пиксели без GL | swgl не компилирует шейдеры на лету, `egui_glow` на нём не пойдёт |
+| JS | `mozjs-sys` (SpiderMonkey) из исходников, `CXXSTDLIB=c++` (наш libc++) | |
+| Опыт порта Servo | Redox, 10.2025: Servo запущен на relibc (доделывали таймеры, futex, TLS, загрузчик) | список граблей |
+| GL «по-взрослому» (потом) | Mesa llvmpipe: рецепт Redox (`redox-24.0`, swrast+LLVM), патчи Managarm | WebGL, скорость; нужны `dlopen`, порт LLVM |
 
-**Устройство: оболочка отдельно, движок отдельно.** Rust-ABI между
-`.so` нестабилен, а Servo ломает API ежемесячно, поэтому:
-- **`fossai-webcore`** — наш тонкий крейт-переходник `cdylib` с **C-ABI**
-  (~20 функций: создать/закрыть вид, `load_url`, назад/вперёд/обновить,
-  события мыши/клавиш/колеса/касаний, размер, забрать кадр или отдать
-  текстуру, обратные вызовы: заголовок, адрес, загрузка, всплывающее окно,
-  загрузка файла, диалоги) + номер версии ABI. Собирается **вместе** со
-  своей версией Servo; при выходе Servo правится только он.
-- **Оболочка `browser`** (форк Zervo) знает только C-ABI и грузит
-  `libwebcore-<версия>.so` через `dlopen`, проверяя версию ABI.
-- Тогда обновить ядро = положить новую `.so` — оболочку не пересобираем.
+Отвергнуто: свой GL на Rust (зрелого нет), SwiftShader+ANGLE (тяжело),
+WebRender на wgpu (не существует), softpipe (слишком медленно).
 
-**Обновления — два пути.**
-1. **С ОС:** в образ корня кладётся движок **LTS** + оболочка; обновляется
-   вместе с системой (`sysupdate`, A/B-слоты, откат — уже есть).
-2. **Без ОС:** пакет `servo-engine-<версия>.fpk` (подписанный, как
-   драйверы и `pkg`), канал из `update.cfg` (`browser=stable|monthly`).
-   Ставится в `/var/lib/browser/engine/<версия>/`, рядом остаётся прошлая.
-   Оболочка при старте берёт **новейшую проверенную** версию из
-   `/var/lib/browser/engine` и из образа; если новая падает при запуске
-   (отметка «запустилась» не появилась дважды подряд) — откат на прошлую и
-   запись в журнал. «Параметры → Браузер»: версия ядра, канал, «Проверить
-   обновления». Оболочка сама — тоже `fpk` и обновляется так же.
-3. **Конвейер:** раз в месяц (выпуск Servo) — подъём версии в
-   `fossai-webcore`, сборка x86-64 и aarch64, наши сценарии `servo-*`
-   (ниже), подпись, выкладка в канал `monthly`; раз в полгода LTS идёт в
-   `stable` и в образ ОС.
+### Этапы
+- **N1 — libc: хвосты под `std`.** `O_NONBLOCK`, `O_APPEND`, `O_CLOEXEC`,
+  сокеты в `poll` (и, может, `epoll_*` поверх него для `mio`),
+  `clock_gettime` всех часов, `getrandom`, `sched_yield`,
+  `pthread_attr_setstacksize`, `sysconf`, `realpath`, `getcwd/chdir`,
+  `socket` опции (`SO_REUSEADDR`, `TCP_NODELAY`), `writev/readv`,
+  `__cxa_thread_atexit_impl`; сигналы — таблица без доставки (как сейчас).
+  Проверка — сценарий на C.
+- **N2 — `std` Rust: цель `x86_64-unknown-freeos` / `aarch64-unknown-freeos`.**
+  Спека-JSON по образцу Managarm (`os=freeos`, `families=["unix"]`,
+  `has_thread_local`, линковка нашим `ld.lld` + `crt0`/picolibc,
+  `relocation-model=pie`); форк `libc` (`unix/freeos`); `std` через
+  `-Zbuild-std=std,panic_abort` с правками `cfg` в `library/std` (патч
+  в `ports/rust-std/`, накатывается на `rust-src` текущего nightly).
+  Проверка — сценарий `rust-std`: `println!`, `std::thread` + `Mutex` +
+  `Condvar`, `std::fs`, `TcpStream` к `httpd` стенда, `Instant`, паника с
+  раскруткой. Потом — перевод одной нашей программы с `no_std` на `std`.
+- **N3 — экосистема.** `[patch.crates-io]` форков (`libc`, `mio`,
+  `socket2`, `getrandom`, `parking_lot_core`, `memmap2`, `surfman` — только
+  чтобы собрался); проверка — `tokio` (rt-multi-thread) и `rustls` клиент.
+- **N4 — C/C++-зависимости Servo.** `mozjs-sys` (сначала без JIT —
+  `js_jit` выкл.; JIT потом через `MAP_JIT` + RW↔RX), freetype, harfbuzz,
+  fontconfig (уже есть), `aws-lc-sys` (или фича на `ring`), `rusqlite`
+  bundled; `jemalloc` — выкл. (наш malloc).
+- **N5 — swgl-рендер.** Сначала **на хосте Linux** (быстрые итерации): свой
+  `RenderingContext` на `swgl::Context`, страница → PNG; `webgl` выкл.
+  Затем то же под `*-unknown-freeos`.
+- **N6 — Servo без окна на FreeOS.** Мини-программа: открыть страницу
+  `httpd` стенда, снимок в PNG — сценарий `servo-headless`.
+- **N7 — окно и оболочка `browser` (своя, с нуля).** Окна — наш API
+  (`SYS_WIN*`) без winit; интерфейс — egui + `egui_software_backend`;
+  кадр страницы (swgl) и интерфейс собираются в один буфер окна. Дизайн —
+  по мотивам Zervo: боковая панель с вкладками и рабочими пространствами
+  (сворачивается в верхнюю), новая вкладка с поиском и плитками, темы,
+  избранное, история, загрузки. Код Zervo — только как пример; если
+  какой-то файл берём почти как есть — он остаётся под MPL-2.0 со своим
+  заголовком. Сценарий `servo-window` (щелчок по ссылке, ввод, вкладки).
+- **N8 — авторство и лицензии.** `ports/browser/NOTICE.md` и «О программе»:
+  «Дизайн по мотивам Zervo — © Goddv, https://github.com/Goddv/Zervo
+  (MPL-2.0)»; «Движок Servo — © The Servo Project Developers,
+  https://servo.org (MPL-2.0)»; swgl/WebRender — © Mozilla (MPL-2.0);
+  текст лицензии https://mozilla.org/MPL/2.0/, ссылка на наши исходники.
+  То же — в «Параметры → О системе → Сторонние компоненты».
+- **N9 — обновления движка.** `dlopen` у нас нет, поэтому движок и оболочка —
+  один бинарник, но **отдельный пакет** `browser-<версия>.fpk`, не часть
+  образа: (1) в образ ОС кладётся сборка на Servo **LTS**, обновляется с
+  системой (`sysupdate`, A/B); (2) без обновления ОС — канал `browser=` в
+  `update.cfg` (`stable` = LTS, `monthly` = свежий Servo), подписанный
+  пакет в `/var/lib/browser/<версия>/`, прошлая версия остаётся; два
+  неудачных старта подряд — откат. «Параметры → Браузер»: версия движка,
+  канал, «Проверить обновления». Конвейер: выпуск Servo → подъём версии →
+  сборка x86-64/aarch64 → сценарии `servo-*` → подпись → канал. Разделить
+  на `.so` движка — когда появится `dlopen` (вместе с Mesa).
+- **N10 — синхронизация в свой репозиторий (идея Романа из чата Qwen 05.11).**
+  Крейт `browser-sync`: вкладки, закладки, история, настройки — в **свой
+  закрытый репозиторий** GitHub (REST Contents API) или Gitea/Forgejo/
+  WebDAV. Файлы — **по устройству** (`devices/<id>/tabs.json`, …), чтобы
+  не было конфликтов «кто последний записал»; закладки — слияние по
+  записи с отметкой времени. Пароли — `passwords.enc`, ключ из
+  мастер-пароля (Argon2id → XChaCha20-Poly1305). Настройка «для простых
+  людей»: вход по GitHub **Device Flow** (код на экране), репозиторий
+  создаётся сам; токен хранится зашифрованным (он — главный секрет). Видны
+  метаданные (время и размер коммитов) — сказать об этом в настройках.
+  Позже — то же для состояния ОС (стол, значки, темы, пароли Wi-Fi).
+- **N11 — телефон (aarch64).** Та же цель `aarch64-unknown-freeos` —
+  слой Linux не нужен; касания → события `WebView`, экранная клавиатура.
+  Затем **убрать NetSurf** (ПК и телефон) и Chromium из образа/TODO.
+- **N12 — потом:** `dlopen` + Mesa llvmpipe (WebGL, скорость, движок
+  отдельной `.so`), JIT SpiderMonkey, видео (GStreamer/ffmpeg),
+  подстановка паролей, расширения.
 
-**Шаги.**
-- **S1 — Servo живёт в слое Linux (ПК, x86-64).** Сборка servoshell и Zervo
-  под `x86_64-linux-gnu` в Debian 12 (glibc как у `/compat/linux`),
-  без GStreamer. Запуск через слой Linux: сначала `--headless` /
-  `SoftwareRenderingContext` (Mesa llvmpipe surfaceless из пакетов Debian),
-  снимок страницы в PNG — сценарий `servo-headless`. Mesa в образе пока
-  нет — первым делом `libgl1-mesa-dri`/`libegl-mesa0` из Debian в корень
-  `/opt/debian` (зависимость пакета, как `debian` у Chromium). Что вероятно
-  доделать в слое: JIT SpiderMonkey (`mprotect` RWX), потоки/futex, шрифты.
-- **S2 — окно.** winit через наш сервер Wayland: EGL Mesa на платформе
-  Wayland программно (swrast отдаёт кадр через `wl_shm` — dmabuf не нужен).
-  Если не выйдет — оболочка рисует сама: `SoftwareRenderingContext` →
-  кадр → буфер `wl_shm`. Проверить протоколы, которые просит winit
-  (`xdg_decoration`, `wp_fractional_scale`, `wl_seat`, курсор). Сценарий
-  `servo-window`: страница из `httpd` стенда, щелчок по ссылке, ввод.
-- **S3 — форк Zervo → `browser`.** Поднять до текущего Servo, переложить на
-  `fossai-webcore`, убрать связку ключей/обои, `NOTICE.md` и «О программе»,
-  значок на столе, `opens=html,url`, браузер по умолчанию; Chromium —
-  убрать из образа и TODO.
-- **S4 — обновления.** Пакет `servo-engine`, загрузчик версий с откатом,
-  канал в `update.cfg`, пункт «Параметры → Браузер», сценарий
-  `servo-update` (поставить новое ядро, затем «битое» — откат).
-- **S5 — убрать NetSurf** (ПК и телефон), когда S2 зелёный на телефоне.
-- **S6 — телефон (aarch64).** Слой Linux на aarch64 сейчас программы Linux
-  отвергает (фаза 71a) — его довести, либо ждать `std` Rust (S7). Плюс
-  сервер Wayland на телефоне (окон Wayland там нет), затем та же сборка aarch64 программно; GPU Mali —
-  отдельно и позже. Касания → события `WebView`, экранная клавиатура.
-- **S7 — потом:** родная сборка без слоя Linux, когда будет `std` Rust для
-  FreeOS (`*-unknown-freeos`); видео (GStreamer); подстановка паролей.
+Риски: корректность futex/TLS под нагрузкой Servo (у Redox именно это),
+сборка SpiderMonkey под новую ОС, скорость однопоточного swgl.
 
 ## Wine и Proton — на потом (Роман 07.11: «гигантские вехи»)
 
