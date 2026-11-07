@@ -35,8 +35,9 @@ use crate::arch::Arch;
 use crate::{cbuild, java, paths, util};
 
 /// Программы на `std`, которые едут в `/bin`: `rstd` — сама `std`,
-/// `rtokio` — асинхронная экосистема (tokio/mio/socket2, N3).
-pub const PROGRAMS: [&str; 2] = ["rstd", "rtokio"];
+/// `rtokio` — асинхронная экосистема (tokio/mio/socket2, N3), `rtls` — TLS
+/// (rustls + ring, N3).
+pub const PROGRAMS: [&str; 3] = ["rstd", "rtokio", "rtls"];
 
 /// Крейты экосистемы, которым нужна ветка под FreeOS (N3). Правка одна и та
 /// же: рядом с каждым `target_os = "redox"` встаёт `"freeos"` — Redox тоже
@@ -45,10 +46,16 @@ pub const PROGRAMS: [&str; 2] = ["rstd", "rtokio"];
 /// `mio`: у Redox epoll, у нас его нет, поэтому `mio` собирается в
 /// официальном режиме `poll()` (`--cfg mio_unsupported_force_poll_poll`).
 /// Версии закреплены, хеши — `cksum` с index.crates.io (07.11.2026).
-const LIKE_REDOX: &[(&str, &str, &str)] = &[
-    ("mio", "1.2.4", "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"),
-    ("socket2", "0.6.5", "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"),
-    ("tokio", "1.54.1", "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"),
+const LIKE_REDOX: &[(&str, &str, &str, &str)] = &[
+    ("mio", "1.2.4", "redox", "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"),
+    ("socket2", "0.6.5", "redox", "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"),
+    ("tokio", "1.54.1", "redox", "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"),
+    // Случайные байты для ring/rustls: как у Vita — getentropy() (у нас поверх
+    // SYS_RANDOM); у Redox он читал бы /dev/urandom.
+    ("getrandom", "0.2.17", "vita", "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"),
+    // `ring` (крипто rustls): SystemRandom включён по списку ОС — как у Vita.
+    // C и ассемблер собирает наш набор (`CC_<цель>` = `<арх>-freeos-cc`).
+    ("ring", "0.17.14", "vita", "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"),
 ];
 
 /// Версия `libc`, которой собирается `std` этого тулчейна (`library/Cargo.lock`).
@@ -136,6 +143,16 @@ pub fn build_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
     .env_remove("CARGO_TARGET_DIR")
     // Свой `library/` вместо `rust-src` тулчейна.
     .env("__CARGO_TESTS_ONLY_SRC_ROOT", &library);
+    // C и ассемблер крейтов (ring и др., через крейт `cc`) — нашим набором:
+    // обёртка `<арх>-freeos-cc` и `llvm-ar`. Ключ — триплет с подчёркиваниями.
+    let key = triple.replace('-', "_");
+    let cc = crate::sdk::bin_dir().join(util::exe_name(&format!("{}-freeos-cc", arch.name())));
+    if cc.is_file() {
+        cmd.env(format!("CC_{key}"), &cc);
+    }
+    if let Ok(ar) = cbuild::llvm_tool("llvm-ar") {
+        cmd.env(format!("AR_{key}"), ar);
+    }
     util::run(&mut cmd, &format!("std Rust и программы на std ({triple})"))?;
 
     let out = target_dir.join(&triple).join("release");
@@ -193,13 +210,18 @@ fn prepare() -> Result<PathBuf> {
 
     let slash = |p: &Path| p.display().to_string().replace('\\', "/");
     let mut patches = format!("[patch.crates-io]\nlibc = {{ path = \"{}\" }}\n", slash(&libc));
-    for (name, version, sha) in LIKE_REDOX {
+    for (name, version, like, sha) in LIKE_REDOX {
         let dir = src.join(format!("{name}-{version}"));
         unpack_crate(name, version, sha, &dir)?;
-        let sites = next_to_redox(&dir)?;
-        say!("{name} {version}: freeos рядом с redox в {sites} местах");
+        let sites = next_to(&dir, like)?;
+        say!("{name} {version}: freeos рядом с {like} в {sites} местах");
         if *name == "mio" {
             patch_mio(&dir)?;
+        }
+        if *name == "ring" {
+            // Ассемблер ring (perlasm, ELF) — по списку ОС с ABI Linux; без
+            // него на x86-64 нет `bn_mul_mont` и др. Наши объектники — ELF.
+            replace(&dir.join("build.rs"), "const LINUX_ABI: &[&str] = &[", "const LINUX_ABI: &[&str] = &[\n    \"freeos\",")?;
         }
         patches += &format!("{name} = {{ path = \"{}\" }}\n", slash(&dir));
     }
@@ -376,21 +398,22 @@ fn patch_mio(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Поставить `target_os = "freeos"` рядом с каждым `target_os = "redox"`.
-fn next_to_redox(dir: &Path) -> Result<usize> {
+/// Поставить `target_os = "freeos"` рядом с каждым `target_os = "<like>"`.
+fn next_to(dir: &Path, like: &str) -> Result<usize> {
+    let tag = format!("target_os = \"{like}\"");
     let mut files = Vec::new();
     collect_files(dir, &mut files)?;
     let mut sites = 0;
     for file in files.into_iter().filter(|f| f.extension().is_some_and(|x| x == "rs")) {
         let text = fs::read_to_string(&file)?;
-        let n = text.matches("target_os = \"redox\"").count();
+        let n = text.matches(&tag).count();
         if n > 0 {
             sites += n;
-            fs::write(&file, text.replace("target_os = \"redox\"", "target_os = \"redox\", target_os = \"freeos\""))?;
+            fs::write(&file, text.replace(&tag, &format!("{tag}, target_os = \"freeos\"")))?;
         }
     }
     if sites == 0 {
-        bail!("{}: ни одного target_os = \"redox\" — версия сменилась, сверить", dir.display());
+        bail!("{}: ни одного {tag} — версия сменилась, сверить", dir.display());
     }
     Ok(sites)
 }

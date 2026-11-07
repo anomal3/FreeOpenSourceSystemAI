@@ -2,7 +2,7 @@
 name = "rstd"
 version = "0.1.0"
 edition = "2021"
-description = "Проверка std Rust и экосистемы на FreeOS (цель <арх>-unknown-freeos): rstd — std, rtokio — tokio/mio/socket2"
+description = "Проверка std Rust и экосистемы на FreeOS (цель <арх>-unknown-freeos): rstd — std, rtokio — tokio/mio/socket2, rtls — rustls/ring"
 publish = false
 
 # Отдельный workspace: собирается своей целью и своим -Zbuild-std
@@ -13,6 +13,8 @@ publish = false
 # `--config build/rust-std/src/patches.toml`).
 [dependencies]
 libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
 
 [profile.release]

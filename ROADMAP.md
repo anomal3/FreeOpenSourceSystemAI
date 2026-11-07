@@ -11190,9 +11190,16 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   с ключом-адресом ядра) и `F_GETFL` сокетов. В `rstd` добавлены проверки
   `poll()` (pipe из другого потока, срок, принятый сокет), неблокирующих
   `accept4`/`connect`/`read` и нагрузка Mutex+Condvar (100 000 сообщений).
-  **Осталось из N3:** `rustls` (нужен `ring` или `aws-lc` — C/asm через
-  `cc` нашим набором), `getrandom`/`parking_lot_core`/`memmap2` — по мере
-  того, как их потянут.
+  **rustls — сделано 07.11:** `ring` 0.17.14 (C и perlasm-ассемблер — наш
+  набор: xtask даёт крейту `cc` `CC_<цель>`=`<арх>-freeos-cc` и
+  `AR_<цель>`=`llvm-ar`; freeos добавлен в `LINUX_ABI` его `build.rs`, иначе
+  нет `bn_mul_mont`), `getrandom` 0.2.17 и `SystemRandom` ring — как у Vita
+  (`getentropy()`). `/bin/rtls`: сертификат `rcgen` и TLS 1.3
+  (AES-256-GCM) клиент+сервер через петлю — зелёный на x86_64 и aarch64
+  (~50–60 мс рукопожатие). Схема подмены теперь общая: у каждого крейта
+  свой образец ОС (`redox` — сетевые, `vita` — случайность).
+  **Осталось из N3:** `parking_lot_core`, `memmap2` и прочие — по мере того,
+  как их потянет Servo.
 - **N4 — C/C++-зависимости Servo.** `mozjs-sys` (сначала без JIT —
   `js_jit` выкл.; JIT потом через `MAP_JIT` + RW↔RX), freetype, harfbuzz,
   fontconfig (уже есть), `aws-lc-sys` (или фича на `ring`), `rusqlite`
