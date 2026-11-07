@@ -11182,7 +11182,9 @@ Servo; Proton/DXVK — позже, когда будет видеокарта.
   под `x86_64-linux-gnu` в Debian 12 (glibc как у `/compat/linux`),
   без GStreamer. Запуск через слой Linux: сначала `--headless` /
   `SoftwareRenderingContext` (Mesa llvmpipe surfaceless из пакетов Debian),
-  снимок страницы в PNG — сценарий `servo-headless`. Что вероятно
+  снимок страницы в PNG — сценарий `servo-headless`. Mesa в образе пока
+  нет — первым делом `libgl1-mesa-dri`/`libegl-mesa0` из Debian в корень
+  `/opt/debian` (зависимость пакета, как `debian` у Chromium). Что вероятно
   доделать в слое: JIT SpiderMonkey (`mprotect` RWX), потоки/futex, шрифты.
 - **S2 — окно.** winit через наш сервер Wayland: EGL Mesa на платформе
   Wayland программно (swrast отдаёт кадр через `wl_shm` — dmabuf не нужен).
@@ -11198,8 +11200,9 @@ Servo; Proton/DXVK — позже, когда будет видеокарта.
   канал в `update.cfg`, пункт «Параметры → Браузер», сценарий
   `servo-update` (поставить новое ядро, затем «битое» — откат).
 - **S5 — убрать NetSurf** (ПК и телефон), когда S2 зелёный на телефоне.
-- **S6 — телефон (aarch64).** Сначала сервер Wayland на телефоне (сейчас
-  окон Wayland там нет), затем та же сборка aarch64 программно; GPU Mali —
+- **S6 — телефон (aarch64).** Слой Linux на aarch64 сейчас программы Linux
+  отвергает (фаза 71a) — его довести, либо ждать `std` Rust (S7). Плюс
+  сервер Wayland на телефоне (окон Wayland там нет), затем та же сборка aarch64 программно; GPU Mali —
   отдельно и позже. Касания → события `WebView`, экранная клавиатура.
 - **S7 — потом:** родная сборка без слоя Linux, когда будет `std` Rust для
   FreeOS (`*-unknown-freeos`); видео (GStreamer); подстановка паролей.
