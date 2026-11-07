@@ -235,7 +235,12 @@ pub fn build(arch: Arch) -> Result<()> {
     builder.field("summary", "Wine 11.0 (WineHQ build for Debian 12), 64-bit; windows through the kernel Wayland server (winewayland)");
     builder.field("about", "Wine для программ Windows: Блокнот и другие в окнах стола");
     builder.field("caption", "Notepad (Wine)");
-    builder.field("start", "/opt/debian/bin/bash /opt/wine/bin/fossai-wine notepad");
+    // Без программы скрипт открывает Блокнот; стол дописывает к `start`
+    // путь файла (`opens`), поэтому `notepad` здесь не пишется (07.11).
+    builder.field("start", "/opt/debian/bin/bash /opt/wine/bin/fossai-wine");
+    // Двойной щелчок по `.exe` на столе и в «Файлах» — через Wine.
+    builder.field("opens", "exe");
+    builder.field("desktop", "yes");
     builder.field("permissions", "windows files net jit");
     builder.requires("debian");
     let mut bytes = 0usize;
