@@ -1166,9 +1166,9 @@ fn run_builtin(line: &str) -> bool {
         "tasks" => tasks(),
         #[cfg(target_arch = "x86_64")]
         "lxstat" => linux_stat(argument),
-        #[cfg(target_arch = "x86_64")]
+        // Вызовы программ Linux и (N4) родных программ — на обеих архитектурах.
         "lxtrace" => {
-            crate::linux::recent::set_trace(argument);
+            crate::user::trace::set(argument);
             sprintln!("  lxtrace: {}", if argument.is_empty() || argument == "off" { "off" } else { argument });
         }
         // Запросы и события сервера Wayland — в серийную линию (`on`/`off`).

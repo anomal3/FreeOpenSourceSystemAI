@@ -1,0 +1,173 @@
+diff --git a/mozjs/build/autoconf/config.sub b/mozjs/build/autoconf/config.sub
+index 4aaae46..acf3a31 100755
+--- a/mozjs/build/autoconf/config.sub
++++ b/mozjs/build/autoconf/config.sub
+@@ -2094,6 +2094,7 @@ case $os in
+ 	| qnx* \
+ 	| rdos* \
+ 	| redox* \
++	| freeos* \
+ 	| rhapsody* \
+ 	| riscix* \
+ 	| riscos* \
+diff --git a/mozjs/build/moz.configure/init.configure b/mozjs/build/moz.configure/init.configure
+index 63049b6..adef5af 100644
+--- a/mozjs/build/moz.configure/init.configure
++++ b/mozjs/build/moz.configure/init.configure
+@@ -525,6 +525,8 @@ def split_triplet(triplet, allow_wasi=False):
+         canonical_os = canonical_kernel = "NetBSD"
+     elif os.startswith("openbsd"):
+         canonical_os = canonical_kernel = "OpenBSD"
++    elif os.startswith("freeos"):
++        canonical_os = canonical_kernel = "FreeOS"
+     elif os.startswith("solaris"):
+         canonical_os = canonical_kernel = "SunOS"
+     elif os.startswith("wasi") and allow_wasi:
+@@ -945,6 +947,15 @@ def target_is_openbsd(target):
+ set_define("XP_OPENBSD", target_is_openbsd)
+ 
+ 
++@depends(target)
++def target_is_freeos(target):
++    if target.kernel == "FreeOS":
++        return True
++
++
++set_define("XP_FREEOS", target_is_freeos)
++
++
+ @depends(target)
+ def target_is_netbsd(target):
+     if target.kernel == "NetBSD":
+diff --git a/mozjs/build/moz.configure/toolchain.configure b/mozjs/build/moz.configure/toolchain.configure
+index dff149b..b6cc2b0 100755
+--- a/mozjs/build/moz.configure/toolchain.configure
++++ b/mozjs/build/moz.configure/toolchain.configure
+@@ -2219,7 +2219,7 @@ set_define("_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", True, when=using_libcxx)
+ @depends(target, build_environment)
+ def visibility_flags(target, env):
+     if target.os != "WINNT":
+-        if target.kernel in ("Darwin", "FreeBSD", "OpenBSD") or target.raw_os.endswith("-ohos"):
++        if target.kernel in ("Darwin", "FreeBSD", "FreeOS", "OpenBSD") or target.raw_os.endswith("-ohos"):
+             return ("-fvisibility=hidden", "-fvisibility-inlines-hidden")
+         return (
+             "-I%s/system_wrappers" % os.path.join(env.dist),
+diff --git a/mozjs/js/src/gc/Memory.cpp b/mozjs/js/src/gc/Memory.cpp
+index 76dad23..b9317ba 100644
+--- a/mozjs/js/src/gc/Memory.cpp
++++ b/mozjs/js/src/gc/Memory.cpp
+@@ -1067,7 +1067,8 @@ size_t GetPageFaultCount() {
+     return 0;
+   }
+   return pmc.PageFaultCount;
+-#elif defined(__wasi__)
++#elif defined(__wasi__) || defined(__freeos__)
++  // FreeOS: в rusage нет счётчиков страничных промахов.
+   return 0;
+ #else
+   struct rusage usage;
+diff --git a/mozjs/js/src/threading/posix/PosixThread.cpp b/mozjs/js/src/threading/posix/PosixThread.cpp
+index 8340ead..00a2aff 100644
+--- a/mozjs/js/src/threading/posix/PosixThread.cpp
++++ b/mozjs/js/src/threading/posix/PosixThread.cpp
+@@ -113,6 +113,10 @@ void ThisThread::SetName(const char* name) {
+   rv = 0;
+ #elif defined(__NetBSD__)
+   rv = pthread_setname_np(pthread_self(), "%s", (void*)name);
++#elif defined(__freeos__)
++  // FreeOS: имён потоков нет.
++  (void)name;
++  rv = 0;
+ #else
+   rv = pthread_setname_np(pthread_self(), name);
+ #endif
+diff --git a/mozjs/mfbt/RandomNum.cpp b/mozjs/mfbt/RandomNum.cpp
+index 42ce50f..ae776ad 100644
+--- a/mozjs/mfbt/RandomNum.cpp
++++ b/mozjs/mfbt/RandomNum.cpp
+@@ -109,6 +109,19 @@ MFBT_API bool GenerateRandomBytesFromOS(void* aBuffer, size_t aLength) {
+ 
+ #  endif  // defined(__linux__)
+ 
++#  if defined(__freeos__)
++  // FreeOS: /dev/urandom нет, есть getentropy() (поверх SYS_RANDOM), по
++  // 256 байт за раз. Без этой ветки JS_Init крутился в open("/dev/urandom").
++  for (size_t done = 0; done < aLength;) {
++    size_t chunk = aLength - done < 256 ? aLength - done : 256;
++    if (getentropy(static_cast<char*>(aBuffer) + done, chunk) != 0) {
++      return false;
++    }
++    done += chunk;
++  }
++  return true;
++#  endif  // defined(__freeos__)
++
+   int fd = open("/dev/urandom", O_RDONLY);
+   if (fd < 0) {
+     return false;
+diff --git a/mozjs/mozglue/misc/TimeStamp_posix.cpp b/mozjs/mozglue/misc/TimeStamp_posix.cpp
+index 9137c18..5dc8d25 100644
+--- a/mozjs/mozglue/misc/TimeStamp_posix.cpp
++++ b/mozjs/mozglue/misc/TimeStamp_posix.cpp
+@@ -11,7 +11,9 @@
+ // obtained with this API; see TimeDuration::Resolution;
+ //
+ 
+-#include <sys/syscall.h>
++#if !defined(__freeos__)  // FreeOS: нет sys/syscall.h, нужен только XP_LINUX
++#  include <sys/syscall.h>
++#endif
+ #include <time.h>
+ #include <unistd.h>
+ #include <string.h>
+diff --git a/mozjs/python/mozbuild/mozbuild/configure/constants.py b/mozjs/python/mozbuild/mozbuild/configure/constants.py
+index 4e60004..19639e2 100644
+--- a/mozjs/python/mozbuild/mozbuild/configure/constants.py
++++ b/mozjs/python/mozbuild/mozbuild/configure/constants.py
+@@ -35,6 +35,7 @@ class OS(EnumString):
+         "Android",
+         "DragonFly",
+         "FreeBSD",
++        "FreeOS",
+         "GNU",
+         "iOS",
+         "NetBSD",
+@@ -51,6 +52,7 @@ class Kernel(EnumString):
+         "Darwin",
+         "DragonFly",
+         "FreeBSD",
++        "FreeOS",
+         "kFreeBSD",
+         "Linux",
+         "NetBSD",
+@@ -140,6 +142,7 @@ kernel_preprocessor_checks = {
+     "Darwin": "__APPLE__",
+     "DragonFly": "__DragonFly__",
+     "FreeBSD": "__FreeBSD__",
++    "FreeOS": "__freeos__",
+     "kFreeBSD": "__FreeBSD_kernel__",
+     "Linux": "__linux__",
+     "NetBSD": "__NetBSD__",
+diff --git a/src/jsglue.cpp b/src/jsglue.cpp
+index 8f2d532..a898487 100644
+--- a/src/jsglue.cpp
++++ b/src/jsglue.cpp
+@@ -993,7 +993,7 @@ bool AppendToRootedObjectVector(JS::PersistentRootedObjectVector* v,
+ 
+ void DeleteRootedObjectVector(JS::PersistentRootedObjectVector* v) { delete v; }
+ 
+-#if defined(__linux__) || defined(__wasi__)
++#if defined(__linux__) || defined(__wasi__) || defined(__freeos__)
+ #  include <malloc.h>
+ #elif defined(__FreeBSD__)
+ #  include <malloc_np.h>
+@@ -1015,7 +1015,8 @@ static size_t MallocSizeOf(const void* aPtr) {
+     return 0;
+   }
+ 
+-#if defined(__linux__) || defined(__wasi__) || defined(__FreeBSD__)
++#if defined(__linux__) || defined(__wasi__) || defined(__FreeBSD__) || \
++    defined(__freeos__)
+   return malloc_usable_size((void*)aPtr);
+ #elif defined(__APPLE__)
+   return malloc_size((void*)aPtr);

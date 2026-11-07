@@ -153,6 +153,9 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     if let Some(llm) = llama(arch)? {
         samples.push(("llama-0.7.0.fpk", llm));
     }
+    if let Some(engine) = servo(arch)? {
+        samples.push((SERVO_PACKAGE, engine));
+    }
     // Корень программ Linux (фаза 71b) — готовым пакетом от `xtask thirdparty`.
     if arch == Arch::X86_64 {
         let path = crate::debian::package_path();
@@ -202,7 +205,7 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
 /// Пакеты игр: только на установочный носитель, не в RAM-диск живой системы.
 /// Там же llama.cpp (фаза 70d) — по той же причине: десятки мегабайт.
 /// NetSurf (начато 03.11) — тоже: пять мегабайт, которые нужны не каждому.
-pub const GAMES: [&str; 8] = [
+pub const GAMES: [&str; 9] = [
     "freedoom-0.13.fpk",
     "sopwith-2.9.0.fpk",
     "netsurf-3.11.fpk",
@@ -211,7 +214,29 @@ pub const GAMES: [&str; 8] = [
     "linuxweb-150.fpk",
     "jbr-25.fpk",
     "wine-11.fpk",
+    SERVO_PACKAGE,
 ];
+
+/// Браузер на Servo (план «Servo нативно», N4–N9) — пакетом, как и задумано
+/// в N9: движок — десятки мегабайт, RAM-диску живой системы они не по силам.
+/// Пока в нём проверка SpiderMonkey `jsprobe` (N4).
+pub const SERVO_PACKAGE: &str = "servo-0.1.fpk";
+
+/// Пакет `servo`: программы, собранные Linux-хостом сборки
+/// (`ports/servo/builder/build-jsprobe.sh` → `build/linux/<имя>-<арх>`).
+/// Нет их — пакета нет: без Docker система собирается как раньше.
+fn servo(arch: Arch) -> Result<Option<Vec<u8>>> {
+    let Some(jsprobe) = crate::ruststd::linux_host_program("jsprobe", arch) else {
+        say!("пакет servo пропущен: нет build/linux/jsprobe-{} — собрать: ports/servo/builder/build-jsprobe.sh", arch.name());
+        return Ok(None);
+    };
+    let mut servo = Builder::new(Kind::Package, "servo", "0.1");
+    servo.field("summary", "Servo browser engine for FreeOS (in progress): SpiderMonkey check");
+    servo.field("about", "движок браузера Servo (в работе): проверка SpiderMonkey");
+    let data = fs::read(&jsprobe).with_context(|| format!("не удалось прочитать {}", jsprobe.display()))?;
+    servo.file(&Entry { path: String::from("bin/jsprobe"), mode: 0o755, uid: 0, gid: 0, data });
+    Ok(Some(servo.finish()))
+}
 
 /// llama.cpp пакетом (фаза 70d): программы llama.cpp, проверка библиотеки
 /// C++ (`cxxdemo`) и маленькая модель stories15M — чтобы было что запустить

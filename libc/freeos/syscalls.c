@@ -555,12 +555,16 @@ void *sbrk(ptrdiff_t increment) {
 /* `mmap`: безымянная память — всегда ленивая, как у любой системы с
  * отложенным выделением; кусок файла — только на чтение.
  *
+ * Адрес **без** `MAP_FIXED` — подсказка (третий аргумент `SYS_MMAP`, 08.11):
+ * свободное место в областях по запросу ядро отдаёт ровно там, занятое —
+ * пренебрегает подсказкой, как разрешает POSIX. SpiderMonkey без этого не
+ * выравнивал свои куски памяти и крутился в цикле вечно.
+ *
  * Чего нет, и почему это отказ, а не «сделаем похоже»:
- * - `MAP_FIXED` — ядро выбирает адрес само и чужой не принимает. Отказ
- *   `EINVAL`: программа, которой нужен именно этот адрес, обязана узнать, что
- *   его не будет, — положить память в другое место молча значило бы отдать не
- *   то, что просили. Адрес **без** `MAP_FIXED` — подсказка, и ею можно
- *   пренебречь, как разрешает POSIX.
+ * - `MAP_FIXED` поверх занятого — ядро чужие области не снимает. Безымянная
+ *   память по свободному адресу выдаётся (это та же подсказка, которую ядро
+ *   приняло); не принял — `EINVAL`: программа, которой нужен именно этот
+ *   адрес, обязана узнать, что его не будет. Файл с `MAP_FIXED` — `EINVAL`.
  * - запись в отображение файла — ядро отображает файл только на чтение;
  *   `EACCES`, как у POSIX при файле, открытом без права записи.
  * - `MAP_SHARED` у безымянной памяти равен `MAP_PRIVATE`: делить её не с кем,
@@ -570,9 +574,24 @@ void *sbrk(ptrdiff_t increment) {
  * как у Apple: только безымянная, и `prot` у неё не спрашивается — страница
  * бывает то «читать и писать», то «читать и исполнять», и переключает её ядро
  * по обращению. Без этого флага «писать и исполнять» — отказ, как и был. */
+/* Безымянная память с подсказкой; `MAP_FIXED` — только если ядро положило её
+ * ровно по адресу. */
+static void *anon_map(void *addr, size_t len, long kind, int flags) {
+    long got = freeos_syscall(SYS_MMAP, (long)len, kind, (long)addr);
+    if (got < 0) {
+        freeos_set_errno(got);
+        return MAP_FAILED;
+    }
+    if ((flags & MAP_FIXED) != 0 && (void *)got != addr) {
+        freeos_syscall(SYS_MUNMAP, got, (long)len, 0);
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    return (void *)got;
+}
+
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
-    (void)addr;
-    if (len == 0 || (flags & MAP_FIXED) != 0) {
+    if (len == 0 || ((flags & MAP_FIXED) != 0 && ((flags & MAP_ANONYMOUS) == 0 || addr == NULL))) {
         errno = EINVAL;
         return MAP_FAILED;
     }
@@ -581,12 +600,7 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
             errno = EINVAL;
             return MAP_FAILED;
         }
-        long got = freeos_syscall(SYS_MMAP, (long)len, FREEOS_MAP_JIT, 0);
-        if (got < 0) {
-            freeos_set_errno(got);
-            return MAP_FAILED;
-        }
-        return (void *)got;
+        return anon_map(addr, len, FREEOS_MAP_JIT, flags);
     }
     if ((prot & PROT_WRITE) != 0 && (prot & PROT_EXEC) != 0) {
         /* W^X — правило системы. `EACCES` — ответ POSIX на права, которых не
@@ -597,11 +611,11 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
 
     long got;
     if ((flags & MAP_ANONYMOUS) != 0) {
-        got = freeos_syscall(SYS_MMAP, (long)len, FREEOS_MAP_LAZY, 0);
-        if (got < 0) {
-            freeos_set_errno(got);
+        void *area = anon_map(addr, len, FREEOS_MAP_LAZY, flags);
+        if (area == MAP_FAILED) {
             return MAP_FAILED;
         }
+        got = (long)area;
         /* Ядро выдаёт «читать и писать»; остальное — второй просьбой. */
         if (prot != (PROT_READ | PROT_WRITE)) {
             long done = freeos_syscall(SYS_MPROTECT, got, (long)len, prot);

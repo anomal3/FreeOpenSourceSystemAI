@@ -159,6 +159,15 @@ pub fn build_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
     Ok(PROGRAMS.iter().map(|name| (*name, out.join(name))).collect())
 }
 
+/// Программа на `std`, собранная Linux-хостом сборки (`ports/servo/builder`,
+/// Docker): SpiderMonkey и прочий C++ Mozilla на Windows не собираются
+/// (`configure` на python + make + sh). Лежит в `build/linux/<имя>-<арх>`;
+/// нет файла — `None`.
+pub fn linux_host_program(name: &str, arch: Arch) -> Option<PathBuf> {
+    let path = paths::build_dir().join("linux").join(format!("{name}-{}", arch.name()));
+    path.is_file().then_some(path)
+}
+
 /// `libfreeos.a` кладёт в набор `cargo xtask sdk`; правка `libc/freeos` без
 /// него до программ на `std` не доедет (программы на C берут объектники
 /// напрямую и этого не замечают).

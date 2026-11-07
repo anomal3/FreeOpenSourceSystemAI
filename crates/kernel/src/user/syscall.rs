@@ -84,6 +84,20 @@ const MAX_PATH: usize = 255;
 /// Вызывать только из обработчика ловушки, пришедшей из пользовательского
 /// режима: [`SYS_EXIT`] не возвращается, а уходит в точку запуска программы.
 pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
+    // SAFETY: тот же договор, что у самой `handle`.
+    let result = unsafe { dispatch(number, a0, a1, a2) };
+    // Трассировка родных вызовов — тем же `lxtrace <имя>`, что у программ
+    // Linux (N4: так искали, где SpiderMonkey крутится в `JS_Init`).
+    super::trace::native(number, [a0, a1, a2], result);
+    result
+}
+
+/// Сам разбор вызова (см. [`handle`]).
+///
+/// # Safety
+///
+/// Как у [`handle`].
+unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
     match number {
         SYS_WRITE => write(a0, a1, a2),
         SYS_EXIT => {
@@ -160,7 +174,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_RESOLVE => resolve(a0, a1, a2),
         SYS_RANDOM => random(a0, a1),
         SYS_UPDATE => update(a0, a1),
-        SYS_MMAP => mmap(a0, a1),
+        SYS_MMAP => mmap(a0, a1, a2),
         SYS_MUNMAP => munmap(a0, a1),
         user_abi::SYS_MPROTECT => mprotect(a0, a1, a2),
         SYS_MMAP_FILE => mmap_file(a0, a1, a2),
@@ -1426,9 +1440,10 @@ pub(super) fn net_errno(err: NetError) -> i64 {
 /// остальных вызовах договора.
 ///
 /// Проверять `len` по таблицам здесь нечего: это длина, а не указатель. Всё,
-/// что можно сказать неверно, скажет [`super::Program::mmap`].
-fn mmap(len: usize, flags: usize) -> i64 {
-    match super::with_current(|program| program.mmap(len, flags)) {
+/// что можно сказать неверно, скажет [`super::Program::mmap`]. `hint` —
+/// подсказка адреса ([`user_abi::SYS_MMAP`]), ноль — «где угодно».
+fn mmap(len: usize, flags: usize, hint: usize) -> i64 {
+    match super::with_current(|program| program.mmap_hinted(len, flags, hint)) {
         Some(Ok(addr)) => addr as i64,
         Some(Err(err)) => mmap_errno(err),
         None => ERR_NO_PROGRAM,

@@ -161,6 +161,49 @@ static void check_aligned_carve(void) {
     ok("aligned carve");
 }
 
+/* Подсказка адреса (08.11, ради SpiderMonkey): взять кусок с запасом, отдать
+ * его и попросить выровненный адрес внутри — свободное место ядро отдаёт ровно
+ * там. `MAP_FIXED` на свободный адрес — тоже он; на занятый — `EINVAL`. */
+static void check_hint(void) {
+    const size_t size = 256 * 1024;
+    const size_t align = 1024 * 1024;
+    char *mem = mmap(NULL, size + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        fail("hint: mmap");
+        return;
+    }
+    char *aligned = (char *)(((uintptr_t)mem + align - 1) & ~(uintptr_t)(align - 1));
+    munmap(mem, size + align);
+    char *got = mmap(aligned, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (got != aligned) {
+        errno = 0;
+        fail("hint: a free hinted address is given as is");
+        return;
+    }
+    got[0] = 1;
+    char *again = mmap(aligned, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (again == MAP_FAILED || again == aligned) {
+        errno = 0;
+        fail("hint: a taken hinted address goes elsewhere");
+        return;
+    }
+    munmap(again, size);
+    errno = 0;
+    if (mmap(aligned, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED ||
+        errno != EINVAL) {
+        fail("hint: MAP_FIXED over a taken range is refused");
+        return;
+    }
+    munmap(aligned, size);
+    got = mmap(aligned, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (got != aligned) {
+        fail("hint: MAP_FIXED at a free address");
+        return;
+    }
+    munmap(got, size);
+    ok("address hint and MAP_FIXED");
+}
+
 /* Дыра посередине: соседи по обе стороны живы и помнят своё. */
 static void check_hole(void) {
     const size_t pages = 16;
@@ -407,6 +450,7 @@ int main(int argc, char **argv) {
     printf("cmem: starting\n");
     check_lazy();
     check_aligned_carve();
+    check_hint();
     check_hole();
     check_code();
     check_none();

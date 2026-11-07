@@ -72,6 +72,7 @@ pub mod shm;
 pub mod sock;
 pub mod space;
 pub mod syscall;
+pub mod trace;
 
 use core::fmt::Write as _;
 
@@ -921,6 +922,13 @@ impl Program {
     /// будет ни здесь, ни там: такое отображение отвергает сам построитель
     /// таблиц ([`crate::mm::MapError::WriteExecute`]).
     fn mmap(&mut self, len: usize, flags: usize) -> Result<usize, MmapError> {
+        self.mmap_hinted(len, flags, 0)
+    }
+
+    /// [`Program::mmap`] с подсказкой адреса (`hint`, ноль — «где угодно»):
+    /// свободное и выровненное место в областях по запросу берётся как есть,
+    /// иначе ядро выбирает само ([`user_abi::SYS_MMAP`]).
+    fn mmap_hinted(&mut self, len: usize, flags: usize, hint: usize) -> Result<usize, MmapError> {
         let huge = flags & MAP_HUGE != 0;
         let jit = flags & user_abi::MAP_JIT != 0;
         // Память кода ленива всегда: страницу, которую ещё не писали, нечем
@@ -933,7 +941,7 @@ impl Program {
             return Err(MmapError::BadRequest);
         }
         if lazy {
-            let (base, pages) = self.reserve(len, PAGE_SIZE)?;
+            let (base, pages) = self.reserve_hinted(len, PAGE_SIZE, hint)?;
             let anon = if jit { Anon::jit() } else { Anon::read_write(true) };
             self.remember(Mapping { base, pages, blocks: 0, source: Source::Anonymous(anon) });
             return Ok(base);
@@ -943,7 +951,7 @@ impl Program {
         // область, начавшаяся мимо неё, не получит ни одного блока, сколько бы
         // непрерывной памяти ни нашлось.
         let align = if huge { HUGE_PAGE_SIZE } else { PAGE_SIZE };
-        let (base, pages) = self.reserve(len, align)?;
+        let (base, pages) = self.reserve_hinted(len, align, hint)?;
 
         // SAFETY: `reserve` вернул адрес внутри области запроса, не
         // пересекающийся ни с одной уже выданной; образ и стек лежат ниже
@@ -1838,6 +1846,26 @@ impl Program {
         }
         let base = self.find_gap(bytes, align).ok_or(MmapError::Limit)?;
         Ok((base, pages))
+    }
+
+    /// [`Self::reserve`] с подсказкой адреса: `hint`, выровненный по `align`,
+    /// целиком внутри одной из областей по запросу и не задевающий ни одной
+    /// записанной области, берётся как есть; иначе — обычный поиск места.
+    /// Подсказка — не обещание, поэтому неудача здесь не отказ.
+    fn reserve_hinted(&self, len: usize, align: usize, hint: usize) -> Result<(usize, usize), MmapError> {
+        let (base, pages) = self.reserve(len, align)?;
+        if hint == 0 || hint % align != 0 {
+            return Ok((base, pages));
+        }
+        let bytes = pages * PAGE_SIZE;
+        let Some(end) = hint.checked_add(bytes) else {
+            return Ok((base, pages));
+        };
+        let inside = (hint >= MMAP_BASE && end <= MMAP_BASE + MMAP_LOW_BYTES)
+            || (hint >= MMAP_HIGH_BASE && end <= MMAP_HIGH_END);
+        let first = self.mappings.partition_point(|region| region.end() <= hint);
+        let free = self.mappings.get(first).is_none_or(|region| region.base >= end);
+        Ok(if inside && free { (hint, pages) } else { (base, pages) })
     }
 
     /// Найти в области запроса свободное место под `bytes` байт.

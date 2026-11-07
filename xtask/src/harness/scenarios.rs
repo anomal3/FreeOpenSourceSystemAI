@@ -6665,6 +6665,9 @@ pub const ALL: &[Scenario] = &[
             // Частичный `munmap`: голова и хвост (`mono_valloc_aligned`),
             // дыра посередине и снятие поперёк дыры.
             Step::Await("cmem: ok aligned carve", 30_000),
+            // Подсказка адреса `mmap` (третий аргумент SYS_MMAP, ради
+            // SpiderMonkey) и MAP_FIXED на свободном месте.
+            Step::Await("cmem: ok address hint and MAP_FIXED", 30_000),
             Step::Await("cmem: ok hole in the middle", 30_000),
             // W^X держится, а код, записанный программой, исполняется — и
             // исполняется последний записанный (на AArch64 это синхронизация
@@ -6915,6 +6918,53 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("rtls: FAILED"),
             Step::Absent("rtokio: FAILED"),
             Step::Absent("rstd: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "servo-js",
+        about: "SpiderMonkey (mozjs, без JIT) на FreeOS: JS_Init, рантайм, глобальный объект, вычисление выражений. jsprobe в пакете servo собирает Linux-хост (ports/servo/builder/build-jsprobe.sh).",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // Движок заводит вспомогательные потоки (GC, разбор) по числу ядер.
+        extra: &["-smp", "4"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // Диск переживает прогоны: прежняя сборка пакета снимается
+            // (её может и не быть — тогда `pkg` просто откажет).
+            Step::Line("run /bin/pkg remove servo"),
+            Step::Wait(3_000),
+            Step::Line("run /bin/pkg install /media/servo-0.1.fpk"),
+            Step::Await("pkg: installed servo 0.1, 1 file(s)", 120_000),
+            Step::Line("run /opt/servo/bin/jsprobe"),
+            Step::Await("jsprobe: engine", 60_000),
+            Step::Await("jsprobe: runtime", 60_000),
+            Step::Await("jsprobe: global", 60_000),
+            Step::Await("jsprobe: case 0 = Some(2)", 60_000),
+            Step::Await("jsprobe: case 1 = Some(5050)", 60_000),
+            Step::Await("jsprobe: case 2 = Some(64)", 60_000),
+            Step::Await("jsprobe: ok", 30_000),
+            Step::Await("exited with code 0", 30_000),
+            Step::Absent("jsprobe: FAIL"),
             Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],

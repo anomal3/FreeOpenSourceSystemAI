@@ -8,7 +8,7 @@
 //! сам поток, читает — он же, когда падает.
 
 use alloc::string::String;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::sched;
 
@@ -56,35 +56,16 @@ fn show_failure(number: usize, args: [usize; 6], result: i64) {
     crate::kprintln!("  linux       : {} {number}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x}) = {result} {path}", sched::current());
 }
 
-/// Трассировка (`kernel lxtrace <имя>`, фаза 74): печатать каждый вызов
-/// программ, чей файл кончается на это имя. Пусто — выключена.
-static TRACE: crate::sync::SpinLock<String> = crate::sync::SpinLock::new(String::new());
-static TRACING: AtomicBool = AtomicBool::new(false);
-/// Сколько строк трассировки ещё можно напечатать.
-static TRACE_LEFT: AtomicUsize = AtomicUsize::new(0);
-
-/// Включить трассировку программ с именем `name` (`off` или пусто — выключить).
-pub fn set_trace(name: &str) {
-    let name = name.trim();
-    let on = !name.is_empty() && name != "off";
-    *TRACE.lock() = if on { String::from(name) } else { String::new() };
-    TRACE_LEFT.store(20_000, Ordering::Relaxed);
-    TRACING.store(on, Ordering::Relaxed);
-}
-
+/// Трассировка (`lxtrace <имя>`, фаза 74): печатать каждый вызов программ,
+/// чей файл кончается на это имя. Имя, включатель и запас строк — общие с
+/// родными вызовами ([`crate::user::trace`]).
 fn trace(number: usize, args: [usize; 6], result: i64) {
     // Удачные `mprotect`, `madvise`, `clock_gettime` и `sched_yield` JIT
     // делает тысячами — они съедали весь запас строк.
     if result >= 0 && matches!(number, 10 | 24 | 28 | 228) {
         return;
     }
-    let Some(path) = crate::user::with_current(|program| program.path.clone()) else { return };
-    let matches = {
-        let name = TRACE.lock();
-        // Несколько имён — через запятую.
-        name.split(',').any(|one| !one.is_empty() && path.ends_with(one))
-    };
-    if !matches || TRACE_LEFT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err() {
+    if !crate::user::trace::wanted() {
         return;
     }
     // Пути — у вызовов с путём и у `rename`/`renameat`/`mkdir`/`unlinkat`.
@@ -121,7 +102,7 @@ fn trace(number: usize, args: [usize; 6], result: i64) {
 /// Запомнить вызов текущего потока.
 pub fn record(number: usize, args: [usize; 6], result: i64) {
     show_failure(number, args, result);
-    if TRACING.load(Ordering::Relaxed) {
+    if crate::user::trace::on() {
         trace(number, args, result);
     }
     let slot = sched::current_slot();

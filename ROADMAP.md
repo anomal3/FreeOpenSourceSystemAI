@@ -11234,6 +11234,35 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   jsglue.cpp (malloc_usable_size), CharacterEncoding.cpp (mbsinit). План:
   форк `mozjs_sys` 153.6.0-1 с ОС `freeos` (как Redox, без притворства
   Linux), подмена через patches.toml, проба `JS_Init` + `Evaluate("1+1")`.
+  **SpiderMonkey на FreeOS — сделано 08.11 (x86_64):** `ports/servo/mozjs/`
+  — `freeos.patch` (9 файлов, +41/−5) и `prepare.sh` (крейт с crates.io,
+  хеш, патч → `build/servo/mozjs_sys-153.6.0-1`, git с исходником в первом
+  коммите). ОС `FreeOS`: `config.sub`, `split_triplet`, `XP_FREEOS`,
+  `constants.py` (ядро опознаётся по `__freeos__` от freeos-cc — обход
+  проверки, как у Redox, не нужен), `-fvisibility=hidden` как у FreeBSD
+  (`gcc_hidden.h` спорит с видимостью libc++); в коде — имя потока
+  (заглушка), `ru_majflt` (0), `sys/syscall.h` только для Linux,
+  `malloc_usable_size`, **случайность через `getentropy()`** (без неё
+  `JS_Init` вечно открывал `/dev/urandom`). Сборка — `ports/servo/builder/
+  build-jsprobe.sh` в Docker (компиляция в томе `fossai-servo`, не на
+  примонтированном диске; bindgen получает триплет/макросы/заголовки
+  freeos-cc и `-nostdlibinc`; `-lc++ -lc++abi -lunwind`; pkg-config — .pc
+  sysroot с путями контейнера). `/opt/servo/bin/jsprobe` (10 МБ, без JIT,
+  без intl) — в **пакете `servo-0.1.fpk`** (носитель установки, как
+  llama/wine: в initrd 64 МиБ не влезает, а браузер по N9 и так пакет);
+  xtask берёт готовое из `build/linux/<имя>-<арх>`, нет файла — нет пакета.
+  Сценарий `servo-js` (установленная система): JS_Init, рантайм, глобальный
+  объект, `1+1`, цикл, `sort/map/reduce+JSON.parse` — зелёный, 13 с.
+  Попутно в ядре и libc: **подсказка адреса `mmap`** — `SYS_MMAP(len,
+  flags, hint)`, свободное выровненное место в областях по запросу
+  отдаётся ровно там (SpiderMonkey выравнивает куски так: взять с запасом,
+  отдать, попросить выровненный адрес); `MAP_FIXED` на свободном месте
+  работает (`cmem: ok address hint and MAP_FIXED`). **Трассировка родных
+  вызовов** — тот же `lxtrace <имя>` (строки `ntrace`, у вызовов с путём —
+  путь), теперь и на aarch64: так и нашёлся `/dev/urandom`.
+  **Осталось из N4:** aarch64 (`build-jsprobe.sh aarch64`), `intl`
+  (ICU4X — Servo его включает), JIT потом; freetype/harfbuzz/fontconfig,
+  `aws-lc-sys`/ring, `rusqlite`.
 - **N5 — swgl-рендер.** Сначала **на хосте Linux** (быстрые итерации): свой
   `RenderingContext` на `swgl::Context`, страница → PNG; `webgl` выкл.
   Затем то же под `*-unknown-freeos`.

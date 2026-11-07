@@ -45,6 +45,18 @@ export __CARGO_TESTS_ONLY_SRC_ROOT=$W/build/rust-std/src/library
 export CARGO_TARGET_DIR=$L/target
 eval "export CC_$KEY=$ARCH-freeos-cc CXX_$KEY=$ARCH-freeos-c++ AR_$KEY=llvm-ar"
 
+# pkg-config целевых библиотек (zlib, freetype, fontconfig…): .pc из sysroot
+# с путями контейнера вместо путей Windows.
+PC=/tmp/pkgconfig-$ARCH
+mkdir -p $PC
+for f in $SR/pkgconfig/*.pc; do
+    sed 's#[A-Za-z]:/BlueGit/FreeOpenSourseSystemAI#/work#g' "$f" > $PC/$(basename "$f")
+done
+export PKG_CONFIG_ALLOW_CROSS=1
+eval "export PKG_CONFIG_PATH_$KEY=$PC PKG_CONFIG_LIBDIR_$KEY=$PC"
+# configure SpiderMonkey при кросс-сборке смотрит сюда (mozjs_sys/build.rs).
+export TARGET_PKG_CONFIG_PATH=$PC
+
 # Подмены крейтов — те же, что у xtask, с путями контейнера.
 sed 's#[A-Za-z]:/BlueGit/FreeOpenSourseSystemAI#/work#g' $W/build/rust-std/src/patches.toml > /tmp/patches.toml
 # library/Cargo.toml указывает на libc относительным путём — менять нечего.

@@ -1,0 +1,21 @@
+[package]
+name = "jsprobe"
+version = "0.1.0"
+edition = "2021"
+description = "N4: SpiderMonkey (mozjs) на FreeOS — JS_Init, глобальный объект, Evaluate"
+publish = false
+
+# Отдельный workspace: собирается в контейнере fossai-builder
+# (ports/servo/builder/build-jsprobe.sh) целью <арх>-unknown-freeos.
+[workspace]
+
+# mozjs_sys подменяется копией с ОС freeos (build/servo/mozjs_sys-*,
+# правки — ports/servo/mozjs/freeos.patch); без JIT, как у Servo без js_jit.
+[dependencies]
+mozjs = { version = "=0.26.13", default-features = false, features = ["libz-sys"] }
+
+[profile.release]
+panic = "abort"
+debug = false
+codegen-units = 16
+strip = true
