@@ -11260,7 +11260,11 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   работает (`cmem: ok address hint and MAP_FIXED`). **Трассировка родных
   вызовов** — тот же `lxtrace <имя>` (строки `ntrace`, у вызовов с путём —
   путь), теперь и на aarch64: так и нашёлся `/dev/urandom`.
-  **Осталось из N4:** aarch64 (`build-jsprobe.sh aarch64`), `intl`
+  **aarch64 — тоже зелёный (08.11)**: тот же патч без правок,
+  `build-jsprobe.sh aarch64` (9,9 МБ), `servo-js` за 14 с. Грабли: `dash`
+  не передаёт аргументы в `.` — `shift` в скрипте только после
+  `freeos-env.sh`, иначе тихо собирался x86_64.
+  **Осталось из N4:** `intl`
   (ICU4X — Servo его включает), JIT потом; freetype/harfbuzz/fontconfig,
   `aws-lc-sys`/ring, `rusqlite`.
 - **N5 — swgl-рендер.** Сначала **на хосте Linux** (быстрые итерации): свой

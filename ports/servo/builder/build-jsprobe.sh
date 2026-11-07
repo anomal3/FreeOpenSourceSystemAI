@@ -11,9 +11,11 @@
 # Готовая программа — build/linux/jsprobe-<арх>.
 set -e
 ARCH=${1:-x86_64}
-[ $# -gt 0 ] && shift
 MOZJS_SYS=mozjs_sys-153.6.0-1
+# dash не передаёт аргументы в `.`: freeos-env.sh видит наши $1 — поэтому
+# `shift` только после него.
 . /work/ports/servo/builder/freeos-env.sh "$ARCH"
+[ $# -gt 0 ] && shift
 sh /work/ports/servo/mozjs/prepare.sh
 
 mkdir -p /cache/src
