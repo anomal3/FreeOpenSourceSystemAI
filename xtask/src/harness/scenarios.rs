@@ -6816,7 +6816,7 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "rust-std",
-        about: "Программа на std Rust (цель x86_64-unknown-freeos): потоки, Mutex/Condvar/RwLock, thread_local, время, файлы, TCP.",
+        about: "Программа на std Rust (цель <арх>-unknown-freeos): потоки, Mutex/Condvar/RwLock, thread_local, время, файлы, TCP.",
         target: Target::Live,
         usb_only: false,
         tablet: false,
@@ -6830,8 +6830,7 @@ pub const ALL: &[Scenario] = &[
         host_echo: false,
         host_repo: false,
         host_site: false,
-        // Цель aarch64-unknown-freeos — следующим шагом.
-        arches: &[Arch::X86_64],
+        arches: &[],
         reboots: false,
         updates: false,
         big_file: false,
@@ -6841,7 +6840,7 @@ pub const ALL: &[Scenario] = &[
         steps: &[
             Step::Await(PROMPT, BOOT),
             Step::Line("run /bin/rstd"),
-            Step::Await("rstd: std on freeos x86_64", 30_000),
+            Step::Await("rstd: std on freeos ", 30_000),
             Step::Await("rstd: ok args come from argv", 30_000),
             Step::Await("rstd: ok heap and HashMap with random keys", 30_000),
             Step::Await("rstd: ok mutex keeps a counter exact across 4 threads", 120_000),
