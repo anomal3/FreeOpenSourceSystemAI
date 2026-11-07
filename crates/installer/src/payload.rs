@@ -293,7 +293,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 62] = [
+const PROGRAMS: [(&CStr16, &str); 63] = [
     // vDSO программ Linux (01.11.2026): время без входа в ядро. Не программа,
     // но едет тем же путём — так он есть и на установленной системе.
     (cstr16!("\\FREEOS\\BIN\\VDSO"), "vdso"),
@@ -373,6 +373,8 @@ const PROGRAMS: [(&CStr16, &str); 62] = [
     // Память для чужой среды и потоки POSIX на C (фазы 56–57).
     (cstr16!("\\FREEOS\\BIN\\CMEM"), "cmem"),
     (cstr16!("\\FREEOS\\BIN\\CTHREADS"), "cthreads"),
+    // Программа на std Rust (цель <арх>-unknown-freeos, 07.11.2026).
+    (cstr16!("\\FREEOS\\BIN\\RSTD"), "rstd"),
     // Слой POSIX под чужую среду исполнения (фаза 58b).
     (cstr16!("\\FREEOS\\BIN\\CPOSIX"), "cposix"),
     (cstr16!("\\FREEOS\\BIN\\CNET"), "cnet"),

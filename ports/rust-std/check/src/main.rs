@@ -120,7 +120,12 @@ fn main() {
     // Запись — где получится. Корень живой системы только для чтения (ядро
     // отвечает ERR_UNSUPPORTED → ENOSYS), там проверка пропускается; на
     // установленной системе пишется в дом.
-    let candidates = [std::env::var_os("HOME").map(Into::into).unwrap_or_default(), std::env::temp_dir()];
+    // Первый аргумент — каталог для записи (`run /bin/rstd /home/roman`).
+    let candidates = [
+        args.get(1).map(Into::into).unwrap_or_default(),
+        std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
+        std::env::temp_dir(),
+    ];
     let mut dir = None;
     for base in candidates.iter().filter(|b| !b.as_os_str().is_empty()) {
         let d = base.join("rstd");

@@ -2907,7 +2907,12 @@ fn press_right(qmp: Option<&mut qmp::Qmp>, hmp: &mut monitor::Monitor, down: boo
 /// Четыре гигабайта — с 24.10: пакет обновления вырос до 175 МБ (Wayland и
 /// прочее ядро фаз 71), и три пакета снова не помещались рядом с системой и
 /// играми на носителе (полный прогон 24.10).
-const TARGET_DISK_MIB: u64 = 4096;
+///
+/// Шесть — с 07.11: `/media` слота A несёт пакеты с носителя (`wine-11` 316 МБ,
+/// `linuxweb` 350 МБ, `llama` 55 МБ…), и корень в треть четырёх гигабайт
+/// (≈1,2 ГБ) кончился на программе в 600 КБ (`rstd`, `install`: «the
+/// filesystem has no free blocks left»).
+const TARGET_DISK_MIB: u64 = 6144;
 
 /// Размер целевого диска: [`TARGET_DISK_MIB`] или `FOSSAI_TARGET_MIB` из
 /// окружения. Нужно Rider (`crate::rider`): 4,5 ГБ в `/opt` не помещаются в
