@@ -70,6 +70,13 @@ struct sockaddr_in6 {
 #define IPV6_MULTICAST_LOOP 19
 #define IPV6_JOIN_GROUP 20
 #define IPV6_LEAVE_GROUP 21
+/* Порт `std` Rust (N2, 07.11): `std::net` объявляет `set_ttl`/`ttl` и
+ * групповые IPv6 под этими именами. Числа — Linux; `setsockopt` на них
+ * отвечает `ENOPROTOOPT`, пока ядро их не знает. */
+#define IP_TOS 1
+#define IP_TTL 2
+#define IPV6_ADD_MEMBERSHIP IPV6_JOIN_GROUP
+#define IPV6_DROP_MEMBERSHIP IPV6_LEAVE_GROUP
 /* Фаза 70d: cpp-httplib (его тянет llama.cpp) ставит `IPV6_V6ONLY` всякому
  * слушающему сокету и разбирает адреса макросами `IN6_IS_ADDR_*`. IPv6 в
  * системе нет: `setsockopt` с этим параметром отвечает отказом, а сокета

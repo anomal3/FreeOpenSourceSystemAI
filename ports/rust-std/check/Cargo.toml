@@ -1,0 +1,14 @@
+[package]
+name = "rstd"
+version = "0.1.0"
+edition = "2021"
+description = "Проверка std Rust на FreeOS (цель <арх>-unknown-freeos): потоки, файлы, время, сеть"
+publish = false
+
+# Отдельный workspace: собирается своей целью и своим -Zbuild-std
+# (`cargo xtask` → `xtask::ruststd`), а не вместе с остальными крейтами.
+[workspace]
+
+[profile.release]
+panic = "abort"
+debug = false

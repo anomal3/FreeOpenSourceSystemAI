@@ -42,6 +42,7 @@ mod chromium;
 mod java;
 mod wine;
 mod rider;
+mod ruststd;
 mod statefs;
 mod debian;
 mod fimg;

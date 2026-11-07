@@ -1,0 +1,40 @@
+{
+  "arch": "x86_64",
+  "cpu": "x86-64",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+  "llvm-target": "x86_64-unknown-none-elf",
+  "metadata": {
+    "description": "FreeOS / FossAi (picolibc + libc/freeos)",
+    "host_tools": false,
+    "std": true,
+    "tier": 3
+  },
+  "os": "freeos",
+  "env": "newlib",
+  "vendor": "unknown",
+  "target-family": ["unix"],
+  "target-pointer-width": 64,
+  "max-atomic-width": 64,
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "executables": true,
+  "dynamic-linking": false,
+  "crt-static-default": true,
+  "crt-static-respected": true,
+  "crt-objects-fallback": "false",
+  "position-independent-executables": true,
+  "static-position-independent-executables": true,
+  "relocation-model": "pie",
+  "has-thread-local": true,
+  "tls-model": "local-exec",
+  "panic-strategy": "abort",
+  "plt-by-default": false,
+  "relro-level": "off",
+  "stack-probes": { "kind": "inline" },
+  "pre-link-args": {
+    "gnu-lld": ["-z", "max-page-size=0x1000", "--defsym=__freeos_pie=1", "-e", "__freeos_entry", "--eh-frame-hdr"]
+  },
+  "late-link-args": {
+    "gnu-lld": ["--start-group", "-lunwind", "-lfreeos", "-lc", "-lm", "-lclang_rt.builtins", "--end-group"]
+  }
+}

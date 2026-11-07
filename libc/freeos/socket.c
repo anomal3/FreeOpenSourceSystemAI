@@ -144,14 +144,17 @@ int socket(int domain, int type, int protocol) {
 }
 
 /* Адрес в `bind` у нас всегда «любой»: адрес у машины один. Другой — не наш,
- * и честный ответ на него — `EADDRNOTAVAIL`, а не молча «любой». */
+ * и честный ответ на него — `EADDRNOTAVAIL`, а не молча «любой».
+ * Петля `127.0.0.0/8` — тоже наша: ядро доставляет на неё (проверено `rstd`,
+ * эхо через 127.0.0.1, 07.11.2026), а `std` Rust и почти любой сервер для
+ * проверок слушают именно `127.0.0.1`. */
 int bind(int fd, const struct sockaddr *address, socklen_t length) {
     uint32_t ip;
     uint16_t port;
     if (take_address(address, length, &ip, &port) != 0) {
         return -1;
     }
-    if (ip != INADDR_ANY) {
+    if (ip != INADDR_ANY && (ip >> 24) != 127) {
         struct freeos_netinfo net;
         long code = freeos_syscall(SYS_NETINFO, (long)&net, sizeof(net), 0);
         if (code < 0 || net.address != ip) {

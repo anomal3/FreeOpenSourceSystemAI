@@ -133,6 +133,13 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
             Ok(built) => programs.extend(built),
             Err(err) => say!("программы на C пропущены: {err}"),
         }
+        // Программы на `std` Rust (цель `<арх>-unknown-freeos`, N2 браузера
+        // на Servo, 07.11.2026) — тем же правилом, что программы на C: нет
+        // `rust-src` или набора — строка в журнале, а не остановка сборки.
+        match crate::ruststd::build_programs(opts.arch) {
+            Ok(built) => programs.extend(built),
+            Err(err) => say!("программы на std Rust пропущены: {err:#}"),
+        }
         // vDSO программ Linux (01.11.2026) — в `/bin`, как программы.
         match crate::cbuild::build_linux_vdso(opts.arch) {
             Ok(Some(vdso)) => programs.push((crate::cbuild::LINUX_VDSO, vdso)),
