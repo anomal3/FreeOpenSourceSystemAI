@@ -161,6 +161,19 @@ impl Handle {
         }
     }
 
+    /// Общая память обычного файла за дескриптором (07.11): Wine 11 отдаёт
+    /// серверу Wayland буфер окна дескриптором файла своего раздела, а не
+    /// `memfd`. Объект — тот же, что у `mmap(MAP_SHARED)` этого файла в
+    /// программе ([`super::shm::SharedMem::for_file`]), так что сервер видит
+    /// то, что программа рисует.
+    #[must_use]
+    pub fn file_memory(&self, size: usize) -> Option<Arc<super::shm::SharedMem>> {
+        match &self.0 {
+            Slot::File(open) => super::shm::SharedMem::for_file(Arc::clone(&open.node), 0, size, false),
+            _ => None,
+        }
+    }
+
     /// Дескриптор на узел, открытый ядром, — чтобы отдать его программе
     /// (`SCM_RIGHTS`; раскладка клавиатуры Wayland, фаза 71i).
     #[must_use]

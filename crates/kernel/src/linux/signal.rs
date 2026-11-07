@@ -535,6 +535,42 @@ pub fn deliver_fault(frame: &mut crate::arch::TrapFrame, vector: u8, addr: usize
     if action.handler == 0 || action.handler == SIG_IGN || mask & bit(sig) != 0 {
         return false;
     }
+    // Переход по нулевому адресу (фаза 71j: Wine молча глотает такие сбои в
+    // своём коде Unix) — в журнал с адресом возврата с вершины стека: по нему
+    // видно, кто позвал пустой указатель. Первые двадцать на систему.
+    if sig == SIGSEGV && frame.rip < 0x1_0000 {
+        static SHOWN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        if SHOWN.fetch_add(1, Ordering::Relaxed) < 20 {
+            let rsp = frame.rsp as usize;
+            let back = if crate::user::space::user_can(rsp, 8, crate::mm::PageFlags::READ) {
+                // SAFETY: проверено строкой выше; пространство — текущей программы.
+                unsafe { core::ptr::read_unaligned(rsp as *const u64) }
+            } else {
+                0
+            };
+            let place = crate::user::with_current(|program| program.image_at(back as usize)).flatten();
+            crate::kprintln!(
+                "  linux       : {} jumped to {:#x} (fault at {:#x}), return address {back:#x} (file offset, size: {place:x?}), rdi {:#x}",
+                sched::current(),
+                frame.rip,
+                at,
+                frame.rdi
+            );
+        }
+    }
+    // Отказ страницы с адресом в программе (фаза 71j) — что за область там.
+    if vector == 14 && frame.rip >= 0x1_0000 {
+        static SHOWN_PF: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        if SHOWN_PF.fetch_add(1, Ordering::Relaxed) < 20 {
+            let what = crate::user::with_current(|program| program.describe_region(addr)).unwrap_or_default();
+            crate::kprintln!(
+                "  linux       : {} page fault at {addr:#x} (error {:#x}) from {:#x}: {what}",
+                sched::current(),
+                frame.error,
+                frame.rip
+            );
+        }
+    }
     let fault = Fault { code, addr: at, trapno: u64::from(vector), err: frame.error };
     enter_handler(frame, slot, sig, action, action.handler, mask, mask, Some(fault));
     true

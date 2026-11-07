@@ -204,7 +204,12 @@ pub fn default_jobs() -> usize {
 pub fn run(opts: &TestOptions) -> Result<()> {
     let selected: Vec<&'static Scenario> = match &opts.only {
         Some(name) => scenarios::ALL.iter().filter(|s| s.name == *name).collect(),
-        None => scenarios::ALL.iter().collect(),
+        // Rider отложен (`crate::rider::enabled`): его сценарии — только
+        // по имени или с `FOSSAI_WITH_RIDER=1`.
+        None => scenarios::ALL
+            .iter()
+            .filter(|s| crate::rider::enabled() || !crate::rider::SCENARIOS.contains(&s.name))
+            .collect(),
     };
     if selected.is_empty() {
         let names: Vec<&str> = scenarios::ALL.iter().map(|s| s.name).collect();

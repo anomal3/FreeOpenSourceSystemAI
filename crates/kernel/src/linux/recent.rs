@@ -48,7 +48,7 @@ fn path_arg(number: usize) -> Option<usize> {
 fn show_failure(number: usize, args: [usize; 6], result: i64) {
     // `readlink` не ссылки — `EINVAL`: так .NET и glibc спрашивают «ссылка
     // ли это» на каждом шаге пути, и эти строки вытесняли остальные.
-    if result >= 0 || routine(-result) || (number == 89 && result == -22) || FAILED_SHOWN.fetch_add(1, Ordering::Relaxed) >= FAILED_LIMIT {
+    if result >= 0 || routine(-result) || (number == 89 && result == -22) || (number == 9 && result == -12) || FAILED_SHOWN.fetch_add(1, Ordering::Relaxed) >= FAILED_LIMIT {
         return;
     }
     let [a0, a1, a2, a3, ..] = args;

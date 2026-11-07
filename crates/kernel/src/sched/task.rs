@@ -454,6 +454,9 @@ pub struct Task {
     /// Ноль у всякой задачи, которая хранилища не просила: у ядерных задач и у
     /// однопоточных программ.
     pub tls: u64,
+    /// База `GS` третьего кольца (x86-64): ноль у всех, кроме программ Linux,
+    /// которые просили её `arch_prctl(ARCH_SET_GS)` (Wine — TEB).
+    pub gs: u64,
     /// Сколько раз задача получала процессор.
     pub switches: u64,
     /// Сколько раз задачу снимали с процессора не по её воле — по истёкшему
@@ -632,6 +635,7 @@ impl Task {
             name: "idle",
             state: TaskState::Running,
             tls: 0,
+            gs: 0,
             switches: 0,
             preempted: 0,
             cpu_ms: 0,
@@ -670,6 +674,7 @@ impl Task {
             name,
             state: TaskState::Ready,
             tls: 0,
+            gs: 0,
             switches: 0,
             preempted: 0,
             cpu_ms: 0,

@@ -22,11 +22,21 @@
 //! отображение) или по [`SharedMem::flush`]. Видно это всем, кто отобразил
 //! тот же объект (и детям после `fork`); другому `mmap` того же файла —
 //! только после записи обратно.
+//!
+//! # Один объект на файл (фаза 71j)
+//!
+//! Wine держит общую память сервера и клиентов на файлах: `wineserver`
+//! создаёт файл, отображает его на запись и передаёт дескриптор клиенту
+//! (`SCM_RIGHTS`), клиент отображает тот же файл — и оба обязаны видеть одни
+//! кадры (`KUSER_SHARED_DATA`, общее состояние окон). Поэтому объект файла
+//! заводится по номеру узла ([`Node::file_id`]) один на всех
+//! ([`SharedMem::for_file`]): смещение в объекте — смещение в файле, кусок
+//! дочитывается, когда отображают дальше.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -48,13 +58,22 @@ pub struct SharedMem {
 struct FileBack {
     node: Arc<dyn Node>,
     start: u64,
-    end: u64,
+    /// Конец прочитанного; у общего объекта файла растёт.
+    end: AtomicU64,
     /// Отпечаток каждой страницы, какой она лежит в файле: при записи обратно
     /// страница с тем же отпечатком пропускается. Без этого назад писалось
     /// всё, чего касались, — и IntelliJ (Rider), отображающая индексы на
     /// запись, а пишущая в них мало, при выходе десятками тысяч записей по
     /// 4 КБ занимала файловую систему на минуты: система «висла» (27.10).
     clean: Mutex<BTreeMap<usize, u64>>,
+}
+
+/// Общие объекты файлов по номеру узла (фаза 71j, [`SharedMem::for_file`]).
+static FILES: Mutex<Vec<((usize, u64), Weak<SharedMem>)>> = Mutex::new(Vec::new());
+
+/// Страница-буфер для чтения куска файла.
+fn vec_page() -> Vec<u8> {
+    alloc::vec![0u8; PAGE_SIZE]
 }
 
 /// Отпечаток страницы: FNV-1a по 64 битам. Не защита, а сравнение «та же ли
@@ -93,7 +112,7 @@ impl SharedMem {
         let mem = Arc::new(Self {
             frames: Mutex::new(BTreeMap::new()),
             size: AtomicU64::new(size),
-            file: Some(FileBack { node: Arc::clone(&node), start: offset, end, clean: Mutex::new(BTreeMap::new()) }),
+            file: Some(FileBack { node: Arc::clone(&node), start: offset, end: AtomicU64::new(end), clean: Mutex::new(BTreeMap::new()) }),
         });
         // Кусками по [`FILE_RUN`]: одно чтение файловой системы вместо
         // шестидесяти четырёх.
@@ -115,6 +134,67 @@ impl SharedMem {
         }
         mem.remember_clean();
         Some(mem)
+    }
+
+    /// Общий объект файла (фаза 71j): один на узел для всех процессов, с
+    /// дочитанным `[offset, offset + len)`. Узел без номера — по самому
+    /// объекту узла. `existing_only` — только если объект уже есть
+    /// (общее отображение на чтение: см. `linux::mmap`).
+    pub fn for_file(node: Arc<dyn Node>, offset: u64, len: usize, existing_only: bool) -> Option<Arc<Self>> {
+        // Узел без номера (`/tmp` в памяти — там wineserver держит файл
+        // сессии, 07.11): ключ — сам объект узла. Клиент получает тот же
+        // объект через `SCM_RIGHTS`, так что и ключ у него тот же.
+        let id = node.file_id().unwrap_or((usize::MAX, alloc::sync::Arc::as_ptr(&node) as *const () as usize as u64));
+        let end = offset.checked_add(len as u64)?;
+        let mut files = FILES.lock();
+        files.retain(|(_, live)| live.strong_count() > 0);
+        let found = files.iter().find(|(other, _)| *other == id).and_then(|(_, live)| live.upgrade());
+        let mem = match found {
+            Some(mem) => mem,
+            None if existing_only => return None,
+            None => {
+                if len > MAX_FILE_MAP {
+                    return None;
+                }
+                let mem = Arc::new(Self {
+                    frames: Mutex::new(BTreeMap::new()),
+                    size: AtomicU64::new(node.metadata().size),
+                    file: Some(FileBack { node: Arc::clone(&node), start: 0, end: AtomicU64::new(0), clean: Mutex::new(BTreeMap::new()) }),
+                });
+                files.push((id, Arc::downgrade(&mem)));
+                mem
+            }
+        };
+        drop(files);
+        mem.load(offset, end)?;
+        Some(mem)
+    }
+
+    /// Дочитать из файла страницы `[offset, end)`, которых объект ещё не
+    /// касался (тронутые — уже свои, их не перезаписывать).
+    fn load(&self, offset: u64, end: u64) -> Option<()> {
+        let back = self.file.as_ref()?;
+        let size = back.node.metadata().size;
+        self.size.fetch_max(size, Ordering::Relaxed);
+        let first = (offset as usize) / PAGE_SIZE;
+        let last = (end.min(size) as usize).div_ceil(PAGE_SIZE);
+        let mut page = vec_page();
+        for index in first..last {
+            if self.frames.lock().contains_key(&index) {
+                continue;
+            }
+            let at = (index * PAGE_SIZE) as u64;
+            let take = ((size - at) as usize).min(PAGE_SIZE);
+            let got = back.node.read_at(at, &mut page[..take]).ok()?;
+            let frame = self.frame(index)?;
+            // SAFETY: кадр только что выдан объекту (или выдан раньше и пуст:
+            // страницы не касались); прямое отображение, внутри страницы.
+            unsafe { core::ptr::copy_nonoverlapping(page.as_ptr(), super::frame_bytes(frame), got) };
+            let bytes = unsafe { core::slice::from_raw_parts(super::frame_bytes(frame), PAGE_SIZE) };
+            back.clean.lock().insert(index, fingerprint(bytes));
+        }
+        back.end.fetch_max(end, Ordering::Relaxed);
+        Some(())
     }
 
     /// Запомнить отпечатки всех страниц — такими они лежат в файле.
@@ -139,7 +219,7 @@ impl SharedMem {
             return;
         };
         let size = back.node.metadata().size;
-        let end = back.end.min(size);
+        let end = back.end.load(Ordering::Relaxed).min(size);
         let pages: Vec<(usize, PhysAddr)> = self.frames.lock().iter().map(|(page, frame)| (*page, *frame)).collect();
         let mut clean = back.clean.lock();
         // Изменившиеся страницы — `(страница, кадр, отпечаток)`.

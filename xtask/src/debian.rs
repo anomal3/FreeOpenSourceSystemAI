@@ -176,11 +176,17 @@ pub fn build(arch: Arch) -> Result<()> {
 
 /// Скачать (или взять из кеша) пакеты, сверить хеши и разложить в `root`.
 pub(crate) fn unpack(cache: &std::path::Path, packages: &[(&str, &str)], root: &mut BTreeMap<String, Node>) -> Result<()> {
+    unpack_from(SNAPSHOT, cache, packages, root)
+}
+
+/// То же, что [`unpack`], но из другого архива пакетов (`base` — его корень
+/// с `/` на конце): Wine берётся у WineHQ (фаза 71j).
+pub(crate) fn unpack_from(base: &str, cache: &std::path::Path, packages: &[(&str, &str)], root: &mut BTreeMap<String, Node>) -> Result<()> {
     for &(pool, sha256) in packages {
         let name = pool.rsplit('/').next().unwrap_or(pool);
         let file = cache.join(name);
         if !file.is_file() || digest(&fs::read(&file)?) != sha256 {
-            let url = format!("{SNAPSHOT}{pool}");
+            let url = format!("{base}{pool}");
             say!("> curl {url}");
             let status = std::process::Command::new("curl")
                 .args(["--location", "--fail", "--silent", "--show-error", "--output"])

@@ -336,6 +336,20 @@ pub fn execve(frame: &mut crate::arch::TrapFrame, path: usize, argv: usize, envp
         }
     };
     let shown = linux.clone();
+    // Аргументы — в журнал (фаза 71j): процессы Wine все зовутся `wine`, а
+    // программа Windows — в `argv[1]`; без этого не видно, кто кого плодит.
+    if args.len() > 1 {
+        let mut line = args[1..].join(" ");
+        if line.len() > 160 {
+            let mut cut = 160;
+            while !line.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            line.truncate(cut);
+        }
+        let debug = env.iter().find(|var| var.starts_with("WINEDEBUG=")).map_or("", |var| var.as_str());
+        crate::kprintln!("  linux       : {} execve '{shown}' with {line} {debug}", crate::sched::current());
+    }
     let result = exec_linux(frame, linux, args, &env, 0);
     // Отказ `execve` у ребёнка виден снаружи только кодом 127 — причину
     // ядро говорит само (фаза 71h).

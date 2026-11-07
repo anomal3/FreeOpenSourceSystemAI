@@ -711,6 +711,19 @@ pub fn set_current_tls(base: u64) {
     arch::set_user_tls(base);
 }
 
+/// Задать базу `GS` исполняющейся задачи (программы Linux на x86-64,
+/// `arch_prctl(ARCH_SET_GS)`; Wine держит там TEB) — как [`set_current_tls`].
+pub fn set_current_gs(base: u64) {
+    {
+        let mut sched = SCHED.lock();
+        let current = sched.current();
+        if let Some(task) = sched.tasks[current].as_mut() {
+            task.gs = base;
+        }
+    }
+    arch::set_user_gs(base);
+}
+
 /// Номер слота исполняющейся задачи.
 ///
 /// Слот, а не идентификатор: по нему индексируются таблицы, которые ведут о
@@ -1200,6 +1213,7 @@ fn schedule_with(cause: Cause) {
     // указателями и ставится ниже, до самого переключения: регистр один на
     // процессор, и задача обязана найти на нём своё значение, а не соседкино.
     let mut to_tls: u64 = 0;
+    let mut to_gs: u64 = 0;
 
     {
         let mut sched = SCHED.lock();
@@ -1341,6 +1355,7 @@ fn schedule_with(cause: Cause) {
                                 task.woken_by_irq_ms = 0;
                             }
                             to_tls = task.tls;
+                            to_gs = task.gs;
                         }
                         let state = &mut sched.cpus[cpu];
                         state.previous = Some(current);
@@ -1369,6 +1384,7 @@ fn schedule_with(cause: Cause) {
         // описывает задачу с отображённым стеком — построенную `Context::new`
         // либо сохранённую предыдущим вызовом этой функции.
         arch::set_user_tls(to_tls);
+        arch::set_user_gs(to_gs);
         unsafe { arch::switch_context(from, to) };
         // Сюда управление возвращается уже в контексте задачи, которая когда-то
         // уступила процессор, — возможно, на другом процессоре. Первое, что она

@@ -940,12 +940,14 @@ impl Client {
             Obj::Shm => {
                 if opcode == 0 {
                     let new = args.u32()?;
-                    let _size = args.i32()?;
+                    let size = args.i32()?;
                     let Some(fd) = self.fds.pop_front() else {
                         self.fail(id, 2, "create_pool without a descriptor");
                         return Ok(());
                     };
-                    match fd.shared_memory() {
+                    // `memfd` и `/dev/shm` — сами общая память; обычный файл
+                    // (Wine 11: файл раздела) — через общий объект файла.
+                    match fd.shared_memory().or_else(|| fd.file_memory(size.max(0) as usize)) {
                         Some(mem) => {
                             self.objects.insert(new, Obj::Pool(mem));
                         }

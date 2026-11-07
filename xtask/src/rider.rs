@@ -151,6 +151,19 @@ const SCRIPT: &str = "#!/bin/bash\n\
     export RIDER_VM_OPTIONS=/opt/rider/fossai/rider64.vmoptions\n\
     exec /opt/rider/bin/rider \"$@\"\n";
 
+/// Rider и всё, что берётся из его дистрибутива (пакет Java `jbr-25.fpk`,
+/// сценарии `rider`, `vbox-show`, `java`), — только с `FOSSAI_WITH_RIDER=1`.
+/// Слово Романа 06.11: проверку Rider прошли, вернёмся к нему после браузера,
+/// когда система станет стабильнее; а пока он съедает место (архив 2,4 ГБ,
+/// целевой диск на 24 ГиБ).
+#[must_use]
+pub fn enabled() -> bool {
+    std::env::var("FOSSAI_WITH_RIDER").is_ok_and(|value| value == "1")
+}
+
+/// Сценарии, которые без Rider не идут.
+pub const SCENARIOS: [&str; 3] = ["rider", "vbox-show", "java"];
+
 /// Разложить Rider в раздел состояния образа `disk_path`.
 pub fn place(disk_path: &Path) -> Result<()> {
     // Уже лежит тот же — второй раз не раскладываем: это минуты записи.

@@ -19,7 +19,12 @@ pub(super) fn place(linux: &str) -> String {
         Some((parent, name)) => (parent, name),
         None => return String::from(linux),
     };
-    let mut out = crate::linux_path::resolve(parent, cred);
+    // Ссылки посреди пути — пройти (07.11): Wine создаёт каталоги через
+    // `dosdevices/c:` → `../drive_c`, и `mkdir` по такому пути отвечал
+    // `ENOENT` («Failed to create directory C:\\Program Files»). Последний
+    // компонент не трогается — как у Linux для `mkdir`, `unlink`, `rename`.
+    let parent = super::links::follow(parent);
+    let mut out = crate::linux_path::resolve(&parent, cred);
     if !out.ends_with('/') {
         out.push('/');
     }

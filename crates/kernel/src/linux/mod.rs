@@ -726,11 +726,9 @@ fn linux_path(dir: usize, ptr: usize) -> Result<String, i64> {
     let base = if dir == AT_FDCWD {
         crate::user::with_current(|program| program.linux_cwd.clone()).unwrap_or_else(|| String::from("/"))
     } else {
-        match crate::user::with_current(|program| {
-            program.linux_dirs.iter().find(|(fd, _)| *fd == dir).map(|(_, path)| path.clone())
-        }) {
-            Some(Some(path)) => path,
-            _ => return Err(-e::ENOTDIR),
+        match dir_path(dir) {
+            Some(path) => path,
+            None => return Err(-e::ENOTDIR),
         }
     };
     let mut joined = base;
@@ -835,11 +833,47 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     }
     if directory {
         crate::user::with_current(|program| {
+            if let Ok(node) = program.files.file_or_dir(fd) {
+                remember_dir(&node, &linux);
+            }
             program.linux_dirs.retain(|(other, _)| *other != fd);
             program.linux_dirs.push((fd, linux));
         });
     }
     fd as i64
+}
+
+/// Пути каталогов по их узлам (фаза 71j): дескриптор каталога, пришедший
+/// через `dup` или `SCM_RIGHTS` (wineserver отдаёт клиентам Wine каталоги
+/// так), в `linux_dirs` процесса не записан — путь находится по узлу.
+static DIR_PATHS: crate::sync::Mutex<Vec<(alloc::sync::Weak<dyn crate::vfs::Node>, String)>> = crate::sync::Mutex::new(Vec::new());
+
+fn remember_dir(node: &alloc::sync::Arc<dyn crate::vfs::Node>, linux: &str) {
+    let mut paths = DIR_PATHS.lock();
+    paths.retain(|(live, _)| live.strong_count() > 0);
+    let key = alloc::sync::Arc::as_ptr(node) as *const ();
+    if let Some(entry) = paths.iter_mut().find(|(live, _)| live.as_ptr() as *const () == key) {
+        entry.1 = String::from(linux);
+        return;
+    }
+    paths.push((alloc::sync::Arc::downgrade(node), String::from(linux)));
+}
+
+/// Путь Linux каталога, открытого дескриптором `fd` этой программы: свой
+/// (`linux_dirs`) или по узлу ([`DIR_PATHS`]).
+fn dir_path(fd: usize) -> Option<String> {
+    crate::user::with_current(|program| {
+        if let Some((_, path)) = program.linux_dirs.iter().find(|(other, _)| *other == fd) {
+            return Some(path.clone());
+        }
+        let node = program.files.file_or_dir(fd).ok()?;
+        if node.metadata().kind != NodeKind::Directory {
+            return None;
+        }
+        let key = alloc::sync::Arc::as_ptr(&node) as *const ();
+        DIR_PATHS.lock().iter().find(|(live, _)| live.as_ptr() as *const () == key).map(|(_, path)| path.clone())
+    })
+    .flatten()
 }
 
 /// `struct stat` Linux x86-64 — 144 байта.
@@ -887,6 +921,10 @@ fn put_stat(out: usize, kind: u32, mode: u16, uid: u32, gid: u32, size: u64, mti
         mode: kind | (u32::from(mode) & 0o7777),
         uid,
         gid,
+        // Номер устройства — у символьных разный (фаза 71j): Wine глушит весь
+        // свой отладочный вывод, если `st_rdev` stderr совпал с `/dev/null`,
+        // а у нас он был нулём у всех.
+        rdev: if kind == S_IFCHR { ino.max(1) } else { 0 },
         size: size as i64,
         blksize: 4096,
         blocks: size.div_ceil(512) as i64,
@@ -932,7 +970,19 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
             return put_stat(out, S_IFLNK, 0o777, 0, 0, text.len() as u64, 0, ino_of(&linux));
         }
     }
-    let linux = links::follow(&linux);
+    let mut linux = links::follow(&linux);
+    // `/proc/self/exe` — ссылка на файл программы (фаза 71j): `realpath`
+    // glibc идёт по ней, только если `lstat` назвал её ссылкой, — иначе
+    // wineserver искал свои `nls` в `/proc/self/../share/wine`.
+    if linux == "/proc/self/exe" {
+        let exe = crate::user::with_current(|program| String::from(crate::linux_path::shown(&program.path))).unwrap_or_default();
+        if !follow {
+            return put_stat(out, S_IFLNK, 0o777, 0, 0, exe.len() as u64, 0, ino_of(&linux));
+        }
+        if !exe.is_empty() {
+            linux = exe;
+        }
+    }
     // `/proc/self/fd/N` — ссылка на открытое; `stat` идёт по ней, то есть
     // это `fstat` дескриптора (фаза 71h: песочница Chromium так проверяет
     // открытые дескрипторы). `/proc/self/task/<tid>` — каталог потока.
@@ -955,7 +1005,15 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
     }
     if special::exists(&linux) {
         let kind = if linux.starts_with("/dev/") { S_IFCHR } else { S_IFREG };
-        return put_stat(out, kind, 0o666, 0, 0, 0, 0, ino_of(&linux));
+        // Настоящие номера Linux у известных устройств (`makedev(1, 3)` …).
+        let ino = match linux.as_str() {
+            "/dev/null" => 0x103,
+            "/dev/zero" => 0x105,
+            "/dev/random" => 0x108,
+            "/dev/urandom" => 0x109,
+            _ => ino_of(&linux),
+        };
+        return put_stat(out, kind, 0o666, 0, 0, 0, 0, ino);
     }
     if special::is_directory(&linux) || matches!(linux.as_str(), "/dev" | "/sys" | "/dev/shm") {
         let done = put_stat(out, S_IFDIR, 0o555, 0, 0, 0, 0, ino_of(&linux));
@@ -978,6 +1036,7 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
     let meta = node.metadata();
     let kind = match meta.kind {
         NodeKind::Directory => S_IFDIR,
+        NodeKind::File if ipc::is_listening(&linux) => S_IFSOCK,
         NodeKind::File => S_IFREG,
     };
     let ino = ino_of_node(&*node).unwrap_or_else(|| ino_of(&path));
@@ -1185,15 +1244,14 @@ fn chdir(ptr: usize) -> i64 {
 /// `fchdir` — в каталог, открытый дескриптором (фаза 71i: `mkdir -p`
 /// coreutils идёт по пути так); его путь запомнил `openat`.
 fn fchdir(fd: usize) -> i64 {
-    let answer = crate::user::with_current(|program| {
-        match program.linux_dirs.iter().find(|(other, _)| *other == fd).map(|(_, path)| path.clone()) {
-            Some(path) => {
-                program.linux_cwd = path;
-                0
-            }
-            None if program.files.is_open(fd) => -e::ENOTDIR,
-            None => -e::EBADF,
+    let found = dir_path(fd);
+    let answer = crate::user::with_current(|program| match found {
+        Some(path) => {
+            program.linux_cwd = path;
+            0
         }
+        None if program.files.is_open(fd) => -e::ENOTDIR,
+        None => -e::EBADF,
     });
     answer.unwrap_or(-e::ESRCH)
 }
@@ -1217,6 +1275,12 @@ fn readlink(dir: usize, ptr: usize, buf: usize, size: usize) -> i64 {
         // SAFETY: проверено строкой выше.
         unsafe { core::ptr::copy_nonoverlapping(exe.as_ptr(), buf as *mut u8, len) };
         return len as i64;
+    }
+    // Особые узлы (`/proc`, `/proc/self`, `/dev/null` …) есть, но не ссылки:
+    // `realpath` glibc спрашивает `readlink` о каждом шаге пути и на `ENOENT`
+    // сдаётся (фаза 71j: wineserver не находил свои `nls`).
+    if special::exists(&path) || special::is_directory(&path) || matches!(path.as_str(), "/proc" | "/dev" | "/sys" | "/dev/shm") {
+        return -e::EINVAL;
     }
     let full = crate::linux_path::resolve(&path, crate::user::credentials());
     match crate::fs::resolve_as(crate::user::credentials(), &full, Access::NONE) {
@@ -1422,9 +1486,11 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
     // просят адреса так).
     let bytes = len.div_ceil(4096).saturating_mul(4096);
     if flags & MAP_FIXED == 0 && addr != 0 && len != 0 {
-        let free = crate::user::with_current(|program| program.low_range_free(addr, bytes)).unwrap_or(false);
+        let free = crate::user::with_current(|program| program.range_free(addr, bytes)).unwrap_or(false);
         if flags & MAP_FIXED_NOREPLACE != 0 {
-            if !free && addr < crate::user::WINDOW_BASE {
+            // Занято или не наше место — `EEXIST`, кроме адресов выше окна:
+            // там `ENOMEM` (ниже), как у Linux за концом пространства.
+            if !free && addr.checked_add(bytes).is_some_and(|end| end <= crate::user::WINDOW_BASE + (1 << 39)) {
                 return -e::EEXIST;
             }
         } else if free {
@@ -1457,7 +1523,8 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
                 if offset % 4096 != 0 {
                     return -e::EINVAL;
                 }
-                match crate::user::shm::SharedMem::of_file(node, offset as u64, len) {
+                // Один объект на файл для всех процессов (фаза 71j).
+                match crate::user::shm::SharedMem::for_file(node, offset as u64, len, false) {
                     Some(mem) => {
                         shared = Some((mem, offset as u64));
                         None
@@ -1473,11 +1540,54 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
             _ if shared_flag
                 && crate::user::with_current(|program| program.files.access_mode(fd)).is_some_and(|mode| mode.is_ok_and(|mode| mode != 0)) =>
             {
-                return -e::ENODEV;
+                // Файл уже отображён на запись кем-то (wineserver — общая
+                // память для клиентов Wine, фаза 71j): те же кадры.
+                match crate::user::shm::SharedMem::for_file(node, offset as u64, len, true) {
+                    Some(mem) if offset % 4096 == 0 => {
+                        shared = Some((mem, offset as u64));
+                        None
+                    }
+                    _ => return -e::ENODEV,
+                }
+            }
+            // Общее отображение файла, открытого только на чтение, который
+            // кто-то уже отобразил на запись (07.11): клиенты Wine так
+            // отображают память сессии wineserver — снимок не видел бы ни
+            // записей сервера, ни выросшего файла.
+            _ if shared_flag && offset % 4096 == 0 => {
+                match crate::user::shm::SharedMem::for_file(alloc::sync::Arc::clone(&node), offset as u64, len, true) {
+                    Some(mem) => {
+                        shared = Some((mem, offset as u64));
+                        None
+                    }
+                    None => Some((node, offset as u64)),
+                }
+            }
+            // Частное отображение файла, который уже отображён кем-то общим
+            // на запись (07.11): клиенты Wine так отображают
+            // память wineserver (`MAP_PRIVATE`, чтение и запись) и ждут, что
+            // увидят его записи — у Linux частная страница видит файл, пока
+            // её не переписали. Снимок не видел ни записей, ни новых страниц.
+            // Запись клиента здесь станет видна и серверу: клиенты Wine в эту
+            // память не пишут.
+            _ if offset % 4096 == 0 => {
+                match crate::user::shm::SharedMem::for_file(alloc::sync::Arc::clone(&node), offset as u64, len, true) {
+                    Some(mem) => {
+                        shared = Some((mem, offset as u64));
+                        None
+                    }
+                    None => Some((node, offset as u64)),
+                }
             }
             _ => Some((node, offset as u64)),
         }
     };
+    // Выше конца окна программ (1 ТиБ) места нет: Linux на адрес за
+    // пределом пространства отвечает `ENOMEM` — так Wine ищет верх адресов
+    // и резервирует его кусками (фаза 71j).
+    if fixed && addr.checked_add(bytes).is_none_or(|end| end > crate::user::WINDOW_BASE + (1 << 39)) {
+        return -e::ENOMEM;
+    }
     match crate::user::with_current(|program| program.linux_mmap(addr, len, prot, fixed, file, shared)) {
         Some(Ok(base)) => base as i64,
         Some(Err(err)) => errno(crate::user::syscall::mmap_errno(err)),
@@ -1779,9 +1889,24 @@ unsafe fn arch_prctl(code: usize, addr: usize) -> i64 {
             unsafe { core::ptr::write_unaligned(addr as *mut u64, base as u64) };
             0
         }
-        // GS ядро отдаёт заглушке входа `syscall` (`swapgs`); своей базы GS
-        // программе Linux пока не положено.
-        ARCH_SET_GS | ARCH_GET_GS => -e::EINVAL,
+        // База GS (фаза 71j): Wine держит в ней TEB. Ядро GS не адресует —
+        // заглушка `syscall` меняет базы `swapgs` лишь на две инструкции.
+        ARCH_SET_GS => {
+            if addr >= 1 << 47 {
+                return -e::EPERM;
+            }
+            crate::sched::set_current_gs(addr as u64);
+            0
+        }
+        ARCH_GET_GS => {
+            if !space::user_can(addr, 8, PageFlags::WRITE) {
+                return -e::EFAULT;
+            }
+            let base = crate::arch::user_gs();
+            // SAFETY: проверено строкой выше.
+            unsafe { core::ptr::write_unaligned(addr as *mut u64, base) };
+            0
+        }
         _ => -e::EINVAL,
     }
 }

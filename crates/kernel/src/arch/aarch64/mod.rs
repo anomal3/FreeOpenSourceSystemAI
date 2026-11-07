@@ -869,6 +869,9 @@ pub fn set_user_tls(base: u64) {
     }
 }
 
+/// База `GS` (x86-64, Wine) — у AArch64 такого регистра нет.
+pub fn set_user_gs(_base: u64) {}
+
 pub fn wait_for_interrupt() {
     // SAFETY: `wfi` не трогает ни память, ни стек: это подсказка процессору
     // остановить конвейер до внешнего события.

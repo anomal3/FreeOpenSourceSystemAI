@@ -40,6 +40,7 @@ mod thirdparty;
 mod netsurf;
 mod chromium;
 mod java;
+mod wine;
 mod rider;
 mod statefs;
 mod debian;

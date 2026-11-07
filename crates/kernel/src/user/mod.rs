@@ -1221,6 +1221,26 @@ impl Program {
         self.mappings.get(first).is_none_or(|region| region.base >= end)
     }
 
+    /// Свободен ли `[addr, addr + bytes)` для подсказки `mmap` и
+    /// `MAP_FIXED_NOREPLACE` где угодно: в нижней области — как
+    /// [`Self::low_range_free`], в окне — внутри областей по запросу
+    /// ([`owns`] без образа и стека) и без чужих областей (фаза 71j).
+    pub(crate) fn range_free(&self, addr: usize, bytes: usize) -> bool {
+        if addr < WINDOW_BASE {
+            return self.low_range_free(addr, bytes);
+        }
+        let Some(end) = addr.checked_add(bytes) else {
+            return false;
+        };
+        let in_mmap = (addr >= MMAP_BASE && end <= MMAP_BASE + MMAP_LOW_BYTES)
+            || (addr >= MMAP_HIGH_BASE && end <= WINDOW_BASE + (1 << 39));
+        if addr % PAGE_SIZE != 0 || !in_mmap {
+            return false;
+        }
+        let first = self.mappings.partition_point(|region| region.end() <= addr);
+        self.mappings.get(first).is_none_or(|region| region.base >= end)
+    }
+
     /// Снять всё, что лежит в `[addr, addr + bytes)`, — для `MAP_FIXED`.
     /// Пусто — не отказ: «положи сюда» о пустом месте и просит. Задетая
     /// область, которую резать нельзя (стек, поверхность окна), — отказ.
@@ -4235,6 +4255,9 @@ struct LinuxThreadStart {
     regs: arch::TrapFrame,
     /// База TLS (FS) потока.
     tls: u64,
+    /// База `GS` — наследуется от родителя, как у Linux (Wine: TEB ставит
+    /// поток сам, но до этого живёт с родительской).
+    gs: u64,
     clear_tid: usize,
 }
 
@@ -4245,7 +4268,7 @@ struct LinuxThreadStart {
 pub fn spawn_linux_thread(regs: arch::TrapFrame, tls: u64, clear_tid: usize) -> Result<sched::TaskId, ThreadError> {
     let process = current_process().ok_or(ThreadError::NoProgram)?;
     let mask = LINUX_SIGMASK[sched::current_slot()].load(Ordering::Relaxed);
-    let start = alloc::boxed::Box::new(LinuxThreadStart { process, regs, tls, clear_tid });
+    let start = alloc::boxed::Box::new(LinuxThreadStart { process, regs, tls, gs: arch::user_gs(), clear_tid });
     let raw = alloc::boxed::Box::into_raw(start);
     match sched::spawn_raw("thread", PROGRAM_STACK_SIZE, linux_thread_entry, raw as usize) {
         Ok(id) => {
@@ -4293,6 +4316,7 @@ extern "C" fn linux_thread_entry(arg: usize) -> ! {
     IN_USER[slot].store(true, Ordering::Release);
     kprintln!("  thread      : {} (Linux) runs at {:#018x}", sched::current(), start.regs.rip);
     sched::set_current_tls(start.tls);
+    sched::set_current_gs(start.gs);
     sched::set_current_space(Some(root));
     // SAFETY: корень принадлежит живому процессу — ссылка на него у нас.
     unsafe { arch::activate_space(root) };
@@ -4510,6 +4534,8 @@ struct ForkStart {
     /// Регистры родителя в момент `fork`, с нулём в RAX.
     regs: arch::TrapFrame,
     tls: u64,
+    /// База `GS` родителя (`fork` её сохраняет).
+    gs: u64,
     /// `CLONE_CHILD_SETTID`: куда в памяти **ребёнка** записать его номер.
     set_tid: usize,
     /// `CLONE_CHILD_CLEARTID`.
@@ -4542,6 +4568,7 @@ pub fn spawn_linux_process(
         process: Arc::new(Mutex::new(program)),
         regs,
         tls,
+        gs: arch::user_gs(),
         set_tid,
         clear_tid,
         mask: LINUX_SIGMASK[slot].load(Ordering::Relaxed),
@@ -4602,6 +4629,7 @@ extern "C" fn linux_fork_entry(arg: usize) -> ! {
     IN_USER[slot].store(true, Ordering::Release);
     kprintln!("  user        : {} forked from #{ppid}, runs at {:#018x}", sched::current(), start.regs.rip);
     sched::set_current_tls(start.tls);
+    sched::set_current_gs(start.gs);
     sched::set_current_space(Some(root));
     // SAFETY: корень принадлежит живому процессу — ссылка на него в таблице.
     unsafe { arch::activate_space(root) };
@@ -4722,6 +4750,7 @@ pub fn exec(frame: &mut arch::TrapFrame, path: &str, args: &[&str], env: &[&str]
     drop(old_space);
 
     sched::set_current_tls(0);
+    sched::set_current_gs(0);
     set_stack(slot, layout.stack_top - MAIN_STACK_PAGES * PAGE_SIZE, layout.stack_top);
     LINUX_ALTSTACK[slot].0.store(0, Ordering::Relaxed);
     LINUX_ALTSTACK[slot].1.store(0, Ordering::Relaxed);
@@ -4801,6 +4830,33 @@ impl Program {
     /// От чьего имени исполняется программа.
     pub fn credentials(&self) -> Credentials {
         self.cred
+    }
+
+    /// Какой файл отображён по адресу `addr` (фаза 71j, журнал сбоев):
+    /// смещение в файле и длина файла — по длине библиотеку видно и без имени.
+    pub fn image_at(&self, addr: usize) -> Option<(u64, u64)> {
+        let region = self.mappings.iter().find(|region| region.base <= addr && addr < region.end())?;
+        match &region.source {
+            Source::Image(image) => Some(((addr - region.base) as u64 + image.offset, image.node.metadata().size)),
+            _ => None,
+        }
+    }
+
+    /// Что за область по адресу `addr` (журнал сбоев, фаза 71j).
+    pub fn describe_region(&self, addr: usize) -> alloc::string::String {
+        let Some(region) = self.mappings.iter().find(|region| region.base <= addr && addr < region.end()) else {
+            return alloc::string::String::from("no region");
+        };
+        let kind = match &region.source {
+            Source::Anonymous(_) => "anonymous",
+            Source::ThreadStack => "thread stack",
+            Source::Image(_) => "file (private)",
+            Source::Shared(_) => "shared",
+            Source::File(_) => "file",
+            _ => "other",
+        };
+        let present = arch::translate(self.space.root(), VirtAddr::new(addr & !(PAGE_SIZE - 1))).map(|(_, flags)| flags);
+        alloc::format!("{kind} {:#x}..{:#x}, page {present:?}", region.base, region.end())
     }
 
     pub fn linux_maps(&self) -> alloc::string::String {
@@ -5158,8 +5214,11 @@ pub fn owns(ptr: usize, len: usize) -> bool {
     // Вся полоса, куда стек может встать при любом сдвиге, — по той же причине,
     // по которой ниже названа вся область памяти по запросу.
     let in_stack = ptr >= STACK_LOWEST && end <= STACK_TOP;
+    // Выше [`MMAP_HIGH_END`] — до конца окна: свои адреса сюда не выдаются
+    // (запас), но `MAP_FIXED` программы Linux вправе сюда лечь — Wine кладёт
+    // образы DLL сверху вниз от найденного потолка (фаза 71j).
     let in_mmap = (ptr >= MMAP_BASE && end <= MMAP_BASE + MMAP_LOW_BYTES)
-        || (ptr >= MMAP_HIGH_BASE && end <= MMAP_HIGH_END);
+        || (ptr >= MMAP_HIGH_BASE && end <= WINDOW_BASE + (1 << 39));
     in_image || in_stack || in_mmap || in_low
 }
 

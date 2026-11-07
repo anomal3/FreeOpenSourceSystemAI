@@ -11035,6 +11035,67 @@ Wi-Fi, браузер с JPEG, время из сети (см. «Телефон:
 **Llama** (llama.cpp — порт C++/CMake уже начат, фаза 70d) и браузер **Servo**
 (кандидат — Zervo, см. «Записано на потом (Роман 04.11)»).
 
+Уточнение Романа 06.11 вечером: **Wine — только для ПК**, телефону не нужен.
+Порядок: сначала Wine до рабочих программ `.exe` (слой работает), потом
+**Servo**; **NetSurf убираем вообще** (и Chromium — заменить Servo). Подсказка
+для агента, который переносит систему на другой телефон, — `docs/PHONE_PORTING.md`.
+
+### Фаза 71j — Wine: Блокнот Windows в окне стола — **сделано 07.11.2026**
+
+Сценарий `wine` (`FOSSAI_TARGET_MIB=8192`, `install`, затем `wine`):
+`pkg install wine` → `run -b /opt/debian/bin/bash /opt/wine/bin/fossai-wine
+notepad` → префикс создаётся сам (wineboot, services, rundll32, winedevice,
+explorer `/desktop`), окно «Untitled - Notepad» с меню рисуется на столе через
+`winewayland` и сервер Wayland ядра (снимок `wine-notepad`), 4 мин 39 с.
+
+Пакет `wine-11.fpk` (`xtask thirdparty --only wine`, `xtask/src/wine.rs`):
+сборка WineHQ 11.0 для bookworm (в Debian 12 только Wine 8 без
+`winewayland`), только 64 бита, PE без отладки (737 → 249 МиБ), без
+`wine-preloader` и модулей под X11/звук/USB/камеры; библиотеки Debian по
+`DT_NEEDED` плюс FreeType и **fontconfig** (`dlopen`) со своим `fonts.conf`.
+Скрипт `bin/fossai-wine`: `--debug=КАНАЛЫ` (WINEDEBUG) и `--server-debug=N`
+(`wineserver -dN`) первыми словами. Пакет — на носитель установщика
+(`payload.rs`, `GAMES`), в RAM-диск не едет. Диск стенда для цепочки с Wine —
+8 ГиБ (на 4 ГиБ корень 806 МиБ мал).
+
+Что пришлось сделать в ядре, в порядке, как всплывало:
+- `arch_prctl(ARCH_SET_GS/GET_GS)` — база GS на задачу, переключается с
+  контекстом, наследуется `clone`/`fork`, `execve` её обнуляет (TEB Wine).
+- `readlink` особых узлов (`/proc`, `/proc/self`) — `EINVAL`, `lstat`
+  `/proc/self/exe` — ссылка (`realpath` glibc; wineserver искал `nls`).
+- Сокеты Unix с относительным именем — от текущего каталога (файл сокета
+  ложится там); `stat` живого слушателя — `S_IFSOCK`.
+- `fchdir`/`openat` от дескриптора каталога, пришедшего через `dup` или
+  `SCM_RIGHTS`, — путь по узлу (`DIR_PATHS`).
+- Ссылки посреди пути у `mkdir`/`rmdir`/`unlink`/`rename` (`fsops::place`):
+  Wine создаёт `C:\Program Files`, `C:\users\…` через `dosdevices/c:`.
+- Общая память файла — один объект на узел для всех процессов
+  (`SharedMem::for_file`; узел без номера — по самому объекту): `MAP_SHARED`
+  на запись, `MAP_SHARED` на чтение и **`MAP_PRIVATE`** файла, который кто-то
+  уже отобразил общим, — те же кадры (клиенты Wine так видят память сессии
+  wineserver; отступление от Linux: запись в такую частную страницу видна
+  всем — клиенты Wine туда не пишут). Сервер Wayland берёт пул `wl_shm` и из
+  обычного файла (`Handle::file_memory`): Wine 11 отдаёт буфер окна файлом
+  раздела, а не `memfd`.
+- `mmap` выше окна — `ENOMEM`; `MAP_FIXED` в последний ГиБ окна;
+  `MAP_FIXED_NOREPLACE` в окне проверяет занятость.
+- `st_rdev` у символьных устройств разный: Wine глушит весь свой отладочный
+  вывод, если stderr «совпал» с `/dev/null`.
+- Журнал для разбора: аргументы `execve` (+ `WINEDEBUG`); переход по нулевому
+  адресу — с адресом возврата (смещение и длина файла); отказ страницы — с
+  видом области (`describe_region`); неудачные `mmap` за окном и `readlink`
+  не-ссылок не печатаются.
+
+Хвосты (не мешают Блокноту): `wine-preloader` (статический PIE без метки ABI
+и `PT_INTERP`) ядро считает родной программой — выкинут из пакета;
+`create_desktop` у части процессов `INVALID_HANDLE`; `coml2.dll` c0000005;
+RpcSs/OLE не поднимается; ожидания `loader_section` по 60 с; Vulkan нет;
+`getxattr` → `EOPNOTSUPP`. Цепочка `chromium-window` → `wine` на одном диске:
+после удаления Chromium btrfs раздела состояния (2 ГиБ) не отдал место —
+`pkg: cannot write …winemenubuilder.exe`; отдельно `install` → `wine` — ок.
+Дальше по плану Романа: программы `.exe` побольше (проверка слоя), потом
+Servo; Proton/DXVK — позже, когда будет видеокарта.
+
 ## Телефон — на потом (Роман 06.11: «в TODO, концепцию показать хватает»)
 
 - **SMS:** приём и показ входящих (`+CMTI`/`AT+CMGR`, PDU), окно сообщений;

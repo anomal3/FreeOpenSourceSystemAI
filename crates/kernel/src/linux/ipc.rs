@@ -639,7 +639,19 @@ fn name_of(addr: usize, len: usize) -> Result<Vec<u8>, i64> {
         return Ok(path.to_vec());
     }
     let end = path.iter().position(|byte| *byte == 0).unwrap_or(path.len());
-    Ok(path[..end].to_vec())
+    let path = &path[..end];
+    // Относительное имя — от текущего каталога (фаза 71j): wineserver
+    // делает `chdir` в свой каталог и слушает `"socket"`, а клиент сначала
+    // проверяет `stat("socket")` — файл должен лечь туда, куда смотрит он.
+    if path.first().is_some_and(|byte| *byte != b'/') {
+        if let Ok(relative) = core::str::from_utf8(path) {
+            let mut joined = crate::user::with_current(|program| program.linux_cwd.clone()).unwrap_or_else(|| alloc::string::String::from("/"));
+            joined.push('/');
+            joined.push_str(relative);
+            return Ok(super::normalize(&joined).into_bytes());
+        }
+    }
+    Ok(path.to_vec())
 }
 
 /// Записать `sockaddr_un` с именем `name` (или пустым) в `addr`/`len`.
@@ -709,6 +721,12 @@ pub fn unlink_socket(linux: &str) -> bool {
     // Заодно — записи слушателей, которых уже нет.
     names.retain(|(name, live)| live.strong_count() > 0 && name.as_slice() != linux.as_bytes());
     listened
+}
+
+/// Слушает ли живой сокет этот путь — `stat` называет его файл сокетом
+/// (`S_IFSOCK`): клиент Wine проверяет это прежде `connect` (фаза 71j).
+pub fn is_listening(linux: &str) -> bool {
+    NAMES.lock().iter().any(|(name, live)| name.as_slice() == linux.as_bytes() && live.strong_count() > 0)
 }
 
 pub fn listen(fd: usize) -> i64 {

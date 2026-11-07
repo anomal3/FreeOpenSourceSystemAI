@@ -120,6 +120,9 @@ enum How {
     /// Java (JetBrains Runtime 25) из дистрибутива Rider для Linux — см.
     /// [`crate::java`].
     Java,
+    /// Wine 11 (WineHQ для bookworm) и библиотеки Debian, которые он грузит
+    /// (фаза 71j) — см. [`crate::wine`].
+    Wine,
     /// NetSurf (начато 03.11): браузер и десяток его библиотек одним архивом,
     /// каждая — своим `buildsystem`; поверхность окна и патчи — в
     /// `ports/netsurf`. См. [`crate::netsurf`].
@@ -191,7 +194,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 24] = [
+const PROJECTS: [Project; 25] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -674,6 +677,17 @@ const PROJECTS: [Project; 24] = [
         how: How::Java,
         installs: &[],
     },
+    // Wine (фаза 71j): пакеты WineHQ для bookworm и библиотеки Debian;
+    // адреса и хеши — в `crate::wine` (качает он сам), здесь — главный пакет.
+    Project {
+        name: "wine",
+        version: "11",
+        url: crate::wine::MAIN_URL,
+        sha256: crate::wine::MAIN_SHA256,
+        unpacked: "debian",
+        how: How::Wine,
+        installs: &[],
+    },
 ];
 
 /// Собрать чужие проекты под все указанные архитектуры: все или только
@@ -701,8 +715,20 @@ pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> 
             continue;
         }
         if project.how == How::Java {
+            // Java — из дистрибутива Rider (2,4 ГБ): только по имени или с
+            // `FOSSAI_WITH_RIDER=1` (Rider отложен, 06.11).
+            if only.is_empty() && !crate::rider::enabled() {
+                say!("java пропущена: Rider отложен (FOSSAI_WITH_RIDER=1 или --only java)");
+                continue;
+            }
             for &arch in arches {
                 crate::java::build(arch)?;
+            }
+            continue;
+        }
+        if project.how == How::Wine {
+            for &arch in arches {
+                crate::wine::build(arch)?;
             }
             continue;
         }
@@ -1037,7 +1063,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         }
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
-        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java => return Ok(()),
+        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java | How::Wine => return Ok(()),
         How::NetSurf => crate::netsurf::build(source, &work, arch)?,
         How::Doomgeneric => {
             let game = work.join("doomgeneric");

@@ -290,6 +290,34 @@ pub fn set_user_tls(base: u64) {
     unsafe { wrmsr(IA32_FS_BASE, base) };
 }
 
+/// `IA32_GS_BASE` — база `GS` третьего кольца. Ядро `GS` не адресует: заглушка
+/// входа `syscall` берёт стек через `swapgs` и тут же меняет базы обратно,
+/// так что всё время в ядре в этом MSR лежит база программы. Программы Linux
+/// ставят её `arch_prctl(ARCH_SET_GS)` — так Wine держит блок потока Windows
+/// (TEB, `gs:[0x30]`), фаза 71j.
+const IA32_GS_BASE: u32 = 0xC000_0101;
+
+/// Что записано в `IA32_GS_BASE` на каждом процессоре (как [`FS_BASE_NOW`]).
+static GS_BASE_NOW: [core::sync::atomic::AtomicU64; crate::smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// База `GS` программы, которая сейчас на этом процессоре.
+#[must_use]
+pub fn user_gs() -> u64 {
+    GS_BASE_NOW[crate::smp::cpu()].load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Поставить базу `GS` программы, если она отличается от нынешней.
+pub fn set_user_gs(base: u64) {
+    let cpu = crate::smp::cpu();
+    if GS_BASE_NOW[cpu].swap(base, core::sync::atomic::Ordering::Relaxed) == base {
+        return;
+    }
+    // SAFETY: в ядре (вне двух инструкций заглушки `syscall`, где прерывания
+    // запрещены) в `IA32_GS_BASE` лежит база программы — её и меняем.
+    unsafe { wrmsr(IA32_GS_BASE, base) };
+}
+
 unsafe fn wrmsr(msr: u32, value: u64) {
     // SAFETY: см. контракт функции.
     unsafe {
