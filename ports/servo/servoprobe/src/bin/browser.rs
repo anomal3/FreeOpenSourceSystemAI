@@ -198,7 +198,7 @@ impl WebViewDelegate for Delegate {
         println!("browser: title {title:?}");
         match title {
             Some(t) => self.window.set_title(&format!("OBSOS — {}", t.trim())),
-            None => self.window.set_title("OBSOS"),
+            None => self.window.set_title("OBSOS — Браузер"),
         }
     }
 
@@ -309,7 +309,7 @@ fn modifiers_of(mask: i32) -> Modifiers {
 fn main() {
     let t0 = Instant::now();
     println!("browser: start");
-    let Some(window) = Window::open("OBSOS", 1024, 700) else {
+    let Some(window) = Window::open("OBSOS — Браузер", 1024, 700) else {
         std::process::exit(1);
     };
     let context = SwglRenderingContext::new(PhysicalSize::new(window.width.get(), window.height.get()));

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """OBSOS browser icon — procedural (no deps): rounded tile with a violet→teal
-gradient, an open white ring ("O", gap upper-right) and an orange planet in the
+gradient, an open white ring ("O", gap upper-right), the Earth inside the ring
+(oceans, continents, lit from the Sun) and a small yellow Sun far away in the
 gap. Renders PNGs at several sizes with 4x4 supersampling.
 
 usage: obsos_icon.py <out_dir>
@@ -27,13 +28,47 @@ def hexc(h):
 TILE_A = hexc('#6a3cf0')   # violet, top-left
 TILE_B = hexc('#10b8a8')   # teal, bottom-right
 RING = hexc('#ffffff')
-PLANET_A = hexc('#ffd04a')
-PLANET_B = hexc('#ff5e3a')
+SUN_CORE = hexc('#fff6c8')
+SUN_EDGE = hexc('#ffc43a')
+OCEAN_LIT = hexc('#3a9cf0')
+OCEAN_DARK = hexc('#0a3f8f')
+LAND_LIT = hexc('#5cc65a')
+LAND_DARK = hexc('#1f6b32')
+ATMO = hexc('#9fd8ff')
 SHADOW = (0.08, 0.04, 0.25)
 
 GAP_FROM = -70.0   # degrees, screen coords (y down): gap from -70°…
 GAP_TO = 10.0      # …to +10° (upper right)
-PLANET_AT = -30.0
+SUN_AT = -30.0
+
+# Continents: ellipses in disc coords (-1..1): cx, cy, rx, ry, angle (deg).
+LAND = [
+    # North America
+    (-0.38, -0.36, 0.36, 0.22, -20),
+    (-0.58, -0.12, 0.14, 0.20, 10),
+    (-0.22, -0.05, 0.10, 0.16, 35),
+    # South America
+    (-0.10, 0.36, 0.20, 0.30, -18),
+    (-0.02, 0.68, 0.09, 0.16, -12),
+    # Greenland
+    (-0.02, -0.74, 0.14, 0.08, 0),
+    # Europe
+    (0.42, -0.48, 0.22, 0.10, 15),
+    # Africa
+    (0.52, -0.12, 0.26, 0.17, 0),
+    (0.54, 0.22, 0.20, 0.30, 10),
+]
+
+
+def in_land(u, v):
+    for cx, cy, rx, ry, ang in LAND:
+        a = math.radians(ang)
+        dx, dy = u - cx, v - cy
+        x = dx * math.cos(a) + dy * math.sin(a)
+        y = -dx * math.sin(a) + dy * math.cos(a)
+        if (x / rx) ** 2 + (y / ry) ** 2 <= 1.0:
+            return True
+    return False
 
 
 def sd_round_rect(x, y, cx, cy, hw, hh, r):
@@ -65,9 +100,16 @@ def render(size):
     px = bytearray()
     cx, cy = 0.5, 0.52
     ring_r, ring_t = 0.255, 0.092 if size >= 32 else 0.11
-    pr = 0.075 if size >= 32 else 0.09
-    pa = math.radians(PLANET_AT)
+    pr = 0.05 if size >= 32 else 0.075
+    pa = math.radians(SUN_AT)
     pcx, pcy = cx + ring_r * math.cos(pa), cy + ring_r * math.sin(pa)
+    # Earth inside the ring.
+    er = ring_r - ring_t / 2 - (0.022 if size >= 32 else 0.015)
+    # light comes from the Sun direction
+    lx, ly = math.cos(pa), math.sin(pa)
+    lz = 0.55
+    ln = math.sqrt(lx * lx + ly * ly + lz * lz)
+    lx, ly, lz = lx / ln, ly / ln, lz / ln
     for j in range(size):
         px.append(0)  # filter byte
         for i in range(size):
@@ -94,17 +136,33 @@ def render(size):
                     rd = ring_cover(x, y, cx, cy, ring_r, ring_t)
                     if rd < 0:
                         col = RING
-                    # planet glow + body
+                    # Earth: sphere shading, oceans and continents, atmosphere rim
+                    ed = math.hypot(x - cx, y - cy)
+                    if ed < er + 0.018 and ed >= er:
+                        a = (1.0 - (ed - er) / 0.018) * 0.55
+                        col = mix(col, ATMO, a)
+                    if ed < er:
+                        u, v = (x - cx) / er, (y - cy) / er
+                        z = math.sqrt(max(0.0, 1.0 - u * u - v * v))
+                        lam = max(0.0, u * lx + v * ly + z * lz)
+                        shade = 0.35 + 0.65 * lam
+                        if v < -0.86 or v > 0.9:
+                            base = mix((0.62, 0.70, 0.80), (1, 1, 1), shade)  # polar ice
+                        elif in_land(u, v):
+                            base = mix(LAND_DARK, LAND_LIT, shade)
+                        else:
+                            base = mix(OCEAN_DARK, OCEAN_LIT, shade)
+                        # atmosphere haze towards the limb
+                        base = mix(base, ATMO, (1.0 - z) ** 3 * 0.45)
+                        col = base
+                    # Sun far away: glow + small bright disc
                     pd = math.hypot(x - pcx, y - pcy) - pr
-                    if pd < 0.05:
-                        g = max(0.0, 1.0 - max(pd, 0.0) / 0.05) * 0.35
-                        col = mix(col, PLANET_A, g)
+                    if pd < 0.06:
+                        g = max(0.0, 1.0 - max(pd, 0.0) / 0.06) ** 2 * 0.6
+                        col = mix(col, SUN_EDGE, g)
                     if pd < 0:
-                        u = min(max(((x - pcx) + (y - pcy)) / (2 * pr) + 0.5, 0.0), 1.0)
-                        col = mix(PLANET_A, PLANET_B, u)
-                        # tiny specular
-                        if math.hypot(x - (pcx - pr * 0.35), y - (pcy - pr * 0.35)) < pr * 0.28:
-                            col = mix(col, (1, 1, 1), 0.55)
+                        k = min(1.0, math.hypot(x - pcx, y - pcy) / pr)
+                        col = mix(SUN_CORE, SUN_EDGE, k * k)
                     acc[0] += col[0]
                     acc[1] += col[1]
                     acc[2] += col[2]
