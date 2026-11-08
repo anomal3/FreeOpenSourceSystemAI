@@ -13,6 +13,7 @@ members = [
     "crates/clr-vm",
     "crates/disk",
     "crates/ext2",
+    "crates/filelocks",
     "crates/fdt",
     "crates/fpk",
     "crates/fuzz",

@@ -1141,6 +1141,10 @@ mod tests {
         assert_eq!(size_of::<user_abi::PollFd>(), 16);
         assert_eq!(fields_of("freeos_thread_info"), ["id", "stack_low", "stack_high"]);
         assert_eq!(size_of::<user_abi::ThreadInfo>(), 24);
+        // 08.11.2026: блокировки файлов.
+        assert_eq!(fields_of("freeos_file_lock"), ["kind", "pid", "start", "len"]);
+        assert_eq!(size_of::<user_abi::FileLock>(), 24);
+        assert_eq!(core::mem::offset_of!(user_abi::FileLock, start), 8);
         // Фаза 60: `sysconf` берёт отсюда память и число процессоров.
         assert_eq!(
             fields_of("freeos_sysinfo"),
@@ -1229,6 +1233,21 @@ mod tests {
             "FDCTL_NONBLOCK" => abi::FDCTL_NONBLOCK as i64,
             "FDCTL_FLAGS" => abi::FDCTL_FLAGS as i64,
             "FD_NONBLOCK" => abi::FD_NONBLOCK,
+            "SYS_FLOCK" => abi::SYS_FLOCK as i64,
+            "FLOCK_GETLK" => abi::FLOCK_GETLK as i64,
+            "FLOCK_SETLK" => abi::FLOCK_SETLK as i64,
+            "FLOCK_SETLKW" => abi::FLOCK_SETLKW as i64,
+            "FLOCK_OFD_GETLK" => abi::FLOCK_OFD_GETLK as i64,
+            "FLOCK_OFD_SETLK" => abi::FLOCK_OFD_SETLK as i64,
+            "FLOCK_OFD_SETLKW" => abi::FLOCK_OFD_SETLKW as i64,
+            "FLOCK_FILE" => abi::FLOCK_FILE as i64,
+            "FLOCK_SH" => abi::FLOCK_SH as i64,
+            "FLOCK_EX" => abi::FLOCK_EX as i64,
+            "FLOCK_NB" => abi::FLOCK_NB as i64,
+            "FLOCK_UN" => abi::FLOCK_UN as i64,
+            "FILE_LOCK_READ" => abi::FILE_LOCK_READ as i64,
+            "FILE_LOCK_WRITE" => abi::FILE_LOCK_WRITE as i64,
+            "FILE_LOCK_UNLOCK" => abi::FILE_LOCK_UNLOCK as i64,
             "SYS_SOUND" => abi::SYS_SOUND as i64,
             "SOUND_WRITE" => abi::SOUND_WRITE as i64,
             "SOUND_DRAIN" => abi::SOUND_DRAIN as i64,

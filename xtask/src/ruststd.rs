@@ -53,6 +53,9 @@ const LIKE_REDOX: &[(&str, &str, &str, &str)] = &[
     // Случайные байты для ring/rustls: как у Vita — getentropy() (у нас поверх
     // SYS_RANDOM); у Redox он читал бы /dev/urandom.
     ("getrandom", "0.2.17", "vita", "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"),
+    // Его же 0.4 — у Servo (uuid, rand): без ветки — compile_error «target is
+    // not supported». Хеш — crates.io API, 08.11.2026.
+    ("getrandom", "0.4.3", "vita", "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"),
     // `ring` (крипто rustls): SystemRandom включён по списку ОС — как у Vita.
     // C и ассемблер собирает наш набор (`CC_<цель>` = `<арх>-freeos-cc`).
     ("ring", "0.17.14", "vita", "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"),
@@ -227,12 +230,29 @@ fn prepare() -> Result<PathBuf> {
         if *name == "mio" {
             patch_mio(&dir)?;
         }
+        if *name == "getrandom" && version.starts_with("0.4") {
+            // libc у 0.4 — зависимость по списку ОС в Cargo.toml (next_to
+            // правит только .rs): без freeos там `libc` не найден.
+            replace(
+                &dir.join("Cargo.toml"),
+                "target_os = \"openbsd\", target_os = \"vita\",",
+                "target_os = \"openbsd\", target_os = \"vita\", target_os = \"freeos\",",
+            )?;
+        }
         if *name == "ring" {
             // Ассемблер ring (perlasm, ELF) — по списку ОС с ABI Linux; без
             // него на x86-64 нет `bn_mul_mont` и др. Наши объектники — ELF.
             replace(&dir.join("build.rs"), "const LINUX_ABI: &[&str] = &[", "const LINUX_ABI: &[&str] = &[\n    \"freeos\",")?;
         }
-        patches += &format!("{name} = {{ path = \"{}\" }}\n", slash(&dir));
+        // Две версии одного крейта (getrandom 0.2 и 0.4) — два ключа: второй
+        // под своим именем с `package`, иначе повтор ключа в TOML.
+        let key = format!("{name}-{}", version.replace('.', "-"));
+        let first = !LIKE_REDOX.iter().any(|(n, v, ..)| n == name && v < version);
+        if first {
+            patches += &format!("{name} = {{ path = \"{}\" }}\n", slash(&dir));
+        } else {
+            patches += &format!("{key} = {{ path = \"{}\", package = \"{name}\" }}\n", slash(&dir));
+        }
     }
     fs::write(src.join("patches.toml"), patches)?;
 

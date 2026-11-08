@@ -18,7 +18,7 @@
 //! том и разобранный inode — сотни байт, но выделяет их куча ядра, а не
 //! программа, и предела у неё нет.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
@@ -83,6 +83,19 @@ struct Open {
     /// была позиция. Без него журналы, дописываемые от запуска к запуску
     /// (`idea.log` Rider), писались с начала и затирали сами себя.
     append: AtomicBool,
+    /// Брал ли этот открытый файл блокировки OFD или `flock` (08.11.2026):
+    /// только тогда при его уничтожении есть что снимать в таблице блокировок.
+    ofd_locked: AtomicBool,
+}
+
+impl Drop for Open {
+    /// Закрыта последняя копия открытого файла — его блокировки OFD и `flock`
+    /// уходят вместе с ним.
+    fn drop(&mut self) {
+        if self.ofd_locked.load(Ordering::Relaxed) {
+            crate::fs::locks::release(crate::fs::locks::Owner::Open(self as *const Open as usize));
+        }
+    }
 }
 
 /// Что лежит в месте таблицы.
@@ -178,7 +191,7 @@ impl Handle {
     /// (`SCM_RIGHTS`; раскладка клавиатуры Wayland, фаза 71i).
     #[must_use]
     pub fn of_node(node: Arc<dyn Node>, writable: bool) -> Self {
-        Self(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None, append: AtomicBool::new(false) })))
+        Self(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None, append: AtomicBool::new(false), ofd_locked: AtomicBool::new(false) })))
     }
 }
 
@@ -295,6 +308,34 @@ pub struct Table {
     linux: bool,
     /// `FD_CLOEXEC` по номеру дескриптора: закрыть при `execve`.
     cloexec: BTreeSet<usize>,
+    /// Владелец POSIX-блокировок этого процесса (08.11.2026): номер таблицы,
+    /// выданный при первой блокировке; ноль — блокировок не брали, снимать
+    /// при `close` нечего. Таблица одна на процесс (потоки делят её), `fork`
+    /// даёт новую, `execve` — та же: ровно жизнь владельца POSIX.
+    lock_owner: usize,
+}
+
+/// Номера владельцев POSIX-блокировок; ноль не выдаётся.
+static NEXT_LOCK_OWNER: AtomicUsize = AtomicUsize::new(1);
+
+/// Чья блокировка (`SYS_FLOCK`, `fcntl` слоя Linux).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LockScope {
+    /// `F_SETLK` POSIX — процесс.
+    Process,
+    /// `F_OFD_SETLK` — открытый файл.
+    Open,
+    /// `flock(2)` — открытый файл, весь файл, своё пространство.
+    Flock,
+}
+
+impl Drop for Table {
+    /// Процесс ушёл — его POSIX-блокировки тоже.
+    fn drop(&mut self) {
+        if self.lock_owner != 0 {
+            crate::fs::locks::release(crate::fs::locks::Owner::Process(self.lock_owner));
+        }
+    }
 }
 
 /// Сколько дескрипторов у программы Linux (фаза 71h): Chromium держит их
@@ -314,7 +355,7 @@ static EMPTY: Option<Slot> = None;
 impl Table {
     #[must_use]
     pub const fn new() -> Self {
-        Self { slots: alloc::vec::Vec::new(), std: [const { None }; FD_FIRST], linux: false, cloexec: BTreeSet::new() }
+        Self { slots: alloc::vec::Vec::new(), std: [const { None }; FD_FIRST], linux: false, cloexec: BTreeSet::new(), lock_owner: 0 }
     }
 
     /// Таблица программы Linux: номера 0–2 заняты стандартными потоками и
@@ -326,6 +367,7 @@ impl Table {
             std: [Some(Slot::Std(0)), Some(Slot::Std(1)), Some(Slot::Std(2))],
             linux: true,
             cloexec: BTreeSet::new(),
+            lock_owner: 0,
         }
     }
 
@@ -339,6 +381,8 @@ impl Table {
             std: core::array::from_fn(|index| copy(&self.std[index])),
             linux: self.linux,
             cloexec: self.cloexec.clone(),
+            // POSIX-блокировки ребёнку не наследуются: у него свой владелец.
+            lock_owner: 0,
         }
     }
 
@@ -378,10 +422,70 @@ impl Table {
 
     /// Положить в свободное место `fd`; `FD_CLOEXEC` у нового — снят.
     fn put(&mut self, fd: usize, slot: Slot) {
-        if let Ok(cell) = self.cell_mut(fd) {
-            *cell = Some(slot);
+        let old = match self.cell_mut(fd) {
+            Ok(cell) => cell.replace(slot),
+            Err(_) => None,
+        };
+        // `dup2` поверх открытого — это его закрытие (блокировки POSIX).
+        if let Some(old) = old {
+            self.release_posix(&old);
         }
         self.set_cloexec(fd, false);
+    }
+
+    /// Закрыт дескриптор файла: POSIX снимает **все** блокировки процесса на
+    /// этом файле, через какой бы дескриптор их ни брали.
+    fn release_posix(&self, slot: &Slot) {
+        if self.lock_owner == 0 {
+            return;
+        }
+        if let Slot::File(open) = slot {
+            if let Some(key) = open.node.file_id() {
+                crate::fs::locks::release_file(key, crate::fs::locks::Owner::Process(self.lock_owner));
+            }
+        }
+    }
+
+    /// Блокировка (08.11.2026): `query` — `GETLK` (ответ — мешающая
+    /// блокировка или `None`), иначе взять/снять (`kind == None`); ответ
+    /// `Some` — занято, и вот кем. Не ждёт: ждёт вызывающий, вне замка
+    /// программы. `pid` — что ответить чужому `GETLK` о блокировке процесса.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lock(
+        &mut self,
+        fd: usize,
+        scope: LockScope,
+        query: bool,
+        kind: Option<crate::fs::locks::Kind>,
+        start: u64,
+        end: u64,
+        pid: i32,
+    ) -> Result<Option<crate::fs::locks::Lock>, FileError> {
+        use crate::fs::locks::{self, Kind, Owner, Space};
+        let open = match self.cell(fd)?.as_ref() {
+            Some(Slot::File(open)) => Arc::clone(open),
+            Some(_) => return Err(FileError::Vfs(VfsError::WrongKind)),
+            None => return Err(FileError::BadFd),
+        };
+        // Файловая система без номеров (FAT, initrd) — ключа нет.
+        let key = open.node.file_id().ok_or(FileError::Vfs(VfsError::Unsupported))?;
+        let (owner, space, pid) = match scope {
+            LockScope::Process => {
+                if self.lock_owner == 0 {
+                    self.lock_owner = NEXT_LOCK_OWNER.fetch_add(1, Ordering::Relaxed);
+                }
+                (Owner::Process(self.lock_owner), Space::Record, pid)
+            }
+            LockScope::Open | LockScope::Flock => {
+                open.ofd_locked.store(true, Ordering::Relaxed);
+                let space = if scope == LockScope::Flock { Space::Flock } else { Space::Record };
+                (Owner::Open(Arc::as_ptr(&open) as usize), space, -1)
+            }
+        };
+        if query {
+            return Ok(locks::conflict(key, owner, space, kind.unwrap_or(Kind::Write), start, end));
+        }
+        Ok(locks::set(key, owner, space, kind, start, end, pid).err())
     }
 
     /// Наименьший свободный номер не меньше `min` (у Linux — считая 0–2).
@@ -531,6 +635,7 @@ impl Table {
             writable,
             entries,
             append: AtomicBool::new(false),
+            ofd_locked: AtomicBool::new(false),
         })));
         Ok(fd)
     }
@@ -542,7 +647,7 @@ impl Table {
         // Каталог в памяти (`/proc`, фаза 71h) — со снимком имён, как у
         // открытого с диска.
         let entries = if node.metadata().kind == NodeKind::Directory { node.list().ok() } else { None };
-        self.put(fd, Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries, append: AtomicBool::new(false) })));
+        self.put(fd, Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries, append: AtomicBool::new(false), ofd_locked: AtomicBool::new(false) })));
         Ok(fd)
     }
 
@@ -572,6 +677,7 @@ impl Table {
             writable: true,
             entries: None,
             append: AtomicBool::new(false),
+            ofd_locked: AtomicBool::new(false),
         })));
         Ok(fd)
     }
@@ -732,7 +838,10 @@ impl Table {
         let taken = self.cell_mut(fd)?.take();
         self.set_cloexec(fd, false);
         match taken {
-            Some(_) => Ok(()),
+            Some(slot) => {
+                self.release_posix(&slot);
+                Ok(())
+            }
             None => Err(FileError::BadFd),
         }
     }

@@ -206,6 +206,8 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_SOCKFD => sockfd(a0, a1),
         user_abi::SYS_SOCKCTL => sockctl(a0, a1, a2),
         user_abi::SYS_FDCTL => fdctl(a0, a1, a2),
+        // 08.11.2026: блокировки файлов (fcntl F_*LK, flock).
+        user_abi::SYS_FLOCK => flock(a0, a1, a2),
         user_abi::SYS_SOUND => sound(a0, a1, a2),
         // Фаза 68o: вход по SSH в живую систему и команды ядра по сети.
         user_abi::SYS_LIVE_KEYS => live_keys(a0, a1),
@@ -2713,6 +2715,96 @@ fn fdctl(fd: usize, op: usize, arg: usize) -> i64 {
         Some(Ok(answer)) => answer,
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `SYS_FLOCK` (08.11.2026): блокировки файлов — см. договор.
+///
+/// `FileLock` читается до замка программы, ответ `GETLK` пишется после: память
+/// программы под её замком трогать нельзя (подгрузка страницы берёт тот же
+/// замок). Ждущие (`SETLKW`, `flock` без `NB`) спят на `io_events` и
+/// перепроверяют таблицу — её будит каждое снятие.
+fn flock(fd: usize, op: usize, arg: usize) -> i64 {
+    use super::files::LockScope;
+    use crate::fs::locks::{Kind, EOF};
+    let kind_of = |k: u32| match k {
+        user_abi::FILE_LOCK_READ => Ok(Some(Kind::Read)),
+        user_abi::FILE_LOCK_WRITE => Ok(Some(Kind::Write)),
+        user_abi::FILE_LOCK_UNLOCK => Ok(None),
+        _ => Err(ERR_UNSUPPORTED),
+    };
+    let (scope, query, wait, kind, start, end) = match op {
+        user_abi::FLOCK_FILE => {
+            let kind = match arg & !user_abi::FLOCK_NB {
+                user_abi::FLOCK_SH => Some(Kind::Read),
+                user_abi::FLOCK_EX => Some(Kind::Write),
+                user_abi::FLOCK_UN => None,
+                _ => return ERR_UNSUPPORTED,
+            };
+            (LockScope::Flock, false, arg & user_abi::FLOCK_NB == 0 && kind.is_some(), kind, 0, EOF)
+        }
+        user_abi::FLOCK_GETLK..=user_abi::FLOCK_OFD_SETLKW => {
+            if arg % align_of::<user_abi::FileLock>() != 0
+                || !space::user_can(arg, size_of::<user_abi::FileLock>(), PageFlags::WRITE)
+            {
+                return ERR_BAD_ADDRESS;
+            }
+            // SAFETY: адрес проверен на выравнивание и на запись (значит, и чтение).
+            let req = unsafe { core::ptr::read(arg as *const user_abi::FileLock) };
+            let kind = match kind_of(req.kind) {
+                Ok(kind) => kind,
+                Err(code) => return code,
+            };
+            let Some((start, end)) = filelocks::range(req.start, req.len) else {
+                return ERR_UNSUPPORTED;
+            };
+            let ofd = op >= user_abi::FLOCK_OFD_GETLK;
+            let scope = if ofd { LockScope::Open } else { LockScope::Process };
+            let query = matches!(op, user_abi::FLOCK_GETLK | user_abi::FLOCK_OFD_GETLK);
+            if query && kind.is_none() {
+                return ERR_UNSUPPORTED;
+            }
+            let wait = matches!(op, user_abi::FLOCK_SETLKW | user_abi::FLOCK_OFD_SETLKW) && kind.is_some();
+            (scope, query, wait, kind, start, end)
+        }
+        _ => return ERR_UNSUPPORTED,
+    };
+    loop {
+        let seen = crate::io_events::generation();
+        let result = super::with_current(|program| {
+            let pid = program.linux_pid as i32;
+            program.files.lock(fd, scope, query, kind, start, end, pid)
+        });
+        let busy = match result {
+            None => return ERR_NO_PROGRAM,
+            Some(Err(err)) => return errno(err),
+            Some(Ok(busy)) => busy,
+        };
+        if query {
+            let (start, len) = busy.map_or((start, 0), |l| filelocks::to_len(l.start, l.end));
+            let answer = match busy {
+                None => user_abi::FileLock { kind: user_abi::FILE_LOCK_UNLOCK, pid: 0, start, len },
+                Some(l) => user_abi::FileLock {
+                    kind: if l.kind == Kind::Write { user_abi::FILE_LOCK_WRITE } else { user_abi::FILE_LOCK_READ },
+                    pid: l.pid,
+                    start,
+                    len,
+                },
+            };
+            if !space::user_can(arg, size_of::<user_abi::FileLock>(), PageFlags::WRITE) {
+                return ERR_BAD_ADDRESS;
+            }
+            // SAFETY: проверено строкой выше (и выравнивание — до замка).
+            unsafe { core::ptr::write(arg as *mut user_abi::FileLock, answer) };
+            return 0;
+        }
+        if busy.is_none() {
+            return 0;
+        }
+        if !wait || super::kill_pending() {
+            return ERR_AGAIN;
+        }
+        crate::io_events::wait(seen, Some(crate::time::uptime_ms() + PIPE_SLICE_MS));
     }
 }
 

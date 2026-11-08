@@ -22,6 +22,8 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 zstd = { version = "0.13", default-features = false }
+# flock/fcntl напрямую — проверка блокировок ядра (SYS_FLOCK).
+libc = "0.2"
 
 [profile.release]
 panic = "abort"

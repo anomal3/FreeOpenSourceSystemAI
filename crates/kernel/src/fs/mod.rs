@@ -30,6 +30,8 @@
 pub mod btrfsfs;
 pub mod ext2fs;
 pub mod fat;
+// Блокировки файлов (08.11.2026): fcntl F_*LK и flock для всех программ.
+pub mod locks;
 
 pub use btrfsfs::BtrfsFs;
 pub use ext2fs::Ext2Fs;

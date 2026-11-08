@@ -1,0 +1,26 @@
+[package]
+name = "servoprobe"
+version = "0.1.0"
+edition = "2021"
+description = "N5/N6: Servo 0.8 на FreeOS — сначала просто собрать движок (cargo check/build), потом — страница без окна"
+publish = false
+
+# Отдельный workspace: собирается в контейнере fossai-builder
+# (ports/servo/builder/build-servoprobe.sh <арх>) целью <арх>-unknown-freeos.
+[workspace]
+
+[dependencies]
+# Без default-features: без js_jit, multiprocess (gaol, песочница), clipboard,
+# devtools; без media-gstreamer, webxr, webgpu, webgl, bluetooth (ROADMAP N4).
+servo = { version = "=0.8.0", default-features = false }
+# Нет fork — каналы между «процессами» Servo только внутри процесса.
+ipc-channel = { version = "0.23", features = ["force-inprocess"] }
+# У servo-fonts freetype-sys закрыт cfg по ОС, а webrender тянет его и так:
+# FreeType и libpng — из исходников крейта.
+freetype-sys = { version = "0.23", features = ["bundled"] }
+
+[profile.release]
+panic = "abort"
+debug = false
+codegen-units = 16
+strip = true

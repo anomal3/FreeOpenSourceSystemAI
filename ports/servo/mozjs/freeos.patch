@@ -1,3 +1,26 @@
+diff --git a/build.rs b/build.rs
+index af9176a..67d8b57 100644
+--- a/build.rs
++++ b/build.rs
+@@ -489,7 +489,7 @@ fn link_static_lib_binaries(build_dir: &Path) {
+     }
+     if let Some(cxxstdlib) = env::var("CXXSTDLIB").ok() {
+         println!("cargo:rustc-link-lib={cxxstdlib}");
+-    } else if target.contains("apple") || target.contains("freebsd") || target.contains("ohos") {
++    } else if target.contains("apple") || target.contains("freebsd") || target.contains("freeos") || target.contains("ohos") {
+         println!("cargo:rustc-link-lib=c++");
+     } else if target.contains("windows") && target.contains("gnu") {
+         println!("cargo:rustc-link-lib=stdc++");
+@@ -619,7 +619,8 @@ fn get_common_cc(build_dir: &Path, target: BuildTarget) -> cc::Build {
+ 
+     if get_cc_rs_env_os("CXXSTDLIB").is_none() {
+         let is_apple = target_triple.contains("apple");
+-        let is_freebsd = target_triple.contains("freebsd");
++        // FreeOS: libc++, как у FreeBSD.
++        let is_freebsd = target_triple.contains("freebsd") || target_triple.contains("freeos");
+         let is_ohos = target_triple.contains("ohos");
+         if is_apple || is_freebsd || is_ohos {
+             builder.cpp_set_stdlib("c++");
 diff --git a/mozjs/build/autoconf/config.sub b/mozjs/build/autoconf/config.sub
 index 4aaae46..acf3a31 100755
 --- a/mozjs/build/autoconf/config.sub

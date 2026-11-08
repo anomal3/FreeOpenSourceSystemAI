@@ -7018,6 +7018,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await("depsprobe: ok aws-lc aes-256-gcm", 30_000),
             Step::Await("depsprobe: ok aws-lc ecdsa p-256", 30_000),
             Step::Await("depsprobe: ok rustls + aws-lc handshake", 60_000),
+            // Блокировки файлов ядра (SYS_FLOCK, 08.11.2026).
+            Step::Await("depsprobe: ok locks: flock between two opens", 30_000),
+            Step::Await("depsprobe: ok locks: fcntl F_SETLK/F_GETLK", 30_000),
             Step::Await("depsprobe: ok sqlite in memory", 60_000),
             Step::Await("depsprobe: ok sqlite file database", 120_000),
             Step::Await("depsprobe: done, 0 check(s) failed", 30_000),

@@ -1597,6 +1597,64 @@ pub const CALL_INCOMING: u8 = 4;
 /// Модема нет или он не готов.
 pub const CALL_NO_MODEM: u8 = 0xFF;
 
+/// Блокировки файлов (08.11.2026): `(дескриптор, действие, аргумент) -> 0`.
+///
+/// Рекомендательные, одна таблица ядра на всю систему, общая со слоем Linux;
+/// читать и писать файл они не мешают. Ключ — сам файл (том и номер inode), а
+/// не имя. У файловой системы без номеров (FAT, initrd) —
+/// [`ERR_UNSUPPORTED`].
+///
+/// * [`FLOCK_GETLK`], [`FLOCK_SETLK`], [`FLOCK_SETLKW`] — `fcntl` POSIX:
+///   аргумент — адрес [`FileLock`] (начало уже от начала файла), владелец —
+///   процесс: свои блокировки ему не мешают, режутся и склеиваются по
+///   диапазону и снимаются, когда процесс закрывает **любой** свой
+///   дескриптор этого файла, и при выходе.
+/// * `FLOCK_OFD_*` — то же, но владелец — открытый файл (все копии `dup`),
+///   снимаются с закрытием последней копии; с POSIX конфликтуют.
+/// * [`FLOCK_FILE`] — `flock(2)`: аргумент — биты [`FLOCK_SH`]/[`FLOCK_EX`]/
+///   [`FLOCK_UN`] и [`FLOCK_NB`]; весь файл, владелец — открытый файл,
+///   с блокировками `fcntl` не пересекается.
+///
+/// Занято — [`ERR_AGAIN`]; `SETLKW` и `flock` без `NB` ждут (вне замка
+/// программы). `GETLK` пишет в [`FileLock`] мешающую блокировку или
+/// [`FILE_LOCK_UNLOCK`], если мешать нечему.
+pub const SYS_FLOCK: usize = 88;
+pub const FLOCK_GETLK: usize = 1;
+pub const FLOCK_SETLK: usize = 2;
+pub const FLOCK_SETLKW: usize = 3;
+pub const FLOCK_OFD_GETLK: usize = 4;
+pub const FLOCK_OFD_SETLK: usize = 5;
+pub const FLOCK_OFD_SETLKW: usize = 6;
+pub const FLOCK_FILE: usize = 7;
+/// [`FLOCK_FILE`]: разделяемая.
+pub const FLOCK_SH: usize = 1;
+/// [`FLOCK_FILE`]: исключительная.
+pub const FLOCK_EX: usize = 2;
+/// [`FLOCK_FILE`]: не ждать.
+pub const FLOCK_NB: usize = 4;
+/// [`FLOCK_FILE`]: снять.
+pub const FLOCK_UN: usize = 8;
+/// [`FileLock::kind`]: читающая (разделяемая).
+pub const FILE_LOCK_READ: u32 = 0;
+/// [`FileLock::kind`]: пишущая (исключительная).
+pub const FILE_LOCK_WRITE: u32 = 1;
+/// [`FileLock::kind`]: снять; в ответе `GETLK` — «мешать нечему».
+pub const FILE_LOCK_UNLOCK: u32 = 2;
+
+/// Блокировка [`SYS_FLOCK`] (`struct freeos_file_lock`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileLock {
+    /// `FILE_LOCK_*`.
+    pub kind: u32,
+    /// Ответ `GETLK`: номер процесса-владельца; у OFD и `flock` — `-1`.
+    pub pid: i32,
+    /// Начало — от начала файла.
+    pub start: u64,
+    /// Длина; ноль — до конца файла (и дальше).
+    pub len: u64,
+}
+
 /// Размер буфера вывода [`SYS_KERNEL_COMMAND`].
 pub const KERNEL_COMMAND_OUT: usize = 64 * 1024;
 
@@ -2615,6 +2673,10 @@ mod tests {
         assert_eq!((FDCTL_NONBLOCK, FDCTL_FLAGS, FD_NONBLOCK), (1, 2, 1));
         assert_eq!(SYS_SOUND, 82);
         assert_eq!(SYS_SETCLOCK, 86);
+        assert_eq!(SYS_FLOCK, 88);
+        assert_eq!((FLOCK_GETLK, FLOCK_SETLK, FLOCK_SETLKW, FLOCK_FILE), (1, 2, 3, 7));
+        assert_eq!((FLOCK_SH, FLOCK_EX, FLOCK_NB, FLOCK_UN), (1, 2, 4, 8));
+        assert_eq!(core::mem::size_of::<FileLock>(), 24);
         assert_eq!((SOUND_WRITE, SOUND_DRAIN, SOUND_RATE, SOUND_CHANNELS), (1, 2, 48_000, 2));
         assert_eq!((PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC), (0, 1, 2, 4));
         assert_eq!((MAP_HUGE, MAP_LAZY, MAP_JIT), (1, 2, 4));
@@ -2651,7 +2713,7 @@ mod tests {
             SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_DEVICE_OPEN, SYS_DEVICE_MAP, SYS_DEVICE_WAIT,
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
-            SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK, SYS_MODEM,
+            SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK, SYS_MODEM, SYS_FLOCK,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(

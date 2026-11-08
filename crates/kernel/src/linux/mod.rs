@@ -248,6 +248,10 @@ mod e {
     pub const EIO: i64 = 5;
     pub const EBADF: i64 = 9;
     pub const EAGAIN: i64 = 11;
+    /// `flock(LOCK_NB)`: занято (то же число, что `EAGAIN`).
+    pub const EWOULDBLOCK: i64 = EAGAIN;
+    /// `fcntl` `F_*LK`: диапазон не помещается в 64 бита.
+    pub const EOVERFLOW: i64 = 75;
     pub const EOPNOTSUPP: i64 = 95;
     pub const ENOMEM: i64 = 12;
     pub const EACCES: i64 = 13;
@@ -425,7 +429,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
                 crate::fs::fsync_all();
                 0
             }
-            nr::FLOCK => 0,
+            nr::FLOCK => flock(a0, a1),
             nr::CHMOD => fsops::chmod(AT_FDCWD, a0, a1),
             nr::FCHMODAT => fsops::chmod(a0, a1, a2),
             nr::FCHMOD => fsops::fchmod(a0, a1),
@@ -1307,9 +1311,12 @@ unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
     const F_OFD_GETLK: usize = 36;
     const F_OFD_SETLK: usize = 37;
     const F_OFD_SETLKW: usize = 38;
-    const F_UNLCK: i16 = 2;
     const FD_CLOEXEC: usize = 1;
     const O_NONBLOCK: usize = 0o4000;
+    if matches!(cmd, F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW) {
+        // SAFETY: адрес `struct flock` проверяет сам `fcntl_lock`.
+        return unsafe { fcntl_lock(fd, cmd, arg) };
+    }
     let result = crate::user::with_current(|program| {
         let files = &mut program.files;
         match cmd {
@@ -1338,15 +1345,9 @@ unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
             // никто не нарушает, ничего не стоит не проверять.
             F_ADD_SEALS => files.cloexec(fd).map(|_| 0),
             F_GET_SEALS => files.cloexec(fd).map(|_| 0),
-            // Блокировки записей (фаза 71i: LevelDB и SQLite профиля
-            // Chromium): между процессами одного пользователя спорить не о
-            // чем — всякая блокировка удаётся, а спросившему отвечают
-            // «свободно».
-            F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => files.cloexec(fd).map(|_| 0),
-            // Ответ пишется в память программы ниже, уже без замка: подгрузка
-            // страницы в `user_can` берёт тот же замок программы, и поток
-            // ждал сам себя (Chromium, «Restore pages» через SQLite).
-            F_GETLK | F_OFD_GETLK => files.cloexec(fd).map(|_| 0),
+            // Блокировки записей — ниже, в `fcntl_lock` (08.11.2026: до этого
+            // всякая удавалась, и два процесса писали одну базу SQLite).
+            F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => Ok(0),
             F_SETFL => {
                 files.cloexec(fd)?;
                 files.set_nonblock(fd, arg & O_NONBLOCK != 0)?;
@@ -1357,18 +1358,153 @@ unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
         }
     });
     match result {
-        Some(Ok(_)) if matches!(cmd, F_GETLK | F_OFD_GETLK) => {
-            // `struct flock`: первое поле — `l_type`.
-            if !space::user_can(arg, 2, PageFlags::WRITE) {
-                return -e::EFAULT;
-            }
-            // SAFETY: проверено строкой выше.
-            unsafe { core::ptr::write_unaligned(arg as *mut i16, F_UNLCK) };
-            0
-        }
         Some(Ok(answer)) => answer,
         Some(Err(err)) => file_errno(err),
         None => -e::ESRCH,
+    }
+}
+
+/// `fcntl` `F_GETLK`/`F_SETLK`/`F_SETLKW` и `F_OFD_*` (08.11.2026): та же
+/// таблица ядра, что у родных программ (`crate::fs::locks`).
+///
+/// `struct flock` (x86-64 и AArch64 одинаково, 32 байта): `i16 l_type`
+/// (`F_RDLCK` 0, `F_WRLCK` 1, `F_UNLCK` 2), `i16 l_whence`, `i64 l_start` (8),
+/// `i64 l_len` (16), `i32 l_pid` (24). Память программы читается до её замка и
+/// пишется после: подгрузка страницы в `user_can` берёт тот же замок, и поток
+/// ждал бы сам себя (Chromium, «Restore pages» через SQLite). Ждущий `SETLKW`
+/// спит на `io_events` и прерывается сигналом (`EINTR`).
+unsafe fn fcntl_lock(fd: usize, cmd: usize, arg: usize) -> i64 {
+    use crate::fs::locks::{Kind, EOF};
+    use crate::user::files::{LockScope, Whence};
+    const F_GETLK: usize = 5;
+    const F_SETLKW: usize = 7;
+    const F_OFD_GETLK: usize = 36;
+    const F_OFD_SETLKW: usize = 38;
+    if !space::user_can(arg, 32, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    let at = arg as *const u8;
+    // SAFETY: 32 байта по `arg` проверены строкой выше.
+    let (l_type, whence, l_start, l_len, l_pid) = unsafe {
+        (
+            core::ptr::read_unaligned(at as *const i16),
+            core::ptr::read_unaligned(at.add(2) as *const i16),
+            core::ptr::read_unaligned(at.add(8) as *const i64),
+            core::ptr::read_unaligned(at.add(16) as *const i64),
+            core::ptr::read_unaligned(at.add(24) as *const i32),
+        )
+    };
+    let ofd = cmd >= F_OFD_GETLK;
+    if ofd && l_pid != 0 {
+        return -e::EINVAL;
+    }
+    let kind = match l_type {
+        0 => Some(Kind::Read),
+        1 => Some(Kind::Write),
+        2 => None,
+        _ => return -e::EINVAL,
+    };
+    let query = cmd == F_GETLK || cmd == F_OFD_GETLK;
+    if query && kind.is_none() {
+        return -e::EINVAL;
+    }
+    let wait = (cmd == F_SETLKW || cmd == F_OFD_SETLKW) && kind.is_some();
+    let scope = if ofd { LockScope::Open } else { LockScope::Process };
+    loop {
+        let seen = crate::io_events::generation();
+        let result = crate::user::with_current(|program| {
+            let pid = program.linux_pid as i32;
+            let files = &mut program.files;
+            // Начало — от начала файла; длина < 0 — диапазон до `l_start`.
+            let base = match whence {
+                0 => 0i64,
+                1 => files.seek(fd, 0, Whence::Current)? as i64,
+                2 => files.describe(fd)?.size as i64,
+                _ => return Ok(Err(-e::EINVAL)),
+            };
+            let mut start = base.saturating_add(l_start);
+            let mut len = l_len;
+            if len < 0 {
+                start = start.saturating_add(len);
+                len = len.saturating_neg();
+            }
+            if start < 0 {
+                return Ok(Err(-e::EINVAL));
+            }
+            let Some((start, end)) = filelocks::range(start as u64, len as u64) else {
+                return Ok(Err(-e::EOVERFLOW));
+            };
+            files.lock(fd, scope, query, kind, start, end, pid).map(|busy| Ok((busy, start, end)))
+        });
+        let (busy, start, end) = match result {
+            None => return -e::ESRCH,
+            Some(Err(err)) => return file_errno(err),
+            Some(Ok(Err(code))) => return code,
+            Some(Ok(Ok(answer))) => answer,
+        };
+        if query {
+            let (l_type, l_start, l_len, l_pid) = match busy {
+                None => (2i16, start, if end == EOF { 0 } else { end - start }, 0i32),
+                Some(l) => {
+                    let (s, n) = filelocks::to_len(l.start, l.end);
+                    (if l.kind == Kind::Write { 1 } else { 0 }, s, n, l.pid)
+                }
+            };
+            if !space::user_can(arg, 32, PageFlags::WRITE) {
+                return -e::EFAULT;
+            }
+            let out = arg as *mut u8;
+            // SAFETY: проверено строкой выше.
+            unsafe {
+                core::ptr::write_unaligned(out as *mut i16, l_type);
+                core::ptr::write_unaligned(out.add(2) as *mut i16, 0);
+                core::ptr::write_unaligned(out.add(8) as *mut i64, l_start as i64);
+                core::ptr::write_unaligned(out.add(16) as *mut i64, l_len as i64);
+                core::ptr::write_unaligned(out.add(24) as *mut i32, l_pid);
+            }
+            return 0;
+        }
+        if busy.is_none() {
+            return 0;
+        }
+        if !wait {
+            return -e::EAGAIN;
+        }
+        if signal::pending() {
+            return -e::EINTR;
+        }
+        crate::io_events::wait(seen, Some(crate::time::uptime_ms() + 250));
+    }
+}
+
+/// `flock(2)` (08.11.2026): весь файл, владелец — открытый файл, своё
+/// пространство (с `fcntl` не пересекается). `LOCK_SH` 1, `LOCK_EX` 2,
+/// `LOCK_NB` 4, `LOCK_UN` 8.
+fn flock(fd: usize, operation: usize) -> i64 {
+    use crate::fs::locks::{Kind, EOF};
+    use crate::user::files::LockScope;
+    let kind = match operation & !4 {
+        1 => Some(Kind::Read),
+        2 => Some(Kind::Write),
+        8 => None,
+        _ => return -e::EINVAL,
+    };
+    let wait = operation & 4 == 0 && kind.is_some();
+    loop {
+        let seen = crate::io_events::generation();
+        let result =
+            crate::user::with_current(|program| program.files.lock(fd, LockScope::Flock, false, kind, 0, EOF, -1));
+        match result {
+            None => return -e::ESRCH,
+            Some(Err(err)) => return file_errno(err),
+            Some(Ok(None)) => return 0,
+            Some(Ok(Some(_))) if !wait => return -e::EWOULDBLOCK,
+            Some(Ok(Some(_))) => {}
+        }
+        if signal::pending() {
+            return -e::EINTR;
+        }
+        crate::io_events::wait(seen, Some(crate::time::uptime_ms() + 250));
     }
 }
 

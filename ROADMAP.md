@@ -11304,20 +11304,34 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   patch-crates.sh`): на «прочих» ОС он читает `/dev/urandom`, а у родных
   программ `/dev` нет (он только в слое Linux) — freeos поставлен к ОС с
   `getentropy()` (FreeBSD/OpenBSD/macOS), как mozjs.
-  **SQLite в файле:** VFS по умолчанию («unix») берёт блокировки
-  `fcntl(F_SETLK)`, а у ядра их нет (ENOSYS) → `SQLITE_IOERR_LOCK` (3850).
-  Со встроенным VFS `unix-none` (без блокировок) база пишется и читается
-  заново. Профиль браузера — один процесс (Servo без multiprocess), так что
-  для Servo это годится: сделать `unix-none` VFS по умолчанию
-  (`-DSQLITE_EXTRA_INIT=…` + `sqlite3_vfs_register(find("unix-none"), 1)`)
-  или блокировки в ядре — решить при сборке servo-net/servo-storage.
+  **SQLite в файле и блокировки файлов (08.11):** VFS «unix» берёт
+  блокировки `fcntl(F_SETLK)`, а у ядра их не было (ENOSYS →
+  `SQLITE_IOERR_LOCK`, 3850; слой Linux на них молча соглашался — два
+  процесса Chromium могли писать одну базу). `unix-none` (без блокировок) был
+  только мостиком: два окна/запуска браузера на одном профиле испортили бы
+  базу. Сделаны **настоящие рекомендательные блокировки в ядре**: крейт
+  `crates/filelocks` (таблица диапазонов: слияние/разрезание, конфликты,
+  снятие; 7 тестов на хосте, в т.ч. последовательность SQLite двух
+  процессов), `kernel/src/fs/locks.rs` (одна таблица на систему, ключ —
+  `file_id()` тома и inode; FAT/initrd — «не поддерживается»), вызов
+  `SYS_FLOCK = 88` (`FLOCK_GETLK/SETLK/SETLKW/OFD_*/FILE`, `struct
+  freeos_file_lock`), владельцы: POSIX — процесс (номер у таблицы
+  дескрипторов; снимаются при `close` любого дескриптора файла, `dup2`
+  поверх и выходе), OFD и `flock` — открытый файл (снимаются с последней
+  копией). Ждущие (`SETLKW`, `flock` без `NB`) спят на `io_events` вне
+  замка программы. libc: `fcntl` `F_GETLK/F_SETLK/F_SETLKW` (`SEEK_CUR`/
+  `SEEK_END`/отрицательная длина считаются в libc), `flock()`. Слой Linux:
+  `fcntl` `F_*LK`/`F_OFD_*` и `flock` — та же таблица (`EINTR` по сигналу).
+  Проверка: `servo-deps` — `flock` двух открытий одного файла конфликтует,
+  `F_SETLK`/`F_GETLK` своего процесса не мешают себе, SQLite с VFS «unix» —
+  зелёный на x86_64 и aarch64; `chromium-window`, `cthreads`, `rust-std` —
+  зелёные.
   Пакет `servo` получил `permissions = windows files net` (без `net` даже
   `bind` на 127.0.0.1 — EACCES). **Итог — зелёный на x86_64 (14 с) и
   aarch64 (18 с)**: TLS 1.3 через петлю 160/92 мс, ECDSA P-256 48/18 мс,
   depsprobe 9,5/8,8 МБ; `servo-js`, `cthreads`, `rust-std` после правок libc
   — зелёные.
   **Осталось из N4:** JIT потом; HWCAP для aarch64 (AES/SHA в железе);
-  блокировки файлов (`fcntl`/`flock`) в ядре или `unix-none` по умолчанию;
   `/dev/urandom`/`/dev/null` для родных программ — подумать (чужой код ждёт
   их чаще, чем хотелось бы). Дальше — N5 (swgl) и сборка самого `servo`
   (`cargo check` с подменами: servo-fonts/fonts-traits + свой `font_list`,
@@ -11325,6 +11339,19 @@ WebRender на wgpu (не существует), softpipe (слишком мед
 - **N5 — swgl-рендер.** Сначала **на хосте Linux** (быстрые итерации): свой
   `RenderingContext` на `swgl::Context`, страница → PNG; `webgl` выкл.
   Затем то же под `*-unknown-freeos`.
+  **Сборка самого Servo — начато 08.11:** `ports/servo/servoprobe`
+  (`servo = "=0.8.0"` без фич, `ipc-channel` `force-inprocess`,
+  `freetype-sys` bundled) + `build-servoprobe.sh <арх> [check]` (Docker;
+  общее окружение C/C++ — `servo-env.sh`, mozjs — как у jsprobe). Ход
+  `cargo check` под freeos: 147 → 201 → 258 крейтов. Поправлено по дороге:
+  mozjs `build.rs` знает freeos (libc++ как у FreeBSD) — общий
+  `CXXSTDLIB=c++` ломал хостовый C++ (glslopt у webrender); `libc` freeos:
+  `siginfo_t` (signal-hook-registry), `mprotect/msync/madvise/MADV_*/
+  MAP_ANON` (memmap2), `malloc_usable_size` (servo-allocator);
+  `getrandom` 0.4.3 — ветка «как у Vita» (getentropy) + freeos в списке ОС
+  его `Cargo.toml` (две версии getrandom в `patches.toml` — второй ключ с
+  `package`). Дальше — по ошибкам check (ожидаются servo-fonts cfg + свой
+  `font_list`, gaol).
 - **N6 — Servo без окна на FreeOS.** Мини-программа: открыть страницу
   `httpd` стенда, снимок в PNG — сценарий `servo-headless`.
 - **N7 — окно и оболочка `browser` (своя, с нуля).** Окна — наш API

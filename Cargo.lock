@@ -503,6 +503,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "filelocks"
+version = "0.8.0"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -650,6 +654,7 @@ dependencies = [
  "ed25519-dalek",
  "ext2",
  "fdt",
+ "filelocks",
  "font8x8",
  "fpk",
  "linked_list_allocator",

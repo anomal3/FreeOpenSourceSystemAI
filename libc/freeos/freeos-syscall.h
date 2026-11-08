@@ -80,6 +80,8 @@
 #define SYS_FDCTL 81
 /* Звук (фаза 67f). */
 #define SYS_SOUND 82
+/* Блокировки файлов: fcntl F_GETLK/F_SETLK/F_SETLKW и flock (08.11.2026). */
+#define SYS_FLOCK 88
 
 /* ── Значения, которые эти вызовы принимают и возвращают ──────────────────── */
 
@@ -121,6 +123,25 @@
 #define FREEOS_FDCTL_NONBLOCK 1
 #define FREEOS_FDCTL_FLAGS 2
 #define FREEOS_FD_NONBLOCK 1
+
+/* Действия `SYS_FLOCK(fd, действие, аргумент)` (08.11.2026). У записей
+ * (`fcntl`) аргумент — адрес `struct freeos_file_lock` с уже посчитанным
+ * началом от начала файла; у `FLOCK_FILE` (`flock`) — биты `FLOCK_SH`… */
+#define FREEOS_FLOCK_GETLK 1
+#define FREEOS_FLOCK_SETLK 2
+#define FREEOS_FLOCK_SETLKW 3
+#define FREEOS_FLOCK_OFD_GETLK 4
+#define FREEOS_FLOCK_OFD_SETLK 5
+#define FREEOS_FLOCK_OFD_SETLKW 6
+#define FREEOS_FLOCK_FILE 7
+#define FREEOS_FLOCK_SH 1
+#define FREEOS_FLOCK_EX 2
+#define FREEOS_FLOCK_NB 4
+#define FREEOS_FLOCK_UN 8
+/* Вид блокировки в `struct freeos_file_lock`. */
+#define FREEOS_FILE_LOCK_READ 0
+#define FREEOS_FILE_LOCK_WRITE 1
+#define FREEOS_FILE_LOCK_UNLOCK 2
 
 /* Действия `SYS_SOUND` и его формат (фаза 67f). */
 #define FREEOS_SOUND_WRITE 1
@@ -270,6 +291,16 @@ struct freeos_thread_info {
     uint64_t id;
     uint64_t stack_low;
     uint64_t stack_high;
+};
+
+/* Раскладка `FileLock` — блокировка `SYS_FLOCK` (08.11.2026): вид
+ * (`FREEOS_FILE_LOCK_*`), номер процесса-владельца (ответ `GETLK`; у OFD — -1),
+ * начало от начала файла и длина (0 — до конца файла). */
+struct freeos_file_lock {
+    uint32_t kind;
+    int32_t pid;
+    uint64_t start;
+    uint64_t len;
 };
 
 /* Ответ `SYS_SYSINFO` (`user_abi::SysInfo`, 144 байта). libc берёт из него

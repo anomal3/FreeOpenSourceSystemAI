@@ -1,0 +1,13 @@
+[package]
+name = "filelocks"
+description = "Advisory file lock table for the kernel: POSIX record locks (fcntl F_SETLK/F_GETLK, per process), open-file-description locks (F_OFD_*) and BSD flock — byte ranges with split/merge, conflict queries, release on close/exit."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Без зависимостей: чистая логика над диапазонами, проверяется на хосте
+# (`cargo test -p filelocks`); ядро держит таблицу под своим замком.
+
+[lints]
+workspace = true

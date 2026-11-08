@@ -155,6 +155,20 @@ s! {
         pub sa_flags: c_int,
     }
 
+    // <signal.h> picolibc (N5, 08.11.2026): нужен signal-hook-registry
+    // (tokio/Servo). Сигналы ядро не доставляет — тип только для раскладки.
+    pub struct siginfo_t {
+        pub si_signo: c_int,
+        pub si_code: c_int,
+        pub si_errno: c_int,
+        pub si_pid: crate::pid_t,
+        pub si_uid: crate::uid_t,
+        pub si_addr: *mut c_void,
+        pub si_status: c_int,
+        pub si_band: c_long,
+        pub si_value: crate::sigval,
+    }
+
     pub struct stack_t {
         pub ss_sp: *mut c_void,
         pub ss_flags: c_int,
@@ -1478,3 +1492,37 @@ pub const _SC_XOPEN_STREAMS: c_int = 101;
 pub const _SC_XOPEN_UNIX: c_int = 102;
 pub const _SC_XOPEN_UUCP: c_int = 121;
 pub const _SC_XOPEN_VERSION: c_int = 103;
+
+// ── Память: mprotect/msync/madvise (N5, 08.11.2026) ─────────────────────────
+// Нужны memmap2 (Servo: шрифты, кеш). Функции — libc/freeos (posix.c,
+// syscalls.c), значения — libc/freeos/include/sys/mman.h.
+extern "C" {
+    pub fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int;
+    pub fn msync(addr: *mut c_void, len: size_t, flags: c_int) -> c_int;
+    pub fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int;
+    pub fn posix_madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int;
+    // picolibc <malloc.h>; servo-allocator (учёт памяти), как у Linux.
+    pub fn malloc_usable_size(ptr: *mut c_void) -> size_t;
+}
+pub const MAP_ANON: c_int = MAP_ANONYMOUS;
+pub const MADV_NORMAL: c_int = 0;
+pub const MADV_RANDOM: c_int = 1;
+pub const MADV_SEQUENTIAL: c_int = 2;
+pub const MADV_WILLNEED: c_int = 3;
+pub const MADV_DONTNEED: c_int = 4;
+pub const MADV_FREE: c_int = 8;
+pub const MADV_REMOVE: c_int = 9;
+pub const MADV_DONTFORK: c_int = 10;
+pub const MADV_DOFORK: c_int = 11;
+pub const MADV_MERGEABLE: c_int = 12;
+pub const MADV_UNMERGEABLE: c_int = 13;
+pub const MADV_HUGEPAGE: c_int = 14;
+pub const MADV_NOHUGEPAGE: c_int = 15;
+pub const MADV_DONTDUMP: c_int = 16;
+pub const MADV_DODUMP: c_int = 17;
+pub const MADV_WIPEONFORK: c_int = 18;
+pub const MADV_KEEPONFORK: c_int = 19;
+pub const MADV_COLD: c_int = 20;
+pub const MADV_PAGEOUT: c_int = 21;
+pub const MADV_POPULATE_READ: c_int = 22;
+pub const MADV_POPULATE_WRITE: c_int = 23;

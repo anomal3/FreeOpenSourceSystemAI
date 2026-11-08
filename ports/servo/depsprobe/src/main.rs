@@ -47,7 +47,11 @@ fn main() {
     zstd_check();
     awslc();
     tls();
-    sqlite(std::env::args().nth(1).map(PathBuf::from).as_deref());
+    let dir = std::env::args().nth(1).map(PathBuf::from);
+    if let Some(dir) = &dir {
+        locks(dir);
+    }
+    sqlite(dir.as_deref());
     let failed = FAILED.load(Ordering::SeqCst);
     println!("depsprobe: done, {failed} check(s) failed");
     std::process::exit(if failed == 0 { 0 } else { 1 });
@@ -268,6 +272,51 @@ fn tls() {
     }
 }
 
+/// Блокировки файлов ядра (SYS_FLOCK, 08.11.2026). Два открытия одного файла —
+/// два владельца у `flock` (конфликт), а POSIX-блокировки `fcntl` у процесса
+/// одни на все его дескрипторы (не конфликтуют) и снимаются закрытием любого.
+fn locks(dir: &Path) {
+    use std::os::fd::AsRawFd;
+    let path = dir.join("depsprobe.lock");
+    let (Ok(a), Ok(b)) = (std::fs::File::create(&path), std::fs::File::open(&path)) else {
+        return check("locks: open file twice", false);
+    };
+    let (fa, fb) = (a.as_raw_fd(), b.as_raw_fd());
+    unsafe {
+        let ex = libc::flock(fa, libc::LOCK_EX | libc::LOCK_NB) == 0;
+        let busy = libc::flock(fb, libc::LOCK_SH | libc::LOCK_NB) == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK);
+        let un = libc::flock(fa, libc::LOCK_UN) == 0;
+        let then = libc::flock(fb, libc::LOCK_SH | libc::LOCK_NB) == 0;
+        println!("depsprobe: flock ex={ex} other-open-busy={busy} unlock={un} then-shared={then}");
+        check("locks: flock between two opens", ex && busy && un && then);
+        libc::flock(fb, libc::LOCK_UN);
+
+        let mut fl: libc::flock = std::mem::zeroed();
+        fl.l_type = libc::F_WRLCK as _;
+        fl.l_whence = libc::SEEK_SET as _;
+        fl.l_start = 100;
+        fl.l_len = 10;
+        let set = libc::fcntl(fa, libc::F_SETLK, &fl as *const libc::flock) == 0;
+        // Свой процесс — не мешает себе, и через другой дескриптор тоже.
+        let mut q: libc::flock = std::mem::zeroed();
+        q.l_type = libc::F_WRLCK as _;
+        q.l_start = 0;
+        q.l_len = 0;
+        let own = libc::fcntl(fb, libc::F_GETLK, &mut q as *mut libc::flock) == 0 && q.l_type == libc::F_UNLCK as _;
+        let again = libc::fcntl(fb, libc::F_SETLK, &fl as *const libc::flock) == 0;
+        drop(b); // закрытие любого дескриптора снимает POSIX-блокировки процесса
+        let mut un: libc::flock = std::mem::zeroed();
+        un.l_type = libc::F_UNLCK as _;
+        un.l_len = 0;
+        let unlock = libc::fcntl(fa, libc::F_SETLK, &un as *const libc::flock) == 0;
+        println!("depsprobe: fcntl setlk={set} own-getlk-free={own} same-process-again={again} unlock={unlock}");
+        check("locks: fcntl F_SETLK/F_GETLK", set && own && again && unlock);
+    }
+    drop(a);
+    let _ = std::fs::remove_file(&path);
+}
+
 fn sqlite(dir: Option<&Path>) {
     use rusqlite::Connection;
     let run = |db: &Connection| -> rusqlite::Result<i64> {
@@ -293,34 +342,27 @@ fn sqlite(dir: Option<&Path>) {
     let Some(dir) = dir else { return };
     let path = dir.join("depsprobe.sqlite");
     let _ = std::fs::remove_file(&path);
-    // VFS по умолчанию («unix») берёт блокировки fcntl(F_SETLK), которых у
-    // ядра нет (ENOSYS) — это и проверяется первым; затем «unix-none» (без
-    // блокировок: один процесс на базу, как профиль браузера без multiprocess).
-    for vfs in [None, Some("unix-none")] {
-        let open = |p: &Path| match vfs {
-            None => Connection::open(p),
-            Some(v) => Connection::open_with_flags_and_vfs(p, rusqlite::OpenFlags::default(), v),
-        };
-        let name = vfs.unwrap_or("default");
-        let _ = std::fs::remove_file(&path);
-        let t = Instant::now();
-        let res = (|| -> rusqlite::Result<(i64, i64)> {
-            let first = { let db = open(&path)?; run(&db)? };
-            // Открыть заново — данные на диске, а не в кеше соединения.
-            let db = open(&path)?;
-            let n = db.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))?;
-            Ok((first, n))
-        })();
-        match res {
-            Ok((sum, n)) => {
-                println!("depsprobe: sqlite file vfs {name} {} in {:?}, sum {sum}, rows {n}", path.display(), t.elapsed());
-                if vfs.is_some() {
-                    check("sqlite file database", sum == 500_500 && n == 1000);
-                }
-            }
-            Err(e) if vfs.is_none() => println!("depsprobe: sqlite file vfs default: {e:?}"),
-            Err(e) => check(&format!("sqlite file database ({e:?})"), false),
+    // VFS «unix» — с блокировками fcntl(F_SETLK) ядра (SYS_FLOCK): так
+    // базу профиля могут открывать несколько окон и запусков браузера.
+    let vfs = unsafe {
+        let v = rusqlite::ffi::sqlite3_vfs_find(std::ptr::null());
+        if v.is_null() { String::from("?") } else { CStr::from_ptr((*v).zName).to_string_lossy().into_owned() }
+    };
+    let _ = std::fs::remove_file(&path);
+    let t = Instant::now();
+    let res = (|| -> rusqlite::Result<(i64, i64)> {
+        let first = { let db = Connection::open(&path)?; run(&db)? };
+        // Открыть заново — данные на диске, а не в кеше соединения.
+        let db = Connection::open(&path)?;
+        let n = db.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))?;
+        Ok((first, n))
+    })();
+    match res {
+        Ok((sum, n)) => {
+            println!("depsprobe: sqlite file (default vfs {vfs}) {} in {:?}, sum {sum}, rows {n}", path.display(), t.elapsed());
+            check("sqlite file database", vfs == "unix" && sum == 500_500 && n == 1000);
         }
+        Err(e) => check(&format!("sqlite file database (vfs {vfs}: {e:?})"), false),
     }
     let _ = std::fs::remove_file(&path);
 }

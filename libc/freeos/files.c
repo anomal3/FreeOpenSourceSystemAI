@@ -555,12 +555,98 @@ int link(const char *target, const char *path) {
     return -1;
 }
 
-/* Блокировок файлов у ядра нет — как и у `fcntl` (`F_SETLK`). */
+/* Блокировки файлов (08.11.2026) — `SYS_FLOCK`, одна таблица ядра на всю
+ * систему, общая с программами Linux. Рекомендательные: читать и писать файл
+ * не мешают, мешают только взять конфликтующую блокировку.
+ *
+ * `flock(2)` — на весь файл, владелец — открытый файл (все копии `dup`), с
+ * блокировками `fcntl` не пересекается. Без `LOCK_NB` ждёт. */
 int flock(int fd, int operation) {
-    (void)fd;
-    (void)operation;
-    errno = ENOSYS;
-    return -1;
+    long code = freeos_syscall(SYS_FLOCK, fd, FREEOS_FLOCK_FILE, operation);
+    if (code == FREEOS_ERR_AGAIN) {
+        errno = EWOULDBLOCK;
+        return -1;
+    }
+    return code < 0 ? freeos_set_errno(code) : 0;
+}
+
+/* `fcntl` `F_GETLK`/`F_SETLK`/`F_SETLKW`: блокировка диапазона байтов,
+ * владелец — процесс (снимается при закрытии любого его дескриптора этого
+ * файла и при выходе). Начало ядро ждёт уже от начала файла: `SEEK_CUR` и
+ * `SEEK_END` пересчитываются здесь, отрицательная длина — тоже. Занято —
+ * `EAGAIN` (SQLite и прочие понимают его как «занято»). */
+static int lock_record(int fd, int op, struct flock *fl) {
+    if (fl == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    long long start = fl->l_start;
+    switch (fl->l_whence) {
+    case SEEK_SET:
+        break;
+    case SEEK_CUR: {
+        off_t here = lseek(fd, 0, SEEK_CUR);
+        if (here < 0) {
+            return -1;
+        }
+        start += here;
+        break;
+    }
+    case SEEK_END: {
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            return -1;
+        }
+        start += st.st_size;
+        break;
+    }
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+    long long len = fl->l_len;
+    if (len < 0) {
+        start += len;
+        len = -len;
+    }
+    if (start < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct freeos_file_lock req;
+    switch (fl->l_type) {
+    case F_RDLCK:
+        req.kind = FREEOS_FILE_LOCK_READ;
+        break;
+    case F_WRLCK:
+        req.kind = FREEOS_FILE_LOCK_WRITE;
+        break;
+    case F_UNLCK:
+        req.kind = FREEOS_FILE_LOCK_UNLOCK;
+        break;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+    req.pid = 0;
+    req.start = (uint64_t)start;
+    req.len = (uint64_t)len;
+    long code = freeos_syscall(SYS_FLOCK, fd, op, (long)&req);
+    if (code < 0) {
+        return freeos_set_errno(code);
+    }
+    if (op == FREEOS_FLOCK_GETLK) {
+        if (req.kind == FREEOS_FILE_LOCK_UNLOCK) {
+            fl->l_type = F_UNLCK;
+        } else {
+            fl->l_type = req.kind == FREEOS_FILE_LOCK_READ ? F_RDLCK : F_WRLCK;
+            fl->l_whence = SEEK_SET;
+            fl->l_start = (long)req.start;
+            fl->l_len = (long)req.len;
+            fl->l_pid = (short)req.pid;
+        }
+    }
+    return 0;
 }
 
 /* ── Дескрипторы ─────────────────────────────────────────────────────────── */
@@ -623,7 +709,8 @@ int pipe2(int fds[2], int flags) {
  *   (фазы 65b, 66b); `O_APPEND` у нас не бывает. `F_SETFL` включает и
  *   снимает `O_NONBLOCK` у сокета и канала; у файла он ничего не меняет —
  *   файл не ждёт и так;
- * - блокировки (`F_GETLK`, `F_SETLK`, `F_SETLKW`) — `ENOSYS`: у ядра их нет. */
+ * - блокировки (`F_GETLK`, `F_SETLK`, `F_SETLKW`) — `SYS_FLOCK` (08.11.2026),
+ *   см. `lock_record` выше. */
 int fcntl(int fd, int cmd, ...) {
     va_list args;
     va_start(args, cmd);
@@ -676,6 +763,12 @@ int fcntl(int fd, int cmd, ...) {
             return code < 0 ? freeos_set_errno(code) : 0;
         }
         return 0;
+    case F_GETLK:
+        return lock_record(fd, FREEOS_FLOCK_GETLK, (struct flock *)arg);
+    case F_SETLK:
+        return lock_record(fd, FREEOS_FLOCK_SETLK, (struct flock *)arg);
+    case F_SETLKW:
+        return lock_record(fd, FREEOS_FLOCK_SETLKW, (struct flock *)arg);
     default:
         errno = ENOSYS;
         return -1;
