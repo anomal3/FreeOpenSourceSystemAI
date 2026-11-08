@@ -178,11 +178,15 @@ impl EventLoopWaker for Waker {
 
 struct Delegate {
     window: Rc<Window>,
+    context: Rc<SwglRenderingContext>,
 }
 
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, webview: WebView) {
+        // Servo рисует кадр, а показать его — дело встраивающей программы
+        // (как у servoshell: `paint`, затем `present`).
         webview.paint();
+        self.context.present();
     }
 
     fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
@@ -323,7 +327,7 @@ fn main() {
         .preferences(swgl_ctx::preferences())
         .event_loop_waker(Box::new(Waker(Arc::new(AtomicBool::new(false)))))
         .build();
-    let delegate = Rc::new(Delegate { window: window.clone() });
+    let delegate = Rc::new(Delegate { window: window.clone(), context: context.clone() });
     let webview = WebViewBuilder::new(&servo, context.clone() as Rc<dyn RenderingContext>)
         .delegate(delegate.clone())
         .url(start_url())

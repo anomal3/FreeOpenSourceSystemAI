@@ -11362,9 +11362,38 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   name/OS2 через `skrifa`, без Fontconfig; общие имена serif/sans-serif/
   monospace → DejaVu/Noto), `navigator.platform` — «Linux».
   **08.11: `cargo check` всего Servo (478 крейтов) под freeos — проходит.**
-  Дальше — полная сборка и компоновка `servoprobe`.
+  **N5/N6 — страница нарисована (08.11, x86_64):** `servoprobe` — свой
+  `RenderingContext` поверх **swgl** (`ports/servo/servoprobe/src/swgl_ctx.rs`:
+  `swgl::Context` как `gleam::Gl`, `glow` из таблицы трёх функций swgl без
+  `dlopen`; surfman/EGL не нужны — без `connection()` у Servo просто нет
+  WebGL), `WebView` без окна, страница `data:` → `take_screenshot` → проверка
+  цветов и «чернил» текста, PNG — base64-строками в журнал (`servoprobe-png`,
+  собирается на хосте). Сценарий `servo-page` зелёный: Servo поднимается за
+  0,8 с, страница 2 с, снимок 85 мс; бинарник 116 МБ. Чинили по дороге:
+  tokio — драйвер сигналов на `pipe2` вместо `socketpair(AF_UNIX)` (у родных
+  программ его нет; `patch_tokio`), `inventory` «как у Redox» (иначе ресурсы
+  Servo не регистрируются), профиль `~/.config/servo` и `TMPDIR` в доме
+  (`/tmp` на установленной системе нет), корни сертификатов Mozilla
+  (`network_use_webpki_roots`, системного хранилища CA нет), `servo-paint`:
+  `clear_caches_with_quads` и `enable_dithering` выкл. на freeos (swgl не
+  умеет `DepthFunc(ALWAYS)` и шейдеров DITHERING).
+  **Первая видимая версия (часть N7, 08.11, x86_64):** `/opt/servo/bin/browser`
+  (`src/bin/browser.rs`) — окно стола через `freeos_window_*` (кадр swgl
+  BGRA → поверхность окна, `commit`), мышь (щелчки), колесо (прокрутка),
+  клавиатура (символы и именованные клавиши), изменение размера окна,
+  крестик; заголовок окна — «Servo — <заголовок страницы>»; встроенная
+  стартовая страница (градиент, JavaScript, кнопка, поле, ссылки) или адрес
+  аргументом. В пакете `servo` — `caption`/`start`: «Servo» в меню и «Открыть»
+  в уведомлении после установки. Сценарий `servo-window` зелёный (снимки
+  photos/servo-window-*.png). Урок: `present()` зовёт встраивающая
+  программа после `webview.paint()`, Servo — нет. **Осталось:** адресная
+  строка/вкладки/назад-вперёд (своя оболочка на egui), прокрутка колесом
+  слабее заданной (60 px вместо 300 — разобраться), курсор (форма указателя),
+  буфер обмена, aarch64 (сборка идёт), скорость больших страниц, сеть
+  (страницы из интернета — проверить с `network: true`).
 - **N6 — Servo без окна на FreeOS.** Мини-программа: открыть страницу
-  `httpd` стенда, снимок в PNG — сценарий `servo-headless`.
+  `httpd` стенда, снимок в PNG — сценарий `servo-headless`. **Сделано 08.11 как
+  `servo-page` (страница `data:`; `httpd` — вместе с сетью).**
 - **N7 — окно и оболочка `browser` (своя, с нуля).** Окна — наш API
   (`SYS_WIN*`) без winit; интерфейс — egui + `egui_software_backend`;
   кадр страницы (swgl) и интерфейс собираются в один буфер окна. Дизайн —

@@ -42,6 +42,8 @@ echo "servo-script = { path = \"/cache/src/$SCRIPT\" }" >> /tmp/patches.toml
 # DepthFunc (gl.cc:1390), программа падала на первом кадре. На FreeOS рисует
 # swgl: очистка обычным glClear по ножницам.
 PAINT=servo-paint-0.8.0
+# Копия от прежней версии правки (без дизеринга) — пересоздать.
+grep -q 'enable_dithering: !cfg' /cache/src/$PAINT/painter.rs 2>/dev/null || rm -rf /cache/src/$PAINT
 if copy_crate $PAINT painter.rs; then
     python3 - /cache/src/$PAINT <<'EOF'
 import sys
@@ -53,6 +55,11 @@ s = s.replace(old, '                shared_font_namespace: Some(painter_id.into(
               '                // FreeOS (__freeos__): swgl не умеет DepthFunc(ALWAYS).\n'
               '                clear_caches_with_quads: !cfg!(target_os = "freeos"),\n'
               '                ..Default::default()', 1)
+# Дизеринг градиентов — варианта шейдеров DITHERING в swgl нет («unknown
+# shader ps_quad_gradient DITHERING», assert в BindAttribLocation).
+old = '                enable_dithering: true,'
+assert old in s, p
+s = s.replace(old, '                enable_dithering: !cfg!(target_os = "freeos"),', 1)
 open(p, 'w', encoding='utf-8').write(s)
 EOF
 fi
