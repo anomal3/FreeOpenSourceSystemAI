@@ -12,9 +12,11 @@
 //! снимком `devices/<id>/tabs.json`, закрытие чужих — просьбой в коллекции
 //! `tab-close`.
 //!
-//! Здесь только логика: сеть (GitHub Contents API, Gitea/Forgejo, WebDAV) —
-//! реализация типажа [`Store`] снаружи; пароли (`passwords.enc`, Argon2id →
-//! XChaCha20-Poly1305) и вход по GitHub Device Flow — в оболочке браузера.
+//! Площадки — [`remote`]: GitHub, GitLab, Bitbucket (точки синхронизации —
+//! теги Git), Яндекс Диск и любой WebDAV, Google Диск, папка; вход токеном,
+//! паролем приложения или через браузер (OAuth Device Flow, [`remote::oauth`]).
+//! Сам HTTP — снаружи, за типажом [`remote::Http`] (крейт без зависимостей).
+//! Обмен и откат к точке — [`sync`]. Шифрование паролей — в оболочке.
 //!
 //! ```
 //! use browser_sync::{MemStore, Replica};
@@ -37,7 +39,9 @@ pub mod hlc;
 pub mod dir;
 pub mod json;
 pub mod op;
+pub mod remote;
 pub mod replica;
+pub mod sync;
 pub mod tabs;
 
 #[cfg(feature = "std")]

@@ -7121,6 +7121,28 @@ pub const ALL: &[Scenario] = &[
             Step::Wheel(-5),
             Step::Wait(4_000),
             Step::Painted("servo-window-scrolled"),
+            Step::Expect("browser: ui frame 1"),
+            // Оболочка (N7, egui): «+ Новая вкладка» в боковой панели —
+            // вторая вкладка, фокус сразу в адресной строке; набрать путь к
+            // файлу пакета, Enter — страница открылась. Числа — геометрия
+            // `browser.rs` (SIDEBAR_W 216, шапка 34, кнопка 30, строка 30).
+            Step::Aim(Aim::Content("OBSOS — Браузер", 100, 53)),
+            Step::Click,
+            Step::Await("browser: tab 2 opened", 30_000),
+            Step::Await("browser: load status Complete", 120_000),
+            Step::Wait(2_000),
+            Step::Type("/opt/obsos/share/NOTICE.md"),
+            Step::Key("ret"),
+            Step::Await("browser: go file:///opt/obsos/share/NOTICE.md", 20_000),
+            Step::Await("browser: load status Complete", 120_000),
+            Step::Wait(4_000),
+            Step::Painted("servo-window-notice"),
+            // Щелчок по первой вкладке в списке — она снова видна.
+            Step::Aim(Aim::Content("OBSOS — Браузер", 100, 93)),
+            Step::Click,
+            Step::Await("browser: tab 1 active", 20_000),
+            Step::Wait(3_000),
+            Step::Painted("servo-window-tab1"),
             Step::Aim(Aim::Close("OBSOS — Браузер")),
             Step::Click,
             Step::Await("browser: closed", 60_000),
