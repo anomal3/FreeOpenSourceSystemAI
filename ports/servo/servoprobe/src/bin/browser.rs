@@ -370,6 +370,7 @@ fn main() {
                     // Щелчок колеса — 60 точек; к себе (x < 0) — вниз по странице.
                     let delta = DeviceVector2D::new(0.0, -(ev.x as f32) * 60.0);
                     let at = *mouse.borrow();
+                    println!("browser: wheel {} at {},{}", ev.x, at.x, at.y);
                     webview.notify_scroll_event(
                         Scroll::Delta(WebViewVector::Device(delta)),
                         WebViewPoint::Device(at),

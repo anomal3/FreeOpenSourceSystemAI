@@ -11362,7 +11362,7 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   name/OS2 через `skrifa`, без Fontconfig; общие имена serif/sans-serif/
   monospace → DejaVu/Noto), `navigator.platform` — «Linux».
   **08.11: `cargo check` всего Servo (478 крейтов) под freeos — проходит.**
-  **N5/N6 — страница нарисована (08.11, x86_64):** `servoprobe` — свой
+  **N5/N6 — страница нарисована (08.11, x86_64 и aarch64):** `servoprobe` — свой
   `RenderingContext` поверх **swgl** (`ports/servo/servoprobe/src/swgl_ctx.rs`:
   `swgl::Context` как `gleam::Gl`, `glow` из таблицы трёх функций swgl без
   `dlopen`; surfman/EGL не нужны — без `connection()` у Servo просто нет
@@ -11377,7 +11377,7 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   (`network_use_webpki_roots`, системного хранилища CA нет), `servo-paint`:
   `clear_caches_with_quads` и `enable_dithering` выкл. на freeos (swgl не
   умеет `DepthFunc(ALWAYS)` и шейдеров DITHERING).
-  **Первая видимая версия (часть N7, 08.11, x86_64):** `/opt/servo/bin/browser`
+  **Первая видимая версия (часть N7, 08.11):** `/opt/servo/bin/browser`
   (`src/bin/browser.rs`) — окно стола через `freeos_window_*` (кадр swgl
   BGRA → поверхность окна, `commit`), мышь (щелчки), колесо (прокрутка),
   клавиатура (символы и именованные клавиши), изменение размера окна,
@@ -11386,11 +11386,15 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   аргументом. В пакете `servo` — `caption`/`start`: «Servo» в меню и «Открыть»
   в уведомлении после установки. Сценарий `servo-window` зелёный (снимки
   photos/servo-window-*.png). Урок: `present()` зовёт встраивающая
-  программа после `webview.paint()`, Servo — нет. **Осталось:** адресная
-  строка/вкладки/назад-вперёд (своя оболочка на egui), прокрутка колесом
-  слабее заданной (60 px вместо 300 — разобраться), курсор (форма указателя),
-  буфер обмена, aarch64 (сборка идёт), скорость больших страниц, сеть
-  (страницы из интернета — проверить с `network: true`).
+  программа после `webview.paint()`, Servo — нет. **aarch64 — тоже зелёный
+  (08.11):** `servo-page` (Servo 0,74 с, страница 1,3 с, снимок 98 мс) и
+  `servo-window` (окно 984×688 на экране 1024×768), бинарники ~119 МБ.
+  Прокрутка: 60 px на щелчок колеса; `Step::Wheel(-5)` стенда приходит одним
+  отчётом мыши = одним щелчком (`browser: wheel -1`) — не ошибка.
+  **Осталось:** адресная строка/вкладки/назад-вперёд (своя оболочка на
+  egui), курсор (форма указателя), буфер обмена, скорость больших страниц,
+  сеть (страницы из интернета — сценарий с `network: true`), `/tmp` в
+  установленной системе (сейчас Servo обходит через `TMPDIR`).
 - **N6 — Servo без окна на FreeOS.** Мини-программа: открыть страницу
   `httpd` стенда, снимок в PNG — сценарий `servo-headless`. **Сделано 08.11 как
   `servo-page` (страница `data:`; `httpd` — вместе с сетью).**
