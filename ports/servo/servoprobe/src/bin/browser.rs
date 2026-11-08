@@ -197,8 +197,8 @@ impl WebViewDelegate for Delegate {
         let title = title.filter(|t| !t.trim().is_empty());
         println!("browser: title {title:?}");
         match title {
-            Some(t) => self.window.set_title(&format!("Servo — {}", t.trim())),
-            None => self.window.set_title("Servo"),
+            Some(t) => self.window.set_title(&format!("OBSOS — {}", t.trim())),
+            None => self.window.set_title("OBSOS"),
         }
     }
 
@@ -208,10 +208,11 @@ impl WebViewDelegate for Delegate {
     }
 }
 
-const START: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>FreeOS</title></head>\
+const START: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Добро пожаловать</title></head>\
 <body style=\"margin:0;font-family:sans-serif;background:#f4f6fb;color:#1d2433\">\
 <div style=\"background:linear-gradient(90deg,#2d6cdf,#7a4fd8);color:white;padding:28px 36px\">\
-<h1 style=\"margin:0;font-size:34px\">Браузер FreeOS</h1>\
+<h1 style=\"margin:0;font-size:34px\">OBSOS</h1>\
+<p style=\"margin:4px 0 0;font-size:15px;opacity:.85\">Open Browser for System Open Source — браузер FreeOS</p>\
 <p style=\"margin:8px 0 0;font-size:17px;opacity:.9\">Движок Servo · JavaScript SpiderMonkey · рисует swgl на процессоре</p></div>\
 <div style=\"padding:24px 36px;font-size:16px;line-height:1.5\">\
 <p>Это первая видимая сборка: страница, мышь, колесо и клавиатура. Адресная строка и вкладки — следующим шагом.</p>\
@@ -308,7 +309,7 @@ fn modifiers_of(mask: i32) -> Modifiers {
 fn main() {
     let t0 = Instant::now();
     println!("browser: start");
-    let Some(window) = Window::open("Servo", 1024, 700) else {
+    let Some(window) = Window::open("OBSOS", 1024, 700) else {
         std::process::exit(1);
     };
     let context = SwglRenderingContext::new(PhysicalSize::new(window.width.get(), window.height.get()));

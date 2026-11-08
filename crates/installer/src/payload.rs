@@ -607,9 +607,9 @@ const PACKAGES: [(&CStr16, &str); 15] = [
     (cstr16!("\\FREEOS\\PKG\\JBR.FPK"), "jbr-25.fpk"),
     // Wine 11 (фаза 71j) — тоже только если собран.
     (cstr16!("\\FREEOS\\PKG\\WINE.FPK"), "wine-11.fpk"),
-    // Движок Servo (N4: пока проверка SpiderMonkey `jsprobe`) — только если
-    // собран Linux-хостом сборки (ports/servo/builder).
-    (cstr16!("\\FREEOS\\PKG\\SERVO.FPK"), "servo-0.1.fpk"),
+    // Браузер OBSOS на движке Servo (N4–N7, 08.11.2026) — только если собран
+    // Linux-хостом сборки (ports/servo/builder).
+    (cstr16!("\\FREEOS\\PKG\\OBSOS.FPK"), "obsos-0.1.fpk"),
 ];
 
 /// Размер файла по данным файловой системы.

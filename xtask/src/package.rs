@@ -220,7 +220,7 @@ pub const GAMES: [&str; 9] = [
 /// Браузер на Servo (план «Servo нативно», N4–N9) — пакетом, как и задумано
 /// в N9: движок — десятки мегабайт, RAM-диску живой системы они не по силам.
 /// Пока в нём проверка SpiderMonkey `jsprobe` (N4).
-pub const SERVO_PACKAGE: &str = "servo-0.1.fpk";
+pub const SERVO_PACKAGE: &str = "obsos-0.1.fpk";
 
 /// Пакет `servo`: программы, собранные Linux-хостом сборки
 /// (`ports/servo/builder/build-jsprobe.sh` → `build/linux/<имя>-<арх>`).
@@ -230,9 +230,11 @@ fn servo(arch: Arch) -> Result<Option<Vec<u8>>> {
         say!("пакет servo пропущен: нет build/linux/jsprobe-{} — собрать: ports/servo/builder/build-jsprobe.sh", arch.name());
         return Ok(None);
     };
-    let mut servo = Builder::new(Kind::Package, "servo", "0.1");
-    servo.field("summary", "Servo browser engine for FreeOS (in progress): SpiderMonkey check");
-    servo.field("about", "движок браузера Servo (в работе): проверка SpiderMonkey");
+    // OBSOS — Open Browser for System Open Source («Обсос»; Роман, 08.11.2026):
+    // браузер FreeOS на движке Servo.
+    let mut servo = Builder::new(Kind::Package, "obsos", "0.1");
+    servo.field("summary", "OBSOS, the FreeOS web browser (Servo engine, SpiderMonkey, software rendering)");
+    servo.field("about", "браузер OBSOS на движке Servo");
     // Как у NetSurf: окна, файлы (база SQLite, кеш), сеть (TLS через петлю у
     // depsprobe — без `net` даже bind на 127.0.0.1 отказан). `jit` — когда
     // SpiderMonkey пойдёт с JIT (N12).
@@ -253,14 +255,20 @@ fn servo(arch: Arch) -> Result<Option<Vec<u8>>> {
     // Servo в окне (N7, первая видимая версия): программа «Servo» в меню.
     if let Some(browser) = crate::ruststd::linux_host_program("servo-browser", arch) {
         let data = fs::read(&browser).with_context(|| format!("не удалось прочитать {}", browser.display()))?;
-        servo.file(&Entry { path: String::from("bin/browser"), mode: 0o755, uid: 0, gid: 0, data });
-        servo.field("caption", "Servo");
-        servo.field("start", "/opt/servo/bin/browser");
+        servo.file(&Entry { path: String::from("bin/obsos"), mode: 0o755, uid: 0, gid: 0, data });
+        servo.field("caption", "OBSOS");
+        servo.field("start", "/opt/obsos/bin/obsos");
     }
     // Авторство и лицензии (N8): MPL-2.0 и Unicode требуют, чтобы уведомление
     // ехало вместе с двоичным файлом.
     let notice = include_bytes!("../../ports/browser/NOTICE.md").to_vec();
     servo.file(&Entry { path: String::from("share/NOTICE.md"), mode: 0o644, uid: 0, gid: 0, data: notice });
+    // Свой значок OBSOS (assets/icons/obsos, 08.11.2026): ярлык, панель
+    // задач, меню «Пуск», уведомление об установке.
+    let icon = crate::fimg::from_png(include_bytes!("../../assets/icons/obsos/obsos-256.png"))
+        .context("значок OBSOS: PNG не разобрался")?;
+    servo.file(&Entry { path: String::from("icon.fimg"), mode: 0o644, uid: 0, gid: 0, data: icon });
+    servo.field("icon", "/opt/obsos/icon.fimg");
     Ok(Some(servo.finish()))
 }
 

@@ -1926,7 +1926,7 @@ impl Menu {
                     }
                     let side = px(32);
                     let icon = Rect::new(cell.rect.x + (cell.rect.w as i32 - side as i32) / 2, cell.rect.y + px(10) as i32, side, side);
-                    draw_item_icon(ctx, &mut self.surface, icon, item);
+                    draw_item_icon(ctx, &mut self.surface, icon, item, &self.packages);
                     let label = Rect::new(cell.rect.x + px(2) as i32, icon.bottom() + px(6) as i32, cell.rect.w - px(4), px(18));
                     let caption = item.caption(&self.packages);
                     let width = ctx.face(Role::Caption).width(caption).min(label.w);
@@ -1946,7 +1946,7 @@ impl Menu {
                     }
                     let side = px(20);
                     let icon = Rect::new(cell.rect.x + px(8) as i32, cell.rect.y + (cell.rect.h as i32 - side as i32) / 2, side, side);
-                    draw_item_icon(ctx, &mut self.surface, icon, item);
+                    draw_item_icon(ctx, &mut self.surface, icon, item, &self.packages);
                     let x = icon.right() + px(10) as i32;
                     paint::text_clipped(ctx, &mut self.surface, Role::Body, x, paint::baseline(ctx, Role::Body, cell.rect), (cell.rect.right() - x).max(0) as u32, caption, p.ink2);
                 }
@@ -2024,6 +2024,14 @@ impl Menu {
             let Some(item) = self.items.get(row.index).copied() else {
                 continue;
             };
+            // Пакет со своим значком (поле `icon` манифеста, 08.11.2026) —
+            // его значок, а не общая коробка.
+            let art = match item {
+                Item::Package(index) => {
+                    self.packages.get(index).map(|launcher| super::appicon::of_manifest(&launcher.icon))
+                }
+                _ => None,
+            };
             draw_row(
                 m,
                 &mut self.surface,
@@ -2031,6 +2039,7 @@ impl Menu {
                 item.caption(&self.packages),
                 item.about(&self.packages),
                 row.index == self.row,
+                art.as_ref(),
             );
         }
 
@@ -2039,7 +2048,16 @@ impl Menu {
 }
 
 /// Значок строки «Пуска»: значок макета, если есть, иначе знак на плитке.
-fn draw_item_icon(ctx: Ctx, s: &mut Surface, rect: Rect, item: Item) {
+fn draw_item_icon(ctx: Ctx, s: &mut Surface, rect: Rect, item: Item, packages: &[Launcher]) {
+    // Пакет со своим значком (поле `icon` манифеста, 08.11.2026).
+    if let Item::Package(index) = item {
+        if let Some(launcher) = packages.get(index) {
+            if launcher.icon.starts_with('/') {
+                super::appicon::of_manifest(&launcher.icon).draw(ctx, s, rect);
+                return;
+            }
+        }
+    }
     match super::appicon::design_for(item.icon()) {
         Some(image) => image.draw(s, rect),
         None => paint::icon_tile(ctx, s, rect, item.icon(), item.tone(), false),
@@ -2051,7 +2069,15 @@ fn draw_item_icon(ctx: Ctx, s: &mut Surface, rect: Rect, item: Item) {
 /// Свободной функцией, а не методом: строке нужна поверхность и ничего больше,
 /// а подпись к ней лежит в том же `self`, что и поверхность, — методу пришлось
 /// бы одолжить оба поля сразу.
-fn draw_row(m: Metrics, s: &mut Surface, row: &MenuRow, label: &str, note: &str, selected: bool) {
+fn draw_row(
+    m: Metrics,
+    s: &mut Surface,
+    row: &MenuRow,
+    label: &str,
+    note: &str,
+    selected: bool,
+    art: Option<&super::appicon::Art>,
+) {
     let ctx = m.ctx;
     let p = ctx.palette;
     let tile = Rect::new(
@@ -2086,9 +2112,10 @@ fn draw_row(m: Metrics, s: &mut Surface, row: &MenuRow, label: &str, note: &str,
         if selected {
             paint::row(ctx, s, row.rect, RowState::Selected);
         }
-        match super::appicon::design_for(row.icon) {
-            Some(image) => image.draw(s, tile),
-            None => paint::icon_tile(ctx, s, tile, row.icon, row.tone, selected),
+        match (art, super::appicon::design_for(row.icon)) {
+            (Some(art), _) => art.draw(ctx, s, tile),
+            (None, Some(image)) => image.draw(s, tile),
+            (None, None) => paint::icon_tile(ctx, s, tile, row.icon, row.tone, selected),
         }
     }
 
