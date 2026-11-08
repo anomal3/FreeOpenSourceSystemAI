@@ -1039,6 +1039,8 @@ pub const RLIMIT_FSIZE: c_int = 1;
 pub const RLIMIT_NOFILE: c_int = 5;
 pub const RLIMIT_STACK: c_int = 3;
 pub const RLIM_SAVED_CUR: crate::rlim_t = 9223372036854775807;
+// <sys/resource.h> picolibc: RLIM_INFINITY = INT64_MAX (servo-script).
+pub const RLIM_INFINITY: crate::rlim_t = 9223372036854775807;
 pub const RLIM_SAVED_MAX: crate::rlim_t = 9223372036854775807;
 pub const RTLD_DEFAULT: *mut c_void = 0 as *mut c_void;
 pub const RTLD_GLOBAL: c_int = 256;
@@ -1503,6 +1505,25 @@ extern "C" {
     pub fn posix_madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int;
     // picolibc <malloc.h>; servo-allocator (учёт памяти), как у Linux.
     pub fn malloc_usable_size(ptr: *mut c_void) -> size_t;
+}
+
+// rustix (ветки Redox, 08.11.2026): renameat2 — libc/freeos/files.c (флаги —
+// EINVAL); номер устройства — как <sys/stat.h> picolibc: старшая половина
+// dev_t (64 бита) — major, младшая — minor.
+extern "C" {
+    pub fn renameat2(olddirfd: c_int, oldpath: *const c_char, newdirfd: c_int, newpath: *const c_char, flags: c_uint) -> c_int;
+}
+pub const RENAME_NOREPLACE: c_uint = 1;
+pub const RENAME_EXCHANGE: c_uint = 2;
+pub const RENAME_WHITEOUT: c_uint = 4;
+pub const fn makedev(major: c_uint, minor: c_uint) -> dev_t {
+    ((major as dev_t) << 32) | minor as dev_t
+}
+pub const fn major(dev: dev_t) -> c_uint {
+    (dev >> 32) as c_uint
+}
+pub const fn minor(dev: dev_t) -> c_uint {
+    (dev & 0xffff_ffff) as c_uint
 }
 pub const MAP_ANON: c_int = MAP_ANONYMOUS;
 pub const MADV_NORMAL: c_int = 0;

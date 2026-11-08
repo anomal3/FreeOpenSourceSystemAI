@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
@@ -363,6 +364,29 @@ int fchmodat(int dir, const char *path, mode_t mode, int flags) {
     char buf[FREEOS_PATH_LIMIT + 1];
     const char *full = at_path(dir, path, buf);
     return full == NULL ? -1 : chmod(full, mode);
+}
+
+/* `renameat` и `renameat2` (08.11.2026, rustix у Servo): пути от каталогов —
+ * как у остальных `*at`. Флаги `renameat2` (`RENAME_NOREPLACE`,
+ * `RENAME_EXCHANGE`) ядро не умеет — `EINVAL`, а не тихо обычное
+ * переименование: «не затирать» молча нарушенное — потерянный файл. */
+int renameat(int from_dir, const char *from, int to_dir, const char *to) {
+    char from_buf[FREEOS_PATH_LIMIT + 1];
+    char to_buf[FREEOS_PATH_LIMIT + 1];
+    const char *from_full = at_path(from_dir, from, from_buf);
+    if (from_full == NULL) {
+        return -1;
+    }
+    const char *to_full = at_path(to_dir, to, to_buf);
+    return to_full == NULL ? -1 : rename(from_full, to_full);
+}
+
+int renameat2(int from_dir, const char *from, int to_dir, const char *to, unsigned int flags) {
+    if (flags != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    return renameat(from_dir, from, to_dir, to);
 }
 
 /* Обрезать файл ядро умеет только до нуля — открытием с `O_TRUNC`; любая

@@ -56,6 +56,9 @@ const LIKE_REDOX: &[(&str, &str, &str, &str)] = &[
     // Его же 0.4 — у Servo (uuid, rand): без ветки — compile_error «target is
     // not supported». Хеш — crates.io API, 08.11.2026.
     ("getrandom", "0.4.3", "vita", "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"),
+    // rustix (Servo: tempfile, memmap/fs через std-подобный API) — libc-бэкенд;
+    // ветки Redox (минимальный unix: без statfs, fallocate, fadvise…).
+    ("rustix", "1.1.6", "redox", "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"),
     // `ring` (крипто rustls): SystemRandom включён по списку ОС — как у Vita.
     // C и ассемблер собирает наш набор (`CC_<цель>` = `<арх>-freeos-cc`).
     ("ring", "0.17.14", "vita", "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"),
@@ -238,6 +241,9 @@ fn prepare() -> Result<PathBuf> {
                 "target_os = \"openbsd\", target_os = \"vita\",",
                 "target_os = \"openbsd\", target_os = \"vita\", target_os = \"freeos\",",
             )?;
+        }
+        if *name == "rustix" {
+            patch_rustix(&dir)?;
         }
         if *name == "ring" {
             // Ассемблер ring (perlasm, ELF) — по списку ОС с ABI Linux; без
@@ -427,6 +433,34 @@ fn patch_mio(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// rustix (08.11.2026): ветки Redox подходят почти везде, кроме того, что
+/// есть только в libc Redox. Ошибки errno, которых нет у newlib (у picolibc
+/// тоже), исключены там для Vita — freeos рядом с ней; `O_PATH`/`O_SYMLINK`
+/// — только Redox, из этих двух условий freeos убирается. `renameat2` и
+/// `makedev` дают libc/freeos и ports/rust-std/libc/freeos.rs.
+fn patch_rustix(dir: &Path) -> Result<()> {
+    let backend = dir.join("src/backend/libc");
+    edit(&backend.join("io/errno.rs"), |text| {
+        let n = text.matches("        target_os = \"vita\",\n").count();
+        if n == 0 {
+            bail!("нет якоря target_os = \"vita\" в errno.rs — rustix сменился, сверить");
+        }
+        Ok(text.replace("        target_os = \"vita\",\n", "        target_os = \"vita\",\n        target_os = \"freeos\",\n"))
+    })?;
+    let types = backend.join("fs/types.rs");
+    replace(
+        &types,
+        "            target_os = \"redox\", target_os = \"freeos\",\n        ))]\n        const PATH = bitcast!(c::O_PATH);",
+        "            target_os = \"redox\",\n        ))]\n        const PATH = bitcast!(c::O_PATH);",
+    )?;
+    replace(
+        &types,
+        "#[cfg(any(apple, target_os = \"redox\", target_os = \"freeos\"))]\n        const SYMLINK = bitcast!(c::O_SYMLINK);",
+        "#[cfg(any(apple, target_os = \"redox\"))]\n        const SYMLINK = bitcast!(c::O_SYMLINK);",
+    )?;
+    Ok(())
+}
+
 /// Поставить `target_os = "freeos"` рядом с каждым `target_os = "<like>"`.
 fn next_to(dir: &Path, like: &str) -> Result<usize> {
     let tag = format!("target_os = \"{like}\"");
@@ -438,7 +472,20 @@ fn next_to(dir: &Path, like: &str) -> Result<usize> {
         let n = text.matches(&tag).count();
         if n > 0 {
             sites += n;
-            fs::write(&file, text.replace(&tag, &format!("{tag}, target_os = \"freeos\"")))?;
+            // Внутри списка `any(…)` достаточно дописать freeos рядом. Но
+            // одиночный предикат — `not(TAG)`, `cfg(TAG)`, `cfg_attr(TAG, …)` —
+            // от этого стал бы недопустимым (`not(a, b)`; rustix, 08.11.2026):
+            // там TAG заворачивается в `any(TAG, freeos)`. Метка не даёт
+            // общей замене тронуть уже завёрнутое.
+            const MARK: &str = "\u{0}freeos-like\u{0}";
+            let any = format!("any({tag}, target_os = \"freeos\")");
+            let text = text
+                .replace(&format!("not({tag})"), &format!("not({MARK})"))
+                .replace(&format!("cfg({tag})"), &format!("cfg({MARK})"))
+                .replace(&format!("cfg_attr({tag},"), &format!("cfg_attr({MARK},"))
+                .replace(&tag, &format!("{tag}, target_os = \"freeos\""))
+                .replace(MARK, &any);
+            fs::write(&file, text)?;
         }
     }
     if sites == 0 {

@@ -30,6 +30,8 @@ case $ARCH in
     *) CLANG_TRIPLE="$ARCH-unknown-none-elf" ;;
 esac
 eval "export BINDGEN_EXTRA_CLANG_ARGS_$KEY=\"--target=$CLANG_TRIPLE -D__freeos__=1 -D__FreeOS__=1 -D_POSIX_THREADS=1 -D_POSIX_MONOTONIC_CLOCK=200112L -D_GNU_SOURCE=1 -nostdlibinc -nostdinc++ -isystem $SR/include/c++/v1 -isystem $SR/include\""
+# Правки в крейтах самого Servo: gaol, шрифты, servo-script (patch-servo.sh).
+. /work/ports/servo/builder/patch-servo.sh
 # stylo и привязки скриптов генерируют код на python хоста.
 export PYTHON3=python3
 

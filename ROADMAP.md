@@ -11350,8 +11350,19 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   MAP_ANON` (memmap2), `malloc_usable_size` (servo-allocator);
   `getrandom` 0.4.3 — ветка «как у Vita» (getentropy) + freeos в списке ОС
   его `Cargo.toml` (две версии getrandom в `patches.toml` — второй ключ с
-  `package`). Дальше — по ошибкам check (ожидаются servo-fonts cfg + свой
-  `font_list`, gaol).
+  `package`). Дальше 375 → 416 → 478: `rustix` 1.1.6 «как у Redox»
+  (+ `patch_rustix`: errno — рядом с Vita, без `O_PATH`/`O_SYMLINK`;
+  `next_to` заворачивает одиночные `not(TAG)`/`cfg(TAG)`/`cfg_attr(TAG,…)` в
+  `any(TAG, freeos)` — иначе `not(a, b)`), libc: `renameat`/`renameat2`
+  (флаги — EINVAL), `makedev/major/minor`, `RLIM_INFINITY`;
+  `ports/servo/builder/patch-servo.sh`: gaol — пустой крейт (только для
+  `multiprocess`), **шрифты** (`ports/servo/fonts`: freeos в условиях
+  servo-fonts/servo-fonts-traits — FreeType как у Linux; свой `font_list.rs`
+  — обход `/usr/share/fonts`, семейство/насыщенность/ширина/наклон из таблиц
+  name/OS2 через `skrifa`, без Fontconfig; общие имена serif/sans-serif/
+  monospace → DejaVu/Noto), `navigator.platform` — «Linux».
+  **08.11: `cargo check` всего Servo (478 крейтов) под freeos — проходит.**
+  Дальше — полная сборка и компоновка `servoprobe`.
 - **N6 — Servo без окна на FreeOS.** Мини-программа: открыть страницу
   `httpd` стенда, снимок в PNG — сценарий `servo-headless`.
 - **N7 — окно и оболочка `browser` (своя, с нуля).** Окна — наш API

@@ -1674,12 +1674,6 @@ dependencies = [
 [[package]]
 name = "gaol"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "061957ca7a966a39a79ebca393a9a6c7babda10bf9dd6f11d00041558d929c22"
-dependencies = [
- "libc",
- "log",
-]
 
 [[package]]
 name = "generic-array"
@@ -4464,14 +4458,12 @@ dependencies = [
 [[package]]
 name = "rustix"
 version = "1.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5146,8 +5138,6 @@ dependencies = [
 [[package]]
 name = "servo-fonts"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "908148cafdbb232f4ac59b6e0fb0ac8b31f97c80f1ad98beeddb4ed689cddae0"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -5206,8 +5196,6 @@ dependencies = [
 [[package]]
 name = "servo-fonts-traits"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ee68596af5e88e51cf5e9b8deda7243f706f7a0c6b697c5cd0231341dd1ffcf"
 dependencies = [
  "atomic_refcell",
  "dwrote",
@@ -5845,8 +5833,6 @@ dependencies = [
 [[package]]
 name = "servo-script"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6c3e52be4165b3f98b992f384156b049d30b769004a96cf52903ea27cd32f9b"
 dependencies = [
  "accesskit",
  "app_units",
