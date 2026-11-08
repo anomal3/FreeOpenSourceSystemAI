@@ -44,4 +44,6 @@ fi
 freeos_build /work/ports/servo/servoprobe
 mkdir -p /work/build/linux
 cp -f "$CARGO_TARGET_DIR/$TRIPLE/release/servoprobe" "/work/build/linux/servoprobe-$ARCH"
-ls -la "/work/build/linux/servoprobe-$ARCH"
+# Окно на столе FreeOS (src/bin/browser.rs) — программа «Servo» в меню.
+cp -f "$CARGO_TARGET_DIR/$TRIPLE/release/browser" "/work/build/linux/servo-browser-$ARCH"
+ls -la "/work/build/linux/servoprobe-$ARCH" "/work/build/linux/servo-browser-$ARCH"

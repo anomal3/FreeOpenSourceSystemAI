@@ -36,4 +36,25 @@ open(p, 'w', encoding='utf-8').write(s)
 EOF
 fi
 echo "servo-script = { path = \"/cache/src/$SCRIPT\" }" >> /tmp/patches.toml
+
+# servo-paint: WebRender очищает кэш картинок «квадратами» с тестом глубины
+# ALWAYS, а swgl (программный GL) умеет только LESS/LEQUAL — assert в
+# DepthFunc (gl.cc:1390), программа падала на первом кадре. На FreeOS рисует
+# swgl: очистка обычным glClear по ножницам.
+PAINT=servo-paint-0.8.0
+if copy_crate $PAINT painter.rs; then
+    python3 - /cache/src/$PAINT <<'EOF'
+import sys
+p = sys.argv[1] + '/painter.rs'
+s = open(p, encoding='utf-8').read()
+old = '                shared_font_namespace: Some(painter_id.into()),\n                ..Default::default()'
+assert old in s, p
+s = s.replace(old, '                shared_font_namespace: Some(painter_id.into()),\n'
+              '                // FreeOS (__freeos__): swgl не умеет DepthFunc(ALWAYS).\n'
+              '                clear_caches_with_quads: !cfg!(target_os = "freeos"),\n'
+              '                ..Default::default()', 1)
+open(p, 'w', encoding='utf-8').write(s)
+EOF
+fi
+echo "servo-paint = { path = \"/cache/src/$PAINT\" }" >> /tmp/patches.toml
 echo "patch-servo: gaol (пусто), шрифты, $SCRIPT (freeos)"

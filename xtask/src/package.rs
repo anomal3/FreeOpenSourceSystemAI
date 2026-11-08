@@ -245,6 +245,18 @@ fn servo(arch: Arch) -> Result<Option<Vec<u8>>> {
         let data = fs::read(&deps).with_context(|| format!("не удалось прочитать {}", deps.display()))?;
         servo.file(&Entry { path: String::from("bin/depsprobe"), mode: 0o755, uid: 0, gid: 0, data });
     }
+    // Сам Servo без окна: страница → снимок (N5/N6, `build-servoprobe.sh`).
+    if let Some(probe) = crate::ruststd::linux_host_program("servoprobe", arch) {
+        let data = fs::read(&probe).with_context(|| format!("не удалось прочитать {}", probe.display()))?;
+        servo.file(&Entry { path: String::from("bin/servoprobe"), mode: 0o755, uid: 0, gid: 0, data });
+    }
+    // Servo в окне (N7, первая видимая версия): программа «Servo» в меню.
+    if let Some(browser) = crate::ruststd::linux_host_program("servo-browser", arch) {
+        let data = fs::read(&browser).with_context(|| format!("не удалось прочитать {}", browser.display()))?;
+        servo.file(&Entry { path: String::from("bin/browser"), mode: 0o755, uid: 0, gid: 0, data });
+        servo.field("caption", "Servo");
+        servo.field("start", "/opt/servo/bin/browser");
+    }
     // Авторство и лицензии (N8): MPL-2.0 и Unicode требуют, чтобы уведомление
     // ехало вместе с двоичным файлом.
     let notice = include_bytes!("../../ports/browser/NOTICE.md").to_vec();

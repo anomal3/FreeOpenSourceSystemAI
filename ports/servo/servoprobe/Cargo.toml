@@ -2,7 +2,7 @@
 name = "servoprobe"
 version = "0.1.0"
 edition = "2021"
-description = "N5/N6: Servo 0.8 на FreeOS — сначала просто собрать движок (cargo check/build), потом — страница без окна"
+description = "N5/N6: Servo 0.8 на FreeOS — страница без окна, рисование swgl (программный GL Firefox), снимок в PNG"
 publish = false
 
 # Отдельный workspace: собирается в контейнере fossai-builder
@@ -12,12 +12,23 @@ publish = false
 [dependencies]
 # Без default-features: без js_jit, multiprocess (gaol, песочница), clipboard,
 # devtools; без media-gstreamer, webxr, webgpu, webgl, bluetooth (ROADMAP N4).
-servo = { version = "=0.8.0", default-features = false }
+# baked-in-resources — файлы ресурсов Servo (user-agent CSS и т. п.) внутри
+# программы.
+servo = { version = "=0.8.0", default-features = false, features = ["baked-in-resources"] }
 # Нет fork — каналы между «процессами» Servo только внутри процесса.
 ipc-channel = { version = "0.23", features = ["force-inprocess"] }
 # У servo-fonts freetype-sys закрыт cfg по ОС, а webrender тянет его и так:
 # FreeType и libpng — из исходников крейта.
 freetype-sys = { version = "0.23", features = ["bundled"] }
+# Рисование без видеокарты: swgl — программный OpenGL из Firefox («Software
+# WebRender»), `swgl::Context` реализует `gleam::Gl`. Без surfman/EGL/dlopen.
+swgl = "0.70"
+gleam = "0.15"
+glow = "0.17"
+dpi = "0.1"
+url = "2.5"
+# Только ради типа ошибки в `RenderingContext::make_current`.
+surfman = { version = "0.14", default-features = false }
 
 [profile.release]
 panic = "abort"

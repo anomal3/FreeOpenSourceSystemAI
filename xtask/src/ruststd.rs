@@ -59,6 +59,9 @@ const LIKE_REDOX: &[(&str, &str, &str, &str)] = &[
     // rustix (Servo: tempfile, memmap/fs через std-подобный API) — libc-бэкенд;
     // ветки Redox (минимальный unix: без statfs, fallocate, fadvise…).
     ("rustix", "1.1.6", "redox", "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"),
+    // inventory (Servo: регистрация читателя ресурсов) — конструктор в
+    // .init_array по списку ОС; без freeos регистрация молча не происходит.
+    ("inventory", "0.3.25", "redox", "6928282826c822ad91bf1c9a1cb90a30ba1c26770749929b4656cd6be829cd7c"),
     // `ring` (крипто rustls): SystemRandom включён по списку ОС — как у Vita.
     // C и ассемблер собирает наш набор (`CC_<цель>` = `<арх>-freeos-cc`).
     ("ring", "0.17.14", "vita", "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"),
@@ -244,6 +247,9 @@ fn prepare() -> Result<PathBuf> {
         }
         if *name == "rustix" {
             patch_rustix(&dir)?;
+        }
+        if *name == "tokio" {
+            patch_tokio(&dir)?;
         }
         if *name == "ring" {
             // Ассемблер ring (perlasm, ELF) — по списку ОС с ABI Linux; без
@@ -431,6 +437,26 @@ fn patch_mio(dir: &Path) -> Result<()> {
         "        target_os = \"macos\",\n        target_os = \"redox\",",
     )?;
     Ok(())
+}
+
+/// tokio (08.11.2026, Servo): драйвер сигналов заводится при всяком runtime с
+/// вводом-выводом и берёт пару `UnixStream::pair()` — `socketpair(AF_UNIX)`,
+/// которого у родных программ FreeOS нет (он есть только в слое Linux):
+/// Servo падал на старте. Сигналы родным программам ядро не доставляет,
+/// драйверу нужно лишь что-то читаемое для `poll` — канал (`pipe2`). Чтение
+/// и запись `UnixStream` в std — `read`/`write`, с каналом они работают.
+fn patch_tokio(dir: &Path) -> Result<()> {
+    replace(
+        &dir.join("src/signal/unix.rs"),
+        "        let (receiver, sender) = UnixStream::pair().expect(\"failed to create UnixStream\");",
+        "        #[cfg(not(target_os = \"freeos\"))]\n        let (receiver, sender) = UnixStream::pair().expect(\"failed to create UnixStream\");\n        \
+         // FreeOS: socketpair(AF_UNIX) у родных программ нет — канал.\n        \
+         #[cfg(target_os = \"freeos\")]\n        let (receiver, sender) = {\n            \
+         use std::os::unix::io::FromRawFd;\n            let mut fds = [0; 2];\n            \
+         let r = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };\n            \
+         assert_eq!(r, 0, \"failed to create the signal pipe\");\n            \
+         unsafe { (UnixStream::from_raw_fd(fds[0]), UnixStream::from_raw_fd(fds[1])) }\n        };",
+    )
 }
 
 /// rustix (08.11.2026): ветки Redox подходят почти везде, кроме того, что
