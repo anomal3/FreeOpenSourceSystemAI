@@ -490,16 +490,75 @@ int setrlimit(int resource, const struct rlimit *limit) {
 
 /* ── Сигналы ─────────────────────────────────────────────────────────────── */
 
-/* Ядро сигналов не посылает вовсе: отказ страницы снимает программу так, как
- * это сделал бы обработчик по умолчанию, а остановить поток сборщику мусора
- * Mono не нужно — он собран с кооперативной остановкой.
+/* Сигналы от других программ ядро родным программам не посылает: остановить
+ * поток сборщику мусора Mono не нужно — он собран с кооперативной остановкой,
+ * и Mono ставит обработчики на старте под `g_assert`, поэтому таблица ведётся
+ * честно — записать, прочитать прежний, отказать на `SIGKILL` и `SIGSTOP`.
  *
- * Поэтому `sigaction` ведёт таблицу обработчиков честно — записать, прочитать
- * прежний, отказать на `SIGKILL` и `SIGSTOP`, — но позван обработчик не будет
- * никогда. Отказать здесь `ENOSYS` было бы хуже, а не честнее: Mono ставит
- * обработчики на старте под `g_assert` и без таблицы не запускается, хотя ни
- * одного сигнала в её режиме не ждёт. */
+ * Отказы процессора (09.11.2026) — доставляются: `SIGILL`, `SIGTRAP`, `SIGBUS`,
+ * `SIGFPE`, `SIGSEGV` с обработчиком уходят в ядро (`SYS_SIGACTION`). На них
+ * держится JIT SpiderMonkey: ловушки и проверки прерывания wasm — это `ud2`
+ * и `SIGILL`, выход за память wasm — `SIGSEGV`. Ядро зовёт `fault_entry` с
+ * кадром как у Linux (номер Linux, siginfo Linux, ucontext как в
+ * <ucontext.h>); она переводит номер и siginfo в раскладку picolibc и зовёт
+ * обработчик программы, а её `ret` уходит в `__freeos_sigreturn`. */
 static struct sigaction handlers[NSIG];
+
+#define SYS_SIGACTION 91
+#define SYS_SIGRETURN 92
+
+void __freeos_sigreturn(void);
+#if defined(__x86_64__)
+__asm__(".text\n.globl __freeos_sigreturn\n.type __freeos_sigreturn,@function\n"
+        "__freeos_sigreturn:\n    mov $92, %eax\n    int $0x80\n    ud2\n");
+#elif defined(__aarch64__)
+__asm__(".text\n.globl __freeos_sigreturn\n.type __freeos_sigreturn,%function\n"
+        "__freeos_sigreturn:\n    mov x8, #92\n    svc #0\n    brk #0\n");
+#endif
+
+/* Номер сигнала у ядра (как у Linux) — для отказов процессора; иначе 0. */
+static int kernel_signal(int sig) {
+    switch (sig) {
+    case SIGILL: return 4;
+    case SIGTRAP: return 5;
+    case SIGBUS: return 7;
+    case SIGFPE: return 8;
+    case SIGSEGV: return 11;
+    default: return 0;
+    }
+}
+
+static int libc_signal(int ksig) {
+    switch (ksig) {
+    case 4: return SIGILL;
+    case 5: return SIGTRAP;
+    case 7: return SIGBUS;
+    case 8: return SIGFPE;
+    case 11: return SIGSEGV;
+    default: return ksig;
+    }
+}
+
+static void fault_entry(int ksig, void *kinfo, void *context) {
+    int sig = libc_signal(ksig);
+    if (sig <= 0 || sig >= NSIG) {
+        return;
+    }
+    struct sigaction action = handlers[sig];
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    info.si_signo = sig;
+    /* siginfo Linux: si_code — смещение 8, si_addr — 16. */
+    info.si_code = *(int *)((char *)kinfo + 8);
+    info.si_addr = *(void **)((char *)kinfo + 16);
+    if (action.sa_flags & SA_SIGINFO) {
+        if (action.sa_sigaction != NULL) {
+            action.sa_sigaction(sig, &info, context);
+        }
+    } else if (action.sa_handler != SIG_DFL && action.sa_handler != SIG_IGN) {
+        action.sa_handler(sig);
+    }
+}
 
 int sigaction(int signal, const struct sigaction *action, struct sigaction *old) {
     if (signal <= 0 || signal >= NSIG || ((signal == SIGKILL || signal == SIGSTOP) && action != NULL)) {
@@ -511,6 +570,13 @@ int sigaction(int signal, const struct sigaction *action, struct sigaction *old)
     }
     if (action != NULL) {
         handlers[signal] = *action;
+        int ksig = kernel_signal(signal);
+        if (ksig != 0) {
+            int real = (action->sa_flags & SA_SIGINFO) ? action->sa_sigaction != NULL
+                                                       : (action->sa_handler != SIG_DFL && action->sa_handler != SIG_IGN);
+            /* Старое ядро без SYS_SIGACTION — как раньше: только таблица. */
+            (void)freeos_syscall(SYS_SIGACTION, ksig, real ? (long)fault_entry : 0, (long)__freeos_sigreturn);
+        }
     }
     return 0;
 }

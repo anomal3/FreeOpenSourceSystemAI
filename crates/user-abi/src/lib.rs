@@ -1682,6 +1682,20 @@ pub const WIN_CURSOR_RESIZE_NS: usize = 6;
 /// спрашивать каждый раз — пояс могут сменить, не перезапуская программу.
 pub const SYS_TZINFO: usize = 90;
 
+/// Обработчик отказов процессора у родной программы (09.11.2026, JIT
+/// SpiderMonkey: ловушки и прерывания wasm — `ud2` и `SIGILL`):
+/// `(сигнал, обработчик, возврат) -> 0`.
+///
+/// Номера сигналов — как у Linux (`SIGILL` 4, `SIGTRAP` 5, `SIGBUS` 7,
+/// `SIGFPE` 8, `SIGSEGV` 11). Обработчик ноль — снять (отказ снова снимает
+/// программу). Кадр — как у Linux: `(сигнал, siginfo, ucontext)`, в `ucontext`
+/// — регистры и `fpregs` (образ `fxsave`); обработчик возвращается `ret` на
+/// «возврат», а тот зовёт [`SYS_SIGRETURN`]. Пока только x86-64.
+pub const SYS_SIGACTION: usize = 91;
+/// Выход из обработчика отказа: регистры, флаги и x87/SSE — из `ucontext`,
+/// на который указывает стек (`ret` обработчика снял адрес возврата).
+pub const SYS_SIGRETURN: usize = 92;
+
 /// Размер буфера вывода [`SYS_KERNEL_COMMAND`].
 pub const KERNEL_COMMAND_OUT: usize = 64 * 1024;
 
@@ -2702,6 +2716,7 @@ mod tests {
         assert_eq!(SYS_SETCLOCK, 86);
         assert_eq!(SYS_FLOCK, 88);
         assert_eq!((SYS_WINCURSOR, SYS_TZINFO), (89, 90));
+        assert_eq!((SYS_SIGACTION, SYS_SIGRETURN), (91, 92));
         assert_eq!((WIN_CURSOR_ARROW, WIN_CURSOR_TEXT, WIN_CURSOR_HAND, WIN_CURSOR_RESIZE_NS), (0, 1, 2, 6));
         assert_eq!((FLOCK_GETLK, FLOCK_SETLK, FLOCK_SETLKW, FLOCK_FILE), (1, 2, 3, 7));
         assert_eq!((FLOCK_SH, FLOCK_EX, FLOCK_NB, FLOCK_UN), (1, 2, 4, 8));

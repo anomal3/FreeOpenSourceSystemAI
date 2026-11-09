@@ -77,6 +77,8 @@ pub struct DevUi {
     pub dom: Rc<RefCell<Option<Value>>>,
     pub selected: Rc<RefCell<String>>,
     pub started: Instant,
+    /// Отдать фокус строке ввода консоли (панель только что открыли).
+    pub focus_input: bool,
 }
 
 impl Default for DevUi {
@@ -89,6 +91,7 @@ impl Default for DevUi {
             dom: Rc::default(),
             selected: Rc::default(),
             started: Instant::now(),
+            focus_input: true,
         }
     }
 }
@@ -176,6 +179,9 @@ fn console(ui: &mut Ui, shell: &mut Shell, active: Option<WebViewId>) {
     });
     ui.horizontal(|ui| {
         let edit = ui.add(egui::TextEdit::singleline(&mut shell.dev.input).hint_text("JavaScript — Enter выполнить").font(egui::TextStyle::Monospace).desired_width(ui.available_width()));
+        if std::mem::take(&mut shell.dev.focus_input) {
+            edit.request_focus();
+        }
         if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !shell.dev.input.trim().is_empty() {
             let code = std::mem::take(&mut shell.dev.input);
             shell.delegate.devlog.borrow_mut().console(active, "input", format!("› {code}"));
@@ -187,6 +193,8 @@ fn console(ui: &mut Ui, shell: &mut Shell, active: Option<WebViewId>) {
                         Ok(v) => show_value(&v),
                         Err(e) => format!("ошибка: {e:?}"),
                     };
+                    let short: String = text.chars().take(600).collect();
+                    println!("browser: devtools ← {short}");
                     delegate.devlog.borrow_mut().console(Some(id), "result", format!("← {text}"));
                 });
             }

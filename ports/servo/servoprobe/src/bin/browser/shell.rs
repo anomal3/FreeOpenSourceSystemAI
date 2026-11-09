@@ -1032,6 +1032,9 @@ impl Shell {
             }
             Action::Panel(panel) => {
                 self.panel = if self.panel == Some(panel) { None } else { Some(panel) };
+                if panel == Panel::DevTools {
+                    self.dev.focus_input = true;
+                }
                 self.filter.clear();
                 if panel == Panel::Sync && self.panel.is_some() {
                     self.load_points();

@@ -527,7 +527,9 @@ pub fn deliver_fault(frame: &mut crate::arch::TrapFrame, vector: u8, addr: usize
         17 => (SIGBUS, 1, addr as u64),
         _ => return false,
     };
-    let Some((true, action)) = crate::user::with_current(|program| (program.linux, program.linux_actions[sig])) else {
+    // Программа Linux — по своему `rt_sigaction`; родная — по
+    // `SYS_SIGACTION` (09.11.2026, JIT SpiderMonkey). Таблица одна.
+    let Some(action) = crate::user::with_current(|program| program.linux_actions[sig]) else {
         return false;
     };
     let slot = sched::current_slot();

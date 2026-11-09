@@ -199,6 +199,8 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_WINCURSOR => wincursor(a0 as i64, a1),
         // 09.11.2026: часовой пояс для программ (JavaScript `Date`).
         user_abi::SYS_TZINFO => i64::from(crate::time::offset_minutes()),
+        // 09.11.2026: отказы процессора — сигналом и родной программе.
+        user_abi::SYS_SIGACTION => native_sigaction(a0, a1, a2),
         // Фаза 62c: заголовок окна меняется на ходу.
         user_abi::SYS_WINTITLE => wintitle(a0 as i64, a1, a2),
         // Фаза 62d: у окна есть владелец.
@@ -2260,6 +2262,26 @@ fn winresize(id: i64, size: usize) -> i64 {
     match super::resize_window(slot, w, h) {
         Ok(base) => base as i64,
         Err(err) => window_errno(err),
+    }
+}
+
+/// `sigaction(сигнал, обработчик, возврат) -> 0` для родной программы: та же
+/// таблица, что у программ Linux, — отказ доставит `linux::signal::deliver_fault`.
+fn native_sigaction(sig: usize, handler: usize, restorer: usize) -> i64 {
+    if !matches!(sig, 4 | 5 | 7 | 8 | 11) {
+        return ERR_UNSUPPORTED;
+    }
+    // Нижняя (пользовательская) половина адресов.
+    const USER_TOP: usize = 0x0000_8000_0000_0000;
+    if handler != 0 && (handler >= USER_TOP || restorer == 0 || restorer >= USER_TOP) {
+        return user_abi::ERR_BAD_ADDRESS;
+    }
+    // SA_NODEFER: отказ внутри обработчика (wasm в wasm) — тоже сигналом.
+    const SA_NODEFER: usize = 0x4000_0000;
+    let action = super::LinuxAction { handler, flags: if handler == 0 { 0 } else { SA_NODEFER }, restorer, mask: 0 };
+    match super::with_current(|program| program.linux_actions[sig] = action) {
+        Some(()) => 0,
+        None => user_abi::ERR_NO_TASK,
     }
 }
 

@@ -475,6 +475,14 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
     // Системный вызов разбирается до всего остального: его номер лежит выше
     // границы внешних прерываний, и попав в ветку ниже, он был бы подтверждён
     // как чужое прерывание контроллера.
+    if vector == VECTOR_SYSCALL && frame.rax as usize == user_abi::SYS_SIGRETURN {
+        // Выход из обработчика отказа родной программы: регистры — из её
+        // `ucontext`, а не ответ системного вызова в `rax`.
+        crate::linux::signal::sigreturn(frame);
+        // SAFETY: как у системного вызова ниже.
+        unsafe { crate::user::check_kill() };
+        return;
+    }
     if vector == VECTOR_SYSCALL {
         // SAFETY: ловушка пришла из пользовательского режима, то есть
         // `enter_user` действительно исполняется и вернуться есть куда.
