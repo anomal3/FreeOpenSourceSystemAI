@@ -22,7 +22,7 @@ index af9176a..67d8b57 100644
          if is_apple || is_freebsd || is_ohos {
              builder.cpp_set_stdlib("c++");
 diff --git a/mozjs/build/autoconf/config.sub b/mozjs/build/autoconf/config.sub
-index 4aaae46..acf3a31 100755
+index 4aaae46..acf3a31 100644
 --- a/mozjs/build/autoconf/config.sub
 +++ b/mozjs/build/autoconf/config.sub
 @@ -2094,6 +2094,7 @@ case $os in
@@ -63,7 +63,7 @@ index 63049b6..adef5af 100644
  def target_is_netbsd(target):
      if target.kernel == "NetBSD":
 diff --git a/mozjs/build/moz.configure/toolchain.configure b/mozjs/build/moz.configure/toolchain.configure
-index dff149b..b6cc2b0 100755
+index dff149b..b6cc2b0 100644
 --- a/mozjs/build/moz.configure/toolchain.configure
 +++ b/mozjs/build/moz.configure/toolchain.configure
 @@ -2219,7 +2219,7 @@ set_define("_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", True, when=using_libcxx)
@@ -103,6 +103,46 @@ index 76dad23..b9317ba 100644
    return 0;
  #else
    struct rusage usage;
+diff --git a/mozjs/js/src/jit/ProcessExecutableMemory.cpp b/mozjs/js/src/jit/ProcessExecutableMemory.cpp
+index c2028b3..9d9757c 100644
+--- a/mozjs/js/src/jit/ProcessExecutableMemory.cpp
++++ b/mozjs/js/src/jit/ProcessExecutableMemory.cpp
+@@ -577,6 +577,11 @@ static unsigned ProtectionSettingToFlags(ProtectionSetting protection) {
+   }
+ #    endif
+   return true;
++#  elif defined(__freeos__)
++  // FreeOS: mmap(MAP_FIXED) поверх своей же резервной области ядро не
++  // кладёт (чужие области не снимаются), а права ленивой области меняет
++  // mprotect — по куску, с синхронизацией кеша команд на aarch64.
++  return mprotect(addr, bytes, ProtectionSettingToFlags(protection)) == 0;
+ #  else
+   unsigned prot_flags = ProtectionSettingToFlags(protection);
+   int flags = MAP_FIXED | MAP_PRIVATE | MAP_ANON;
+@@ -608,6 +613,10 @@ static void DecommitPages(void* addr, size_t bytes) {
+     ret = madvise(addr, bytes, MADV_FREE_REUSABLE);
+   } while (ret != 0 && errno == EAGAIN);
+   MOZ_RELEASE_ASSERT(ret == 0);
++#  elif defined(__freeos__)
++  int ret = mprotect(addr, bytes, PROT_NONE);
++  MOZ_RELEASE_ASSERT(ret == 0);
++  (void)madvise(addr, bytes, MADV_DONTNEED);
+ #  else
+   // Use mmap with MAP_FIXED and PROT_NONE. Inspired by jemalloc's
+   // pages_decommit.
+diff --git a/mozjs/js/src/jit/arm64/vixl/MozCpu-vixl.cpp b/mozjs/js/src/jit/arm64/vixl/MozCpu-vixl.cpp
+index 2839823..34b09c7 100644
+--- a/mozjs/js/src/jit/arm64/vixl/MozCpu-vixl.cpp
++++ b/mozjs/js/src/jit/arm64/vixl/MozCpu-vixl.cpp
+@@ -115,7 +115,7 @@ void CPU::EnsureIAndDCacheCoherency(void* address, size_t length) {
+   FlushInstructionCache(GetCurrentProcess(), address, length);
+ #elif defined(XP_DARWIN)
+   sys_icache_invalidate(address, length);
+-#elif defined(__aarch64__) && (defined(__linux__) || defined(__android__) || defined(__FreeBSD__))
++#elif defined(__aarch64__) && (defined(__linux__) || defined(__android__) || defined(__FreeBSD__) || defined(__freeos__))
+   // Implement the cache synchronisation for all targets where AArch64 is the
+   // host, even if we're building the simulator for an AAarch64 host. This
+   // allows for cases where the user wants to simulate code as well as run it
 diff --git a/mozjs/js/src/threading/posix/PosixThread.cpp b/mozjs/js/src/threading/posix/PosixThread.cpp
 index 8340ead..00a2aff 100644
 --- a/mozjs/js/src/threading/posix/PosixThread.cpp
@@ -118,6 +158,38 @@ index 8340ead..00a2aff 100644
  #else
    rv = pthread_setname_np(pthread_self(), name);
  #endif
+diff --git a/mozjs/js/src/wasm/WasmSignalHandlers.cpp b/mozjs/js/src/wasm/WasmSignalHandlers.cpp
+index 817f93c..e9c5a34 100644
+--- a/mozjs/js/src/wasm/WasmSignalHandlers.cpp
++++ b/mozjs/js/src/wasm/WasmSignalHandlers.cpp
+@@ -34,6 +34,9 @@
+ #  include <mach/mach.h>
+ #elif !defined(__wasi__)
+ #  include <signal.h>
++#  if defined(__freeos__)
++#    include <ucontext.h>  // у Linux его приносит signal.h
++#  endif
+ #endif
+ 
+ using namespace js;
+@@ -113,7 +116,7 @@ using namespace js::wasm;
+ #      define R01_sig(p) ((p)->sc_frame.fixreg[1])
+ #      define R32_sig(p) ((p)->sc_frame.srr0)
+ #    endif
+-#  elif defined(__linux__) || defined(__sun)
++#  elif defined(__linux__) || defined(__sun) || defined(__freeos__)
+ #    if defined(__linux__)
+ #      define EIP_sig(p) ((p)->uc_mcontext.gregs[REG_EIP])
+ #      define EBP_sig(p) ((p)->uc_mcontext.gregs[REG_EBP])
+@@ -137,7 +140,7 @@ using namespace js::wasm;
+ #      define R14_sig(p) ((p)->uc_mcontext.gregs[REG_R14])
+ #      define R15_sig(p) ((p)->uc_mcontext.gregs[REG_R15])
+ #    endif
+-#    if defined(__linux__) && defined(__aarch64__)
++#    if (defined(__linux__) || defined(__freeos__)) && defined(__aarch64__)
+ #      define EPC_sig(p) ((p)->uc_mcontext.pc)
+ #      define RFP_sig(p) ((p)->uc_mcontext.regs[29])
+ #      define RLR_sig(p) ((p)->uc_mcontext.regs[30])
 diff --git a/mozjs/mfbt/RandomNum.cpp b/mozjs/mfbt/RandomNum.cpp
 index 42ce50f..ae776ad 100644
 --- a/mozjs/mfbt/RandomNum.cpp

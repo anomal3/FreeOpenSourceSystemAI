@@ -35,6 +35,23 @@ s = s.replace(old, '// FreeOS (__freeos__): как Linux — так сайтам
 open(p, 'w', encoding='utf-8').write(s)
 EOF
 fi
+# servo-script: потоковая компиляция WebAssembly (`compileStreaming`,
+# `instantiateStreaming`) теряет начало тела: куски ответа, пришедшие до того,
+# как страница вызвала compileStreaming, уходят в обычный поток тела, а
+# компилятор получает файл с середины («failed to match magic number» —
+# .NET/Blazor на web.pynop.online, 09.11.2026). Без обработчика потока
+# SpiderMonkey не заводит эти функции, и загрузчики берут `arrayBuffer()`.
+# Правка отдельно от копии выше и повторяема (метка — `__freeos__`).
+python3 - /cache/src/$SCRIPT <<'EOF'
+import sys
+p = sys.argv[1] + '/runtime/script_runtime.rs'
+s = open(p, encoding='utf-8').read()
+if '__freeos__' not in s:
+    old = '            InitConsumeStreamCallback(cx, Some(consume_stream), Some(report_stream_error));'
+    assert old in s, p
+    s = s.replace(old, '            // __freeos__: без потоковой компиляции wasm (patch-servo.sh).\n            let _ = (consume_stream, report_stream_error);', 1)
+    open(p, 'w', encoding='utf-8').write(s)
+EOF
 echo "servo-script = { path = \"/cache/src/$SCRIPT\" }" >> /tmp/patches.toml
 
 # servo-paint: WebRender очищает кэш картинок «квадратами» с тестом глубины

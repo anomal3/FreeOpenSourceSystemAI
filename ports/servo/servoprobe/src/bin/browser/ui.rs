@@ -410,10 +410,19 @@ fn toolbar(ui: &mut Ui, shell: &mut Shell, look: &Look, p: &Palette, actions: &m
                 let has_logins = origin.as_ref().is_some_and(|o| !shell.profile.logins_for(o).is_empty());
                 let marked = url.as_ref().is_some_and(|u| shell.profile.is_bookmarked(u.as_str()));
                 let web = url.as_ref().is_some_and(|u| u.scheme().starts_with("http"));
-                let right = 30.0 * (2.0 + has_logins as u8 as f32 + 2.0 * web as u8 as f32) + 16.0 + if web { 22.0 } else { 0.0 };
+                // Кнопки справа: ширина 30 и промежуток между ними.
+                let gap = ui.spacing().item_spacing.x;
+                let icons = 2.0 + has_logins as u8 as f32 + 2.0 * web as u8 as f32;
+                let right = (30.0 + gap) * icons + if web { 22.0 + gap } else { 0.0 } + 12.0;
                 if shell.focus_address {
                     ui.memory_mut(|m| m.request_focus(address_id));
                     shell.focus_address = false;
+                    // Как в Chromium: Ctrl+L / F6 / Alt+D выделяют весь адрес —
+                    // набранное заменяет его, а не дописывается в конец.
+                    let mut state = egui::text_edit::TextEditState::load(ui.ctx(), address_id).unwrap_or_default();
+                    let len = shell.address.chars().count();
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(len))));
+                    state.store(ui.ctx(), address_id);
                 }
                 let secure = url.as_ref().is_some_and(|u| u.scheme() == "https" || u.scheme() == "obsos");
                 let plain = secure || shell.address.is_empty();
@@ -572,7 +581,8 @@ fn toasts(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette) {
 // ── Выдвижная панель ────────────────────────────────────────────────────────
 
 fn drawer(ctx: &egui::Context, shell: &mut Shell, panel: Panel, page: Rect, p: &Palette, actions: &mut Vec<Action>) {
-    let width = DRAWER_W.min(page.width());
+    // Инструменты разработчика шире: в сеть и DOM помещаются адреса.
+    let width = if panel == Panel::DevTools { (page.width() * 0.6).max(DRAWER_W) } else { DRAWER_W }.min(page.width());
     egui::Area::new(egui::Id::new("obsos-drawer"))
         .order(egui::Order::Foreground)
         .fixed_pos(pos2(page.right() - width, page.top()))
@@ -604,6 +614,7 @@ fn drawer(ctx: &egui::Context, shell: &mut Shell, panel: Panel, page: Rect, p: &
                     Panel::Scripts => scripts(ui, shell),
                     Panel::Profiles => profiles(ui, shell),
                     Panel::Downloads => downloads(ui, shell, actions),
+                    Panel::DevTools => crate::devtools::ui(ui, shell, actions),
                 });
             });
         });
@@ -622,6 +633,7 @@ fn panel_title(panel: Panel) -> &'static str {
         Panel::Scripts => "Скрипты и стили",
         Panel::Profiles => "Профили",
         Panel::Downloads => "Загрузки",
+        Panel::DevTools => "Инструменты разработчика",
     }
 }
 
@@ -641,6 +653,7 @@ fn menu(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
         (Panel::Settings, "Настройки"),
         (Panel::Scripts, "Скрипты и стили (вместо расширений)"),
         (Panel::Downloads, "Загрузки    Ctrl+J"),
+        (Panel::DevTools, "Инструменты разработчика    F12"),
         (Panel::Profiles, "Профили"),
     ] {
         if item(ui, text) {

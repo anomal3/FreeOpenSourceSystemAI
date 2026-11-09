@@ -73,6 +73,8 @@ pub struct Delegate {
     pub page_cursor: std::cell::Cell<window::CursorShape>,
     pub blocker: Rc<RefCell<crate::blocker::Blocker>>,
     pub downloads: Rc<crate::downloads::Downloads>,
+    /// Консоль и сеть для инструментов разработчика (F12).
+    pub devlog: RefCell<crate::devtools::DevLog>,
 }
 
 impl Delegate {
@@ -173,12 +175,18 @@ impl WebViewDelegate for Delegate {
     /// до сети. Сам документ страницы не трогаем.
     fn load_web_resource(&self, webview: WebView, load: servo::WebResourceLoad) {
         let request = load.request();
-        if request.is_for_main_frame {
-            return;
-        }
-        let Some(host) = request.url.host_str().map(str::to_string) else { return };
+        let host = request.url.host_str().map(str::to_string).unwrap_or_default();
         let site = webview.url().and_then(|u| u.host_str().map(str::to_string));
-        let blocked = self.blocker.borrow().blocks(&host, site.as_deref());
+        let blocked = !request.is_for_main_frame && !host.is_empty() && self.blocker.borrow().blocks(&host, site.as_deref());
+        self.devlog.borrow_mut().request(crate::devtools::NetEntry {
+            webview: webview.id(),
+            method: request.method.to_string(),
+            url: request.url.as_str().to_string(),
+            kind: format!("{:?}", request.destination),
+            main: request.is_for_main_frame,
+            blocked,
+            at: Instant::now(),
+        });
         if blocked {
             let url = request.url.as_url().clone();
             let mut blocker = self.blocker.borrow_mut();
@@ -204,10 +212,19 @@ impl WebViewDelegate for Delegate {
         self.note(Note::HideControl(id));
     }
 
-    fn show_console_message(&self, webview: WebView, _level: ConsoleLogLevel, message: String) {
+    fn show_console_message(&self, webview: WebView, level: ConsoleLogLevel, message: String) {
         if let Some(payload) = message.strip_prefix(SCRIPT_PREFIX) {
             self.note(Note::Script(webview.id(), payload.to_string()));
+            return;
         }
+        let level = format!("{level:?}");
+        // Ошибки страниц — и в журнал системы: по нему видно, на чём сайт
+        // сломался, даже без открытой консоли.
+        if level.contains("Error") || level.contains("Warn") {
+            let short: String = message.chars().take(400).collect();
+            println!("browser: console {level}: {short}");
+        }
+        self.devlog.borrow_mut().console(Some(webview.id()), &level, message);
     }
 }
 
@@ -236,6 +253,18 @@ impl ClipboardDelegate for Delegate {
 pub const PAGE_SCRIPT: &str = r#"(function(){
 if (window.__obsos) return; window.__obsos = 1;
 function send(o){ try { console.log('__obsos__:' + JSON.stringify(o)); } catch(e){} }
+// Servo отдаёт потоковой компиляции wasm тело ответа ещё сжатым (gzip от
+// сервера) — «failed to match magic number» у .NET/Blazor. arrayBuffer() даёт
+// распакованное: компилируем из него.
+try {
+  if (window.WebAssembly) {
+    var W = WebAssembly, body = function(src){ return Promise.resolve(src).then(function(r){ return r.arrayBuffer(); }); };
+    W.instantiateStreaming = function(src, imports){ return body(src).then(function(b){ return W.instantiate(b, imports); }); };
+    W.compileStreaming = function(src){ return body(src).then(function(b){ return W.compile(b); }); };
+  }
+} catch(e) {}
+window.addEventListener('error', function(e){ if (!(e instanceof ErrorEvent)) return; try { console.error('Uncaught ' + (e.message || e) + (e.filename ? ' @ ' + e.filename + ':' + e.lineno + ':' + e.colno : '')); } catch(x){} }, true);
+window.addEventListener('unhandledrejection', function(e){ try { var r = e.reason; console.error('Unhandled rejection: ' + (r && (r.stack || r.message) || r)); } catch(x){} });
 try {
   if (!('MediaSource' in window)) {
     var told = false;
@@ -415,6 +444,7 @@ pub enum Panel {
     Scripts,
     Profiles,
     Downloads,
+    DevTools,
 }
 
 pub enum Modal {
@@ -493,6 +523,7 @@ pub struct Shell {
     pub auth_tries: Vec<String>,
     pub find: FindBar,
     pub tools: ToolsUi,
+    pub dev: crate::devtools::DevUi,
     /// Закрытые вкладки — для Ctrl+Shift+T (последняя — в конце).
     pub closed: Vec<String>,
     pub quit: bool,

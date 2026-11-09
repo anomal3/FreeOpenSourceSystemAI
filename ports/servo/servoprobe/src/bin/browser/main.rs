@@ -17,6 +17,7 @@
 mod swgl_ctx;
 
 mod blocker;
+mod devtools;
 mod downloads;
 mod net;
 mod pages;
@@ -303,6 +304,7 @@ fn main() {
         page_cursor: std::cell::Cell::new(window::CursorShape::Arrow),
         blocker: blocker.clone(),
         downloads: downloads.clone(),
+        devlog: RefCell::new(devtools::DevLog::default()),
     });
     let draft_provider = vault.as_ref().and_then(|v| v.account().cloned());
     let mut shell = Shell {
@@ -339,6 +341,7 @@ fn main() {
         auth_tries: Vec::new(),
         find: Default::default(),
         tools: Default::default(),
+        dev: Default::default(),
         closed: Vec::new(),
         quit: false,
     };
@@ -501,6 +504,7 @@ fn main() {
                             (Some('h'), false) => Some(Action::Panel(Panel::History)),
                             (Some('j'), false) => Some(Action::Panel(Panel::Downloads)),
                             (Some('n'), true) => Some(Action::PrivateWindow),
+                            (Some('i' | 'j'), true) => Some(Action::Panel(Panel::DevTools)),
                             (Some('o' | 'b'), true) => Some(Action::Panel(Panel::Bookmarks)),
                             (Some('f'), false) => Some(Action::FindOpen),
                             (Some('g'), _) => Some(Action::Find { back: shift }),
@@ -538,6 +542,8 @@ fn main() {
                         Some(Action::Reload)
                     } else if named(20) {
                         Some(Action::Reader)
+                    } else if named(23) {
+                        Some(Action::Panel(Panel::DevTools))
                     } else if named(17) {
                         Some(Action::FocusAddress)
                     } else if named(21) {

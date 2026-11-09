@@ -379,6 +379,17 @@ fn patch_std(library: &Path) -> Result<()> {
     replace(&library.join("std/build.rs"), "        || target_os == \"vita\"\n", "        || target_os == \"vita\"\n        || target_os == \"freeos\"\n")?;
     // Случайные байты — getentropy() поверх SYS_RANDOM.
     replace(&std.join("sys/random/mod.rs"), "    target_os = \"emscripten\" => {", "    any(target_os = \"emscripten\", target_os = \"freeos\") => {")?;
+    // Число процессоров — sysconf(_SC_NPROCESSORS_ONLN) libc FreeOS (из
+    // SYS_SYSINFO). Без этого `available_parallelism` отвечал «Unsupported», и
+    // поток Canvas Servo (vello_cpu, `unwrap`) ронял браузер на любой странице
+    // с <canvas> (09.11.2026).
+    replace(
+        &std.join("sys/thread/unix.rs"),
+        "        _ => {\n            // FIXME: implement on l4re\n",
+        "        target_os = \"freeos\" => {\n            // _SC_NPROCESSORS_ONLN libc FreeOS (unistd.h).\n            match unsafe { libc::sysconf(139) } {\n                \
+         -1 => Err(io::Error::last_os_error()),\n                0 => Err(io::Error::UNKNOWN_THREAD_COUNT),\n                \
+         cpus => Ok(unsafe { NonZero::new_unchecked(cpus as usize) }),\n            }\n        }\n        _ => {\n            // FIXME: implement on l4re\n",
+    )?;
     // std::os::freeos.
     replace(
         &std.join("os/mod.rs"),

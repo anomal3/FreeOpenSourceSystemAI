@@ -175,5 +175,15 @@ pub fn prepare_dirs(fallback: Option<&std::path::Path>) -> std::path::PathBuf {
 pub fn preferences() -> servo::Preferences {
     let mut prefs = servo::Preferences::default();
     prefs.network_use_webpki_roots = true;
+    // Веб-приложения (PWA, Blazor — web.pynop.online, 09.11.2026) без проверки
+    // зовут `navigator.serviceWorker.register`, хранят данные в IndexedDB и
+    // следят за размерами элементов: в Servo эти части есть, но выключены.
+    prefs.dom_serviceworker_enabled = true;
+    prefs.dom_indexeddb_enabled = true;
+    prefs.dom_intersection_observer_enabled = true;
+    prefs.dom_resize_observer_enabled = true;
+    prefs.dom_crypto_subtle_enabled = true;
+    // GitHub: `document.adoptedStyleSheets` (без него скрипты страницы падают).
+    prefs.dom_adoptedstylesheet_enabled = true;
     prefs
 }

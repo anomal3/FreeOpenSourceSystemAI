@@ -11571,10 +11571,32 @@ WebRender на wgpu (не существует), softpipe (слишком мед
     (браузер ставит `TZ=Etc/GMT-3` до запуска Servo); общий **буфер обмена**
     — готовый `SYS_CLIPBOARD` (85) вместо своего. Сценарий `servo-window`:
     `timezone Etc/GMT-3`, `blocker 90 domains`, F9, Ctrl+J, окно инкогнито.
-  **Осталось честно:** MSE/видео и WebGL в самом движке (только передача в
-  Chromium), родной `O_APPEND` в libc, `TZ` для программ на C (libc его не
-  ставит), мост буфера обмена с Wayland-программами, OBSOS на телефоне (N11),
-  проверка синхронизации на настоящих аккаунтах (нужен вход Романа).
+  - **09.11, ночь — сайты с JS и WebAssembly (Роман: «на страницах с JS не
+    грузится», web.pynop.online):** поток Canvas Servo (vello_cpu) падал на
+    `available_parallelism` → Unsupported и ронял браузер на любой странице с
+    canvas — std для freeos берёт число процессоров из `sysconf` (правка в
+    `xtask/src/ruststd.rs`; `-Zbuild-std` правки исходников std сам не видит —
+    чистить `build/std` в `/cache/target-servo`); окно не разворачивалось —
+    ядро давало поверхность не больше 4 МиБ (1024×1024), теперь до размера
+    экрана (`window_max_bytes`); **JIT SpiderMonkey** (`js_jit`) — без него
+    нет WebAssembly: `freeos.patch` +память кода через `mprotect`
+    (`ProcessExecutableMemory`), ucontext FreeOS в `WasmSignalHandlers`, кеш
+    команд aarch64 (vixl); SIMD wasm требует SSE4.1 — у QEMU по умолчанию
+    (`qemu64`) его нет, сценарию `-cpu max`; потоковая компиляция wasm в
+    Servo теряет начало тела («magic number») — обработчик потока выключен
+    (`patch-servo.sh`), загрузчики берут `arrayBuffer`; включены префы
+    Service Worker, IndexedDB, IntersectionObserver, ResizeObserver,
+    WebCrypto, adoptedStyleSheets (GitHub). **DevTools** (F12, Ctrl+Shift+I/J:
+    консоль с вводом JS и ошибками страниц — они же в журнал системы, сеть,
+    DOM с `outerHTML` и подсветкой). Ctrl+L выделяет адрес. Сценарий
+    `obsos-web` (сеть QEMU): **Blazor-приложение web.pynop.online
+    стартует** (страница входа), ya.ru, github.com, F12, F5.
+  **Осталось честно:** сигналы для родных программ (трап wasm сейчас роняет
+  браузер целиком), GitHub без стилей (файлы с CDN githubassets не
+  грузятся — разобрать), картинки части сайтов (webp/avif?), MSE/видео и
+  WebGL, родной `O_APPEND` в libc, `TZ` для программ на C, мост буфера
+  обмена с Wayland, OBSOS на телефоне (N11), JIT на aarch64 не проверен,
+  синхронизация на настоящих аккаунтах (нужен вход Романа).
 
 Риски: корректность futex/TLS под нагрузкой Servo (у Redox именно это),
 сборка SpiderMonkey под новую ОС, скорость однопоточного swgl.
