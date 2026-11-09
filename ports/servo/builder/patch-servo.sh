@@ -54,6 +54,24 @@ if '__freeos__' not in s:
 EOF
 echo "servo-script = { path = \"/cache/src/$SCRIPT\" }" >> /tmp/patches.toml
 
+# servo-net: только HTTP/1.1. По HTTP/2 к одному CDN (github.githubassets.com)
+# часть потоков на FreeOS повисала: таблицы стилей оставались пустыми, GitHub
+# без вёрстки (09.11.2026). HTTP/1.1 — до шести соединений на сайт, как у
+# других браузеров.
+NET=servo-net-0.8.0
+if copy_crate $NET connector.rs; then
+    python3 - /cache/src/$NET <<'EOF'
+import sys
+p = sys.argv[1] + '/connector.rs'
+s = open(p, encoding='utf-8').read()
+old = '        .enable_http1()\n        .enable_http2()\n'
+assert old in s, p
+s = s.replace(old, '        // __freeos__: без HTTP/2 (patch-servo.sh).\n        .enable_http1()\n', 1)
+open(p, 'w', encoding='utf-8').write(s)
+EOF
+fi
+echo "servo-net = { path = \"/cache/src/$NET\" }" >> /tmp/patches.toml
+
 # servo-paint: WebRender очищает кэш картинок «квадратами» с тестом глубины
 # ALWAYS, а swgl (программный GL) умеет только LESS/LEQUAL — assert в
 # DepthFunc (gl.cc:1390), программа падала на первом кадре. На FreeOS рисует

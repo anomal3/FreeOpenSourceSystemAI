@@ -49,6 +49,8 @@ argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 sha2 = "0.10"
 # Проверка утечки пароля (Have I Been Pwned хранит SHA-1 префиксы).
 sha1 = "0.10"
+# Предупреждения и ошибки Servo (сеть, загрузка стилей) — в журнал системы.
+log = "0.4"
 getrandom = "0.4"
 
 [patch.crates-io]

@@ -231,7 +231,33 @@ fn tz_name(minutes: i32) -> String {
     }
 }
 
+/// Журнал Servo (`log`): предупреждения и ошибки — в журнал системы, по
+/// ним видно, почему не загрузился файл страницы. Не больше 400 строк за
+/// запуск — сайты бывают болтливы.
+struct Logger;
+
+static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl log::Log for Logger {
+    fn enabled(&self, meta: &log::Metadata) -> bool {
+        meta.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) || LOGGED.fetch_add(1, Ordering::Relaxed) >= 400 {
+            return;
+        }
+        let text: String = record.args().to_string().chars().take(300).collect();
+        println!("browser: log {} {}: {text}", record.level(), record.target());
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: Logger = Logger;
+
 fn main() {
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let t0 = Instant::now();
     println!("browser: start");
     let mut args = std::env::args().skip(1);
