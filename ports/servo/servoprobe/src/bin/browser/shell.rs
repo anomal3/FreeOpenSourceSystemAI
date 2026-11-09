@@ -265,7 +265,43 @@ pub enum Action {
     Zoom(f32),
     Panel(Panel),
     SyncNow(Option<String>),
+    /// Поиск на странице: открыть строку (Ctrl+F), следующее/предыдущее, закрыть.
+    FindOpen,
+    Find { back: bool },
+    FindClose,
     Quit,
+}
+
+/// Строка поиска на странице. В Servo своего поиска нет — ищет скрипт
+/// (`find_script`): подсвечивает совпадения `<mark>` и прокручивает к текущему.
+#[derive(Default)]
+pub struct FindBar {
+    pub open: bool,
+    pub text: String,
+    pub focus: bool,
+    /// «3/12» — ответ скрипта (пишет обратный вызов `evaluate_javascript`).
+    pub status: Rc<RefCell<String>>,
+}
+
+/// Скрипт поиска: `q` — строка (пусто — убрать подсветку), `back` — назад.
+pub fn find_script(q: &str, back: bool) -> String {
+    let mut quoted = String::new();
+    json::write_str(q, &mut quoted);
+    format!(
+        r#"(function(q,back){{var s=window.__obsosFind;
+if(!s||s.q!==q){{if(s){{s.marks.forEach(function(m){{var p=m.parentNode;if(p){{p.replaceChild(document.createTextNode(m.textContent),m);p.normalize();}}}});}}
+s={{q:q,marks:[],i:-1}};window.__obsosFind=s;
+if(q&&document.body){{var lq=q.toLowerCase(),w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null),nodes=[],n;
+while((n=w.nextNode())){{var t=n.parentNode&&n.parentNode.nodeName;if(t!=='SCRIPT'&&t!=='STYLE'&&t!=='TEXTAREA'&&n.nodeValue.toLowerCase().indexOf(lq)>=0)nodes.push(n);}}
+nodes.forEach(function(n){{var v=n.nodeValue,lv=v.toLowerCase(),pos=0,i,f=document.createDocumentFragment();
+while((i=lv.indexOf(lq,pos))>=0){{f.appendChild(document.createTextNode(v.slice(pos,i)));var m=document.createElement('mark');
+m.style.background='#ffd54a';m.style.color='#000';m.textContent=v.slice(i,i+q.length);f.appendChild(m);s.marks.push(m);pos=i+q.length;}}
+f.appendChild(document.createTextNode(v.slice(pos)));n.parentNode.replaceChild(f,n);}});}}}}
+if(!s.marks.length)return q?'0/0':'';
+if(s.i>=0)s.marks[s.i].style.background='#ffd54a';
+s.i=back?(s.i<=0?s.marks.length-1:s.i-1):(s.i+1)%s.marks.length;
+var m=s.marks[s.i];m.style.background='#ff8a3d';m.scrollIntoView({{block:'center'}});return (s.i+1)+'/'+s.marks.length;}})({quoted},{back})"#
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,6 +392,7 @@ pub struct Shell {
     /// Сколько раз уже подставили сохранённый HTTP-вход для адреса (чтобы не
     /// зациклиться на неверном).
     pub auth_tries: Vec<String>,
+    pub find: FindBar,
     pub quit: bool,
 }
 
@@ -426,7 +463,16 @@ impl Shell {
             notice_path: String::from("/opt/obsos/share/NOTICE.md"),
         };
         if let Ok(mut shared) = self.page_data.lock() {
+            if *shared == data {
+                return;
+            }
             *shared = data;
+        }
+        // Открытые «Новые вкладки» показывают старые плитки — перерисовать.
+        for tab in &self.tabs {
+            if tab.real_url.as_ref().is_some_and(|u| u.as_str().starts_with("obsos://newtab")) {
+                tab.webview.reload();
+            }
         }
     }
 
@@ -822,9 +868,34 @@ impl Shell {
                 }
             }
             Action::SyncNow(label) => self.sync_now(label),
+            Action::FindOpen => {
+                self.find.open = true;
+                self.find.focus = true;
+            }
+            Action::Find { back } => self.find_step(back),
+            Action::FindClose => {
+                self.find.open = false;
+                self.find.status.borrow_mut().clear();
+                if let Some(w) = self.active_view() {
+                    w.evaluate_javascript(find_script("", false), |_| {});
+                }
+            }
             Action::Quit => return false,
         }
         true
+    }
+
+    fn find_step(&mut self, back: bool) {
+        let Some(w) = self.active_view() else { return };
+        let status = self.find.status.clone();
+        w.evaluate_javascript(find_script(&self.find.text, back), move |result| {
+            let text = match result {
+                Ok(servo::JSValue::String(t)) => t,
+                _ => String::from("?"),
+            };
+            println!("browser: find {text}");
+            *status.borrow_mut() = text;
+        });
     }
 
     // ── Синхронизация ───────────────────────────────────────────────────

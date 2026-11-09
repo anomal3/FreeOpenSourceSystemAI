@@ -1,6 +1,6 @@
 //! OBSOS — Open Browser for System Open Source, браузер FreeOS на Servo.
 //!
-//! `obsos [--profile <имя>] [адрес]`
+//! `obsos [--profile <имя>] [--sync-folder <папка>] [адрес]`
 //!
 //! Окно стола FreeOS, страницу рисует swgl (программный OpenGL, `swgl_ctx`),
 //! оболочку — egui прямо в пиксели окна (`ui.rs`). Вкладки — `WebView`
@@ -9,7 +9,7 @@
 //! Диск, WebDAV, папка) — в отдельном потоке (`syncer.rs`), пароли — в
 //! зашифрованном хранилище (`vault.rs`).
 //!
-//! Клавиши: Ctrl+T/W/L/D/H/B/Q/Tab, Ctrl+Shift+S, F5, Alt+←/→, Ctrl+±/0 — масштаб.
+//! Клавиши: Ctrl+T/W/L/D/H/B/F/G/Q/Tab, Ctrl+Shift+S, F5, Alt+←/→, Ctrl+±/0 — масштаб.
 
 #[path = "../../swgl_ctx.rs"]
 mod swgl_ctx;
@@ -195,9 +195,15 @@ fn main() {
     println!("browser: start");
     let mut args = std::env::args().skip(1);
     let (mut profile_name, mut first_url) = (String::from("default"), None);
+    let mut sync_folder: Option<String> = None;
     while let Some(arg) = args.next() {
         if arg == "--profile" {
             profile_name = args.next().unwrap_or_default();
+        } else if arg == "--sync-folder" {
+            // Синхронизация в папку без панели — для стенда и для общей
+            // папки (флешка, сетевой диск): площадка проверяется,
+            // сохраняется в хранилище и включается, как из «Синхронизации».
+            sync_folder = args.next();
         } else {
             first_url = Some(arg);
         }
@@ -280,6 +286,7 @@ fn main() {
         show_passwords: Default::default(),
         new_profile: String::new(),
         auth_tries: Vec::new(),
+        find: Default::default(),
         quit: false,
     };
     if let Some(v) = &shell.vault {
@@ -312,6 +319,12 @@ fn main() {
         }
     }
     println!("browser: servo up in {:?}", t0.elapsed());
+    if let Some(dir) = sync_folder {
+        let mut account = browser_sync::remote::Account::new(browser_sync::remote::Provider::Folder);
+        account.repo = dir;
+        shell.sync.draft = account;
+        shell.check_account();
+    }
 
     let ctx = egui::Context::default();
     let mut look = shell.look().clone();
@@ -415,6 +428,8 @@ fn main() {
                             (Some('h'), _) => Some(Action::Panel(Panel::History)),
                             (Some('b'), _) => Some(Action::Panel(Panel::Bookmarks)),
                             (Some('q'), _) => Some(Action::Quit),
+                            (Some('f'), _) => Some(Action::FindOpen),
+                            (Some('g'), _) => Some(Action::Find { back: mask & 1 != 0 }),
                             (Some('s'), _) if mask & 1 != 0 => Some(Action::SyncNow(None)),
                             (_, 9) => Some(Action::Activate((shell.active + 1) % shell.tabs.len().max(1))),
                             (_, 43 | 61) => Some(Action::Zoom(1.1)),
@@ -428,14 +443,18 @@ fn main() {
                         Some(Action::Forward)
                     } else if ev.code == WIN_KEY_NAMED + 16 {
                         Some(Action::Reload)
-                    } else if ev.code == 27 && shell.panel.is_some() && !ctx.egui_wants_keyboard_input() {
+                    } else if ev.code == 27 && shell.find.open {
+                        Some(Action::FindClose)
+                    } else if ev.code == 27 && shell.panel.is_some() {
                         shell.panel = None;
+                        println!("browser: panel closed");
+                        ui_due = Some(Instant::now());
                         None
                     } else {
                         None
                     };
                     if let Some(action) = shortcut {
-                        println!("browser: shortcut");
+                        println!("browser: shortcut {action:?}");
                         if !shell.run(action, &window) {
                             break 'run;
                         }

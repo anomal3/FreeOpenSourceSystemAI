@@ -212,8 +212,47 @@ pub fn shell_ui(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     if let Some(panel) = shell.panel {
         drawer(&ctx, shell, panel, page, &p, actions);
     }
+    if shell.find.open {
+        find_bar(&ctx, shell, page, &p, actions);
+    }
     modal(&ctx, shell, page, &p, actions);
     toasts(&ctx, shell, page, &p);
+}
+
+/// Строка поиска на странице (Ctrl+F): справа сверху над страницей.
+fn find_bar(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, actions: &mut Vec<Action>) {
+    let id = egui::Id::new("obsos-find");
+    egui::Area::new(egui::Id::new("obsos-find-bar"))
+        .order(egui::Order::Foreground)
+        .anchor(Align2::RIGHT_TOP, vec2(-(ctx.content_rect().max.x - page.right()) - 12.0, page.top() + 8.0))
+        .show(ctx, |ui| {
+            egui::Frame::new().fill(p.toolbar).corner_radius(8).inner_margin(Margin::symmetric(10, 6)).stroke(Stroke::new(1.0_f32, p.accent)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let edit = ui.add(egui::TextEdit::singleline(&mut shell.find.text).id(id).hint_text("Найти на странице").desired_width(220.0));
+                    if shell.find.focus {
+                        edit.request_focus();
+                        shell.find.focus = false;
+                    }
+                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if enter {
+                        let back = ui.input(|i| i.modifiers.shift);
+                        actions.push(Action::Find { back });
+                        edit.request_focus();
+                    }
+                    let status = shell.find.status.borrow().clone();
+                    ui.label(RichText::new(if status == "0/0" { String::from("нет") } else { status }).small());
+                    if ui.small_button("Пред.").on_hover_text("Shift+Enter").clicked() {
+                        actions.push(Action::Find { back: true });
+                    }
+                    if ui.small_button("След.").on_hover_text("Enter, Ctrl+G").clicked() {
+                        actions.push(Action::Find { back: false });
+                    }
+                    if icon_button(ui, Icon::Close, true, "Закрыть (Esc)", p) {
+                        actions.push(Action::FindClose);
+                    }
+                });
+            });
+        });
 }
 
 fn sidebar(ui: &mut Ui, shell: &mut Shell, look: &Look, p: &Palette, actions: &mut Vec<Action>) {
@@ -562,6 +601,10 @@ fn menu(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
             actions.push(Action::Zoom(1.1));
         }
     });
+    if item(ui, "Найти на странице    Ctrl+F") {
+        actions.push(Action::FindOpen);
+        shell.panel = None;
+    }
     if item(ui, "Открыть страницу в Chromium") {
         actions.push(Action::Chromium(String::new()));
     }

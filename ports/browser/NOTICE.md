@@ -19,6 +19,8 @@ https://github.com/anomal3/FreeOpenSourceSystemAI
 | **ICU** (Intl в SpiderMonkey) | © Unicode, Inc. и участники | Unicode License v3 (`Unicode-3.0`) |
 | **ICU4X** (обёртки Intl в `mozjs_sys`) | © Unicode, Inc. и участники | Unicode-3.0 |
 | **egui** | © Emil Ernerfeldt и участники | MIT или Apache-2.0 |
+| **egui_software_backend** (с правкой FreeOS, `ports/servo/egui-software-backend`) | © DGriffin91 (github.com/DGriffin91) и участники | MIT или Apache-2.0 |
+| **RustCrypto**: `argon2`, `chacha20poly1305`, `sha2` (хранилище паролей) | © RustCrypto Developers | MIT или Apache-2.0 |
 | **zlib** (`libz-sys`) | © Jean-loup Gailly, Mark Adler | Zlib |
 | **HarfBuzz** (`harfbuzz-sys`) | © HarfBuzz contributors | MIT («Old MIT») |
 | **FreeType** (`freetype-sys`) | © The FreeType Project | FTL (BSD-подобная, с упоминанием) или GPL-2.0 — берём FTL |

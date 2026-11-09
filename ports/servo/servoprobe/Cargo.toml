@@ -46,6 +46,11 @@ argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 sha2 = "0.10"
 getrandom = "0.4"
 
+[patch.crates-io]
+# Холст egui не обновлялся, когда фигура исчезала (закрытая панель оставалась
+# поверх страницы) — копия с правкой, см. ports/servo/egui-software-backend/FREEOS.md.
+egui_software_backend = { path = "../egui-software-backend" }
+
 [profile.release]
 panic = "abort"
 debug = false

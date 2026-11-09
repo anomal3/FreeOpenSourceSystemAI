@@ -24,7 +24,7 @@ use servo::protocol_handler::{
 };
 
 /// Что страницам нужно знать об оболочке (обновляет главный поток).
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct PageData {
     pub bookmarks: Vec<(String, String)>,
     pub search_action: String,
