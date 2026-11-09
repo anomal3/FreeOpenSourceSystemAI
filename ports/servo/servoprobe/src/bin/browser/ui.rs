@@ -573,8 +573,8 @@ fn menu(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
         shell.panel = None;
     }
     for (panel, text) in [
-        (Panel::Bookmarks, "Закладки"),
-        (Panel::History, "История"),
+        (Panel::Bookmarks, "Закладки    Ctrl+Shift+O"),
+        (Panel::History, "История    Ctrl+H"),
         (Panel::Passwords, "Пароли"),
         (Panel::RemoteTabs, "Вкладки других устройств"),
         (Panel::Sync, "Синхронизация"),
@@ -612,7 +612,7 @@ fn menu(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
         actions.push(Action::NewTabUrl(String::from("obsos://about")));
         shell.panel = None;
     }
-    if item(ui, "Выход    Ctrl+Q") {
+    if item(ui, "Выход    Ctrl+Shift+Q") {
         actions.push(Action::Quit);
     }
     ui.separator();

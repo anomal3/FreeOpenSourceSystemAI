@@ -9,7 +9,9 @@
 //! Диск, WebDAV, папка) — в отдельном потоке (`syncer.rs`), пароли — в
 //! зашифрованном хранилище (`vault.rs`).
 //!
-//! Клавиши: Ctrl+T/W/L/D/H/B/F/G/Q/Tab, Ctrl+Shift+S, F5, Alt+←/→, Ctrl+±/0 — масштаб.
+//! Клавиши — раскладка Chromium (Ctrl+T/W/L/D/H/F/G/R, Ctrl+Shift+T/O/Q,
+//! Ctrl+1..9, Ctrl+Tab, Alt+←/→/Home, F3/F5/F6/F10, Ctrl±/0) и своя
+//! Ctrl+Shift+S — синхронизировать.
 
 #[path = "../../swgl_ctx.rs"]
 mod swgl_ctx;
@@ -287,6 +289,7 @@ fn main() {
         new_profile: String::new(),
         auth_tries: Vec::new(),
         find: Default::default(),
+        closed: Vec::new(),
         quit: false,
     };
     if let Some(v) = &shell.vault {
@@ -353,9 +356,12 @@ fn main() {
                 WIN_CLOSE => break 'run,
                 WIN_RESIZE => {
                     let (w, h) = (ev.x.max(1) as u32, ev.y.max(1) as u32);
+                    println!("browser: resize asked {w}x{h}");
                     if window.resize(w, h) {
                         shell.resize_all(&window);
                         println!("browser: resized {w}x{h}");
+                    } else {
+                        println!("browser: resize to {w}x{h} failed: {}", std::io::Error::last_os_error());
                     }
                 }
                 WIN_MOVE => {
@@ -416,33 +422,67 @@ fn main() {
                 WIN_KEY | WIN_KEYUP => {
                     let pressed = ev.kind == WIN_KEY;
                     mask = ev.x;
-                    let (ctrl, alt) = (mask & 2 != 0, mask & 4 != 0);
+                    let (shift, ctrl, alt) = (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
+                    // `y` — латинский знак физической клавиши (ядро, user-abi). По
+                    // нему, а не по коду, узнаются сочетания: Ctrl+H и
+                    // Ctrl+Backspace приходят одним кодом 8, а Ctrl+буква в
+                    // русской раскладке — латинской клавишей.
+                    let latin = char::from_u32(ev.y as u32).filter(|c| c.is_ascii_graphic()).map(|c| c.to_ascii_lowercase());
+                    let letter = if ctrl || alt { latin.filter(|c| c.is_ascii_alphanumeric()) } else { None };
+                    let named = |n: u32| ev.code == WIN_KEY_NAMED + n;
+                    let tabs = shell.tabs.len().max(1);
+                    // Раскладка Chromium (Linux).
                     let shortcut = if !pressed || blocked {
                         None
                     } else if ctrl {
-                        match (letter_of(ev.code), ev.code) {
-                            (Some('t'), _) => Some(Action::NewTab),
-                            (Some('w'), _) => Some(Action::Close(shell.active)),
-                            (Some('l'), _) => Some(Action::FocusAddress),
-                            (Some('d'), _) => Some(Action::ToggleBookmark),
-                            (Some('h'), _) => Some(Action::Panel(Panel::History)),
-                            (Some('b'), _) => Some(Action::Panel(Panel::Bookmarks)),
-                            (Some('q'), _) => Some(Action::Quit),
-                            (Some('f'), _) => Some(Action::FindOpen),
-                            (Some('g'), _) => Some(Action::Find { back: mask & 1 != 0 }),
-                            (Some('s'), _) if mask & 1 != 0 => Some(Action::SyncNow(None)),
-                            (_, 9) => Some(Action::Activate((shell.active + 1) % shell.tabs.len().max(1))),
-                            (_, 43 | 61) => Some(Action::Zoom(1.1)),
-                            (_, 45) => Some(Action::Zoom(1.0 / 1.1)),
-                            (_, 48) => Some(Action::Zoom(0.0)),
+                        match (letter.or(latin), shift) {
+                            (Some('t'), false) => Some(Action::NewTab),
+                            (Some('t'), true) => Some(Action::Reopen),
+                            (Some('w'), false) => Some(Action::Close(shell.active)),
+                            (Some('l' | 'k' | 'e'), false) => Some(Action::FocusAddress),
+                            (Some('d'), false) => Some(Action::ToggleBookmark),
+                            (Some('h'), false) => Some(Action::Panel(Panel::History)),
+                            (Some('o' | 'b'), true) => Some(Action::Panel(Panel::Bookmarks)),
+                            (Some('f'), false) => Some(Action::FindOpen),
+                            (Some('g'), _) => Some(Action::Find { back: shift }),
+                            (Some('r'), _) => Some(Action::Reload),
+                            (Some('q'), true) => Some(Action::Quit),
+                            (Some('s'), true) => Some(Action::SyncNow(None)),
+                            (Some(d @ '1'..='8'), false) => {
+                                let n = d as usize - '1' as usize;
+                                (n < shell.tabs.len()).then_some(Action::Activate(n))
+                            }
+                            (Some('9'), false) => Some(Action::Activate(tabs - 1)),
+                            (Some('=' | '+'), _) => Some(Action::Zoom(1.1)),
+                            (Some('-'), _) => Some(Action::Zoom(1.0 / 1.1)),
+                            (Some('0'), false) => Some(Action::Zoom(0.0)),
+                            _ if ev.code == 9 || named(8) => {
+                                // Ctrl+Tab / Ctrl+PgDn — следующая, с Shift и Ctrl+PgUp — предыдущая.
+                                let back = (ev.code == 9 && shift) || named(7);
+                                Some(Action::Activate(if back { (shell.active + tabs - 1) % tabs } else { (shell.active + 1) % tabs }))
+                            }
+                            _ if named(7) => Some(Action::Activate((shell.active + tabs - 1) % tabs)),
+                            _ if named(15) => Some(Action::Close(shell.active)),
+                            _ if named(9) && shift => Some(Action::Panel(Panel::History)),
                             _ => None,
                         }
-                    } else if alt && ev.code == WIN_KEY_NAMED + 1 {
-                        Some(Action::Back)
-                    } else if alt && ev.code == WIN_KEY_NAMED + 2 {
-                        Some(Action::Forward)
-                    } else if ev.code == WIN_KEY_NAMED + 16 {
+                    } else if alt {
+                        match letter {
+                            Some('d') => Some(Action::FocusAddress),
+                            Some('f' | 'e') => Some(Action::Panel(Panel::Menu)),
+                            _ if named(1) => Some(Action::Back),
+                            _ if named(2) => Some(Action::Forward),
+                            _ if named(5) => Some(Action::Home),
+                            _ => None,
+                        }
+                    } else if named(16) {
                         Some(Action::Reload)
+                    } else if named(17) {
+                        Some(Action::FocusAddress)
+                    } else if named(21) {
+                        Some(Action::Panel(Panel::Menu))
+                    } else if named(14) {
+                        Some(if shell.find.open { Action::Find { back: shift } } else { Action::FindOpen })
                     } else if ev.code == 27 && shell.find.open {
                         Some(Action::FindClose)
                     } else if ev.code == 27 && shell.panel.is_some() {
@@ -462,14 +502,14 @@ fn main() {
                     }
                     let to_shell = blocked || shell.focus_address || ctx.egui_wants_keyboard_input();
                     if to_shell {
-                        // Буфер обмена OBSOS: Ctrl+V в поле оболочки.
-                        if pressed && ctrl && letter_of(ev.code) == Some('v') {
+                        // Буфер обмена OBSOS: Ctrl+V/C/X в поле оболочки.
+                        if pressed && ctrl && letter == Some('v') {
                             events.push(egui::Event::Paste(shell.delegate.clipboard.borrow().clone()));
-                        } else if pressed && ctrl && letter_of(ev.code) == Some('c') {
+                        } else if pressed && ctrl && letter == Some('c') {
                             events.push(egui::Event::Copy);
-                        } else if pressed && ctrl && letter_of(ev.code) == Some('x') {
+                        } else if pressed && ctrl && letter == Some('x') {
                             events.push(egui::Event::Cut);
-                        } else if let Some(key) = egui_key(ev.code) {
+                        } else if let Some(key) = letter.and_then(|l| egui::Key::from_name(&l.to_ascii_uppercase().to_string())).or_else(|| egui_key(ev.code)) {
                             events.push(egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: egui_modifiers(mask) });
                         }
                         let printable = ev.code < WIN_KEY_NAMED && ev.code >= 32 && ev.code != 127;
@@ -478,11 +518,18 @@ fn main() {
                                 events.push(egui::Event::Text(c.to_string()));
                             }
                         }
-                    } else if let (Some(w), Some(key)) = (&view, servo_key(ev.code)) {
-                        let state = if pressed { KeyState::Down } else { KeyState::Up };
-                        let mut event = KeyboardEvent::from_state_and_key(state, key);
-                        event.event.modifiers = servo_modifiers(mask);
-                        w.notify_input_event(InputEvent::Keyboard(event));
+                    } else if let Some(w) = &view {
+                        // Ctrl+буква — странице буквой (Ctrl+A, Ctrl+C в полях сайта).
+                        let key = match letter {
+                            Some(l) if ctrl => Some(Key::Character(l.to_string())),
+                            _ => servo_key(ev.code),
+                        };
+                        if let Some(key) = key {
+                            let state = if pressed { KeyState::Down } else { KeyState::Up };
+                            let mut event = KeyboardEvent::from_state_and_key(state, key);
+                            event.event.modifiers = servo_modifiers(mask);
+                            w.notify_input_event(InputEvent::Keyboard(event));
+                        }
                     }
                 }
                 _ => {}

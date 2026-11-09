@@ -268,6 +268,10 @@ pub enum Action {
     /// Поиск на странице: открыть строку (Ctrl+F), следующее/предыдущее, закрыть.
     FindOpen,
     Find { back: bool },
+    /// Вернуть последнюю закрытую вкладку (Ctrl+Shift+T).
+    Reopen,
+    /// Домашняя страница в текущей вкладке (Alt+Home).
+    Home,
     FindClose,
     Quit,
 }
@@ -393,6 +397,8 @@ pub struct Shell {
     /// зациклиться на неверном).
     pub auth_tries: Vec<String>,
     pub find: FindBar,
+    /// Закрытые вкладки — для Ctrl+Shift+T (последняя — в конце).
+    pub closed: Vec<String>,
     pub quit: bool,
 }
 
@@ -531,7 +537,13 @@ impl Shell {
         if index >= self.tabs.len() {
             return true;
         }
-        self.tabs.remove(index);
+        let tab = self.tabs.remove(index);
+        if let Some(url) = tab.real_url {
+            self.closed.push(url.to_string());
+            if self.closed.len() > 25 {
+                self.closed.remove(0);
+            }
+        }
         println!("browser: tab {} closed ({} open)", index + 1, self.tabs.len());
         if self.tabs.is_empty() {
             return false;
@@ -547,6 +559,9 @@ impl Shell {
 
     pub fn resize_all(&self, window: &Window) {
         let size = page_size(self.look(), window.width.get(), window.height.get());
+        // Холст swgl Servo меняет сам (`resize_rendering_context`) и, если
+        // холст уже нужного размера, пропускает перестройку WebRender, —
+        // поэтому трогать его здесь нельзя.
         for tab in &self.tabs {
             tab.webview.resize(size);
         }
@@ -868,6 +883,17 @@ impl Shell {
                 }
             }
             Action::SyncNow(label) => self.sync_now(label),
+            Action::Reopen => {
+                if let Some(url) = self.closed.pop() {
+                    if let Ok(url) = url::Url::parse(&url) {
+                        self.new_tab(url, window);
+                    }
+                }
+            }
+            Action::Home => {
+                let home = self.home_url();
+                self.load(home);
+            }
             Action::FindOpen => {
                 self.find.open = true;
                 self.find.focus = true;

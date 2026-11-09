@@ -7140,10 +7140,11 @@ pub const ALL: &[Scenario] = &[
             Step::Await("browser: load status Complete", 120_000),
             Step::Wait(4_000),
             Step::Painted("servo-window-notice"),
-            // Ctrl+D — закладка (журнал операций профиля), Ctrl+B — панель закладок.
+            // Ctrl+D — закладка (журнал операций профиля), Ctrl+Shift+O — панель
+            // закладок (раскладка Chromium).
             Step::Key("ctrl-d"),
             Step::Await("browser: bookmark added obsos://view?path=", 20_000),
-            Step::Key("ctrl-b"),
+            Step::Key("ctrl-shift-o"),
             Step::Await("browser: shortcut Panel(Bookmarks)", 10_000),
             Step::Wait(3_000),
             Step::Painted("servo-window-bookmarks"),
@@ -7177,8 +7178,14 @@ pub const ALL: &[Scenario] = &[
             Step::Await("browser: tab 1 active", 20_000),
             Step::Wait(3_000),
             Step::Painted("servo-window-tab1"),
-            Step::Aim(Aim::Close("OBSOS — Браузер")),
+            // Развернуть окно: оболочка и страница занимают весь экран.
+            Step::Aim(Aim::Maximize("OBSOS — Браузер")),
             Step::Click,
+            Step::Await("browser: resized ", 20_000),
+            Step::Wait(4_000),
+            Step::Painted("servo-window-max"),
+            // Прицел стенда помнит прежнюю рамку — выход клавишами Chromium.
+            Step::Key("ctrl-shift-q"),
             Step::Await("browser: closed", 60_000),
             // Значок OBSOS в «Пуске» (поле `icon` манифеста, 08.11.2026).
             Step::Wait(1_000),
