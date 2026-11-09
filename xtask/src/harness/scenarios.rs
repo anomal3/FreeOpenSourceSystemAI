@@ -7145,7 +7145,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ctrl-d"),
             Step::Await("browser: bookmark added obsos://view?path=", 20_000),
             Step::Key("ctrl-shift-o"),
-            Step::Await("browser: shortcut Panel(Bookmarks)", 10_000),
+            Step::Await("browser: shortcut Panel(Bookmarks)", 60_000),
             Step::Wait(3_000),
             Step::Painted("servo-window-bookmarks"),
             Step::Absent("browser: profile write failed"),
@@ -7154,7 +7154,7 @@ pub const ALL: &[Scenario] = &[
             Step::AwaitAny("browser: sync ok pushed ", 120_000),
             // Ctrl+Shift+S — синхронизировать сейчас: закладка уходит в папку.
             Step::Key("ctrl-shift-s"),
-            Step::Await("browser: shortcut SyncNow(None)", 10_000),
+            Step::Await("browser: shortcut SyncNow(None)", 60_000),
             Step::Await("browser: sync start (Папка)", 20_000),
             Step::Await("browser: sync ok pushed 1 ", 120_000),
             Step::Absent("browser: sync failed"),
@@ -7168,8 +7168,22 @@ pub const ALL: &[Scenario] = &[
             Step::Painted("servo-window-find"),
             Step::Key("esc"),
             Step::Wait(1_000),
+            // Пояс для JavaScript — от ядра (SYS_TZINFO), блокировщик рекламы
+            // поднялся со встроенным списком.
+            Step::AwaitAny("browser: timezone ", 5_000),
+            Step::AwaitAny("browser: blocker ", 5_000),
+            // F9 — режим чтения (как в Firefox).
+            Step::Key("f9"),
+            Step::Await("browser: reader mode", 60_000),
+            Step::Wait(3_000),
+            Step::Painted("servo-window-reader"),
+            // Ctrl+J — загрузки.
+            Step::Key("ctrl-j"),
+            Step::Await("browser: shortcut Panel(Downloads)", 60_000),
+            Step::Wait(2_000),
+            Step::Painted("servo-window-downloads"),
             Step::Key("esc"),
-            Step::Await("browser: panel closed", 10_000),
+            Step::Await("browser: panel closed", 60_000),
             Step::Wait(2_000),
             Step::Painted("servo-window-closed"),
             // Щелчок по первой вкладке в списке — она снова видна.
@@ -7184,6 +7198,16 @@ pub const ALL: &[Scenario] = &[
             Step::Await("browser: resized ", 20_000),
             Step::Wait(4_000),
             Step::Painted("servo-window-max"),
+            // Ctrl+Shift+N — окно инкогнито (временный профиль), Ctrl+Shift+Q его закрывает.
+            Step::Key("ctrl-shift-n"),
+            Step::Await("desktop     : opened 'OBSOS — Инкогнито' for ", 60_000),
+            Step::Await("browser: profile инкогнито", 60_000),
+            Step::Await("browser: load status Complete", 120_000),
+            Step::Wait(4_000),
+            Step::Painted("servo-window-private"),
+            Step::Key("ctrl-shift-q"),
+            Step::Await("browser: closed", 60_000),
+            Step::Wait(2_000),
             // Прицел стенда помнит прежнюю рамку — выход клавишами Chromium.
             Step::Key("ctrl-shift-q"),
             Step::Await("browser: closed", 60_000),

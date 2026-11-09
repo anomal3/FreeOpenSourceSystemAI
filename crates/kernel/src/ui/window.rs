@@ -305,6 +305,8 @@ pub struct ProgramView {
     /// [`user_abi::SYS_WINSTYLE`] и тем самым обещала отвечать на
     /// [`user_abi::WIN_RESIZE`].
     resizable: bool,
+    /// Форма указателя над содержимым (09.11.2026, [`user_abi::SYS_WINCURSOR`]).
+    cursor: super::pointer::Shape,
     /// Размер содержимого, о котором стол последним попросил программу, пока
     /// она не ответила. См. [`Window::replace_pixels`].
     asked: Option<(u32, u32)>,
@@ -512,6 +514,7 @@ impl Window {
         let content = Content::Program(ProgramView {
             pixels,
             resizable: false,
+            cursor: super::pointer::Shape::Arrow,
             asked: None,
             events: VecDeque::new(),
         });
@@ -529,6 +532,7 @@ impl Window {
         let content = Content::Program(ProgramView {
             pixels,
             resizable: false,
+            cursor: super::pointer::Shape::Arrow,
             asked: None,
             events: VecDeque::new(),
         });
@@ -720,6 +724,22 @@ impl Window {
         match &self.content {
             Content::Program(view) => view.resizable,
             _ => self.app.resizable(),
+        }
+    }
+
+    /// Форма указателя над содержимым окна программы; у окон ядра — `None`.
+    #[must_use]
+    pub fn program_cursor(&self) -> Option<super::pointer::Shape> {
+        match &self.content {
+            Content::Program(view) => Some(view.cursor),
+            _ => None,
+        }
+    }
+
+    /// Запомнить форму указателя, которую просит программа (09.11.2026).
+    pub fn set_program_cursor(&mut self, shape: super::pointer::Shape) {
+        if let Content::Program(view) = &mut self.content {
+            view.cursor = shape;
         }
     }
 

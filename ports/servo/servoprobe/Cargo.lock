@@ -6471,6 +6471,7 @@ dependencies = [
  "ipc-channel",
  "rustls",
  "servo",
+ "sha1 0.10.7",
  "sha2",
  "surfman",
  "swgl",

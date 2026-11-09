@@ -319,6 +319,65 @@ pub fn markdown(text: &str) -> String {
     out
 }
 
+/// Режим чтения: найти основной текст страницы (блок с наибольшим текстом
+/// абзацев при малой доле ссылок), выбросить меню, рекламу, формы и
+/// оформление сайта, показать статью спокойным шрифтом. Повторно — вернуть
+/// страницу (перезагрузка).
+pub const READER_SCRIPT: &str = r#"(function(){
+if (window.__obsosReader) { location.reload(); return 'off'; }
+var scored = [], best = null, bestScore = 0;
+var nodes = document.querySelectorAll('article, main, [role=main], section, div, td');
+for (var i = 0; i < nodes.length; i++) {
+  var el = nodes[i], ps = el.querySelectorAll('p'), text = 0;
+  for (var j = 0; j < ps.length; j++) text += ps[j].textContent.trim().length;
+  if (text < 200) continue;
+  var all = el.textContent.length || 1, links = 0, as = el.querySelectorAll('a');
+  for (var k = 0; k < as.length; k++) links += as[k].textContent.length;
+  var score = text * (1 - Math.min(0.9, links / all));
+  if (el.tagName == 'ARTICLE' || el.getAttribute('role') == 'main' || el.tagName == 'MAIN') score *= 1.3;
+  scored.push([el, score]);
+  if (score > bestScore) { best = el; bestScore = score; }
+}
+// Предок лучшего блока набирает почти столько же — взять самый узкий блок,
+// в котором почти весь текст.
+for (var d = 0; best && d < scored.length; d++) {
+  if (scored[d][0] !== best && best.contains(scored[d][0]) && scored[d][1] >= 0.85 * bestScore) best = scored[d][0];
+}
+if (!best) best = document.body;
+var content = best.cloneNode(true);
+var junk = content.querySelectorAll('script, style, noscript, iframe, nav, aside, form, button, input, select, textarea, footer, [role=navigation], [role=complementary], [aria-hidden=true]');
+for (var m = 0; m < junk.length; m++) if (junk[m].parentNode) junk[m].parentNode.removeChild(junk[m]);
+var every = content.querySelectorAll('*');
+for (var n = 0; n < every.length; n++) {
+  var a = every[n].attributes;
+  for (var q = a.length - 1; q >= 0; q--) {
+    var name = a[q].name;
+    if (name == 'style' || name == 'class' || name == 'id' || name.indexOf('on') == 0 || name == 'width' || name == 'height') every[n].removeAttribute(name);
+  }
+}
+var title = (document.querySelector('h1') || {}).textContent || document.title || '';
+var sheets = document.querySelectorAll('link[rel=stylesheet], style');
+for (var t = 0; t < sheets.length; t++) sheets[t].parentNode.removeChild(sheets[t]);
+var style = document.createElement('style');
+style.textContent = 'html{background:#f6f1e7}body{max-width:44em;margin:0 auto;padding:2.2em 1.4em 4em;font:19px/1.7 Georgia,"DejaVu Serif",serif;color:#2b2a27;background:#f6f1e7}' +
+  'h1{font:700 1.9em/1.25 "DejaVu Sans",sans-serif;margin:.2em 0 .8em}h2,h3{font-family:"DejaVu Sans",sans-serif;line-height:1.3}' +
+  'img,video,figure{max-width:100%;height:auto}figure{margin:1.2em 0}figcaption{font-size:.8em;color:#6b665d}' +
+  'a{color:#1b5fae}pre,code{font-size:.85em;white-space:pre-wrap;background:#ece5d8;border-radius:4px;padding:.1em .3em}' +
+  'blockquote{margin:1em 0;padding-left:1em;border-left:3px solid #c9bfae;color:#4d4a44}table{border-collapse:collapse}td,th{border:1px solid #d6cdbd;padding:.3em .5em}' +
+  '.obsos-reader-src{font:13px sans-serif;color:#8a8478;margin-bottom:1.5em}';
+document.head.appendChild(style);
+var body = document.body;
+while (body.firstChild) body.removeChild(body.firstChild);
+var h = document.createElement('h1'); h.textContent = title.trim(); body.appendChild(h);
+var src = document.createElement('div'); src.className = 'obsos-reader-src'; src.textContent = location.hostname + ' · режим чтения (ещё раз — выйти)'; body.appendChild(src);
+var firstH1 = content.querySelector('h1'); if (firstH1 && firstH1.textContent.trim() == title.trim()) firstH1.parentNode.removeChild(firstH1);
+body.appendChild(content);
+body.removeAttribute('class'); body.removeAttribute('style'); document.documentElement.removeAttribute('class'); document.documentElement.removeAttribute('style');
+window.__obsosReader = 1;
+window.scrollTo(0, 0);
+return 'on';
+})()"#;
+
 fn view_file(d: &PageData, path: &str) -> (u16, String) {
     let shown = escape(path);
     match std::fs::read(path) {

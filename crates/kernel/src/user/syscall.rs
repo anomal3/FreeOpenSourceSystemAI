@@ -195,6 +195,10 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_WINRESIZE => winresize(a0 as i64, a1),
         // Фаза 62b: окно говорит, что умеет, — размер у него меняет человек.
         user_abi::SYS_WINSTYLE => winstyle(a0 as i64, a1),
+        // 09.11.2026: форма указателя над окном (браузер: ссылки, поля).
+        user_abi::SYS_WINCURSOR => wincursor(a0 as i64, a1),
+        // 09.11.2026: часовой пояс для программ (JavaScript `Date`).
+        user_abi::SYS_TZINFO => i64::from(crate::time::offset_minutes()),
         // Фаза 62c: заголовок окна меняется на ходу.
         user_abi::SYS_WINTITLE => wintitle(a0 as i64, a1, a2),
         // Фаза 62d: у окна есть владелец.
@@ -2255,6 +2259,28 @@ fn winresize(id: i64, size: usize) -> i64 {
     let (w, h) = ((size >> 32) as u32, (size & 0xffff_ffff) as u32);
     match super::resize_window(slot, w, h) {
         Ok(base) => base as i64,
+        Err(err) => window_errno(err),
+    }
+}
+
+/// `wincursor(id, форма) -> 0` (09.11.2026).
+fn wincursor(id: i64, shape: usize) -> i64 {
+    let slot = match own_window(id) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
+    let shape = match shape {
+        user_abi::WIN_CURSOR_ARROW => crate::ui::pointer::Shape::Arrow,
+        user_abi::WIN_CURSOR_TEXT => crate::ui::pointer::Shape::Text,
+        user_abi::WIN_CURSOR_HAND => crate::ui::pointer::Shape::Hand,
+        user_abi::WIN_CURSOR_MOVE => crate::ui::pointer::Shape::Move,
+        user_abi::WIN_CURSOR_NOT_ALLOWED => crate::ui::pointer::Shape::NotAllowed,
+        user_abi::WIN_CURSOR_RESIZE_EW => crate::ui::pointer::Shape::ResizeEw,
+        user_abi::WIN_CURSOR_RESIZE_NS => crate::ui::pointer::Shape::ResizeNs,
+        _ => return ERR_UNSUPPORTED,
+    };
+    match super::cursor_window(slot, shape) {
+        Ok(()) => 0,
         Err(err) => window_errno(err),
     }
 }

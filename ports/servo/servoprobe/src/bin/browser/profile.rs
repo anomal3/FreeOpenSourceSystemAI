@@ -196,6 +196,8 @@ pub struct Settings {
     pub home: String,
     pub restore_session: bool,
     pub save_passwords: bool,
+    /// Блокировать рекламу и трекеры (`blocker.rs`).
+    pub block_ads: bool,
     pub autofill: bool,
     pub sync_auto: bool,
     /// Минуты между автоматическими синхронизациями.
@@ -221,6 +223,7 @@ impl Settings {
             home: String::from("obsos://newtab"),
             restore_session: true,
             save_passwords: true,
+            block_ads: true,
             autofill: true,
             sync_auto: true,
             sync_every_min: 15,
@@ -239,6 +242,7 @@ impl Settings {
             ("home".into(), Value::Str(self.home.clone())),
             ("restore_session".into(), Value::Bool(self.restore_session)),
             ("save_passwords".into(), Value::Bool(self.save_passwords)),
+            ("block_ads".into(), Value::Bool(self.block_ads)),
             ("autofill".into(), Value::Bool(self.autofill)),
             ("sync_auto".into(), Value::Bool(self.sync_auto)),
             ("sync_every_min".into(), Value::Num(self.sync_every_min.to_string())),
@@ -278,6 +282,7 @@ impl Settings {
         }
         s.restore_session = flag("restore_session", s.restore_session);
         s.save_passwords = flag("save_passwords", s.save_passwords);
+        s.block_ads = flag("block_ads", s.block_ads);
         s.autofill = flag("autofill", s.autofill);
         s.sync_auto = flag("sync_auto", s.sync_auto);
         s.sync_every_min = num("sync_every_min", s.sync_every_min).clamp(1, 24 * 60);
@@ -320,6 +325,9 @@ pub struct Profile {
     pub logins: BTreeMap<String, Login>,
     /// Записей паролей, зашифрованных чужим ключом.
     pub foreign_logins: usize,
+    /// Окно инкогнито: профиль во временном каталоге, история и сеанс не
+    /// пишутся, при закрытии каталог стирается.
+    pub private: bool,
 }
 
 fn read_json_field(v: &Value, key: &str) -> String {
@@ -363,10 +371,42 @@ impl Profile {
             history: Vec::new(),
             logins: BTreeMap::new(),
             foreign_logins: 0,
+            private: false,
         };
         profile.save_settings();
         profile.compact_if_large();
         profile.reload();
+        profile
+    }
+
+    /// Профиль инкогнито: оформление и поиск — как у обычного, всё остальное
+    /// с нуля во временном каталоге (`~/.cache/obsos/private-<номер>`).
+    pub fn open_private() -> Profile {
+        let home = Self::root().parent().and_then(|p| p.parent()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/home"));
+        let dir = home.join(".cache").join("obsos").join(format!("private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("sync"));
+        let mut settings = std::fs::read_to_string(Self::root().join("default").join("settings.json"))
+            .ok()
+            .and_then(|t| Settings::parse(&t))
+            .unwrap_or_else(|| Settings::default_for(Settings::new_device()));
+        settings.device = Settings::new_device();
+        settings.restore_session = false;
+        settings.save_passwords = false;
+        settings.sync_auto = false;
+        let replica = Replica::new(DirStore::new(dir.join("sync")), &settings.device);
+        let profile = Profile {
+            name: String::from("инкогнито"),
+            dir,
+            settings,
+            replica,
+            bookmarks: Vec::new(),
+            history: Vec::new(),
+            logins: BTreeMap::new(),
+            foreign_logins: 0,
+            private: true,
+        };
+        profile.save_settings();
         profile
     }
 
@@ -489,7 +529,7 @@ impl Profile {
 
     /// Посещение (страница загрузилась). Внутренние страницы не пишутся.
     pub fn visit(&mut self, url: &str, title: &str) {
-        if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://")) {
+        if self.private || !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://")) {
             return;
         }
         let now = now_ms();
@@ -582,6 +622,9 @@ impl Profile {
     // ── Сессия ──────────────────────────────────────────────────────────
 
     pub fn save_session(&self, urls: &[String], active: usize) {
+        if self.private {
+            return;
+        }
         let v = Value::Obj(vec![
             ("tabs".into(), Value::Arr(urls.iter().map(|u| Value::Str(u.clone())).collect())),
             ("active".into(), Value::Num(active.to_string())),

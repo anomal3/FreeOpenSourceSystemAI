@@ -200,6 +200,235 @@ impl Http for Client {
     }
 }
 
+/// Скачать файл в каталог (загрузки браузера): потоком, с ходом
+/// `progress(получено, всего)`, отменой `cancel`. Имя — из
+/// `Content-Disposition`, иначе из адреса; пишется в `<имя>.part`, готовое
+/// переименовывается. Возвращает путь готового файла.
+pub fn download(
+    url: &str,
+    dir: &std::path::Path,
+    progress: &dyn Fn(u64, Option<u64>, &str),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<std::path::PathBuf, String> {
+    use std::sync::atomic::Ordering;
+    let mut current = url.to_string();
+    for _ in 0..6 {
+        let target = parse_target(&current)?;
+        let head = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept-Encoding: identity\r\nUser-Agent: Mozilla/5.0 (X11; FreeOS) OBSOS/0.1\r\nAccept: */*\r\n\r\n",
+            target.path, target.host
+        );
+        let tcp = connect(&target)?;
+        let mut stream: Box<dyn Read> = if target.tls {
+            let name = rustls::pki_types::ServerName::try_from(target.host.clone()).map_err(|e| format!("имя сервера: {e}"))?;
+            let conn = rustls::ClientConnection::new(tls_config(), name).map_err(|e| format!("TLS: {e}"))?;
+            let mut s = rustls::StreamOwned::new(conn, tcp);
+            s.write_all(head.as_bytes()).and_then(|_| s.flush()).map_err(|e| format!("TLS {}: {e}", target.host))?;
+            Box::new(s)
+        } else {
+            let mut s = tcp;
+            s.write_all(head.as_bytes()).map_err(|e| format!("отправка: {e}"))?;
+            Box::new(s)
+        };
+        // Заголовки.
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 32 * 1024];
+        let head_end = loop {
+            if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i;
+            }
+            let n = read_some(&mut *stream, &mut buf)?;
+            if n == 0 {
+                return Err(String::from("сервер закрыл соединение до заголовков"));
+            }
+            raw.extend_from_slice(&buf[..n]);
+            if raw.len() > 256 * 1024 {
+                return Err(String::from("заголовки ответа слишком длинные"));
+            }
+        };
+        let head_text = String::from_utf8_lossy(&raw[..head_end]).to_string();
+        let mut rest = raw[head_end + 4..].to_vec();
+        let mut lines = head_text.split("\r\n");
+        let status: u16 = lines.next().and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse().ok()).ok_or("строка статуса")?;
+        let headers: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))).collect();
+        let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            let location = header("location").ok_or("перенаправление без адреса")?;
+            current = if location.starts_with("http://") || location.starts_with("https://") {
+                location
+            } else {
+                let base = url::Url::parse(&current).map_err(|e| e.to_string())?;
+                base.join(&location).map_err(|e| e.to_string())?.to_string()
+            };
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("сервер ответил {status}"));
+        }
+        let total = header("content-length").and_then(|v| v.parse::<u64>().ok());
+        let chunked = header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+        let name = header("content-disposition").and_then(|d| disposition_name(&d)).unwrap_or_else(|| name_from_url(&current));
+        let _ = std::fs::create_dir_all(dir);
+        let path = unique_path(dir, &name);
+        let shown = path.file_name().and_then(|n| n.to_str()).unwrap_or("файл").to_string();
+        let part = path.with_file_name(format!("{shown}.part"));
+        let mut file = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+        let mut got = 0u64;
+        let mut last_report = std::time::Instant::now();
+        let mut dechunker = Dechunker::default();
+        let mut write = |data: &[u8], got: &mut u64| -> Result<(), String> {
+            file.write_all(data).map_err(|e| format!("запись: {e}"))?;
+            *got += data.len() as u64;
+            Ok(())
+        };
+        progress(0, total, &shown);
+        let mut finished = false;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&part);
+                return Err(String::from("отменено"));
+            }
+            if !rest.is_empty() {
+                if chunked {
+                    let mut out = Vec::new();
+                    finished = dechunker.feed(&rest, &mut out)?;
+                    write(&out, &mut got)?;
+                } else {
+                    let take = total.map(|t| (t - got).min(rest.len() as u64) as usize).unwrap_or(rest.len());
+                    write(&rest[..take], &mut got)?;
+                    finished = total.is_some_and(|t| got >= t);
+                }
+                rest.clear();
+            }
+            if last_report.elapsed() > Duration::from_millis(250) {
+                progress(got, total, &shown);
+                last_report = std::time::Instant::now();
+            }
+            if finished {
+                break;
+            }
+            let n = read_some(&mut *stream, &mut buf)?;
+            if n == 0 {
+                if chunked || total.is_some_and(|t| got < t) {
+                    let _ = std::fs::remove_file(&part);
+                    return Err(format!("соединение оборвалось на {got} байт"));
+                }
+                break;
+            }
+            rest.extend_from_slice(&buf[..n]);
+        }
+        drop(file);
+        std::fs::rename(&part, &path).map_err(|e| format!("переименование: {e}"))?;
+        progress(got, Some(got), &shown);
+        return Ok(path);
+    }
+    Err(String::from("слишком много перенаправлений"))
+}
+
+fn read_some(stream: &mut dyn Read, buf: &mut [u8]) -> Result<usize, String> {
+    loop {
+        match stream.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(0),
+            Err(e) => return Err(format!("чтение: {e}")),
+        }
+    }
+}
+
+/// Разбор `Transfer-Encoding: chunked` потоком (куски приходят как попало).
+#[derive(Default)]
+struct Dechunker {
+    pending: Vec<u8>,
+    /// Сколько байт данных текущего куска ещё впереди; `None` — ждём строку размера.
+    left: Option<usize>,
+}
+
+impl Dechunker {
+    /// `true` — встретился последний (нулевой) кусок.
+    fn feed(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<bool, String> {
+        self.pending.extend_from_slice(data);
+        loop {
+            match self.left {
+                None => {
+                    let Some(end) = self.pending.windows(2).position(|w| w == b"\r\n") else { return Ok(false) };
+                    let text = std::str::from_utf8(&self.pending[..end]).map_err(|_| "chunked: размер")?;
+                    let text = text.split(';').next().unwrap_or("").trim();
+                    if text.is_empty() {
+                        // Пустая строка — хвост прошлого куска.
+                        self.pending.drain(..end + 2);
+                        continue;
+                    }
+                    let size = usize::from_str_radix(text, 16).map_err(|_| "chunked: размер")?;
+                    self.pending.drain(..end + 2);
+                    if size == 0 {
+                        return Ok(true);
+                    }
+                    self.left = Some(size);
+                }
+                Some(left) => {
+                    if self.pending.is_empty() {
+                        return Ok(false);
+                    }
+                    let take = left.min(self.pending.len());
+                    out.extend_from_slice(&self.pending[..take]);
+                    self.pending.drain(..take);
+                    self.left = if take == left { None } else { Some(left - take) };
+                }
+            }
+        }
+    }
+}
+
+/// `attachment; filename="a b.zip"` / `filename*=UTF-8''%D1%84.txt`.
+fn disposition_name(value: &str) -> Option<String> {
+    let mut plain = None;
+    for part in value.split(';').map(str::trim) {
+        if let Some(v) = part.strip_prefix("filename*=") {
+            let v = v.trim_matches('"');
+            let encoded = v.split_once("''").map(|(_, e)| e).unwrap_or(v);
+            let decoded = url::form_urlencoded::parse(format!("x={}", encoded.replace('+', "%2B")).as_bytes()).next().map(|(_, v)| v.into_owned());
+            if let Some(name) = decoded.and_then(|n| clean_name(&n)) {
+                return Some(name);
+            }
+        } else if let Some(v) = part.strip_prefix("filename=") {
+            plain = clean_name(v.trim_matches('"'));
+        }
+    }
+    plain
+}
+
+fn name_from_url(url: &str) -> String {
+    let parsed = url::Url::parse(url).ok();
+    let last = parsed
+        .as_ref()
+        .and_then(|u| u.path_segments().and_then(|mut s| s.next_back().map(str::to_string)))
+        .filter(|s| !s.is_empty())
+        .map(|s| url::form_urlencoded::parse(format!("x={}", s.replace('+', "%2B")).as_bytes()).next().map(|(_, v)| v.into_owned()).unwrap_or(s));
+    last.and_then(|n| clean_name(&n)).unwrap_or_else(|| String::from("download"))
+}
+
+/// Имя без каталогов и управляющих знаков.
+fn clean_name(name: &str) -> Option<String> {
+    let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    let name = name.trim().trim_start_matches('.').to_string();
+    (!name.is_empty() && name.len() <= 200).then_some(name)
+}
+
+/// `файл.zip`, а если занято — `файл (1).zip`, `файл (2).zip`…
+fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    (1..1000).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| !p.exists()).unwrap_or(first)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +444,20 @@ mod tests {
         assert_eq!((t.tls, t.host.as_str(), t.port, t.path.as_str()), (true, "webdav.yandex.ru", 443, "/OBSOS/x?y=1"));
         let t = parse_target("http://10.0.2.2:8080").unwrap();
         assert_eq!((t.port, t.path.as_str()), (8080, "/"));
+    }
+
+    #[test]
+    fn streaming_dechunk_and_names() {
+        let mut d = Dechunker::default();
+        let mut out = Vec::new();
+        assert!(!d.feed(b"4\r\nWi", &mut out).unwrap());
+        assert!(!d.feed(b"ki\r\n5;x\r\npedia\r", &mut out).unwrap());
+        assert!(d.feed(b"\n0\r\n\r\n", &mut out).unwrap());
+        assert_eq!(out, b"Wikipedia");
+        assert_eq!(disposition_name("attachment; filename=\"a b.zip\"").as_deref(), Some("a b.zip"));
+        assert_eq!(disposition_name("attachment; filename*=UTF-8''%D1%84.txt").as_deref(), Some("ф.txt"));
+        assert_eq!(name_from_url("https://x.org/dl/../setup%20v2.exe?x=1"), "setup v2.exe");
+        assert_eq!(name_from_url("https://x.org/"), "download");
+        assert_eq!(clean_name("../../etc/passwd").as_deref(), Some("passwd"));
     }
 }

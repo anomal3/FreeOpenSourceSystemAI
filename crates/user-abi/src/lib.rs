@@ -1655,6 +1655,33 @@ pub struct FileLock {
     pub len: u64,
 }
 
+/// Форма указателя мыши над окном программы (09.11.2026, браузер OBSOS):
+/// `(окно, форма) -> 0`.
+///
+/// Форма — `WIN_CURSOR_*`; над рамкой и уголком окна стол рисует свою.
+/// Незнакомая форма — [`ERR_UNSUPPORTED`]. Указатель уже над окном — форма
+/// меняется сразу, без движения мыши.
+pub const SYS_WINCURSOR: usize = 89;
+/// Обычная стрелка.
+pub const WIN_CURSOR_ARROW: usize = 0;
+/// Текстовый курсор (поле ввода, выделяемый текст).
+pub const WIN_CURSOR_TEXT: usize = 1;
+/// Рука (ссылка, кнопка).
+pub const WIN_CURSOR_HAND: usize = 2;
+/// Перемещение (перетаскивание).
+pub const WIN_CURSOR_MOVE: usize = 3;
+/// Нельзя.
+pub const WIN_CURSOR_NOT_ALLOWED: usize = 4;
+/// Растяжка по горизонтали (разделитель колонок).
+pub const WIN_CURSOR_RESIZE_EW: usize = 5;
+/// Растяжка по вертикали.
+pub const WIN_CURSOR_RESIZE_NS: usize = 6;
+
+/// Часовой пояс системы (09.11.2026): `() -> смещение от UTC в минутах`
+/// (Москва — `180`). Тот же, что у часов панели («Параметры → Дата и время»);
+/// спрашивать каждый раз — пояс могут сменить, не перезапуская программу.
+pub const SYS_TZINFO: usize = 90;
+
 /// Размер буфера вывода [`SYS_KERNEL_COMMAND`].
 pub const KERNEL_COMMAND_OUT: usize = 64 * 1024;
 
@@ -2674,6 +2701,8 @@ mod tests {
         assert_eq!(SYS_SOUND, 82);
         assert_eq!(SYS_SETCLOCK, 86);
         assert_eq!(SYS_FLOCK, 88);
+        assert_eq!((SYS_WINCURSOR, SYS_TZINFO), (89, 90));
+        assert_eq!((WIN_CURSOR_ARROW, WIN_CURSOR_TEXT, WIN_CURSOR_HAND, WIN_CURSOR_RESIZE_NS), (0, 1, 2, 6));
         assert_eq!((FLOCK_GETLK, FLOCK_SETLK, FLOCK_SETLKW, FLOCK_FILE), (1, 2, 3, 7));
         assert_eq!((FLOCK_SH, FLOCK_EX, FLOCK_NB, FLOCK_UN), (1, 2, 4, 8));
         assert_eq!(core::mem::size_of::<FileLock>(), 24);

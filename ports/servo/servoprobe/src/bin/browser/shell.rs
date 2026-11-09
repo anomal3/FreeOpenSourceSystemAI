@@ -58,15 +58,21 @@ pub enum Note {
     Script(WebViewId, String),
     /// Команда со страницы `obsos://action/…` или подмена адреса.
     Action(Action),
+    /// Заблокирован запрос рекламы/трекера на странице.
+    Blocked(WebViewId),
 }
 
 pub struct Delegate {
     pub notes: RefCell<Vec<Note>>,
     pub context: Rc<SwglRenderingContext>,
-    /// Буфер обмена OBSOS (у FreeOS общего пока нет): страница ↔ адресная
-    /// строка ↔ поля оболочки.
+    /// Запасной буфер обмена (если ядро без SYS_CLIPBOARD); обычно — общий
+    /// буфер системы (`window::clipboard_*`).
     pub clipboard: Rc<RefCell<String>>,
     pub content: Rc<UserContentManager>,
+    /// Форма указателя, которую просит страница (над ссылкой — рука).
+    pub page_cursor: std::cell::Cell<window::CursorShape>,
+    pub blocker: Rc<RefCell<crate::blocker::Blocker>>,
+    pub downloads: Rc<crate::downloads::Downloads>,
 }
 
 impl Delegate {
@@ -121,7 +127,7 @@ impl WebViewDelegate for Delegate {
         self.note(Note::Opened(webview));
     }
 
-    fn request_navigation(&self, webview: WebView, request: NavigationRequest) {
+    fn request_navigation(&self, _webview: WebView, request: NavigationRequest) {
         let url = request.url.clone();
         if url.scheme() == "obsos" && url.host_str() == Some("action") {
             let target = url.query_pairs().find(|(k, _)| k == "url").map(|(_, v)| v.into_owned()).unwrap_or_default();
@@ -136,12 +142,54 @@ impl WebViewDelegate for Delegate {
             }
             return;
         }
+        if crate::downloads::looks_like_file(&url) {
+            request.deny();
+            self.note(Note::Action(Action::Download(url.to_string())));
+            return;
+        }
         if url.scheme() == "file" && pages::viewable_path(url.path()) {
             request.deny();
             self.note(Note::Action(Action::OpenUrl(pages::view_url(url.path()).to_string())));
             return;
         }
         request.allow();
+    }
+
+    fn notify_cursor_changed(&self, _webview: WebView, cursor: servo::Cursor) {
+        use servo::Cursor as C;
+        use window::CursorShape as S;
+        self.page_cursor.set(match cursor {
+            C::Pointer => S::Hand,
+            C::Text | C::VerticalText => S::Text,
+            C::Move | C::Grab | C::Grabbing | C::AllScroll => S::Move,
+            C::NotAllowed | C::NoDrop => S::NotAllowed,
+            C::EResize | C::WResize | C::EwResize | C::ColResize => S::ResizeEw,
+            C::NResize | C::SResize | C::NsResize | C::RowResize => S::ResizeNs,
+            _ => S::Arrow,
+        });
+    }
+
+    /// Блокировка рекламы и трекеров: запрос к рекламному домену отменяется
+    /// до сети. Сам документ страницы не трогаем.
+    fn load_web_resource(&self, webview: WebView, load: servo::WebResourceLoad) {
+        let request = load.request();
+        if request.is_for_main_frame {
+            return;
+        }
+        let Some(host) = request.url.host_str().map(str::to_string) else { return };
+        let site = webview.url().and_then(|u| u.host_str().map(str::to_string));
+        let blocked = self.blocker.borrow().blocks(&host, site.as_deref());
+        if blocked {
+            let url = request.url.as_url().clone();
+            let mut blocker = self.blocker.borrow_mut();
+            blocker.blocked_total += 1;
+            if blocker.blocked_total <= 3 || blocker.blocked_total % 50 == 0 {
+                println!("browser: blocked {host} ({} total)", blocker.blocked_total);
+            }
+            drop(blocker);
+            self.note(Note::Blocked(webview.id()));
+            load.intercept(servo::WebResourceResponse::new(url)).cancel();
+        }
     }
 
     fn request_authentication(&self, webview: WebView, request: AuthenticationRequest) {
@@ -169,10 +217,13 @@ impl ClipboardDelegate for Delegate {
     }
 
     fn get_text(&self, _webview: WebView, request: StringRequest) {
-        request.success(self.clipboard.borrow().clone());
+        // Буфер обмена системы (общий с терминалом и Блокнотом); старое ядро
+        // без него — свой.
+        request.success(window::clipboard_get().unwrap_or_else(|| self.clipboard.borrow().clone()));
     }
 
     fn set_text(&self, _webview: WebView, text: String) {
+        window::clipboard_set(&text);
         *self.clipboard.borrow_mut() = text;
     }
 }
@@ -213,6 +264,10 @@ document.addEventListener('click', function(e){
   if (b && b.form) grab(b.form);
 }, true);
 document.addEventListener('keydown', function(e){ if (e.key == 'Enter' && e.target && e.target.form) grab(e.target.form); }, true);
+document.addEventListener('click', function(e){
+  var a = e.target; while (a && a.tagName != 'A') a = a.parentElement;
+  if (a && a.hasAttribute('download') && a.href && /^https?:/.test(a.href)) { e.preventDefault(); send({t:'download', url: a.href}); }
+}, true);
 function probe(){ if (document.querySelector('input[type=password]')) send({t:'pwfield'}); }
 if (document.readyState == 'complete') probe(); else window.addEventListener('load', probe);
 })();"#;
@@ -246,6 +301,8 @@ pub struct Tab {
     pub loading: bool,
     pub status: Option<String>,
     pub zoom: f32,
+    /// Сколько запросов рекламы/трекеров заблокировано на этой странице.
+    pub blocked: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -268,12 +325,49 @@ pub enum Action {
     /// Поиск на странице: открыть строку (Ctrl+F), следующее/предыдущее, закрыть.
     FindOpen,
     Find { back: bool },
+    /// Скачать адрес в «Загрузки».
+    Download(String),
+    /// Блокировка рекламы на текущем сайте: выключить/включить (щит).
+    ToggleBlockSite,
+    /// Режим чтения: только текст статьи.
+    Reader,
+    /// Новое окно инкогнито (Ctrl+Shift+N): профиль во временном каталоге.
+    PrivateWindow,
     /// Вернуть последнюю закрытую вкладку (Ctrl+Shift+T).
     Reopen,
     /// Домашняя страница в текущей вкладке (Alt+Home).
     Home,
     FindClose,
     Quit,
+}
+
+/// Состояние генератора паролей, проверки утечек, импорта и скачивания
+/// списков фильтров (ответы фоновых потоков — в `Arc<Mutex>`).
+pub struct ToolsUi {
+    pub gen_len: usize,
+    pub gen_symbols: bool,
+    pub generated: String,
+    pub import_path: String,
+    /// Запись пароля → «не найден в утечках» / «найден N раз».
+    pub leaks: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
+    /// Скачанный список EasyList (или ошибка), пока главный поток не забрал.
+    pub filters: Arc<Mutex<Option<Result<String, String>>>>,
+    pub filters_busy: bool,
+}
+
+impl Default for ToolsUi {
+    fn default() -> Self {
+        let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/home"));
+        ToolsUi {
+            gen_len: 20,
+            gen_symbols: true,
+            generated: String::new(),
+            import_path: format!("{home}/Downloads/"),
+            leaks: Arc::default(),
+            filters: Arc::default(),
+            filters_busy: false,
+        }
+    }
 }
 
 /// Строка поиска на странице. В Servo своего поиска нет — ищет скрипт
@@ -320,6 +414,7 @@ pub enum Panel {
     Settings,
     Scripts,
     Profiles,
+    Downloads,
 }
 
 pub enum Modal {
@@ -397,6 +492,7 @@ pub struct Shell {
     /// зациклиться на неверном).
     pub auth_tries: Vec<String>,
     pub find: FindBar,
+    pub tools: ToolsUi,
     /// Закрытые вкладки — для Ctrl+Shift+T (последняя — в конце).
     pub closed: Vec<String>,
     pub quit: bool,
@@ -495,6 +591,7 @@ impl Shell {
             loading: true,
             status: None,
             zoom: 1.0,
+            blocked: 0,
         });
         let index = self.tabs.len() - 1;
         println!("browser: tab {} opened ({} open)", self.opened, self.tabs.len());
@@ -527,7 +624,7 @@ impl Shell {
         tab.webview.paint();
         self.context.present();
         self.address = tab.url.clone();
-        window.set_title(&format!("OBSOS — {}", tab.title));
+        window.set_title(&format!("{} — {}", if self.profile.private { "OBSOS (инкогнито)" } else { "OBSOS" }, tab.title));
         self.infobars.clear();
         println!("browser: tab {} active", index + 1);
     }
@@ -601,7 +698,7 @@ impl Shell {
                             if tab.url.is_empty() { String::from("Новая вкладка") } else { tab.url.clone() }
                         });
                         if i == active {
-                            window.set_title(&format!("OBSOS — {}", tab.title));
+                            window.set_title(&format!("{} — {}", if self.profile.private { "OBSOS (инкогнито)" } else { "OBSOS" }, tab.title));
                         }
                     }
                 }
@@ -620,6 +717,9 @@ impl Shell {
                 Note::Load(id, status) => {
                     if let Some(i) = self.tab_index(id) {
                         self.tabs[i].loading = status != LoadStatus::Complete;
+                        if status == LoadStatus::Started {
+                            self.tabs[i].blocked = 0;
+                        }
                         if status == LoadStatus::Complete {
                             let (url, title) = (self.tabs[i].real_url.clone(), self.tabs[i].title.clone());
                             if let Some(url) = url {
@@ -655,6 +755,11 @@ impl Shell {
                 Note::Action(action) => {
                     self.run(action, window);
                 }
+                Note::Blocked(id) => {
+                    if let Some(i) = self.tab_index(id) {
+                        self.tabs[i].blocked += 1;
+                    }
+                }
             }
         }
         changed
@@ -670,7 +775,8 @@ impl Shell {
                 if let Ok(servo::JSValue::String(text)) = result {
                     if !text.is_empty() {
                         let what = text.trim_start_matches("Unknown content type").trim().trim_matches(|c| c == '(' || c == ')' || c == '.').to_string();
-                        delegate.note(Note::Script(id, format!("{{\"t\":\"unsupported\",\"what\":\"тип файла {what}\"}}")));
+                        println!("browser: unknown type {what} — download");
+                        delegate.note(Note::Script(id, String::from("{\"t\":\"fetch\"}")));
                     }
                 }
             },
@@ -770,6 +876,24 @@ impl Shell {
                     self.fill(id, &logins[0]);
                 } else if !self.infobars.iter().any(|b| matches!(b, Infobar::ChooseLogin(_))) {
                     self.infobars.push(Infobar::ChooseLogin(origin));
+                }
+            }
+            // Servo не показывает такой тип — скачать, а вкладку вернуть назад.
+            Some("fetch") => {
+                let Some(i) = self.tab_index(id) else { return };
+                let Some(url) = self.tabs[i].real_url.clone() else { return };
+                self.download(url.as_str());
+                let webview = self.tabs[i].webview.clone();
+                if webview.can_go_back() {
+                    webview.go_back(1);
+                } else {
+                    self.tabs[i].webview.load(url::Url::parse("obsos://newtab").expect("newtab"));
+                }
+            }
+            // Ссылка `<a download>` на странице.
+            Some("download") => {
+                if let Some(url) = v.str_field("url") {
+                    self.download(url);
                 }
             }
             Some("unsupported") => {
@@ -883,6 +1007,24 @@ impl Shell {
                 }
             }
             Action::SyncNow(label) => self.sync_now(label),
+            Action::Download(url) => self.download(&url),
+            Action::ToggleBlockSite => {
+                let Some(host) = self.tabs.get(self.active).and_then(|t| t.real_url.as_ref()?.host_str().map(str::to_string)) else { return true };
+                let allowed = self.delegate.blocker.borrow_mut().toggle_site(&host);
+                self.toast(if allowed { "Блокировка рекламы на этом сайте выключена" } else { "Блокировка рекламы на этом сайте включена" });
+                if let Some(tab) = self.tabs.get(self.active) {
+                    tab.webview.reload();
+                }
+            }
+            Action::Reader => {
+                if let Some(w) = self.active_view() {
+                    println!("browser: reader mode");
+                    w.evaluate_javascript(pages::READER_SCRIPT, |_| {});
+                }
+            }
+            Action::PrivateWindow => {
+                let _ = window::spawn("/opt/obsos/bin/obsos --private");
+            }
             Action::Reopen => {
                 if let Some(url) = self.closed.pop() {
                     if let Ok(url) = url::Url::parse(&url) {
@@ -909,6 +1051,11 @@ impl Shell {
             Action::Quit => return false,
         }
         true
+    }
+
+    pub fn download(&mut self, url: &str) {
+        self.delegate.downloads.start(url);
+        self.toast("Загрузка началась — Ctrl+J");
     }
 
     fn find_step(&mut self, back: bool) {

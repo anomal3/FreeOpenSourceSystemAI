@@ -93,6 +93,10 @@ enum Icon {
     Key,
     Plus,
     Close,
+    /// Щит блокировки рекламы: включена (true) или выключена на сайте.
+    Shield(bool),
+    /// Режим чтения (раскрытая книга).
+    Book,
 }
 
 fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -150,6 +154,27 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Plus => {
             painter.line_segment([ctr + vec2(-r, 0.0), ctr + vec2(r, 0.0)], s);
             painter.line_segment([ctr + vec2(0.0, -r), ctr + vec2(0.0, r)], s);
+        }
+        Icon::Shield(on) => {
+            let pts = vec![
+                ctr + vec2(0.0, -r),
+                ctr + vec2(r * 0.85, -r * 0.6),
+                ctr + vec2(r * 0.7, r * 0.3),
+                ctr + vec2(0.0, r),
+                ctr + vec2(-r * 0.7, r * 0.3),
+                ctr + vec2(-r * 0.85, -r * 0.6),
+            ];
+            if on {
+                painter.add(egui::Shape::convex_polygon(pts, color.gamma_multiply(0.35), s));
+            } else {
+                painter.add(egui::Shape::closed_line(pts, s));
+                painter.line_segment([ctr + vec2(-r, r), ctr + vec2(r, -r)], s);
+            }
+        }
+        Icon::Book => {
+            painter.line_segment([ctr + vec2(0.0, -r * 0.6), ctr + vec2(0.0, r * 0.8)], s);
+            painter.add(egui::Shape::closed_line(vec![ctr + vec2(0.0, -r * 0.6), ctr + vec2(-r, -r * 0.8), ctr + vec2(-r, r * 0.6), ctr + vec2(0.0, r * 0.8)], s));
+            painter.add(egui::Shape::closed_line(vec![ctr + vec2(0.0, -r * 0.6), ctr + vec2(r, -r * 0.8), ctr + vec2(r, r * 0.6), ctr + vec2(0.0, r * 0.8)], s));
         }
         Icon::Close => {
             let k = r * 0.7;
@@ -267,7 +292,13 @@ fn sidebar(ui: &mut Ui, shell: &mut Shell, look: &Look, p: &Palette, actions: &m
             let painter = ui.painter();
             painter.circle_filled(pos2(rect.left() + 10.0, rect.center().y), 7.0, p.accent);
             painter.circle_filled(pos2(rect.left() + 20.0, rect.center().y - 5.0), 3.0, p.accent2);
-            painter.text(pos2(rect.left() + 30.0, rect.center().y), Align2::LEFT_CENTER, "OBSOS", FontId::proportional(18.0), p.text);
+            let brand = painter.text(pos2(rect.left() + 30.0, rect.center().y), Align2::LEFT_CENTER, "OBSOS", FontId::proportional(18.0), p.text);
+            if shell.profile.private {
+                // Окно инкогнито видно сразу: метка рядом с именем.
+                let badge = Rect::from_min_size(pos2(brand.right() + 8.0, rect.center().y - 10.0), vec2(84.0, 20.0));
+                painter.rect_filled(badge, 10.0, mix(p.accent, p.sidebar, 0.35));
+                painter.text(badge.center(), Align2::CENTER_CENTER, "инкогнито", FontId::proportional(12.0), Color32::WHITE);
+            }
             let new_tab = egui::Button::new(RichText::new("+  Новая вкладка").color(p.text)).fill(mix(p.sidebar, p.text, 0.1)).corner_radius(8);
             if ui.add_sized([width, NEW_TAB_H], new_tab).on_hover_text("Ctrl+T").clicked() {
                 actions.push(Action::NewTab);
@@ -378,7 +409,8 @@ fn toolbar(ui: &mut Ui, shell: &mut Shell, look: &Look, p: &Palette, actions: &m
                 let origin = url.as_ref().and_then(crate::vault::origin_of);
                 let has_logins = origin.as_ref().is_some_and(|o| !shell.profile.logins_for(o).is_empty());
                 let marked = url.as_ref().is_some_and(|u| shell.profile.is_bookmarked(u.as_str()));
-                let right = 30.0 * (2.0 + has_logins as u8 as f32) + 16.0;
+                let web = url.as_ref().is_some_and(|u| u.scheme().starts_with("http"));
+                let right = 30.0 * (2.0 + has_logins as u8 as f32 + 2.0 * web as u8 as f32) + 16.0 + if web { 22.0 } else { 0.0 };
                 if shell.focus_address {
                     ui.memory_mut(|m| m.request_focus(address_id));
                     shell.focus_address = false;
@@ -401,6 +433,31 @@ fn toolbar(ui: &mut Ui, shell: &mut Shell, look: &Look, p: &Palette, actions: &m
                     if let Some(o) = &origin {
                         shell.infobars.retain(|b| !matches!(b, Infobar::ChooseLogin(_)));
                         shell.infobars.push(Infobar::ChooseLogin(o.clone()));
+                    }
+                }
+                if web {
+                    let host = url.as_ref().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+                    let (enabled, allowed) = {
+                        let b = shell.delegate.blocker.borrow();
+                        (b.enabled, b.allows(&host))
+                    };
+                    let count = shell.tabs.get(shell.active).map(|t| t.blocked).unwrap_or(0);
+                    let tip = if !enabled {
+                        String::from("Блокировка рекламы выключена (Настройки)")
+                    } else if allowed {
+                        format!("Реклама на {host} не блокируется — включить")
+                    } else {
+                        format!("Заблокировано рекламы и трекеров: {count}. Щелчок — не блокировать на {host}")
+                    };
+                    if icon_button(ui, Icon::Shield(enabled && !allowed), enabled, &tip, p) {
+                        actions.push(Action::ToggleBlockSite);
+                    }
+                    let (r, _) = ui.allocate_exact_size(vec2(22.0, 28.0), Sense::hover());
+                    if enabled && !allowed && count > 0 {
+                        ui.painter().text(r.left_center(), Align2::LEFT_CENTER, if count > 99 { String::from("99+") } else { count.to_string() }, FontId::proportional(11.0), p.accent2);
+                    }
+                    if icon_button(ui, Icon::Book, true, "Режим чтения", p) {
+                        actions.push(Action::Reader);
                     }
                 }
                 if icon_button(ui, Icon::Star(marked), url.is_some(), "Закладка (Ctrl+D)", p) {
@@ -546,6 +603,7 @@ fn drawer(ctx: &egui::Context, shell: &mut Shell, panel: Panel, page: Rect, p: &
                     Panel::Settings => settings(ui, shell),
                     Panel::Scripts => scripts(ui, shell),
                     Panel::Profiles => profiles(ui, shell),
+                    Panel::Downloads => downloads(ui, shell, actions),
                 });
             });
         });
@@ -563,6 +621,7 @@ fn panel_title(panel: Panel) -> &'static str {
         Panel::Settings => "Настройки",
         Panel::Scripts => "Скрипты и стили",
         Panel::Profiles => "Профили",
+        Panel::Downloads => "Загрузки",
     }
 }
 
@@ -581,6 +640,7 @@ fn menu(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
         (Panel::Looks, "Оформление"),
         (Panel::Settings, "Настройки"),
         (Panel::Scripts, "Скрипты и стили (вместо расширений)"),
+        (Panel::Downloads, "Загрузки    Ctrl+J"),
         (Panel::Profiles, "Профили"),
     ] {
         if item(ui, text) {
@@ -601,6 +661,14 @@ fn menu(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
             actions.push(Action::Zoom(1.1));
         }
     });
+    if item(ui, "Новое окно инкогнито    Ctrl+Shift+N") {
+        actions.push(Action::PrivateWindow);
+        shell.panel = None;
+    }
+    if item(ui, "Режим чтения") {
+        actions.push(Action::Reader);
+        shell.panel = None;
+    }
     if item(ui, "Найти на странице    Ctrl+F") {
         actions.push(Action::FindOpen);
         shell.panel = None;
@@ -691,6 +759,7 @@ fn passwords(ui: &mut Ui, shell: &mut Shell) {
     }
     ui.checkbox(&mut shell.profile.settings.save_passwords, "Предлагать сохранить пароль");
     ui.checkbox(&mut shell.profile.settings.autofill, "Подставлять сохранённые пароли");
+    password_tools(ui, shell);
     ui.separator();
     let f = filter_box(ui, shell, "Найти сайт");
     let mut delete = None;
@@ -711,6 +780,18 @@ fn passwords(ui: &mut Ui, shell: &mut Shell) {
                 }
                 if ui.small_button("копировать").clicked() {
                     *shell.delegate.clipboard.borrow_mut() = login.password.clone();
+                    crate::window::clipboard_set(&login.password);
+                }
+                let leak = shell.tools.leaks.lock().ok().and_then(|l| l.get(record).cloned());
+                match leak {
+                    Some(text) => {
+                        ui.label(RichText::new(text).small());
+                    }
+                    None => {
+                        if ui.small_button("утечки?").on_hover_text("Проверить по базе Have I Been Pwned: уходят только 5 знаков SHA-1").clicked() {
+                            check_leak(shell, record.clone(), login.password.clone());
+                        }
+                    }
                 }
                 if ui.small_button("удалить").clicked() {
                     delete = Some(record.clone());
@@ -723,6 +804,151 @@ fn passwords(ui: &mut Ui, shell: &mut Shell) {
     }
     if let Some(record) = delete {
         shell.profile.delete_login(&record);
+    }
+}
+
+/// Проверка утечки в фоне (сеть), ответ — в `tools.leaks`.
+fn check_leak(shell: &mut Shell, record: String, password: String) {
+    let leaks = shell.tools.leaks.clone();
+    if let Ok(mut l) = leaks.lock() {
+        l.insert(record.clone(), String::from("проверяю…"));
+    }
+    let _ = std::thread::Builder::new().name(String::from("obsos-leak")).spawn(move || {
+        let text = match crate::tools::leak_count(&password) {
+            Ok(0) => String::from("✓ в утечках не найден"),
+            Ok(n) => format!("⚠ найден в утечках {n} раз — смените"),
+            Err(e) => format!("не проверить: {e}"),
+        };
+        if let Ok(mut l) = leaks.lock() {
+            l.insert(record, text);
+        }
+    });
+}
+
+/// Генератор паролей, импорт и экспорт паролей и закладок.
+fn password_tools(ui: &mut Ui, shell: &mut Shell) {
+    egui::CollapsingHeader::new("Сгенерировать пароль").show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut shell.tools.gen_len, 8..=64).text("знаков"));
+            ui.checkbox(&mut shell.tools.gen_symbols, "знаки !#$");
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Сгенерировать").clicked() {
+                shell.tools.generated = crate::tools::generate_password(shell.tools.gen_len, shell.tools.gen_symbols);
+            }
+            if !shell.tools.generated.is_empty() && ui.button("Копировать").clicked() {
+                crate::window::clipboard_set(&shell.tools.generated);
+                *shell.delegate.clipboard.borrow_mut() = shell.tools.generated.clone();
+                shell.toast("Пароль скопирован");
+            }
+        });
+        if !shell.tools.generated.is_empty() {
+            ui.label(RichText::new(&shell.tools.generated).monospace().strong());
+        }
+    });
+    egui::CollapsingHeader::new("Импорт и экспорт").show(ui, |ui| {
+        ui.label(RichText::new("Файл: пароли — CSV из Chrome/Firefox/Edge, закладки — HTML («Экспорт закладок»).").small());
+        ui.add(egui::TextEdit::singleline(&mut shell.tools.import_path).desired_width(f32::INFINITY));
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Импорт паролей (CSV)").clicked() {
+                let msg = match std::fs::read_to_string(shell.tools.import_path.trim()).map_err(|e| e.to_string()).and_then(|t| crate::tools::parse_passwords_csv(&t)) {
+                    Ok(list) => {
+                        let n = list.len();
+                        for (origin, username, password) in list {
+                            shell.save_login(Login { origin, username, password, updated_ms: now_ms() });
+                        }
+                        format!("Импортировано паролей: {n}")
+                    }
+                    Err(e) => format!("Не импортировать: {e}"),
+                };
+                shell.toast(&msg);
+            }
+            if ui.button("Импорт закладок (HTML)").clicked() {
+                let msg = match std::fs::read_to_string(shell.tools.import_path.trim()) {
+                    Ok(t) => {
+                        let list = crate::tools::parse_bookmarks_html(&t);
+                        let n = list.len();
+                        for (url, title) in list {
+                            if !shell.profile.is_bookmarked(&url) {
+                                shell.profile.add_bookmark(&url, &title);
+                            }
+                        }
+                        shell.update_page_data();
+                        format!("Импортировано закладок: {n}")
+                    }
+                    Err(e) => format!("Не открыть файл: {e}"),
+                };
+                shell.toast(&msg);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            let dir = shell.delegate.downloads.dir.clone();
+            if ui.button("Экспорт закладок").clicked() {
+                let items: Vec<(String, String)> = shell.profile.bookmarks.iter().map(|b| (b.url.clone(), b.title.clone())).collect();
+                let path = dir.join("obsos-bookmarks.html");
+                let _ = std::fs::create_dir_all(&dir);
+                let msg = match std::fs::write(&path, crate::tools::bookmarks_html(&items)) {
+                    Ok(()) => format!("Закладки: {}", path.display()),
+                    Err(e) => format!("Не записать: {e}"),
+                };
+                shell.toast(&msg);
+            }
+            if ui.button("Экспорт паролей (CSV, открытым текстом!)").clicked() {
+                let items: Vec<(String, String, String)> = shell.profile.logins.values().map(|l| (l.origin.clone(), l.username.clone(), l.password.clone())).collect();
+                let path = dir.join("obsos-passwords.csv");
+                let _ = std::fs::create_dir_all(&dir);
+                let msg = match std::fs::write(&path, crate::tools::passwords_csv(&items)) {
+                    Ok(()) => format!("Пароли: {} — удалите файл после переноса", path.display()),
+                    Err(e) => format!("Не записать: {e}"),
+                };
+                shell.toast(&msg);
+            }
+        });
+    });
+}
+
+/// Списки фильтров: EasyList + EasyPrivacy (+ RuAdList) скачиваются в фоне.
+fn blocker_lists(ui: &mut Ui, shell: &mut Shell) {
+    let (rules, total) = {
+        let b = shell.delegate.blocker.borrow();
+        (b.filter_rules, b.blocked_total)
+    };
+    ui.label(RichText::new(format!("Правил из списков: {rules}; заблокировано запросов за сеанс: {total}. Щит в адресной строке выключает блокировку на сайте.")).small());
+    let done = shell.tools.filters.lock().ok().and_then(|mut f| f.take());
+    if let Some(result) = done {
+        shell.tools.filters_busy = false;
+        let msg = match result {
+            Ok(text) => format!("Списки обновлены: {} доменов", shell.delegate.blocker.borrow_mut().store_filters(&text)),
+            Err(e) => format!("Списки не скачались: {e}"),
+        };
+        shell.toast(&msg);
+    }
+    if shell.tools.filters_busy {
+        ui.label("Скачиваю списки…");
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    } else if ui.button("Скачать/обновить списки (EasyList, EasyPrivacy, RuAdList)").clicked() {
+        shell.tools.filters_busy = true;
+        let slot = shell.tools.filters.clone();
+        let _ = std::thread::Builder::new().name(String::from("obsos-filters")).spawn(move || {
+            use browser_sync::remote::{Http, Request};
+            let mut all = String::new();
+            let mut errors = Vec::new();
+            for url in [
+                "https://easylist.to/easylist/easylist.txt",
+                "https://easylist.to/easylist/easyprivacy.txt",
+                "https://easylist-downloads.adblockplus.org/advblock.txt",
+            ] {
+                match crate::net::Client.send(&Request::new("GET", url)) {
+                    Ok(r) if r.status == 200 => all.push_str(&String::from_utf8_lossy(&r.body)),
+                    Ok(r) => errors.push(format!("{url}: {}", r.status)),
+                    Err(e) => errors.push(format!("{url}: {e}")),
+                }
+            }
+            let result = if all.is_empty() { Err(errors.join("; ")) } else { Ok(all) };
+            if let Ok(mut f) = slot.lock() {
+                *f = Some(result);
+            }
+        });
     }
 }
 
@@ -987,6 +1213,10 @@ fn settings(ui: &mut Ui, shell: &mut Shell) {
     });
     ui.label(RichText::new("Имя устройства").strong());
     ui.add(egui::TextEdit::singleline(&mut s.device_name).desired_width(f32::INFINITY));
+    ui.label(RichText::new("Реклама и трекеры").strong());
+    if ui.checkbox(&mut s.block_ads, "Блокировать рекламу и трекеры").changed() {
+        shell.delegate.blocker.borrow_mut().enabled = s.block_ads;
+    }
     let after = (s.search, s.home.clone());
     if after != before {
         let (search, home) = after;
@@ -995,6 +1225,7 @@ fn settings(ui: &mut Ui, shell: &mut Shell) {
         shell.update_page_data();
     }
     shell.profile.save_settings();
+    blocker_lists(ui, shell);
     ui.separator();
     ui.label(RichText::new("Мастер-пароль хранилища").strong());
     let has = shell.vault.as_ref().is_some_and(|v| v.has_master_password());
@@ -1045,8 +1276,84 @@ fn scripts(ui: &mut Ui, shell: &mut Shell) {
     }
 }
 
+fn downloads(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
+    use crate::downloads::{State, human_size};
+    let dir = shell.delegate.downloads.dir.clone();
+    ui.label(RichText::new(format!("Папка: {} («Загрузки» в «Файлах»)", dir.display())).small());
+    ui.horizontal(|ui| {
+        if ui.button("Открыть папку").clicked() {
+            let _ = crate::window::spawn(&format!("/bin/files {}", dir.display()));
+        }
+        if ui.button("Очистить список").clicked() {
+            shell.delegate.downloads.clear_finished();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut shell.filter).hint_text("адрес файла").desired_width(240.0));
+        if ui.button("Скачать").clicked() && shell.filter.trim().starts_with("http") {
+            actions.push(Action::Download(shell.filter.trim().to_string()));
+            shell.filter.clear();
+        }
+    });
+    ui.separator();
+    let items = shell.delegate.downloads.snapshot();
+    if items.is_empty() {
+        ui.label("Загрузок пока нет. Ссылки на архивы, программы, видео и файлы, которые Servo не показывает, скачиваются сюда.");
+    }
+    if items.iter().any(|d| d.state == State::Running) {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(400));
+    }
+    for (index, item) in items.iter().enumerate().rev() {
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(&item.name).strong());
+            match &item.state {
+                State::Running => {
+                    let fraction = item.total.map(|t| item.got as f32 / t.max(1) as f32);
+                    let text = match item.total {
+                        Some(t) => format!("{} из {} · {}/с", human_size(item.got), human_size(t), human_size(item.speed() as u64)),
+                        None => format!("{} · {}/с", human_size(item.got), human_size(item.speed() as u64)),
+                    };
+                    ui.add(egui::ProgressBar::new(fraction.unwrap_or(0.0)).text(text).animate(fraction.is_none()));
+                    if ui.small_button("Отменить").clicked() {
+                        shell.delegate.downloads.cancel(index);
+                    }
+                }
+                State::Done(path) => {
+                    ui.label(RichText::new(format!("готово · {}", human_size(item.got))).small());
+                    ui.horizontal(|ui| {
+                        let shown = path.display().to_string();
+                        if crate::pages::viewable_path(&shown) && ui.small_button("Открыть").clicked() {
+                            actions.push(Action::NewTabUrl(crate::pages::view_url(&shown).to_string()));
+                        }
+                        if shown.ends_with(".fpk") && ui.small_button("Установить").clicked() {
+                            let _ = crate::window::spawn(&format!("/bin/pkg install {shown}"));
+                        }
+                        if ui.small_button("Скачать снова").clicked() {
+                            actions.push(Action::Download(item.url.clone()));
+                        }
+                    });
+                }
+                State::Failed(e) => {
+                    ui.colored_label(Color32::from_rgb(0xe0, 0x70, 0x60), format!("не скачалось: {e}"));
+                    if ui.small_button("Повторить").clicked() {
+                        actions.push(Action::Download(item.url.clone()));
+                    }
+                }
+            }
+            ui.label(RichText::new(clip(&item.url, 60)).small().weak());
+        });
+    }
+}
+
 fn profiles(ui: &mut Ui, shell: &mut Shell) {
     ui.label(RichText::new("У каждого профиля свои куки, закладки, пароли и синхронизация.").small());
+    if shell.profile.private {
+        ui.label(RichText::new("Это окно инкогнито: история, куки и вход забываются при закрытии.").strong());
+    }
+    if ui.button("Окно гостя (инкогнито, Ctrl+Shift+N)").clicked() {
+        let _ = crate::window::spawn("/opt/obsos/bin/obsos --private");
+    }
     for name in crate::profile::Profile::list() {
         ui.horizontal(|ui| {
             ui.label(if name == shell.profile.name { format!("● {name} (открыт)") } else { name.clone() });

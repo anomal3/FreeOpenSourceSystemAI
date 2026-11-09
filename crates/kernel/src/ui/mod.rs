@@ -2218,6 +2218,12 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
         match desktop.window_at(x, y) {
             Some((_, Hit::Resize(edges))) => resize_shape(edges),
             Some((index, Hit::Body)) if desktop.app_at(index) == Some(App::Terminal) => pointer::Shape::Text,
+            // Окно программы выбирает форму само (SYS_WINCURSOR): рука над
+            // ссылкой браузера, текст над полем.
+            Some((index, Hit::Body)) => match desktop.app_at(index) {
+                Some(app @ App::Program(..)) => desktop.find(app).and_then(|w| w.program_cursor()).unwrap_or(pointer::Shape::Arrow),
+                _ => pointer::Shape::Arrow,
+            },
             _ => pointer::Shape::Arrow,
         }
     };
@@ -5211,6 +5217,23 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
             kprintln!("  desktop     : '{}' is resizable", name_of(desktop, app));
         }
         desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Форма указателя над окном программы (09.11.2026, `user_abi::SYS_WINCURSOR`).
+/// Указатель уже над окном — форма меняется сразу.
+pub fn cursor_window(task: u32, slot: u32, shape: pointer::Shape) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let Some(window) = desktop.find(app) else {
+            return Err(WindowError::NoWindow);
+        };
+        window.set_program_cursor(shape);
+        if desktop.hovered() == Some(app) && desktop.dragging().is_none() && !desktop.resizing() && !desktop.menu_open() && !desktop.context_open() {
+            desktop.set_pointer_shape(shape);
+        }
         Ok(())
     })
     .unwrap_or_else(|| Err(unavailable()))

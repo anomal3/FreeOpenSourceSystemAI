@@ -16,11 +16,14 @@
 #[path = "../../swgl_ctx.rs"]
 mod swgl_ctx;
 
+mod blocker;
+mod downloads;
 mod net;
 mod pages;
 mod profile;
 mod shell;
 mod syncer;
+mod tools;
 mod ui;
 mod vault;
 mod window;
@@ -192,14 +195,45 @@ fn content_manager(servo: &servo::Servo, profile: &Profile) -> Rc<UserContentMan
     manager
 }
 
+fn egui_cursor(icon: egui::CursorIcon) -> window::CursorShape {
+    use egui::CursorIcon as C;
+    use window::CursorShape as S;
+    match icon {
+        C::PointingHand => S::Hand,
+        C::Text | C::VerticalText => S::Text,
+        C::Move | C::Grab | C::Grabbing | C::AllScroll => S::Move,
+        C::NotAllowed | C::NoDrop => S::NotAllowed,
+        C::ResizeHorizontal | C::ResizeColumn | C::ResizeEast | C::ResizeWest => S::ResizeEw,
+        C::ResizeVertical | C::ResizeRow | C::ResizeNorth | C::ResizeSouth => S::ResizeNs,
+        _ => S::Arrow,
+    }
+}
+
+/// Имя пояса для ICU по смещению: целые часы — `Etc/GMT-3` (знак у `Etc`
+/// обратный: это Москва, UTC+3), иначе запись POSIX `<+0530>-5:30`.
+fn tz_name(minutes: i32) -> String {
+    if minutes == 0 {
+        String::from("UTC")
+    } else if minutes % 60 == 0 {
+        format!("Etc/GMT{:+}", -minutes / 60)
+    } else {
+        let (sign, m) = if minutes > 0 { ('+', minutes) } else { ('-', -minutes) };
+        let posix_sign = if minutes > 0 { '-' } else { '+' };
+        format!("<{sign}{:02}{:02}>{posix_sign}{}:{:02}", m / 60, m % 60, m / 60, m % 60)
+    }
+}
+
 fn main() {
     let t0 = Instant::now();
     println!("browser: start");
     let mut args = std::env::args().skip(1);
     let (mut profile_name, mut first_url) = (String::from("default"), None);
     let mut sync_folder: Option<String> = None;
+    let mut private = false;
     while let Some(arg) = args.next() {
-        if arg == "--profile" {
+        if arg == "--private" {
+            private = true;
+        } else if arg == "--profile" {
             profile_name = args.next().unwrap_or_default();
         } else if arg == "--sync-folder" {
             // Синхронизация в папку без панели — для стенда и для общей
@@ -210,13 +244,25 @@ fn main() {
             first_url = Some(arg);
         }
     }
-    let Some(window) = Window::open("OBSOS — Браузер", 1024, 700) else {
+    let Some(window) = Window::open(if private { "OBSOS — Инкогнито" } else { "OBSOS — Браузер" }, 1024, 700) else {
         std::process::exit(1);
     };
     let window = Rc::new(window);
     // TMPDIR и прочие каталоги Servo — до запуска его потоков.
     let _ = swgl_ctx::prepare_dirs(None);
-    let profile = Profile::open(&profile_name);
+    // Часовой пояс для JavaScript (`Date`, `Intl`): SpiderMonkey берёт его из
+    // `TZ`, а пояс знает ядро (SYS_TZINFO, «Параметры → Дата и время»).
+    if std::env::var_os("TZ").is_none() {
+        if let Some(minutes) = window::timezone_minutes() {
+            let tz = tz_name(minutes);
+            println!("browser: timezone {tz}");
+            // SAFETY (edition 2021: безопасно): до запуска потоков Servo.
+            std::env::set_var("TZ", tz);
+        }
+    }
+    let profile = if private { Profile::open_private() } else { Profile::open(&profile_name) };
+    let blocker = Rc::new(RefCell::new(blocker::Blocker::load(&profile.dir, profile.settings.block_ads)));
+    let downloads = Rc::new(downloads::Downloads::new());
     println!("browser: profile {} ({}), device {}", profile.name, profile.dir.display(), profile.settings.device);
     let (vault, need_master) = match Vault::open(&profile.dir, None) {
         Ok(v) => (Some(v), false),
@@ -254,6 +300,9 @@ fn main() {
         context: context.clone(),
         clipboard: Rc::new(RefCell::new(String::new())),
         content,
+        page_cursor: std::cell::Cell::new(window::CursorShape::Arrow),
+        blocker: blocker.clone(),
+        downloads: downloads.clone(),
     });
     let draft_provider = vault.as_ref().and_then(|v| v.account().cloned());
     let mut shell = Shell {
@@ -289,6 +338,7 @@ fn main() {
         new_profile: String::new(),
         auth_tries: Vec::new(),
         find: Default::default(),
+        tools: Default::default(),
         closed: Vec::new(),
         quit: false,
     };
@@ -340,6 +390,10 @@ fn main() {
     let mut ui_due = Some(Instant::now());
     let mut ui_frames = 0u64;
     let mut over_ui = false;
+    // Указатель над страницей (а не над оболочкой) — форму курсора выбирает
+    // страница; иначе — egui.
+    let mut over_page = false;
+    let mut ui_cursor = egui::CursorIcon::Default;
     let started = Instant::now();
     let mut last_session = Instant::now();
 
@@ -368,7 +422,8 @@ fn main() {
                     let pos = egui::pos2(ev.x as f32, ev.y as f32);
                     events.push(egui::Event::PointerMoved(pos));
                     over_ui = ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background);
-                    if in_page(ev.x, ev.y) && !over_ui && !blocked {
+                    over_page = in_page(ev.x, ev.y) && !over_ui && !blocked;
+                    if over_page {
                         mouse = page_point(ev.x, ev.y);
                         if let Some(w) = &view {
                             w.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(WebViewPoint::Device(mouse))));
@@ -434,6 +489,8 @@ fn main() {
                     // Раскладка Chromium (Linux).
                     let shortcut = if !pressed || blocked {
                         None
+                    } else if ctrl && alt && letter == Some('r') {
+                        Some(Action::Reader)
                     } else if ctrl {
                         match (letter.or(latin), shift) {
                             (Some('t'), false) => Some(Action::NewTab),
@@ -442,6 +499,8 @@ fn main() {
                             (Some('l' | 'k' | 'e'), false) => Some(Action::FocusAddress),
                             (Some('d'), false) => Some(Action::ToggleBookmark),
                             (Some('h'), false) => Some(Action::Panel(Panel::History)),
+                            (Some('j'), false) => Some(Action::Panel(Panel::Downloads)),
+                            (Some('n'), true) => Some(Action::PrivateWindow),
                             (Some('o' | 'b'), true) => Some(Action::Panel(Panel::Bookmarks)),
                             (Some('f'), false) => Some(Action::FindOpen),
                             (Some('g'), _) => Some(Action::Find { back: shift }),
@@ -477,6 +536,8 @@ fn main() {
                         }
                     } else if named(16) {
                         Some(Action::Reload)
+                    } else if named(20) {
+                        Some(Action::Reader)
                     } else if named(17) {
                         Some(Action::FocusAddress)
                     } else if named(21) {
@@ -504,7 +565,8 @@ fn main() {
                     if to_shell {
                         // Буфер обмена OBSOS: Ctrl+V/C/X в поле оболочки.
                         if pressed && ctrl && letter == Some('v') {
-                            events.push(egui::Event::Paste(shell.delegate.clipboard.borrow().clone()));
+                            let text = window::clipboard_get().unwrap_or_else(|| shell.delegate.clipboard.borrow().clone());
+                            events.push(egui::Event::Paste(text));
                         } else if pressed && ctrl && letter == Some('c') {
                             events.push(egui::Event::Copy);
                         } else if pressed && ctrl && letter == Some('x') {
@@ -558,8 +620,10 @@ fn main() {
             for command in &output.platform_output.commands {
                 if let egui::OutputCommand::CopyText(text) = command {
                     *shell.delegate.clipboard.borrow_mut() = text.clone();
+                    window::clipboard_set(text);
                 }
             }
+            ui_cursor = output.platform_output.cursor_icon;
             let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
             renderer.render_to_canvas(ww as usize, wh as usize, &primitives, &output.textures_delta, output.pixels_per_point);
             let delay = output.viewport_output.values().map(|v| v.repaint_delay).min().unwrap_or(Duration::MAX);
@@ -588,6 +652,7 @@ fn main() {
             }
         }
 
+        window.set_cursor(if over_page { shell.delegate.page_cursor.get() } else { egui_cursor(ui_cursor) });
         let page_fresh = std::mem::take(&mut page.borrow_mut().fresh);
         if page_fresh || ui_drawn {
             let (ox, oy) = page_origin(&look);
@@ -615,7 +680,11 @@ fn main() {
         }
     }
     shell.tabs.clear();
+    let private_dir = shell.profile.private.then(|| shell.profile.dir.clone());
     drop(shell);
     window.close();
+    if let Some(dir) = private_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
     println!("browser: closed");
 }

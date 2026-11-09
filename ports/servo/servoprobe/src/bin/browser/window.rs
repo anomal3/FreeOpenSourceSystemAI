@@ -49,6 +49,7 @@ pub struct Window {
     /// Красный в младшем байте (FREEOS_PIXEL_RGB): байты точки R,G,B,A;
     /// иначе B,G,R,A.
     pub swap_rb: bool,
+    cursor: Cell<CursorShape>,
 }
 
 impl Window {
@@ -75,6 +76,7 @@ impl Window {
             width: Cell::new(width),
             height: Cell::new(height),
             swap_rb: fmt == PIXEL_RGB,
+            cursor: Cell::new(CursorShape::Arrow),
         })
     }
 
@@ -94,6 +96,14 @@ impl Window {
         self.width.set(width);
         self.height.set(height);
         true
+    }
+
+    pub fn set_cursor(&self, shape: CursorShape) {
+        if self.cursor.get() != shape {
+            self.cursor.set(shape);
+            // SAFETY: окно наше, вызов без адресов.
+            unsafe { syscall3(SYS_WINCURSOR, self.id as usize, shape as usize, 0) };
+        }
     }
 
     pub fn set_title(&self, title: &str) {
@@ -182,8 +192,34 @@ impl PageFrame {
 }
 
 const SYS_SPAWN: usize = 21;
+const SYS_CLIPBOARD: usize = 85;
+const CLIP_SET: usize = 1;
+const CLIP_GET: usize = 2;
+const SYS_WINCURSOR: usize = 89;
+const SYS_TZINFO: usize = 90;
 /// Наследовать консоль родителя (`FREEOS_SPAWN_INHERIT`).
 const SPAWN_INHERIT: isize = -1;
+/// Нет такого вызова (`ERR_NO_SYSCALL`: ядро старше браузера).
+const ERR_NOSYS: isize = -2;
+
+/// Ловушка ядра FreeOS, как `freeos_syscall` в libc/freeos/freeos-syscall.h:
+/// номер и три аргумента.
+///
+/// # Safety
+/// Аргументы-адреса должны быть верны для вызова `number`.
+unsafe fn syscall3(number: usize, a0: usize, a1: usize, a2: usize) -> isize {
+    let result: isize;
+    // SAFETY: договор ловушки FreeOS; адреса проверяет вызывающий.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        std::arch::asm!("int 0x80", inlateout("rax") number as isize => result,
+            in("rdi") a0, in("rsi") a1, in("rdx") a2, options(nostack));
+        #[cfg(target_arch = "aarch64")]
+        std::arch::asm!("svc #0", in("x8") number, inlateout("x0") a0 as isize => result,
+            in("x1") a1, in("x2") a2, options(nostack));
+    }
+    result
+}
 
 /// Запустить программу, не дожидаясь её. Строка разбирается тем же
 /// разборщиком, что у оболочки (пробелы — разделители), поэтому `&` и `?` в
@@ -191,19 +227,51 @@ const SPAWN_INHERIT: isize = -1;
 /// отвергает. Возвращает номер задачи.
 pub fn spawn(command: &str) -> Result<i64, i64> {
     let bytes = command.as_bytes();
-    let result: isize;
-    // SAFETY: ловушка ядра FreeOS, как `freeos_syscall` в
-    // libc/freeos/freeos-syscall.h: номер и три аргумента; строка живёт до
-    // возврата из вызова.
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        std::arch::asm!("int 0x80", inlateout("rax") SYS_SPAWN as isize => result,
-            in("rdi") bytes.as_ptr(), in("rsi") bytes.len(), in("rdx") SPAWN_INHERIT, options(nostack));
-        #[cfg(target_arch = "aarch64")]
-        std::arch::asm!("svc #0", in("x8") SYS_SPAWN, inlateout("x0") bytes.as_ptr() as isize => result,
-            in("x1") bytes.len(), in("x2") SPAWN_INHERIT, options(nostack));
-    }
+    // SAFETY: строка живёт до возврата из вызова.
+    let result = unsafe { syscall3(SYS_SPAWN, bytes.as_ptr() as usize, bytes.len(), SPAWN_INHERIT as usize) };
     if result < 0 { Err(result as i64) } else { Ok(result as i64) }
+}
+
+/// Буфер обмена системы (общий с терминалом, Блокнотом, «Файлами»).
+pub fn clipboard_set(text: &str) {
+    // SAFETY: строка живёт до возврата.
+    unsafe { syscall3(SYS_CLIPBOARD, CLIP_SET, text.as_ptr() as usize, text.len()) };
+}
+
+pub fn clipboard_get() -> Option<String> {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        // SAFETY: буфер наш, длина — его.
+        let n = unsafe { syscall3(SYS_CLIPBOARD, CLIP_GET, buf.as_mut_ptr() as usize, buf.len()) };
+        if n < 0 {
+            return None;
+        }
+        let n = n as usize;
+        if n <= buf.len() {
+            buf.truncate(n);
+            return String::from_utf8(buf).ok();
+        }
+        buf = vec![0u8; n];
+    }
+}
+
+/// Смещение часового пояса системы от UTC в минутах (`None` — ядро старое).
+pub fn timezone_minutes() -> Option<i32> {
+    // SAFETY: вызов без адресов.
+    let r = unsafe { syscall3(SYS_TZINFO, 0, 0, 0) };
+    (r != ERR_NOSYS && r.abs() <= 18 * 60).then_some(r as i32)
+}
+
+/// Форма указателя над окном (`WIN_CURSOR_*`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CursorShape {
+    Arrow = 0,
+    Text = 1,
+    Hand = 2,
+    Move = 3,
+    NotAllowed = 4,
+    ResizeEw = 5,
+    ResizeNs = 6,
 }
 
 pub const CHROMIUM: &str = "/opt/chromium/bin/chromium";

@@ -2737,6 +2737,11 @@ pub fn style_window(slot: u32, flags: u32) -> Result<(), WindowError> {
     crate::ui::style_window(sched::current().as_u32(), slot, flags).map_err(WindowError::Desktop)
 }
 
+/// Форма указателя над окном `slot` текущей программы (09.11.2026).
+pub fn cursor_window(slot: u32, shape: crate::ui::pointer::Shape) -> Result<(), WindowError> {
+    crate::ui::cursor_window(sched::current().as_u32(), slot, shape).map_err(WindowError::Desktop)
+}
+
 /// Переставить всплывающее окно `slot` текущей программы (фаза 62e).
 pub fn place_window(slot: u32, anchor: (i32, i32)) -> Result<(), WindowError> {
     crate::ui::place_window(sched::current().as_u32(), slot, anchor).map_err(WindowError::Desktop)
