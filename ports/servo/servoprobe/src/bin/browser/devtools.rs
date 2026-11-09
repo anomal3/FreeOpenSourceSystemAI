@@ -79,6 +79,8 @@ pub struct DevUi {
     pub started: Instant,
     /// Отдать фокус строке ввода консоли (панель только что открыли).
     pub focus_input: bool,
+    /// Ширина панели (встроена справа), меняется мышью.
+    pub width: f32,
 }
 
 impl Default for DevUi {
@@ -92,6 +94,7 @@ impl Default for DevUi {
             selected: Rc::default(),
             started: Instant::now(),
             focus_input: true,
+            width: 520.0,
         }
     }
 }

@@ -172,6 +172,13 @@ fn egui_key(code: u32) -> Option<egui::Key> {
 fn content_manager(servo: &servo::Servo, profile: &Profile) -> Rc<UserContentManager> {
     let manager = Rc::new(UserContentManager::new(servo));
     manager.add_script(Rc::new(UserScript::new(shell::PAGE_SCRIPT.to_string(), None)));
+    // Белый фон корня, как у других браузеров: страница без своего фона и
+    // короче окна иначе оставляла под собой куски предыдущей (плитки
+    // WebRender не перерисовывались). Стиль пользователя — свой фон
+    // страницы его перекрывает.
+    if let Ok(url) = url::Url::parse("obsos://style/base.css") {
+        manager.add_stylesheet(Rc::new(servo::user_contents::UserStyleSheet::new(String::from("html { background-color: #fff; }"), url)));
+    }
     let dir = profile.dir.join("userscripts");
     let mut files: Vec<_> = std::fs::read_dir(&dir).map(|r| r.flatten().map(|e| e.path()).collect()).unwrap_or_default();
     files.sort();
@@ -403,7 +410,8 @@ fn main() {
     'run: loop {
         let mut input = false;
         let (ox, oy) = page_origin(&look);
-        let in_page = |x: i32, y: i32| x >= ox as i32 && y >= oy as i32;
+        let page_right = window.width.get().saturating_sub(crate::shell::dev_dock()) as i32;
+        let in_page = |x: i32, y: i32| x >= ox as i32 && y >= oy as i32 && x < page_right;
         let page_point = |x: i32, y: i32| DevicePoint::new((x - ox as i32) as f32, (y - oy as i32) as f32);
         while let Some(ev) = window.next_event() {
             input = true;
@@ -645,6 +653,18 @@ fn main() {
                 }
                 ui_due = Some(Instant::now());
             }
+            // Инструменты разработчика открыли, закрыли или растянули — страница
+            // уже или шире (встроены справа, как в Chromium).
+            let want_dock = if shell.panel == Some(Panel::DevTools) {
+                (shell.dev.width as u32).min(window.width.get().saturating_sub(300))
+            } else {
+                0
+            };
+            if want_dock != crate::shell::dev_dock() {
+                crate::shell::set_dev_dock(want_dock);
+                shell.resize_all(&window);
+                ui_due = Some(Instant::now());
+            }
             // Оформление поменялось — стиль egui и место страницы.
             if *shell.look() != look {
                 let relayout = page_origin(shell.look()) != page_origin(&look);
@@ -685,12 +705,13 @@ fn main() {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    shell.tabs.clear();
     let private_dir = shell.profile.private.then(|| shell.profile.dir.clone());
-    drop(shell);
     window.close();
     if let Some(dir) = private_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
+    // Всё своё уже сохранено. Разбор Servo на выходе (потоки, Service Worker)
+    // мог висеть минутами — выходим сразу, память и потоки снимет ядро.
     println!("browser: closed");
+    std::process::exit(0);
 }

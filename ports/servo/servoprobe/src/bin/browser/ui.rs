@@ -232,7 +232,9 @@ pub fn shell_ui(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     let ctx = ui.ctx().clone();
     let (ox, oy) = page_origin(&look);
     let screen = ctx.content_rect();
-    let page = Rect::from_min_max(pos2(ox as f32, oy as f32), screen.max);
+    // Страница — без встроенных справа инструментов разработчика.
+    let dock = crate::shell::dev_dock() as f32;
+    let page = Rect::from_min_max(pos2(ox as f32, oy as f32), pos2(screen.max.x - dock, screen.max.y));
     overlays(&ctx, shell, page, &p, actions);
     if let Some(panel) = shell.panel {
         drawer(&ctx, shell, panel, page, &p, actions);
@@ -581,11 +583,32 @@ fn toasts(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette) {
 // ── Выдвижная панель ────────────────────────────────────────────────────────
 
 fn drawer(ctx: &egui::Context, shell: &mut Shell, panel: Panel, page: Rect, p: &Palette, actions: &mut Vec<Action>) {
-    // Инструменты разработчика шире: в сеть и DOM помещаются адреса.
-    let width = if panel == Panel::DevTools { (page.width() * 0.6).max(DRAWER_W) } else { DRAWER_W }.min(page.width());
+    // Инструменты разработчика встроены справа (страница уже на их ширину,
+    // `dev_dock`), ширина — перетаскиванием левого края; остальные панели —
+    // поверх страницы.
+    let dev = panel == Panel::DevTools;
+    let docked = dev && crate::shell::dev_dock() > 0;
+    let width = if dev { shell.dev.width } else { DRAWER_W.min(page.width()) };
+    let left = if docked { page.right() } else { page.right() - width };
+    if dev {
+        let handle = egui::Area::new(egui::Id::new("obsos-dev-split")).order(egui::Order::Tooltip).fixed_pos(pos2(left - 4.0, page.top())).show(ctx, |ui| {
+            let (r, resp) = ui.allocate_exact_size(vec2(8.0, page.height()), Sense::drag());
+            let active = resp.hovered() || resp.dragged();
+            if active {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            ui.painter().line_segment([pos2(r.center().x, r.top()), pos2(r.center().x, r.bottom())], Stroke::new(if active { 3.0_f32 } else { 1.0 }, if active { p.accent } else { mix(p.sidebar, p.text, 0.25) }));
+            resp.drag_delta().x
+        });
+        let dx = handle.inner;
+        if dx != 0.0 {
+            let max = (ctx.content_rect().width() - 300.0).max(320.0);
+            shell.dev.width = (shell.dev.width - dx).clamp(280.0, max);
+        }
+    }
     egui::Area::new(egui::Id::new("obsos-drawer"))
         .order(egui::Order::Foreground)
-        .fixed_pos(pos2(page.right() - width, page.top()))
+        .fixed_pos(pos2(left, page.top()))
         .show(ctx, |ui| {
             egui::Frame::new().fill(p.sidebar).inner_margin(Margin::same(14)).stroke(Stroke::new(1.0_f32, mix(p.sidebar, p.text, 0.15))).show(ui, |ui| {
                 ui.set_width(width - 28.0);

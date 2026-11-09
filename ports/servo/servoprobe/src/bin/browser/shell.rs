@@ -37,7 +37,19 @@ pub fn page_origin(look: &Look) -> (u32, u32) {
 
 pub fn page_size(look: &Look, w: u32, h: u32) -> dpi::PhysicalSize<u32> {
     let (x, y) = page_origin(look);
-    dpi::PhysicalSize::new(w.saturating_sub(x).max(1), h.saturating_sub(y).max(1))
+    dpi::PhysicalSize::new(w.saturating_sub(x).saturating_sub(dev_dock()).max(1), h.saturating_sub(y).max(1))
+}
+
+/// Ширина инструментов разработчика, встроенных справа (как в Chromium):
+/// страница на столько уже. Ноль — закрыты.
+static DEV_DOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn dev_dock() -> u32 {
+    DEV_DOCK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_dev_dock(px: u32) {
+    DEV_DOCK.store(px, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ── События Servo → главный цикл ────────────────────────────────────────────

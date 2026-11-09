@@ -185,5 +185,10 @@ pub fn preferences() -> servo::Preferences {
     prefs.dom_crypto_subtle_enabled = true;
     // GitHub: `document.adoptedStyleSheets` (без него скрипты страницы падают).
     prefs.dom_adoptedstylesheet_enabled = true;
+    // Современная вёрстка сайтов (GitHub, GitLab): контейнерные запросы,
+    // колонки, вариативные шрифты — в Servo есть, но выключены.
+    prefs.layout_css_container_queries_enabled = true;
+    prefs.layout_css_columns_enabled = true;
+    prefs.layout_css_font_variations_enabled = true;
     prefs
 }
