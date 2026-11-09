@@ -7217,6 +7217,8 @@ pub const ALL: &[Scenario] = &[
             Step::Type("Array.from(document.styleSheets).map(function(s){var n;try{n=s.cssRules.length}catch(e){n='X'}return (s.href||'inline').split('/').pop().slice(0,16)+':'+n+(s.disabled?'D':'')+(s.media&&s.media.mediaText?'['+s.media.mediaText+']':'')}).join(' ')+' || '+getComputedStyle(document.body).fontFamily+' || '+(document.querySelector('.auth-form')?getComputedStyle(document.querySelector('.auth-form')).width:'no-auth-form')"),
             Step::Key("ret"),
             Step::Await("browser: devtools ", 60_000),
+            Step::Wait(3_000),
+            Step::Painted("sites-github-devtools"),
             Step::Key("esc"),
             Step::Await("browser: panel closed", 60_000),
             Step::Wait(90_000),
