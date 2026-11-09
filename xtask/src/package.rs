@@ -270,7 +270,12 @@ fn servo(arch: Arch) -> Result<Option<Vec<u8>>> {
         .context("значок OBSOS: PNG не разобрался")?;
     servo.file(&Entry { path: String::from("icon.fimg"), mode: 0o644, uid: 0, gid: 0, data: icon });
     servo.field("icon", "/opt/obsos/icon.fimg");
-    Ok(Some(servo.finish()))
+    // Подписанная сборка (N12, «неподписанные сборки» у Zervo): браузер ходит
+    // в сеть и хранит пароли — `pkg install` проверяет подпись ключом системы
+    // и отказывает пакету, подпись которого не сходится.
+    let mut bytes = servo.finish();
+    crate::keys::sign(&mut bytes, &crate::keys::release()?);
+    Ok(Some(bytes))
 }
 
 /// llama.cpp пакетом (фаза 70d): программы llama.cpp, проверка библиотеки

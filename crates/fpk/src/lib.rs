@@ -413,7 +413,7 @@ impl Header {
         self.payload_offset() + self.payload_len
     }
 
-    /// Подписан ли контейнер. Сегодня всегда `false` — см. заголовок модуля.
+    /// Подписан ли контейнер (обновления системы, драйверы, браузер OBSOS).
     #[must_use]
     pub const fn is_signed(&self) -> bool {
         self.signature_algorithm != 0

@@ -231,7 +231,13 @@ pub fn rollback<S: Store>(
 where
     S::Error: core::fmt::Debug,
 {
-    // Состояние на момент точки — в памяти.
+    let then = fetch_point(remote, point)?;
+    apply_rollback(replica, then, collections, now_ms)
+}
+
+/// Файлы всех устройств на момент точки — в памяти (сетевая часть отката;
+/// браузер делает её в потоке синхронизации).
+pub fn fetch_point(remote: &mut dyn Remote, point: &str) -> Result<MemStore, Error> {
     let mut then = MemStore::default();
     for dev in remote.devices(Some(point))? {
         if !valid_name(&dev) {
@@ -247,6 +253,20 @@ where
             }
         }
     }
+    Ok(then)
+}
+
+/// Записать в реплику операции, возвращающие коллекции к состоянию `then`
+/// (из [`fetch_point`]).
+pub fn apply_rollback<S: Store>(
+    replica: &mut Replica<S>,
+    then: MemStore,
+    collections: &[&str],
+    now_ms: u64,
+) -> Result<Rollback, Error>
+where
+    S::Error: core::fmt::Debug,
+{
     let mut past = Replica::new(then, replica.device());
     let mut result = Rollback::default();
     for coll in collections {

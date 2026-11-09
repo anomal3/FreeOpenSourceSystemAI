@@ -7125,7 +7125,7 @@ pub const ALL: &[Scenario] = &[
             // Оболочка (N7, egui): «+ Новая вкладка» в боковой панели —
             // вторая вкладка, фокус сразу в адресной строке; набрать путь к
             // файлу пакета, Enter — страница открылась. Числа — геометрия
-            // `browser.rs` (SIDEBAR_W 216, шапка 34, кнопка 30, строка 30).
+            // `browser/ui.rs` (боковая панель 216, шапка 34, кнопка 30, строка 30).
             Step::Aim(Aim::Content("OBSOS — Браузер", 100, 53)),
             Step::Click,
             Step::Await("browser: tab 2 opened", 30_000),
@@ -7133,10 +7133,20 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(2_000),
             Step::Type("/opt/obsos/share/NOTICE.md"),
             Step::Key("ret"),
-            Step::Await("browser: go file:///opt/obsos/share/NOTICE.md", 20_000),
+            // Markdown открывается своей страницей просмотра obsos://view.
+            Step::Await("browser: go obsos://view?path=", 20_000),
             Step::Await("browser: load status Complete", 120_000),
             Step::Wait(4_000),
             Step::Painted("servo-window-notice"),
+            // Ctrl+D — закладка (журнал операций профиля), Ctrl+B — панель закладок.
+            Step::Key("ctrl-d"),
+            Step::Await("browser: bookmark added obsos://view?path=", 20_000),
+            Step::Key("ctrl-b"),
+            Step::Wait(3_000),
+            Step::Painted("servo-window-bookmarks"),
+            Step::Absent("browser: profile write failed"),
+            Step::Key("ctrl-b"),
+            Step::Wait(1_000),
             // Щелчок по первой вкладке в списке — она снова видна.
             Step::Aim(Aim::Content("OBSOS — Браузер", 100, 93)),
             Step::Click,

@@ -16,7 +16,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::replica::Store;
@@ -92,7 +92,10 @@ impl Store for DirStore {
         {
             let mut f = fs::File::create(&tmp)?;
             f.write_all(data.as_bytes())?;
-            f.sync_all()?;
+            // Сброс на диск — по возможности: не на каждой ОС есть fsync
+            // (FreeOS), а данные уже записаны; ошибка здесь потеряла бы
+            // операцию в памяти, хотя на диске она есть.
+            let _ = f.sync_all();
         }
         fs::rename(&tmp, &full)
     }
@@ -102,9 +105,14 @@ impl Store for DirStore {
         if let Some(dir) = full.parent() {
             fs::create_dir_all(dir)?;
         }
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(full)?;
+        // Не `append(true)`: родной libc FreeOS не знает `O_APPEND` (ENOSYS).
+        // Свой журнал пишет только своё устройство и один процесс — запись
+        // «в конец» через seek равносильна дозаписи.
+        let mut f = fs::OpenOptions::new().create(true).write(true).truncate(false).open(full)?;
+        f.seek(io::SeekFrom::End(0))?;
         f.write_all(data.as_bytes())?;
-        f.sync_data()
+        let _ = f.sync_data();
+        Ok(())
     }
 }
 

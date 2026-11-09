@@ -302,6 +302,23 @@ fn install_file(path: &str) -> i64 {
         close(fd);
         return 1;
     }
+    // Подписанный пакет (браузер OBSOS, драйверы) обязан сходиться с ключом
+    // системы: подпись есть, а не сходится — пакет подменён по дороге или
+    // подписан чужим, ставить нельзя. Неподписанный ставится, но вслух.
+    if header.is_signed() {
+        if !signed_by_trusted(fd, &header, manifest.text().as_bytes()) {
+            Line::new()
+                .str("pkg: ")
+                .str(name)
+                .str(" is signed, but not by a key this system trusts (or was changed after signing); refusing")
+                .end();
+            close(fd);
+            return 1;
+        }
+        Line::new().str("pkg: ").str(name).str(" signature ok").end();
+    } else {
+        Line::new().str("pkg: ").str(name).str(" is not signed").end();
+    }
     // Память «на запись и исполнение» (JIT) пока ставится без вопроса, но
     // вслух: окно «программа просит JIT — разрешить?» для пакетов без
     // доверенной подписи записано в ROADMAP («Разрешение JIT»).

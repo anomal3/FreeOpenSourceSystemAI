@@ -92,6 +92,11 @@ impl SwglRenderingContext {
 impl RenderingContext for SwglRenderingContext {
     fn prepare_for_rendering(&self) {
         self.gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
+        // Кадр рисуется поверх прошлого: страница без фона во всё окно
+        // (ошибка «Unknown content type», короткий документ) оставляла под
+        // собой предыдущую страницу. Холст браузера — белый.
+        self.gl.clear_color(1.0, 1.0, 1.0, 1.0);
+        self.gl.clear(gl::COLOR_BUFFER_BIT);
     }
 
     fn read_to_image(&self, rect: DeviceIntRect) -> Option<RgbaImage> {
