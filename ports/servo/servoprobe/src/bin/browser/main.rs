@@ -259,6 +259,13 @@ static LOGGER: Logger = Logger;
 /// Мобильный режим (узкий экран): мобильный User-Agent и масштаб страниц 2.
 pub static MOBILE: AtomicBool = AtomicBool::new(false);
 
+/// Палец на странице: где коснулся, где сейчас, ведёт ли (прокрутка).
+struct Touch {
+    start: (i32, i32),
+    last: (i32, i32),
+    dragging: bool,
+}
+
 fn main() {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
     // Дом должен быть записываемым (профиль, кеш и база Servo). На телефоне
@@ -460,6 +467,10 @@ fn main() {
     let mut ui_cursor = egui::CursorIcon::Default;
     let started = Instant::now();
     let mut last_session = Instant::now();
+    // Палец на странице (мобильный режим): касание ведёт — прокрутка, нет —
+    // по отпусканию это щелчок там, где коснулись.
+    let mobile = MOBILE.load(Ordering::Relaxed);
+    let mut touch: Option<Touch> = None;
 
     'run: loop {
         let mut input = false;
@@ -488,7 +499,18 @@ fn main() {
                     events.push(egui::Event::PointerMoved(pos));
                     over_ui = ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background);
                     over_page = in_page(ev.x, ev.y) && !over_ui && !blocked;
-                    if over_page {
+                    if let Some(t) = touch.as_mut() {
+                        if !t.dragging && ((ev.x - t.start.0).abs() > 12 || (ev.y - t.start.1).abs() > 12) {
+                            t.dragging = true;
+                        }
+                        if t.dragging {
+                            let delta = DeviceVector2D::new((t.last.0 - ev.x) as f32, (t.last.1 - ev.y) as f32);
+                            t.last = (ev.x, ev.y);
+                            if let Some(w) = &view {
+                                w.notify_scroll_event(Scroll::Delta(WebViewVector::Device(delta)), WebViewPoint::Device(page_point(t.start.0, t.start.1)));
+                            }
+                        }
+                    } else if over_page {
                         mouse = page_point(ev.x, ev.y);
                         if let Some(w) = &view {
                             w.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(WebViewPoint::Device(mouse))));
@@ -508,7 +530,25 @@ fn main() {
                     events.push(egui::Event::PointerMoved(pos));
                     events.push(egui::Event::PointerButton { pos, button, pressed, modifiers: egui_modifiers(mask) });
                     let to_page = in_page(ev.x, ev.y) && !over_ui && !blocked;
-                    if to_page {
+                    if mobile && ev.code != 2 && (touch.is_some() || (pressed && to_page)) {
+                        if pressed {
+                            touch = Some(Touch { start: (ev.x, ev.y), last: (ev.x, ev.y), dragging: false });
+                            shell.panel = None;
+                        } else if let Some(t) = touch.take() {
+                            if !t.dragging {
+                                // Не вёл пальцем — щелчок там, где коснулся.
+                                mouse = page_point(t.start.0, t.start.1);
+                                if let Some(w) = &view {
+                                    w.set_focused(true);
+                                    let at = WebViewPoint::Device(mouse);
+                                    w.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(at)));
+                                    w.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(MouseButtonAction::Down, MouseButton::Primary, at)));
+                                    w.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(MouseButtonAction::Up, MouseButton::Primary, at)));
+                                }
+                                println!("browser: tap at {},{}", t.start.0, t.start.1);
+                            }
+                        }
+                    } else if to_page {
                         mouse = page_point(ev.x, ev.y);
                         if let Some(w) = &view {
                             let button = if ev.code == 2 { MouseButton::Secondary } else { MouseButton::Primary };

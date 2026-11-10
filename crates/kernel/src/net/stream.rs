@@ -13,12 +13,10 @@
 //!
 //! **Не** реализовано и названо здесь, а не спрятано:
 //!
-//! * **Сегменты не по порядку отбрасываются.** Пришедший раньше своего времени
-//!   сегмент не откладывается, а выбрасывается, и собеседник пришлёт его снова.
-//!   Это законно (TCP обязан переживать потери) и стоит пропускной способности
-//!   на сети с перестановкой пакетов. Очередь пересборки — заметный кусок кода
-//!   и заметный кусок памяти на соединение, и заводить его до того, как
-//!   появится, чем измерить выигрыш, значит писать вслепую.
+//! * **Очередь пересборки — простая** (10.11.2026, измерено на Wi-Fi телефона:
+//!   при ~8 % потерь выброс хвоста окна держал приём на 350 КиБ/с). Сегмент
+//!   из будущего хранится, пока не закроется дыра; на дыру сразу уходит
+//!   повторное подтверждение. SACK нет.
 //! * **Нет управления перегрузкой** — ни медленного старта, ни `cwnd`.
 //!   Ограничение одно: окно, которое объявил собеседник. В локальной сети и в
 //!   эмуляторе это то же самое; на настоящем интернет-канале это означает, что
@@ -38,6 +36,7 @@
 //! запросов подряд, исчерпывает систему.
 
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 use crate::net::ipv4::Ipv4;
 use crate::net::tcp;
@@ -178,6 +177,10 @@ pub struct Connection {
 
     /// Надо отправить подтверждение — данными или отдельным сегментом.
     pub need_ack: bool,
+    /// Подтверждение не откладывать (дыра в потоке или она закрылась).
+    pub ack_now: bool,
+    /// Сегменты, пришедшие раньше ожидаемого: номер и байты.
+    pub ooo: Vec<(u32, Vec<u8>)>,
     /// Программа попросила закрыть отправку; `FIN` уйдёт, когда кончатся данные.
     pub closing: bool,
     /// Наш `FIN` уже в пути (и занимает один номер).
@@ -213,6 +216,8 @@ impl Connection {
             retries: 0,
             expires_at: 0,
             need_ack: false,
+            ack_now: false,
+            ooo: Vec::new(),
             closing: false,
             fin_sent: false,
             peer_closed: false,
@@ -276,9 +281,14 @@ impl Connection {
             return true;
         }
         if sequence != self.rcv_nxt {
-            // Подтверждение всё равно отправим: собеседник узнает, чего мы
-            // ждём, и пришлёт именно это.
+            // Подтверждение — сразу (повторное, «жду вот это»): по трём таким
+            // собеседник повторит пропуск, не дожидаясь таймера. Сегмент из
+            // будущего — в очередь до заполнения дыры (10.11: Wi-Fi телефона
+            // терял ~8 % кадров, и выброшенный хвост окна держал приём на
+            // 350 КиБ/с).
             self.need_ack = true;
+            self.ack_now = true;
+            self.keep_out_of_order(sequence, data);
             return false;
         }
         let room = RECEIVE_BUFFER - self.recv.len().min(RECEIVE_BUFFER);
@@ -286,7 +296,57 @@ impl Connection {
         self.recv.extend(&data[..taken]);
         self.rcv_nxt = self.rcv_nxt.wrapping_add(taken as u32);
         self.need_ack = true;
+        if !self.ooo.is_empty() {
+            self.drain_out_of_order();
+            // Дыра закрыта — собеседнику надо узнать сразу.
+            self.ack_now = true;
+        }
         taken == data.len()
+    }
+
+    /// Сохранить сегмент, пришедший раньше ожидаемого, если он влезает в окно.
+    fn keep_out_of_order(&mut self, sequence: u32, data: &[u8]) {
+        if !tcp::after(sequence, self.rcv_nxt) || self.ooo.iter().any(|(s, _)| *s == sequence) {
+            return;
+        }
+        let ahead = sequence.wrapping_sub(self.rcv_nxt) as usize;
+        let room = RECEIVE_BUFFER - self.recv.len().min(RECEIVE_BUFFER);
+        let held: usize = self.ooo.iter().map(|(_, d)| d.len()).sum();
+        if ahead + data.len() > room || held + data.len() > RECEIVE_BUFFER {
+            return;
+        }
+        self.ooo.push((sequence, data.to_vec()));
+    }
+
+    /// Переложить из очереди «не по порядку» всё, что теперь стало по порядку.
+    fn drain_out_of_order(&mut self) {
+        loop {
+            let mut progressed = false;
+            let mut index = 0;
+            while index < self.ooo.len() {
+                let (sequence, ref data) = self.ooo[index];
+                let end = sequence.wrapping_add(data.len() as u32);
+                if !tcp::after(end, self.rcv_nxt) {
+                    // Уже принято целиком.
+                    self.ooo.swap_remove(index);
+                    continue;
+                }
+                if !tcp::after(sequence, self.rcv_nxt) {
+                    let skip = self.rcv_nxt.wrapping_sub(sequence) as usize;
+                    let room = RECEIVE_BUFFER - self.recv.len().min(RECEIVE_BUFFER);
+                    let (_, data) = self.ooo.swap_remove(index);
+                    let taken = (data.len() - skip).min(room);
+                    self.recv.extend(&data[skip..skip + taken]);
+                    self.rcv_nxt = self.rcv_nxt.wrapping_add(taken as u32);
+                    progressed = true;
+                    continue;
+                }
+                index += 1;
+            }
+            if !progressed {
+                return;
+            }
+        }
     }
 
     /// Завести таймер повторной передачи, если он ещё не заведён.

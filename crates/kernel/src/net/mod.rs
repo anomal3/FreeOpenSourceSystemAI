@@ -211,6 +211,11 @@ struct Interface {
     /// программы, говорящие сами с собой по TCP: интерфейс Rider и его
     /// движок .NET.
     looped: alloc::collections::VecDeque<alloc::vec::Vec<u8>>,
+    /// Пачка кадров с карты разбирается — чистые подтверждения копятся и
+    /// уходят одним на соединение после пачки (10.11, Wi-Fi телефона: кадр
+    /// там уходит медленно, и подтверждение на каждый сегмент ограничивало
+    /// приём ~280 сегментами в секунду, 350 КиБ/с).
+    defer_acks: bool,
 }
 
 /// «Карта» машины без сети: только петля (`lo`). Наружу ничего не уходит и
@@ -310,6 +315,7 @@ fn start_loopback() {
         last_reply: None,
         next_id: 1,
         looped: alloc::collections::VecDeque::new(),
+        defer_acks: false,
     });
     match crate::sched::spawn_daemon("net", service_task) {
         Ok(id) => crate::kprintln!("  network     : no card; loopback 127.0.0.1/8 only, task {id}"),
@@ -443,6 +449,7 @@ fn start(device: alloc::boxed::Box<dyn Card>) {
         last_reply: None,
         next_id: 1,
         looped: alloc::collections::VecDeque::new(),
+        defer_acks: false,
     });
 
     // Задача-приёмник заводится сразу и служебной: она работает, пока работает
@@ -1082,6 +1089,7 @@ pub fn arp_table() -> alloc::vec::Vec<(Ipv4, Mac, u64)> {
 pub fn service_task() {
     let mut frame = [0u8; FRAME_MAX];
     loop {
+        let mut batch = 0usize;
         loop {
             let mut guard = INTERFACE.lock();
             let Some(iface) = guard.as_mut() else {
@@ -1090,12 +1098,20 @@ pub fn service_task() {
                 return;
             };
             let Some(len) = iface.device.receive(&mut frame) else {
+                flush_acks(iface);
                 break;
             };
             // Кадр разбирается под тем же локом: ответ на него уйдёт через ту
             // же карту, и отпускать лок между «поняли, что это ARP-запрос» и
-            // «ответили на него» незачем.
+            // «ответили на него» незачем. Чистые подтверждения — после пачки
+            // (не дольше 16 кадров).
+            iface.defer_acks = true;
             handle(iface, &frame[..len]);
+            iface.defer_acks = false;
+            batch += 1;
+            if batch % 4 == 0 {
+                flush_acks(iface);
+            }
         }
         // Петля — тем же разбором. Ответ на кадр петли может лечь в ту же
         // очередь (SYN → SYN-ACK), и он разберётся этим же циклом.
@@ -1561,6 +1577,15 @@ fn tcp_reject(iface: &mut Interface, source: Ipv4, segment: &tcp::Segment<'_>) {
     }
 }
 
+/// Отправить отложенные подтверждения (см. [`Interface::defer_acks`]).
+fn flush_acks(iface: &mut Interface) {
+    let pending: alloc::vec::Vec<usize> =
+        iface.streams.indices().collect::<alloc::vec::Vec<_>>().into_iter().filter(|i| iface.streams.at(*i).is_some_and(|c| c.need_ack)).collect();
+    for index in pending {
+        tcp_pump(iface, index);
+    }
+}
+
 /// Отправить всё, что соединение задолжало: `SYN`, данные, `FIN`, подтверждение.
 fn tcp_pump(iface: &mut Interface, index: usize) {
     let now = crate::time::uptime_ms();
@@ -1595,7 +1620,7 @@ fn tcp_pump(iface: &mut Interface, index: usize) {
                 } else if conn.closing && !conn.fin_sent && conn.in_flight() == 0 {
                     flags = tcp::ACK | tcp::FIN;
                     fin = true;
-                } else if conn.need_ack {
+                } else if conn.need_ack && (!iface.defer_acks || conn.ack_now) {
                     flags = tcp::ACK;
                 } else {
                     return;
@@ -1666,6 +1691,7 @@ fn tcp_pump(iface: &mut Interface, index: usize) {
 
         let Some(conn) = iface.streams.at(index) else { return };
         conn.need_ack = false;
+        conn.ack_now = false;
         let mut span = take as u32;
         if flags & tcp::SYN != 0 || fin {
             span += 1;

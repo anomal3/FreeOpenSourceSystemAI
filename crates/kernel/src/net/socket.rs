@@ -80,6 +80,8 @@ pub struct Table {
     slots: [Option<Socket>; MAX_SOCKETS],
     /// Откуда выдавать следующий эфемерный порт.
     next_ephemeral: u16,
+    /// Первый эфемерный порт уже выбран случайно.
+    seeded: bool,
 }
 
 /// Почему не вышло.
@@ -121,6 +123,7 @@ impl Table {
         Self {
             slots: [const { None }; MAX_SOCKETS],
             next_ephemeral: EPHEMERAL_FIRST,
+            seeded: false,
         }
     }
 
@@ -308,6 +311,16 @@ impl Table {
                 .flatten()
                 .any(|socket| socket.local_port == port)
         };
+        // Первый порт после загрузки — случайный (10.11): с одного и того же
+        // 49152 после каждой перезагрузки сервер, у которого прошлое
+        // соединение с этого порта ещё в TIME_WAIT, отвергал первое новое
+        // (телефон: первая загрузка после перезагрузки падала).
+        if !self.seeded {
+            self.seeded = true;
+            let mut bytes = [0u8; 2];
+            crate::random::fill(&mut bytes);
+            self.next_ephemeral = EPHEMERAL_FIRST + u16::from_le_bytes(bytes) % (u16::MAX - EPHEMERAL_FIRST);
+        }
         for _ in 0..=(u16::MAX - EPHEMERAL_FIRST) {
             let port = self.next_ephemeral;
             self.next_ephemeral = if port == u16::MAX { EPHEMERAL_FIRST } else { port + 1 };
