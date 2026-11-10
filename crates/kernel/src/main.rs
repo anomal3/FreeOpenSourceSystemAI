@@ -495,6 +495,13 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
 
     mount_initrd(&info);
     mount_disk_root(&info);
+    // Телефон: программы, которые не влезли в `boot`, — с раздела `cache`.
+    #[cfg(all(target_arch = "aarch64", feature = "phone"))]
+    {
+        arch::mtk_store::mount();
+        // Записываемый дом: корень телефона — FAT32 только на чтение.
+        arch::mtk_store::mount_home();
+    }
 
     // Часовой пояс лежит в том же файле настроек, что язык и раскладка, и
     // читается там же, где личность сеанса, — как только стало известно, какая

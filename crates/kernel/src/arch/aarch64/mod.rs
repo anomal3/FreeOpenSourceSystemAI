@@ -25,6 +25,9 @@ pub mod mtk_touch_fw;
 // адрес размещения заранее неизвестен.
 #[cfg(feature = "phone")]
 pub mod linux_boot;
+/// Том программ на разделе `cache` eMMC телефона (OBSOS).
+#[cfg(feature = "phone")]
+pub mod mtk_store;
 
 /// Адрес дерева устройств, если машина описана им.
 ///

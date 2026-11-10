@@ -11612,6 +11612,23 @@ WebRender на wgpu (не существует), softpipe (слишком мед
 Риски: корректность futex/TLS под нагрузкой Servo (у Redox именно это),
 сборка SpiderMonkey под новую ОС, скорость однопоточного swgl.
 
+## OBSOS: видео (MSE) и WebGL в движке — TODO (Роман 10.11)
+
+Сейчас сайты с потоковым видео (Media Source Extensions: YouTube, онлайн-
+кинотеатры) и WebGL браузер узнаёт и предлагает открыть в Chromium
+(`obsos://unsupported`). Своими силами в Servo:
+- **MSE и видео:** Servo играет медиа через GStreamer (`media-gstreamer`) —
+  у нас выключен. Нужно: GStreamer (или ffmpeg) под freeos — glib, gst-core,
+  плагины демуксеров (mp4/webm), декодеры (dav1d — AV1, libvpx — VP9,
+  openh264 — H.264), вывод звука в наш `SYS_SOUND`, кадры — в текстуры swgl;
+  затем фича `media-gstreamer` и сценарий с роликом. Самая большая часть —
+  портировать GStreamer и декодеры (Linux-зависимости, потоки, mmap).
+- **WebGL:** Servo рисует WebGL через surfman/GL — у нас swgl только для
+  WebRender. Путь: Mesa llvmpipe (программный GL, нужен `dlopen` или
+  статическая сборка) или WebGL поверх swgl (урезанный GL ES 2 — проверить,
+  чего не хватает), фича `webgl`, затем сценарий с three.js.
+- Пока этого нет — оставить передачу в Chromium и экран «чего не хватает».
+
 ## Установщик с мышью и выбором компонентов — TODO (Роман 07.11)
 
 Сейчас установщик — только клавиатура (`Simple Text Input`). Потом — как

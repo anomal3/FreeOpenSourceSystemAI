@@ -1118,6 +1118,40 @@ fn firmware_present() -> bool {
 /// порядок цвета, затем точки по 4 байта), `fastboot get_staged` его забирает.
 /// Зачем это — см. `Fastboot::stage_screen` в ядре: видеть телефон, не прося
 /// человека его сфотографировать.
+/// Раздел `cache` у Redmi 9C — 442 368 КиБ; том не больше.
+const CACHE_BYTES: u64 = 442_368 * 1024;
+
+/// Том ext2 с OBSOS для раздела `cache` (ядро монтирует его в `/opt/obsos`,
+/// `arch::aarch64::mtk_store`): `bin/obsos`, `share/NOTICE.md`, `icon.fimg`.
+pub fn store(out: &Path) -> Result<()> {
+    let browser = crate::ruststd::linux_host_program("servo-browser", crate::arch::Arch::Aarch64)
+        .context("нет build/linux/servo-browser-aarch64 — собрать: ports/servo/builder/build-servoprobe.sh aarch64")?;
+    let program = std::fs::read(&browser).with_context(|| format!("не прочитать {}", browser.display()))?;
+    let notice = std::fs::read(paths::workspace_root().join("ports/browser/NOTICE.md")).context("ports/browser/NOTICE.md")?;
+    let icon = crate::fimg::from_png(&std::fs::read(paths::workspace_root().join("assets/icons/obsos/obsos-256.png")).context("значок OBSOS")?)
+        .context("значок OBSOS: PNG не разобрался")?;
+    let payload = (program.len() + notice.len() + icon.len()) as u64;
+    // Запас на метаданные ext2 (таблицы inode, битовые карты, косвенные блоки):
+    // пятая часть и 16 МиБ, с округлением до мебибайта.
+    let bytes = ((payload + payload / 5 + 16 * 1024 * 1024).div_ceil(1024 * 1024) * 1024 * 1024).min(CACHE_BYTES);
+    if payload + 8 * 1024 * 1024 > bytes {
+        bail!("OBSOS ({payload} байт) не помещается в раздел cache ({CACHE_BYTES} байт)");
+    }
+    let sectors = bytes / 512;
+    let mut disk = disk::MemDisk::new(sectors).context("не хватило памяти под том")?;
+    let options = ext2::FormatOptions { label: "OBSOS", uuid: *b"obsos-phone-0001", time: 0 };
+    let mut fs = ext2::format(&mut disk, 0, sectors, &options).map_err(|err| anyhow::anyhow!("разметка ext2: {err}"))?;
+    for (path, data, mode) in [("bin/obsos", &program, 0o755), ("share/NOTICE.md", &notice, 0o644), ("icon.fimg", &icon, 0o644)] {
+        fs.write_file_path(&mut disk, path, data, mode, 0, 0).map_err(|err| anyhow::anyhow!("запись {path}: {err}"))?;
+    }
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(out, disk.into_vec()).with_context(|| format!("не записать {}", out.display()))?;
+    println!("том OBSOS: {} ({} МиБ, программа {} байт) — fastboot flash cache {}", out.display(), bytes / 1024 / 1024, program.len(), out.display());
+    Ok(())
+}
+
 pub fn shot(out: &Path) -> Result<()> {
     let fastboot = fastboot_path();
     let raw = out.with_extension("raw");

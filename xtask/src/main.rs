@@ -136,6 +136,13 @@ enum Command {
     /// Принести прошивку тачскрина телефона: чужая, в хранилище её нет.
     PhoneFirmware,
     /// Снять экран телефона по кабелю в PNG (`oem shot` + `get_staged`).
+    /// Том ext2 с браузером OBSOS для раздела `cache` телефона (10.11.2026):
+    /// в `boot` вместе с ядром он не помещается. Записать —
+    /// `fastboot flash cache build/phone-cache.img`.
+    PhoneStore {
+        #[arg(default_value = "build/phone-cache.img")]
+        out: std::path::PathBuf,
+    },
     PhoneShot {
         /// Куда положить снимок.
         #[arg(default_value = "build/phone-shot.png")]
@@ -901,6 +908,10 @@ fn real_main() -> Result<()> {
 
         Command::PhoneShot { out } => {
             phone::shot(&out)?;
+        }
+
+        Command::PhoneStore { out } => {
+            phone::store(&out)?;
         }
 
         Command::BtrfsFixture => {

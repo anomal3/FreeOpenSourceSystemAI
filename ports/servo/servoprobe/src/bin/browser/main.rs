@@ -258,6 +258,15 @@ static LOGGER: Logger = Logger;
 
 fn main() {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    // Дом должен быть записываемым (профиль, кеш и база Servo). На телефоне
+    // корень — FAT32 только на чтение, а записываемый том в памяти ядро
+    // монтирует в `/home`: туда, если в `HOME` писать нельзя.
+    let writable = |dir: &std::path::Path| std::fs::create_dir_all(dir.join(".config")).is_ok();
+    if !std::env::var_os("HOME").map(std::path::PathBuf::from).is_some_and(|home| writable(&home)) && writable(std::path::Path::new("/home")) {
+        println!("browser: home /home (HOME is not writable)");
+        // SAFETY (edition 2021: безопасно): до запуска любых потоков.
+        std::env::set_var("HOME", "/home");
+    }
     let t0 = Instant::now();
     println!("browser: start");
     let mut args = std::env::args().skip(1);
@@ -416,6 +425,12 @@ fn main() {
     }
 
     let ctx = egui::Context::default();
+    // Узкий экран (телефон, 720 точек): вкладки сверху — боковая панель
+    // съела бы треть ширины. Только на этот запуск, в профиль не пишется.
+    if window.width.get() < 800 && shell.profile.settings.look.side_tabs {
+        shell.profile.settings.look.side_tabs = false;
+        shell.resize_all(&window);
+    }
     let mut look = shell.look().clone();
     ui::style(&ctx, &look);
     let mut renderer = EguiSoftwareRender::new(if window.swap_rb { ColorFieldOrder::Rgba } else { ColorFieldOrder::Bgra });

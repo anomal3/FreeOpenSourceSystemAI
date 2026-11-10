@@ -57,6 +57,8 @@ pub const fn can_power_off() -> bool {
 /// загрузчик. См. [`aarch64::linux_boot`].
 #[cfg(all(target_arch = "aarch64", feature = "phone"))]
 pub use aarch64::linux_boot;
+#[cfg(all(target_arch = "aarch64", feature = "phone"))]
+pub use aarch64::mtk_store;
 
 /// Адресное пространство ядра — реализация [`crate::mm::AddressSpace`] для
 /// текущей архитектуры. На x86-64 это дерево от PML4, на AArch64 — пара

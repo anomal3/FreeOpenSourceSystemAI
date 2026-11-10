@@ -1202,6 +1202,9 @@ pub const PHONE_COMMAND: &str = "/bin/phone";
 /// Браузер на домашнем экране телефона: NetSurf из RAM-диска (`xtask phone`).
 pub const BROWSER_COMMAND: &str = "/opt/netsurf/bin/netsurf";
 
+/// OBSOS на телефоне — с тома раздела `cache` (`arch::mtk_store`).
+pub const OBSOS_COMMAND: &str = "/opt/obsos/bin/obsos";
+
 fn mobile_items() -> Vec<Item> {
     let program = |icon, label: &str, command: &str| Item {
         kind: Kind::Program(icon),
@@ -1217,6 +1220,8 @@ fn mobile_items() -> Vec<Item> {
     out.push(program(Icon::Phone, "Телефон", PHONE_COMMAND));
     // Браузер (04.11) — NetSurf, лёгкий: HTML и CSS без JavaScript.
     out.push(program(Icon::Network, "Браузер", BROWSER_COMMAND));
+    // OBSOS (10.11.2026) — Servo с JavaScript; лежит на разделе `cache`.
+    out.push(program(Icon::Network, "OBSOS", OBSOS_COMMAND));
     out.push(app(App::Terminal, "Терминал"));
     out.push(app(App::Settings, "Настройки"));
     out.push(program(Icon::Folder, FILES_LABEL, FILES_COMMAND));
