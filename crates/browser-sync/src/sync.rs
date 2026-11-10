@@ -391,6 +391,20 @@ mod tests {
         two_devices(Provider::GoogleDrive);
     }
 
+    /// Репозиторий создан на сайте пустым (без README): Git Data API на нём
+    /// отвечает 409 — первый коммит делает Contents API, дальше как обычно.
+    #[test]
+    fn github_empty_repository() {
+        let server = FakeServer::new(Flavor::GitHub).with_empty_repo();
+        let acc = account(Provider::GitHub);
+        let mut pc = Replica::new(MemStore::default(), "pc1");
+        pc.put("bookmarks", "https://example.com/", "Example", 1_000).unwrap();
+        let r = sync(pc.store_mut(), &mut *remote::open(&acc, &server).unwrap(), "pc1", &mut SyncState::default(), Some("111"), 1_794_155_405_000)
+            .unwrap_or_else(|e| panic!("empty repo: {e}"));
+        assert_eq!(r.pushed, 1);
+        assert!(r.point.is_some());
+    }
+
     #[test]
     fn bad_token_is_auth_error() {
         let server = FakeServer::new(Flavor::GitHub);

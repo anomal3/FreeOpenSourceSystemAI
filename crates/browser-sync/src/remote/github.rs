@@ -9,7 +9,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::{Account, Error, Http, RemoteFile, Request, Remote, SyncPoint, send, send_ok, status_error, url_encode};
+use super::{Account, Error, Http, RemoteFile, Request, Remote, SyncPoint, b64_encode, send, send_ok, status_error, url_encode};
 use crate::json::Value;
 
 pub struct GitHub<'a> {
@@ -117,11 +117,56 @@ impl<'a> GitHub<'a> {
     }
 }
 
+impl GitHub<'_> {
+    /// Ветка синхронизации должна быть: у пустого репозитория (создан без
+    /// README — GitHub отвечает 409 «Git Repository is empty») Git Data API не
+    /// работает вовсе, первый коммит делает Contents API; ветки нет, а
+    /// репозиторий не пуст — она ответвляется от ветки по умолчанию.
+    fn ensure_branch(&self, repo: &Value) -> Result<(), Error> {
+        let path = self.repo_path(&format!("/git/ref/heads/{}", url_encode(&self.branch, b"")));
+        let response = send(self.http, &self.req("GET", &path))?;
+        if response.ok() {
+            return Ok(());
+        }
+        let default = repo.str_field("default_branch").unwrap_or("main").to_string();
+        let base = if response.status == 409 {
+            None
+        } else if response.status == 404 {
+            let path = self.repo_path(&format!("/git/ref/heads/{}", url_encode(&default, b"")));
+            let found = send(self.http, &self.req("GET", &path))?;
+            match found.status {
+                200..=299 => found.json()?.get("object").and_then(|o| o.str_field("sha")).map(str::to_string),
+                // Ветки по умолчанию тоже нет — репозиторий пуст.
+                404 | 409 => None,
+                _ => return Err(status_error("ветка по умолчанию", &found)),
+            }
+        } else {
+            return Err(status_error("конец ветки", &response));
+        };
+        match base {
+            Some(sha) => {
+                let body = obj(alloc::vec![("ref", s(&format!("refs/heads/{}", self.branch))), ("sha", s(&sha))]);
+                send_ok(self.http, &self.req("POST", &self.repo_path("/git/refs")).json(&body), "создание ветки")?;
+            }
+            None => {
+                let text = "# OBSOS\n\nЗакладки, история и настройки браузера OBSOS (FreeOS): журналы устройств в `devices/`.\n";
+                let body = obj(alloc::vec![
+                    ("message", s("OBSOS: начало синхронизации")),
+                    ("content", s(&b64_encode(text.as_bytes()))),
+                    ("branch", s(&self.branch)),
+                ]);
+                send_ok(self.http, &self.req("PUT", &self.repo_path("/contents/README.md")).json(&body), "первый коммит")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Remote for GitHub<'_> {
     fn prepare(&mut self) -> Result<(), Error> {
         let response = send(self.http, &self.req("GET", &self.repo_path("")))?;
         if response.ok() {
-            return Ok(());
+            return self.ensure_branch(&response.json()?);
         }
         if response.status != 404 {
             return Err(status_error("репозиторий", &response));

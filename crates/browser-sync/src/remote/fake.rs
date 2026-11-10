@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
 use super::github::{arr, obj, s};
-use super::{Http, Request, Response, b64_encode, form_decode, url_decode};
+use super::{Http, Request, Response, b64_decode, b64_encode, form_decode, url_decode};
 use crate::json::{self, Value};
 use crate::sync::content_hash;
 
@@ -110,6 +110,12 @@ impl FakeServer {
         FakeServer { flavor, repo: RefCell::new(repo), bad_auth: Cell::new(false) }
     }
 
+    /// Репозиторий уже есть, но пустой — создан на сайте без README.
+    pub fn with_empty_repo(self) -> Self {
+        self.repo.borrow_mut().exists = true;
+        self
+    }
+
     /// Все запросы шли с верным заголовком входа.
     pub fn auth_ok(&self) -> bool {
         !self.bad_auth.get()
@@ -164,7 +170,17 @@ impl FakeServer {
             return resp(404, "Not Found");
         }
         match (req.method.as_str(), rest) {
-            ("GET", "") => json_resp(200, obj(alloc::vec![("private", Value::Bool(true))])),
+            ("GET", "") => json_resp(200, obj(alloc::vec![("private", Value::Bool(true)), ("default_branch", s("main"))])),
+            // Contents API: первый коммит пустого репозитория (и любой файл).
+            ("PUT", r) if r.starts_with("/contents/") => {
+                let target = url_decode(&r["/contents/".len()..]);
+                let body = body_json(req);
+                let Some(data) = body.str_field("content").and_then(b64_decode) else { return resp(422, "bad content") };
+                let mut files = repo.head.map(|h| repo.commits[h].files.clone()).unwrap_or_default();
+                files.insert(target, String::from_utf8_lossy(&data).into_owned());
+                Self::commit(&mut repo, files);
+                json_resp(201, obj(alloc::vec![]))
+            }
             ("GET", r) if r.starts_with("/contents/") => {
                 let target = url_decode(&r["/contents/".len()..]);
                 let Some(files) = Self::snapshot(&repo, q.get("ref").map(String::as_str).unwrap_or("main")) else {
