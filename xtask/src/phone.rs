@@ -345,13 +345,8 @@ pub fn build(options: &Options) -> Result<PathBuf> {
             } else {
                 say!("прошивки блока связи: {} файл(ов) в /lib/firmware/connsys", extra.len());
             }
-            let browser = netsurf_files(crate::arch::Arch::Aarch64)?;
-            if browser.is_empty() {
-                say!("NetSurf не собран — браузера на телефоне не будет: cargo xtask thirdparty netsurf");
-            } else {
-                say!("браузер NetSurf: /opt/netsurf/bin/netsurf");
-            }
-            extra.extend(browser);
+            // NetSurf на RAM-диске больше не нужен (10.11): браузер телефона —
+            // OBSOS на разделе `cache` (`xtask phone-store`).
             // Файлы модема (05.11): NVRAM этого аппарата, распакованные 7-Zip
             // из снятых разделов (`firmware/modem/<раздел>.d/md`, в хранилище
             // нет — IMEI и калибровка). Ядро отдаёт их модему по CCCI FS

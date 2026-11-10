@@ -127,6 +127,15 @@ pub fn of_manifest(icon: &str) -> Art {
     Art::glyph(named(icon))
 }
 
+/// Свой значок программы из `/opt/<имя>/…` — `/opt/<имя>/icon.fimg`, если
+/// он есть, даже без установленного пакета (OBSOS на телефоне лежит томом
+/// раздела `cache`, а не пакетом).
+#[must_use]
+pub fn opt_icon(path: &str) -> Option<Arc<Image>> {
+    let name = path.strip_prefix("/opt/")?.split('/').next().filter(|n| !n.is_empty())?;
+    image(&alloc::format!("/opt/{name}/icon.fimg"))
+}
+
 /// Значок набора по имени из манифеста.
 #[must_use]
 pub fn named(name: &str) -> Icon {
@@ -155,6 +164,9 @@ pub fn of_program(path: &str, title: &str) -> (Art, String) {
         let name = rest.split('/').next().unwrap_or("");
         if let Some(launcher) = super::panel::list_packages().into_iter().find(|launcher| launcher.name == name) {
             return (of_manifest(&launcher.icon), group);
+        }
+        if let Some(image) = opt_icon(path) {
+            return (Art::Image(image), group);
         }
     }
     let program = path.rsplit('/').next().unwrap_or(path);

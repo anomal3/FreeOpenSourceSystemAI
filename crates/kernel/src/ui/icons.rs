@@ -1022,7 +1022,11 @@ impl Icons {
                     Kind::Folder => super::appicon::file_icon(&item.label, true),
                     Kind::File => super::appicon::file_icon(&item.label, false),
                     Kind::App(app) => super::appicon::design_for(app.icon()),
-                    Kind::Program(icon) => super::appicon::design_for(*icon),
+                    Kind::Program(icon) => item
+                        .path
+                        .as_deref()
+                        .and_then(super::appicon::opt_icon)
+                        .or_else(|| super::appicon::design_for(*icon)),
                     Kind::Trash(full) => super::appicon::design(if *full { "place-trash-full" } else { "place-trash-empty" }),
                     _ => None,
                 };
@@ -1199,10 +1203,8 @@ fn system_items() -> Vec<Item> {
 /// Номеронабиратель — значок на главном экране и трубка в доке телефона.
 pub const PHONE_COMMAND: &str = "/bin/phone";
 
-/// Браузер на домашнем экране телефона: NetSurf из RAM-диска (`xtask phone`).
-pub const BROWSER_COMMAND: &str = "/opt/netsurf/bin/netsurf";
-
-/// OBSOS на телефоне — с тома раздела `cache` (`arch::mtk_store`).
+/// Браузер телефона — OBSOS с тома раздела `cache` (`arch::mtk_store`);
+/// значок — его `/opt/obsos/icon.fimg`. NetSurf с телефона убран 10.11.
 pub const OBSOS_COMMAND: &str = "/opt/obsos/bin/obsos";
 
 fn mobile_items() -> Vec<Item> {
@@ -1218,9 +1220,7 @@ fn mobile_items() -> Vec<Item> {
     // «Телефон» — номеронабиратель (03.11); звонить станет, когда появится
     // модем, а набрать номер можно уже сейчас.
     out.push(program(Icon::Phone, "Телефон", PHONE_COMMAND));
-    // Браузер (04.11) — NetSurf, лёгкий: HTML и CSS без JavaScript.
-    out.push(program(Icon::Network, "Браузер", BROWSER_COMMAND));
-    // OBSOS (10.11.2026) — Servo с JavaScript; лежит на разделе `cache`.
+    // Браузер — OBSOS (10.11.2026): Servo с JavaScript, лежит на разделе `cache`.
     out.push(program(Icon::Network, "OBSOS", OBSOS_COMMAND));
     out.push(app(App::Terminal, "Терминал"));
     out.push(app(App::Settings, "Настройки"));

@@ -52,7 +52,9 @@ const TX_CMD: u32 = 15;
 const RX_DATA: u32 = 0;
 const RX_EVENT: u32 = 1;
 
-const TX_SLOTS: usize = 16;
+/// 64, а не 16 (10.11): на странице по TLS 16 мест переполнялись (130 кадров
+/// из 2552 отброшено), и TCP ждал повтора по таймеру — страница шла 50 с.
+const TX_SLOTS: usize = 64;
 const RX_DATA_SLOTS: usize = 64;
 /// Кольцо событий большое: кадры эфира при поиске идут сюда же, потоком,
 /// и на 16 местах (как у драйвера) прошивка переполняла его и вставала, если
@@ -218,6 +220,7 @@ pub fn setup_dma() -> Result<Vec<String>, &'static str> {
         write(rx_reg(ring, 4), slots as u32)?;
         write(rx_reg(ring, 8), slots as u32 - 1)?;
     }
+    *RX_NEXT.lock() = [0, 0];
     // Включить: TX и RX, пакеты по 16 слов, обратная запись DDONE,
     // многоканальность, младший байт первым, без гашения такта.
     let cfg = read(GLO_CFG)?;
@@ -289,33 +292,57 @@ fn enqueue(ring: u32, packet: &[u8], need_room: bool) -> Result<usize, &'static 
     Ok(cpu)
 }
 
+/// Следующий слот к чтению в кольцах приёма (данные, события).
+static RX_NEXT: SpinLock<[usize; 2]> = SpinLock::new([0, 0]);
+
+/// Дескрипторов в строке кэша (16 байт против 64).
+const DESC_PER_LINE: usize = 4;
+
 /// Забрать следующий принятый пакет из кольца, если он есть к сроку.
+///
+/// Дескрипторы возвращаются блоку только целой строкой кэша, когда все
+/// четыре прочитаны (10.11): возврат по одному писал в память всю строку
+/// с устаревшими соседями и затирал дескриптор, который блок как раз
+/// заполнил, — приём вставал навсегда на первой же странице по TLS.
 fn receive(ring: u32, timeout_ms: u64) -> Result<Option<Vec<u8>>, &'static str> {
     let (virt, phys) = dma()?;
-    let (desc_off, buf_off, slots) = match ring {
-        RX_DATA => (RX_DATA_DESC, RX_DATA_BUF, RX_DATA_SLOTS),
-        _ => (RX_EVENT_DESC, RX_EVENT_BUF, RX_EVENT_SLOTS),
+    let (desc_off, buf_off, slots, which) = match ring {
+        RX_DATA => (RX_DATA_DESC, RX_DATA_BUF, RX_DATA_SLOTS, 0),
+        _ => (RX_EVENT_DESC, RX_EVENT_BUF, RX_EVENT_SLOTS, 1),
     };
-    let cpu = read(rx_reg(ring, 8))? as usize % slots;
-    let slot = (cpu + 1) % slots;
-    let desc = virt + desc_off + slot * 16;
     let started = crate::time::uptime_ns();
     loop {
-        dcache(desc, 16);
-        let ctrl = get32(desc + 4);
-        if ctrl & (1 << 31) != 0 {
-            let len = ((ctrl >> 16) & 0x3fff) as usize;
-            let buf = virt + buf_off + slot * BUF;
-            dcache(buf, len.min(BUF));
-            let mut data = alloc::vec![0u8; len.min(BUF)];
-            // SAFETY: буфер слота — в нашей памяти DMA.
-            unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, data.as_mut_ptr(), data.len()) };
-            // Вернуть дескриптор блоку.
-            put32(desc, (phys + (buf_off + slot * BUF) as u64) as u32);
-            put32(desc + 4, (BUF as u32) << 16);
+        {
+            let mut next = RX_NEXT.lock();
+            let slot = next[which] % slots;
+            let desc = virt + desc_off + slot * 16;
+            // Строка чистая (мы её не пишем, пока блок владеет соседями),
+            // так что это только сброс копии.
             dcache(desc, 16);
-            write(rx_reg(ring, 8), slot as u32)?;
-            return Ok(Some(data));
+            let ctrl = get32(desc + 4);
+            if ctrl & (1 << 31) != 0 {
+                let len = ((ctrl >> 16) & 0x3fff) as usize;
+                let buf = virt + buf_off + slot * BUF;
+                dcache(buf, len.min(BUF));
+                let mut data = alloc::vec![0u8; len.min(BUF)];
+                // SAFETY: буфер слота — в нашей памяти DMA.
+                unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, data.as_mut_ptr(), data.len()) };
+                next[which] = (slot + 1) % slots;
+                if slot % DESC_PER_LINE == DESC_PER_LINE - 1 {
+                    // Вся строка прочитана — вернуть четыре дескриптора разом.
+                    let first = slot + 1 - DESC_PER_LINE;
+                    for s in first..=slot {
+                        let d = virt + desc_off + s * 16;
+                        put32(d, (phys + (buf_off + s * BUF) as u64) as u32);
+                        put32(d + 4, (BUF as u32) << 16);
+                        put32(d + 8, 0);
+                        put32(d + 12, 0);
+                    }
+                    dcache(virt + desc_off + first * 16, DESC_PER_LINE * 16);
+                    write(rx_reg(ring, 8), slot as u32)?;
+                }
+                return Ok(Some(data));
+            }
         }
         if crate::time::uptime_ns().wrapping_sub(started) > timeout_ms * 1_000_000 {
             return Ok(None);

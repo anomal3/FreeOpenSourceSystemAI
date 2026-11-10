@@ -625,6 +625,9 @@ impl Shell {
 
     fn open_tab(&mut self, webview: WebView, window: &Window) {
         self.opened += 1;
+        if crate::MOBILE.load(std::sync::atomic::Ordering::Relaxed) {
+            webview.set_hidpi_scale_factor(euclid::Scale::new(2.0));
+        }
         webview.resize(page_size(self.look(), window.width.get(), window.height.get()));
         self.tabs.push(Tab {
             webview,

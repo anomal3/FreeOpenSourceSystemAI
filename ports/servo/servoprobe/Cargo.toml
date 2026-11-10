@@ -18,6 +18,8 @@ publish = false
 # web.pynop.online). Правки SpiderMonkey под FreeOS — mozjs/freeos.patch
 # (память кода через mprotect, ucontext в обработчиках wasm, кеш команд aarch64).
 servo = { version = "=0.8.0", default-features = false, features = ["baked-in-resources", "js_jit"] }
+# Масштаб страниц (`WebView::set_hidpi_scale_factor`) — тип `euclid::Scale`, та же версия, что у Servo.
+euclid = "0.22"
 # Нет fork — каналы между «процессами» Servo только внутри процесса.
 ipc-channel = { version = "0.23", features = ["force-inprocess"] }
 # У servo-fonts freetype-sys закрыт cfg по ОС, а webrender тянет его и так:

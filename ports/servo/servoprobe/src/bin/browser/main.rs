@@ -256,6 +256,9 @@ impl log::Log for Logger {
 
 static LOGGER: Logger = Logger;
 
+/// Мобильный режим (узкий экран): мобильный User-Agent и масштаб страниц 2.
+pub static MOBILE: AtomicBool = AtomicBool::new(false);
+
 fn main() {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
     // Дом должен быть записываемым (профиль, кеш и база Servo). На телефоне
@@ -331,9 +334,19 @@ fn main() {
         println!("browser: obsos:// not registered");
     }
     let opts = servo::Opts { config_dir: Some(profile.servo_dir()), ..servo::Opts::default() };
+    // Узкий экран (телефон, 10.11): сайты отдают мобильную версию по
+    // User-Agent, `<meta name=viewport>` учитывается, а страница рисуется
+    // в масштабе 2 — 720 точек экрана это 360 CSS-пикселей, как у телефонов.
+    let mut prefs = swgl_ctx::preferences();
+    if window.width.get() < 800 {
+        MOBILE.store(true, Ordering::Relaxed);
+        prefs.user_agent = String::from("Mozilla/5.0 (Android 10; Mobile; rv:153.0) Servo/0.8.0 Firefox/153.0");
+        prefs.viewport_meta_enabled = true;
+        println!("browser: mobile mode (narrow screen)");
+    }
     let servo = ServoBuilder::default()
         .opts(opts)
-        .preferences(swgl_ctx::preferences())
+        .preferences(prefs)
         .protocol_registry(protocols)
         .event_loop_waker(Box::new(Waker(Arc::new(AtomicBool::new(false)))))
         .build();

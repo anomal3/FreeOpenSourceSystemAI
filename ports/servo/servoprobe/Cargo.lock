@@ -6461,6 +6461,7 @@ dependencies = [
  "dpi",
  "egui",
  "egui_software_backend",
+ "euclid",
  "freetype-sys",
  "getrandom 0.4.3",
  "gleam",
