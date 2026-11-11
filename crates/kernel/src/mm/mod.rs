@@ -139,10 +139,30 @@ pub fn heap_size() -> usize {
 /// аллокатора кадров и до построения таблиц.
 pub fn choose_heap_size(total_frames: usize) {
     const STEP: usize = 2 * 1024 * 1024;
-    // 1/16 памяти (10.11; было 1/64): на телефоне с 2 ГиБ куча выходила 64 МиБ,
-    // и браузер с тяжёлой страницей (структуры его областей, потоков, сокетов)
-    // вешал систему целиком.
-    let bytes = (total_frames.saturating_mul(PAGE_SIZE) / 16).clamp(HEAP_SIZE, HEAP_MAX) / STEP * STEP;
+    // Потолок — 1/16 памяти (10.11; было 1/64), но при старте куча берёт
+    // только [`HEAP_INITIAL`] и растёт по мере нужды (11.11, `heap::grow`):
+    // заранее занятые 512 МиБ на машине с 16 ГиБ — это память, которой нет у
+    // программ (локальные модели), при 19 МиБ настоящего расхода в простое.
+    let limit = (total_frames.saturating_mul(PAGE_SIZE) / 16).clamp(HEAP_SIZE, HEAP_MAX) / STEP * STEP;
+    HEAP_LIMIT.store(limit, core::sync::atomic::Ordering::Relaxed);
+    HEAP_BYTES.store(HEAP_INITIAL.min(limit), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Сколько кучи отображается при старте (11.11); дальше — рост до
+/// [`heap_limit`].
+pub const HEAP_INITIAL: usize = 32 * 1024 * 1024;
+
+/// До скольких байт куче разрешено расти в этой загрузке.
+static HEAP_LIMIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(HEAP_SIZE);
+
+/// Потолок роста кучи ядра.
+#[must_use]
+pub fn heap_limit() -> usize {
+    HEAP_LIMIT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Запомнить новый размер кучи после роста (`heap::grow`).
+pub(crate) fn set_heap_size(bytes: usize) {
     HEAP_BYTES.store(bytes, core::sync::atomic::Ordering::Relaxed);
 }
 

@@ -196,6 +196,12 @@ unsafe impl GlobalAlloc for KernelHeap {
             Outcome::Exhausted(stats) => stats,
         };
 
+        // Куча кончилась — вырасти и попробовать ещё раз (11.11).
+        if grow(layout.size() + layout.align()) {
+            // SAFETY: тот же контракт `GlobalAlloc::alloc`.
+            return unsafe { self.alloc(layout) };
+        }
+
         // Возврат null означает OOM, и стандартный обработчик тут же
         // запаникует сообщением вида «memory allocation of N bytes failed», в
         // котором нет ни состояния кучи, ни выравнивания. Поэтому всё, что мы
@@ -239,6 +245,80 @@ unsafe impl GlobalAlloc for KernelHeap {
         // Печать — уже без лока, по той же причине, что и в `alloc`.
         kprintln!("mm: deallocation before heap::init, ignored");
     }
+}
+
+/// Идёт ли рост кучи (см. [`grow`]).
+static GROWING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Шаг роста кучи.
+const GROW_STEP: usize = 8 * 1024 * 1024;
+
+/// Вырастить кучу хотя бы на `need` байт, не выше [`crate::mm::heap_limit`]
+/// (11.11): при старте отображены только `HEAP_INITIAL`, остальное окно
+/// занимается кадрами, когда понадобится, — ОС в простое держит столько
+/// памяти, сколько использует.
+///
+/// Кадры отображаются сразу за концом кучи вне её замка (эти адреса ещё
+/// ничьи), потом куча расширяется под замком. Растёт один: второй ждёт
+/// первого и перепроверяет размер. Из кода с закрытыми прерываниями
+/// (обработчик, держатель спин-замка) рост не ждёт — `false`, и выделение
+/// откажет, как раньше.
+fn grow(need: usize) -> bool {
+    use core::sync::atomic::Ordering;
+    use crate::mm::FrameAllocator;
+    let before = crate::mm::heap_size();
+    while GROWING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if !crate::arch::interrupts::enabled() {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    // Пока ждали, мог вырасти другой.
+    if crate::mm::heap_size() != before {
+        GROWING.store(false, Ordering::Release);
+        return true;
+    }
+    let limit = crate::mm::heap_limit();
+    let step = (need.div_ceil(PAGE_SIZE) * PAGE_SIZE + PAGE_SIZE).max(GROW_STEP);
+    let target = (before + step).min(limit);
+    let mut mapped = before;
+    while mapped < target {
+        let Some(frame) = crate::mm::frame::with(|frames| frames.allocate()).flatten() else {
+            break;
+        };
+        // SAFETY: адрес — в окне кучи сразу за её концом, никем не занят;
+        // кадр только что выдан и ничей.
+        let ok = unsafe {
+            crate::arch::map_active(
+                crate::mm::VirtAddr::new(HEAP_BASE + mapped),
+                frame,
+                PAGE_SIZE,
+                crate::mm::PageFlags::READ.union(crate::mm::PageFlags::WRITE),
+            )
+        }
+        .is_ok();
+        if !ok {
+            // SAFETY: кадр так и не попал ни в одну таблицу.
+            crate::mm::frame::with(|frames| unsafe { frames.free(frame) });
+            break;
+        }
+        mapped += PAGE_SIZE;
+    }
+    let grown = mapped - before;
+    if grown > 0 {
+        let mut slot = HEAP.inner.lock();
+        if let Some(heap) = slot.as_mut() {
+            // SAFETY: `[top, top + grown)` только что отображён на свежие кадры
+            // и примыкает к концу кучи.
+            unsafe { heap.extend(grown) };
+            crate::mm::set_heap_size(mapped);
+        }
+    }
+    GROWING.store(false, Ordering::Release);
+    if grown > 0 {
+        kprintln!("  heap        : grown to {} MiB (limit {} MiB)", mapped >> 20, limit >> 20);
+    }
+    grown >= need.min(target - before) && grown > 0
 }
 
 /// Отдать куче диапазон `HEAP_BASE .. HEAP_BASE + HEAP_SIZE`.
