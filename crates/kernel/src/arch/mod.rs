@@ -28,7 +28,12 @@ pub use x86_64::{
     set_user_gs, set_user_tls, user_gs, user_tls,
     pci_config_read32, pci_config_write32, poll_boot_devices, power_off, reboot, reboot_on_key,
     remember_serial, report_boot_devices, serial_fallback, spawn_input_services, wait_for_interrupt,
+    hypervisor_log,
 };
+
+/// Строка в журнал гипервизора — на AArch64 такого канала нет.
+#[cfg(target_arch = "aarch64")]
+pub fn hypervisor_log(_text: &[u8]) {}
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;

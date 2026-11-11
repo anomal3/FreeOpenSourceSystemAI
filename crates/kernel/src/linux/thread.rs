@@ -32,22 +32,19 @@ pub fn clone(frame: &crate::arch::TrapFrame, flags: usize, stack: usize, parent_
     }
     let tls = if flags & CLONE_SETTLS != 0 { tls as u64 } else { crate::arch::user_tls() };
     let clear = if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 };
-    let id = match crate::user::spawn_linux_thread(regs, tls, clear) {
+    // Номер пишется до того, как поток войдёт в программу (см.
+    // `spawn_linux_thread`): иначе быстрый поток успел бы выйти и обнулить
+    // `pd->tid` раньше этой записи.
+    let set_tid = [
+        if flags & CLONE_PARENT_SETTID != 0 { parent_tid } else { 0 },
+        if flags & CLONE_CHILD_SETTID != 0 { child_tid } else { 0 },
+    ];
+    let id = match crate::user::spawn_linux_thread(regs, tls, clear, set_tid) {
         Ok(id) => id,
         Err(crate::user::ThreadError::TooManyTasks) => return -e::EAGAIN,
         Err(_) => return -e::ENOMEM,
     };
-    let tid = id.as_u32();
-    // Новый поток может успеть побежать раньше этих строк: glibc читает
-    // `pd->tid` в нём самом только через `THREAD_SELF`, а ждут номера родитель
-    // (`pthread_create`) и `pthread_join` — им и пишется здесь.
-    for (flag, at) in [(CLONE_PARENT_SETTID, parent_tid), (CLONE_CHILD_SETTID, child_tid)] {
-        if flags & flag != 0 && at != 0 && space::user_can(at, 4, PageFlags::WRITE) {
-            // SAFETY: адрес проверен на запись; пространство общее у потоков.
-            unsafe { core::ptr::write_volatile(at as *mut u32, tid) };
-        }
-    }
-    i64::from(tid)
+    i64::from(id.as_u32())
 }
 
 /// Новый процесс — копия текущего (фаза 71d). `CLONE_VM` без `CLONE_THREAD`

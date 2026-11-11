@@ -4298,26 +4298,52 @@ struct LinuxThreadStart {
     /// поток сам, но до этого живёт с родительской).
     gs: u64,
     clear_tid: usize,
+    /// Родитель кончил готовить поток: записал номер в `set_tid` и маску
+    /// сигналов. До этого поток в программу не входит.
+    released: core::sync::atomic::AtomicBool,
 }
 
 /// Завести поток программы Linux (`clone` с `CLONE_VM|CLONE_THREAD`): он
 /// продолжит с той же инструкции и с теми же регистрами, что родитель, — на
 /// этом стоят обёртки `clone`/`clone3` glibc. Стек дал сам процесс.
+///
+/// `set_tid` — адреса, куда записать номер нового потока
+/// (`CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID`, 0 — не писать). Пишутся
+/// здесь, **до** того как поток войдёт в программу: на другом процессоре он
+/// мог успеть отработать и выйти, обнулив `clear_tid` (у glibc это тот же
+/// `pd->tid`), — и запоздавшая запись родителя вернула бы туда номер
+/// (`pthread_join` ждал бы вечно) или легла бы в уже отданный стек.
 #[cfg(target_arch = "x86_64")]
-pub fn spawn_linux_thread(regs: arch::TrapFrame, tls: u64, clear_tid: usize) -> Result<sched::TaskId, ThreadError> {
+pub fn spawn_linux_thread(regs: arch::TrapFrame, tls: u64, clear_tid: usize, set_tid: [usize; 2]) -> Result<sched::TaskId, ThreadError> {
     let process = current_process().ok_or(ThreadError::NoProgram)?;
     let mask = LINUX_SIGMASK[sched::current_slot()].load(Ordering::Relaxed);
-    let start = alloc::boxed::Box::new(LinuxThreadStart { process, regs, tls, gs: arch::user_gs(), clear_tid });
+    let start = alloc::boxed::Box::new(LinuxThreadStart {
+        process,
+        regs,
+        tls,
+        gs: arch::user_gs(),
+        clear_tid,
+        released: core::sync::atomic::AtomicBool::new(false),
+    });
     let raw = alloc::boxed::Box::into_raw(start);
     match sched::spawn_raw("thread", PROGRAM_STACK_SIZE, linux_thread_entry, raw as usize) {
         Ok(id) => {
             // Маска сигналов наследуется (как у Linux). Слот нового потока
-            // известен только по номеру; пишем до того, как он войдёт в
-            // программу, — он ещё ждёт у планировщика или в начале батута.
+            // известен только по номеру; поток ждёт `released` и в программу
+            // ещё не вошёл.
             if let Some((slot, _)) = sched::lookup(id) {
                 LINUX_SIGMASK[slot].store(mask, Ordering::Relaxed);
                 LINUX_PENDING[slot].store(0, Ordering::Relaxed);
             }
+            for at in set_tid {
+                if at != 0 && space::user_can(at, 4, PageFlags::WRITE) {
+                    // SAFETY: адрес проверен на запись; пространство общее у потоков.
+                    unsafe { core::ptr::write_volatile(at as *mut u32, id.as_u32()) };
+                }
+            }
+            // SAFETY: коробку поток освобождает только после `released`, так
+            // что до этой записи она жива.
+            unsafe { (*raw).released.store(true, Ordering::Release) };
             Ok(id)
         }
         Err(err) => {
@@ -4339,6 +4365,11 @@ extern "C" fn linux_thread_entry(arg: usize) -> ! {
     arch::interrupts::enable();
     // SAFETY: указатель выделен в `spawn_linux_thread` и передан ровно один раз.
     let start = unsafe { alloc::boxed::Box::from_raw(arg as *mut LinuxThreadStart) };
+    // Ждать, пока родитель допишет номер потока и маску (см. `spawn_linux_thread`):
+    // это несколько инструкций после постановки в очередь.
+    while !start.released.load(Ordering::Acquire) {
+        sched::yield_now();
+    }
     let slot = sched::current_slot();
     let root = start.process.lock().space.root();
     {

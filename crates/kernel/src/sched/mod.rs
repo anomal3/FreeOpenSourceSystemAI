@@ -1440,6 +1440,7 @@ static DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Попросить аварийный дамп: его напечатает ближайший тик загрузочного
 /// процессора. Зовётся из обработчика клавиатуры.
 pub fn request_dump() {
+    arch::hypervisor_log(b"  dump        : Pause seen\n");
     DUMP_REQUESTED.store(true, Ordering::Release);
 }
 
@@ -1454,13 +1455,49 @@ static STALE_SEEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicU
 /// никогда, и снаружи это выглядит как «процессоры простаивают, а программа
 /// стоит» (llama в VirtualBox, 11.11). Лок — `try_lock`: тик не ждёт.
 pub fn diag_tick(ticks: u64) {
+    /// Строка дампа — и в журнал ядра, и в журнал гипервизора: в VirtualBox
+    /// экран бывает занят зависшим столом, а линия — встать посреди строки.
+    struct HyperLog;
+    impl core::fmt::Write for HyperLog {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            arch::hypervisor_log(text.as_bytes());
+            Ok(())
+        }
+    }
+    macro_rules! dumpln {
+        ($($arg:tt)*) => {{
+            let _ = core::fmt::Write::write_fmt(&mut HyperLog, format_args!($($arg)*));
+            arch::hypervisor_log(b"\n");
+            crate::kprintln!($($arg)*);
+        }};
+    }
+
     let dump = DUMP_REQUESTED.swap(false, Ordering::AcqRel);
     if !dump && ticks % 1000 != 0 {
         return;
     }
+    // Пульс тика загрузочного процессора — раз в 10 с, только в журнал
+    // гипервизора: по нему видно, доходит ли тик до этой точки при зависании.
+    if ticks % 10_000 == 0 {
+        let mut line = HyperLog;
+        let _ = core::fmt::Write::write_fmt(&mut line, format_args!("  pulse       : tick {ticks}\n"));
+    }
+    if dump {
+        // До лока планировщика: это видно, даже если он занят навсегда.
+        dumpln!("  dump        : tick {ticks}, uptime {} ms", crate::time::uptime_ms());
+        for c in 0..smp::online() {
+            dumpln!(
+                "  dump        : cpu {c} idle {} idle ticks {} need resched {} slice left {}",
+                ON_IDLE[c].load(Ordering::Relaxed),
+                IDLE_TICKS[c].load(Ordering::Relaxed),
+                NEED_RESCHED[c].load(Ordering::Relaxed),
+                SLICE_LEFT[c].load(Ordering::Relaxed)
+            );
+        }
+    }
     let Some(sched) = SCHED.try_lock() else {
         if dump {
-            crate::kprintln!("  dump        : scheduler lock is held by another CPU");
+            dumpln!("  dump        : scheduler lock is held by another CPU");
         }
         return;
     };
@@ -1486,18 +1523,18 @@ pub fn diag_tick(ticks: u64) {
     }
     STALE_SEEN.store(stale, Ordering::Relaxed);
     if dump {
-        // Дамп и на экран (11.11): линия в VirtualBox встаёт посреди строки.
-        crate::console::reclaim_screen();
-        crate::kprintln!("  dump        : uptime {} ms, {} stale label(s)", crate::time::uptime_ms(), stale);
+        // Экран не забирается: забор идёт через локи консоли, и зависни он —
+        // не было бы и журнала гипервизора, единственного надёжного здесь.
+        dumpln!("  dump        : uptime {} ms, {} stale label(s)", crate::time::uptime_ms(), stale);
         for (c, state) in sched.cpus.iter().enumerate().take(smp::online()) {
-            crate::kprintln!("  dump        : cpu {c} runs slot {} (prev {:?})", state.current, state.previous);
+            dumpln!("  dump        : cpu {c} runs slot {} (prev {:?})", state.current, state.previous);
         }
         for (slot, entry) in sched.slots().iter().enumerate() {
             let Some(task) = entry else { continue };
             if task.state == TaskState::Finished {
                 continue;
             }
-            crate::kprintln!(
+            dumpln!(
                 "  dump        : slot {slot} #{} {} {:?} cpu {:?} boost {}",
                 task.id.as_u32(),
                 task.name,
