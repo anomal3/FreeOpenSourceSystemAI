@@ -852,15 +852,14 @@ pub fn stream_recv(owner: TaskId, index: usize, out: &mut [u8]) -> Result<usize,
         // Окно **до** чтения: по нему решается, узнал ли собеседник, что место
         // освободилось.
         let before = conn.window();
-        let mut taken = 0;
-        while taken < out.len() {
-            match conn.recv.pop_front() {
-                Some(byte) => {
-                    out[taken] = byte;
-                    taken += 1;
-                }
-                None => break,
-            }
+        let taken = out.len().min(conn.recv.len());
+        for (slot, byte) in out.iter_mut().zip(conn.recv.drain(..taken)) {
+            *slot = byte;
+        }
+        // Место освободилось — отложенные сегменты «не по порядку» могли
+        // теперь влезть.
+        if !conn.ooo.is_empty() {
+            conn.drain_out_of_order();
         }
         // Освободившееся место надо объявить: собеседник, которому мы сказали
         // «окно почти ноль», сам не догадается, что оно открылось, и будет

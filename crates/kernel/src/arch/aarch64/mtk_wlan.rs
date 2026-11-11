@@ -1498,6 +1498,23 @@ impl Card {
         );
         // Указатели колец приёма (CPU — наш, DMA — блока): застрявшее
         // кольцо видно по ним, а не по счётчикам.
+        // Память — рядом (10.11): телефон вставал целиком на тяжёлых
+        // страницах, и по этой строке видно, не кончалась ли куча или кадры.
+        let heap = crate::mm::heap::stats();
+        let frames = crate::mm::frame::stats();
+        crate::kprintln!(
+            "  memory      : heap {} of {} MiB used, frames {} of {} MiB free",
+            heap.used >> 20,
+            heap.size >> 20,
+            (frames.free * 4096) >> 20,
+            (frames.total * 4096) >> 20
+        );
+        // Самый долгий участок с закрытыми прерываниями и где он взят.
+        crate::latency::report_recent();
+        crate::kprintln!(
+            "  watchdog    : kicker silent at most {} ms",
+            super::mtk::WATCHDOG_STARVED_MAX_MS.load(Ordering::Relaxed)
+        );
         let idx = |ring: u32, field: u64| read(rx_reg(ring, field)).unwrap_or(u32::MAX);
         crate::kprintln!(
             "  wlan        : rings data cpu {} dma {}, event cpu {} dma {}",

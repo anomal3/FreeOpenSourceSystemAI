@@ -229,6 +229,21 @@ pub fn watchdog_kick() {
     }
 }
 
+/// Самое долгое молчание задачи-пинальщика (мс), замеченное из тика.
+pub static WATCHDOG_STARVED_MAX_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Из тика таймера (10.11, диагностика): запомнить, сколько задача кнопки
+/// питания молчала (голодание задач видно в сводке Wi-Fi). Не пинает:
+/// пинок отсюда прятал бы настоящее зависание задач. Печати нет: тик — в
+/// прерывании, а замок журнала мог держать прерванный код.
+pub fn watchdog_tick() {
+    if !WATCHDOG_ON.load(Ordering::Acquire) {
+        return;
+    }
+    let silent = crate::time::uptime_ms().saturating_sub(WATCHDOG_LAST_KICK_MS.load(Ordering::Relaxed));
+    WATCHDOG_STARVED_MAX_MS.fetch_max(silent, Ordering::Relaxed);
+}
+
 /// Задача кнопки питания заработала: поставить метку «в fastboot» и включить
 /// таймер.
 ///

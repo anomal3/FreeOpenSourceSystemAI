@@ -164,6 +164,8 @@ pub fn on_timer_tick() {
         // опустошать было бы некому.
         crate::serial::start_queue();
         crate::serial::pump();
+        #[cfg(all(target_arch = "aarch64", feature = "phone"))]
+        crate::arch::watchdog_tick();
     }
     // Момент прихода тика подмешивается в пул случайности. Тик — самое
     // предсказуемое прерывание в системе, и энтропии в нём немного: она вся в

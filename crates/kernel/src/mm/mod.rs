@@ -139,7 +139,10 @@ pub fn heap_size() -> usize {
 /// аллокатора кадров и до построения таблиц.
 pub fn choose_heap_size(total_frames: usize) {
     const STEP: usize = 2 * 1024 * 1024;
-    let bytes = (total_frames.saturating_mul(PAGE_SIZE) / 64).clamp(HEAP_SIZE, HEAP_MAX) / STEP * STEP;
+    // 1/16 памяти (10.11; было 1/64): на телефоне с 2 ГиБ куча выходила 64 МиБ,
+    // и браузер с тяжёлой страницей (структуры его областей, потоков, сокетов)
+    // вешал систему целиком.
+    let bytes = (total_frames.saturating_mul(PAGE_SIZE) / 16).clamp(HEAP_SIZE, HEAP_MAX) / STEP * STEP;
     HEAP_BYTES.store(bytes, core::sync::atomic::Ordering::Relaxed);
 }
 

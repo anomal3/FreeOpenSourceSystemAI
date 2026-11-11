@@ -7280,7 +7280,9 @@ pub const ALL: &[Scenario] = &[
             // десятки мегабайт, отладочное ядро, программная отрисовка.
             Step::Wait(150_000),
             // Приложение .NET поднялось: Blazor перешёл на страницу входа.
-            Step::Await("browser: url https://web.pynop.online/Account/Login", 300_000),
+            // Где угодно в выводе (10.11): с очередью пересборки TCP вход
+            // открывается ещё во время паузы выше.
+            Step::AwaitAny("browser: url https://web.pynop.online/Account/Login", 300_000),
             Step::Wait(10_000),
             Step::Painted("obsos-web-pynop-app"),
             Step::Absent("support WebAssembly"),

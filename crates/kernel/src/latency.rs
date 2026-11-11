@@ -120,9 +120,20 @@ pub fn start() -> u64 {
 /// Кончился участок с закрытыми прерываниями, начатый в `since` в месте `at`.
 pub fn irq_off_ended(since: u64, at: &'static Location<'static>) {
     IRQ_OFF.note(since, at);
+    RECENT.note(since, at);
 }
 
 /// Строка для `tasks`.
 pub fn report() {
     IRQ_OFF.print("interrupts held off");
 }
+
+/// Самый долгий участок с прошлого вызова — и сбросить (для периодической
+/// сводки: рекорд с загрузки заслоняет то, что происходит сейчас).
+pub fn report_recent() {
+    RECENT.print("interrupts held off (last period)");
+    RECENT.longest.store(0, Ordering::Relaxed);
+    RECENT.at.store(ptr::null_mut(), Ordering::Relaxed);
+}
+
+static RECENT: Record = Record::new();

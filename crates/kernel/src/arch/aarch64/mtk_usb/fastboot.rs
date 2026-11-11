@@ -508,6 +508,15 @@ impl Fastboot {
             }
             self.state = State::Lines { at: 0 };
             self.continue_lines(0);
+        } else if text == "oem ps" {
+            self.tasks();
+        } else if text == "oem logtail" {
+            // Только хвост журнала (10.11): весь журнал с модемом и Wi-Fi
+            // перерос то, что fastboot на ПК принимает строками за раз.
+            let until = klog::written();
+            let at = until.saturating_sub(8 * 1024).max(klog::oldest());
+            self.state = State::Log { at, until, last: false };
+            self.continue_log(at, until, false);
         } else if text == "oem log" || text == "oem klog" {
             let (at, until) = (klog::oldest(), klog::written());
             self.state = State::Log { at, until, last: false };
@@ -1418,6 +1427,29 @@ impl Fastboot {
     /// `oem wdt [on | off | status]` (05.11) — сторожевой таймер TOPRGU (см.
     /// `mtk::watchdog_arm`): включить, выключить вместе с меткой «в fastboot»,
     /// посмотреть. Ответ — строками `INFO`, как у `oem mem`.
+    /// `oem ps` (10.11) — кто ест процессор: задачи по убыванию времени
+    /// процессора, с состоянием и числом постановок. Для зависаний, когда
+    /// оболочка уже не отвечает, а USB ещё жив.
+    fn tasks(&mut self) {
+        let mut all = crate::sched::snapshot();
+        all.sort_by(|a, b| b.cpu_ms.cmp(&a.cpu_ms));
+        self.line_count = 0;
+        self.say(alloc::format!("uptime {} ms, {} tasks", crate::time::uptime_ms(), all.len()).as_bytes());
+        for t in all.iter().take(LINES - 1) {
+            let line = alloc::format!(
+                "#{} {} {:?} cpu {} ms sw {}",
+                t.id.as_u32(),
+                t.name,
+                t.state,
+                t.cpu_ms,
+                t.switches
+            );
+            self.say(line.as_bytes());
+        }
+        self.state = State::Lines { at: 0 };
+        self.continue_lines(0);
+    }
+
     fn wdt(&mut self, arg: &str) {
         use crate::arch::aarch64::mtk;
         let result = match arg {

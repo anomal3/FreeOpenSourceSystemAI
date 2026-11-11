@@ -345,7 +345,10 @@ enum Rank {
 
 fn rank_of(name: &str) -> Option<Rank> {
     match name {
-        "usb" | "ehci" | "ohci" | "touch" | "net" => Some(Rank::Driver),
+        // `usb-gadget` и `powerkey` — телефон (10.11): связь по кабелю и
+        // пинальщик сторожевого таймера голодали за тяжёлой страницей, и
+        // сторож перезагружал живую машину.
+        "usb" | "ehci" | "ohci" | "touch" | "net" | "usb-gadget" | "powerkey" => Some(Rank::Driver),
         "shell" | "wayland" => Some(Rank::Desktop),
         _ => None,
     }

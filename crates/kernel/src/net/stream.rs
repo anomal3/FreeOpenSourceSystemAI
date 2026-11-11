@@ -319,7 +319,7 @@ impl Connection {
     }
 
     /// Переложить из очереди «не по порядку» всё, что теперь стало по порядку.
-    fn drain_out_of_order(&mut self) {
+    pub fn drain_out_of_order(&mut self) {
         loop {
             let mut progressed = false;
             let mut index = 0;
@@ -334,10 +334,14 @@ impl Connection {
                 if !tcp::after(sequence, self.rcv_nxt) {
                     let skip = self.rcv_nxt.wrapping_sub(sequence) as usize;
                     let room = RECEIVE_BUFFER - self.recv.len().min(RECEIVE_BUFFER);
+                    if room < data.len() - skip {
+                        // Не влезает целиком — ждать, пока программа прочтёт
+                        // (иначе хвост сегмента потерялся бы молча).
+                        return;
+                    }
                     let (_, data) = self.ooo.swap_remove(index);
-                    let taken = (data.len() - skip).min(room);
-                    self.recv.extend(&data[skip..skip + taken]);
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(taken as u32);
+                    self.recv.extend(&data[skip..]);
+                    self.rcv_nxt = self.rcv_nxt.wrapping_add((data.len() - skip) as u32);
                     progressed = true;
                     continue;
                 }

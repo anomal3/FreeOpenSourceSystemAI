@@ -286,6 +286,8 @@ fn main() {
     while let Some(arg) = args.next() {
         if arg == "--private" {
             private = true;
+        } else if arg == "--no-jit" || arg == "--no-offthread" {
+            // Разбираются ниже, при настройке движка.
         } else if arg == "--profile" {
             profile_name = args.next().unwrap_or_default();
         } else if arg == "--sync-folder" {
@@ -345,6 +347,19 @@ fn main() {
     // User-Agent, `<meta name=viewport>` учитывается, а страница рисуется
     // в масштабе 2 — 720 точек экрана это 360 CSS-пикселей, как у телефонов.
     let mut prefs = swgl_ctx::preferences();
+    // Ключи для поиска сбоев (10.11, телефон вставал на m.vk.com):
+    // `--no-jit` — JavaScript без JIT, `--no-offthread` — без фоновой
+    // компиляции в отдельных потоках.
+    if std::env::args().any(|a| a == "--no-jit") {
+        prefs.js_disable_jit = true;
+        prefs.js_baseline_jit_enabled = false;
+        prefs.js_ion_enabled = false;
+        println!("browser: JIT off (--no-jit)");
+    }
+    if std::env::args().any(|a| a == "--no-offthread") {
+        prefs.js_offthread_compilation_enabled = false;
+        println!("browser: off-thread JS compilation off (--no-offthread)");
+    }
     if window.width.get() < 800 {
         MOBILE.store(true, Ordering::Relaxed);
         prefs.user_agent = String::from("Mozilla/5.0 (Android 10; Mobile; rv:153.0) Servo/0.8.0 Firefox/153.0");
