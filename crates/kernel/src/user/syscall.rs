@@ -300,7 +300,14 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
     if fd == FD_STDERR {
         return match core::str::from_utf8(bytes) {
             Ok(text) => {
-                if crate::ui::is_active() {
+                // Программа терминала (вывод не в канале) — stderr туда же,
+                // куда stdout, как в любой консоли (11.11): иначе человек не
+                // видел ни ошибок, ни логов консольной программы (llama.cpp).
+                // Печать оболочки и так дублируется в журнал.
+                let piped = super::with_current(|program| program.stdout.is_some()).unwrap_or(true);
+                if !piped {
+                    crate::shell::print(format_args!("{text}"));
+                } else if crate::ui::is_active() {
                     crate::serial::_print(format_args!("{text}"));
                 } else {
                     // Графики нет — значит и картинки, которую надо беречь, нет
