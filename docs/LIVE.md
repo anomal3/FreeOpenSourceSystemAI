@@ -77,6 +77,12 @@ UEFI выключить **Secure Boot**.
 - Только `x86_64` и только UEFI.
 - В VirtualBox с графическим контроллером *VMSVGA* в фоновом (headless) режиме
   снимок экрана бывает чёрным — выбирайте **VBoxVGA**.
+- VirtualBox на Windows с включённым Hyper-V (WSL2, Docker Desktop,
+  «Платформа низкоуровневой оболочки Windows») работает в медленном режиме
+  NEM — в `VBox.log` строка «Snail execution mode». В нём прерывания таймера
+  почти не доходят до процессора, пока программа крутится в цикле ожидания:
+  многопоточные программы (llama.cpp на нескольких ядрах) подвисают, а вместе
+  с ними и стол, и ssh. Выход — QEMU или Windows без Hyper-V.
 - Сетевые карты: Intel e1000 (82540EM и родственные), virtio-net.
 
 Сообщить о проблеме: [Issues](https://github.com/anomal3/FreeOpenSourceSystemAI/issues).
@@ -95,3 +101,7 @@ Boots from the image and **writes nothing to the machine's disks**.
   USBImager or `dd`; boot the stick's **UEFI** entry from the boot menu
   (F12/F11/F8/Esc); turn Secure Boot off if it is not listed.
 - Idle footprint: about **44 MiB** of RAM in live mode.
+- Known: VirtualBox on Windows with Hyper-V enabled (WSL2, Docker Desktop)
+  runs in NEM "snail" mode, where timer interrupts barely reach a vCPU spinning
+  in user code — multi-threaded programs (llama.cpp on several cores) stall
+  together with the desktop and ssh. Use QEMU or a host without Hyper-V.
