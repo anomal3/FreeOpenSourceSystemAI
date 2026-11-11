@@ -11671,6 +11671,48 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   Vulkan (драйвер видеокарты; lavapipe на процессоре — лишь для проверки).
 - Без видеокарты игры на DirectX не про нас; NVIDIA — см. «Видеокарты NVIDIA».
 
+### ПЛАН Proton (Роман 12.11: «Proton и зависимости свои»; телефон отложен)
+
+Proton = Wine (ветка Valve/GE) + fsync + DXVK/VKD3D + свои библиотеки, без
+Steam. Что уже есть в слое Linux (разбор 12.11): futex WAIT/WAKE/BITSET,
+eventfd, epoll, timerfd, memfd, ppoll, tgkill, sigaltstack, clone3. Чего нет:
+`futex_waitv`, `FUTEX_WAKE_OP` по-настоящему (сейчас будит оба адреса без
+`op`), `signalfd`, `rt_sigqueueinfo`, `process_vm_readv`, `ptrace`,
+`modify_ldt`, SysV `shm*`, 32-битного сегмента кода (только `0x33`), а
+сигнал доходит до потока **только на выходе из вызова** — поток, крутящийся в
+своём коде, `SIGUSR1` не получит (на этом Wine приостанавливает потоки:
+`SuspendThread`, `GetThreadContext` чужого потока).
+
+Шаги по порядку (каждый — сценарий + коммит):
+1. **fsync:** `futex_waitv` (449) в слое Linux, `FUTEX_WAKE_OP` с `op`;
+   пробная программа на C (ожидание нескольких futex, пробуждение каждого,
+   таймаут) в сценарии.
+2. **Асинхронные сигналы:** доставка ждущего сигнала на возврате в третье
+   кольцо из **прерывания** (таймер, IPI), а не только из вызова; IPI
+   потоку на другом процессоре при `tgkill`. Проба: поток в пустом цикле
+   получает `SIGUSR1`, обработчик читает и меняет контекст (`ucontext`).
+3. **Пакет `proton-ge`:** готовая сборка GE-Proton (GitHub, tar.zst; собрана
+   в Steam Runtime на старой glibc) → `xtask thirdparty --only proton`,
+   раскладка `files/` как есть, своё `bin/fossai-proton` (префикс,
+   `WINEFSYNC=1`, драйвер Wayland, без Steam и pressure-vessel);
+   «свои зависимости» — недостающие библиотеки Steam Runtime по
+   `DT_NEEDED` из снимка Debian 12, как у `wine.rs`. Сценарий `proton`:
+   Блокнот, затем `winecfg`, в журнале `fsync: up and running`.
+4. **32-битные программы:** сегмент кода `0x23` (32-битный, третье кольцо)
+   в GDT, `modify_ldt`/`set_thread_area` по нужде; проверить, нужен ли
+   GE-Proton i386-часть Linux (старый WoW64) или хватает нового WoW64
+   (32-битный PE внутри 64-битного процесса). Проба — 32-битный Блокнот.
+5. **OpenGL без видеокарты:** Mesa из Debian 12 (llvmpipe, `libLLVM-15`
+   берётся готовым — порт LLVM не нужен), EGL поверх нашего Wayland через
+   `wl_shm`; wined3d (DirectX 9/10/11 → OpenGL). Проба — пример D3D9.
+6. **Vulkan без видеокарты:** lavapipe из `mesa-vulkan-drivers` Debian 12,
+   `libvulkan1`, WSI Wayland через `wl_shm`; DXVK из GE-Proton поверх него.
+   Проба — `vkcube`, затем тот же пример D3D9/D3D11 через DXVK. Скорость —
+   только для проверки; настоящая — с драйвером видеокарты (NVIDIA позже).
+7. **Звук:** `winealsa` или `winepulse` поверх нашего звука (выбрать по
+   разбору) — после графики.
+8. Настоящая игра без античита (бесплатная, DirectX 9) — итог вехи.
+
 ## Телефон — на потом (Роман 06.11: «в TODO, концепцию показать хватает»)
 
 - **SMS:** приём и показ входящих (`+CMTI`/`AT+CMGR`, PDU), окно сообщений;

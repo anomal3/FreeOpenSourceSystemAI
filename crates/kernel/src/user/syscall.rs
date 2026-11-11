@@ -2478,6 +2478,52 @@ fn futex_wait(addr: usize, expected: u32, timeout_ms: usize) -> i64 {
     }
 }
 
+/// Чем кончилось ожидание на нескольких адресах ([`futex_wait_many`]).
+pub(crate) enum FutexMany {
+    /// Разбудили по адресу с этим номером.
+    Woken(usize),
+    /// Слово по этому номеру уже не равно ожидаемому — не уснули.
+    Changed,
+    /// Адрес с этим номером не годится (чужой, невыровненный, не отображён).
+    BadAddress,
+    /// Проснулись без пробуждения по ключу: срок или сигнал — решает
+    /// вызывающий по часам и по ждущим сигналам.
+    Other,
+}
+
+/// Ждать сразу на нескольких словах программы (`futex_waitv` Linux, 12.11):
+/// пары «адрес — ожидаемое значение», срок — миллисекунды работы системы.
+///
+/// Проверка всех слов и сон — под одним локом планировщика, как у
+/// [`futex_wait`]: пробуждение по любому из адресов между проверкой и сном
+/// не теряется.
+pub(crate) fn futex_wait_many(entries: &[(usize, u32)], until: Option<u64>) -> FutexMany {
+    let mut keys = alloc::vec::Vec::new();
+    if keys.try_reserve_exact(entries.len()).is_err() {
+        return FutexMany::Other;
+    }
+    for &(addr, _) in entries {
+        let Some(key) = super::futex_key(addr) else {
+            return FutexMany::BadAddress;
+        };
+        keys.push(key);
+    }
+    let mut changed = false;
+    let woken = sched::block_on_futexes(keys.into_boxed_slice(), until, || {
+        changed = entries.iter().any(|&(addr, expected)| {
+            // SAFETY: каждый адрес проверен `futex_key` выше: принадлежит
+            // программе, выровнен и отображён на чтение и запись.
+            unsafe { core::ptr::read_volatile(addr as *const u32) != expected }
+        });
+        changed
+    });
+    match woken {
+        Some(index) => FutexMany::Woken(index),
+        None if changed => FutexMany::Changed,
+        None => FutexMany::Other,
+    }
+}
+
 /// `futex_wake(addr, count) -> сколько разбудили`.
 fn futex_wake(addr: usize, count: usize) -> i64 {
     let Some(key) = super::futex_key(addr) else {

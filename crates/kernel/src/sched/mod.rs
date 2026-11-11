@@ -499,7 +499,8 @@ impl Scheduler {
                     Wait::Until(tick)
                     | Wait::Input(tick)
                     | Wait::IrqUntil(_, tick)
-                    | Wait::FutexUntil(_, tick),
+                    | Wait::FutexUntil(_, tick)
+                    | Wait::FutexMany(tick),
                 ) => now >= tick,
                 _ => false,
             };
@@ -1123,8 +1124,57 @@ pub fn wake_futex(key: usize, count: usize) -> usize {
         if matches!(task.state, TaskState::Blocked(Wait::Futex(waited) | Wait::FutexUntil(waited, _)) if waited == key) {
             task.state = TaskState::Ready;
             woken += 1;
+        } else if matches!(task.state, TaskState::Blocked(Wait::FutexMany(_))) {
+            let index = task.futex_keys.as_ref().and_then(|keys| keys.iter().position(|&waited| waited == key));
+            if let Some(index) = index {
+                task.futex_woken = Some(index);
+                task.state = TaskState::Ready;
+                woken += 1;
+            }
         }
     }
+    woken
+}
+
+/// Заблокироваться сразу на нескольких ключах (`futex_waitv`, 12.11).
+///
+/// `ready` — как у [`block_on_futex`], под локом планировщика: проверка всех
+/// слов и сон без щели между ними. `until` — срок в миллисекундах работы
+/// системы. Возвращает номер ключа, по которому разбудили; `None` — не
+/// уснули (`ready` ответил «да»), вышел срок или разбудил кто-то другой
+/// (сигнал) — разбирается вызывающий.
+pub fn block_on_futexes(
+    keys: alloc::boxed::Box<[usize]>,
+    until: Option<u64>,
+    ready: impl FnOnce() -> bool,
+) -> Option<usize> {
+    let mut keys = Some(keys);
+    {
+        let mut sched = SCHED.lock();
+        if !sched.running || ready() {
+            drop(sched);
+            drop(keys);
+            return None;
+        }
+        let current = sched.current();
+        if let Some(task) = sched.tasks[current].as_mut() {
+            task.futex_keys = keys.take();
+            task.futex_woken = None;
+            task.state = TaskState::Blocked(Wait::FutexMany(until.unwrap_or(u64::MAX)));
+        }
+    }
+    schedule();
+    // Коробку — из-под лока и освободить уже без него: куча под локом
+    // планировщика — лишний порядок захвата.
+    let (keys, woken) = {
+        let mut sched = SCHED.lock();
+        let current = sched.current();
+        match sched.tasks[current].as_mut() {
+            Some(task) => (task.futex_keys.take(), task.futex_woken.take()),
+            None => (None, None),
+        }
+    };
+    drop(keys);
     woken
 }
 

@@ -212,6 +212,10 @@ pub enum Wait {
     /// таймеры. Отдельный вариант по той же причине, что [`Wait::IrqUntil`]:
     /// «поспать, потом подождать» пропустило бы пробуждение, пришедшее во сне.
     FutexUntil(usize, u64),
+    /// Ожидание на нескольких адресах сразу — ключи в [`Task::futex_keys`]
+    /// (`futex_waitv`, на нём fsync Wine/Proton). Число — срок по часам
+    /// работы системы в миллисекундах, `u64::MAX` — без срока.
+    FutexMany(u64),
 }
 
 impl fmt::Display for TaskState {
@@ -255,6 +259,7 @@ impl TaskState {
             Self::Blocked(Wait::Futex(key) | Wait::FutexUntil(key, _)) => {
                 Some(("waiting on an address, key", key as u64))
             }
+            Self::Blocked(Wait::FutexMany(at)) => Some(("waiting on several addresses until uptime ms", at)),
             Self::Blocked(Wait::Irq(source)) => Some(("waiting for device", u64::from(source))),
             Self::Blocked(Wait::IrqUntil(source, _)) => {
                 Some(("waiting for device (with a deadline)", u64::from(source)))
@@ -585,6 +590,13 @@ pub struct Task {
     /// у холостой задачи, которой начинать нечего: она уже исполняется.
     pub entry: Option<extern "C" fn(usize) -> !>,
     pub arg: usize,
+
+    /// Ключи ожидания на нескольких адресах сразу ([`Wait::FutexMany`],
+    /// `futex_waitv` Linux, 12.11). Выделяет их сам ждущий — до лока
+    /// планировщика, — сюда только переносится готовая коробка.
+    pub futex_keys: Option<alloc::boxed::Box<[usize]>>,
+    /// Номер ключа из [`Task::futex_keys`], по которому задачу разбудили.
+    pub futex_woken: Option<usize>,
 }
 
 /// То, что процессор помнит о программе задачи и что обязано меняться вместе с
@@ -656,6 +668,8 @@ impl Task {
             cpu: Some(cpu),
             entry: None,
             arg: 0,
+            futex_keys: None,
+            futex_woken: None,
         }
     }
 
@@ -699,6 +713,8 @@ impl Task {
             cpu: None,
             entry: None,
             arg: 0,
+            futex_keys: None,
+            futex_woken: None,
         }
     }
 }

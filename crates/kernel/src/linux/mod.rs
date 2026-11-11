@@ -160,6 +160,7 @@ mod nr {
     pub const MUNLOCKALL: usize = 152;
     pub const MLOCK2: usize = 325;
     pub const CLONE3: usize = 435;
+    pub const FUTEX_WAITV: usize = 449;
     pub const FORK: usize = 57;
     pub const VFORK: usize = 58;
     pub const EXECVE: usize = 59;
@@ -577,6 +578,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::UNAME => uname(a0),
             nr::ARCH_PRCTL => arch_prctl(a0, a1),
             nr::FUTEX => futex(a0, a1, a2, a3, a4, a5),
+            nr::FUTEX_WAITV => futex_waitv(a0, a1, a2, a3, a4),
             nr::SCHED_GETAFFINITY => affinity(a1, a2),
             nr::GETCPU => getcpu(a0, a1),
             nr::CAPGET => capget(a0, a1),
@@ -2143,16 +2145,148 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usi
             errno(woken.max(0) + moved.max(0))
         }
         FUTEX_WAKE_OP => {
-            // `*addr2 = op(*addr2)`, разбудить на `addr` и — если сравнение
-            // сошлось — на `addr2`. Здесь будятся оба: лишнее пробуждение законно.
-            let _ = (timeout, value3);
+            // `old = *addr2; *addr2 = op(old)` атомарно, разбудить до `value`
+            // на `addr` и, если `cmp(old)` сошлось, до `timeout` (здесь это
+            // число, а не срок) на `addr2` (12.11: раньше `op` не исполнялся
+            // вовсе — слово оставалось прежним).
+            if addr2 % 4 != 0 || !space::user_can(addr2, 4, PageFlags::WRITE) {
+                return -e::EFAULT;
+            }
+            let encoded = value3 as u32;
+            let shift_arg = encoded & (8 << 28) != 0;
+            let operation = (encoded >> 28) & 7;
+            let compare = (encoded >> 24) & 15;
+            let mut oparg = (encoded >> 12) & 0xfff;
+            let cmparg = encoded & 0xfff;
+            if shift_arg {
+                oparg = 1u32.checked_shl(oparg).unwrap_or(0);
+            }
+            // SAFETY: адрес проверен на запись и выровнен — атомарное слово
+            // общей памяти потоков.
+            let word = unsafe { &*(addr2 as *const core::sync::atomic::AtomicU32) };
+            let apply = |old: u32| match operation {
+                0 => Some(oparg),
+                1 => Some(old.wrapping_add(oparg)),
+                2 => Some(old | oparg),
+                3 => Some(old & !oparg),
+                4 => Some(old ^ oparg),
+                _ => None,
+            };
+            let mut old = word.load(core::sync::atomic::Ordering::Relaxed);
+            loop {
+                let Some(new) = apply(old) else {
+                    return -e::ENOSYS;
+                };
+                match word.compare_exchange_weak(old, new, core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(seen) => old = seen,
+                }
+            }
+            let hit = match compare {
+                0 => old == cmparg,
+                1 => old != cmparg,
+                2 => (old as i32) < cmparg as i32,
+                3 => (old as i32) <= cmparg as i32,
+                4 => (old as i32) > cmparg as i32,
+                5 => (old as i32) >= cmparg as i32,
+                _ => return -e::ENOSYS,
+            };
             // SAFETY: контракт `syscall`.
             let woken = unsafe { native(SYS_FUTEX_WAKE, addr, value, 0) };
-            // SAFETY: контракт `syscall`.
-            let other = unsafe { native(SYS_FUTEX_WAKE, addr2, usize::MAX, 0) };
+            let other = if hit && timeout != 0 {
+                // SAFETY: контракт `syscall`.
+                unsafe { native(SYS_FUTEX_WAKE, addr2, timeout, 0) }
+            } else {
+                0
+            };
             errno(woken.max(0) + other.max(0))
         }
         _ => -e::ENOSYS,
+    }
+}
+
+/// `futex_waitv(waiters, count, flags, timeout, clock)` — ждать сразу на
+/// нескольких словах (Linux 5.16, 12.11). На нём fsync Wine/Proton: объект
+/// синхронизации Windows — слово, `WaitForMultipleObjects` — этот вызов.
+///
+/// `struct futex_waitv { u64 val; u64 uaddr; u32 flags; u32 reserved; }`,
+/// у каждого флаг размера `FUTEX_32` (2), можно `FUTEX_PRIVATE_FLAG`.
+/// Срок — **абсолютный** по часам `clock` (`CLOCK_MONOTONIC` или
+/// `CLOCK_REALTIME`), ноль — без срока. Ответ — номер слова, по которому
+/// разбудили; `EAGAIN` — какое-то слово уже не равно ожидаемому.
+unsafe fn futex_waitv(waiters: usize, count: usize, flags: usize, timeout: usize, clock: usize) -> i64 {
+    const FUTEX_32: u32 = 2;
+    const FUTEX_PRIVATE_FLAG: u32 = 128;
+    const MAX_WAITERS: usize = 128;
+    const CLOCK_REALTIME: usize = 0;
+    const CLOCK_MONOTONIC: usize = 1;
+    if flags != 0 || count == 0 || count > MAX_WAITERS {
+        return -e::EINVAL;
+    }
+    if waiters == 0 || !space::user_can(waiters, count * 24, PageFlags::READ) {
+        return -e::EFAULT;
+    }
+    let mut entries = alloc::vec::Vec::new();
+    if entries.try_reserve_exact(count).is_err() {
+        return -e::ENOMEM;
+    }
+    for index in 0..count {
+        // SAFETY: весь массив проверен на чтение выше.
+        let [value, uaddr, tail] = unsafe { core::ptr::read_unaligned((waiters + index * 24) as *const [u64; 3]) };
+        let entry_flags = tail as u32;
+        let reserved = (tail >> 32) as u32;
+        if reserved != 0 || entry_flags & !(FUTEX_32 | FUTEX_PRIVATE_FLAG) != 0 || entry_flags & 3 != FUTEX_32 {
+            return -e::EINVAL;
+        }
+        // Старшие биты значения при 32-битном слове — ошибка, как у Linux.
+        let Ok(expected) = u32::try_from(value) else {
+            return -e::EINVAL;
+        };
+        entries.push((uaddr as usize, expected));
+    }
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        if clock != CLOCK_MONOTONIC && clock != CLOCK_REALTIME {
+            return -e::EINVAL;
+        }
+        if !space::user_can(timeout, 16, PageFlags::READ) {
+            return -e::EFAULT;
+        }
+        // SAFETY: проверено строкой выше.
+        let [seconds, nanos] = unsafe { core::ptr::read_unaligned(timeout as *const [u64; 2]) };
+        let wanted = u128::from(seconds) * 1_000_000_000 + u128::from(nanos);
+        let uptime = u128::from(crate::time::uptime_ns());
+        Some(if clock == CLOCK_REALTIME {
+            let now = u128::from(crate::time::now_unix().unwrap_or(0)) * 1_000_000_000 + uptime % 1_000_000_000;
+            uptime + wanted.saturating_sub(now)
+        } else {
+            wanted
+        })
+    };
+    loop {
+        if signal::pending() {
+            return -e::EINTR;
+        }
+        let until = match deadline {
+            None => None,
+            Some(at) => {
+                let now = u128::from(crate::time::uptime_ns());
+                if at <= now {
+                    return -e::ETIMEDOUT;
+                }
+                let ms = (at - now).div_ceil(1_000_000) as u64;
+                Some(crate::time::uptime_ms().saturating_add(ms.max(1)))
+            }
+        };
+        match crate::user::syscall::futex_wait_many(&entries, until) {
+            crate::user::syscall::FutexMany::Woken(index) => return index as i64,
+            crate::user::syscall::FutexMany::Changed => return -e::EAGAIN,
+            crate::user::syscall::FutexMany::BadAddress => return -e::EFAULT,
+            // Срок (проверит начало цикла), сигнал (тоже) или лишнее
+            // пробуждение — заново.
+            crate::user::syscall::FutexMany::Other => {}
+        }
     }
 }
 
