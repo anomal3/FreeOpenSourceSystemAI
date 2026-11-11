@@ -5787,6 +5787,14 @@ pub const ALL: &[Scenario] = &[
             Step::AwaitAny("main: decoded 64 tokens in", 600_000),
             Step::Line("tasks"),
             Step::Wait(5_000),
+            // Снимок для photos/ (11.11): сказка модели в терминале стола.
+            Step::Line("run /opt/llama/bin/llama-simple -m /opt/llama/models/stories15M-q4_0.gguf -n 48 Once upon a time"),
+            // Второй запуск вставал (11.11): через минуту — дамп по Pause.
+            Step::Wait(60_000),
+            Step::Key("pause"),
+            Step::Wait(5_000),
+            Step::Painted("llama-story"),
+            Step::Await("/opt/llama/bin/llama-simple: exited with code 0", 60_000),
             Step::Absent("KERNEL PANIC"),
         ],
     },

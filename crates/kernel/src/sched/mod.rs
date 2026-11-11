@@ -1434,6 +1434,81 @@ extern "C" fn task_start(slot: usize) -> ! {
     }
 }
 
+/// Просьба об аварийном дампе (клавиша Pause, 11.11).
+static DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Попросить аварийный дамп: его напечатает ближайший тик загрузочного
+/// процессора. Зовётся из обработчика клавиатуры.
+pub fn request_dump() {
+    DUMP_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Сколько задач было с повисшей меткой процессора при прошлой проверке.
+static STALE_SEEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Из тика загрузочного процессора (11.11): аварийный дамп по просьбе и раз в
+/// секунду — проверка повисших меток процессора.
+///
+/// Повисшая метка: задача `Ready`, `cpu = Some(c)`, а процессор `c` её не
+/// исполняет и не только что от неё ушёл. Такую задачу `pick_next` не возьмёт
+/// никогда, и снаружи это выглядит как «процессоры простаивают, а программа
+/// стоит» (llama в VirtualBox, 11.11). Лок — `try_lock`: тик не ждёт.
+pub fn diag_tick(ticks: u64) {
+    let dump = DUMP_REQUESTED.swap(false, Ordering::AcqRel);
+    if !dump && ticks % 1000 != 0 {
+        return;
+    }
+    let Some(sched) = SCHED.try_lock() else {
+        if dump {
+            crate::kprintln!("  dump        : scheduler lock is held by another CPU");
+        }
+        return;
+    };
+    let mut stale = 0usize;
+    for (slot, entry) in sched.slots().iter().enumerate() {
+        let Some(task) = entry else { continue };
+        if let Some(c) = task.cpu {
+            let on = sched.cpus[c].current == slot || sched.cpus[c].previous == Some(slot);
+            if !on && task.state != TaskState::Running {
+                stale += 1;
+                if dump || STALE_SEEN.load(Ordering::Relaxed) == 0 {
+                    crate::kprintln!(
+                        "  sched       : STALE cpu label: #{} {} {:?} marked cpu {c}, cpu {c} runs slot {} (prev {:?})",
+                        task.id.as_u32(),
+                        task.name,
+                        task.state,
+                        sched.cpus[c].current,
+                        sched.cpus[c].previous
+                    );
+                }
+            }
+        }
+    }
+    STALE_SEEN.store(stale, Ordering::Relaxed);
+    if dump {
+        // Дамп и на экран (11.11): линия в VirtualBox встаёт посреди строки.
+        crate::console::reclaim_screen();
+        crate::kprintln!("  dump        : uptime {} ms, {} stale label(s)", crate::time::uptime_ms(), stale);
+        for (c, state) in sched.cpus.iter().enumerate().take(smp::online()) {
+            crate::kprintln!("  dump        : cpu {c} runs slot {} (prev {:?})", state.current, state.previous);
+        }
+        for (slot, entry) in sched.slots().iter().enumerate() {
+            let Some(task) = entry else { continue };
+            if task.state == TaskState::Finished {
+                continue;
+            }
+            crate::kprintln!(
+                "  dump        : slot {slot} #{} {} {:?} cpu {:?} boost {}",
+                task.id.as_u32(),
+                task.name,
+                task.state,
+                task.cpu,
+                task.boost
+            );
+        }
+    }
+}
+
 /// Учёт кванта. Предназначено для вызова из `irq::on_timer_tick`.
 ///
 /// Ничего не переключает — только считает и, когда квант истёк, поднимает флаг

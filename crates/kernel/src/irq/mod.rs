@@ -164,6 +164,8 @@ pub fn on_timer_tick() {
         // опустошать было бы некому.
         crate::serial::start_queue();
         crate::serial::pump();
+        // Аварийный дамп по Pause и проверка повисших меток процессора (11.11).
+        crate::sched::diag_tick(TICKS.load(Ordering::Relaxed));
         #[cfg(all(target_arch = "aarch64", feature = "phone"))]
         crate::arch::watchdog_tick();
     }
