@@ -729,7 +729,7 @@ pub fn builtins(arch: Arch) -> PathBuf {
 
 /// Проверочные программы Linux (фаза 71a): исходники в `libc/linux`, путь в
 /// образе — `/compat/linux/bin/<имя>`.
-const LINUX_PROGRAMS: [&str; 2] = ["hello", "futexv"];
+const LINUX_PROGRAMS: [&str; 3] = ["hello", "futexv", "sigasync"];
 
 /// Общие флаги проверочных программ Linux.
 const LINUX_COMMON: [&str; 10] = [

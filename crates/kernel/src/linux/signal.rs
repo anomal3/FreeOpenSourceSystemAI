@@ -4,12 +4,12 @@
 //!
 //! # Когда сигнал доставляется
 //!
-//! Только на выходе из системного вызова потока — `raise`, `kill` себе,
+//! На выходе из системного вызова потока — `raise`, `kill` себе,
 //! `sigprocmask`, снявший блокировку, и вызов, прерванный `tgkill` соседнего
-//! потока. Асинхронной доставки посреди кода нет, и поэтому в кадр сигнала не
-//! кладётся состояние FPU: обработчик вызывается с границы системного вызова, а
-//! через неё (обычный вызов функции в C) векторные регистры не живут.
-//! Отказы страниц и прочие исключения программу снимают, как и прежде.
+//! потока, — и (12.11) на возврате в программу из прерывания
+//! ([`deliver_async`]): поток, крутящийся в своём коде, получает сигнал не
+//! позже следующего тика. В кадр кладётся состояние x87/SSE (`FXSAVE`).
+//! Отказы процессора — сигналами по обработчикам программы ([`deliver_fault`]).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -469,7 +469,11 @@ pub fn deliver(frame: &mut crate::arch::TrapFrame) {
     match action.handler {
         0 if ignored_by_default(sig) => {}
         0 => {
-            crate::kprintln!("  linux       : killed by signal {sig}");
+            crate::kprintln!(
+                "  linux       : {} killed by signal {sig} at rip {:#x}",
+                sched::current(),
+                frame.rip
+            );
             crate::user::with_current(|program| program.linux_signal = Some(sig as u8));
             // SAFETY: из системного вызова третьего кольца.
             unsafe { crate::arch::return_to_kernel(128 + sig as i64) }
@@ -477,6 +481,28 @@ pub fn deliver(frame: &mut crate::arch::TrapFrame) {
         SIG_IGN => {}
         handler => enter_handler(frame, slot, sig, action, handler, mask, handled_mask, None),
     }
+}
+
+/// Доставка посреди кода (12.11): на возврате в третье кольцо из
+/// **прерывания** — тик таймера застаёт поток, крутящийся в своём коде, не
+/// позже чем через миллисекунду. Так Wine приостанавливает чужие потоки
+/// (`SuspendThread`, `GetThreadContext`: `SIGUSR1` через `tgkill`, обработчик
+/// пишет контекст и ждёт), а .NET и Java останавливают потоки для сборки.
+///
+/// Векторные регистры в процессоре — программы: ядро SSE не трогает, а
+/// возврат из [`crate::irq::on_trap_return`] — уже на этом потоке, после
+/// возможного переключения, — их вернул. Обработчик получает их в кадре, как
+/// и при доставке из вызова.
+pub fn deliver_async(frame: &mut crate::arch::TrapFrame) {
+    let slot = sched::current_slot();
+    if LINUX_PENDING[slot].load(Ordering::Relaxed) & !LINUX_SIGMASK[slot].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    // Только у программы Linux: у родной своих сигналов нет.
+    if !crate::user::with_current(|program| program.linux_pid != 0).unwrap_or(false) {
+        return;
+    }
+    deliver(frame);
 }
 
 /// Отказ процессора — для кадра сигнала: `si_code`, `si_addr` и то, что Linux

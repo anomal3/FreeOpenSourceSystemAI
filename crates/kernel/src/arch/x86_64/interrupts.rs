@@ -686,6 +686,11 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
         // ответа зависело, куда уходить управлению, а здесь — только будет ли
         // задана вторая проверка, и та спрашивает у `user` ещё раз.
         crate::irq::on_trap_return(frame.cs & 3 == 3);
+        // Сигнал программе Linux посреди её кода (12.11): поток, который не
+        // входит в ядро, иначе не получил бы его никогда.
+        if frame.cs & 3 == 3 {
+            crate::linux::signal::deliver_async(frame);
+        }
         return;
     }
 
