@@ -63,7 +63,7 @@ const WINE_PACKAGES: [(&str, &str); 2] = [
 
 /// Пакеты Debian (снимок 20261020, `Packages` bookworm): что нужно модулям
 /// Unix, которые кладутся, и FreeType.
-const PACKAGES: [(&str, &str); 15] = [
+pub const PACKAGES: [(&str, &str); 15] = [
     // `ntdll.so`: раскрутка стека.
     ("pool/main/libu/libunwind/libunwind8_1.6.2-3_amd64.deb", "7b297868682836e4c87be349f17e4a56bc287586e3576503e84a5cb5485ce925"),
     ("pool/main/x/xz-utils/liblzma5_5.4.1-1+deb12u1_amd64.deb", "f96d8876b53ec89d76a992bc199679b818cf518225a768954d9451fb556a4eb7"),

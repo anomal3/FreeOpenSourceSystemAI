@@ -123,6 +123,8 @@ enum How {
     /// Wine 11 (WineHQ для bookworm) и библиотеки Debian, которые он грузит
     /// (фаза 71j) — см. [`crate::wine`].
     Wine,
+    /// GE-Proton (12.11) без Steam и свои зависимости — см. [`crate::proton`].
+    Proton,
     /// NetSurf (начато 03.11): браузер и десяток его библиотек одним архивом,
     /// каждая — своим `buildsystem`; поверхность окна и патчи — в
     /// `ports/netsurf`. См. [`crate::netsurf`].
@@ -194,7 +196,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 25] = [
+const PROJECTS: [Project; 26] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -688,6 +690,17 @@ const PROJECTS: [Project; 25] = [
         how: How::Wine,
         installs: &[],
     },
+    // Proton (12.11): готовая сборка GE-Proton и свои зависимости из Debian;
+    // архив в полгигабайта — только по имени или с `FOSSAI_WITH_PROTON=1`.
+    Project {
+        name: "proton",
+        version: "11",
+        url: crate::proton::URL,
+        sha256: crate::proton::SHA256,
+        unpacked: "proton",
+        how: How::Proton,
+        installs: &[],
+    },
 ];
 
 /// Собрать чужие проекты под все указанные архитектуры: все или только
@@ -729,6 +742,16 @@ pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> 
         if project.how == How::Wine {
             for &arch in arches {
                 crate::wine::build(arch)?;
+            }
+            continue;
+        }
+        if project.how == How::Proton {
+            if only.is_empty() && !crate::proton::enabled() {
+                say!("proton пропущен: FOSSAI_WITH_PROTON=1 или --only proton");
+                continue;
+            }
+            for &arch in arches {
+                crate::proton::build(arch)?;
             }
             continue;
         }
@@ -1063,7 +1086,9 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         }
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
-        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java | How::Wine => return Ok(()),
+        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java | How::Wine | How::Proton => {
+            return Ok(());
+        }
         How::NetSurf => crate::netsurf::build(source, &work, arch)?,
         How::Doomgeneric => {
             let game = work.join("doomgeneric");

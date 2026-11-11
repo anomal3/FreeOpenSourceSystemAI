@@ -40,6 +40,7 @@ mod thirdparty;
 mod netsurf;
 mod chromium;
 mod java;
+mod proton;
 mod wine;
 mod rider;
 mod ruststd;
