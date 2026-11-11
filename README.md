@@ -85,6 +85,8 @@ Ready images are on the [releases page](https://github.com/anomal3/FreeOpenSourc
 `x86_64` for a PC or a virtual machine, `aarch64` for ARM64. **UEFI only** — there is no BIOS
 boot path and there will not be one.
 
+Step by step - VirtualBox settings and writing a USB stick - in **[docs/LIVE.md](docs/LIVE.md)**.
+
 In VirtualBox: type *Other/Unknown (64-bit)*, **turn EFI on**, attach the ISO. Hyper-V:
 *Generation 2*. Defaults work; nothing needs changing.
 
