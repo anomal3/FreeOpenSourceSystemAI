@@ -64,6 +64,45 @@ unsafe fn device_tree() -> Option<fdt::Fdt<'static>> {
     unsafe { fdt::Fdt::from_ptr(dtb as *const u8) }
 }
 
+/// Сколько процессоров телефона будить (11.11): поднимаем по шагам —
+/// сперва один дополнительный, потом все.
+const TREE_CPUS_MAX: usize = 8;
+
+/// Процессоры из дерева устройств (машина без ACPI — телефон): `/psci` даёт
+/// способ вызова прошивки, `/cpus/cpu@*` — `MPIDR` в `reg` и
+/// `enable-method = "psci"`. Загрузочный — первым. `None` — дерева нет или в
+/// нём не объявлен PSCI.
+pub fn cpus_from_tree(boot: u64) -> Option<crate::smp::Found> {
+    // SAFETY: дерево ещё отображено и не забрано (см. `device_tree`): процессоры
+    // ищутся при загрузке, до того как ядро забирает память загрузчика.
+    let fdt = unsafe { device_tree() }?;
+    let psci = fdt.find("/psci").or_else(|| fdt.find_compatible("arm,psci-1.0")).or_else(|| fdt.find_compatible("arm,psci-0.2"))?;
+    let hvc = psci.property_str("method") == Some("hvc");
+    power::set_tree_conduit(hvc);
+    let mut found = crate::smp::Found::only(boot);
+    for node in fdt.nodes().filter(|n| n.name.starts_with("cpu@")) {
+        if node.property_str("enable-method") != Some("psci") {
+            continue;
+        }
+        let Some(reg) = node.property("reg") else { continue };
+        let mpidr = reg.chunks(4).fold(0u64, |acc, c| {
+            (acc << 32) | u64::from(u32::from_be_bytes([c[0], c.get(1).copied().unwrap_or(0), c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)]))
+        });
+        if found.count < TREE_CPUS_MAX || mpidr == boot {
+            found.push(mpidr & 0xFF_00FF_FFFF, 0);
+        } else {
+            found.total += 1;
+        }
+    }
+    crate::kprintln!(
+        "  smp         : device tree: PSCI via {}, {} processor(s), waking {}",
+        if hvc { "HVC" } else { "SMC" },
+        found.total,
+        found.count
+    );
+    Some(found)
+}
+
 /// Линия, объявленная деревом этой машины.
 ///
 /// `None` означает «в дереве порта нет» — законное состояние, и обрабатывать

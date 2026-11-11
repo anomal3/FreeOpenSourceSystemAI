@@ -66,6 +66,13 @@ const fn affinity(mpidr: u64) -> u32 {
 /// Найти процессоры в MADT.
 #[must_use]
 pub fn discover() -> Found {
+    // Без ACPI (телефон, 11.11) — процессоры и способ вызова PSCI из дерева
+    // устройств: `/psci` (`method`) и `/cpus/cpu@*` (`reg`, `enable-method`).
+    if crate::acpi::rsdp() == 0
+        && let Some(found) = super::cpus_from_tree(own_mpidr())
+    {
+        return found;
+    }
     // SAFETY: адрес RSDP запомнен при разборе хэндоффа; ноль означает «таблиц
     // нет» и обрабатывается внутри.
     unsafe { super::acpi::processors(crate::acpi::rsdp(), own_mpidr()) }
@@ -75,7 +82,7 @@ pub fn discover() -> Found {
 ///
 /// `repr(C)` и все поля по восемь байт: читает запись ассемблер по смещениям,
 /// посчитанным из этой же структуры.
-#[repr(C)]
+#[repr(C, align(64))]
 struct Record {
     mair: u64,
     tcr: u64,
@@ -88,6 +95,13 @@ struct Record {
     entry: u64,
     /// Номер процессора — аргумент точки входа.
     index: u64,
+    /// Докуда дошёл проснувшийся (11.11, телефон): 1 — вошёл, 2 — MMU
+    /// включён, 3 — Rust, 4 — прерывания настроены. Смещение 64 — своя
+    /// строка кэша (запись выровнена на 64): первую отметку он пишет мимо
+    /// кэша, и чужая грязная строка не должна её затереть.
+    stage: u64,
+    /// Куда проснувшийся прыгнул из ассемблера (диагностика).
+    jumped: u64,
 }
 
 /// Одна запись на всех: процессоры запускаются по одному, и прежний к моменту
@@ -101,7 +115,25 @@ static RECORD: Racy<Record> = Racy::new(Record {
     stack: 0,
     entry: 0,
     index: 0,
+    stage: 0,
+    jumped: 0,
 });
+
+/// Куда прыгнул последний будимый процессор (диагностика).
+pub fn last_jump() -> u64 {
+    let record = RECORD.get();
+    clean_to_memory(record as usize, core::mem::size_of::<Record>());
+    // SAFETY: чтение поля записи.
+    unsafe { core::ptr::read_volatile(&raw const (*record).jumped) }
+}
+
+/// Этап, до которого дошёл последний будимый процессор (см. `Record::stage`).
+pub fn last_stage() -> u64 {
+    let record = RECORD.get();
+    clean_to_memory(record as usize, core::mem::size_of::<Record>());
+    // SAFETY: чтение поля записи; барьер выше.
+    unsafe { core::ptr::read_volatile(&raw const (*record).stage) }
+}
 
 global_asm!(
     r#"
@@ -113,6 +145,35 @@ aarch64_secondary_entry:
     // MMU выключен, адреса физические; x0 — запись загрузочного процессора.
     msr     daifset, #0xf
     mov     x19, x0
+    mov     x1, #1
+    str     x1, [x19, #{stage}]
+    dsb     sy
+    // Телефон (11.11): ATF будит остальные процессоры на EL2, хотя ядро живёт
+    // на EL1 — записи в регистры EL1 тогда ничего не значат, MMU не
+    // включается, и первый же доступ к верхней половине падает. Спуститься
+    // на EL1, как `head_fdt.S` делает на загрузочном.
+    mrs     x1, CurrentEL
+    lsr     x1, x1, #2
+    cmp     x1, #2
+    b.ne    1f
+    mrs     x1, cnthctl_el2
+    orr     x1, x1, #3
+    msr     cnthctl_el2, x1
+    msr     cntvoff_el2, xzr
+    movz    x1, #0x8000, lsl #16
+    msr     hcr_el2, x1
+    movz    x1, #0x33ff
+    msr     cptr_el2, x1
+    msr     hstr_el2, xzr
+    movz    x1, #0x0800
+    movk    x1, #0x30d0, lsl #16
+    msr     sctlr_el1, x1
+    movz    x1, #0x3c5
+    msr     spsr_el2, x1
+    adr     x1, 1f
+    msr     elr_el2, x1
+    eret
+1:
     // Тот же порядок, что при активации таблиц на загрузочном: сначала вся
     // геометрия трансляции, один `isb`, и только потом включение MMU.
     ldr     x1, [x19, #{mair}]
@@ -128,13 +189,27 @@ aarch64_secondary_entry:
     ldr     x1, [x19, #{sctlr}]
     msr     sctlr_el1, x1
     isb
+    mov     x1, #2
+    str     x1, [x19, #{stage}]
     // MMU включён; ядро отображено на себя, поэтому x19 и счётчик команд
     // по-прежнему верны. Стек — холостой задачи, в верхней половине.
+    // FP/SIMD — сразу (11.11, телефон): ATF будит ядро с CPACR_EL1 = 0, и
+    // первая же команда SIMD в коде на Rust ловушкой уходила в никуда —
+    // векторов исключений у проснувшегося ещё нет.
+    mov     x1, #(3 << 20)
+    msr     cpacr_el1, x1
+    isb
     msr     spsel, #1
     ldr     x1, [x19, #{stack}]
     mov     sp, x1
+    mov     x1, #5
+    str     x1, [x19, #{stage}]
     ldr     x0, [x19, #{index}]
     ldr     x2, [x19, #{entry}]
+    str     x2, [x19, #{jumped}]
+    mov     x1, #6
+    str     x1, [x19, #{stage}]
+    dsb     sy
     mov     x29, xzr
     mov     x30, xzr
     br      x2
@@ -147,6 +222,8 @@ aarch64_secondary_entry:
     stack = const offset_of!(Record, stack),
     entry = const offset_of!(Record, entry),
     index = const offset_of!(Record, index),
+    stage = const offset_of!(Record, stage),
+    jumped = const offset_of!(Record, jumped),
 );
 
 unsafe extern "C" {
@@ -233,6 +310,7 @@ pub fn start_cpu(index: usize, id: u64, extra: u64, stack_top: usize) -> bool {
     // SAFETY: процессоры запускаются по одному, и прежний свою запись уже
     // прочитал: он сообщил о себе, прежде чем мы дошли сюда.
     unsafe {
+        (*record).stage = 0;
         (*record).stack = stack_top as u64;
         (*record).entry = secondary_entry as *const () as usize as u64;
         (*record).index = index as u64;
@@ -241,6 +319,13 @@ pub fn start_cpu(index: usize, id: u64, extra: u64, stack_top: usize) -> bool {
     // Адреса физические, и они совпадают с виртуальными: образ ядра отображён
     // на себя.
     let entry = aarch64_secondary_entry as *const () as usize as u64;
+    // Проснувшийся читает запись и код входа с выключенным MMU, то есть мимо
+    // кэша (11.11, телефон: настоящий Cortex-A53, не QEMU) — вытолкнуть их в
+    // память.
+    clean_to_memory(record as usize, core::mem::size_of::<Record>());
+    clean_to_memory(entry as usize, 0x100);
+    // SAFETY: барьеры без побочных эффектов на данные.
+    unsafe { asm!("dsb sy", "isb", options(nostack, preserves_flags)) };
     // SAFETY: номер функции и соглашение — из PSCI и FADT; адрес входа — код
     // ядра, запись — данные ядра, и то и другое по физическим адресам.
     match unsafe { power::cpu_on(crate::acpi::rsdp(), id, entry, record as u64) } {
@@ -252,12 +337,27 @@ pub fn start_cpu(index: usize, id: u64, extra: u64, stack_top: usize) -> bool {
     }
 }
 
+/// Вытолкнуть строки кэша диапазона в память (`dc civac`).
+fn clean_to_memory(start: usize, len: usize) {
+    let mut line = start & !63;
+    while line < start + len {
+        // SAFETY: адрес — в образе ядра, отображённом на себя.
+        unsafe { asm!("dc civac, {}", in(reg) line, options(nostack, preserves_flags)) };
+        line += 64;
+    }
+}
+
 /// Первая функция на Rust, которую исполняет проснувшийся процессор.
 extern "C" fn secondary_entry(index: usize) -> ! {
     // SAFETY: запись `TPIDR_EL1` — первое, что делает процессор, до любого лока
     // (см. заголовок модуля).
     unsafe { asm!("msr tpidr_el1, {}", in(reg) index, options(nomem, nostack, preserves_flags)) };
+    let record = RECORD.get();
+    // SAFETY: запись этапа; запись принадлежит запуску этого процессора.
+    unsafe { core::ptr::write_volatile(&raw mut (*record).stage, 3) };
     super::interrupts::init_secondary();
+    // SAFETY: см. выше.
+    unsafe { core::ptr::write_volatile(&raw mut (*record).stage, 4) };
     super::fpu::enable_access();
     crate::smp::secondary_main(index)
 }

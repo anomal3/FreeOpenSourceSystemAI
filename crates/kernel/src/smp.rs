@@ -228,6 +228,10 @@ pub fn start(one_cpu: bool) {
                 "  smp         : cpu {index} ({} {id:#x}) did not report within {START_TIMEOUT_MS} ms",
                 arch::smp::ID_NAME
             );
+            #[cfg(target_arch = "aarch64")]
+            kprintln!("  smp         : cpu {index} reached stage {}", arch::smp::last_stage());
+            #[cfg(target_arch = "aarch64")]
+            kprintln!("  smp         : jumped {:#x}", arch::smp::last_jump());
         }
     }
 

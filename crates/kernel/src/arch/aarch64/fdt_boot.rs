@@ -553,15 +553,16 @@ pub fn gic_layout(fdt: &Fdt<'_>) -> Option<super::acpi::GicLayout> {
     if distributor == 0 {
         return None;
     }
-    let second = windows.next().map(|region| region.address).filter(|address| *address != 0);
+    let second_region = windows.next().filter(|region| region.address != 0);
+    let second = second_region.map(|region| region.address);
 
     Some(super::acpi::GicLayout {
         distributor: distributor as usize,
         cpu_interface: if version == 2 { second.map(|address| address as usize) } else { None },
         redistributor: if version == 3 { second.map(|address| address as usize) } else { None },
-        // Машина, описанная деревом, остальных процессоров не запускает, и
-        // искать их redistributor'ы незачем.
-        redistributor_span: 0,
+        // Всё окно redistributor'ов (11.11): телефон будит остальные
+        // процессоры через PSCI, и каждому нужен свой кадр из этого окна.
+        redistributor_span: if version == 3 { second_region.map_or(0, |region| region.size as usize) } else { 0 },
         version,
     })
 }

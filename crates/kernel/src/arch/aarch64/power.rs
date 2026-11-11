@@ -126,6 +126,34 @@ unsafe fn conduit(rsdp: u64) -> Option<Conduit> {
     })
 }
 
+/// PSCI, объявленный деревом устройств (`/psci`, `method`): 0 — не объявлен,
+/// 1 — SMC, 2 — HVC. Телефон (11.11): ACPI нет, а запуск остальных
+/// процессоров — через PSCI прошивки ATF. Только для `CPU_ON`: выключение и
+/// перезагрузка телефона идут своим путём (сторожевой таймер, метки RTC).
+static TREE_CONDUIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Запомнить способ вызова PSCI из дерева устройств.
+pub fn set_tree_conduit(hvc: bool) {
+    TREE_CONDUIT.store(if hvc { 2 } else { 1 }, core::sync::atomic::Ordering::Release);
+}
+
+/// Чем звать прошивку для `CPU_ON`: FADT, иначе дерево устройств.
+///
+/// # Safety
+///
+/// См. [`power_off`].
+unsafe fn cpu_conduit(rsdp: u64) -> Option<Conduit> {
+    // SAFETY: контракт функции.
+    if let Some(conduit) = unsafe { conduit(rsdp) } {
+        return Some(conduit);
+    }
+    match TREE_CONDUIT.load(core::sync::atomic::Ordering::Acquire) {
+        1 => Some(Conduit::Smc),
+        2 => Some(Conduit::Hvc),
+        _ => None,
+    }
+}
+
 /// Номер функции PSCI `CPU_ON` в 64-разрядном соглашении SMC.
 const PSCI_CPU_ON: u32 = 0xC400_0003;
 
@@ -139,7 +167,7 @@ const PSCI_NOT_SUPPORTED: i64 = -1;
 /// См. [`power_off`].
 pub unsafe fn psci_available(rsdp: u64) -> bool {
     // SAFETY: контракт функции.
-    unsafe { conduit(rsdp) }.is_some()
+    unsafe { cpu_conduit(rsdp) }.is_some()
 }
 
 /// Разбудить процессор `mpidr`: начать исполнение в EL1 с физического адреса
@@ -154,7 +182,7 @@ pub unsafe fn psci_available(rsdp: u64) -> bool {
 /// что он читает по `context`, обязано лежать по физическим адресам.
 pub unsafe fn cpu_on(rsdp: u64, mpidr: u64, entry: u64, context: u64) -> Result<(), i64> {
     // SAFETY: контракт функции.
-    let Some(conduit) = (unsafe { conduit(rsdp) }) else {
+    let Some(conduit) = (unsafe { cpu_conduit(rsdp) }) else {
         return Err(PSCI_NOT_SUPPORTED);
     };
     // SAFETY: номер функции из спецификации PSCI, способ вызова — из FADT.
