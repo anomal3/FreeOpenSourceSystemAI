@@ -141,6 +141,10 @@ int main() {
     std::cv_status status = wake.wait_for(hold, std::chrono::milliseconds(50));
     auto waited = std::chrono::steady_clock::now() - start;
     hold.unlock();
+    if (!(status == std::cv_status::timeout && waited >= std::chrono::milliseconds(50))) {
+        std::cout << "cxx: wait_for returned " << (status == std::cv_status::timeout ? "timeout" : "no_timeout") << " after "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(waited).count() << " us" << std::endl;
+    }
     check(status == std::cv_status::timeout && waited >= std::chrono::milliseconds(50), "wait_for timeout");
 
     std::exception_ptr carried;
