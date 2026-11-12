@@ -13,7 +13,7 @@ use anyhow::Result;
 use crate::debian::{Node, follow, unpack};
 
 /// Пакеты trixie (снимок 20261020): путь в архиве и SHA-256 из Packages.
-pub const PACKAGES: [(&str, &str); 50] = [
+pub const PACKAGES: [(&str, &str); 52] = [
     ("pool/main/libg/libglvnd/libegl1_1.7.0-1+b2_amd64.deb", "62e7bc8ccd47a60e55aad17f83d8d474310d782eb8589bbce2ab714c31712406"),
     ("pool/main/libg/libglvnd/libgles2_1.7.0-1+b2_amd64.deb", "e12c18aa77939d122ee1dea520ba0440b97dc19200b7396e03dff03a3ece74c1"),
     ("pool/main/libg/libglvnd/libglvnd0_1.7.0-1+b2_amd64.deb", "887f74008166549ce9e100c906aa937e95d6e5ce1c8d86efe8c95fd953359b9c"),
@@ -64,6 +64,8 @@ pub const PACKAGES: [(&str, &str); 50] = [
     ("pool/main/e/expat/libexpat1_2.8.3-1~deb13u1_amd64.deb", "38abe0e710a07688e9c149d74536e67cfee0364bdb64dd6d644c32a1cfad389f"),
     ("pool/main/libf/libffi/libffi8_3.4.8-2_amd64.deb", "0ebdc340de33333639c3c63874cd4b15ac2e83dfa1ef3053b7eefaf4919f4f68"),
     ("pool/main/x/xz-utils/liblzma5_5.8.1-1+deb13u1_amd64.deb", "1cfcc6e0dc36f438a79b6e2189facdb9d150b08f57d190a60e01c98075c7f896"),
+    ("pool/main/a/alsa-lib/libasound2t64_1.2.14-1+deb13u1_amd64.deb", "5495496142d57e5ad6d581ac5456ec3c87f872c109a2bfb815d154b673eebc67"),
+    ("pool/main/a/alsa-lib/libasound2-data_1.2.14-1+deb13u1_all.deb", "04688afdff3769c0f685541daed7b2f6f0cb946799ddf1d5847ddf11fe245559"),
 ];
 
 /// Каталог библиотек в пакетах trixie (usrmerge).
@@ -117,6 +119,20 @@ pub fn add(cache: &Path, files: &mut Vec<(String, Vec<u8>, u32)>, patch: fn(&mut
             libs += 1;
         }
     }
+    // Настройки ALSA (libasound2-data) - в share/alsa/ (ALSA_CONFIG_DIR) и
+    // своё: «default» - plug поверх единственного устройства ядра (S16_LE,
+    // 2 канала, 48 кГц, `linux/snd.rs`), остальное libasound переведёт сама.
+    let mut alsa = 0;
+    for path in &paths {
+        let Some(rest) = path.strip_prefix("usr/share/alsa/") else { continue };
+        if let Some((data, mode)) = follow(&mesa, path, 0) {
+            put(files, format!("share/alsa/{rest}"), data.clone(), mode);
+            alsa += 1;
+        }
+    }
+    let fossai = "pcm.!default { type plug slave.pcm \"hw:0,0\" }\nctl.!default { type hw card 0 }\n";
+    put(files, String::from("share/alsa/fossai.conf"), fossai.as_bytes().to_vec(), 0o644);
+    say!("mesa: настроек ALSA {alsa}");
     // Вендор EGL (glvnd) - Mesa по имени библиотеки: она в LD_LIBRARY_PATH.
     let egl = "{\"file_format_version\" : \"1.0.0\", \"ICD\" : { \"library_path\" : \"libEGL_mesa.so.0\" }}\n";
     put(files, String::from("share/glvnd/egl_vendor.d/50_mesa.json"), egl.as_bytes().to_vec(), 0o644);

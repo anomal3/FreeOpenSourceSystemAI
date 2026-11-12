@@ -92,7 +92,7 @@ const SKIP_UNIX: &[&str] = &[
     "wine-preloader",
     "wine64-preloader",
     "winex11.so",
-    "winealsa.so",
+    // `winealsa.so` кладётся: звук через ALSA ядра (`linux/snd.rs`, 12.11).
     "winepulse.so",
     "winegstreamer.so",
     "wineusb.so",
@@ -342,7 +342,8 @@ pub fn build(arch: Arch) -> Result<()> {
         if !seen.insert(name.clone()) {
             continue;
         }
-        if name == "ntdll.so" || name == "win32u.so" {
+        // Свои модули Wine и libasound из Debian 13 (кладёт `mesa::add`).
+        if name == "ntdll.so" || name == "win32u.so" || name == "libasound.so.2" {
             continue;
         }
         let by_this = |list: Vec<String>| list.into_iter().map(|next| (next, name.clone())).collect::<Vec<_>>();
@@ -403,6 +404,9 @@ pub fn build(arch: Arch) -> Result<()> {
         for s in /tmp/.wine-*/server-*/socket; do [ -e \"$s\" ] && [ ! -S \"$s\" ] && LD_LIBRARY_PATH= rm -f \"$s\"; done\n\
         # OpenGL окон (wined3d) через EGL winewayland: в GE по умолчанию выключен.\n\
         export WINE_USE_EGL=${WINE_USE_EGL:-1}\n\
+        # Звук: libasound со своими настройками (ALSA ядра, `plug` поверх hw:0,0).\n\
+        export ALSA_CONFIG_DIR=$P/share/alsa\n\
+        export ALSA_CONFIG_PATH=$P/share/alsa/alsa.conf:$P/share/alsa/fossai.conf\n\
         export XKB_CONFIG_ROOT=$P/share/X11/xkb\n\
         # OpenGL и Vulkan на процессоре (Mesa trixie, 12.11): EGL через glvnd,\n\
         # llvmpipe и lavapipe.\n\

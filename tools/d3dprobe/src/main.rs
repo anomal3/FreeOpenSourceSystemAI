@@ -210,8 +210,79 @@ fn d3d9(seconds: u64) -> Result<()> {
     })
 }
 
+/// `d3dprobe.exe tone ГЦ СЕКУНДЫ`: синус через waveOut (winmm → mmdevapi →
+/// winealsa в Wine), 48 кГц, 16 бит, стерео, четверть шкалы.
+fn tone(hz: u32, seconds: u32) -> std::result::Result<(), String> {
+    use windows::Win32::Media::Audio::{
+        waveOutClose, waveOutOpen, waveOutPrepareHeader, waveOutUnprepareHeader, waveOutWrite, CALLBACK_NULL, HWAVEOUT,
+        WAVEFORMATEX, WAVEHDR, WAVE_MAPPER, WHDR_DONE,
+    };
+    const RATE: u32 = 48_000;
+    let frames = (RATE * seconds) as usize;
+    let mut samples: Vec<i16> = Vec::with_capacity(frames * 2);
+    for i in 0..frames {
+        let v = ((i as f32 * hz as f32 / RATE as f32) * std::f32::consts::TAU).sin();
+        let s = (v * 8192.0) as i16;
+        samples.push(s);
+        samples.push(s);
+    }
+    let format = WAVEFORMATEX {
+        wFormatTag: 1, // WAVE_FORMAT_PCM
+        nChannels: 2,
+        nSamplesPerSec: RATE,
+        nAvgBytesPerSec: RATE * 4,
+        nBlockAlign: 4,
+        wBitsPerSample: 16,
+        cbSize: 0,
+    };
+    let mut out = HWAVEOUT::default();
+    let code = unsafe { waveOutOpen(Some(&mut out), WAVE_MAPPER, &format, Some(0), Some(0), CALLBACK_NULL) };
+    if code != 0 {
+        return Err(format!("waveOutOpen {code}"));
+    }
+    eprintln!("d3dprobe: tone {hz} Hz for {seconds} s, waveOut opened");
+    let mut header = WAVEHDR {
+        lpData: windows::core::PSTR(samples.as_mut_ptr().cast()),
+        dwBufferLength: (samples.len() * 2) as u32,
+        ..Default::default()
+    };
+    let size = std::mem::size_of::<WAVEHDR>() as u32;
+    unsafe {
+        let code = waveOutPrepareHeader(out, &mut header, size);
+        if code != 0 {
+            return Err(format!("waveOutPrepareHeader {code}"));
+        }
+        let code = waveOutWrite(out, &mut header, size);
+        if code != 0 {
+            return Err(format!("waveOutWrite {code}"));
+        }
+        let start = Instant::now();
+        while header.dwFlags & WHDR_DONE == 0 {
+            std::thread::sleep(Duration::from_millis(50));
+            if start.elapsed() > Duration::from_secs(u64::from(seconds) + 20) {
+                return Err(String::from("tone never finished"));
+            }
+        }
+        eprintln!("d3dprobe: tone played in {:.1} s", start.elapsed().as_secs_f64());
+        let _ = waveOutUnprepareHeader(out, &mut header, size);
+        let _ = waveOutClose(out);
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("tone") {
+        let hz = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(440);
+        let seconds = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+        eprintln!("d3dprobe: start, tone");
+        if let Err(err) = tone(hz, seconds) {
+            eprintln!("d3dprobe: error {err}");
+            std::process::exit(1);
+        }
+        eprintln!("d3dprobe: done, tone");
+        return;
+    }
     let api = args.get(1).map(String::as_str).unwrap_or("11");
     let seconds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
     eprintln!("d3dprobe: start, Direct3D {api}");
