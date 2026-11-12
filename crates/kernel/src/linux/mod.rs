@@ -1675,6 +1675,17 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
                 shared = Some((mem, offset as u64));
                 None
             }
+            // `MAP_PRIVATE` памяти memfd — тоже общими кадрами (12.11): у Linux
+            // приватная страница видит записи в файл, пока её не переписали, и
+            // Wine на это рассчитывает — сессия `wineserver` (memfd) у
+            // клиентов отображена «только чтение, приватно», а сервер пишет в
+            // неё объекты. Снимок страниц не видел их вовсе («Failed to get
+            // shared session object»). Настоящего копирования при записи здесь
+            // нет: запись клиента станет видна всем — как у файлов (фаза 71j).
+            Some(mem) if offset % 4096 == 0 => {
+                shared = Some((mem, offset as u64));
+                None
+            }
             // Файл на диске на запись (фаза 71i): разделяемая память с его
             // куском, записанное вернётся в файл (см. `shm`).
             _ if shared_flag && prot & user_abi::PROT_WRITE != 0 => {

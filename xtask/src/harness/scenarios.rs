@@ -6221,7 +6221,11 @@ pub const ALL: &[Scenario] = &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
-            Step::Line("run -b /opt/debian/bin/env LD_LIBRARY_PATH=/opt/proton/lib/x86_64-linux-gnu:/opt/proton/lib WINEDLLPATH=/opt/proton/lib/vkd3d:/opt/proton/lib/wine FONTCONFIG_FILE=/opt/proton/share/wine/fonts.conf XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY=wayland-0 WINE_GRAPHICS_DRIVER=wayland HOME=/home/roman TMPDIR=/home/roman WINEPREFIX=/home/roman/.proton WINEFSYNC=1 WINEESYNC=1 WINENTSYNC=0 WINEDLLOVERRIDES=mscoree,mshtml= WINEDEBUG=fixme-all /opt/proton/lib/wine/x86_64-unix/wine notepad"),
+            // Префикс прошлых прогонов (недоделанный) — прочь: создаётся заново.
+            Step::Line("run /opt/debian/bin/rm -rf /home/roman/.proton"),
+            Step::Await("rm: exited with code 0", 300_000),
+            // Строка оболочки — до 200 байт: окружение — в скрипте пакета.
+            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --debug=fixme-all,+driver,warn+waylanddrv,warn+explorer notepad"),
             Step::Await("fsync: up and running", 900_000),
             Step::Await("wayland     : client #", 900_000),
             Step::Await("'Untitled - Notepad'", 600_000),
@@ -6951,6 +6955,11 @@ pub const ALL: &[Scenario] = &[
             Step::Await("sigasync: ok a register changed in ucontext is seen after rt_sigreturn", 15_000),
             Step::Await("sigasync: 0 failed", 15_000),
             Step::Await("exited with code 0", 15_000),
+            // Память сессии wineserver так, как её видит Wine (12.11).
+            Step::Line("run /compat/linux/bin/shmprobe"),
+            Step::Await("shmprobe: start", 30_000),
+            Step::Await("shmprobe: 0 failed", 30_000),
+            Step::Absent("shmprobe: FAILED"),
             Step::Absent("sigasync: FAILED"),
             Step::Absent("futexv: FAILED"),
             Step::Absent("linux: FAILED"),
