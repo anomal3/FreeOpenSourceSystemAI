@@ -597,6 +597,13 @@ pub struct Task {
     pub futex_keys: Option<alloc::boxed::Box<[usize]>>,
     /// Номер ключа из [`Task::futex_keys`], по которому задачу разбудили.
     pub futex_woken: Option<usize>,
+
+    /// Селектор `FS` на момент ухода с процессора (12.11.2026). Ненулевой —
+    /// поток Wine в 32-битном коде: база `FS` из его дескриптора TLS.
+    pub fs_selector: u16,
+    /// Дескрипторы TLS потока (`set_thread_area`) — записи GDT 12–14 на
+    /// процессоре, где он исполняется.
+    pub tls_entries: [u64; 3],
 }
 
 /// То, что процессор помнит о программе задачи и что обязано меняться вместе с
@@ -670,6 +677,8 @@ impl Task {
             arg: 0,
             futex_keys: None,
             futex_woken: None,
+            fs_selector: 0,
+            tls_entries: [0; 3],
         }
     }
 
@@ -715,6 +724,8 @@ impl Task {
             arg: 0,
             futex_keys: None,
             futex_woken: None,
+            fs_selector: 0,
+            tls_entries: [0; 3],
         }
     }
 }

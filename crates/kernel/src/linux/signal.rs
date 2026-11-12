@@ -29,6 +29,12 @@ fn bit(sig: usize) -> u64 {
     1u64 << (sig - 1)
 }
 
+/// Селекторы третьего кольца — как у Linux x86-64 (`__USER_CS`,
+/// `__USER32_CS`, `__USER_DS`).
+const USER_CS64: u16 = 0x33;
+const USER_CS32: u16 = 0x23;
+const USER_SS: u16 = 0x2b;
+
 /// Что не блокируется никогда.
 const UNBLOCKABLE: u64 = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
 
@@ -727,6 +733,11 @@ fn enter_handler(
     if action.flags & SA_RESETHAND != 0 {
         crate::user::with_current(|program| program.linux_actions[sig] = LinuxAction::default());
     }
+    // Обработчик — 64-битный код, даже если сигнал застал поток в 32-битном
+    // (Wine WoW64, CS `0x23`): прерванный CS лежит в `uc_mcontext`, и
+    // `rt_sigreturn` вернёт его (12.11).
+    f.cs = u64::from(USER_CS64);
+    f.ss = u64::from(USER_SS);
     f.rip = handler as u64;
     f.rsp = sp as u64;
     f.rdi = sig as u64;
@@ -747,13 +758,19 @@ pub fn sigreturn(frame: &mut crate::arch::TrapFrame) {
         unsafe { crate::arch::return_to_kernel(128 + 11) }
     }
     // SAFETY: кадр проверен на чтение выше.
-    let (gregs, mask, fpregs) = unsafe {
+    let (gregs, mask, fpregs, csgsfs) = unsafe {
         (
             core::ptr::read_unaligned((uc + MCONTEXT_AT) as *const [u64; 18]),
             core::ptr::read_unaligned((uc + SIGMASK_AT) as *const u64),
             core::ptr::read_unaligned((uc + FPREGS_AT) as *const u64),
+            core::ptr::read_unaligned((uc + MCONTEXT_AT + 144) as *const u64),
         )
     };
+    // CS — 64-битный или 32-битный пользовательский (WoW64), иначе 64-битный:
+    // другого программе не положено.
+    let cs = (csgsfs & 0xFFFF) as u16;
+    frame.cs = u64::from(if cs == USER_CS32 { USER_CS32 } else { USER_CS64 });
+    frame.ss = u64::from(USER_SS);
     restore_fpu(fpregs as usize);
     let f = frame;
     [f.r8, f.r9, f.r10, f.r11, f.r12, f.r13, f.r14, f.r15, f.rdi, f.rsi, f.rbp, f.rbx, f.rdx, f.rax, f.rcx, f.rsp, f.rip] =

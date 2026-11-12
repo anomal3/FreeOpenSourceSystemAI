@@ -28,12 +28,30 @@ pub use x86_64::{
     set_user_gs, set_user_tls, user_gs, user_tls,
     pci_config_read32, pci_config_write32, poll_boot_devices, power_off, reboot, reboot_on_key,
     remember_serial, report_boot_devices, serial_fallback, spawn_input_services, wait_for_interrupt,
-    hypervisor_log,
+    hypervisor_log, enter_user_segments, clear_fs_selector, set_tls_entry, user_fs_selector, TLS_ENTRY_MIN,
 };
 
 /// Строка в журнал гипервизора — на AArch64 такого канала нет.
 #[cfg(target_arch = "aarch64")]
 pub fn hypervisor_log(_text: &[u8]) {}
+
+// Сегменты x86 (12.11, 32-битный код Wine) — на AArch64 их нет: база TLS
+// одна (`TPIDR_EL0`), её и ставим.
+#[cfg(target_arch = "aarch64")]
+pub fn enter_user_segments(tls: u64, _fs_selector: u16, _tls_entries: &[u64; 3]) {
+    set_user_tls(tls);
+}
+#[cfg(target_arch = "aarch64")]
+pub fn clear_fs_selector() {}
+#[cfg(target_arch = "aarch64")]
+pub fn set_tls_entry(_slot: usize, _descriptor: u64) {}
+#[cfg(target_arch = "aarch64")]
+#[must_use]
+pub fn user_fs_selector() -> u16 {
+    0
+}
+#[cfg(target_arch = "aarch64")]
+pub const TLS_ENTRY_MIN: usize = 12;
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;

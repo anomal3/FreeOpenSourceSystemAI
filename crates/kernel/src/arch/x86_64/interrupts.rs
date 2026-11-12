@@ -475,6 +475,15 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
     // Системный вызов разбирается до всего остального: его номер лежит выше
     // границы внешних прерываний, и попав в ветку ниже, он был бы подтверждён
     // как чужое прерывание контроллера.
+    // `int 0x80` программы Linux — системный вызов i386 (12.11.2026): Wine в
+    // режиме WoW64 так заводит 32-битный `FS` (`set_thread_area`). Родной ABI
+    // `int 0x80` ей не положен.
+    if vector == VECTOR_SYSCALL && crate::user::with_current(|program| program.linux).unwrap_or(false) {
+        frame.rax = crate::linux::i386_syscall(frame) as i32 as u32 as u64;
+        // SAFETY: как у родного системного вызова ниже.
+        unsafe { crate::user::check_kill() };
+        return;
+    }
     if vector == VECTOR_SYSCALL && frame.rax as usize == user_abi::SYS_SIGRETURN {
         // Выход из обработчика отказа родной программы: регистры — из её
         // `ucontext`, а не ответ системного вызова в `rax`.

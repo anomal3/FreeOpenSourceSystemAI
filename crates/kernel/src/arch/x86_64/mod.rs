@@ -307,6 +307,60 @@ pub fn set_user_tls(base: u64) {
     unsafe { wrmsr(IA32_FS_BASE, base) };
 }
 
+/// Селектор в `FS` прямо сейчас (12.11.2026). Ненулевой он у потока Wine,
+/// уходящего в 32-битный код (WoW64): там база `FS` — 32-битный TEB из
+/// дескриптора TLS, а не `IA32_FS_BASE`.
+#[must_use]
+pub fn user_fs_selector() -> u16 {
+    let selector: u16;
+    // SAFETY: чтение сегментного регистра — ни памяти, ни флагов.
+    unsafe { asm!("mov {0:x}, fs", out(reg) selector, options(nomem, nostack, preserves_flags)) };
+    selector
+}
+
+/// Загрузить селектор в `FS`. База из дескриптора (или — у нулевого — та, что
+/// процессор оставит) перекрывает `IA32_FS_BASE`, поэтому кеш его значения
+/// сбрасывается: следующая [`set_user_tls`] запишет MSR заново.
+fn load_fs_selector(selector: u16) {
+    // SAFETY: селектор — нулевой или TLS-запись GDT этого процессора с DPL 3,
+    // описанная `set_thread_area`; ядро сегмент `FS` не использует.
+    unsafe { asm!("mov fs, {0:x}", in(reg) selector, options(nostack, preserves_flags)) };
+    FS_BASE_NOW[crate::smp::cpu()].store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Сегменты третьего кольца задачи, которая сейчас получит процессор: её
+/// дескрипторы TLS — в GDT этого процессора, затем `FS` — её селектор (с
+/// базой из дескриптора) или нулевой с базой `tls` в `IA32_FS_BASE`.
+pub fn enter_user_segments(tls: u64, fs_selector: u16, tls_entries: &[u64; 3]) {
+    for (slot, descriptor) in tls_entries.iter().enumerate() {
+        gdt::set_tls_entry(slot, *descriptor);
+    }
+    if fs_selector != 0 {
+        load_fs_selector(fs_selector);
+        return;
+    }
+    if user_fs_selector() != 0 {
+        load_fs_selector(0);
+    }
+    set_user_tls(tls);
+}
+
+/// Обнулить селектор `FS` исполняющейся задачи — `arch_prctl(ARCH_SET_FS)`,
+/// как у Linux: база отныне из `IA32_FS_BASE`.
+pub fn clear_fs_selector() {
+    if user_fs_selector() != 0 {
+        load_fs_selector(0);
+    }
+}
+
+/// Записать дескриптор TLS `slot` в GDT этого процессора (`set_thread_area`).
+pub fn set_tls_entry(slot: usize, descriptor: u64) {
+    gdt::set_tls_entry(slot, descriptor);
+}
+
+/// Первая запись TLS в GDT (селектор записи `slot` — `(первая + slot) << 3 | 3`).
+pub const TLS_ENTRY_MIN: usize = gdt::TLS_ENTRY_MIN;
+
 /// `IA32_GS_BASE` — база `GS` третьего кольца. Ядро `GS` не адресует: заглушка
 /// входа `syscall` берёт стек через `swapgs` и тут же меняет базы обратно,
 /// так что всё время в ядре в этом MSR лежит база программы. Программы Linux

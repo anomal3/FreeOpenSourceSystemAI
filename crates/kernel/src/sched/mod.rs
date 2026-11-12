@@ -710,9 +710,38 @@ pub fn set_current_tls(base: u64) {
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
             task.tls = base;
+            task.fs_selector = 0;
         }
     }
+    // Как `arch_prctl(ARCH_SET_FS)` Linux: селектор `FS` — нулевой, база — из
+    // MSR (12.11: обработчик сигнала Wine, пойманного в 32-битном коде).
+    arch::clear_fs_selector();
     arch::set_user_tls(base);
+}
+
+/// Дескрипторы TLS исполняющейся задачи (`get_thread_area`, поиск свободной
+/// записи `set_thread_area`).
+#[must_use]
+pub fn current_tls_entries() -> [u64; 3] {
+    let sched = SCHED.lock();
+    sched.tasks[sched.current()].as_ref().map_or([0; 3], |task| task.tls_entries)
+}
+
+/// Записать дескриптор TLS `slot` исполняющейся задачи — в неё и в GDT этого
+/// процессора (`set_thread_area`, 12.11).
+pub fn set_current_tls_entry(slot: usize, descriptor: u64) {
+    if slot >= 3 {
+        return;
+    }
+    // Под локом планировщика прерывания запрещены: задачу не перенесут на
+    // другой процессор между записью в неё и в GDT этого.
+    let mut sched = SCHED.lock();
+    let current = sched.current();
+    if let Some(task) = sched.tasks[current].as_mut() {
+        task.tls_entries[slot] = descriptor;
+    }
+    arch::set_tls_entry(slot, descriptor);
+    drop(sched);
 }
 
 /// Задать базу `GS` исполняющейся задачи (программы Linux на x86-64,
@@ -1267,6 +1296,8 @@ fn schedule_with(cause: Cause) {
     // процессор, и задача обязана найти на нём своё значение, а не соседкино.
     let mut to_tls: u64 = 0;
     let mut to_gs: u64 = 0;
+    let mut to_fs_selector: u16 = 0;
+    let mut to_tls_entries: [u64; 3] = [0; 3];
 
     {
         let mut sched = SCHED.lock();
@@ -1395,6 +1426,9 @@ fn schedule_with(cause: Cause) {
                             if cause == Cause::Preempted {
                                 task.preempted += 1;
                             }
+                            // Селектор `FS` уходящей — у потока Wine в
+                            // 32-битном коде он не нулевой (12.11).
+                            task.fs_selector = arch::user_fs_selector();
                         }
                         if let Some(task) = sched.tasks[next].as_mut() {
                             task.state = TaskState::Running;
@@ -1409,6 +1443,8 @@ fn schedule_with(cause: Cause) {
                             }
                             to_tls = task.tls;
                             to_gs = task.gs;
+                            to_fs_selector = task.fs_selector;
+                            to_tls_entries = task.tls_entries;
                         }
                         let state = &mut sched.cpus[cpu];
                         state.previous = Some(current);
@@ -1436,7 +1472,7 @@ fn schedule_with(cause: Cause) {
         // же метка не даёт соседнему процессору взять ни одну из них. `to`
         // описывает задачу с отображённым стеком — построенную `Context::new`
         // либо сохранённую предыдущим вызовом этой функции.
-        arch::set_user_tls(to_tls);
+        arch::enter_user_segments(to_tls, to_fs_selector, &to_tls_entries);
         arch::set_user_gs(to_gs);
         unsafe { arch::switch_context(from, to) };
         // Сюда управление возвращается уже в контексте задачи, которая когда-то

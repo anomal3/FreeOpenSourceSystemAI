@@ -2236,6 +2236,124 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usi
     }
 }
 
+/// Системный вызов i386 (`int 0x80`) программы Linux (12.11.2026): номер в
+/// `eax`, аргументы в `ebx`, `ecx`, `edx`; адреса — 32-битные. Нужны два:
+/// `set_thread_area` (243) и `get_thread_area` (244) — ими Wine в режиме
+/// WoW64 заводит 32-битный `FS` потока (база — 32-битный TEB). Остальное —
+/// `ENOSYS`: 32-битный код Wine в ядро не ходит, он возвращается в 64-битный.
+#[cfg(target_arch = "x86_64")]
+pub fn i386_syscall(frame: &crate::arch::TrapFrame) -> i64 {
+    const SET_THREAD_AREA: u32 = 243;
+    const GET_THREAD_AREA: u32 = 244;
+    let number = frame.rax as u32;
+    let info = frame.rbx as u32 as usize;
+    match number {
+        SET_THREAD_AREA => set_thread_area(info),
+        GET_THREAD_AREA => get_thread_area(info),
+        _ => {
+            crate::kprintln!("  linux       : i386 system call {number} is not implemented");
+            -e::ENOSYS
+        }
+    }
+}
+
+/// `struct user_desc` i386: номер записи, база, предел, флаги.
+#[cfg(target_arch = "x86_64")]
+fn read_user_desc(info: usize) -> Result<[u32; 4], i64> {
+    if info == 0 || !space::user_can(info, 16, PageFlags::WRITE) {
+        return Err(-e::EFAULT);
+    }
+    // SAFETY: проверено строкой выше.
+    Ok(unsafe { core::ptr::read_unaligned(info as *const [u32; 4]) })
+}
+
+/// Дескриптор GDT из `user_desc` — как `fill_ldt` Linux.
+#[cfg(target_arch = "x86_64")]
+fn descriptor_of(base: u32, limit: u32, flags: u32) -> u64 {
+    let bit = |n: u32| u64::from((flags >> n) & 1);
+    let (seg_32bit, contents, read_exec_only) = (bit(0), u64::from((flags >> 1) & 3), bit(3));
+    let (limit_in_pages, not_present, useable) = (bit(4), bit(5), bit(6));
+    // Пустой: всё ноль или «пустой» Linux (`LDT_empty`).
+    let empty = base == 0
+        && limit == 0
+        && contents == 0
+        && seg_32bit == 0
+        && limit_in_pages == 0
+        && useable == 0
+        && ((read_exec_only == 1 && not_present == 1) || (read_exec_only == 0 && not_present == 0 && flags == 0));
+    if empty {
+        return 0;
+    }
+    let (base, limit) = (u64::from(base), u64::from(limit));
+    let kind = ((read_exec_only ^ 1) << 1) | (contents << 2) | 1;
+    (limit & 0xFFFF)
+        | ((base & 0xFF_FFFF) << 16)
+        | (kind << 40)
+        | (1 << 44)
+        | (3 << 45)
+        | ((not_present ^ 1) << 47)
+        | (((limit >> 16) & 0xF) << 48)
+        | (useable << 52)
+        | (seg_32bit << 54)
+        | (limit_in_pages << 55)
+        | (((base >> 24) & 0xFF) << 56)
+}
+
+/// `set_thread_area(u_info)`: номер −1 — выбрать свободную запись и вернуть
+/// её номер в `u_info`; иначе — записи 12–14 потока.
+#[cfg(target_arch = "x86_64")]
+fn set_thread_area(info: usize) -> i64 {
+    let [entry, base, limit, flags] = match read_user_desc(info) {
+        Ok(desc) => desc,
+        Err(err) => return err,
+    };
+    let first = crate::arch::TLS_ENTRY_MIN as u32;
+    let slot = if entry == u32::MAX {
+        let entries = crate::sched::current_tls_entries();
+        let Some(free) = entries.iter().position(|descriptor| *descriptor == 0) else {
+            return -e::ESRCH;
+        };
+        let number = first + free as u32;
+        // SAFETY: `u_info` проверен на запись в `read_user_desc`.
+        unsafe { core::ptr::write_unaligned(info as *mut u32, number) };
+        free
+    } else if (first..first + 3).contains(&entry) {
+        (entry - first) as usize
+    } else {
+        return -e::EINVAL;
+    };
+    crate::sched::set_current_tls_entry(slot, descriptor_of(base, limit, flags));
+    0
+}
+
+/// `get_thread_area(u_info)`: дескриптор записи `u_info.entry_number` обратно
+/// в `user_desc`.
+#[cfg(target_arch = "x86_64")]
+fn get_thread_area(info: usize) -> i64 {
+    let [entry, ..] = match read_user_desc(info) {
+        Ok(desc) => desc,
+        Err(err) => return err,
+    };
+    let first = crate::arch::TLS_ENTRY_MIN as u32;
+    if !(first..first + 3).contains(&entry) {
+        return -e::EINVAL;
+    }
+    let descriptor = crate::sched::current_tls_entries()[(entry - first) as usize];
+    let field = |shift: u32, mask: u64| ((descriptor >> shift) & mask) as u32;
+    let base = field(16, 0xFF_FFFF) | (field(56, 0xFF) << 24);
+    let limit = field(0, 0xFFFF) | (field(48, 0xF) << 16);
+    let kind = field(40, 0xF);
+    let flags = field(54, 1)
+        | (((kind >> 2) & 3) << 1)
+        | ((((kind >> 1) & 1) ^ 1) << 3)
+        | (field(55, 1) << 4)
+        | ((field(47, 1) ^ 1) << 5)
+        | (field(52, 1) << 6);
+    // SAFETY: `u_info` проверен на запись в `read_user_desc`.
+    unsafe { core::ptr::write_unaligned(info as *mut [u32; 4], [entry, base, limit, flags]) };
+    0
+}
+
 /// `futex_waitv(waiters, count, flags, timeout, clock)` — ждать сразу на
 /// нескольких словах (Linux 5.16, 12.11). На нём fsync Wine/Proton: объект
 /// синхронизации Windows — слово, `WaitForMultipleObjects` — этот вызов.

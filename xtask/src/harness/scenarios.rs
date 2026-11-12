@@ -1,4 +1,4 @@
-﻿//! Сценарии стенда: что именно проверяется прогоном.
+//! Сценарии стенда: что именно проверяется прогоном.
 //!
 //! # Правило проверок
 //!
@@ -6222,17 +6222,17 @@ pub const ALL: &[Scenario] = &[
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             // Префикс прошлых прогонов (недоделанный) — прочь: создаётся заново.
-            Step::Line("run /opt/debian/bin/rm -rf /home/roman/.proton"),
+            Step::Line("run /opt/debian/bin/rm -rf /home/roman/.proton /home/roman/.p32"),
             Step::Await("rm: exited with code 0", 300_000),
             // Строка оболочки — до 200 байт: окружение — в скрипте пакета.
-            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton notepad"),
+            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=WINEPREFIX=/home/roman/.p32 --env=WINEARCH=wow64 --debug=fixme-all,+loaddll c:/windows/syswow64/notepad.exe"),
             Step::Await("fsync: up and running", 900_000),
             Step::Await("wayland     : client #", 900_000),
             Step::Await("'Untitled - Notepad'", 600_000),
             Step::Wait(30_000),
             Step::Move(1, 0),
             Step::Wait(2_000),
-            Step::Painted("proton-notepad"),
+            Step::Painted("proton-notepad32"),
             Step::Absent("KERNEL PANIC"),
         ],
     },
@@ -6960,6 +6960,11 @@ pub const ALL: &[Scenario] = &[
             Step::Await("shmprobe: start", 30_000),
             Step::Await("shmprobe: 0 failed", 30_000),
             Step::Absent("shmprobe: FAILED"),
+            // 32-битный код в 64-битном процессе (12.11, WoW64 Wine).
+            Step::Line("run /compat/linux/bin/wow32probe"),
+            Step::Await("wow32: start", 30_000),
+            Step::Await("wow32: 0 failed", 120_000),
+            Step::Absent("wow32: FAILED"),
             Step::Absent("sigasync: FAILED"),
             Step::Absent("futexv: FAILED"),
             Step::Absent("linux: FAILED"),

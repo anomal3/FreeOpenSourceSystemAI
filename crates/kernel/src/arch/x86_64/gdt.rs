@@ -74,9 +74,15 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub const KERNEL_CODE_SELECTOR: u16 = 1 << 3;
 /// Селектор сегмента данных ядра: запись 2, RPL 0.
 pub const KERNEL_DATA_SELECTOR: u16 = 2 << 3;
-/// Запись GDT с TSS загрузочного процессора (дескриптор системный и занимает
-/// две записи).
-const BOOT_TSS_ENTRY: usize = 3;
+/// Селектор 32-битного сегмента кода пользователя: запись 4, RPL 3 — `0x23`,
+/// как `__USER32_CS` Linux (12.11.2026, шаг 4 плана Proton). Wine в режиме
+/// WoW64 берёт его жёстко и уходит в 32-битный код дальним переходом.
+pub const USER_CODE32_SELECTOR: u16 = (4 << 3) | 3;
+/// Первая из трёх записей TLS потока (`set_thread_area`), как
+/// `GDT_ENTRY_TLS_MIN` Linux на x86-64: селекторы `0x63`, `0x6b`, `0x73`.
+pub const TLS_ENTRY_MIN: usize = 12;
+/// Сколько записей TLS у потока.
+pub const TLS_ENTRIES: usize = 3;
 /// Селектор сегмента данных пользователя: запись 5, RPL 3.
 ///
 /// Младшие два бита селектора — запрошенный уровень привилегий, и тройка в них
@@ -85,12 +91,14 @@ const BOOT_TSS_ENTRY: usize = 3;
 pub const USER_DATA_SELECTOR: u16 = (5 << 3) | 3;
 /// Селектор сегмента кода пользователя: запись 6, RPL 3.
 pub const USER_CODE_SELECTOR: u16 = (6 << 3) | 3;
-/// Первая запись с TSS остальных процессоров.
+/// Первая запись с TSS: процессор `c` — записи `16 + 2c` и `17 + 2c`.
 ///
-/// После пользовательских сегментов, а не сразу за TSS загрузочного: записи 5 и
-/// 6 закреплены раскладкой, совместимой с `sysret`, и сдвигать их ради того,
-/// чтобы TSS лежали подряд, значило бы менять договор с третьим кольцом.
-const SECONDARY_TSS_ENTRY: usize = 7;
+/// С 12.11.2026 у каждого процессора своя GDT (записи TLS — свои у каждого
+/// потока, и на процессоре лежат значения того, кто на нём исполняется), а
+/// TSS загрузочного переехала из записей 3–4: запись 4 — 32-битный код
+/// (`0x23`, как у Linux). Номера TSS по-прежнему разные у всех процессоров:
+/// по селектору в `TR` процессор узнаёт свой номер ([`current_cpu`]).
+const TSS_ENTRY_BASE: usize = 16;
 
 /// Номер IST для двойной ошибки. Значение попадает в поле `IST` дескриптора
 /// вектора и индексирует `TSS.IST1..IST7` начиная с единицы; ноль означает
@@ -133,9 +141,38 @@ const KERNEL_DATA_DESCRIPTOR: u64 = DESC_ACCESSED | DESC_RW | DESC_CODE_DATA | D
 /// `DPL = 3` — сегмент доступен из третьего кольца.
 const DESC_DPL3: u64 = 3 << 45;
 
-/// Сегмент данных пользователя: ring 3, записываемый.
-const USER_DATA_DESCRIPTOR: u64 =
-    DESC_ACCESSED | DESC_RW | DESC_CODE_DATA | DESC_PRESENT | DESC_DPL3;
+/// Сегмент данных пользователя: ring 3, записываемый, плоский на 4 ГиБ с
+/// `B` = 1 (12.11.2026). В 64-битном режиме база, предел и `B` не значат
+/// ничего, а в режиме совместимости (32-битный код Wine, CS `0x23`) —
+/// значат: с нулевым пределом и `B` = 0 стек был 16-битным, и `push`
+/// писал по `SP`, а не по `ESP` (адрес `0xefc` вместо `0x30000efc`).
+const USER_DATA_DESCRIPTOR: u64 = DESC_ACCESSED
+    | DESC_RW
+    | DESC_CODE_DATA
+    | DESC_PRESENT
+    | DESC_DPL3
+    | DESC_DEFAULT_32
+    | DESC_GRANULARITY_4K
+    | DESC_LIMIT_MAX;
+
+/// `D` — 32-битный сегмент (размер операнда по умолчанию), `G` — предел в
+/// страницах.
+const DESC_DEFAULT_32: u64 = 1 << 54;
+const DESC_GRANULARITY_4K: u64 = 1 << 55;
+/// Предел `0xFFFFF` (с `G` — все 4 ГиБ): младшие 16 бит и биты 48–51.
+const DESC_LIMIT_MAX: u64 = 0xFFFF | (0xF << 48);
+
+/// 32-битный сегмент кода пользователя (compatibility mode): ring 3, плоский
+/// на 4 ГиБ, без `L`.
+const USER_CODE32_DESCRIPTOR: u64 = DESC_ACCESSED
+    | DESC_RW
+    | DESC_EXECUTABLE
+    | DESC_CODE_DATA
+    | DESC_PRESENT
+    | DESC_DPL3
+    | DESC_DEFAULT_32
+    | DESC_GRANULARITY_4K
+    | DESC_LIMIT_MAX;
 
 /// Сегмент кода пользователя: ring 3, 64-битный.
 const USER_CODE_DESCRIPTOR: u64 = DESC_ACCESSED
@@ -260,7 +297,7 @@ fn tss_descriptor_low(base: u64, limit: u32) -> u64 {
 
 /// Первая из двух записей GDT, в которых лежит TSS процессора `cpu`.
 const fn tss_entry(cpu: usize) -> usize {
-    if cpu == 0 { BOOT_TSS_ENTRY } else { SECONDARY_TSS_ENTRY + 2 * (cpu - 1) }
+    TSS_ENTRY_BASE + 2 * cpu
 }
 
 /// Номер процессора по регистру задачи.
@@ -275,11 +312,8 @@ pub fn current_cpu() -> usize {
     // памяти, ни стека, ни флагов. Селектор расширяется нулями до 64 бит.
     unsafe { asm!("str {}", out(reg) selector, options(nomem, nostack, preserves_flags)) };
     let entry = (selector & 0xFFFF) >> 3;
-    if entry == BOOT_TSS_ENTRY {
-        return 0;
-    }
-    if entry >= SECONDARY_TSS_ENTRY && (entry - SECONDARY_TSS_ENTRY) % 2 == 0 {
-        let cpu = (entry - SECONDARY_TSS_ENTRY) / 2 + 1;
+    if entry >= TSS_ENTRY_BASE && (entry - TSS_ENTRY_BASE) % 2 == 0 {
+        let cpu = (entry - TSS_ENTRY_BASE) / 2;
         if cpu < MAX_CPUS {
             return cpu;
         }
@@ -289,16 +323,57 @@ pub fn current_cpu() -> usize {
 
 // --- GDT ----------------------------------------------------------------------
 
-/// Записей в GDT: нулевая, код и данные ядра, две под TSS загрузочного
-/// процессора, данные и код пользователя, и по две на TSS каждого следующего.
-const GDT_ENTRIES: usize = SECONDARY_TSS_ENTRY + 2 * (MAX_CPUS - 1);
+/// Записей в GDT: нулевая, код и данные ядра, свободная, 32-битный код
+/// пользователя, данные и 64-битный код пользователя, свободные, три TLS,
+/// свободная — и по две на TSS каждого процессора (в своей таблице занята
+/// только своя пара).
+const GDT_ENTRIES: usize = TSS_ENTRY_BASE + 2 * MAX_CPUS;
 
 /// GDT выровнена на 16 не по требованию архитектуры, а ради того, чтобы ни один
 /// дескриптор не пересекал границу строки кеша.
 #[repr(C, align(16))]
 struct Gdt([u64; GDT_ENTRIES]);
 
-static GDT: Racy<Gdt> = Racy::new(Gdt([0; GDT_ENTRIES]));
+/// GDT каждого процессора (12.11.2026): записи TLS — значения потока, который
+/// на этом процессоре исполняется.
+static GDTS: [Racy<Gdt>; MAX_CPUS] = [const { Racy::new(Gdt([0; GDT_ENTRIES])) }; MAX_CPUS];
+
+/// Общие записи — в таблицу процессора `cpu`.
+///
+/// # Safety
+///
+/// Таблицу `cpu` никто не загрузил и не пишет одновременно.
+unsafe fn fill_template(cpu: usize) {
+    let gdt = GDTS[cpu].get();
+    // SAFETY: контракт функции.
+    unsafe {
+        (*gdt).0[0] = 0; // нулевой дескриптор: загрузка его селектора обнуляет сегмент
+        (*gdt).0[1] = KERNEL_CODE_DESCRIPTOR;
+        (*gdt).0[2] = KERNEL_DATA_DESCRIPTOR;
+        (*gdt).0[4] = USER_CODE32_DESCRIPTOR;
+        // Порядок «32-битный код, данные, 64-битный код» — тот, которого
+        // требует `sysret` (база `STAR` — запись 4). Сам `sysret` здесь не
+        // используется — возврат идёт `iretq`, — но раскладка та же, что у
+        // Linux, и программы на неё рассчитывают (`0x23`, `0x2b`, `0x33`).
+        (*gdt).0[5] = USER_DATA_DESCRIPTOR;
+        (*gdt).0[6] = USER_CODE_DESCRIPTOR;
+    }
+}
+
+/// Записать дескриптор TLS `slot` (0..3) в GDT этого процессора — значение
+/// потока, который на нём исполняется (переключение контекста и
+/// `set_thread_area`). Загруженный в `FS` селектор не меняется, пока его не
+/// загрузят снова.
+pub fn set_tls_entry(slot: usize, descriptor: u64) {
+    if slot >= TLS_ENTRIES || !INSTALLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let gdt = GDTS[current_cpu()].get();
+    // SAFETY: таблица этого процессора, пишет в записи TLS только он сам с
+    // запрещёнными прерываниями (переключение) или из своего системного
+    // вызова; процессор читает дескриптор только при загрузке селектора.
+    unsafe { (&raw mut (*gdt).0[TLS_ENTRY_MIN + slot]).write_volatile(descriptor) };
+}
 
 /// Операнд инструкций `lgdt` и `lidt`: предел и базовый адрес таблицы.
 ///
@@ -337,7 +412,7 @@ unsafe fn describe_tss(cpu: usize) {
     }
     let base = tss as u64;
     let entry = tss_entry(cpu);
-    let gdt = GDT.get();
+    let gdt = GDTS[cpu].get();
     // SAFETY: условия контракта; `Gdt` не `packed`, поля выровнены, индекс
     // меньше `GDT_ENTRIES` по построению `tss_entry` при `cpu < MAX_CPUS`.
     unsafe {
@@ -346,9 +421,9 @@ unsafe fn describe_tss(cpu: usize) {
     }
 }
 
-/// Указатель на GDT для `lgdt` — один на все процессоры.
-fn gdt_pointer() -> DescriptorTablePointer {
-    DescriptorTablePointer { limit: (size_of::<Gdt>() - 1) as u16, base: GDT.get() as u64 }
+/// Указатель на GDT процессора `cpu` для `lgdt`.
+fn gdt_pointer(cpu: usize) -> DescriptorTablePointer {
+    DescriptorTablePointer { limit: (size_of::<Gdt>() - 1) as u16, base: GDTS[cpu].get() as u64 }
 }
 
 /// Построить и загрузить GDT, TSS и стеки IST загрузочного процессора.
@@ -364,23 +439,12 @@ pub fn init() {
         }
         // SAFETY: ядро на этом этапе однопоточно (остальные процессоры ещё
         // спят), прерывания запрещены, селектор загрузочного TSS не загружен.
-        unsafe { describe_tss(0) };
-
-        let gdt = GDT.get();
-        // SAFETY: та же статика при тех же условиях эксклюзивности.
         unsafe {
-            (*gdt).0[0] = 0; // нулевой дескриптор: загрузка его селектора обнуляет сегмент
-            (*gdt).0[1] = KERNEL_CODE_DESCRIPTOR;
-            (*gdt).0[2] = KERNEL_DATA_DESCRIPTOR;
-            // Порядок «сначала данные, потом код» соответствует тому, которого
-            // требует `sysret`. Сам `sysret` здесь не используется — системные
-            // вызовы приходят ловушкой, — но раскладка, совместимая с ним,
-            // ничего не стоит и снимает будущую перестановку таблицы.
-            (*gdt).0[5] = USER_DATA_DESCRIPTOR;
-            (*gdt).0[6] = USER_CODE_DESCRIPTOR;
+            fill_template(0);
+            describe_tss(0);
         }
 
-        let pointer = gdt_pointer();
+        let pointer = gdt_pointer(0);
         // SAFETY: таблица заполнена выше, лежит в статике с временем жизни
         // 'static и содержит корректные сегменты ядра. Записи под TSS остальных
         // процессоров пока нулевые, то есть «нет дескриптора», и никто их не
@@ -407,8 +471,11 @@ pub fn prepare_secondary(cpu: usize) {
         return;
     }
     // SAFETY: процессоры запускаются строго по одному, и вызывает это
-    // загрузочный до запуска `cpu`; ни один процессор не держит этот селектор.
-    unsafe { describe_tss(cpu) };
+    // загрузочный до запуска `cpu`; таблицу `cpu` ещё никто не загрузил.
+    unsafe {
+        fill_template(cpu);
+        describe_tss(cpu);
+    }
 }
 
 /// Загрузить общую GDT и свой TSS — первое, что делает проснувшийся процессор.
@@ -419,7 +486,7 @@ pub fn prepare_secondary(cpu: usize) {
 /// него и до первого захвата любого лока: до `ltr` номер процессора читается из
 /// регистра, в котором ещё ничего нет.
 pub unsafe fn load_secondary(cpu: usize) {
-    let pointer = gdt_pointer();
+    let pointer = gdt_pointer(cpu);
     // SAFETY: таблица та же, что у загрузочного процессора, и содержит сегменты
     // ядра; запись TSS этого процессора подготовлена `prepare_secondary`.
     unsafe {
