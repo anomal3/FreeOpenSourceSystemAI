@@ -11778,6 +11778,15 @@ eventfd, epoll, timerfd, memfd, ppoll, tgkill, sigaltstack, clone3. Чего н�
   перезагрузку) — «is not a socket», скрипт чистит.
   Ловушки стенда: погасший экран не отдаёт кадров (сценарий: `power never`);
   после окна Wine фокус не возвращается терминалу (щелчок в «Terminal»).
+- **Шаг 7 сделан** (e4b32f8, 12.11): звук Windows через ALSA ядра.
+  `linux/snd.rs` — `/dev/snd/controlC0` и `pcmC0D0p`, один режим S16_LE,
+  2 канала, 48 кГц, период 1024, буфер 4096 кадров; `HW_REFINE` сужает
+  запрос до него, данные — `WRITEI_FRAMES` в `sound::feed`, `hw_ptr` по
+  часам, `mmap` статуса нет — libasound сама уходит на `SYNC_PTR`. В пакете
+  `winealsa.so`, libasound 1.2.14 и её настройки (`ALSA_CONFIG_DIR`,
+  `fossai.conf`: `default` = `plug` поверх `hw:0,0`). Проба
+  `d3dprobe.exe tone 440 4` (waveOut) — сценарий `proton-sound`: в WAV QEMU
+  тон 440 Гц, 3993 мс. Запись (микрофон) не сделана.
   Открыто: 10–13 к/с DXVK на простой заливке — медленно (шестерёнки 90),
   не разобрано; `wineserver` при выходе — assert `obj->refcount`;
   `received delete_id for unknown id` от нашего сервера Wayland.
