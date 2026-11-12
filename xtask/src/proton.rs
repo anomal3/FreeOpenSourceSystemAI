@@ -154,6 +154,10 @@ const TRIXIE: [(&str, &str); 4] = [
     ("pool/main/libx/libxkbcommon/libxkbregistry0_1.7.0-2_amd64.deb", "e9b5a7051efa2b299348b4f6b1ebc1416f2523c4224af495d9cca4adbb22183a"),
 ];
 
+/// Раскладки клавиатуры Xkb (bookworm, `all`).
+const XKB_DATA: [(&str, &str); 1] =
+    [("pool/main/x/xkeyboard-config/xkb-data_2.35.1-1_all.deb", "28a79c61b785f403da93af58c39aed13c022032935e3e54362c6707169cfe982")];
+
 /// Что из glibc trixie кладётся (`usr/lib/x86_64-linux-gnu/…`).
 const GLIBC_LIBS: [&str; 12] = [
     "ld-linux-x86-64.so.2",
@@ -272,6 +276,18 @@ pub fn build(arch: Arch) -> Result<()> {
     let mut files: Vec<(String, Vec<u8>, u32)> = Vec::new();
     // Что искать и кто это потребовал — для внятного отказа.
     let mut todo: Vec<(String, String)> = DLOPEN.iter().map(|name| (String::from(*name), String::from("dlopen"))).collect();
+    // Раскладки клавиатуры (xkb-data): без них `winewayland` не разбирает
+    // правила Xkb («Failed to parse default Xkb ruleset»). Корень —
+    // `XKB_CONFIG_ROOT` в скрипте.
+    let mut xkb: BTreeMap<String, Node> = BTreeMap::new();
+    unpack(&cache, &XKB_DATA, &mut xkb)?;
+    let xkb_paths: Vec<String> = xkb.keys().filter(|path| path.starts_with("usr/share/X11/xkb/")).cloned().collect();
+    for path in xkb_paths {
+        if let Some((data, mode)) = follow(&xkb, &path, 0) {
+            files.push((format!("share/X11/xkb/{}", &path["usr/share/X11/xkb/".len()..]), data.clone(), mode));
+        }
+    }
+
     // Своя glibc (trixie) и её загрузчик под коротким именем.
     let mut glibc: BTreeMap<String, Node> = BTreeMap::new();
     unpack(&cache, &GLIBC, &mut glibc)?;
@@ -379,6 +395,10 @@ pub fn build(arch: Arch) -> Result<()> {
         export WINENTSYNC=0\n\
         export WINEDLLOVERRIDES=\"mscoree,mshtml=${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}\"\n\
         export WINEDEBUG=${WINEDEBUG:-fixme-all}\n\
+        export XKB_CONFIG_ROOT=$P/share/X11/xkb\n\
+        # `--env=ИМЯ=ЗНАЧЕНИЕ` (сколько угодно, первыми) — своя переменная: у\n\
+        # `run` оболочки окружения нет (WAYLAND_DEBUG=client и подобные).\n\
+        while case \"$1\" in --env=*) true ;; *) false ;; esac; do export \"${1#--env=}\"; shift; done\n\
         case \"$1\" in --debug=*) export WINEDEBUG=\"${1#--debug=}\"; shift ;; esac\n\
         case \"$1\" in --server-debug=*) mkdir -p \"$WINEPREFIX\"; $P/bin/wineserver -d\"${1#--server-debug=}\"; shift ;; esac\n\
         [ $# -eq 0 ] && set -- notepad\n\

@@ -237,9 +237,15 @@ const GLOBALS: [(u32, &str, u32); 8] = [
     (1, "wl_compositor", 4),
     (2, "wl_subcompositor", 1),
     (3, "wl_shm", 1),
-    (4, "xdg_wm_base", 2),
+    // xdg_wm_base 6 и wl_output 4 (12.11): `winewayland` GE-Proton не
+    // привязывается к более старым — `bind` даже не уходит, и Wine остаётся без
+    // окон («compositor doesn't support xdg_wm_base»). Новое в этих версиях
+    // для сервера необязательно: события `configure_bounds`,
+    // `wm_capabilities`, `name`, `description` можно не слать, а новые
+    // запросы (`set_reactive`, `reposition`, `release`) принимаются молча.
+    (4, "xdg_wm_base", 6),
     (5, "wl_seat", 5),
-    (6, "wl_output", 2),
+    (6, "wl_output", 4),
     // Буфер обмена и перетаскивание. Пока — объекты, принимающие запросы, и
     // ни одного предложения данных: Java (AWT на Wayland) без этого глобала не
     // заводит окно вовсе («Can't bind to the wl_data_device_manager»), а

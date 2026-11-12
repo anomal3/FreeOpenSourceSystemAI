@@ -6225,7 +6225,7 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run /opt/debian/bin/rm -rf /home/roman/.proton"),
             Step::Await("rm: exited with code 0", 300_000),
             // Строка оболочки — до 200 байт: окружение — в скрипте пакета.
-            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --debug=fixme-all,+driver,warn+waylanddrv,warn+explorer notepad"),
+            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton notepad"),
             Step::Await("fsync: up and running", 900_000),
             Step::Await("wayland     : client #", 900_000),
             Step::Await("'Untitled - Notepad'", 600_000),

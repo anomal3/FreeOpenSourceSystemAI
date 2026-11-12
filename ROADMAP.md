@@ -11732,6 +11732,23 @@ eventfd, epoll, timerfd, memfd, ppoll, tgkill, sigaltstack, clone3. Чего н�
   winscard, amd_ags, lsteamclient, vrclient, wineopenxr, protontts, речь,
   камеры, Bluetooth, NVML. На носитель — только с `FOSSAI_WITH_PROTON=1`,
   диск стенда — `FOSSAI_TARGET_MIB=12288`; сценарий `proton`.
+- **Шаг 3, 12.11 днём — Proton в системе** (74f91d0, 706e0f3, 4010500 и
+  дальше): путь к окну, по преградам —
+  установщик кусками (`read_chunks`, Proton больше памяти установщика);
+  манифест fpk до 2 МиБ; btrfs фиксирует не чаще раза в секунду (`pkg
+  install` 1567 → 557 с); пакет без wine-mono/Gecko (887 МиБ); своя glibc
+  2.41 (trixie) с `PT_INTERP` `wine`/`wineserver` на `/opt/proton/glibc/ld.so`
+  (модули GE хотят 2.38+); загрузчик `x86_64-unix/wine` напрямую и
+  переходник `i386-unix/wine64` (статическая программа без libc: GE
+  запускает им новые 64-битные процессы); `munmap` пустого — 0;
+  `epoll_pwait2`; **`MAP_PRIVATE` memfd — общими кадрами** (сессия
+  wineserver; проба `shmprobe`); libwayland 1.23 и xkbcommon 1.7 из trixie
+  (`winewayland.so` GE молча не грузился); `xkb-data` и `XKB_CONFIG_ROOT`;
+  `--env=` в `fossai-proton`; сервер Wayland: `xdg_wm_base` 6, `wl_output` 4
+  (GE не привязывается к старшим версиям). fsync: «fsync: up and running».
+  Ловушки: сценарии на установленном диске грузят ядро **со времени
+  `install`** (правка ядра — снова `install`); строка оболочки ≤200 байт;
+  `ld.so` 2.41, запущенная напрямую, падает #GP (не разобрано).
 - **К шагу 4** (разбор исходников Wine 11): на Linux `cs32_sel = 0x23`
   жёстко (у нас 0x20 — верхняя половина TSS загрузочного: TSS переложить);
   32-битный FS Wine заводит `set_thread_area`/`modify_ldt` через `int 0x80`
