@@ -447,9 +447,23 @@ pub fn run(
         }
         progress(5, Step::Copy(what));
         logln!("[install] copying package -> /media/{name} ({size} bytes)");
-        let data = payload.read(index).map_err(Error::Payload)?;
-        fs.write_file_path(&mut dev, &format!("media/{name}"), &data, 0o644, 0, 0)?;
-        drop(data);
+        // Кусками по 8 МиБ (12.11): пакет целиком в память установщика не
+        // помещается (Proton — полтора гигабайта при 512 МиБ машины).
+        let file = fs.write_file_path(&mut dev, &format!("media/{name}"), &[], 0o644, 0, 0)?;
+        let mut failed = None;
+        payload
+            .read_chunks(index, 8 << 20, |offset, chunk| {
+                if let Err(err) = fs.write_at(&mut dev, file, offset, chunk) {
+                    failed = Some(err);
+                    return Err(payload::Error::NoVolume);
+                }
+                Ok(())
+            })
+            .or_else(|err| if failed.is_some() { Ok(()) } else { Err(err) })
+            .map_err(Error::Payload)?;
+        if let Some(err) = failed {
+            return Err(err.into());
+        }
         packages += 1;
     }
     logln!("[install] root: {packages} package(s) in /media");

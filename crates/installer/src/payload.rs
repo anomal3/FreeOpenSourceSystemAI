@@ -692,4 +692,45 @@ impl Payload {
 
         Ok(data)
     }
+
+    /// Прочитать файл кусками по `chunk` байт и отдать каждый `sink` вместе со
+    /// смещением (12.11.2026). Для пакетов больше памяти установщика: Proton —
+    /// полтора гигабайта, а машине установщика хватает и 512 МиБ.
+    pub fn read_chunks(
+        &mut self,
+        index: usize,
+        chunk: usize,
+        mut sink: impl FnMut(u64, &[u8]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let item = self.items.get(index).ok_or(Error::NoVolume)?;
+        let (path, what, size) = (item.source, item.what, item.size);
+        let handle = self
+            .root
+            .open(path, FileMode::Read, FileAttribute::empty())
+            .map_err(|err| {
+                logln!("[payload] cannot reopen {path}: {err:?}");
+                Error::Unreadable(what)
+            })?;
+        let Ok(FileType::Regular(mut file)) = handle.into_type() else {
+            return Err(Error::Unreadable(what));
+        };
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(chunk).map_err(|_| Error::NoMemory(what))?;
+        buffer.resize(chunk, 0);
+        let mut offset = 0u64;
+        while offset < size {
+            let want = usize::try_from((size - offset).min(chunk as u64)).unwrap_or(chunk);
+            let read = file.read(&mut buffer[..want]).map_err(|err| {
+                logln!("[payload] cannot read {path}: {err:?}");
+                Error::Unreadable(what)
+            })?;
+            if read == 0 {
+                logln!("[payload] short read of {path}: {offset} of {size} bytes");
+                return Err(Error::Unreadable(what));
+            }
+            sink(offset, &buffer[..read])?;
+            offset += read as u64;
+        }
+        Ok(())
+    }
 }
