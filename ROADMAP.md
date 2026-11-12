@@ -11756,6 +11756,31 @@ eventfd, epoll, timerfd, memfd, ppoll, tgkill, sigaltstack, clone3. Чего н�
   родным ABI: для программ Linux нужна развилка на таблицу i386 (минимум эти
   два) и LDT/записи TLS в GDT; переход 32↔64 — дальний `ljmp` в
   `wow64cpu`, ядру системных вызовов из 32-битного кода не приходит.
+- **Шаг 4 сделан** (9fcfeef): 32-битный Блокнот через новый WoW64.
+- **Шаги 5–6 сделаны** (12.11 вечер–ночь; e0f055e, 4ec6122, 6055636, 5ae8fe7).
+  Mesa и Vulkan — из **Debian 13** (`xtask/src/mesa.rs`, 50 пакетов: Mesa
+  25.0.7, LLVM 19, glvnd), не 12: под свою glibc 2.41 пакета. Итог проб
+  (QEMU, 4 ЦП, без видеокарты):
+  `es2gears_wayland` (EGL llvmpipe) ~90 к/с; `vkcube`/`vulkaninfo` на
+  lavapipe (Vulkan 1.4.305); `tools/d3dprobe` (своя проба D3D9/11 на Rust,
+  едет в пакете `share/fossai/d3dprobe.exe`): D3D11 через DXVK ~13 к/с,
+  D3D9 через DXVK ~10–12 к/с, D3D11 через wined3d (OpenGL) ~28 к/с.
+  Сценарии `proton-gl` (ставит пакет), `proton-gl-run`, `proton-d3d`.
+  `fossai-proton`: `--run=проба`, `--dxvk` (DLL DXVK в префикс, как Proton),
+  `--fresh` (новый префикс), `WINE_USE_EGL=1` (без него в GE «EGL support is
+  disabled» и wined3d без OpenGL).
+  Преграды: Mesa требует libX11/xcb и liblzma даже под Wayland; `mincore`
+  обязан отвечать `ENOMEM` на неотображённое (Mesa так проверяет указатель);
+  выход процесса закрывает файлы **сразу** (поток, не доехавший до конца,
+  держал сокет Wayland — окно Wine висело и ловило щелчки); `cp`/`rm` Debian
+  из скрипта — с пустым `LD_LIBRARY_PATH` (иначе glibc 2.41 пакета); сокет
+  wineserver прошлой загрузки в `/tmp` (у нас `/tmp` переживает
+  перезагрузку) — «is not a socket», скрипт чистит.
+  Ловушки стенда: погасший экран не отдаёт кадров (сценарий: `power never`);
+  после окна Wine фокус не возвращается терминалу (щелчок в «Terminal»).
+  Открыто: 10–13 к/с DXVK на простой заливке — медленно (шестерёнки 90),
+  не разобрано; `wineserver` при выходе — assert `obj->refcount`;
+  `received delete_id for unknown id` от нашего сервера Wayland.
 
 ## Телефон — на потом (Роман 06.11: «в TODO, концепцию показать хватает»)
 
