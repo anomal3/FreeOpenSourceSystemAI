@@ -414,7 +414,18 @@ pub fn build(arch: Arch) -> Result<()> {
         # `--run=ПРОГРАММА` - проба из bin/ пакета (es2gears_wayland, vkcube) с\n\
         # тем же окружением.\n\
         case \"$1\" in --run=*) n=\"${1#--run=}\"; shift; exec \"$P/bin/$n\" \"$@\" ;; esac\n\
-        case \"$1\" in --server-debug=*) mkdir -p \"$WINEPREFIX\"; $P/bin/wineserver -d\"${1#--server-debug=}\"; shift ;; esac\n\
+        # `--fresh` - начать с нового префикса (у `rm` оболочки FossAi нет `-r`).\n\
+        case \"$1\" in --fresh) shift; LD_LIBRARY_PATH= rm -rf \"$WINEPREFIX\" ;; esac\n\
+        case \"$1\" in --server-debug=*) LD_LIBRARY_PATH= mkdir -p \"$WINEPREFIX\"; $P/bin/wineserver -d\"${1#--server-debug=}\"; shift ;; esac\n\
+        # `--dxvk` - Direct3D 8-11 через DXVK (Vulkan), как в Proton: DLL DXVK\n\
+        # кладутся в префикс поверх wined3d и включаются как native.\n\
+        case \"$1\" in --dxvk) shift\n\
+            s=\"$WINEPREFIX/drive_c/windows\"\n\
+            [ -d \"$s/system32\" ] || $P/lib/wine/x86_64-unix/wine wineboot -i\n\
+            # `cp` Debian - со своей glibc, без нашего LD_LIBRARY_PATH (2.41).\n\
+            LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/x86_64-windows/*.dll \"$s/system32/\"\n\
+            [ -d \"$s/syswow64\" ] && LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/i386-windows/*.dll \"$s/syswow64/\"\n\
+            export WINEDLLOVERRIDES=\"d3d8,d3d9,d3d10core,d3d11,dxgi=n;$WINEDLLOVERRIDES\" ;; esac\n\
         [ $# -eq 0 ] && set -- notepad\n\
         # Загрузчик архитектуры напрямую: `bin/wine` GE ищет `ntdll.so` в\n\
         # `lib/wine/`, а не в `lib/wine/x86_64-unix/` (12.11).\n\
@@ -429,6 +440,9 @@ pub fn build(arch: Arch) -> Result<()> {
     let wine64 = cbuild::build_linux_static("wine64-stub")?;
     files.push((String::from("lib/wine/i386-unix/wine64"), wine64, 0o755));
     files.push((String::from("share/wine/fonts.conf"), FONTS_CONF.as_bytes().to_vec(), 0o644));
+    // Проба DirectX 9/11 (`tools/d3dprobe`, программа Windows) - для сценариев
+    // wined3d и DXVK (12.11).
+    files.push((String::from("share/fossai/d3dprobe.exe"), d3dprobe()?, 0o755));
 
     let mut builder = Builder::new(Kind::Package, "proton", "11");
     builder.field("summary", "GE-Proton11-12 without Steam: Wine with fsync, DXVK and VKD3D-Proton; windows through the kernel Wayland server");
@@ -449,6 +463,21 @@ pub fn build(arch: Arch) -> Result<()> {
 }
 
 /// Убрать `.` и `..` из относительного пути.
+/// Собирает `tools/d3dprobe` (Rust, x86_64-pc-windows-msvc, статический CRT)
+/// и отдаёт `d3dprobe.exe`.
+fn d3dprobe() -> Result<Vec<u8>> {
+    let dir = crate::paths::workspace_root().join("tools/d3dprobe");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = std::process::Command::new(cargo)
+        .args(["build", "--release", "--target", "x86_64-pc-windows-msvc"])
+        .current_dir(&dir)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .status()?;
+    anyhow::ensure!(status.success(), "d3dprobe не собрался");
+    Ok(fs::read(dir.join("target/x86_64-pc-windows-msvc/release/d3dprobe.exe"))?)
+}
+
 fn normalize(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for part in path.split('/') {

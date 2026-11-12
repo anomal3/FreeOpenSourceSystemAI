@@ -1,0 +1,26 @@
+[package]
+name = "d3dprobe"
+version = "0.1.0"
+edition = "2021"
+description = "Проба DirectX 9/11 для Proton в FossAi: окно, очистка цветом, FPS в stderr"
+
+# Отдельный проект для Windows (x86_64-pc-windows-msvc), не член рабочей области ядра.
+[workspace]
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D9",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
