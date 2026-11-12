@@ -6318,7 +6318,7 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_000),
             // wined3d (OpenGL через EGL winewayland) - пока без проверки FPS:
             // «Failed to find a suitable pixel format» (12.11), лог +wgl для разбора.
-            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --debug=+wgl,+opengl,fixme-all --fresh /opt/proton/share/fossai/d3dprobe.exe 11 30"),
+            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=WINE_USE_EGL=1 --debug=+wgl,fixme-all --fresh /opt/proton/share/fossai/d3dprobe.exe 11 30"),
             Step::Wait(240_000),
             Step::Painted("d3d11-wined3d"),
             Step::Absent("KERNEL PANIC"),
