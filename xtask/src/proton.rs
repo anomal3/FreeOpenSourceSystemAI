@@ -398,6 +398,11 @@ pub fn build(arch: Arch) -> Result<()> {
         export WINENTSYNC=0\n\
         export WINEDLLOVERRIDES=\"mscoree,mshtml=${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}\"\n\
         export WINEDEBUG=${WINEDEBUG:-fixme-all}\n\
+        # `/tmp` у FossAi переживает перезагрузку: сокет wineserver прошлой\n\
+        # загрузки остаётся обычным файлом, и Wine падает «is not a socket».\n\
+        for s in /tmp/.wine-*/server-*/socket; do [ -e \"$s\" ] && [ ! -S \"$s\" ] && LD_LIBRARY_PATH= rm -f \"$s\"; done\n\
+        # OpenGL окон (wined3d) через EGL winewayland: в GE по умолчанию выключен.\n\
+        export WINE_USE_EGL=${WINE_USE_EGL:-1}\n\
         export XKB_CONFIG_ROOT=$P/share/X11/xkb\n\
         # OpenGL и Vulkan на процессоре (Mesa trixie, 12.11): EGL через glvnd,\n\
         # llvmpipe и lavapipe.\n\

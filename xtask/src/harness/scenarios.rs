@@ -6303,9 +6303,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await("d3dprobe: done", 120_000),
             Step::Wait(5_000),
             // Фокус терминалу: после окна Wine он сам не возвращается.
-            Step::Aim(Aim::Title("Terminal")),
+            Step::Aim(Aim::Middle("Terminal")),
             Step::Click,
-            Step::Wait(1_000),
+            Step::Wait(2_000),
             Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --dxvk /opt/proton/share/fossai/d3dprobe.exe 9 30"),
             Step::Await("d3dprobe: start", 300_000),
             Step::Await("FPS", 300_000),
@@ -6313,14 +6313,16 @@ pub const ALL: &[Scenario] = &[
             Step::Await("d3dprobe: done", 120_000),
             Step::Wait(5_000),
             // Фокус терминалу: после окна Wine он сам не возвращается.
-            Step::Aim(Aim::Title("Terminal")),
+            Step::Aim(Aim::Middle("Terminal")),
             Step::Click,
-            Step::Wait(1_000),
+            Step::Wait(2_000),
             // wined3d (OpenGL через EGL winewayland) - пока без проверки FPS:
             // «Failed to find a suitable pixel format» (12.11), лог +wgl для разбора.
-            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=WINE_USE_EGL=1 --debug=+wgl,fixme-all --fresh /opt/proton/share/fossai/d3dprobe.exe 11 30"),
-            Step::Wait(240_000),
+            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=WINE_USE_EGL=1 /opt/proton/share/fossai/d3dprobe.exe 11 30"),
+            Step::Await("d3dprobe: start", 300_000),
+            Step::Await("FPS", 300_000),
             Step::Painted("d3d11-wined3d"),
+            Step::Await("d3dprobe: done", 120_000),
             Step::Absent("KERNEL PANIC"),
         ],
     },

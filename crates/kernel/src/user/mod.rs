@@ -4003,6 +4003,18 @@ fn finish(slot: usize, code: i64) -> i64 {
     if leaked > 0 {
         kprintln!("  user        : closed {leaked} file(s) the program left open");
     }
+    // Дескрипторы закрываются сейчас, а не с последней ссылкой: поток, ещё не
+    // доехавший до своего конца, держал бы сокеты процесса - и окно Wine оставалось
+    // на столе после выхода программы, ловя щелчки (клиент Wayland не «уходил»,
+    // 12.11). Linux тоже закрывает файлы при выходе, не дожидаясь уборки зомби.
+    if let Some(process) = process.as_ref() {
+        let old = {
+            let mut program = process.lock();
+            let fresh = if program.linux { files::Table::new_linux() } else { files::Table::new() };
+            core::mem::replace(&mut program.files, fresh)
+        };
+        drop(old);
+    }
     // Сколько страниц образа программа прочитала и сколько из них пришлось
     // выбросить (фаза 54). Числа стоят сразу за неизменной подстрокой — их
     // читает стенд: обход образа обязан стоить по одному чтению на страницу.
