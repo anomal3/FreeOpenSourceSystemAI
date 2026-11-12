@@ -429,6 +429,9 @@ fn install_file(path: &str) -> i64 {
             Line::new()
                 .str("pkg: cannot write ")
                 .str(root.as_str())
+                .str(" (error ")
+                .signed(written)
+                .str(")")
                 .end();
             close(fd);
             return 1;
@@ -806,9 +809,12 @@ fn copy_out(source: i64, offset: u64, size: u64, path: &str, mode: u16) -> i64 {
             return -1;
         }
         let got = got as usize;
-        if write(fd, &chunk[..got]) != got as i64 {
+        let put = write(fd, &chunk[..got]);
+        if put != got as i64 {
             close(fd);
-            return -1;
+            // Код отказа записи (12.11): «не смог записать» без причины не
+            // отличает конец места от сбоя тома.
+            return if put < 0 { put } else { -2 };
         }
         at += got as u64;
         left -= got as u64;
@@ -842,15 +848,37 @@ fn ensure_tree(path: &str) -> bool {
     true
 }
 
+/// Каталог последнего файла, для которого звенья пути уже созданы (12.11).
+///
+/// Файлы манифеста идут подряд по каталогам; без этой памяти каждый файл
+/// звал `mkdir` на каждое звено пути — тысячи вызовов на большом пакете, и
+/// каждый из них ядро завершает сбросом тома.
+static mut LAST_DIR: [u8; 1024] = [0; 1024];
+static mut LAST_DIR_LEN: usize = 0;
+
 /// Создать каталоги для файла, чей путь уже собран, начиная с `base`.
 fn ensure_parents(path: &str, base: usize) -> bool {
+    let dir = path.rfind('/').map_or("", |cut| &path[..cut]);
+    // SAFETY: программа однопоточна.
+    let (last, last_len) = unsafe { (&mut *core::ptr::addr_of_mut!(LAST_DIR), &mut *core::ptr::addr_of_mut!(LAST_DIR_LEN)) };
+    if !dir.is_empty() && *last_len == dir.len() && &last[..*last_len] == dir.as_bytes() {
+        return true;
+    }
     let mut at = base;
     while let Some(cut) = path[at..].find('/') {
         let end = at + cut;
-        if mkdir(&path[..end], 0o755) < 0 && !exists(&path[..end]) {
+        // Звено, которое — начало запомненного каталога, уже есть.
+        let known = *last_len >= end
+            && &last[..end] == path[..end].as_bytes()
+            && (*last_len == end || last[end] == b'/');
+        if !known && mkdir(&path[..end], 0o755) < 0 && !exists(&path[..end]) {
             return false;
         }
         at = end + 1;
+    }
+    if dir.len() <= last.len() {
+        last[..dir.len()].copy_from_slice(dir.as_bytes());
+        *last_len = dir.len();
     }
     true
 }

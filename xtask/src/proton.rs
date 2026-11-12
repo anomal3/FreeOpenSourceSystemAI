@@ -61,7 +61,11 @@ pub const SHA256: &str = "0595159e417c3dbbfb7cc3ae0d3ed15a617cc607aa23ef756ea790
 const ROOT: &str = "GE-Proton11-12-x86_64/files/";
 
 /// Что из `files/` не кладётся (префиксы путей).
-const SKIP_PREFIXES: [&str; 6] = [
+const SKIP_PREFIXES: [&str; 8] = [
+    // wine-mono и Gecko: .NET — своим `clr-vm`, HTML-движок не нужен; в
+    // скрипте они и так выключены (`mscoree,mshtml=`).
+    "share/wine/mono/",
+    "share/wine/gecko/",
     "lib/wine/i386-unix/",
     // NVML (сведения о видеокартах NVIDIA) — без драйвера NVIDIA не нужен.
     "lib/wine/nvidia-libs/",
@@ -122,6 +126,47 @@ const PACKAGES: [(&str, &str); 8] = [
     ("pool/main/n/nettle/libnettle8_3.8.1-2_amd64.deb", "45922e6e289ffd92f0f92d2bb9159e84236ff202d552a461bf10e5335b3f0261"),
     ("pool/main/p/p11-kit/libp11-kit0_0.24.1-2_amd64.deb", "251330faddbf013f060fcdb41f4b0c037c8a6e89ba7c09b04bfcc4e3f0807b22"),
 ];
+
+/// glibc Debian 13 (trixie, тот же снимок): модули Unix GE-Proton11 собраны
+/// под glibc 2.38+ (`ntdll.so`: «version GLIBC_2.38 not found»), а в корне
+/// Debian 12 — 2.36. Своя glibc кладётся в `glibc/`, а в ELF-заголовках
+/// `wine` и `wineserver` загрузчик (`PT_INTERP`) переписывается на её
+/// `ld.so` — см. [`patch_interp`].
+const GLIBC: [(&str, &str); 1] = [(
+    "pool/main/g/glibc/libc6_2.41-12+deb13u4_amd64.deb",
+    "967aa62605721081c3eb2a17650611a792aa802d76a6511d1840242623d204c9",
+)];
+
+/// Что из glibc trixie кладётся (`usr/lib/x86_64-linux-gnu/…`).
+const GLIBC_LIBS: [&str; 12] = [
+    "ld-linux-x86-64.so.2",
+    "libc.so.6",
+    "libm.so.6",
+    "libmvec.so.1",
+    "libpthread.so.0",
+    "libdl.so.2",
+    "librt.so.1",
+    "libresolv.so.2",
+    "libutil.so.1",
+    "libanl.so.1",
+    "libnss_files.so.2",
+    "libnss_dns.so.2",
+];
+
+/// Загрузчик Debian 12 в `PT_INTERP` и наш на его место: не длиннее, чтобы
+/// заменить строку на месте (хвост — нули).
+const INTERP_OLD: &[u8] = b"/lib64/ld-linux-x86-64.so.2\0";
+const INTERP_NEW: &[u8] = b"/opt/proton/glibc/ld.so\0";
+
+/// Переписать загрузчик программы на свою glibc. `false` — строки нет.
+fn patch_interp(data: &mut [u8]) -> bool {
+    let Some(at) = data.windows(INTERP_OLD.len()).position(|window| window == INTERP_OLD) else {
+        return false;
+    };
+    data[at..at + INTERP_OLD.len()].fill(0);
+    data[at..at + INTERP_NEW.len()].copy_from_slice(INTERP_NEW);
+    true
+}
 
 /// Библиотеки GE-Proton в архиве.
 const BUNDLED: &str = "lib/x86_64-linux-gnu/";
@@ -207,9 +252,34 @@ pub fn build(arch: Arch) -> Result<()> {
     let mut files: Vec<(String, Vec<u8>, u32)> = Vec::new();
     // Что искать и кто это потребовал — для внятного отказа.
     let mut todo: Vec<(String, String)> = DLOPEN.iter().map(|name| (String::from(*name), String::from("dlopen"))).collect();
+    // Своя glibc (trixie) и её загрузчик под коротким именем.
+    let mut glibc: BTreeMap<String, Node> = BTreeMap::new();
+    unpack(&cache, &GLIBC, &mut glibc)?;
+    for name in GLIBC_LIBS {
+        let Some((data, mode)) = follow(&glibc, &format!("usr/lib/x86_64-linux-gnu/{name}"), 0) else {
+            bail!("в libc6 trixie нет {name}");
+        };
+        files.push((format!("glibc/{name}"), data.clone(), mode));
+        if name == "ld-linux-x86-64.so.2" {
+            files.push((String::from("glibc/ld.so"), data.clone(), 0o755));
+        }
+    }
+
     for (rest, (data, mode)) in &taken {
         // Библиотеки из архива кладутся только по `DT_NEEDED` — ниже.
         if rest.starts_with(BUNDLED) {
+            continue;
+        }
+        // Программы — на свою glibc.
+        if ["bin/wine", "bin/wineserver", "lib/wine/x86_64-unix/wine", "lib/wine/x86_64-unix/wine64"].contains(&rest.as_str()) {
+            let mut data = data.clone();
+            if !patch_interp(&mut data) {
+                bail!("{rest}: нет загрузчика {:?}", String::from_utf8_lossy(INTERP_OLD));
+            }
+            todo.extend(
+                needed(&data).with_context(|| format!("{rest}: не разобран ELF"))?.into_iter().map(|name| (name, rest.clone())),
+            );
+            files.push((rest.clone(), data, *mode));
             continue;
         }
         let unix_module = rest.starts_with("lib/wine/x86_64-unix/") && rest.ends_with(".so");
@@ -267,7 +337,8 @@ pub fn build(arch: Arch) -> Result<()> {
         # GE-Proton (12.11.2026): программы и игры Windows без Steam, окна —\n\
         # через сервер Wayland ядра, синхронизация — fsync (futex_waitv).\n\
         P=/opt/proton\n\
-        export LD_LIBRARY_PATH=$P/lib/x86_64-linux-gnu:$P/lib\n\
+        # Своя glibc (2.41) первой: модули GE собраны под 2.38+.\n\
+        export LD_LIBRARY_PATH=$P/glibc:$P/lib/x86_64-linux-gnu:$P/lib\n\
         export WINEDLLPATH=$P/lib/vkd3d:$P/lib/wine\n\
         export PATH=$P/bin:$PATH\n\
         export FONTCONFIG_FILE=$P/share/wine/fonts.conf\n\
@@ -278,6 +349,9 @@ pub fn build(arch: Arch) -> Result<()> {
         export HOME=${HOME:-/root}\n\
         export TMPDIR=${TMPDIR:-$HOME}\n\
         export WINEPREFIX=${WINEPREFIX:-$HOME/.proton}\n\
+        # Чисто 64-битный префикс (как `proton` по умолчанию): иначе Wine\n\
+        # ищет для `wineboot` загрузчик в `i386-unix`, которого в пакете нет.\n\
+        export WINEARCH=${WINEARCH:-win64}\n\
         # fsync — да (futex_waitv есть с 12.11), ntsync — нет (/dev/ntsync нет),\n\
         # esync — запасной (eventfd).\n\
         export WINEFSYNC=${WINEFSYNC:-1}\n\
@@ -288,8 +362,18 @@ pub fn build(arch: Arch) -> Result<()> {
         case \"$1\" in --debug=*) export WINEDEBUG=\"${1#--debug=}\"; shift ;; esac\n\
         case \"$1\" in --server-debug=*) mkdir -p \"$WINEPREFIX\"; $P/bin/wineserver -d\"${1#--server-debug=}\"; shift ;; esac\n\
         [ $# -eq 0 ] && set -- notepad\n\
-        exec $P/bin/wine \"$@\"\n";
+        # Загрузчик архитектуры напрямую: `bin/wine` GE ищет `ntdll.so` в\n\
+        # `lib/wine/`, а не в `lib/wine/x86_64-unix/` (12.11).\n\
+        exec $P/lib/wine/x86_64-unix/wine \"$@\"\n";
     files.push((String::from("bin/fossai-proton"), script.as_bytes().to_vec(), 0o755));
+    // Новый 64-битный процесс (`wineboot`, программа из программы) ntdll GE
+    // запускает загрузчиком `i386-unix/wine64`; 32-битной части Linux у нас
+    // нет — переходник отдаёт запуск 64-битному загрузчику. Интерпретатор —
+    // программа без libc (`libc/linux/wine64-stub.c`): сценарий через `bash`
+    // Debian не годится — его загрузчик с glibc 2.41 из `LD_LIBRARY_PATH` не
+    // уживается, а `ld.so` 2.41, запущенная напрямую, падает (12.11).
+    let wine64 = cbuild::build_linux_static("wine64-stub")?;
+    files.push((String::from("lib/wine/i386-unix/wine64"), wine64, 0o755));
     files.push((String::from("share/wine/fonts.conf"), FONTS_CONF.as_bytes().to_vec(), 0o644));
 
     let mut builder = Builder::new(Kind::Package, "proton", "11");

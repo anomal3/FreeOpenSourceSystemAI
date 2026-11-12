@@ -166,6 +166,10 @@ impl Meta {
 /// 305 фиксаций по 30–1300 мс за запуск, почти все — от `fdatasync`.
 const FSYNC_INTERVAL_MS: u64 = 2_000;
 
+/// Не чаще чем раз во столько фиксирует [`BtrfsFs::writeback`] (12.11).
+/// Служебная задача сбрасывает раз в 5 с — дольше этого ничего не ждёт.
+const WRITEBACK_INTERVAL_MS: u64 = 1_000;
+
 /// С какого числа грязных блоков (по 4 КиБ, 16 МиБ) запись сама сбрасывает
 /// кэш порциями после правки.
 const EARLY_WRITE_BACK: usize = 4096;
@@ -625,10 +629,20 @@ impl FileSystem for BtrfsMount {
 
     /// Фиксация накопленного — служебной задачей раз в 5 с, `fsync` и после
     /// правок родных программ (как сброс у ext2).
+    ///
+    /// Не чаще раза в [`WRITEBACK_INTERVAL_MS`] (12.11): родная программа
+    /// зовёт сюда на каждом `close` и `mkdir`, и `pkg install` пакета на 5468
+    /// файлов делал тысячи фиксаций по ~110 мс (полторы тысячи секунд на
+    /// 1,4 ГиБ). Пропущенное зафиксирует служебная задача раз в 5 с —
+    /// порядок записей тот же, том всегда целое прошлое состояние.
     fn writeback(&self) -> VfsResult<()> {
         self.0.write_back_portions()?;
         let mut guard = self.0.inner.lock();
         if guard.pending == 0 {
+            return Ok(());
+        }
+        let recent = crate::time::uptime_ms().saturating_sub(guard.last_commit) < WRITEBACK_INTERVAL_MS;
+        if recent && guard.pending < MAX_PENDING {
             return Ok(());
         }
         guard.commit()

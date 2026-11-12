@@ -187,6 +187,7 @@ mod nr {
     pub const EPOLL_CTL: usize = 233;
     pub const UNLINKAT: usize = 263;
     pub const EPOLL_PWAIT: usize = 281;
+    pub const EPOLL_PWAIT2: usize = 441;
     pub const TIMERFD_CREATE: usize = 283;
     pub const EVENTFD: usize = 284;
     pub const TIMERFD_SETTIME: usize = 286;
@@ -404,6 +405,20 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::EPOLL_CREATE1 => ipc::epoll_create(a0),
             nr::EPOLL_CTL => ipc::epoll_ctl(a0, a1, a2, a3),
             nr::EPOLL_WAIT | nr::EPOLL_PWAIT => ipc::epoll_wait(a0, a1, a2, a3 as i32 as i64),
+            // `epoll_pwait2` (12.11, wineserver): срок — `timespec`, а не
+            // миллисекунды; `NULL` — без срока.
+            nr::EPOLL_PWAIT2 => {
+                let ms = if a3 == 0 {
+                    -1
+                } else if space::user_can(a3, 16, PageFlags::READ) {
+                    // SAFETY: проверено условием выше.
+                    let [seconds, nanos] = unsafe { core::ptr::read_unaligned(a3 as *const [i64; 2]) };
+                    seconds.max(0).saturating_mul(1000).saturating_add((nanos.max(0) + 999_999) / 1_000_000)
+                } else {
+                    return -e::EFAULT;
+                };
+                ipc::epoll_wait(a0, a1, a2, ms)
+            }
             nr::MEMFD_CREATE => ipc::memfd_create(a0, a1),
             nr::FTRUNCATE => ftruncate(a0, a1),
             // Фаза 71h — то, чего потребовал Chromium.
@@ -507,7 +522,12 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::LSEEK => errno(native(SYS_SEEK, a0, a1, a2)),
             nr::MMAP => mmap(a0, a1, a2, a3, a4, args[5]),
             nr::MPROTECT => errno(native(SYS_MPROTECT, a0, a1, a2)),
-            nr::MUNMAP => errno(native(SYS_MUNMAP, a0, a1, 0)),
+            // Снять то, чего нет, у Linux не ошибка (12.11: Wine снимает
+            // `KUSER_SHARED_DATA` на всякий случай и проверяет ответ).
+            nr::MUNMAP => match errno(native(SYS_MUNMAP, a0, a1, 0)) {
+                code if code == -e::EFAULT => 0,
+                code => code,
+            },
             // `brk` отвечает новым концом, а отказ — прежним; ошибки у него нет.
             nr::BRK => crate::user::linux_brk(a0) as i64,
             // Сигналов в системе пока нет (фаза 71c): обработчик запоминать

@@ -782,6 +782,22 @@ pub fn build_linux_programs(arch: Arch) -> Result<Vec<(String, PathBuf)>> {
     Ok(built)
 }
 
+/// Собрать одну программу Linux без libc (статическая PIE, как
+/// проверочные) из `libc/linux/<name>.c` — для пакетов (12.11: переходник
+/// `wine64` Proton). Возвращает содержимое файла.
+pub fn build_linux_static(name: &str) -> Result<Vec<u8>> {
+    let clang = llvm_tool("clang")?;
+    let work = paths::workspace_root().join("build/toolchain/linux/x86_64");
+    std::fs::create_dir_all(&work)?;
+    let source = libc_dir().join("linux").join(format!("{name}.c"));
+    let output = work.join(name);
+    let mut cmd = Command::new(&clang);
+    cmd.args(LINUX_COMMON).args(["-fPIE", "-static-pie"]);
+    cmd.arg(&source).arg("-o").arg(&output);
+    run(cmd, &format!("clang (Linux) {}", source.display()))?;
+    Ok(std::fs::read(&output)?)
+}
+
 /// Имя vDSO в `/bin` (8.3 — носитель установщика на FAT без длинных имён).
 pub const LINUX_VDSO: &str = "vdso";
 
