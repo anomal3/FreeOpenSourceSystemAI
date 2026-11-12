@@ -579,6 +579,12 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
                     -e::EINVAL
                 } else if !space::user_can(a2, pages, PageFlags::WRITE) {
                     -e::EFAULT
+                } else if a0 < 0x1_0000
+                    || crate::user::with_current(|program| program.range_free(a0, pages * 4096)).unwrap_or(true)
+                {
+                    // Linux: ENOMEM, если диапазон не отображён. Mesa (_eglPointerIsDereferenceable)
+                    // так проверяет, можно ли читать указатель (12.11).
+                    -e::ENOMEM
                 } else {
                     // SAFETY: проверено строкой выше.
                     unsafe { core::ptr::write_bytes(a2 as *mut u8, 1, pages) };

@@ -369,6 +369,9 @@ pub fn build(arch: Arch) -> Result<()> {
         bail!("proton: не нашлись библиотеки: {}", missing.join(", "));
     }
 
+    // OpenGL и Vulkan на процессоре (шаги 5-6, 12.11).
+    crate::mesa::add(&cache, &mut files, patch_interp)?;
+
     let script = "#!/bin/bash\n\
         # GE-Proton (12.11.2026): программы и игры Windows без Steam, окна —\n\
         # через сервер Wayland ядра, синхронизация — fsync (futex_waitv).\n\
@@ -396,10 +399,21 @@ pub fn build(arch: Arch) -> Result<()> {
         export WINEDLLOVERRIDES=\"mscoree,mshtml=${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}\"\n\
         export WINEDEBUG=${WINEDEBUG:-fixme-all}\n\
         export XKB_CONFIG_ROOT=$P/share/X11/xkb\n\
+        # OpenGL и Vulkan на процессоре (Mesa trixie, 12.11): EGL через glvnd,\n\
+        # llvmpipe и lavapipe.\n\
+        export __EGL_VENDOR_LIBRARY_FILENAMES=$P/share/glvnd/egl_vendor.d/50_mesa.json\n\
+        export LIBGL_DRIVERS_PATH=$P/lib/dri\n\
+        export LIBGL_ALWAYS_SOFTWARE=1\n\
+        export GALLIUM_DRIVER=llvmpipe\n\
+        export VK_DRIVER_FILES=$P/share/vulkan/icd.d/lvp_icd.x86_64.json\n\
+        export VK_ICD_FILENAMES=$VK_DRIVER_FILES\n\
         # `--env=ИМЯ=ЗНАЧЕНИЕ` (сколько угодно, первыми) — своя переменная: у\n\
         # `run` оболочки окружения нет (WAYLAND_DEBUG=client и подобные).\n\
         while case \"$1\" in --env=*) true ;; *) false ;; esac; do export \"${1#--env=}\"; shift; done\n\
         case \"$1\" in --debug=*) export WINEDEBUG=\"${1#--debug=}\"; shift ;; esac\n\
+        # `--run=ПРОГРАММА` - проба из bin/ пакета (es2gears_wayland, vkcube) с\n\
+        # тем же окружением.\n\
+        case \"$1\" in --run=*) n=\"${1#--run=}\"; shift; exec \"$P/bin/$n\" \"$@\" ;; esac\n\
         case \"$1\" in --server-debug=*) mkdir -p \"$WINEPREFIX\"; $P/bin/wineserver -d\"${1#--server-debug=}\"; shift ;; esac\n\
         [ $# -eq 0 ] && set -- notepad\n\
         # Загрузчик архитектуры напрямую: `bin/wine` GE ищет `ntdll.so` в\n\
