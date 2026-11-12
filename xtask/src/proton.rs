@@ -61,7 +61,12 @@ pub const SHA256: &str = "0595159e417c3dbbfb7cc3ae0d3ed15a617cc607aa23ef756ea790
 const ROOT: &str = "GE-Proton11-12-x86_64/files/";
 
 /// Что из `files/` не кладётся (префиксы путей).
-const SKIP_PREFIXES: [&str; 8] = [
+const SKIP_PREFIXES: [&str; 10] = [
+    // Драйвер X11 целиком (12.11): без `winex11.so` его PE-часть всё равно
+    // грузится, `explorer` выбирает x11 первым по списку и остаётся без
+    // окна («no driver could be loaded») — до `wayland` дело не доходит.
+    "lib/wine/x86_64-windows/winex11.drv",
+    "lib/wine/i386-windows/winex11.drv",
     // wine-mono и Gecko: .NET — своим `clr-vm`, HTML-движок не нужен; в
     // скрипте они и так выключены (`mscoree,mshtml=`).
     "share/wine/mono/",
@@ -137,6 +142,18 @@ const GLIBC: [(&str, &str); 1] = [(
     "967aa62605721081c3eb2a17650611a792aa802d76a6511d1840242623d204c9",
 )];
 
+/// Библиотеки из Debian 13 поверх Debian 12 (12.11): `winewayland.so` GE
+/// зовёт `wl_display_create_queue_with_name` (libwayland 1.23) и
+/// `xkb_compose_table_iterator_*` (libxkbcommon 1.6) — с библиотеками
+/// bookworm `dlopen` драйвера молча падал, и `explorer` оставался без окна.
+/// Раскладываются после `wine::PACKAGES` и перекрывают их.
+const TRIXIE: [(&str, &str); 4] = [
+    ("pool/main/w/wayland/libwayland-client0_1.23.1-3_amd64.deb", "d1607e1db1a7c5378a2e5c6ae7b20f64dc6acf134f953d84a7f5204b74339f33"),
+    ("pool/main/w/wayland/libwayland-egl1_1.23.1-3_amd64.deb", "7c5c3429028b39b9432792db08cb218c43891df439ebc648b83ebee676a80ec5"),
+    ("pool/main/libx/libxkbcommon/libxkbcommon0_1.7.0-2_amd64.deb", "f75ee544f55acc6a271debfab3ea4ae0458afc89d81cfe1a71137e07d4895b86"),
+    ("pool/main/libx/libxkbcommon/libxkbregistry0_1.7.0-2_amd64.deb", "e9b5a7051efa2b299348b4f6b1ebc1416f2523c4224af495d9cca4adbb22183a"),
+];
+
 /// Что из glibc trixie кладётся (`usr/lib/x86_64-linux-gnu/…`).
 const GLIBC_LIBS: [&str; 12] = [
     "ld-linux-x86-64.so.2",
@@ -196,6 +213,9 @@ pub fn build(arch: Arch) -> Result<()> {
     let mut deps: BTreeMap<String, Node> = BTreeMap::new();
     unpack(&cache, &crate::wine::PACKAGES, &mut deps)?;
     unpack(&cache, &PACKAGES, &mut deps)?;
+    // Пути в trixie — `usr/lib/…` (usrmerge), как и у этих пакетов bookworm:
+    // свежие версии ложатся поверх.
+    unpack(&cache, &TRIXIE, &mut deps)?;
 
     // Всё нужное из архива — в память (без пропущенного), ссылки — отдельно.
     let mut taken: BTreeMap<String, (Vec<u8>, u32)> = BTreeMap::new();
