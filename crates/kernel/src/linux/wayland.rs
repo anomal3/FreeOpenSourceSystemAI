@@ -606,6 +606,9 @@ struct Client {
     /// `wl_callback` кадров, которые отвечают на следующем витке — после
     /// того как кадр показан.
     frames_due: Vec<u32>,
+    /// Буферы, уже возвращённые клиенту (`wl_buffer.release`) — второй раз
+    /// не отправлять, пока клиент не прикрепит их снова (13.11).
+    released: Vec<u32>,
     pointer_on: Option<u32>,
     /// Где указатель на ней был в последнем `motion` — чтобы не слать
     /// движения, которого не было.
@@ -650,6 +653,7 @@ impl Client {
             next_slot: FIRST_SLOT,
             serial: 0,
             frames_due: Vec::new(),
+            released: Vec::new(),
             pointer_on: None,
             pointer_at: None,
             keyboard_on: None,
@@ -698,12 +702,7 @@ impl Client {
     /// Один виток: прочитать, разобрать, отправить. `false` — соединения нет.
     fn step(&mut self, now: u64) -> bool {
         let time = now as u32;
-        for callback in core::mem::take(&mut self.frames_due) {
-            if self.objects.contains_key(&callback) {
-                self.send(Msg::new(callback, 0).u32(time));
-                self.delete(callback);
-            }
-        }
+        self.answer_frames(time);
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             match self.conn.recv(&mut buf) {
@@ -756,6 +755,8 @@ impl Client {
                     self.present_popup(index);
                 }
             }
+            // Кадры этого витка показаны — ответить сразу.
+            self.answer_frames(time);
         }
         self.flush();
         !self.broken || !self.out.is_empty()
@@ -1173,6 +1174,8 @@ impl Client {
             }
             1 => {
                 let buffer = args.u32()?;
+                // Прикреплён снова — снова занят сервером до `release`.
+                self.released.retain(|&other| other != buffer);
                 if let Some(Obj::Surface(state)) = self.objects.get_mut(&id) {
                     state.pending = Some((buffer != 0).then_some(buffer));
                 }
@@ -1449,8 +1452,24 @@ impl Client {
 
     /// `wl_buffer.release`, если буфер ещё жив.
     fn release(&mut self, buffer: u32) {
+        if self.released.contains(&buffer) {
+            return;
+        }
         if matches!(self.objects.get(&buffer), Some(Obj::Buffer(_))) {
             self.send(Msg::new(buffer, 0));
+            self.released.push(buffer);
+        }
+    }
+
+    /// Ответить на `wl_surface.frame` всех показанных кадров — сразу, а не на
+    /// следующем витке (13.11): клиент в режиме FIFO (DXVK, Mesa WSI) ждал
+    /// на каждом кадре сон сервера в 16 мс.
+    fn answer_frames(&mut self, time: u32) {
+        for callback in core::mem::take(&mut self.frames_due) {
+            if self.objects.contains_key(&callback) {
+                self.send(Msg::new(callback, 0).u32(time));
+                self.delete(callback);
+            }
         }
     }
 
@@ -1519,6 +1538,7 @@ impl Client {
             return;
         }
         let alpha = has_alpha(&layers);
+        let single = layers.len() == 1;
         let mut clear = false;
         let painted = crate::ui::paint_window(pid, win.slot, area, |target| clear = paint(target, &layers, swap, area, alpha));
         win.dirty = painted.is_err();
@@ -1535,6 +1555,16 @@ impl Client {
                 }
             }
             self.clear_damage(surface, 0);
+            // Кадр скопирован на стол — буфер свободен уже сейчас (13.11): Mesa
+            // WSI с тремя-четырьмя буферами иначе ждала следующего кадра, чтобы
+            // получить прежний обратно. Только без подповерхностей: их кадр
+            // сводится из нескольких буферов при каждой перерисовке.
+            if single {
+                if let Some(Obj::Surface(SurfaceState { shown: Some((buffer, _)), .. })) = self.objects.get(&surface) {
+                    let buffer = *buffer;
+                    self.release(buffer);
+                }
+            }
         }
     }
 
