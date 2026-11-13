@@ -546,6 +546,21 @@ impl Table {
         matches!(self.cell(fd), Ok(Some(_)))
     }
 
+    /// Кто стоит за номером — открытый файл, а не номер (12.11, для `epoll`:
+    /// номер, закрытый и выданный другому, — уже другой файл, и события
+    /// старой записи ему не принадлежат). `None` — номер свободен.
+    #[must_use]
+    pub fn identity(&self, fd: usize) -> Option<usize> {
+        Some(match self.cell(fd).ok()?.as_ref()? {
+            Slot::File(open) => Arc::as_ptr(open) as usize,
+            Slot::PipeRead(reader, _) => reader.id(),
+            Slot::PipeWrite(writer, _) => writer.id(),
+            Slot::Socket(sock) => Arc::as_ptr(sock) as usize,
+            Slot::Std(n) => usize::from(*n) + 1,
+            Slot::Object(object, _) => Arc::as_ptr(object) as *const () as usize,
+        })
+    }
+
     /// Положить объект слоя Linux (фаза 71e).
     pub fn install_object(&mut self, object: Arc<dyn Object>, nonblock: bool) -> Result<usize, FileError> {
         let fd = self.free_fd(0)?;

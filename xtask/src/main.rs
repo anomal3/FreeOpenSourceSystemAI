@@ -42,6 +42,7 @@ mod chromium;
 mod java;
 mod mesa;
 mod proton;
+mod tmnf;
 mod wine;
 mod rider;
 mod ruststd;

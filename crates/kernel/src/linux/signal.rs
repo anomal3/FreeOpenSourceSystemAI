@@ -624,14 +624,93 @@ const FPREGS_AT: usize = MCONTEXT_AT + 23 * 8;
 ///
 /// `area` выровнен на 16 и проверен на запись.
 unsafe fn save_fpu(area: usize) {
+    if let Some((mask, size)) = crate::arch::fpu::signal_xsave() {
+        // Полное состояние (AVX и выше) — `XSAVE`, как Linux (12.11): без
+        // верхних половин `ymm` обработчик, тронувший AVX, портил прерванный
+        // `memcpy` glibc — куча wineserver: «corrupted double-linked list».
+        // SAFETY: контракт функции; область выровнена на 64 и длиной
+        // `size + 4` (см. [`fp_size`]).
+        unsafe {
+            core::arch::asm!(
+                "xsave64 [{}]",
+                in(reg) area,
+                in("eax") mask as u32,
+                in("edx") (mask >> 32) as u32,
+                options(nostack, preserves_flags),
+            );
+            // `fx_sw_reserved` Linux (байты 464..): MAGIC1, extended_size,
+            // xfeatures, xstate_size; за областью — MAGIC2.
+            core::ptr::write_unaligned((area + 464) as *mut u32, FP_XSTATE_MAGIC1);
+            core::ptr::write_unaligned((area + 468) as *mut u32, (size + 4) as u32);
+            core::ptr::write_unaligned((area + 472) as *mut u64, mask);
+            core::ptr::write_unaligned((area + 480) as *mut u32, size as u32);
+            core::ptr::write_unaligned((area + size) as *mut u32, FP_XSTATE_MAGIC2);
+        }
+        return;
+    }
     // SAFETY: контракт функции.
     unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) area, options(nostack, preserves_flags)) };
+}
+
+const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
+
+/// Место под состояние в кадре сигнала: `XSAVE` и MAGIC2 — или `FXSAVE`.
+fn fp_size() -> usize {
+    crate::arch::fpu::signal_xsave().map_or(FPSTATE, |(_, size)| size + 4)
+}
+
+/// Вернуть полное состояние (`XRSTOR`) из кадра, если он наш (`MAGIC1/2`);
+/// `false` — не вышло, тогда хватит `FXRSTOR`.
+fn restore_xstate(area: usize) -> bool {
+    let Some((mask, size)) = crate::arch::fpu::signal_xsave() else { return false };
+    if area % 64 != 0 || size > 4096 || !space::user_can(area, size + 4, PageFlags::READ) {
+        return false;
+    }
+    // SAFETY: проверено строкой выше.
+    let (magic1, magic2) = unsafe {
+        (core::ptr::read_unaligned((area + 464) as *const u32), core::ptr::read_unaligned((area + size) as *const u32))
+    };
+    if magic1 != FP_XSTATE_MAGIC1 || magic2 != FP_XSTATE_MAGIC2 {
+        return false;
+    }
+    let mut buffer = [0u8; 4096 + 64];
+    let skew = buffer.as_ptr().align_offset(64);
+    let copy = &mut buffer[skew..skew + size];
+    // SAFETY: проверено выше.
+    unsafe { core::ptr::copy_nonoverlapping(area as *const u8, copy.as_mut_ptr(), size) };
+    let field = |copy: &[u8], at: usize| u32::from_le_bytes(copy[at..at + 4].try_into().unwrap_or([0; 4]));
+    let allowed = match field(copy, 28) {
+        0 => 0xFFBF,
+        m => m,
+    };
+    let mxcsr = field(copy, 24) & allowed;
+    copy[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+    // Заголовок XSAVE: только включённые компоненты, стандартный формат,
+    // зарезервированное — нули (иначе `XRSTOR` — общая защита в ядре).
+    let bv = u64::from_le_bytes(copy[512..520].try_into().unwrap_or([0; 8])) & mask;
+    copy[512..520].copy_from_slice(&bv.to_le_bytes());
+    copy[520..576].fill(0);
+    // SAFETY: своя область, выровнена на 64, заголовок проверен.
+    unsafe {
+        core::arch::asm!(
+            "xrstor64 [{}]",
+            in(reg) copy.as_ptr(),
+            in("eax") mask as u32,
+            in("edx") (mask >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
+    true
 }
 
 /// Вернуть x87 и SSE из кадра сигнала — через копию в ядре, с проверенным
 /// `MXCSR`: зарезервированный бит в нём — общая защита в самом ядре.
 fn restore_fpu(area: usize) {
     if area == 0 || area % 16 != 0 || !space::user_can(area, FPSTATE, PageFlags::READ) {
+        return;
+    }
+    if restore_xstate(area) {
         return;
     }
     // Выравнивание — вручную, внутри буфера с запасом. `align(16)` у
@@ -675,11 +754,13 @@ fn enter_handler(
     // Над кадром — область `FXSAVE`, выровненная на 16: обработчик вправе
     // испортить регистры SSE, а прерванный код (скомпилированная Java) их
     // ждёт обратно.
-    let fpstate = (base - FPSTATE) & !15;
+    // С `XSAVE` — полное состояние, выровненное на 64 (12.11).
+    let fp_bytes = fp_size();
+    let fpstate = (base - fp_bytes) & !63;
     let total = 8 + UCONTEXT + SIGINFO;
     // После «call» обработчика `rsp + 8` кратен 16.
     let sp = ((fpstate - total) & !15) - 8;
-    if !space::user_can(sp, fpstate + FPSTATE - sp, PageFlags::WRITE) {
+    if !space::user_can(sp, fpstate + fp_bytes - sp, PageFlags::WRITE) {
         crate::kprintln!("  linux       : no room for a signal frame, killed by signal {sig}");
         // SAFETY: из системного вызова или исключения третьего кольца.
         unsafe { crate::arch::return_to_kernel(128 + sig as i64) }
@@ -698,6 +779,10 @@ fn enter_handler(
     unsafe {
         core::ptr::write_bytes(sp as *mut u8, 0, total);
         core::ptr::write_unaligned(sp as *mut u64, action.restorer as u64);
+        // uc_flags: UC_FP_XSTATE — в fpregs полное состояние XSAVE.
+        if crate::arch::fpu::signal_xsave().is_some() {
+            core::ptr::write_unaligned(uc as *mut u64, 1);
+        }
         // uc_stack: ss_sp, ss_flags, ss_size.
         core::ptr::write_unaligned((uc + 16) as *mut u64, alt_sp as u64);
         core::ptr::write_unaligned((uc + 32) as *mut u64, alt_size as u64);

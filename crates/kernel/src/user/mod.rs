@@ -1102,10 +1102,15 @@ impl Program {
         // право, и только безымянная: файл и разделяемую память переключать
         // по обращению значило бы переключать её и у второго владельца.
         let jit = prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0;
-        if jit && (!self.jit_allowed || file.is_some() || shared.is_some()) {
+        // Частное отображение файла «на запись и исполнение» — у программы
+        // Linux с правом `jit` сразу RWX (12.11, секции PE под Wine).
+        let file_rwx = jit && self.rwx_code() && file.is_some() && shared.is_none();
+        if jit && !file_rwx && (!self.jit_allowed || file.is_some() || shared.is_some()) {
             return Err(MmapError::WriteExecute);
         }
-        let flags = if jit {
+        let flags = if file_rwx {
+            RWX_CODE
+        } else if jit {
             PageFlags::READ | PageFlags::WRITE | PageFlags::USER
         } else if prot == 0 {
             PageFlags::NONE
@@ -1664,8 +1669,12 @@ impl Program {
             if region.base > covered || !self.divisible(region) || (code && !self.jit_allowed) {
                 return Err(MmapError::BadRequest);
             }
-            // Памятью кода становится только безымянная память.
-            if jit && !matches!(region.source, Source::Anonymous(_)) {
+            // Памятью кода становится только безымянная память — и сегмент
+            // образа у программы Linux с правом `jit` (12.11: Wine делает
+            // секции PE «на запись и исполнение» — упакованный установщик
+            // Trackmania распаковывает себя поверх своего кода).
+            let image_rwx = self.rwx_code() && matches!(region.source, Source::Image(_));
+            if jit && !matches!(region.source, Source::Anonymous(_)) && !image_rwx {
                 return Err(MmapError::WriteExecute);
             }
             covered = region.end();
@@ -1698,6 +1707,9 @@ impl Program {
                     anon.page_flags()
                 }
                 Source::Image(image) => {
+                    // «Запись и исполнение» сегмента — сразу RWX с пометкой
+                    // JIT (как память кода программы с правом `jit`).
+                    let flags = if jit { RWX_CODE } else { flags };
                     image.flags = flags;
                     // Стала записываемой — значит, её страницы больше не
                     // копия файла (см. `ImageBacking::pinned`).

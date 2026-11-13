@@ -1438,6 +1438,13 @@ const EPOLLET: u32 = 1 << 31;
 
 struct Interest {
     fd: usize,
+    /// Открытый файл за номером при `ADD` ([`Table::identity`]): номер,
+    /// закрытый и выданный другому, — уже чужой, запись молча снимается
+    /// (12.11: wineserver получал события нового сокета со старым `data` —
+    /// указателем на освобождённый объект: «corrupted double-linked list»).
+    ///
+    /// [`Table::identity`]: crate::user::files::Table::identity
+    id: usize,
     events: u32,
     data: u64,
     /// `EPOLLONESHOT` сработал — молчит до `EPOLL_CTL_MOD`.
@@ -1503,9 +1510,9 @@ pub fn epoll_ctl(epfd: usize, op: usize, fd: usize, event: usize) -> i64 {
     if fd == epfd {
         return -e::EINVAL;
     }
-    if !crate::user::with_current(|program| program.files.is_open(fd)).unwrap_or(false) {
+    let Some(id) = crate::user::with_current(|program| program.files.identity(fd)).flatten() else {
         return -e::EBADF;
-    }
+    };
     let epoll = object.as_any().downcast_ref::<Epoll>().expect("epoll_of checked the type");
     let (events, data) = if op == DEL {
         (0, 0)
@@ -1516,6 +1523,8 @@ pub fn epoll_ctl(epfd: usize, op: usize, fd: usize, event: usize) -> i64 {
         }
     };
     let mut interests = epoll.interests.lock();
+    // Запись о прежнем файле под этим номером — чужая: снять.
+    interests.retain(|interest| interest.fd != fd || interest.id == id);
     let at = interests.iter().position(|interest| interest.fd == fd);
     match (op, at) {
         (ADD, Some(_)) => return -e::EEXIST,
@@ -1523,10 +1532,10 @@ pub fn epoll_ctl(epfd: usize, op: usize, fd: usize, event: usize) -> i64 {
             if interests.try_reserve(1).is_err() {
                 return -e::ENOMEM;
             }
-            interests.push(Interest { fd, events, data, disabled: false, last: 0 });
+            interests.push(Interest { fd, id, events, data, disabled: false, last: 0 });
         }
         (MOD, Some(index)) => {
-            interests[index] = Interest { fd, events, data, disabled: false, last: 0 };
+            interests[index] = Interest { fd, id, events, data, disabled: false, last: 0 };
         }
         (DEL, Some(index)) => {
             interests.remove(index);
@@ -1601,12 +1610,20 @@ pub fn epoll_wait(epfd: usize, out: usize, max: usize, timeout: i64) -> i64 {
     let deadline = (timeout >= 0).then(|| crate::time::uptime_ms() + timeout as u64);
     loop {
         let seen = crate::io_events::generation();
-        let fds: Vec<(usize, u32)> = epoll.interests.lock().iter().map(|interest| (interest.fd, interest.events)).collect();
+        let fds: Vec<(usize, usize, u32)> =
+            epoll.interests.lock().iter().map(|interest| (interest.fd, interest.id, interest.events)).collect();
         // Готовность — без замка набора: `readiness_of` берёт замок
         // программы, а объекты — свои.
-        let mut ready: Vec<(usize, u32)> = Vec::new();
+        let mut ready: Vec<(usize, usize, u32)> = Vec::new();
+        let mut stale: Vec<(usize, usize)> = Vec::new();
         let mut soonest: Option<u64> = None;
-        for (fd, events) in fds {
+        for (fd, id, events) in fds {
+            // Номер закрыт или отдан другому файлу — запись мертва (Linux
+            // снимает её с последним закрытием файла).
+            if crate::user::with_current(|program| program.files.identity(fd)).flatten() != Some(id) {
+                stale.push((fd, id));
+                continue;
+            }
             let mut wanted = 0;
             if events & EPOLLIN != 0 {
                 wanted |= user_abi::POLL_IN;
@@ -1632,7 +1649,7 @@ pub fn epoll_wait(epfd: usize, out: usize, max: usize, timeout: i64) -> i64 {
                     bits |= EPOLLERR;
                 }
             }
-            ready.push((fd, bits));
+            ready.push((fd, id, bits));
             if let Some(at) = crate::user::with_current(|program| program.files.deadline(fd)).flatten() {
                 soonest = Some(soonest.map_or(at, |now: u64| now.min(at)));
             }
@@ -1641,8 +1658,11 @@ pub fn epoll_wait(epfd: usize, out: usize, max: usize, timeout: i64) -> i64 {
         let pid = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
         {
             let mut interests = epoll.interests.lock();
-            for (fd, bits) in ready {
-                let Some(interest) = interests.iter_mut().find(|interest| interest.fd == fd) else {
+            if !stale.is_empty() {
+                interests.retain(|interest| !stale.contains(&(interest.fd, interest.id)));
+            }
+            for (fd, id, bits) in ready {
+                let Some(interest) = interests.iter_mut().find(|interest| interest.fd == fd && interest.id == id) else {
                     continue;
                 };
                 let mut report = bits & (interest.events | EPOLLHUP | EPOLLERR);

@@ -164,6 +164,13 @@ pub fn init_secondary() {
     unsafe { write_xcr0(XCR0.load(Ordering::Relaxed)) };
 }
 
+/// Для кадра сигнала Linux (12.11): маска `XCR0` и размер `XSAVE` — или
+/// `None`, если процессор без `XSAVE` (тогда только `FXSAVE`, 512 байт).
+#[must_use]
+pub fn signal_xsave() -> Option<(u64, usize)> {
+    HAVE_XSAVE.load(Ordering::Relaxed).then(|| (XCR0.load(Ordering::Relaxed), area_size()))
+}
+
 /// Сколько байт занимает состояние одной задачи.
 #[must_use]
 pub fn area_size() -> usize {

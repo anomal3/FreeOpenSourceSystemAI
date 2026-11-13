@@ -753,6 +753,8 @@ pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> 
             for &arch in arches {
                 crate::proton::build(arch)?;
             }
+            // Игра на нём (шаг 8): Trackmania Nations Forever.
+            crate::tmnf::build()?;
             continue;
         }
         let source = fetch(project, refresh)?;
