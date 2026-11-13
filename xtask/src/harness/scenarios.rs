@@ -6415,11 +6415,15 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : opened 'TmForever Network check'", 600_000),
             Step::Wait(10_000),
             Step::Painted("tmnf-network"),
-            // Ok выходит из игры без сети (13.11) - Cancel (Esc): дальше без проверки.
+            // Первый запуск только настраивает сеть и выходит (и по Ok, и по
+            // Cancel, 13.11) - второй открывает саму игру.
             Step::Key("esc"),
+            Step::Await("desktop     : focus 'Terminal'", 120_000),
+            Step::Wait(10_000),
+            Step::Line("run -b /opt/debian/bin/bash /opt/tmnf/bin/tmnf"),
+            Step::Await("desktop     : opened 'TmForever' for", 900_000),
             Step::Wait(180_000),
-            Step::Painted("tmnf-after-check"),
-            Step::Line(""),
+            Step::Painted("tmnf-game"),
             Step::Wait(240_000),
             Step::Painted("tmnf-menu"),
             Step::Absent("KERNEL PANIC"),

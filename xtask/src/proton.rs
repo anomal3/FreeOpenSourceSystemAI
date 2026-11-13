@@ -428,9 +428,15 @@ pub fn build(arch: Arch) -> Result<()> {
         case \"$1\" in --server-debug=*) LD_LIBRARY_PATH= mkdir -p \"$WINEPREFIX\"; $P/bin/wineserver -d\"${1#--server-debug=}\"; shift ;; esac\n\
         # `--dxvk` - Direct3D 8-11 через DXVK (Vulkan), как в Proton: DLL DXVK\n\
         # кладутся в префикс поверх wined3d и включаются как native.\n\
+        # Новый префикс — заранее и до конца (13.11): в QEMU он строится дольше\n\
+        # ожидания Wine («boot event wait timed out» → программа без kernel32).\n\
+        case \"$1\" in --server-debug=*) ;; *)\n\
+            if [ ! -f \"$WINEPREFIX/system.reg\" ]; then\n\
+                $P/lib/wine/x86_64-unix/wine wineboot -i\n\
+                $P/bin/wineserver -w\n\
+            fi ;; esac\n\
         case \"$1\" in --dxvk) shift\n\
             s=\"$WINEPREFIX/drive_c/windows\"\n\
-            [ -d \"$s/system32\" ] || $P/lib/wine/x86_64-unix/wine wineboot -i\n\
             # `cp` Debian - со своей glibc, без нашего LD_LIBRARY_PATH (2.41).\n\
             LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/x86_64-windows/*.dll \"$s/system32/\"\n\
             [ -d \"$s/syswow64\" ] && LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/i386-windows/*.dll \"$s/syswow64/\"\n\
