@@ -19,6 +19,60 @@ use crate::sync::Mutex;
 
 static LINKS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
+/// Таблица ссылок переживает перезагрузку (13.11): префикс Wine держится на
+/// ссылках `dosdevices/c:` → `../drive_c` и `z:` → `/`, и без них после
+/// перезагрузки Wine не находил ни `C:`, ни `kernel32.dll`. Таблица целиком
+/// лежит в файле корня (пишет ядро, от root) и перезаписывается на каждой
+/// правке — правки редки (`symlink`, `unlink`, `rename` ссылок).
+const STORE: &str = "/etc/linux-links";
+
+static LOADED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Прочитать таблицу с диска при первом обращении.
+fn load() {
+    if LOADED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let Some(Ok((data, _))) = crate::fs::read(STORE, 4 << 20) else { return };
+    let Ok(text) = core::str::from_utf8(&data) else { return };
+    let mut links = LINKS.lock();
+    for line in text.lines() {
+        if let Some((path, target)) = line.split_once('\t') {
+            if !path.is_empty() && !target.is_empty() {
+                links.entry(String::from(path)).or_insert_with(|| String::from(target));
+            }
+        }
+    }
+}
+
+/// Записать таблицу на диск.
+fn save() {
+    let text = {
+        let links = LINKS.lock();
+        let mut text = String::new();
+        for (path, target) in links.iter() {
+            if path.contains('\n') || path.contains('\t') || target.contains('\n') {
+                continue;
+            }
+            text.push_str(path);
+            text.push('\t');
+            text.push_str(target);
+            text.push('\n');
+        }
+        text
+    };
+    let root = crate::vfs::perm::Credentials::ROOT;
+    let node = match crate::fs::resolve_as(root, STORE, crate::vfs::perm::Access::WRITE) {
+        Some(Ok(node)) => node,
+        _ => match crate::fs::create_as(root, STORE, 0o600) {
+            Some(Ok(node)) => node,
+            _ => return,
+        },
+    };
+    let _ = node.truncate(0);
+    let _ = node.write_at(0, text.as_bytes());
+}
+
 /// Сколько ссылок подряд проходит [`follow`] (у Linux — 40).
 const MAX_HOPS: usize = 8;
 
@@ -36,11 +90,15 @@ pub fn symlink(target: usize, dir: usize, path: usize) -> i64 {
     if exists_on_disk(&linux) {
         return -e::EEXIST;
     }
-    let mut links = LINKS.lock();
-    if links.contains_key(&linux) {
-        return -e::EEXIST;
+    load();
+    {
+        let mut links = LINKS.lock();
+        if links.contains_key(&linux) {
+            return -e::EEXIST;
+        }
+        links.insert(linux, target);
     }
-    links.insert(linux, target);
+    save();
     0
 }
 
@@ -53,6 +111,7 @@ fn exists_on_disk(linux: &str) -> bool {
 
 /// Текст ссылки по абсолютному пути; `None` — это не ссылка.
 pub fn target(linux: &str) -> Option<String> {
+    load();
     LINKS.lock().get(linux).cloned()
 }
 
@@ -66,6 +125,7 @@ pub fn target(linux: &str) -> Option<String> {
 /// десятки раз. Поэтому ищется самый длинный префикс пути (по границе
 /// имён), который сам ссылка, и остаток пути дописывается к её цели.
 pub fn follow(linux: &str) -> String {
+    load();
     let mut path = String::from(linux);
     for _ in 0..MAX_HOPS {
         let hit = {
@@ -104,20 +164,32 @@ pub fn follow(linux: &str) -> String {
 
 /// Убрать ссылку; `false` — по пути её нет.
 pub fn remove(linux: &str) -> bool {
-    LINKS.lock().remove(linux).is_some()
+    load();
+    let removed = LINKS.lock().remove(linux).is_some();
+    if removed {
+        save();
+    }
+    removed
 }
 
 /// Перенести ссылку `old` на `new` (замещая ссылку там); `false` — `old` не
 /// ссылка.
 pub fn rename(old: &str, new: &str) -> bool {
-    let mut links = LINKS.lock();
-    match links.remove(old) {
-        Some(text) => {
-            links.insert(String::from(new), text);
-            true
+    load();
+    let moved = {
+        let mut links = LINKS.lock();
+        match links.remove(old) {
+            Some(text) => {
+                links.insert(String::from(new), text);
+                true
+            }
+            None => false,
         }
-        None => false,
+    };
+    if moved {
+        save();
     }
+    moved
 }
 
 /// `readlink` по ссылке из таблицы; `None` — не ссылка.
