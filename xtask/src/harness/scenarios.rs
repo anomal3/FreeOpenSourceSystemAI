@@ -6387,7 +6387,7 @@ pub const ALL: &[Scenario] = &[
         ohci: false,
         ehci: false,
         disk_bus: DiskBus::Virtio,
-        network: false,
+        network: true,
         e1000: false,
         guest_port: 0,
         host_echo: false,

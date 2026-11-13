@@ -624,7 +624,7 @@ const FPREGS_AT: usize = MCONTEXT_AT + 23 * 8;
 ///
 /// `area` выровнен на 16 и проверен на запись.
 unsafe fn save_fpu(area: usize) {
-    if let Some((mask, size)) = crate::arch::fpu::signal_xsave() {
+    if let Some((mask, size)) = signal_xsave() {
         // Полное состояние (AVX и выше) — `XSAVE`, как Linux (12.11): без
         // верхних половин `ymm` обработчик, тронувший AVX, портил прерванный
         // `memcpy` glibc — куча wineserver: «corrupted double-linked list».
@@ -652,18 +652,26 @@ unsafe fn save_fpu(area: usize) {
     unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) area, options(nostack, preserves_flags)) };
 }
 
+/// Полный `XSAVE` в кадре сигнала (13.11): проверка — не он ли ломает Wine
+/// (`mov rax,[rax+0x2f0]` с нулём сразу после обработчика).
+const SIGNAL_XSAVE: bool = false;
+
+fn signal_xsave() -> Option<(u64, usize)> {
+    if SIGNAL_XSAVE { crate::arch::fpu::signal_xsave() } else { None }
+}
+
 const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
 const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
 
 /// Место под состояние в кадре сигнала: `XSAVE` и MAGIC2 — или `FXSAVE`.
 fn fp_size() -> usize {
-    crate::arch::fpu::signal_xsave().map_or(FPSTATE, |(_, size)| size + 4)
+    signal_xsave().map_or(FPSTATE, |(_, size)| size + 4)
 }
 
 /// Вернуть полное состояние (`XRSTOR`) из кадра, если он наш (`MAGIC1/2`);
 /// `false` — не вышло, тогда хватит `FXRSTOR`.
 fn restore_xstate(area: usize) -> bool {
-    let Some((mask, size)) = crate::arch::fpu::signal_xsave() else { return false };
+    let Some((mask, size)) = signal_xsave() else { return false };
     if area % 64 != 0 || size > 4096 || !space::user_can(area, size + 4, PageFlags::READ) {
         return false;
     }
@@ -780,7 +788,7 @@ fn enter_handler(
         core::ptr::write_bytes(sp as *mut u8, 0, total);
         core::ptr::write_unaligned(sp as *mut u64, action.restorer as u64);
         // uc_flags: UC_FP_XSTATE — в fpregs полное состояние XSAVE.
-        if crate::arch::fpu::signal_xsave().is_some() {
+        if signal_xsave().is_some() {
             core::ptr::write_unaligned(uc as *mut u64, 1);
         }
         // uc_stack: ss_sp, ss_flags, ss_size.
