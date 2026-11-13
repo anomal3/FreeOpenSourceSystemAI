@@ -1262,7 +1262,12 @@ fn ask_reschedule() {
 /// условия, а не однократное «усни и проснись готовым». Лишнее пробуждение стоит
 /// одного витка и ничего не меняет.
 pub fn wake(id: TaskId) {
+    // Замок занят — пробуждение не теряется (13.11): оно ложится в очередь,
+    // которую разбирает ближайшее переключение. Раньше `wake` молча
+    // возвращался, и задача в `futex` без срока спала до чужого пробуждения
+    // (сигнал wineserver клиенту на SMP).
     let Some(mut sched) = SCHED.try_lock() else {
+        defer_wake(id);
         return;
     };
     let found = sched
@@ -1276,6 +1281,28 @@ pub fn wake(id: TaskId) {
             task.state = TaskState::Ready;
         }
     }
+}
+
+/// Отложенные пробуждения (см. [`wake`]): номера задач, ноль — пусто.
+static DEFERRED_WAKES: [core::sync::atomic::AtomicU32; 64] = [const { core::sync::atomic::AtomicU32::new(0) }; 64];
+static DEFERRED_WAKES_ANY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn defer_wake(id: TaskId) {
+    let raw = id.as_u32();
+    if raw == 0 {
+        return;
+    }
+    for cell in &DEFERRED_WAKES {
+        let current = cell.load(Ordering::Relaxed);
+        if current == raw {
+            break;
+        }
+        if current == 0 && cell.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            break;
+        }
+    }
+    DEFERRED_WAKES_ANY.store(true, Ordering::Release);
+    ask_reschedule();
 }
 
 /// Добровольно уступить процессор.
@@ -1314,6 +1341,21 @@ fn schedule_with(cause: Cause) {
         // Номер процессора стабилен до конца блока: прерывания запрещены, и
         // перенести эту задачу на другой процессор нечем.
         let cpu = smp::cpu();
+        // Пробуждения, отложенные `wake` при занятом замке (13.11).
+        if DEFERRED_WAKES_ANY.swap(false, Ordering::AcqRel) {
+            for cell in &DEFERRED_WAKES {
+                let raw = cell.swap(0, Ordering::AcqRel);
+                if raw == 0 {
+                    continue;
+                }
+                let id = TaskId::new(raw);
+                if let Some(task) = sched.tasks.iter_mut().flatten().find(|task| task.id == id) {
+                    if matches!(task.state, TaskState::Blocked(_)) {
+                        task.state = TaskState::Ready;
+                    }
+                }
+            }
+        }
         if sched.running {
             sched.reap();
             // Сроки проверяются здесь, а не в обработчике таймера: обработчик

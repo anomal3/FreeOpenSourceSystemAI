@@ -234,19 +234,37 @@ pub fn send_to_process(pid: u32, sig: usize, only_handled: bool) {
 }
 
 /// `tgkill(tgid, tid, sig)` / `tkill(tid, sig)`.
-pub fn tgkill(_tgid: usize, tid: usize, sig: usize) -> i64 {
+pub fn tgkill(tgid: usize, tid: usize, sig: usize) -> i64 {
     let id = sched::TaskId::new(tid as u32);
     if id == sched::current() {
         return raise_on(sched::current_slot(), sig);
     }
-    // Поток того же процесса — пометить сигнал и разбудить: он увидит его на
-    // выходе из вызова, в котором ждёт.
-    let Some((slot, _)) = sched::lookup(id) else {
+    // Пометить сигнал потоку и разбудить: он увидит его на выходе из вызова,
+    // в котором ждёт. Поток чужого процесса — тоже (13.11): wineserver так
+    // будит клиента на завершение асинхронного ввода-вывода (`SIGUSR1`, APC).
+    // Отказ `ESRCH` терял APC — чтение именованного канала не кончалось, RPC
+    // Wine падал с 1726, службы не вставали, префикс не дособирался.
+    let Some((slot, state)) = sched::lookup(id) else {
         return -e::ESRCH;
     };
-    let same = crate::user::same_process(slot);
-    if !same {
+    if state == sched::TaskState::Finished {
         return -e::ESRCH;
+    }
+    if !crate::user::same_process(slot) {
+        let Some(process) = crate::user::process_at(slot) else {
+            return -e::ESRCH;
+        };
+        let (pid, owner) = {
+            let program = process.lock();
+            (program.linux_pid, program.credentials())
+        };
+        if tgid != 0 && pid as usize != tgid {
+            return -e::ESRCH;
+        }
+        let me = crate::user::credentials();
+        if !me.is_root() && owner.uid != me.uid {
+            return -e::EPERM;
+        }
     }
     let result = raise_on(slot, sig);
     sched::wake(id);
