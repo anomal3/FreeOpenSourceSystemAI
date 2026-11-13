@@ -11803,11 +11803,18 @@ eventfd, epoll, timerfd, memfd, ppoll, tgkill, sigaltstack, clone3. Чего н�
   давал ребёнку чужие базы; Wine читал канарейку как `pthread_teb`); полный
   `XSAVE` в кадре сигнала выключен (`SIGNAL_XSAVE`) — с ним Wine падал, не
   разобрано почему.
-  Открыто: RPC Wine между процессами не работает (`RpcAssoc_BindConnection
-  receive failed with error 1726`, `services.exe` без менеджера служб) —
-  новый префикс строится дольше ожидания Wine («boot event wait timed
-  out»); `wineserver` падает при выходе процессов (``Assertion
-  `obj->refcount' failed``, «corrupted double-linked list»).
+  13.11 днём (25ad0ce, b1ad4df и дальше): **RPC Wine починен** — `tgkill`
+  потоку чужого процесса отвечал `ESRCH`, а wineserver так будит клиента на
+  завершение асинхронного ввода-вывода (APC): ошибки 1726 ушли, службы
+  встают, падения wineserver (assert, corrupted) в последних прогонах не
+  видны. Следом всплыло то, что раньше молча отказывало: `tabtip.exe`
+  (вешал UI Automation) и `nsiproxy.sys` (без `AF_NETLINK` перечисление
+  адаптеров не отвечало, `GetAdaptersInfo` ждала вечно) — оба выключены в
+  `fossai-proton`. Окно Trackmania открывается снова.
+  Открыто: `AF_NETLINK` в ядре (вернуть `nsiproxy`); wined3d D3D11 иногда
+  «Invalid window handle»; DXVK после починки RPC медленнее (69 кадров за
+  30 с вместо ~350 — службы Wine заняли процессор?); новый префикс всё ещё
+  дольше ожидания Wine (скрипт ждёт `wineserver -w`).
   Открыто: 10–13 к/с DXVK на простой заливке — медленно (шестерёнки 90),
   не разобрано; `wineserver` при выходе — assert `obj->refcount`;
   `received delete_id for unknown id` от нашего сервера Wayland.
