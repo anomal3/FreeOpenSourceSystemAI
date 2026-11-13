@@ -379,7 +379,20 @@ pub fn user_gs() -> u64 {
 }
 
 /// Поставить базу `GS` программы, если она отличается от нынешней.
+///
+/// Селектор в `GS` (13.11): 32-битный код WoW64 вправе загрузить его сам, и
+/// загрузка меняет базу мимо `IA32_GS_BASE`-кеша (QEMU TCG — в ноль). Тогда
+/// селектор обнуляется, а база пишется заново: у 64-битной программы Linux
+/// селектор `GS` всегда нулевой, база — только из MSR.
 pub fn set_user_gs(base: u64) {
+    let selector: u16;
+    // SAFETY: чтение сегментного регистра — ни памяти, ни флагов.
+    unsafe { asm!("mov {0:x}, gs", out(reg) selector, options(nomem, nostack, preserves_flags)) };
+    if selector != 0 {
+        // SAFETY: нулевой селектор; ядро `GS` не адресует (см. выше).
+        unsafe { asm!("mov gs, {0:x}", in(reg) 0u16, options(nostack, preserves_flags)) };
+        GS_BASE_NOW[crate::smp::cpu()].store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+    }
     let cpu = crate::smp::cpu();
     if GS_BASE_NOW[cpu].swap(base, core::sync::atomic::Ordering::Relaxed) == base {
         return;

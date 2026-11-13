@@ -2072,7 +2072,7 @@ unsafe fn arch_prctl(code: usize, addr: usize) -> i64 {
             if !space::user_can(addr, 8, PageFlags::WRITE) {
                 return -e::EFAULT;
             }
-            let base = crate::arch::user_tls();
+            let base = crate::sched::current_bases().0;
             // SAFETY: проверено строкой выше.
             unsafe { core::ptr::write_unaligned(addr as *mut u64, base as u64) };
             0
@@ -2090,7 +2090,7 @@ unsafe fn arch_prctl(code: usize, addr: usize) -> i64 {
             if !space::user_can(addr, 8, PageFlags::WRITE) {
                 return -e::EFAULT;
             }
-            let base = crate::arch::user_gs();
+            let base = crate::sched::current_bases().1;
             // SAFETY: проверено строкой выше.
             unsafe { core::ptr::write_unaligned(addr as *mut u64, base) };
             0

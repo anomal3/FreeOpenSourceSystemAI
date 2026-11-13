@@ -30,7 +30,7 @@ pub fn clone(frame: &crate::arch::TrapFrame, flags: usize, stack: usize, parent_
     if stack != 0 {
         regs.rsp = stack as u64;
     }
-    let tls = if flags & CLONE_SETTLS != 0 { tls as u64 } else { crate::arch::user_tls() };
+    let tls = if flags & CLONE_SETTLS != 0 { tls as u64 } else { crate::sched::current_bases().0 };
     let clear = if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 };
     // Номер пишется до того, как поток войдёт в программу (см.
     // `spawn_linux_thread`): иначе быстрый поток успел бы выйти и обнулить
@@ -58,7 +58,7 @@ fn clone_process(frame: &crate::arch::TrapFrame, flags: usize, stack: usize, par
     if stack != 0 {
         regs.rsp = stack as u64;
     }
-    let tls = if flags & CLONE_SETTLS != 0 { tls as u64 } else { crate::arch::user_tls() };
+    let tls = if flags & CLONE_SETTLS != 0 { tls as u64 } else { crate::sched::current_bases().0 };
     let set = if flags & CLONE_CHILD_SETTID != 0 { child_tid } else { 0 };
     let clear = if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 };
     let id = match crate::user::spawn_linux_process(regs, tls, set, clear, flags & CLONE_VM != 0) {

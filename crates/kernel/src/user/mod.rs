@@ -4345,7 +4345,7 @@ pub fn spawn_linux_thread(regs: arch::TrapFrame, tls: u64, clear_tid: usize, set
         process,
         regs,
         tls,
-        gs: arch::user_gs(),
+        gs: crate::sched::current_bases().1,
         clear_tid,
         released: core::sync::atomic::AtomicBool::new(false),
     });
@@ -4662,7 +4662,7 @@ pub fn spawn_linux_process(
         process: Arc::new(Mutex::new(program)),
         regs,
         tls,
-        gs: arch::user_gs(),
+        gs: crate::sched::current_bases().1,
         set_tid,
         clear_tid,
         mask: LINUX_SIGMASK[slot].load(Ordering::Relaxed),

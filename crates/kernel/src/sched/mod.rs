@@ -705,18 +705,29 @@ pub fn set_session(session: usize) {
 /// вернуло её при следующем заходе, и в регистре — чтобы она подействовала
 /// прямо сейчас, без ожидания переключения.
 pub fn set_current_tls(base: u64) {
-    {
-        let mut sched = SCHED.lock();
-        let current = sched.current();
-        if let Some(task) = sched.tasks[current].as_mut() {
-            task.tls = base;
-            task.fs_selector = 0;
-        }
+    // Всё — под локом (прерывания запрещены, 13.11): вытеснение между записью
+    // в задачу и сбросом селектора возвращало в задачу старый селектор `FS`
+    // (переключение сохраняет живой), и поток бежал с чужой базой.
+    let mut sched = SCHED.lock();
+    let current = sched.current();
+    if let Some(task) = sched.tasks[current].as_mut() {
+        task.tls = base;
+        task.fs_selector = 0;
     }
     // Как `arch_prctl(ARCH_SET_FS)` Linux: селектор `FS` — нулевой, база — из
     // MSR (12.11: обработчик сигнала Wine, пойманного в 32-битном коде).
     arch::clear_fs_selector();
     arch::set_user_tls(base);
+    drop(sched);
+}
+
+/// База `FS` и `GS` исполняющейся задачи — из неё самой, под локом (13.11):
+/// кеш процессора (`arch::user_tls`) читается в два шага, и вытеснение с
+/// переносом между ними давало ребёнку `clone` базы чужой задачи.
+#[must_use]
+pub fn current_bases() -> (u64, u64) {
+    let sched = SCHED.lock();
+    sched.tasks[sched.current()].as_ref().map_or((0, 0), |task| (task.tls, task.gs))
 }
 
 /// Дескрипторы TLS исполняющейся задачи (`get_thread_area`, поиск свободной
@@ -747,14 +758,13 @@ pub fn set_current_tls_entry(slot: usize, descriptor: u64) {
 /// Задать базу `GS` исполняющейся задачи (программы Linux на x86-64,
 /// `arch_prctl(ARCH_SET_GS)`; Wine держит там TEB) — как [`set_current_tls`].
 pub fn set_current_gs(base: u64) {
-    {
-        let mut sched = SCHED.lock();
-        let current = sched.current();
-        if let Some(task) = sched.tasks[current].as_mut() {
-            task.gs = base;
-        }
+    let mut sched = SCHED.lock();
+    let current = sched.current();
+    if let Some(task) = sched.tasks[current].as_mut() {
+        task.gs = base;
     }
     arch::set_user_gs(base);
+    drop(sched);
 }
 
 /// Номер слота исполняющейся задачи.
