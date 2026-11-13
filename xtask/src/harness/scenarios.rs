@@ -4982,7 +4982,9 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             // Загрузочная запись заводится в самом конце, до строки «finished»:
             // порядок шагов повторяет порядок строк, а не порядок событий.
-            Step::Await("[install] boot entry Boot", 240_000),
+            // С Proton и Trackmania на носителе - 2,5 ГБ пакетов: копирование
+            // иногда дольше четырёх минут (13.11).
+            Step::Await("[install] boot entry Boot", 900_000),
             Step::Await("[install] BootOrder: FossAi first", 15_000),
             Step::Await("[install] finished", 30_000),
             Step::Expect("[install] state: /etc/passwd"),

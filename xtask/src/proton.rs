@@ -400,7 +400,7 @@ pub fn build(arch: Arch) -> Result<()> {
         # `tabtip.exe` (экранная клавиатура, её запускает explorer) - выключен\n\
         # (13.11): с работающим RPC он вешал UI Automation (`com_event_handlers_cs`),\n\
         # и создание окна игры ждало его без конца.\n\
-        export WINEDLLOVERRIDES=\"mscoree,mshtml,tabtip.exe=${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}\"\n\
+        export WINEDLLOVERRIDES=\"mscoree,mshtml,tabtip.exe,nsiproxy.sys=${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}\"\n\
         export WINEDEBUG=${WINEDEBUG:-fixme-all}\n\
         # `/tmp` у FossAi переживает перезагрузку: сокет wineserver прошлой\n\
         # загрузки остаётся обычным файлом, и Wine падает «is not a socket».\n\
