@@ -11787,6 +11787,27 @@ eventfd, epoll, timerfd, memfd, ppoll, tgkill, sigaltstack, clone3. Чего н�
   `fossai.conf`: `default` = `plug` поверх `hw:0,0`). Проба
   `d3dprobe.exe tone 440 4` (waveOut) — сценарий `proton-sound`: в WAV QEMU
   тон 440 Гц, 3993 мс. Запись (микрофон) не сделана.
+- **Шаг 8 — игра запускается** (13.11; 2c79061, 819e46a, ad1b0f0, 163a6b0 и
+  дальше): Trackmania Nations Forever (бесплатная, DirectX 9, 32 бита) —
+  пакет `tmnf` (установщик Nadeo 530 МБ + `bin/tmnf`), ставится своим Inno
+  Setup в префикс WoW64, переживает перезагрузку и открывает окно игры
+  `TmForever` через DXVK (сценарии `proton-tmnf`, `proton-tmnf-run`; с сетью
+  QEMU; первый запуск только настраивает сеть и выходит). Внутри окна пока
+  чёрное: lavapipe в QEMU не успевает («DxvkSubmissionQueue: Timeout, GPU
+  likely hung») — меню ждёт видеокарты (NVIDIA) или машины быстрее.
+  По дороге в ядре: частное отображение файла RWX для программы с правом
+  `jit` (секции PE, самораспаковка установщика); `epoll` — по открытому
+  файлу, а не номеру; символические ссылки Linux — на диске
+  (`/etc/linux-links`, префикс Wine держится на `dosdevices/c:`); базы
+  `FS`/`GS` потоков — из задачи под замком (`clone` брал кеш процессора и
+  давал ребёнку чужие базы; Wine читал канарейку как `pthread_teb`); полный
+  `XSAVE` в кадре сигнала выключен (`SIGNAL_XSAVE`) — с ним Wine падал, не
+  разобрано почему.
+  Открыто: RPC Wine между процессами не работает (`RpcAssoc_BindConnection
+  receive failed with error 1726`, `services.exe` без менеджера служб) —
+  новый префикс строится дольше ожидания Wine («boot event wait timed
+  out»); `wineserver` падает при выходе процессов (``Assertion
+  `obj->refcount' failed``, «corrupted double-linked list»).
   Открыто: 10–13 к/с DXVK на простой заливке — медленно (шестерёнки 90),
   не разобрано; `wineserver` при выходе — assert `obj->refcount`;
   `received delete_id for unknown id` от нашего сервера Wayland.
