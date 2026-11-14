@@ -2171,17 +2171,24 @@ fn gpu() {
     };
     let (chip, revision) = crate::display::nvidia::chip_of(card.boot0, card.boot42);
     sprintln!(
-        "  gpu: NVIDIA {} {} rev {:02x}, PCI {:02x}:{:02x}.{} device {:04x}",
+        "  gpu: NVIDIA {} {} rev {:02x}, PCI {:02x}:{:02x}.{} device {:04x} rev {:02x}",
         crate::display::nvidia::family(chip >> 4),
         crate::display::nvidia::chip_name(chip),
         revision,
         card.bus,
         card.slot,
         card.function,
-        card.device
+        card.device,
+        card.revision
     );
     sprintln!("  gpu: BOOT_0 {:#010x}, BOOT_42 {:#010x}, BAR0 {:#x}", card.boot0, card.boot42, card.bar0);
     sprintln!("  gpu: local memory range {:#010x}, WPR2 {:#010x}..{:#010x}", card.memory_range, card.wpr2.0, card.wpr2.1);
+    if let Some(bytes) = crate::display::nvidia::vram_bytes(card.memory_range) {
+        sprintln!("  gpu: video memory {} MiB", bytes >> 20);
+    }
+    for line in crate::display::nvidia::vbios_report() {
+        sprintln!("  gpu: {line}");
+    }
 }
 
 fn tasks() {

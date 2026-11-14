@@ -173,7 +173,14 @@ pub unsafe fn probe(root: &crate::pci::Root) {
         wpr2.1,
         if wpr2.1 == 0 { "not set up - FWSEC-FRTS has not run" } else { "set" }
     );
+    if let Some(bytes) = vram_bytes(memory_range) {
+        crate::kprintln!("  nvidia      : video memory {} MiB", bytes >> 20);
+    }
+    let mut rom = Rom::new(mmio.as_usize());
+    let vbios = rom.parse();
+    report(&vbios);
     crate::devices::claim(address, "nvidia (read-only)");
+    *VBIOS.lock() = Some(vbios);
     *FOUND.lock() = Some(Found {
         bus: address.bus,
         slot: address.device,
@@ -186,4 +193,296 @@ pub unsafe fn probe(root: &crate::pci::Root) {
         wpr2,
         bar0: phys.as_u64(),
     });
+}
+
+// --- Этап 2: прошивка карты (VBIOS) -----------------------------------------
+//
+// Источники (открытые): nouveau `nvkm/subdev/bios/{image,pcir,npde,bit}.c`
+// (MIT) и nova-core `vbios.rs`. Прошивка читается через окно PROM в BAR0
+// (0x300000, до 1 МиБ) 32-битными словами — только чтение, как у nova-core.
+
+/// Окно PROM в BAR0.
+const PROM: usize = 0x0030_0000;
+/// Больше окна PROM не бывает.
+const PROM_LEN: usize = 0x0010_0000;
+/// Приложение FWSEC (боевое) в таблице микрокодов Falcon.
+const APPID_FWSEC_PROD: u8 = 0x85;
+
+/// Строки отчёта о прошивке — для журнала и команды `gpu`.
+static VBIOS: SpinLock<Option<alloc::vec::Vec<alloc::string::String>>> = SpinLock::new(None);
+
+/// Отчёт о прошивке карты, если её читали.
+#[must_use]
+pub fn vbios_report() -> alloc::vec::Vec<alloc::string::String> {
+    VBIOS.lock().clone().unwrap_or_default()
+}
+
+/// Размер видеопамяти по `NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE` (как nouveau
+/// `gp100`/`tu102`): величина в битах 9:4, сдвиг в битах 3:0 (в МиБ), бит 30 —
+/// ECC отнимает шестнадцатую часть.
+#[must_use]
+pub fn vram_bytes(range: u32) -> Option<u64> {
+    if range == 0 || range == u32::MAX {
+        return None;
+    }
+    let magnitude = u64::from((range >> 4) & 0x3f);
+    let scale = range & 0xf;
+    let mut size = magnitude << (scale + 20);
+    if range & 0x4000_0000 != 0 {
+        size = size / 16 * 15;
+    }
+    Some(size)
+}
+
+/// Прошивка, читаемая из окна PROM по мере надобности.
+struct Rom {
+    mmio: usize,
+    /// Где в окне начинаются образы (заголовок IFR «NVGI» сдвигает их).
+    start: usize,
+    data: alloc::vec::Vec<u8>,
+}
+
+/// Один образ прошивки (PCI expansion ROM image).
+#[derive(Clone, Copy)]
+struct Image {
+    base: usize,
+    size: usize,
+    kind: u8,
+    vendor: u16,
+    device: u16,
+}
+
+impl Rom {
+    fn new(mmio: usize) -> Self {
+        Self { mmio, start: 0, data: alloc::vec::Vec::new() }
+    }
+
+    fn word_raw(&self, offset: usize) -> u32 {
+        // SAFETY: смещение внутри окна PROM, которое лежит внутри
+        // отображённого BAR0; чтение 32-битное и выровненное.
+        unsafe { core::ptr::read_volatile((self.mmio + PROM + offset) as *const u32) }
+    }
+
+    /// Дочитать прошивку до `end` байт от начала образов.
+    fn ensure(&mut self, end: usize) -> bool {
+        if self.start + end > PROM_LEN {
+            return false;
+        }
+        while self.data.len() < end {
+            let word = self.word_raw(self.start + self.data.len());
+            self.data.extend_from_slice(&word.to_le_bytes());
+        }
+        true
+    }
+
+    fn u8_at(&mut self, offset: usize) -> Option<u8> {
+        self.ensure(offset + 1).then(|| self.data[offset])
+    }
+
+    fn u16_at(&mut self, offset: usize) -> Option<u16> {
+        self.ensure(offset + 2).then(|| u16::from_le_bytes([self.data[offset], self.data[offset + 1]]))
+    }
+
+    fn u32_at(&mut self, offset: usize) -> Option<u32> {
+        self.ensure(offset + 4).then(|| {
+            u32::from_le_bytes([self.data[offset], self.data[offset + 1], self.data[offset + 2], self.data[offset + 3]])
+        })
+    }
+
+    /// Заголовок IFR («NVGI») в начале окна: образы лежат дальше
+    /// (nova-core `rom_offset`, версии 1–3).
+    fn find_start(&mut self) -> Result<usize, &'static str> {
+        if self.word_raw(0) != u32::from_le_bytes(*b"NVGI") {
+            return Ok(0);
+        }
+        let fixed1 = self.word_raw(4);
+        let fixed_size = ((fixed1 >> 16) & 0x7fff) as usize;
+        match (fixed1 >> 8) & 0xff {
+            1 | 2 => Ok(self.word_raw(fixed_size + 4) as usize),
+            3 => {
+                let total = (self.word_raw(8) & 0xf_ffff) as usize;
+                let status = self.word_raw(total) as usize;
+                let directory = status + 0x1000;
+                if directory + 12 > PROM_LEN || self.word_raw(directory) != u32::from_le_bytes(*b"RFRD") {
+                    return Err("IFR v3 without an RFRD directory");
+                }
+                Ok(self.word_raw(directory + 8) as usize)
+            }
+            _ => Err("unknown IFR version"),
+        }
+    }
+
+    /// Следующий образ на `base` (nouveau `nvbios_imagen`): `(образ, последний)`.
+    fn image(&mut self, base: usize) -> Option<(Image, bool)> {
+        match self.u16_at(base)? {
+            0xaa55 | 0xbb77 | 0x4e56 => {}
+            _ => return None,
+        }
+        let pcir = base + usize::from(self.u16_at(base + 0x18)?);
+        match &self.u32_at(pcir)?.to_le_bytes() {
+            b"PCIR" | b"RGIS" | b"NPDS" => {}
+            _ => return None,
+        }
+        let header = usize::from(self.u16_at(pcir + 0x0a)?);
+        let vendor = self.u16_at(pcir + 0x04)?;
+        let device = self.u16_at(pcir + 0x06)?;
+        let mut size = usize::from(self.u16_at(pcir + 0x10)?) * 512;
+        let kind = self.u8_at(pcir + 0x14)?;
+        let mut last = self.u8_at(pcir + 0x15)? & 0x80 != 0;
+        if kind == 0x70 {
+            last = true;
+        } else {
+            let npde = (pcir + header + 0x0f) & !0x0f;
+            if self.u32_at(npde) == Some(u32::from_le_bytes(*b"NPDE")) {
+                let sub = usize::from(self.u16_at(npde + 0x08)?) * 512;
+                if sub != 0 {
+                    size = sub;
+                }
+                last = self.u8_at(npde + 0x0a)? & 0x80 != 0;
+            }
+        }
+        (size != 0).then_some((Image { base, size, kind, vendor, device }, last))
+    }
+
+    /// Разобрать прошивку: образы, таблица BIT, где лежит FWSEC.
+    fn parse(&mut self) -> alloc::vec::Vec<alloc::string::String> {
+        use alloc::format;
+        let mut lines = alloc::vec::Vec::new();
+        match self.find_start() {
+            Ok(start) if start < PROM_LEN => self.start = start,
+            Ok(start) => {
+                lines.push(format!("VBIOS: IFR points past the PROM window ({start:#x})"));
+                return lines;
+            }
+            Err(why) => {
+                lines.push(format!("VBIOS: {why}"));
+                return lines;
+            }
+        }
+        let mut images = alloc::vec::Vec::new();
+        let mut base = 0;
+        while images.len() < 16 {
+            let Some((image, last)) = self.image(base) else { break };
+            images.push(image);
+            base = (image.base + image.size + 511) & !511;
+            if last || base >= PROM_LEN - self.start {
+                break;
+            }
+        }
+        if images.is_empty() {
+            let first = self.word_raw(self.start);
+            lines.push(format!("VBIOS: no ROM image at PROM+{:#x} (first word {first:#010x})", self.start));
+            return lines;
+        }
+        let names: alloc::vec::Vec<_> = images
+            .iter()
+            .map(|image| {
+                let kind = match image.kind {
+                    0x00 => "PCI-AT",
+                    0x03 => "EFI",
+                    0x70 => "NBSI",
+                    0xe0 => "FwSec",
+                    _ => "other",
+                };
+                format!("{kind} {}K", image.size / 1024)
+            })
+            .collect();
+        lines.push(format!(
+            "VBIOS: {} images at PROM+{:#x} ({}), ROM ids {:04x}:{:04x}",
+            images.len(),
+            self.start,
+            names.join(", "),
+            images[0].vendor,
+            images[0].device
+        ));
+        let Some(pci_at) = images.iter().copied().find(|image| image.kind == 0x00) else {
+            lines.push("VBIOS: no PCI-AT image - no BIT table".into());
+            return lines;
+        };
+        let Some(bit) = self.find_bit(pci_at) else {
+            lines.push("VBIOS: no BIT table in the PCI-AT image".into());
+            return lines;
+        };
+        let version = self.u16_at(bit + 6).unwrap_or(0);
+        let header = usize::from(self.u8_at(bit + 8).unwrap_or(0));
+        let token_size = usize::from(self.u8_at(bit + 9).unwrap_or(0));
+        let tokens = usize::from(self.u8_at(bit + 10).unwrap_or(0));
+        let mut ids = alloc::string::String::new();
+        let mut falcon = None;
+        for index in 0..tokens {
+            let token = bit + header + index * token_size;
+            let (Some(id), Some(data_version), Some(offset)) =
+                (self.u8_at(token), self.u8_at(token + 1), self.u16_at(token + 4))
+            else {
+                break;
+            };
+            let shown = if id.is_ascii_graphic() { id as char } else { '?' };
+            ids.push(shown);
+            if id == 0x70 {
+                falcon = Some((data_version, pci_at.base + usize::from(offset)));
+            }
+        }
+        lines.push(format!("VBIOS: BIT {}.{} at {bit:#x}, {tokens} tokens \"{ids}\"", version >> 8, version & 0xff));
+        let Some((_, falcon_data)) = falcon else {
+            lines.push("VBIOS: no falcon data token ('p')".into());
+            return lines;
+        };
+        // Указатель на таблицу микрокодов считается от начала PCI-AT, а сами
+        // микрокоды лежат за ним — в образах FwSec (nova-core: указатель минус
+        // длина PCI-AT, отсчёт от начала образа FwSec).
+        let Some(table_pointer) = self.u32_at(falcon_data) else { return lines };
+        let Some(fwsec) = images.iter().copied().find(|image| image.kind == 0xe0) else {
+            lines.push(format!("VBIOS: falcon table pointer {table_pointer:#x}, but no FwSec image"));
+            return lines;
+        };
+        let rebase = |pointer: u32| (pointer as usize).checked_sub(pci_at.size).map(|offset| fwsec.base + offset);
+        let Some(table) = rebase(table_pointer) else {
+            lines.push(format!("VBIOS: falcon table pointer {table_pointer:#x} inside PCI-AT"));
+            return lines;
+        };
+        let (Some(table_version), Some(table_header), Some(entry_len), Some(entries)) =
+            (self.u8_at(table), self.u8_at(table + 1), self.u8_at(table + 2), self.u8_at(table + 3))
+        else {
+            return lines;
+        };
+        let mut apps = alloc::string::String::new();
+        let mut fwsec_ucode = None;
+        for index in 0..usize::from(entries) {
+            let entry = table + usize::from(table_header) + index * usize::from(entry_len);
+            let (Some(app), Some(pointer)) = (self.u8_at(entry), self.u32_at(entry + 2)) else { break };
+            apps.push_str(&format!(" {app:02x}"));
+            if app == APPID_FWSEC_PROD {
+                fwsec_ucode = rebase(pointer);
+            }
+        }
+        lines.push(format!("VBIOS: falcon ucode table v{table_version}, {entries} entries:{apps}"));
+        match fwsec_ucode {
+            Some(ucode) => {
+                let descriptor_version = self.u8_at(ucode + 1).unwrap_or(0);
+                lines.push(format!(
+                    "VBIOS: FWSEC (prod) ucode at {ucode:#x}, descriptor v{descriptor_version} - stage 3 can load it"
+                ));
+            }
+            None => lines.push("VBIOS: no FWSEC (prod) entry".into()),
+        }
+        lines
+    }
+
+    /// Найти заголовок BIT (`FF B8 'B' 'I' 'T' 00`) в образе PCI-AT.
+    fn find_bit(&mut self, image: Image) -> Option<usize> {
+        let end = image.base + image.size.min(0x10000);
+        if !self.ensure(end) {
+            return None;
+        }
+        self.data[image.base..end]
+            .windows(6)
+            .position(|window| window == [0xff, 0xb8, b'B', b'I', b'T', 0])
+            .map(|position| image.base + position)
+    }
+}
+
+fn report(lines: &[alloc::string::String]) {
+    for line in lines {
+        crate::kprintln!("  nvidia      : {line}");
+    }
 }
