@@ -1164,6 +1164,7 @@ fn run_builtin(line: &str) -> bool {
         }
         "ui" => ui_status(argument),
         "tasks" => tasks(),
+        "gpu" => gpu(),
         #[cfg(target_arch = "x86_64")]
         "lxstat" => linux_stat(argument),
         // Вызовы программ Linux и (N4) родных программ — на обеих архитектурах.
@@ -2159,6 +2160,28 @@ fn linux_stat(argument: &str) {
     if reset {
         sprintln!("  (counters reset)");
     }
+}
+
+/// Видеокарта NVIDIA, если есть (13.11): что за чип и в каком состоянии —
+/// в терминал, чтобы на настоящей машине не нужна была серийная линия.
+fn gpu() {
+    let Some(card) = crate::display::nvidia::found() else {
+        sprintln!("  gpu: no NVIDIA card found");
+        return;
+    };
+    let (chip, revision) = crate::display::nvidia::chip_of(card.boot0, card.boot42);
+    sprintln!(
+        "  gpu: NVIDIA {} {} rev {:02x}, PCI {:02x}:{:02x}.{} device {:04x}",
+        crate::display::nvidia::family(chip >> 4),
+        crate::display::nvidia::chip_name(chip),
+        revision,
+        card.bus,
+        card.slot,
+        card.function,
+        card.device
+    );
+    sprintln!("  gpu: BOOT_0 {:#010x}, BOOT_42 {:#010x}, BAR0 {:#x}", card.boot0, card.boot42, card.bar0);
+    sprintln!("  gpu: local memory range {:#010x}, WPR2 {:#010x}..{:#010x}", card.memory_range, card.wpr2.0, card.wpr2.1);
 }
 
 fn tasks() {

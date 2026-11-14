@@ -547,6 +547,9 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     if let Ok(root) = unsafe { pci::Root::discover(info.acpi_rsdp) } {
         // SAFETY: см. выше.
         unsafe { sound::probe(&root) };
+        // Видеокарта NVIDIA (13.11, этапы 1–2): только узнать, что за чип.
+        // SAFETY: см. выше.
+        unsafe { display::nvidia::probe(&root) };
         // Видеокарты, у которых драйвер в ядре (фаза 68h): режим им меняется
         // по просьбе, а «свои» они с загрузки.
         display::claim_adapters();

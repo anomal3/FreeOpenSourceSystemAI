@@ -2242,8 +2242,20 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
     let to_screen = |pixel: u32| if swap { (pixel & 0xff00_ff00) | ((pixel >> 16) & 0xff) | ((pixel & 0xff) << 16) } else { pixel };
     let keep = if alpha { u32::MAX } else { 0xff_ffff };
     let fill = if alpha { 0 } else { to_screen(BACKDROP) & keep };
-    for y in ay0..ay1 {
-        target.row_mut(y as u32)[ax0 as usize..ax1 as usize].fill(fill);
+    // Один непрозрачный слой закрывает всю область — подложка не видна, и
+    // заливать её — лишний проход по кадру (13.11: DXVK, ~90 мс на кадр).
+    let covered = layers.len() == 1 && {
+        let layer = &layers[0];
+        !layer.blend
+            && layer.x <= ax0
+            && layer.y <= ay0
+            && layer.x + layer.buf.width as i32 >= ax1
+            && layer.y + layer.buf.height as i32 >= ay1
+    };
+    if !covered {
+        for y in ay0..ay1 {
+            target.row_mut(y as u32)[ax0 as usize..ax1 as usize].fill(fill);
+        }
     }
     let mut row = Vec::new();
     if row.try_reserve_exact(area.w as usize * 4).is_err() {
@@ -2268,6 +2280,29 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
                 continue;
             }
             let at = buf.offset + u64::from(sy) * u64::from(buf.stride) + first_column * 4;
+            if !layer.blend {
+                // Короткий путь (13.11): строка клиента — прямо на место в окне,
+                // затем один простой проход (альфа, при нужде — красный с
+                // синим), без промежуточного буфера и ветвлений в цикле.
+                let out = &mut target.row_mut(ty as u32)[x0 as usize..x1 as usize];
+                // SAFETY: те же байты, что у среза `u32` (выравнивание `u8` —
+                // единица), длина — `count` точек по 4 байта.
+                let bytes = unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), count * 4) };
+                if !buf.mem.read(at, bytes) {
+                    return false;
+                }
+                let or = if buf.format == SHM_XRGB8888 { 0xff00_0000 } else { 0 };
+                if swap {
+                    for pixel in out.iter_mut() {
+                        *pixel = to_screen(u32::from_le(*pixel) | or) & keep;
+                    }
+                } else if or != 0 || keep != u32::MAX {
+                    for pixel in out.iter_mut() {
+                        *pixel = (u32::from_le(*pixel) | or) & keep;
+                    }
+                }
+                continue;
+            }
             if !buf.mem.read(at, &mut row[..count * 4]) {
                 return false;
             }

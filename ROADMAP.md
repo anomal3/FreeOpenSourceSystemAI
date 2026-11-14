@@ -13278,6 +13278,39 @@ SDL2), сборка игр Unity — через WebGL в Chromium или сбо�
 
 ## Видеокарты NVIDIA: «чистая комната» с Романом — НАПОМНИТЬ РОМАНУ
 
+**13.11.2026 — решение Романа:** напомнил, рассказа не будет — «делай что
+доступно из открытых источников». Источник — только открытое:
+open-gpu-kernel-modules NVIDIA (MIT), открытые заголовки/документация
+(nvidia/open-gpu-doc), Mesa (NVK) и nouveau как справка по устройству.
+Декомпилированное — по-прежнему нет. Карта для проверки — RTX 3060 (GA106,
+Ampere) на ПК Романа: проверка только на железе (в QEMU/VirtualBox её нет).
+
+**План по открытым источникам (13.11, разбор nouveau `nvkm/subdev/gsp`,
+open-gpu-kernel-modules, open-gpu-doc; на Rust есть `drivers/gpu/nova-core`):**
+1. **PCI и чип** (S) — vendor `10de`, class 03; BAR0 16 МиБ (регистры), BAR1
+   окно VRAM, BAR3; `NV_PMC_BOOT_0` (0x0) и `BOOT_42` (0xA00): chip_id — биты
+   28:20, у GA106 `0x176`. **Сделано (13.11): `display/nvidia.rs`, команда
+   `gpu`** — только чтение, на загрузке; проверить на ПК Романа.
+2. **Память и состояние после POST** (S–M) — размер VRAM (`0x100ce0`), WPR2
+   (`0x1fa824/828`), VBIOS (PROM `BAR0+0x300000` или ROM BAR), разбор BIT.
+   Регистры уже читаются, разбор — следующим.
+3. **Картинка остаётся у GOP** — дисплейный движок без GSP на Ampere не
+   трогается, режим не меняется.
+4. **FWSEC-FRTS** (L, главный риск) — образ FWSEC из VBIOS (ucode type 0x85),
+   патч DMEM-маппера (команда FRTS 0x15), подпись из VBIOS по fuse
+   (`0x8241c0`), запуск на GSP falcon, проверка `0x001438` и WPR2.
+5. **Booter и GSP-RM** (L) — файлы linux-firmware `nvidia/ga106/gsp/`
+   (booter_load, gsp-570.144 или 535.113.01 — сверить), radix3, LIBOS, очереди
+   команд и сообщений, RPC `SET_SYSTEM_INFO`/`SET_REGISTRY`, ждать
+   `GSP_INIT_DONE`, `GET_GSP_STATIC_INFO`. Структуры — строго той же версии.
+6. **Сервисы RM** (XL) — `GSP_RM_ALLOC`/`CONTROL`: дисплей (modeset), каналы
+   `AMPERE_CHANNEL_GPFIFO_A` (0xC56F), страничные таблицы GPU, прерывания.
+7. **3D и вычисления** (XL) — классы `AMPERE_A` (0xC697), compute, copy.
+8. **DRM uAPI nouveau для Mesa NVK** (XL) — `GETPARAM`, `CHANNEL_ALLOC`,
+   `GEM_NEW/INFO`, `VM_INIT/BIND`, `EXEC`, syncobj — тогда Vulkan (DXVK) на карте.
+Риски: подписанные прошивки (свои не загрузить), WPR2 после другой ОС
+(нужен FLR/SBR), ASPM/D0, привязка RPC к версии GSP-RM.
+
 Когда дойдём до драйвера видеокарты (после llama.cpp на процессоре и
 совместимости с программами Linux), **напомнить Роману**: он разобрал
 CUDA/драйвер NVIDIA и расскажет своими словами, как всё работает (запуск
