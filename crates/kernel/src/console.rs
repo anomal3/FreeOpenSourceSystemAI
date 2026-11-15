@@ -25,6 +25,7 @@ use boot_info::{Framebuffer, PixelFormat};
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 use font8x8::legacy::BASIC_LEGACY;
+use mini_ui::typeface::{self, Face, Glyph};
 
 /// Размер глифа в таблице `BASIC_LEGACY`.
 const GLYPH_W: u32 = 8;
@@ -43,6 +44,52 @@ const MARGIN: u32 = 8;
 /// значит получить обрезанный глиф, а не отказ; поэтому она названа здесь, а не
 /// подразумевается.
 const MAX_SCALE: u32 = 3;
+
+/// Наибольшая ширина ячейки сглаженного шрифта (буфер строки на стеке).
+const CELL_MAX: usize = 32;
+
+/// Покрытие точки `(x, y)` ячейки глифом, 0..=255. `y` — от верха строки.
+fn coverage(glyph: &Glyph, x: i32, y: i32) -> u32 {
+    let gx = x - i32::from(glyph.left);
+    let gy = y - i32::from(glyph.top);
+    if gx < 0 || gy < 0 || gx >= i32::from(glyph.w) || gy >= i32::from(glyph.h) {
+        return 0;
+    }
+    let stride = usize::from(glyph.w).div_ceil(2);
+    let at = glyph.off as usize + gy as usize * stride + gx as usize / 2;
+    let byte = typeface::data::COVERAGE.get(at).copied().unwrap_or(0);
+    // Младшая тетрада — левая точка (так упаковывает генератор).
+    let level = if gx % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+    u32::from(level) * 17
+}
+
+/// Покрытие глифа, увеличенного в `zoom` раз: билинейно между точками.
+fn coverage_zoomed(glyph: &Glyph, tx: u32, ty: u32, zoom: u32) -> u32 {
+    if zoom == 1 {
+        return coverage(glyph, tx as i32, ty as i32);
+    }
+    // Центр точки цели в координатах глифа, в 1/256.
+    let fx = ((tx * 2 + 1) * 128 / zoom) as i32 - 128;
+    let fy = ((ty * 2 + 1) * 128 / zoom) as i32 - 128;
+    let (sx, wx) = (fx.div_euclid(256), fx.rem_euclid(256) as u32);
+    let (sy, wy) = (fy.div_euclid(256), fy.rem_euclid(256) as u32);
+    let top = coverage(glyph, sx, sy) * (256 - wx) + coverage(glyph, sx + 1, sy) * wx;
+    let bottom = coverage(glyph, sx, sy + 1) * (256 - wx) + coverage(glyph, sx + 1, sy + 1) * wx;
+    (top * (256 - wy) + bottom * wy) >> 16
+}
+
+/// Смешать два упакованных пикселя: `level` из 255 — доля `fg`. Каналы
+/// по байтам, поэтому порядок (RGB/BGR) не важен.
+fn blend(bg: u32, fg: u32, level: u32) -> u32 {
+    let level = level.min(255);
+    let mut out = 0;
+    for shift in [0, 8, 16] {
+        let b = (bg >> shift) & 0xff;
+        let f = (fg >> shift) & 0xff;
+        out |= ((b * (255 - level) + f * level) / 255) << shift;
+    }
+    out
+}
 
 /// Значение ячейки «что на экране — неизвестно».
 ///
@@ -66,7 +113,7 @@ const INK_DIM: u8 = 3;
 const INK_WHITE: u8 = 4;
 
 /// Шаг бегущей полосы, мс.
-const MARQUEE_MS: u64 = 70;
+const MARQUEE_MS: u64 = 30;
 /// Логотип над полосой загрузки: тот же, что у «Пуска» (RGBA, `FIMG`).
 static LOGO: &[u8] = include_bytes!("../../../assets/logo/fossai-logo.fimg");
 /// Сколько знаков строки журнала копится до перевода строки.
@@ -86,8 +133,17 @@ struct Painter {
     height: u32,
     /// Пикселей на строку развёртки; может быть больше `width`.
     stride: u32,
-    /// Во сколько раз увеличен глиф — 8x8 на экране 1024+ читается плохо.
+    /// Во сколько раз увеличен глиф 8x8 — только когда [`Painter::face`]
+    /// пуст (надпись поверх стола, `overlay`).
     scale: u32,
+    /// Сглаженный моноширинный шрифт (JetBrains Mono из `mini-ui`, 15.11:
+    /// «пиксельный, как у XP — сделай сглаженнее»); `false` — растровый 8x8.
+    ///
+    /// Признак, а не ссылка на начертание: консоль заводится, пока ядро
+    /// исполняется по тождественному отображению, и адрес статики, взятый
+    /// тогда, после ухода в верхнюю половину указывал бы в снятые таблицы
+    /// (15.11 — тройной сбой на первом же тике).
+    smooth: bool,
     /// Верх текста: [`MARGIN`], а при заставке — середина экрана.
     top: u32,
     fg: u32,
@@ -251,6 +307,10 @@ impl Painter {
         if !crate::arch::interrupts::enabled() {
             crate::input::ascii::rescue();
         }
+        if let Some(face) = self.face() {
+            self.draw_face_cell(face, col, row, byte, fg);
+            return;
+        }
         let glyph = BASIC_LEGACY[byte as usize];
         let x0 = MARGIN + col * GLYPH_W * self.scale;
         let y0 = self.top + row * GLYPH_H * self.scale;
@@ -280,22 +340,66 @@ impl Painter {
 }
 
 impl Painter {
-    /// Надпись крупным шрифтом с середины по `y`: `size` — масштаб глифа.
-    fn big_text(&self, y: u32, text: &[u8], size: u32, ink: u32) {
-        let advance = GLYPH_W * size + size; // буква и промежуток
-        let w = advance * text.len() as u32;
-        let x0 = self.width.saturating_sub(w) / 2;
-        for (index, byte) in text.iter().enumerate() {
-            let glyph = BASIC_LEGACY[*byte as usize & 0x7f];
-            for (gy, bits) in glyph.iter().copied().enumerate() {
-                for gx in 0..GLYPH_W {
-                    if (bits >> gx) & 1 != 0 {
-                        for sy in 0..size {
-                            self.fill_row(x0 + index as u32 * advance + gx * size, y + gy as u32 * size + sy, size, ink);
-                        }
-                    }
-                }
+    /// Ширина ячейки текста в точках.
+    /// Сглаженное начертание журнала (адрес берётся по месту, см. `smooth`).
+    fn face(&self) -> Option<&'static Face> {
+        self.smooth.then(|| &typeface::data::MONOLARGE)
+    }
+
+    fn cell_w(&self) -> u32 {
+        match self.face() {
+            Some(face) => typeface::cell(face).0,
+            None => GLYPH_W * self.scale,
+        }
+    }
+
+    /// Высота ячейки (строки) текста в точках.
+    fn cell_h(&self) -> u32 {
+        match self.face() {
+            Some(face) => typeface::cell(face).1,
+            None => GLYPH_H * self.scale,
+        }
+    }
+
+    /// Ячейка сглаженным шрифтом: фон известен, поэтому покрытие смешивается
+    /// с ним, а не с тем, что на экране, — из фреймбуфера не читается ничего.
+    fn draw_face_cell(&self, face: &Face, col: u32, row: u32, byte: u8, fg: u32) {
+        let (cw, ch) = typeface::cell(face);
+        let x0 = MARGIN + col * cw;
+        let y0 = self.top + row * ch;
+        let width = (cw as usize).min(CELL_MAX);
+        let glyph = if byte == b' ' { None } else { face.glyph(char::from(byte)) };
+        let mut line = [0u32; CELL_MAX];
+        for y in 0..ch {
+            for (x, slot) in line[..width].iter_mut().enumerate() {
+                let level = glyph.map_or(0, |glyph| coverage(glyph, x as i32, y as i32));
+                *slot = if level == 0 { self.bg } else { blend(self.bg, fg, level) };
             }
+            self.blit_row(x0, y0 + y, &line[..width]);
+        }
+    }
+
+    /// Надпись сглаженным шрифтом с середины по ширине, верх строки — `y`,
+    /// увеличенная в `zoom` раз с билинейным сглаживанием покрытия.
+    fn big_text(&self, y: u32, face: &Face, text: &str, zoom: u32, ink: u32) {
+        let zoom = zoom.max(1);
+        let w = face.width(text) * zoom;
+        let x0 = self.width.saturating_sub(w) / 2;
+        let height = u32::from(face.line) * zoom;
+        let mut pen = 0u32;
+        let mut line = [0u32; 512];
+        for ch in text.chars() {
+            let Some(glyph) = face.glyph(ch) else { continue };
+            let advance = u32::from(glyph.adv) * zoom;
+            let span = (advance as usize).min(line.len());
+            for ty in 0..height {
+                for (tx, slot) in line[..span].iter_mut().enumerate() {
+                    let level = coverage_zoomed(glyph, tx as u32, ty, zoom);
+                    *slot = if level == 0 { self.bg } else { blend(self.bg, ink, level) };
+                }
+                self.blit_row(x0 + pen, y + ty, &line[..span]);
+            }
+            pen += advance;
         }
     }
 
@@ -313,58 +417,135 @@ impl Painter {
         }
         let x0 = self.width.saturating_sub(side) / 2;
         let mut line = [0u32; 512];
+        // Билинейная выборка с весами в 1/256 точки (15.11: при увеличении
+        // ближайшим соседом логотип выходил «лесенкой»). Цвет берётся
+        // премножённым на альфу, иначе по краю прозрачных точек ползёт кайма.
+        let texel = |x: u32, y: u32| -> [u32; 4] {
+            let at = 8 + ((y.min(h - 1) * w + x.min(w - 1)) * 4) as usize;
+            let a = LOGO[at + 3] as u32;
+            [LOGO[at] as u32 * a / 255, LOGO[at + 1] as u32 * a / 255, LOGO[at + 2] as u32 * a / 255, a]
+        };
         for ty in 0..side {
-            let sy = ty * h / side;
+            // Центр точки цели в координатах источника, в 1/256.
+            let fy = ((ty * 2 + 1) * h * 128 / side).saturating_sub(128);
+            let (sy, wy) = (fy >> 8, fy & 0xff);
             for tx in 0..side {
-                let sx = tx * w / side;
-                let at = 8 + ((sy * w + sx) * 4) as usize;
-                let (r, g, b, a) = (LOGO[at] as u32, LOGO[at + 1] as u32, LOGO[at + 2] as u32, LOGO[at + 3] as u32);
-                let mix = |c: u32, back: u8| ((c * a + back as u32 * (255 - a)) / 255) as u8;
-                line[tx as usize] = encode(format, (mix(r, bg.0), mix(g, bg.1), mix(b, bg.2)));
+                let fx = ((tx * 2 + 1) * w * 128 / side).saturating_sub(128);
+                let (sx, wx) = (fx >> 8, fx & 0xff);
+                let (p00, p10, p01, p11) = (texel(sx, sy), texel(sx + 1, sy), texel(sx, sy + 1), texel(sx + 1, sy + 1));
+                let mut c = [0u32; 4];
+                for i in 0..4 {
+                    let top = p00[i] * (256 - wx) + p10[i] * wx;
+                    let bottom = p01[i] * (256 - wx) + p11[i] * wx;
+                    c[i] = (top * (256 - wy) + bottom * wy) >> 16;
+                }
+                let a = c[3].min(255);
+                let mix = |c: u32, back: u8| (c + back as u32 * (255 - a) / 255).min(255) as u8;
+                line[tx as usize] = encode(format, (mix(c[0], bg.0), mix(c[1], bg.1), mix(c[2], bg.2)));
             }
             self.blit_row(x0, y + ty, &line[..side as usize]);
         }
     }
 
-    /// Полоса загрузки как у Windows XP в стиле Marquee: три синих сегмента
-    /// бегут по рамке слева направо и уходят за край, `phase` — их шаг.
+    /// Полоса загрузки в духе Windows XP (Marquee): три синих сегмента бегут
+    /// по рамке слева направо и уходят за край, `phase` — шаг времени.
     /// Заполнение по этапам казалось зависшим (05.11): этапов мало, а между
-    /// ними — секунды.
+    /// ними — секунды. С 15.11 сглаженная: скруглённая рамка со смешанными
+    /// краями, сегменты едут по точкам, а не прыгают на свою ширину, и
+    /// входят/выходят плавно (край сегмента смешивается с дорожкой).
     fn progress(&self, y: u32, width: u32, height: u32, phase: u32, format: PixelFormat) {
         let x0 = self.width.saturating_sub(width) / 2;
+        let bg = encode(format, BG);
         let frame = encode(format, (0x4A, 0x55, 0x68));
         let track = encode(format, (0x0A, 0x10, 0x20));
-        self.fill_row(x0, y, width, frame);
-        self.fill_row(x0, y + height - 1, width, frame);
-        for row in 1..height - 1 {
-            self.put_pixel(x0, y + row, frame);
-            self.put_pixel(x0 + width - 1, y + row, frame);
-            self.fill_row(x0 + 1, y + row, width - 2, track);
-        }
         let pad = (height / 5).max(2);
-        let seg_h = height.saturating_sub(pad * 2);
+        let seg_h = height.saturating_sub(pad * 2).max(1);
         let seg_w = (seg_h * 2 / 3).max(3);
         let gap = (seg_w / 3).max(1);
         let inner = width.saturating_sub(pad * 2);
-        let segments = inner / (seg_w + gap);
         const RUN: u32 = 3;
-        // Группа въезжает слева и уходит вправо целиком: шагов на круг на
-        // `RUN` больше, чем сегментов.
-        let head = phase % (segments + RUN).max(1);
-        for back in 0..RUN {
-            // `head - back` — сегмент группы; за краями полосы не рисуется.
-            let Some(index) = head.checked_sub(back).filter(|index| *index < segments) else {
-                continue;
+        let run_w = RUN * (seg_w + gap);
+        // Шаг — полсегмента раз в 30 мс: гладко, скорость почти прежняя.
+        let step = (seg_w / 2).max(1);
+        let lap = inner + run_w;
+        let head = (phase * step) % lap.max(1);
+        // Левый край группы относительно начала дорожки (может быть < 0).
+        let group = head as i32 - run_w as i32;
+        let radius = (height / 2).min(6) as i32;
+        // Строка собирается кусками по 64 точки: полоса рисуется и из
+        // прерывания таймера (`splash_tick`), где стек мал — буфер во всю
+        // ширину (4 КиБ) его переполнял.
+        const CHUNK: u32 = 64;
+        let mut line = [0u32; CHUNK as usize];
+        for row in 0..height {
+            let shade = 255 - (row.saturating_sub(pad) * 110 / seg_h);
+            let blue = encode(format, ((0x2E * shade / 255) as u8, (0x8C * shade / 255) as u8, (0xF5 * shade / 255) as u8));
+            let in_seg_row = row >= pad && row < pad + seg_h;
+            for col in 0..width {
+                if col % CHUNK == 0 && col != 0 {
+                    self.blit_row(x0 + col - CHUNK, y + row, &line);
+                }
+                // Рамка: скруглённый прямоугольник, покрытие края по расстоянию
+                // до дуги угла (в 1/16 точки, без плавающей точки).
+                let (cx, cy) = (col as i32, row as i32);
+                let (w, h) = (width as i32, height as i32);
+                let dx = if cx < radius { radius - cx } else if cx >= w - radius { cx - (w - radius - 1) } else { 0 };
+                let dy = if cy < radius { radius - cy } else if cy >= h - radius { cy - (h - radius - 1) } else { 0 };
+                let outer = if dx > 0 && dy > 0 {
+                    // Расстояние центра точки до центра дуги против радиуса.
+                    let d2 = (dx * 16 - 8) * (dx * 16 - 8) + (dy * 16 - 8) * (dy * 16 - 8);
+                    let r = radius * 16;
+                    if d2 <= (r - 16) * (r - 16) {
+                        255
+                    } else if d2 >= r * r {
+                        0
+                    } else {
+                        let d = isqrt(d2 as u32) as i32;
+                        ((r - d) * 255 / 16).clamp(0, 255) as u32
+                    }
+                } else {
+                    255
+                };
+                let border = cx == 0 || cy == 0 || cx == w - 1 || cy == h - 1 || (dx > 0 && dy > 0 && outer < 255);
+                let mut color = if border { frame } else { track };
+                if in_seg_row && !border && cx >= pad as i32 && cx < (pad + inner) as i32 {
+                    let x = cx - pad as i32 - group;
+                    if x >= 0 && (x as u32) < run_w {
+                        let within = x as u32 % (seg_w + gap);
+                        if within < seg_w {
+                            // Сегмент частично за краем дорожки — гасим у краёв.
+                            let edge_l = cx - pad as i32;
+                            let edge_r = (pad + inner) as i32 - 1 - cx;
+                            let fade = (edge_l.min(edge_r).max(0) as u32 * 85).min(255);
+                            color = blend(track, blue, fade.max(64));
+                        }
+                    }
+                }
+                line[(col % CHUNK) as usize] = if outer >= 255 { color } else { blend(bg, color, outer) };
+            }
+            let tail = match width % CHUNK {
+                0 => CHUNK,
+                rest => rest,
             };
-            let sx = x0 + pad + index * (seg_w + gap);
-            for row in 0..seg_h {
-                // Сверху светлее, к низу темнее — объём, как у XP.
-                let shade = 255 - (row * 110 / seg_h.max(1));
-                let color = encode(format, ((0x2E * shade / 255) as u8, (0x8C * shade / 255) as u8, (0xF5 * shade / 255) as u8));
-                self.fill_row(sx, y + pad + row, seg_w, color);
+            if width > 0 {
+                self.blit_row(x0 + width - tail, y + row, &line[..tail as usize]);
             }
         }
     }
+}
+
+/// Целый квадратный корень (Ньютон) — для сглаживания углов.
+fn isqrt(n: u32) -> u32 {
+    if n < 2 {
+        return n;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 /// Как выглядит строка журнала на экране загрузки.
@@ -434,11 +615,13 @@ impl Console {
             return None;
         }
 
-        // Крупнее, чем было (05.11: журнал загрузки на телефоне читался с
-        // трудом): телефон 720 — вдвое, ПК от 1200 — втрое.
+        // Сглаженный JetBrains Mono (15.11, Роман: «пиксельный — сделай
+        // сглаженнее, шрифт чуть меньше, на ПК лог не влезает»): крупный кегль
+        // из `mini-ui` — 10x22 точки на ячейку вместо прежних 24x24 (8x8 втрое).
+        // Растровый 8x8 остаётся запасным для надписи поверх стола.
         let scale = if fb.width >= 1200 { 3 } else { 2 };
-        let cell_w = GLYPH_W * scale;
-        let cell_h = GLYPH_H * scale;
+        let face: &'static Face = &typeface::data::MONOLARGE;
+        let (cell_w, cell_h) = typeface::cell(face);
         let usable_w = fb.width.saturating_sub(MARGIN * 2);
         let usable_h = fb.height.saturating_sub(MARGIN * 2);
         let cols = usable_w / cell_w;
@@ -454,6 +637,7 @@ impl Console {
                 height: fb.height,
                 stride: fb.stride,
                 scale,
+                smooth: true,
                 top: MARGIN,
                 fg: encode(fb.format, FG),
                 bg: encode(fb.format, BG),
@@ -529,10 +713,11 @@ impl Console {
     /// Нарисовать заставку и отвести журналу нижнюю половину экрана.
     fn start_splash(&mut self) {
         let (w, h) = (self.fb.width, self.fb.height);
-        let cell_h = GLYPH_H * self.fb.scale;
+        let cell_h = self.fb.cell_h();
         let side = (w.min(h) / 5).clamp(64, 256);
-        let title = (self.fb.scale * 3).max(3);
-        let title_h = GLYPH_H * title;
+        let title_face: &'static Face = &typeface::data::HEADINGLARGE;
+        let title = if w >= 2560 { 3 } else { 2 };
+        let title_h = u32::from(title_face.line) * title;
         let (_, _, bar_h) = self.bar_geometry();
         // Логотип, под ним FOSSAI, под ним полоса — одним блоком над
         // серединой экрана; журнал — под серединой.
@@ -540,7 +725,7 @@ impl Console {
         let logo_y = (h / 2).saturating_sub(block + cell_h);
         self.fb.logo(logo_y, side, BG, self.format);
         let title_y = logo_y + side + side / 6;
-        self.fb.big_text(title_y, b"FOSSAI", title, self.fb.inks[INK_WHITE as usize]);
+        self.fb.big_text(title_y, title_face, "FOSSAI", title, self.fb.inks[INK_WHITE as usize]);
         self.bar_y = title_y + title_h + cell_h * 2;
         self.splash = true;
         self.stage = 0;
@@ -557,7 +742,7 @@ impl Console {
         let (w, h) = (self.fb.width, self.fb.height);
         let _ = h;
         let width = (w * 2 / 5).clamp(160, 520);
-        let height = (8 * self.fb.scale + 6).max(14);
+        let height = (self.fb.cell_h() + 4).max(14);
         (self.bar_y, width, height)
     }
 
@@ -572,8 +757,18 @@ impl Console {
         let len = self.line_len;
         line[..len].copy_from_slice(&self.line[..len]);
         self.line_len = 0;
-        let mut put = |console: &mut Self, text: &[u8], ink: u8| {
+        // Длинная строка переносится с отступом под текст после тега (15.11:
+        // на ПК журнал не влезал по ширине и обрезался).
+        const INDENT: u32 = 9;
+        let put = |console: &mut Self, text: &[u8], ink: u8| {
             for byte in text {
+                if console.col >= console.cols && console.cols > INDENT * 2 {
+                    console.newline();
+                    while console.col < INDENT && console.row < console.rows {
+                        console.put_cell(console.col, console.row, u16::from(b' '));
+                        console.col += 1;
+                    }
+                }
                 if console.col >= console.cols || console.row >= console.rows {
                     return;
                 }
@@ -776,10 +971,12 @@ impl Console {
         if !self.cursor || self.cursor_drawn || self.row >= self.rows || self.col >= self.cols {
             return;
         }
-        let x0 = MARGIN + self.col * GLYPH_W * self.fb.scale;
-        let y0 = self.fb.top + (self.row + 1) * GLYPH_H * self.fb.scale - self.fb.scale;
-        for y in 0..self.fb.scale {
-            self.fb.fill_row(x0, y0 + y, GLYPH_W * self.fb.scale, self.fb.fg);
+        let (cw, ch) = (self.fb.cell_w(), self.fb.cell_h());
+        let thick = (ch / 8).max(2);
+        let x0 = MARGIN + self.col * cw;
+        let y0 = self.fb.top + (self.row + 1) * ch - thick;
+        for y in 0..thick {
+            self.fb.fill_row(x0, y0 + y, cw, self.fb.fg);
         }
         self.cursor_drawn = true;
     }
@@ -805,10 +1002,12 @@ impl Console {
             // полоску фоном — нижний ряд пикселей глифа при этом пострадает, но
             // это единственный вариант, не стирающий символ целиком.
             None => {
-                let x0 = MARGIN + self.col * GLYPH_W * self.fb.scale;
-                let y0 = self.fb.top + (self.row + 1) * GLYPH_H * self.fb.scale - self.fb.scale;
-                for y in 0..self.fb.scale {
-                    self.fb.fill_row(x0, y0 + y, GLYPH_W * self.fb.scale, self.fb.bg);
+                let (cw, ch) = (self.fb.cell_w(), self.fb.cell_h());
+                let thick = (ch / 8).max(2);
+                let x0 = MARGIN + self.col * cw;
+                let y0 = self.fb.top + (self.row + 1) * ch - thick;
+                for y in 0..thick {
+                    self.fb.fill_row(x0, y0 + y, cw, self.fb.bg);
                 }
             }
         }
@@ -992,6 +1191,7 @@ fn draw_overlay(ov: &Overlay) {
     painter.top = OV_TOP;
     // Крупно: строки читают с фотографии экрана.
     painter.scale = 2;
+    painter.smooth = false;
     let cols = (painter.width.saturating_sub(MARGIN * 2) / (GLYPH_W * painter.scale)).min(OV_COLS as u32);
     for row in 0..OV_ROWS {
         let line = ov.lines[(ov.next + row) % OV_ROWS];
