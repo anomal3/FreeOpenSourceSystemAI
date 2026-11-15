@@ -114,6 +114,10 @@ fn bring_up(handle: StorageHandle) {
     };
     for (first_lba, count, origin) in volumes(&mut device) {
         if let Some((kind, label, fs)) = open_volume(&device, first_lba, count) {
+            if kind == "FAT32" {
+                // Живая флешка с `\FREEOS\LOG.TXT` — туда пойдёт журнал.
+                super::stick_log::offer(&device, first_lba);
+            }
             let path = MOUNT_POINTS[point];
             crate::fs::mount_volume_at(path, fs);
             MOUNTED.lock()[point] = Some(handle);

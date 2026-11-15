@@ -160,6 +160,7 @@ pub fn build_with_key(built: &Built, kind: Kind, live_key: Option<&Path>) -> Res
     payload.push(build_file(build.number));
     if kind == Kind::System {
         payload.push(live_file());
+        payload.push(log_file());
     }
     let bytes = assemble(&payload, kind)?;
 
@@ -213,6 +214,21 @@ fn live_file() -> Payload {
         path: String::from("FREEOS/LIVE"),
         data: b"live medium\n".to_vec(),
         source: PathBuf::from("(метка живого носителя)"),
+    }
+}
+
+/// Файл журнала `\FREEOS\LOG.TXT` на живом носителе (15.11, Роман: «чтобы
+/// на флешку логи писались»): заранее нужного размера, из пробелов. Ядро не
+/// умеет выделять кластеры FAT и не будет — оно переписывает сектора этого
+/// файла на месте (`usb::stick_log`), не трогая ни FAT, ни каталог.
+fn log_file() -> Payload {
+    let mut data = vec![b' '; 4 * 1024 * 1024];
+    let note = b"FossAi kernel log is written here after the USB stick comes up.\n";
+    data[..note.len()].copy_from_slice(note);
+    Payload {
+        path: String::from("FREEOS/LOG.TXT"),
+        data,
+        source: PathBuf::from("(журнал ядра на флешке)"),
     }
 }
 
@@ -719,6 +735,7 @@ pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
     payload.push(build_file(build.number));
     if kind == Kind::System {
         payload.push(live_file());
+        payload.push(log_file());
     }
     let boot = assemble_fat(&payload)?;
 

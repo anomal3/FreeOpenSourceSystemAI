@@ -868,6 +868,11 @@ fn run_session(have_input: bool) -> ! {
         if let Err(err) = sched::spawn_daemon("usb", usb::xhci::service_task) {
             kprintln!("  spawn usb service failed: {err}");
         }
+        // Журнал на живую флешку (15.11): снимает кольцо с самого начала, пишет,
+        // когда найдётся `\FREEOS\LOG.TXT`.
+        if let Err(err) = sched::spawn_daemon("sticklog", usb::stick_log::task) {
+            kprintln!("  spawn stick log failed: {err}");
+        }
     }
 
     // У EHCI задача своя по той же причине, что у OHCI ниже: контроллеры

@@ -40,6 +40,7 @@ pub mod ehci;
 pub mod hid;
 pub mod net;
 pub mod ohci;
+pub mod stick_log;
 pub mod storage;
 pub mod survey;
 pub mod xhci;
