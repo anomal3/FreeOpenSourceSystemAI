@@ -32,6 +32,7 @@ pub mod atl1c;
 pub mod card;
 pub mod dns;
 pub mod e1000;
+pub mod rtl8125;
 pub mod eth;
 pub mod icmp;
 pub mod ipv4;
@@ -387,7 +388,22 @@ unsafe fn probe(rsdp: u64) {
                     }
                     alloc::boxed::Box::new(card)
                 }
-                Err(atl1c::Atl1cError::NoCard) => {
+                // Atheros тоже нет — спрашиваем Realtek RTL8125 (15.11:
+                // встроенная сеть плат на AM5).
+                //
+                // SAFETY: см. выше.
+                Err(atl1c::Atl1cError::NoCard) => match unsafe { rtl8125::Rtl8125::probe(&root) } {
+                    Ok(card) => {
+                        crate::devices::claim(card.address(), "rtl8125");
+                        if !card.link_up() {
+                            crate::kprintln!(
+                                "  network     : rtl8125 10ec:{:04x}: no link on the wire yet",
+                                card.device_id()
+                            );
+                        }
+                        alloc::boxed::Box::new(card)
+                    }
+                    Err(rtl8125::Rtl8125Error::NoCard) => {
                     // Ни одной карты, которую мы умеем. Машина без сети — это
                     // законное состояние, а вот машина с картой, к которой нет
                     // драйвера, — повод назвать её идентификаторы вслух: по ним
@@ -404,11 +420,16 @@ unsafe fn probe(rsdp: u64) {
                             );
                         }
                         crate::kprintln!(
-                            "  network     : drivers in this kernel: virtio-net, e1000, atl1c, and USB RNDIS/CDC ECM"
+                            "  network     : drivers in this kernel: virtio-net, e1000, atl1c, rtl8125, and USB RNDIS/CDC ECM"
                         );
                     }
                     return;
                 }
+                    Err(err) => {
+                        crate::kprintln!("  network     : the RTL8125 did not come up: {err}");
+                        return;
+                    }
+                },
                 Err(err) => {
                     crate::kprintln!("  network     : the card did not come up: {err}");
                     return;
