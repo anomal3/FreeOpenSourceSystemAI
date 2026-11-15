@@ -2165,6 +2165,14 @@ fn linux_stat(argument: &str) {
 /// Видеокарта NVIDIA, если есть (13.11): что за чип и в каком состоянии —
 /// в терминал, чтобы на настоящей машине не нужна была серийная линия.
 fn gpu(argument: &str) {
+    // Этап 5 (15.11): запуск GSP-RM; число — размер кучи WPR2 в МиБ,
+    // `check` — только разобрать прошивку (работает и без карты).
+    if argument == "gsp" || argument.starts_with("gsp ") {
+        for line in crate::display::nvidia_gsp::boot_gsp(argument.trim_start_matches("gsp")) {
+            sprintln!("  gpu: {line}");
+        }
+        return;
+    }
     let Some(card) = crate::display::nvidia::found() else {
         sprintln!("  gpu: no NVIDIA card found");
         return;
@@ -2177,7 +2185,7 @@ fn gpu(argument: &str) {
         return;
     }
     if !argument.is_empty() {
-        sprintln!("  usage: gpu [boot]   (boot = run FWSEC-FRTS on the card, stage 4)");
+        sprintln!("  usage: gpu [boot | gsp [heap MiB]]   (boot = FWSEC-FRTS, stage 4; gsp = start GSP-RM, stage 5)");
         return;
     }
     let (chip, revision) = crate::display::nvidia::chip_of(card.boot0, card.boot42);

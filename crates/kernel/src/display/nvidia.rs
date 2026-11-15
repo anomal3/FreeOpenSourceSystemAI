@@ -60,6 +60,11 @@ unsafe impl Send for Card {}
 
 static CARD: SpinLock<Option<Card>> = SpinLock::new(None);
 
+/// Карта для следующих этапов (`nvidia_gsp`): устройство и окно регистров.
+pub(crate) fn card() -> Option<(crate::pci::Device, Bar0)> {
+    CARD.lock().as_ref().map(|card| (card.device, Bar0(card.mmio)))
+}
+
 /// Найденная карта, если есть.
 #[must_use]
 pub fn found() -> Option<Found> {
@@ -529,21 +534,21 @@ const SIGNATURE: usize = 384;
 
 /// Окно регистров карты.
 #[derive(Clone, Copy)]
-struct Bar0(usize);
+pub(crate) struct Bar0(pub(crate) usize);
 
 impl Bar0 {
-    fn rd(self, offset: usize) -> u32 {
+    pub(crate) fn rd(self, offset: usize) -> u32 {
         // SAFETY: смещение внутри отображённого окна BAR0, 32 бита, выровнено.
         unsafe { core::ptr::read_volatile((self.0 + offset) as *const u32) }
     }
 
-    fn wr(self, offset: usize, value: u32) {
+    pub(crate) fn wr(self, offset: usize, value: u32) {
         // SAFETY: см. `rd`; окно отображено на запись (`probe`).
         unsafe { core::ptr::write_volatile((self.0 + offset) as *mut u32, value) }
     }
 
     /// Ждать, пока `ready` не станет истиной, не дольше `us` микросекунд.
-    fn wait(self, us: u64, ready: impl Fn(Self) -> bool) -> bool {
+    pub(crate) fn wait(self, us: u64, ready: impl Fn(Self) -> bool) -> bool {
         let until = crate::time::uptime_ns().saturating_add(us * 1000);
         loop {
             if ready(self) {
@@ -557,7 +562,7 @@ impl Bar0 {
     }
 }
 
-fn spin_us(us: u64) {
+pub(crate) fn spin_us(us: u64) {
     let until = crate::time::uptime_ns().saturating_add(us * 1000);
     while crate::time::uptime_ns() < until {
         core::hint::spin_loop();

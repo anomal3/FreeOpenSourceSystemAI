@@ -264,6 +264,21 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             if let Some(source) = built.initrd() {
                 payload.push(read_payload(arch::INITRD_ESP_FILE, source)?);
             }
+            // Прошивка GSP для видеокарт NVIDIA Ampere (этап 5, 15.11):
+            // linux-firmware `nvidia/ga102/gsp/*-570.144.bin`, положенная в
+            // `build/nvidia-fw`. Её нет — образ собирается без неё, и `gpu
+            // gsp` скажет, что прошивки нет.
+            let firmware = crate::paths::work_dir().join("nvidia-fw");
+            for (name, esp) in [
+                ("booter_load-570.144.bin", "FREEOS/NVIDIA/BOOTER.BIN"),
+                ("bootloader-570.144.bin", "FREEOS/NVIDIA/BOOTLDR.BIN"),
+                ("gsp-570.144.bin", "FREEOS/NVIDIA/GSP.BIN"),
+            ] {
+                let source = firmware.join(name);
+                if source.is_file() {
+                    payload.push(read_payload(esp, &source)?);
+                }
+            }
         }
         Kind::Installer => {
             let installer = built.get(Component::Installer).ok_or_else(|| {

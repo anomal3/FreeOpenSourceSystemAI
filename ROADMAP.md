@@ -13315,7 +13315,20 @@ open-gpu-kernel-modules, open-gpu-doc; на Rust есть `drivers/gpu/nova-core
    DMEM 0x600 (FBIF 0x600 = 5, PIO на GA102+ закрыт) → BROM (0x111210/19c/198/
    180) → старт → MAILBOX0 == 0, 0x1438>>16 == 0, WPR2 lo == FRTS. Один раз за
    включение питания: повторно WPR2 уже задан.
-5. **Booter и GSP-RM** (L) — файлы linux-firmware `nvidia/ga106/gsp/`
+   **ПРОВЕРЕНО на RTX 3060 (15.11): WPR2 0x2ffe00000, подпись 2 по фьюзу 0x3.**
+5. **Написано (15.11), ждёт проверки: `gpu gsp [куча МиБ | check]`**
+   (`display/nvidia_gsp.rs`). Прошивка linux-firmware 570.144 (`ga102/gsp`:
+   booter_load, bootloader, gsp) кладётся `xtask image` из `build/nvidia-fw`
+   в `\FREEOS\NVIDIA\` живой флешки. `check` разбирает её без карты —
+   проверено в QEMU (IMEM 0x8900@0x100, DMEM 0x6200@0x8a00, PARAADDR 0x10,
+   15513 страниц, 31 страница lvl2). Порядок по nova/nouveau: radix3, LIBOS
+   (LOGINIT/LOGINTR/LOGRM/RMARGS), очереди 0x81000 (63 ячейки), GspFwWprMeta
+   r570, SET_SYSTEM_INFO + SET_REGISTRY до запуска, GSP: сброс + BCR 0x111,
+   booter на SEC2 (DMA, подпись по фьюзу 0x824148), RISC-V active, ждать
+   INIT_DONE с RUN_CPU_SEQUENCER, GET_GSP_STATIC_INFO (имя карты). Куча WPR2 128
+   МиБ (nova), при неудаче `gpu gsp 170` (nouveau). Неудача — только
+   выключение питания (WPR2 задан).
+   Было в плане: **Booter и GSP-RM** (L) — файлы linux-firmware `nvidia/ga106/gsp/`
    (booter_load, gsp-570.144 или 535.113.01 — сверить), radix3, LIBOS, очереди
    команд и сообщений, RPC `SET_SYSTEM_INFO`/`SET_REGISTRY`, ждать
    `GSP_INIT_DONE`, `GET_GSP_STATIC_INFO`. Структуры — строго той же версии.
