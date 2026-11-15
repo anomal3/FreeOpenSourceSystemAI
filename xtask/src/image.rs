@@ -160,7 +160,6 @@ pub fn build_with_key(built: &Built, kind: Kind, live_key: Option<&Path>) -> Res
     payload.push(build_file(build.number));
     if kind == Kind::System {
         payload.push(live_file());
-        payload.push(log_file());
     }
     let bytes = assemble(&payload, kind)?;
 
@@ -216,6 +215,13 @@ fn live_file() -> Payload {
         source: PathBuf::from("(метка живого носителя)"),
     }
 }
+
+/// Раздел журнала на живом носителе: обычный раздел данных FAT32, который
+/// Windows подключает сама (системному разделу EFI на сменном носителе она
+/// буквы не даёт — 15.11, Роман не смог прочитать журнал с флешки).
+const LOGS_PART_BYTES: u64 = 40 * 1024 * 1024;
+/// Тип раздела «Microsoft basic data».
+const BASIC_DATA_TYPE: Guid = Guid::new(0xEBD0_A0A2, 0xB9E5, 0x4433, [0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7]);
 
 /// Файл журнала `\FREEOS\LOG.TXT` на живом носителе (15.11, Роман: «чтобы
 /// на флешку логи писались»): заранее нужного размера, из пробелов. Ядро не
@@ -412,7 +418,9 @@ fn esp_path_string(path: PathBuf) -> String {
 fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
     let content: u64 = payload.iter().map(|file| file.data.len() as u64).sum();
     let esp_bytes = esp_size(content);
-    let disk_bytes = 2 * GPT_MARGIN_BYTES + esp_bytes;
+    // Живой носитель несёт второй раздел — для журнала (см. `log_file`).
+    let logs_bytes = if kind == Kind::System { LOGS_PART_BYTES } else { 0 };
+    let disk_bytes = 2 * GPT_MARGIN_BYTES + esp_bytes + logs_bytes;
     let sectors = disk_bytes / SECTOR_SIZE as u64;
 
     let mut dev = MemDisk::new(sectors).with_context(|| {
@@ -431,19 +439,30 @@ fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
     let seed = content_hash(payload);
 
     gpt::wipe(&mut dev).map_err(|err| anyhow::anyhow!("не удалось очистить образ: {err}"))?;
-    gpt::write(
-        &mut dev,
-        Guid::from_entropy(expand(seed, b"freeos-disk-guid")),
-        &[PartitionSpec {
-            type_guid: gpt::ESP_TYPE,
-            unique_guid: Guid::from_entropy(expand(seed, b"freeos-esp-guid")),
-            first_lba: layout.esp.first_lba,
-            last_lba: layout.esp.last_lba,
+    let mut partitions = vec![PartitionSpec {
+        type_guid: gpt::ESP_TYPE,
+        unique_guid: Guid::from_entropy(expand(seed, b"freeos-esp-guid")),
+        first_lba: layout.esp.first_lba,
+        last_lba: layout.esp.last_lba,
+        attributes: 0,
+        name: "FreeOS ESP",
+    }];
+    let logs = (logs_bytes != 0).then(|| {
+        let first_lba = (layout.esp.last_lba + 1).div_ceil(2048) * 2048;
+        gpt::Range { first_lba, last_lba: first_lba + logs_bytes / SECTOR_SIZE as u64 - 1 }
+    });
+    if let Some(range) = logs {
+        partitions.push(PartitionSpec {
+            type_guid: BASIC_DATA_TYPE,
+            unique_guid: Guid::from_entropy(expand(seed, b"freeos-logs-guid")),
+            first_lba: range.first_lba,
+            last_lba: range.last_lba,
             attributes: 0,
-            name: "FreeOS ESP",
-        }],
-    )
-    .map_err(|err| anyhow::anyhow!("не удалось записать таблицу разделов: {err}"))?;
+            name: "FossAi logs",
+        });
+    }
+    gpt::write(&mut dev, Guid::from_entropy(expand(seed, b"freeos-disk-guid")), &partitions)
+        .map_err(|err| anyhow::anyhow!("не удалось записать таблицу разделов: {err}"))?;
 
     let mut volume = fat32::format(
         &mut dev,
@@ -481,6 +500,24 @@ fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
     volume
         .finish(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось завершить том FAT32: {err}"))?;
+
+    if let Some(range) = logs {
+        let mut logs = fat32::format(
+            &mut dev,
+            range,
+            &fat32::FormatOptions {
+                label: "FOSSAI LOGS",
+                volume_id: (seed >> 16) as u32 ^ 0x1065_a1a1,
+                timestamp: fat32::Timestamp::EPOCH,
+            },
+        )
+        .map_err(|err| anyhow::anyhow!("не удалось отформатировать раздел журнала: {err}"))?;
+        let file = log_file();
+        logs.write_file_path(&mut dev, &file.path, &file.data)
+            .map_err(|err| anyhow::anyhow!("не удалось записать журнал-заготовку: {err}"))?;
+        logs.finish(&mut dev)
+            .map_err(|err| anyhow::anyhow!("не удалось завершить раздел журнала: {err}"))?;
+    }
 
     Ok(dev.into_vec())
 }
@@ -735,7 +772,6 @@ pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
     payload.push(build_file(build.number));
     if kind == Kind::System {
         payload.push(live_file());
-        payload.push(log_file());
     }
     let boot = assemble_fat(&payload)?;
 

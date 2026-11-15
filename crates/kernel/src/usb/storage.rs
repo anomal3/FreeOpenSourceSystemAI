@@ -112,12 +112,14 @@ fn bring_up(handle: StorageHandle) {
         kprintln!("  usb-storage : no free mount point; the device stays unmounted");
         return;
     };
-    for (first_lba, count, origin) in volumes(&mut device) {
+    let found = volumes(&mut device);
+    // Живая флешка несёт журнал в своём разделе (`\FREEOS\LOG.TXT`), и
+    // монтировать его незачем: ядро переписывает только сектора файла.
+    for (first_lba, _, _) in &found {
+        super::stick_log::offer(&device, *first_lba);
+    }
+    for (first_lba, count, origin) in found {
         if let Some((kind, label, fs)) = open_volume(&device, first_lba, count) {
-            if kind == "FAT32" {
-                // Живая флешка с `\FREEOS\LOG.TXT` — туда пойдёт журнал.
-                super::stick_log::offer(&device, first_lba);
-            }
             let path = MOUNT_POINTS[point];
             crate::fs::mount_volume_at(path, fs);
             MOUNTED.lock()[point] = Some(handle);

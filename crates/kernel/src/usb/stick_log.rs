@@ -52,6 +52,8 @@ struct Target {
 static TARGET: SpinLock<Option<Target>> = SpinLock::new(None);
 /// Всё, что ядро напечатало с запуска (насколько успели снять с кольца).
 static CAPTURED: SpinLock<Vec<u8>> = SpinLock::new(Vec::new());
+/// До какой позиции кольца журнала снято в [`CAPTURED`].
+static CAPTURED_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn le16(b: &[u8], at: usize) -> u32 {
     u32::from(u16::from_le_bytes([b[at], b[at + 1]]))
@@ -207,18 +209,19 @@ impl Target {
 
 /// Задача: снимать кольцо журнала в память и дописывать на флешку.
 pub fn task() {
-    let mut position = 0u64;
     let mut next_flush = 0u64;
     let mut chunk = alloc::vec![0u8; 4096];
     loop {
         // Снять новое с кольца.
         loop {
+            // Позиция общая с `flush_now`: снимать одно и то же дважды нельзя.
+            let mut captured = CAPTURED.lock();
+            let position = CAPTURED_AT.load(core::sync::atomic::Ordering::Acquire);
             let (count, next) = crate::klog::read(position, &mut chunk);
-            position = next;
+            CAPTURED_AT.store(next, core::sync::atomic::Ordering::Release);
             if count == 0 {
                 break;
             }
-            let mut captured = CAPTURED.lock();
             let room = CAPTURE_MAX.saturating_sub(captured.len());
             captured.extend_from_slice(&chunk[..count.min(room)]);
         }
@@ -229,6 +232,24 @@ pub fn task() {
         }
         crate::sched::sleep_ms(CAPTURE_MS);
     }
+}
+
+/// Дописать всё накопленное сейчас — перед выключением и перезагрузкой.
+pub fn flush_now() {
+    let mut position = CAPTURED_AT.load(core::sync::atomic::Ordering::Acquire);
+    let mut chunk = [0u8; 512];
+    loop {
+        let (count, next) = crate::klog::read(position, &mut chunk);
+        position = next;
+        if count == 0 {
+            break;
+        }
+        let mut captured = CAPTURED.lock();
+        let room = CAPTURE_MAX.saturating_sub(captured.len());
+        captured.extend_from_slice(&chunk[..count.min(room)]);
+    }
+    CAPTURED_AT.store(position, core::sync::atomic::Ordering::Release);
+    flush();
 }
 
 fn flush() {
