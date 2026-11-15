@@ -13304,6 +13304,17 @@ open-gpu-kernel-modules, open-gpu-doc; на Rust есть `drivers/gpu/nova-core
 4. **FWSEC-FRTS** (L, главный риск) — образ FWSEC из VBIOS (ucode type 0x85),
    патч DMEM-маппера (команда FRTS 0x15), подпись из VBIOS по fuse
    (`0x8241c0`), запуск на GSP falcon, проверка `0x001438` и WPR2.
+   **Написано (15.11), ждёт проверки на ПК Романа: `gpu boot`** — только по
+   команде. Чтение VBIOS на RTX 3060 подтверждено снимком (GA106, 12288 МиБ,
+   4 образа, BIT, FWSEC v3 at 0x41210). Порядок по nova-core/nouveau: GFW boot
+   (0x118128/0x118234) → WPR2 не задан → FRTS = выравн.(VGA workspace 0x625f04
+   или конец VRAM по 0x1183a4, 128K) − 1 МиБ → подпись по фьюзу
+   (fls, popcount ниже) в DMEM+pkc → DMEMMAPPER (appif id 4) init_cmd 0x15 +
+   команда read_vbios/frts_region → bus master, страница flush (0x100c40/10)
+   → сброс GSP Falcon (0x110000), ядро Falcon (0x111668) → DMA IMEM 0x614 /
+   DMEM 0x600 (FBIF 0x600 = 5, PIO на GA102+ закрыт) → BROM (0x111210/19c/198/
+   180) → старт → MAILBOX0 == 0, 0x1438>>16 == 0, WPR2 lo == FRTS. Один раз за
+   включение питания: повторно WPR2 уже задан.
 5. **Booter и GSP-RM** (L) — файлы linux-firmware `nvidia/ga106/gsp/`
    (booter_load, gsp-570.144 или 535.113.01 — сверить), radix3, LIBOS, очереди
    команд и сообщений, RPC `SET_SYSTEM_INFO`/`SET_REGISTRY`, ждать

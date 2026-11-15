@@ -1164,7 +1164,7 @@ fn run_builtin(line: &str) -> bool {
         }
         "ui" => ui_status(argument),
         "tasks" => tasks(),
-        "gpu" => gpu(),
+        "gpu" => gpu(argument),
         #[cfg(target_arch = "x86_64")]
         "lxstat" => linux_stat(argument),
         // Вызовы программ Linux и (N4) родных программ — на обеих архитектурах.
@@ -2164,11 +2164,22 @@ fn linux_stat(argument: &str) {
 
 /// Видеокарта NVIDIA, если есть (13.11): что за чип и в каком состоянии —
 /// в терминал, чтобы на настоящей машине не нужна была серийная линия.
-fn gpu() {
+fn gpu(argument: &str) {
     let Some(card) = crate::display::nvidia::found() else {
         sprintln!("  gpu: no NVIDIA card found");
         return;
     };
+    // Этап 4 (15.11): первая запись в карту — только по прямой просьбе.
+    if argument == "boot" {
+        for line in crate::display::nvidia::boot_fwsec() {
+            sprintln!("  gpu: {line}");
+        }
+        return;
+    }
+    if !argument.is_empty() {
+        sprintln!("  usage: gpu [boot]   (boot = run FWSEC-FRTS on the card, stage 4)");
+        return;
+    }
     let (chip, revision) = crate::display::nvidia::chip_of(card.boot0, card.boot42);
     sprintln!(
         "  gpu: NVIDIA {} {} rev {:02x}, PCI {:02x}:{:02x}.{} device {:04x} rev {:02x}",
