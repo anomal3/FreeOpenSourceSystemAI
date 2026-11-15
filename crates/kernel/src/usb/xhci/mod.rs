@@ -588,6 +588,14 @@ pub struct Controller {
     /// Чем закончилась последняя неудачная попытка поднять устройство: порт,
     /// шаг и сама ошибка.
     last_error: Option<(u8, Stage, XhciError)>,
+    /// Корневые порты, где подъём устройства не удался: порт, когда пробовать
+    /// снова (мс) и сколько раз уже не вышло.
+    ///
+    /// 15.11, настольный ПК на AMD B840: какое-то встроенное устройство не
+    /// поднималось, каждая попытка сбрасывала порт, сброс присылал событие
+    /// порта, событие — новую пересборку, и задача USB крутилась в этом кругу,
+    /// не разбирая кольца событий: мышь рывками, клавиши по три раза.
+    failed_ports: Vec<(u8, u64, u8)>,
     /// Состав портов изменился: либо контроллер сообщил событием, либо это
     /// заметила сверка маски. Разбирает признак задача, а не тот, кто его
     /// поставил.
@@ -724,6 +732,7 @@ impl Controller {
             services: 0,
             occupied: 0,
             last_error: None,
+            failed_ports: Vec::new(),
             ports_changed: false,
             connected: 0,
         };
@@ -1211,16 +1220,29 @@ impl Controller {
             if self.devices.iter().any(|device| device.port == port) {
                 continue;
             }
+            // Порт, где подъём уже не удался, ждёт своего срока.
+            let now = crate::time::uptime_ms();
+            let tries = match self.failed_ports.iter().find(|(p, _, _)| *p == port) {
+                Some((_, retry_at, _)) if now < *retry_at => continue,
+                Some((_, _, tries)) => *tries,
+                None => 0,
+            };
 
             // SAFETY: см. выше.
             match unsafe { self.attach_one(port) } {
                 Ok((k, m)) => {
                     keyboard |= k;
                     mouse |= m;
+                    self.failed_ports.retain(|(p, _, _)| *p != port);
                 }
                 Err((stage, err)) => {
-                    kprintln!("  usb         : port {port} failed while {stage}: {err}");
+                    // Пауза растёт: 2, 4, 8 … до минуты.
+                    let tries = tries.saturating_add(1);
+                    let pause = (2000u64 << tries.min(5)).min(60_000);
+                    kprintln!("  usb         : port {port} failed while {stage}: {err} (try {tries}, next in {pause} ms)");
                     self.last_error = Some((port, stage, err));
+                    self.failed_ports.retain(|(p, _, _)| *p != port);
+                    self.failed_ports.push((port, now + pause, tries));
                 }
             }
         }
@@ -1249,6 +1271,8 @@ impl Controller {
 
         // SAFETY: контракт функции.
         let connected = unsafe { self.connected_mask() };
+        // Вынутое устройство прощено: вставят снова — попробуем сразу.
+        self.failed_ports.retain(|(port, _, _)| connected & 1u32.checked_shl(u32::from(*port) - 1).unwrap_or(0) != 0);
 
         // Сначала — исчезнувшие: их слоты нужны тем, кто пришёл на их место.
         // Вместе с хабом уходит всё, что за ним: у таких устройств тот же
@@ -4384,10 +4408,14 @@ pub fn net_send(handle: UsbHandle, data: &[u8], zlp: bool) -> Result<(), NetErro
 /// незанятом BAR, существует, и клавиатура на нём должна работать.
 /// Наибольший сон задачи обслуживания при работающих прерываниях, мс.
 const IRQ_SAFETY_MS: u64 = 250;
+/// Наименьший промежуток между пересборками портов, мс.
+const HOTPLUG_MIN_MS: u64 = 200;
 
 pub fn service_task() {
     let by_interrupt = interrupts_enabled();
     let mut next_port_check = 0u64;
+    let mut next_hotplug = 0u64;
+    let mut pending_hotplug = 0u32;
 
     loop {
         service();
@@ -4407,8 +4435,12 @@ pub fn service_task() {
             next_port_check = now.saturating_add(PORT_CHECK_PERIOD_MS);
         }
         let changed = ports_changed(compare_mask);
-        if changed != 0 {
-            poll_hotplug(changed);
+        // Пересборка не чаще раза в 200 мс: между ними задача разбирает
+        // кольца событий, то есть ввод (15.11, см. `failed_ports`).
+        pending_hotplug |= changed;
+        if pending_hotplug != 0 && now >= next_hotplug {
+            next_hotplug = now.saturating_add(HOTPLUG_MIN_MS);
+            poll_hotplug(core::mem::take(&mut pending_hotplug));
         }
 
         if by_interrupt {
