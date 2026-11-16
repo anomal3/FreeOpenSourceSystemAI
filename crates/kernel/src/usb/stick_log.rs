@@ -17,6 +17,7 @@
 //! размер файла не трогаются — сектора берутся из цепочки кластеров, которую
 //! записал `xtask`.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use disk::BlockDevice as _;
@@ -137,11 +138,42 @@ pub fn offer(device: &Shared, first_lba: u64) {
     if attr & 0x10 == 0 {
         return;
     }
-    let Some((first, size, _)) = fat.find(&mut device, dir, b"LOG     TXT") else { return };
-    if first < 2 || size == 0 {
+    // Раскладка мониторов (16.11): на живой системе корень только для
+    // чтения, и `desktop.cfg` не записать, — её место здесь же, рядом с
+    // журналом, файлом заранее нужного размера.
+    if LAYOUT.lock().is_none() {
+        if let Some((runs, size)) = file_runs(&fat, &mut device, dir, b"LAYOUT  TXT") {
+            let mut layout = Target { device: device.clone(), runs, size, flushed: 0, fresh: false, failures: 0 };
+            let text = layout.read_all();
+            *LAYOUT.lock() = Some(layout);
+            let text = String::from_utf8_lossy(&text);
+            if let Some(list) = text.lines().find_map(|line| line.trim().strip_prefix("outputs=")) {
+                if crate::display::outputs::saved().is_empty() {
+                    let saved = crate::display::outputs::parse_saved(list);
+                    kprintln!("  stick-log   : monitor layout for {} monitor(s) from \\FREEOS\\LAYOUT.TXT", saved.len());
+                    crate::display::outputs::set_saved(saved);
+                    if let Some(plan) = crate::ui::saved_layout() {
+                        crate::ui::apply_layout(plan);
+                    }
+                }
+            }
+        }
+    }
+    if TARGET.lock().is_some() {
         return;
     }
-    // Сектора файла: цепочка кластеров, слитая в непрерывные куски.
+    let Some((runs, size)) = file_runs(&fat, &mut device, dir, b"LOG     TXT") else { return };
+    kprintln!("  stick-log   : writing the kernel log to \\FREEOS\\LOG.TXT ({} KiB, {} run(s))", size / 1024, runs.len());
+    *TARGET.lock() = Some(Target { device, runs, size, flushed: 0, fresh: true, failures: 0 });
+}
+
+/// Сектора файла `name` в каталоге `dir`: цепочка кластеров, слитая в
+/// непрерывные куски, и размер.
+fn file_runs(fat: &Fat, device: &mut Shared, dir: u32, name: &[u8; 11]) -> Option<(Vec<(u64, u64)>, usize)> {
+    let (first, size, _) = fat.find(device, dir, name)?;
+    if first < 2 || size == 0 {
+        return None;
+    }
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut cluster = first;
     let mut covered = 0u64;
@@ -149,19 +181,31 @@ pub fn offer(device: &Shared, first_lba: u64) {
     while covered < wanted {
         let lba = fat.cluster_lba(cluster);
         match runs.last_mut() {
-            Some((start, count)) if *start + *count == lba => *count += per_cluster,
-            _ => runs.push((lba, per_cluster)),
+            Some((start, count)) if *start + *count == lba => *count += fat.per_cluster,
+            _ => runs.push((lba, fat.per_cluster)),
         }
-        covered += per_cluster;
+        covered += fat.per_cluster;
         if covered >= wanted {
             break;
         }
-        let Some(next) = fat.next(&mut device, cluster) else { break };
+        let next = fat.next(device, cluster)?;
         cluster = next;
     }
-    let size = (covered.min(wanted) as usize * SECTOR).min(size as usize);
-    kprintln!("  stick-log   : writing the kernel log to \\FREEOS\\LOG.TXT ({} KiB, {} run(s))", size / 1024, runs.len());
-    *TARGET.lock() = Some(Target { device, runs, size, flushed: 0, fresh: true, failures: 0 });
+    Some((runs, (covered.min(wanted) as usize * SECTOR).min(size as usize)))
+}
+
+/// Файл раскладки мониторов на флешке, если он есть.
+static LAYOUT: SpinLock<Option<Target>> = SpinLock::new(None);
+
+/// Записать раскладку мониторов на флешку (живая система). `false` — файла
+/// нет или запись не удалась.
+pub fn store_layout(text: &str) -> bool {
+    let Some(mut layout) = LAYOUT.lock().take() else { return false };
+    let size = layout.size;
+    let ok = layout.write_range(text.as_bytes(), 0, size);
+    let _ = layout.device.flush();
+    *LAYOUT.lock() = Some(layout);
+    ok
 }
 
 /// Сектор файла по номеру сектора внутри файла.
@@ -176,6 +220,19 @@ fn file_lba(runs: &[(u64, u64)], mut index: u64) -> Option<u64> {
 }
 
 impl Target {
+    /// Прочитать файл целиком.
+    fn read_all(&mut self) -> Vec<u8> {
+        let mut out = alloc::vec![0u8; self.size.div_ceil(SECTOR) * SECTOR];
+        for index in 0..out.len() / SECTOR {
+            let Some(lba) = file_lba(&self.runs, index as u64) else { break };
+            if self.device.read(lba, &mut out[index * SECTOR..(index + 1) * SECTOR]).is_err() {
+                break;
+            }
+        }
+        out.truncate(self.size);
+        out
+    }
+
     /// Записать сектора файла `[from, to)` из `bytes` (недостающее — пробелы).
     fn write_range(&mut self, bytes: &[u8], from: usize, to: usize) -> bool {
         let mut sector = from / SECTOR;

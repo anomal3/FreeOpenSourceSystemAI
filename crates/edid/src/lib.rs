@@ -81,13 +81,13 @@ impl Mode {
         (self.refresh_mhz() + 500) / 1000
     }
 
-    /// Тот же экран: размер и частота (с точностью до 0,5 Гц) совпадают.
+    /// Тот же экран: размер и частота (с точностью до 0,02 Гц) совпадают.
     #[must_use]
     pub fn same_as(&self, other: &Mode) -> bool {
         self.width == other.width
             && self.height == other.height
             && self.interlaced == other.interlaced
-            && self.refresh_mhz().abs_diff(other.refresh_mhz()) < 500
+            && self.refresh_mhz().abs_diff(other.refresh_mhz()) < 20
     }
 }
 
@@ -146,7 +146,8 @@ impl Monitor {
         let mut out: Vec<u32> = Vec::new();
         for mode in self.modes.iter().filter(|m| m.width == width && m.height == height && !m.interlaced) {
             let r = mode.refresh_mhz();
-            if !out.iter().any(|x| x.abs_diff(r) < 500) {
+            // 59,94 и 60 Гц — разные частоты (телевизоры принимают обе).
+            if !out.iter().any(|x| x.abs_diff(r) < 20) {
                 out.push(r);
             }
         }

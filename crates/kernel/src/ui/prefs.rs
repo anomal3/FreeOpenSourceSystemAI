@@ -190,7 +190,14 @@ pub fn store_open_with(ext: &str, command: &str) -> Result<(), crate::vfs::VfsEr
 pub fn store_outputs(list: alloc::vec::Vec<crate::display::outputs::Saved>) -> Result<alloc::string::String, crate::vfs::VfsError> {
     let text = crate::display::outputs::format_saved(&list);
     crate::display::outputs::set_saved(list);
-    store_key("outputs", &text)?;
+    if let Err(err) = store_key("outputs", &text) {
+        // Живая система: корень только для чтения — на флешку (16.11).
+        if crate::usb::stick_log::store_layout(&alloc::format!("outputs={text}\n")) {
+            crate::kprintln!("  desktop     : monitor layout saved on the stick (\\FREEOS\\LAYOUT.TXT)");
+            return Ok(text);
+        }
+        return Err(err);
+    }
     Ok(text)
 }
 

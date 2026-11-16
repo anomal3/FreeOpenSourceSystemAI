@@ -530,6 +530,10 @@ fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
         let file = log_file();
         logs.write_file_path(&mut dev, &file.path, &file.data)
             .map_err(|err| anyhow::anyhow!("не удалось записать журнал-заготовку: {err}"))?;
+        // Раскладка мониторов живой системы (16.11): корень только для
+        // чтения, и ядро переписывает этот файл на месте.
+        logs.write_file_path(&mut dev, "FREEOS/LAYOUT.TXT", &vec![b' '; 4096])
+            .map_err(|err| anyhow::anyhow!("не удалось записать файл раскладки: {err}"))?;
         logs.finish(&mut dev)
             .map_err(|err| anyhow::anyhow!("не удалось завершить раздел журнала: {err}"))?;
     }
