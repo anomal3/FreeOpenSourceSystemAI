@@ -203,7 +203,12 @@ pub fn default_jobs() -> usize {
 
 pub fn run(opts: &TestOptions) -> Result<()> {
     let selected: Vec<&'static Scenario> = match &opts.only {
-        Some(name) => scenarios::ALL.iter().filter(|s| s.name == *name).collect(),
+        // Через запятую — несколько сценариев одним прогоном (регрессия по
+        // подборке без отдельной сборки на каждый).
+        Some(name) => scenarios::ALL
+            .iter()
+            .filter(|s| name.split(',').any(|one| one.trim() == s.name))
+            .collect(),
         // Rider отложен (`crate::rider::enabled`): его сценарии — только
         // по имени или с `FOSSAI_WITH_RIDER=1`.
         None => scenarios::ALL

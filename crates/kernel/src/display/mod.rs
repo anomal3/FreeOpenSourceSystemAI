@@ -126,6 +126,35 @@ pub fn flush(x: i32, y: i32, w: u32, h: u32) {
     vmsvga::flush(x, y, w, h);
 }
 
+/// Показать изменившийся прямоугольник одного монитора — в его
+/// собственных координатах (16.11, несколько мониторов).
+///
+/// `primary` — это основной монитор: только поверх него лежит консоль
+/// аварийного вывода ([`crate::console::overlay_redraw`]), она рисует в
+/// буфер основного экрана. У выхода прошивки (и у одного экрана stdvga,
+/// VMSVGA, ramfb, Intel) — ровно прежний [`flush`]; у virtio-gpu — его
+/// выход; NVIDIA показывает свою память сама, сказать ей нечего.
+pub fn flush_output(backend: outputs::Backend, primary: bool, x: i32, y: i32, w: u32, h: u32) {
+    match backend {
+        outputs::Backend::Firmware => {
+            if primary {
+                flush(x, y, w, h);
+            }
+        }
+        outputs::Backend::Virtio(scanout) => {
+            if primary {
+                crate::console::overlay_redraw(y, h);
+            }
+            crate::virtio::gpu::flush_scanout(scanout, x, y, w, h);
+        }
+        outputs::Backend::Nvidia(_) => {
+            if primary {
+                crate::console::overlay_redraw(y, h);
+            }
+        }
+    }
+}
+
 /// Отдать курсор адаптеру (фаза 67b): картинка `side`×`side` точек
 /// (`0xAARRGGBB`) с точкой касания `hot`. `false` — адаптер так не умеет, и
 /// стрелку рисует стол.

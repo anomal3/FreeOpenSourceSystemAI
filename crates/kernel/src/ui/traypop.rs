@@ -82,10 +82,10 @@ fn month_days(year: i32, month: u8) -> u8 {
 }
 
 impl TrayPop {
-    /// Открыть окно `kind` над значком трея `anchor` (экран); `panel_top` —
-    /// верх панели задач.
+    /// Открыть окно `kind` над значком трея `anchor` (экран); `area` — место
+    /// основного монитора на столе, `panel_top` — верх панели задач.
     #[must_use]
-    pub fn new(kind: Kind, anchor: Rect, screen_w: u32, panel_top: i32, scale: u32) -> Option<Self> {
+    pub fn new(kind: Kind, anchor: Rect, area: Rect, panel_top: i32, scale: u32) -> Option<Self> {
         let ctx = Ctx::scaled(scale);
         let px = |value: u32| value * scale;
         let (w, h) = match kind {
@@ -99,7 +99,10 @@ impl TrayPop {
             Kind::Network => (px(320), px(PAD + 28 + 8 + 52 + 16 + 32 + PAD)),
             Kind::Calendar => (px(CELL * 7 + PAD * 2), px(PAD + 28 + 18 + 12 + 24 + CELL_H * 6 + 8 + 32 + 12)),
         };
-        let x = (anchor.x + anchor.w as i32 / 2 - w as i32 / 2).clamp(px(12) as i32, (screen_w as i32 - w as i32 - px(12) as i32).max(0));
+        // Нижний предел не выше верхнего: на узком экране `clamp` иначе паникует.
+        let low = area.x + px(12) as i32;
+        let high = (area.right() - w as i32 - px(12) as i32).max(low);
+        let x = (anchor.x + anchor.w as i32 / 2 - w as i32 / 2).clamp(low, high);
         let y = panel_top - px(12) as i32 - h as i32;
         let p = ctx.palette;
         let fill = p.tb1.over(p.tb2.color);

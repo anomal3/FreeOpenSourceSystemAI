@@ -384,8 +384,12 @@ impl Panel {
         (theme::PANEL_H + theme::PANEL_INSET * 2) * scale
     }
 
+    /// Панель на нижнем краю `area` — места основного монитора на столе (на
+    /// одном мониторе это весь экран от (0, 0)). Всё внутри панели — кнопки,
+    /// трей, док — в её собственных координатах, поэтому сдвиг монитора
+    /// касается одного `rect`.
     #[must_use]
-    pub fn new(screen_w: u32, screen_h: u32, scale: u32) -> Option<Self> {
+    pub fn new(area: Rect, scale: u32) -> Option<Self> {
         let scale = scale.max(1);
         // Оба числа обязаны быть теми же, из которых сложена [`Panel::height`]:
         // по ней композитор считает нижнюю границу рабочей области. Разойдись
@@ -397,16 +401,16 @@ impl Panel {
         };
         let inset = inset * scale;
         let plate_h = plate * scale;
-        let plate_w = screen_w.checked_sub(inset * 2).filter(|w| *w > 0)?;
+        let plate_w = area.w.checked_sub(inset * 2).filter(|w| *w > 0)?;
         let surface = Surface::new(plate_w, plate_h, glass_bg())?;
         // Плашка стоит на нижнем поле той полосы, которую панель отнимает у
         // экрана. Считается через [`Panel::height`], а не своим сложением: по
         // этому же числу нижнюю границу рабочей области считает композитор, и
         // два независимых выражения одного числа однажды разойдутся на поле.
-        let top = screen_h as i32 - Self::height(scale) as i32 + inset as i32;
+        let top = area.bottom() - Self::height(scale) as i32 + inset as i32;
         Some(Self {
             surface,
-            rect: Rect::new(inset as i32, top, plate_w, plate_h),
+            rect: Rect::new(area.x + inset as i32, top, plate_w, plate_h),
             scale,
             damage: Rect::EMPTY,
             brand: Rect::EMPTY,
@@ -1525,12 +1529,14 @@ enum CellKind {
 }
 
 impl Menu {
+    /// Меню «Пуск» над панелью основного монитора: `area` — его место на
+    /// столе, `panel_top` — верх панели в координатах стола.
     #[must_use]
-    pub fn new(panel_top: i32, scale: u32, screen_w: u32) -> Option<Self> {
+    pub fn new(area: Rect, panel_top: i32, scale: u32) -> Option<Self> {
         let scale = scale.max(1);
         let ctx = desk_ctx(scale);
         let m = Metrics::new(ctx);
-        if panel_top <= 0 {
+        if panel_top <= area.y {
             return None;
         }
 
@@ -1566,7 +1572,7 @@ impl Menu {
         // строки, а не там, где кончился экран.
         let rows_h = items.len() as u32 * m.pitch + m.rule_height();
         let body_h = rows_h.saturating_sub(m.pitch - m.row_h);
-        let card_h = (m.head_height() + body_h + m.pad).min(panel_top as u32);
+        let card_h = (m.head_height() + body_h + m.pad).min((panel_top - area.y).max(0) as u32);
 
         // На телефоне «Пуск» занимает экран целиком — от строки состояния до
         // дока. Карточка по содержимому здесь не годится: строк десяток, они
@@ -1575,7 +1581,7 @@ impl Menu {
         let (card_w, card_h, width) = if theme::is_mobile() {
             let inset = ctx.px(theme::M_INSET);
             let top = ctx.px(theme::M_STATUS_H + theme::M_INSET);
-            let full_w = screen_w.saturating_sub(inset * 2).max(1);
+            let full_w = area.w.saturating_sub(inset * 2).max(1);
             let full_h = (panel_top - top as i32).max(1) as u32;
             (full_w, full_h, full_w.saturating_sub(m.pad * 2))
         } else {
@@ -1583,8 +1589,8 @@ impl Menu {
             use start_menu::*;
             let _ = (card_w, card_h);
             let w = ctx.px(PAD * 2 + CELL_W * COLUMNS + GAP + LIST_W);
-            let h = ctx.px(MAX_H).min((panel_top as u32).saturating_sub(ctx.px(8)));
-            (w.min(screen_w), h, width)
+            let h = ctx.px(MAX_H).min(((panel_top - area.y).max(0) as u32).saturating_sub(ctx.px(8)));
+            (w.min(area.w), h, width)
         };
 
         let surface = Surface::new(card_w, card_h, glass_bg())?;
@@ -1594,7 +1600,7 @@ impl Menu {
         let left = if theme::is_mobile() { ctx.px(theme::M_INSET) } else { m.inset + ctx.px(8) };
         let lift = if theme::is_mobile() { 0 } else { ctx.px(8) as i32 };
         let rect = Rect::new(
-            left as i32,
+            area.x + left as i32,
             panel_top - surface.height() as i32 - lift,
             surface.width(),
             surface.height(),

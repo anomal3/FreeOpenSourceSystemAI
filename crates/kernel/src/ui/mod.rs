@@ -665,7 +665,15 @@ pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
     // Буфер кадра — условие работы стола, а не украшение: без него собирать
     // картинку негде. Не хватило памяти — система работает в серийной линии,
     // ровно как на машине без фреймбуфера.
-    let Some(mut desktop) = Compositor::new(screen, scale) else {
+    // Стол поднимается на одном экране — основном; остальные мониторы
+    // подключаются, когда реестр их узнает (см. [`attach_outputs`]).
+    let primary = compositor::OutputSlot {
+        rect: mini_ui::Rect::new(0, 0, screen.width(), screen.height()),
+        screen,
+        backend: primary_backend(),
+        primary: true,
+    };
+    let Some(mut desktop) = Compositor::new(alloc::vec![primary], scale) else {
         return false;
     };
 
@@ -689,7 +697,7 @@ pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
         desktop.screen_width(),
         desktop.screen_height(),
         desktop.scale(),
-        desktop.screen_height() as i32 - desktop.work_bottom(),
+        desktop.primary_rect().bottom() - desktop.work_bottom(),
     );
     for entry in desktop.buttons() {
         log_window(&desktop, entry.app, entry.focused);
@@ -740,6 +748,17 @@ pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
     *DESKTOP.lock() = Some(desktop);
     GRAPHICS.store(true, core::sync::atomic::Ordering::Relaxed);
     true
+}
+
+/// Кто показывает основной экран: virtio-gpu — его выход 0 (туда стол
+/// поставил свой экран при запуске), остальное — один экран, который
+/// обновляется прежним [`crate::display::flush`].
+fn primary_backend() -> crate::display::outputs::Backend {
+    if crate::virtio::gpu::active() {
+        crate::display::outputs::Backend::Virtio(0)
+    } else {
+        crate::display::outputs::Backend::Firmware
+    }
 }
 
 /// Доступен ли стол **прямо сейчас**.
@@ -1010,12 +1029,24 @@ fn flush_deferred(desktop: &mut Compositor) {
 }
 
 /// Где на экране стоит окно программы.
+///
+/// Новые окна открываются на основном мониторе: раскладка считается в его
+/// координатах и сдвигается на его место на столе.
 fn layout(desktop: &Compositor, app: App) -> Rect {
+    if theme::is_mobile() {
+        return desktop.mobile_rect();
+    }
+    let p = desktop.primary_rect();
+    layout_local(desktop, app).translate(p.x, p.y)
+}
+
+/// [`layout`] в координатах основного монитора.
+fn layout_local(desktop: &Compositor, app: App) -> Rect {
     // Раскладка считается от размера экрана, а не задана числами: прошивка
     // вправе дать и 800×600, и 1920×1080, и окно, не помещающееся на экран,
     // выглядело бы как испорченная графика.
     let width = desktop.screen_width();
-    let work = desktop.work_bottom().max(1) as u32;
+    let work = (desktop.work_bottom() - desktop.primary_rect().y).max(1) as u32;
     let margin = width / 24;
 
     // На телефоне окно занимает экран целиком — от строки состояния до
@@ -3855,7 +3886,7 @@ fn switch_mode(desktop: &mut Compositor, width: u32, height: u32, status: &Statu
         desktop.screen_width(),
         desktop.screen_height(),
         desktop.scale(),
-        desktop.screen_height() as i32 - desktop.work_bottom(),
+        desktop.primary_rect().bottom() - desktop.work_bottom(),
     );
     for entry in desktop.buttons() {
         log_window(desktop, entry.app, entry.focused);
@@ -4893,8 +4924,11 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         // **под содержимое**, а полосу рисует ядро. Считать иначе значило бы
         // отдавать ей окно, в котором её же рисунок наполовину под заголовком.
         let full_h = if framed { h.saturating_add(Window::title_height(scale)) } else { h };
+        // Окно программы открывается на основном мониторе, по центру его
+        // рабочей области.
+        let p = desktop.primary_rect();
         let screen = desktop.screen_width();
-        let work = desktop.app_bottom().max(1) as u32;
+        let work = (desktop.app_bottom() - p.y).max(1) as u32;
         // На телефоне окно программы открывается во весь экран, как у Android
         // (05.11): рамку держит стол, пиксели лежат в ней по центру или
         // срезаны (NetSurf просит 800×600 на экране шириной 720), а умеющей
@@ -4905,8 +4939,8 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
             desktop.app_area()
         } else {
             Rect::new(
-                ((screen.saturating_sub(w)) / 2) as i32,
-                ((work.saturating_sub(full_h)) / 2) as i32,
+                p.x + ((screen.saturating_sub(w)) / 2) as i32,
+                p.y + ((work.saturating_sub(full_h)) / 2) as i32,
                 w,
                 full_h,
             )

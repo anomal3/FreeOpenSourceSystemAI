@@ -87,8 +87,38 @@ const SHADOW_SPREAD: u32 = 18;
 /// На сколько тень смещена вниз относительно самого слоя.
 const SHADOW_DROP: u32 = 10;
 
+/// Сколько мониторов стол ведёт одновременно — столько мест под их
+/// прямоугольники лежит в самом столе (см. [`Compositor::out_rects`]).
+pub const MAX_OUTPUTS: usize = 8;
+
+/// Монитор стола: экран, в который выводятся собранные полосы, и его место
+/// на общем столе.
+///
+/// Координаты стола начинаются в левом верхнем углу прямоугольника, который
+/// охватывает все включённые мониторы (а не на основном, как в реестре
+/// [`crate::display::outputs`]): так полоса кадра и все прямоугольники
+/// изменений неотрицательны, и буфер полосы просто шириной во весь стол.
+pub struct OutputSlot {
+    /// Экран монитора, в своих координатах (0..w, 0..h).
+    pub screen: Screen,
+    /// Место на столе.
+    pub rect: Rect,
+    pub backend: crate::display::outputs::Backend,
+    /// Основной: на нём панель, меню, значки, уведомления и экран блокировки.
+    pub primary: bool,
+}
+
 pub struct Compositor {
-    screen: Screen,
+    /// Мониторы стола; на машине с одним экраном — один, в (0, 0).
+    outputs: Vec<OutputSlot>,
+    /// Прямоугольник, охватывающий все мониторы, — весь стол, (0, 0, w, h).
+    union: Rect,
+    /// Место основного монитора на столе.
+    primary: Rect,
+    /// Места мониторов подряд — копия из [`Self::outputs`] для указателя:
+    /// он двигается на каждый отчёт мыши, и собирать список в куче на каждое
+    /// движение незачем.
+    out_rects: [Rect; MAX_OUTPUTS],
     /// Экран погашен по бездействию (см. [`Compositor::blank`]).
     blanked: bool,
     /// Снизу вверх: последнее окно поверх остальных.
@@ -162,7 +192,10 @@ pub struct Compositor {
     /// сцены под полётом — большая часть её 50–60 мс. Теперь — копирование.
     /// Ячейка, а не поле: рисуют обои из сборки полосы, где стол только
     /// читается.
-    wall: core::cell::RefCell<Option<(Surface, WallKey)>>,
+    ///
+    /// Мониторов несколько — картинок по одной на каждый **размер** монитора:
+    /// два одинаковых монитора делят одну.
+    wall: core::cell::RefCell<Vec<(Surface, WallKey)>>,
     /// Годна ли [`Self::under`]. Сбрасывается там, где под окнами что-то
     /// меняется (см. [`Self::invalidate_under`]).
     under_valid: bool,
@@ -287,6 +320,36 @@ const BAND_BYTES: u32 = 512 * 1024;
 const BAND_MIN: u32 = 16;
 const BAND_MAX: u32 = 256;
 
+/// Охватывающий прямоугольник, место основного монитора и места всех
+/// мониторов подряд. `None` — мониторов нет или их больше [`MAX_OUTPUTS`].
+fn layout_of(outputs: &[OutputSlot]) -> Option<(Rect, Rect, [Rect; MAX_OUTPUTS])> {
+    let rects: Vec<Rect> = outputs.iter().map(|o| o.rect).collect();
+    let primary = outputs.iter().position(|o| o.primary).unwrap_or(0);
+    layout_of_rects(&rects, primary)
+}
+
+/// То же по одним прямоугольникам (`primary` — номер основного).
+fn layout_of_rects(rects: &[Rect], primary: usize) -> Option<(Rect, Rect, [Rect; MAX_OUTPUTS])> {
+    if rects.is_empty() || rects.len() > MAX_OUTPUTS {
+        return None;
+    }
+    let mut union = rects[0];
+    let mut out = [Rect::EMPTY; MAX_OUTPUTS];
+    for (i, r) in rects.iter().enumerate() {
+        union = union.union(r);
+        out[i] = *r;
+    }
+    // Стол начинается в (0, 0): координаты мониторов приходят уже в нём.
+    let union = Rect::new(0, 0, union.right().max(0) as u32, union.bottom().max(0) as u32);
+    Some((union, rects.get(primary).copied().unwrap_or(rects[0]), out))
+}
+
+/// Буфер полосы во всю ширину стола.
+fn band_buffer(union: Rect) -> Option<Surface> {
+    let rows = (BAND_BYTES / (union.w.max(1) * 4)).clamp(BAND_MIN, BAND_MAX);
+    Surface::new(union.w, rows.min(union.h.max(1)), theme::palette().wall_top)
+}
+
 /// Слои стола, посчитанные от размера экрана, — собранные заранее под новый
 /// режим (фаза С6a). См. [`Compositor::prepare_screen`].
 pub struct Layers {
@@ -305,15 +368,17 @@ impl Compositor {
     /// прямо на экран, без буфера» здесь намеренно нет: он означал бы две
     /// сборки кадра, из которых вторая проверялась бы только на машине, где не
     /// хватило памяти, — то есть никогда.
-    pub fn new(screen: Screen, scale: u32) -> Option<Self> {
-        let mut pointer = Pointer::new(screen.width(), screen.height());
+    pub fn new(outputs: Vec<OutputSlot>, scale: u32) -> Option<Self> {
+        let (union, primary, out_rects) = layout_of(&outputs)?;
+        let mut pointer = Pointer::new(primary);
         pointer.set_scale(scale);
-        let rows = (BAND_BYTES / (screen.width().max(1) * 4)).clamp(BAND_MIN, BAND_MAX);
-        let wall = theme::palette().wall_top;
-        let back = Surface::new(screen.width(), rows.min(screen.height().max(1)), wall)?;
+        let back = band_buffer(union)?;
         let mut compositor = Self {
             back,
-            screen,
+            outputs,
+            union,
+            primary,
+            out_rects,
             windows: Vec::new(),
             focus: 0,
             panel: None,
@@ -331,7 +396,7 @@ impl Compositor {
             home: super::home::Facts::default(),
             under: None,
             scene: None,
-            wall: core::cell::RefCell::new(None),
+            wall: core::cell::RefCell::new(Vec::new()),
             under_valid: false,
             under_dirty: Rect::EMPTY,
             status_text: alloc::string::String::new(),
@@ -364,26 +429,23 @@ impl Compositor {
             cursor_sent: (0, 0),
             cursor_key: usize::MAX,
         };
-        compositor.panel = Panel::new(
-            compositor.screen.width(),
-            compositor.screen.height(),
-            scale.min(2),
-        );
+        compositor.panel = Panel::new(compositor.primary, scale.min(2));
         let panel_top = compositor.work_bottom();
-        compositor.menu = Menu::new(panel_top, scale.min(2), compositor.screen.width());
+        compositor.menu = Menu::new(compositor.primary, panel_top, scale.min(2));
         // Шторка заводится только на телефоне — [`Shade::new`] сам вернёт
         // `None` на настольной машине.
-        compositor.shade = Shade::new(compositor.screen.width(), panel_top, scale);
-        compositor.keyboard =
-            Keyboard::new(compositor.screen.width(), compositor.screen.height(), scale);
+        compositor.shade = Shade::new(compositor.primary.w, panel_top, scale);
+        compositor.keyboard = Keyboard::new(compositor.primary.w, compositor.primary.h, scale);
         // Длина столбца значков считается от рабочей области, а не от экрана:
         // ячейка, заехавшая под панель задач, щёлкается панелью, а не значком.
-        compositor.icons.set_area(panel_top);
+        // Сетка — на основном мониторе.
+        compositor.icons.set_origin(compositor.primary.x, compositor.primary.y);
+        compositor.icons.set_area(panel_top - compositor.primary.y);
         // Ширина экрана и верх сетки — телефону (см. [`Icons::set_span`]). На
         // столе вызов безвреден: мобильная раскладка спрашивает эти числа, а
         // настольная о них не знает.
         // На телефоне сетка стоит под карточкой «Система» домашнего экрана.
-        compositor.icons.set_span(compositor.screen.width(), super::home::grid_top(scale));
+        compositor.icons.set_span(compositor.primary.w, super::home::grid_top(scale));
         compositor.icons.reload();
         Some(compositor)
     }
@@ -392,7 +454,7 @@ impl Compositor {
     pub fn work_bottom(&self) -> i32 {
         match self.panel.as_ref() {
             Some(panel) => panel.rect.y,
-            None => self.screen.height() as i32,
+            None => self.primary.bottom(),
         }
     }
 
@@ -400,7 +462,7 @@ impl Compositor {
     /// экран, дока под ним нет, 04.11), на ПК — та же [`Self::work_bottom`].
     pub fn app_bottom(&self) -> i32 {
         if theme::is_mobile() && self.panel.is_some() {
-            self.screen.height() as i32 - super::gesture::bar_height(self.scale) as i32
+            self.primary.bottom() - super::gesture::bar_height(self.scale) as i32
         } else {
             self.work_bottom()
         }
@@ -411,9 +473,10 @@ impl Compositor {
     /// и полоской жеста.
     #[must_use]
     pub fn app_area(&self) -> Rect {
-        let width = self.screen.width();
+        let width = self.primary.w;
         if !theme::is_mobile() {
-            return Rect::new(0, 0, width, self.app_bottom().max(0) as u32);
+            let p = self.primary;
+            return Rect::new(p.x, p.y, width, (self.app_bottom() - p.y).max(0) as u32);
         }
         let top = mini_ui::paint::Ctx::scaled(self.scale).px(theme::M_STATUS_H) as i32;
         Rect::new(0, top, width, self.app_bottom().saturating_sub(top).max(1) as u32)
@@ -427,7 +490,7 @@ impl Compositor {
         let ctx = mini_ui::paint::Ctx::scaled(self.scale);
         let top = ctx.px(theme::M_STATUS_H + theme::M_INSET) as i32;
         let inset = ctx.px(theme::M_INSET);
-        let w = self.screen.width().saturating_sub(inset * 2).max(1);
+        let w = self.primary.w.saturating_sub(inset * 2).max(1);
         let bottom = self.app_bottom().max(1) as u32;
         let h = bottom.saturating_sub(top.max(0) as u32).max(1);
         Rect::new(inset as i32, top, w, h)
@@ -481,7 +544,7 @@ impl Compositor {
         self.raise(index);
         self.invalidate_recent();
         self.refresh_decorations();
-        self.mark(self.screen.bounds());
+        self.mark(self.union);
         true
     }
 
@@ -494,15 +557,106 @@ impl Compositor {
         }
         self.front_shown = front;
         let top = self.work_bottom().max(0);
-        self.mark(Rect::new(0, top, self.screen.width(), self.screen.height().saturating_sub(top as u32)));
+        let p = self.primary;
+        self.mark(Rect::new(p.x, top, p.w, (p.bottom() - top).max(0) as u32));
     }
 
+    /// Ширина **основного** монитора: от неё — масштаб, форма машины, место
+    /// новых окон. Весь стол — [`Self::desktop_size`].
     pub const fn screen_width(&self) -> u32 {
-        self.screen.width()
+        self.primary.w
     }
 
+    /// Высота основного монитора.
     pub const fn screen_height(&self) -> u32 {
-        self.screen.height()
+        self.primary.h
+    }
+
+    /// Размер всего стола — прямоугольника, охватывающего все мониторы.
+    pub const fn desktop_size(&self) -> (u32, u32) {
+        (self.union.w, self.union.h)
+    }
+
+    /// Весь стол (0, 0, w, h).
+    #[must_use]
+    pub const fn union_rect(&self) -> Rect {
+        self.union
+    }
+
+    /// Место основного монитора на столе.
+    #[must_use]
+    pub const fn primary_rect(&self) -> Rect {
+        self.primary
+    }
+
+    /// Места мониторов на столе, по порядку.
+    #[must_use]
+    pub fn output_rects(&self) -> &[Rect] {
+        &self.out_rects[..self.outputs.len().min(MAX_OUTPUTS)]
+    }
+
+    /// Монитор, на котором лежит точка.
+    fn output_at(&self, x: i32, y: i32) -> Option<usize> {
+        self.output_rects().iter().position(|r| r.contains(x, y))
+    }
+
+    /// Монитор под точкой, а если она в щели между ними — ближайший.
+    fn output_near(&self, x: i32, y: i32) -> usize {
+        self.output_at(x, y).unwrap_or_else(|| {
+            let mut best = 0;
+            let mut best_d = i64::MAX;
+            for (i, r) in self.output_rects().iter().enumerate() {
+                let dx = i64::from((r.x - x).max(0).max(x - (r.right() - 1)));
+                let dy = i64::from((r.y - y).max(0).max(y - (r.bottom() - 1)));
+                let d = dx * dx + dy * dy;
+                if d < best_d {
+                    best_d = d;
+                    best = i;
+                }
+            }
+            best
+        })
+    }
+
+    /// Монитор `i` без того, что внизу отнимает панель (`bottom` — её верх
+    /// или полоска жеста): у основного обрезается низ, у остальных — весь
+    /// монитор.
+    fn area_of(&self, i: usize, bottom: i32) -> Rect {
+        let r = self.output_rects().get(i).copied().unwrap_or(self.primary);
+        if r == self.primary && self.outputs.get(i).is_some_and(|o| o.primary) {
+            Rect::new(r.x, r.y, r.w, (bottom - r.y).max(0) as u32)
+        } else {
+            r
+        }
+    }
+
+    /// Рабочая область монитора `i` для окон: до панели у основного.
+    fn work_rect_of(&self, i: usize) -> Rect {
+        self.area_of(i, self.app_bottom())
+    }
+
+    /// Рабочие области всех мониторов — пределы, в которых двигаются окна.
+    fn work_rects(&self) -> ([Rect; MAX_OUTPUTS], usize) {
+        let n = self.outputs.len().min(MAX_OUTPUTS);
+        let mut areas = [Rect::EMPTY; MAX_OUTPUTS];
+        for (i, area) in areas.iter_mut().enumerate().take(n) {
+            *area = self.work_rect_of(i);
+        }
+        (areas, n)
+    }
+
+    /// Рабочая область монитора, на котором середина прямоугольника.
+    fn work_rect_under(&self, rect: Rect) -> Rect {
+        self.work_rect_of(self.output_near(rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2))
+    }
+
+    /// Куда разворачивается окно, стоящее в `rect`: на ПК — рабочая область
+    /// монитора под его серединой, на телефоне — [`Self::app_area`].
+    fn app_area_for(&self, rect: Rect) -> Rect {
+        if theme::is_mobile() {
+            return self.app_area();
+        }
+        self.work_rect_under(rect)
     }
 
     pub const fn scale(&self) -> u32 {
@@ -565,9 +719,11 @@ impl Compositor {
         let y = oy.saturating_add(anchor.1);
         // В пределах экрана, а не формы: ради этого всплывающие окна и стали
         // окнами стола. Не влезающее сдвигается внутрь экрана.
-        let max_x = (self.screen.width() as i32 - w as i32).max(0);
-        let max_y = (self.screen.height() as i32 - h as i32).max(0);
-        Some(Rect::new(x.clamp(0, max_x), y.clamp(0, max_y), w, h))
+        // Мониторов несколько — в пределах того, на котором угол владельца.
+        let o = self.output_rects()[self.output_near(x, y)];
+        let max_x = (o.right() - w as i32).max(o.x);
+        let max_y = (o.bottom() - h as i32).max(o.y);
+        Some(Rect::new(x.clamp(o.x, max_x), y.clamp(o.y, max_y), w, h))
     }
 
     /// Переставить всплывающее окно: новое место от угла владельца (фаза 62e,
@@ -1052,13 +1208,12 @@ impl Compositor {
 
     /// Сдвинуть активное окно.
     pub fn move_focused(&mut self, dx: i32, dy: i32) {
-        let width = self.screen.width();
-        let bottom = self.app_bottom();
+        let (areas, n) = self.work_rects();
         let Some(window) = self.windows.get_mut(self.focus) else {
             return;
         };
         let before = window.rect;
-        window.move_within(dx, dy, width, bottom);
+        window.move_within(dx, dy, &areas[..n]);
         if window.rect == before {
             return;
         }
@@ -1080,9 +1235,9 @@ impl Compositor {
     /// Один объединяющий при быстром движении накрыл бы полэкрана, тогда как
     /// настоящих изменений два пятна размером с курсор.
     pub fn move_pointer(&mut self, dx: i32, dy: i32) {
-        let (width, height) = (self.screen.width(), self.screen.height());
         let before = self.pointer.rect();
-        let moved = self.pointer.move_by(dx, dy, width, height);
+        let outs = self.out_rects;
+        let moved = self.pointer.move_by(dx, dy, &outs[..self.outputs.len().min(MAX_OUTPUTS)]);
         let appeared = self.pointer.show();
         if !moved && !appeared {
             return;
@@ -1120,15 +1275,17 @@ impl Compositor {
     /// это тот, кто хранит прежнее положение. Заодно из ответа исчезает та
     /// часть движения, которую съел край экрана.
     pub fn move_pointer_to(&mut self, x_fraction: u16, y_fraction: u16) -> (i32, i32) {
-        let (width, height) = (self.screen.width(), self.screen.height());
+        // Планшет показывает точку на основном мониторе: устройство одно, и
+        // его поле ложится на тот экран, где панель.
+        let p = self.primary;
         let (from_x, from_y) = self.pointer.position();
         let before = self.pointer.rect();
 
+        let outs = self.out_rects;
         let moved = self.pointer.move_to(
-            scale_fraction(x_fraction, width),
-            scale_fraction(y_fraction, height),
-            width,
-            height,
+            p.x + scale_fraction(x_fraction, p.w),
+            p.y + scale_fraction(y_fraction, p.h),
+            &outs[..self.outputs.len().min(MAX_OUTPUTS)],
         );
         let appeared = self.pointer.show();
         if !moved && !appeared {
@@ -1156,7 +1313,10 @@ impl Compositor {
     /// (stdvga, ramfb), отвечает `false`, и всё идёт по-старому. На телефоне
     /// стрелки нет вовсе.
     fn hand_cursor(&mut self, appeared: bool) -> bool {
-        if theme::is_mobile() {
+        // Мониторов несколько — стрелку рисует стол: курсор адаптера живёт на
+        // одном выходе (у virtio-gpu — на нулевом), а полоса стола одна на
+        // все мониторы и стрелку в ней покажет каждый, через который она идёт.
+        if theme::is_mobile() || self.outputs.len() > 1 {
             return false;
         }
         let (x, y) = self.pointer.position();
@@ -1383,13 +1543,13 @@ impl Compositor {
             let fresh = packages.iter().find(|launcher| !known.contains(&launcher.name) && !launcher.start.is_empty());
             if let Some(launcher) = fresh {
                 let art = super::appicon::of_manifest(&launcher.icon);
-                let panel_top = self.panel.as_ref().map_or(self.screen.height() as i32, |panel| panel.rect.y);
+                let panel_top = self.panel.as_ref().map_or(self.primary.bottom(), |panel| panel.rect.y);
                 if let Some(toast) = super::toast::Toast::new(
                     &launcher.caption,
                     &art,
                     launcher.start.clone(),
                     launcher.rights,
-                    self.screen.width(),
+                    self.primary,
                     panel_top,
                     self.scale,
                 ) {
@@ -1408,7 +1568,9 @@ impl Compositor {
         if self.lock.is_some() {
             return;
         }
-        let (w, h) = (self.screen.width(), self.screen.height());
+        // Картинка блокировки — размером с основной монитор: на нём часы и
+        // поле пароля, остальные мониторы на это время чёрные.
+        let (w, h) = (self.primary.w, self.primary.h);
         let Some(surface) = Surface::new(w, h, theme::palette().wall_top) else {
             return;
         };
@@ -1422,7 +1584,12 @@ impl Compositor {
             return;
         };
         let full = surface.bounds();
-        self.draw_background(&mut surface, full, 0);
+        // Обои основного монитора, в координатах самой картинки.
+        if theme::is_mobile() {
+            self.draw_background(&mut surface, full, 0);
+        } else {
+            self.draw_wall_on(&mut surface, full, full, 0);
+        }
         lock.draw(&mut surface, self.scale);
         self.lock = Some((lock, surface));
         self.repaint_all();
@@ -1577,8 +1744,7 @@ impl Compositor {
             self.drag_resizes = false;
             return;
         };
-        let width = self.screen.width();
-        let bottom = self.app_bottom();
+        let (areas, n) = self.work_rects();
         if self.drag_resizes {
             // Размер не меняется здесь, а запоминается: см. [`Self::pending_size`]
             // и [`Self::apply_pending_size`].
@@ -1609,7 +1775,7 @@ impl Compositor {
             return;
         };
         let before = window.rect;
-        window.move_within(dx, dy, width, bottom);
+        window.move_within(dx, dy, &areas[..n]);
         if window.rect == before {
             return;
         }
@@ -1700,7 +1866,10 @@ impl Compositor {
         let Some(index) = self.index_of(app) else {
             return false;
         };
-        let mut area = self.app_area();
+        let mut area = match self.windows.get(index) {
+            Some(window) => self.app_area_for(window.rect),
+            None => self.app_area(),
+        };
         // Терминал под открытой клавиатурой телефона — до неё: развёрнутый
         // иначе спрятал бы под ней приглашение (клавиатура ужимает его только
         // при появлении и уходе, см. [`Self::sync_keyboard`]).
@@ -1818,7 +1987,7 @@ impl Compositor {
         if self.menu_open() {
             return;
         }
-        if let Some(menu) = Menu::new(self.work_bottom(), self.scale.min(2), self.screen.width()) {
+        if let Some(menu) = Menu::new(self.primary, self.work_bottom(), self.scale.min(2)) {
             self.menu = Some(menu);
         }
     }
@@ -1838,7 +2007,7 @@ impl Compositor {
         // аптайм меняется раз в секунду, а просят обновиться на каждое касание.
         if theme::is_mobile() && self.home != status.home {
             self.home = status.home;
-            let card = super::home::system_card(self.screen.width(), self.scale);
+            let card = super::home::system_card(self.primary.w, self.scale);
             self.invalidate_under_rect(card);
             self.mark(card);
         }
@@ -1856,7 +2025,7 @@ impl Compositor {
             text.push_str(&alloc::format!(" c{}", crate::cellular::generation()));
             if text != self.status_text {
                 self.status_text = text;
-                let bar = super::statusbar::bounds(self.screen.width(), self.scale);
+                let bar = super::statusbar::bounds(self.primary.w, self.scale);
                 self.invalidate_under_rect(bar);
                 self.mark(bar);
             }
@@ -1934,7 +2103,7 @@ impl Compositor {
             return to;
         }
         let app = flight.app;
-        let fallback = Rect::new(self.screen.width() as i32 / 2, self.screen.height() as i32, 1, 1);
+        let fallback = Rect::new(self.primary.x + self.primary.w as i32 / 2, self.primary.bottom(), 1, 1);
         self.panel.as_ref().and_then(|panel| panel.anchor(app)).unwrap_or(fallback)
     }
 
@@ -1970,7 +2139,7 @@ impl Compositor {
         // посадки возвращает экрану правду.
         // Сел диалог, который затемняет стол, — затемнение по всему экрану.
         if self.scene.take().is_some() || dims(flight.app) {
-            self.mark(self.screen.bounds());
+            self.mark(self.union);
         }
         self.mark(flight.last);
         if flight.motion == Motion::Morph {
@@ -2003,7 +2172,7 @@ impl Compositor {
             // Список «Последнего» поменялся — на экран выходит его карточка.
             // Прежде здесь выходил весь экран, а картинка под ним собиралась
             // заново целиком.
-            let card = super::home::recent_card(self.screen.width(), self.scale, self.icons.bounds().bottom());
+            let card = super::home::recent_card(self.primary.w, self.scale, self.icons.bounds().bottom());
             self.mark(card);
         }
         crate::kprintln!(
@@ -2027,7 +2196,7 @@ impl Compositor {
 
     /// Карточки домашнего экрана телефона — в полосу кадра, под значками.
     fn draw_home(&self, back: &mut Surface, band: Rect, dy: i32) {
-        let width = self.screen.width();
+        let width = self.primary.w;
         super::home::draw_system(back, band, dy, width, self.scale, &self.home);
         let minimized: Vec<(App, alloc::string::String, u64)> = self
             .windows
@@ -2059,7 +2228,7 @@ impl Compositor {
     /// Карточка «Последнее» телефона: меняется, когда окно свернули, вернули
     /// или закрыли. Карточка может появиться и исчезнуть — место её то же.
     fn invalidate_recent(&mut self) {
-        let card = super::home::recent_card(self.screen.width(), self.scale, self.icons.bounds().bottom());
+        let card = super::home::recent_card(self.primary.w, self.scale, self.icons.bounds().bottom());
         self.invalidate_under_rect(card);
     }
 
@@ -2080,7 +2249,7 @@ impl Compositor {
             self.redraw_under_strip();
             return;
         }
-        let (width, height) = (self.screen.width(), self.screen.height());
+        let (width, height) = (self.union.w, self.union.h);
         let fresh = match self.under.take() {
             Some(surface) if surface.width() == width && surface.height() == height => Some(surface),
             _ => Surface::new(width, height, theme::palette().wall_top),
@@ -2112,8 +2281,8 @@ impl Compositor {
     /// рисовать нельзя: карточка, задетая полосой краем, рисуется вся, и её
     /// полупрозрачное стекло легло бы вторым слоем поверх прежнего.
     fn redraw_under_strip(&mut self) {
-        let width = self.screen.width();
-        let dirty = self.under_dirty.intersect(&self.screen.bounds());
+        let width = self.primary.w;
+        let dirty = self.under_dirty.intersect(&self.union);
         self.under_dirty = Rect::EMPTY;
         if dirty.is_empty() {
             return;
@@ -2170,7 +2339,7 @@ impl Compositor {
         let ctx = mini_ui::paint::Ctx::scaled(self.scale);
         match self.keyboard.as_ref() {
             Some(keyboard) if keyboard_up => keyboard.rect.y - ctx.px(keyboard::GAP) as i32,
-            _ => self.screen.height() as i32 - ctx.px(100) as i32,
+            _ => self.primary.h as i32 - ctx.px(100) as i32,
         }
     }
 
@@ -2183,7 +2352,7 @@ impl Compositor {
             slot: self.home.slot,
         };
         let bottom = self.start_bottom(focused);
-        self.start = Start::open(self.screen.width(), bottom, self.scale, user, focused);
+        self.start = Start::open(self.primary.w, bottom, self.scale, user, focused);
         match self.start.as_ref() {
             Some(sheet) => {
                 let rect = sheet.rect;
@@ -2275,7 +2444,7 @@ impl Compositor {
             })
             .collect();
         let count = cards.len();
-        self.tray = Sheet::cards(self.screen.width(), self.screen.height(), self.scale, &cards);
+        self.tray = Sheet::cards(self.primary.w, self.primary.h, self.scale, &cards);
         drop(cards);
         let Some(rect) = self.tray.as_ref().map(|sheet| sheet.rect) else {
             // Экран мал для карточек — прежний лист строк.
@@ -2308,7 +2477,7 @@ impl Compositor {
                 age: tray::age_text(now.saturating_sub(window.minimized_at_ms)),
             })
             .collect();
-        self.tray = Sheet::open(self.screen.width(), self.screen.height(), self.scale, &rows, switcher);
+        self.tray = Sheet::open(self.primary.w, self.primary.h, self.scale, &rows, switcher);
         match self.tray.as_ref() {
             Some(sheet) => {
                 let rect = sheet.rect;
@@ -2329,7 +2498,7 @@ impl Compositor {
     pub fn open_power(&mut self) -> bool {
         self.close_power();
         let can_off = crate::power::can_power_off();
-        self.power = super::powersheet::Sheet::open(self.screen.width(), self.screen.height(), self.scale, can_off);
+        self.power = super::powersheet::Sheet::open(self.primary.w, self.primary.h, self.scale, can_off);
         match self.power.as_ref() {
             Some(sheet) => {
                 let rect = sheet.rect;
@@ -2454,7 +2623,7 @@ impl Compositor {
         self.mark_layer(Rect::new(rect.x, rect.y - gap as i32, rect.w, rect.h + gap));
         if let Some(panel) = self.panel.as_ref() {
             let dock = panel.rect;
-            self.mark(Rect::new(0, dock.y, self.screen.width(), self.screen.height().saturating_sub(dock.y.max(0) as u32)));
+            self.mark(Rect::new(0, dock.y, self.primary.w, self.primary.h.saturating_sub(dock.y.max(0) as u32)));
         }
 
         // «Пуск» переезжает вместе с клавиатурой: встаёт над ней или опускается
@@ -2575,21 +2744,32 @@ impl Compositor {
         let Some((app, _, _, w, h)) = self.pending_size.take() else {
             return;
         };
-        let width = self.screen.width();
-        let bottom = self.app_bottom();
+        let (areas, n) = self.work_rects();
         let edges = self.resize_edges;
         let Some(index) = self.index_of(app) else {
             return;
         };
+        let Some(before) = self.windows.get(index).map(|window| window.rect) else {
+            return;
+        };
+        // Пределы — монитора, на котором окно (по его середине).
+        let work = self.work_rect_under(before);
         let Some(window) = self.windows.get_mut(index) else {
             return;
         };
-        let before = window.rect;
         let (left, top) = (edges & super::window::EDGE_LEFT != 0, edges & super::window::EDGE_TOP != 0);
         // Левый и верхний края тянут к краю экрана, правый и нижний — к
         // правому краю и панели; противоположная сторона стоит на месте.
-        let limit_w = if left { before.right().max(0) as u32 } else { width.saturating_sub(before.x.max(0) as u32) };
-        let limit_h = if top { before.bottom().max(0) as u32 } else { (bottom - before.y).max(0) as u32 };
+        let limit_w = if left {
+            (before.right() - work.x).max(0) as u32
+        } else {
+            (work.right() - before.x.max(work.x)).max(0) as u32
+        };
+        let limit_h = if top {
+            (before.bottom() - work.y).max(0) as u32
+        } else {
+            (work.bottom() - before.y).max(0) as u32
+        };
         let w = (w.max(0) as u32).min(limit_w);
         let h = (h.max(0) as u32).min(limit_h);
         if !window.resize(w, h) {
@@ -2600,7 +2780,7 @@ impl Compositor {
         if left || top {
             let new_x = if left { before.right() - window.rect.w as i32 } else { before.x };
             let new_y = if top { before.bottom() - window.rect.h as i32 } else { before.y };
-            window.move_within(new_x - window.rect.x, new_y - window.rect.y, width, bottom);
+            window.move_within(new_x - window.rect.x, new_y - window.rect.y, &areas[..n]);
         }
         if window.rect == before {
             return;
@@ -2824,10 +3004,10 @@ impl Compositor {
 
     /// Меню стола: открыть в точке, закрыть, спросить пункт под указателем.
     pub fn open_context(&mut self, x: i32, y: i32, items: &[Action]) {
-        let screen = (self.screen.width(), self.screen.height());
-        let bottom = self.work_bottom();
+        // В пределах монитора под точкой; на основном — над панелью.
+        let area = self.area_of(self.output_near(x, y), self.work_bottom());
         let rect = self.context.as_mut().map(|menu| {
-            menu.open_at(x, y, screen, bottom, items);
+            menu.open_at(x, y, area, items);
             menu.rect
         });
         // Вместе с тенью: метка самого меню — только его прямоугольник, и
@@ -2957,9 +3137,9 @@ impl Compositor {
     /// Возвращает место полосы.
     pub fn open_thumbs(&mut self, apps: Vec<App>, anchor: App) -> Option<Rect> {
         let button = self.button_of(anchor)?;
-        let panel_top = self.panel.as_ref().map_or(self.screen.height() as i32, |panel| panel.rect.y);
+        let panel_top = self.panel.as_ref().map_or(self.primary.bottom(), |panel| panel.rect.y);
         self.close_thumbs();
-        let thumbs = super::thumbs::Thumbs::new(apps, button, self.screen.width(), panel_top, self.scale);
+        let thumbs = super::thumbs::Thumbs::new(apps, button, self.primary, panel_top, self.scale);
         let rect = thumbs.rect;
         self.thumbs = Some(thumbs);
         self.mark_layer(rect);
@@ -2971,7 +3151,7 @@ impl Compositor {
         let Some(panel) = self.panel.as_ref() else { return false };
         let Some(anchor) = panel.tray_rect(item) else { return false };
         let panel_top = panel.rect.y;
-        let Some(pop) = super::traypop::TrayPop::new(kind, anchor, self.screen.width(), panel_top, self.scale) else {
+        let Some(pop) = super::traypop::TrayPop::new(kind, anchor, self.primary, panel_top, self.scale) else {
             return false;
         };
         self.mark_layer(pop.rect);
@@ -3205,12 +3385,12 @@ impl Compositor {
     /// Окно, которому после этого не хватило рабочей области, поджимается к
     /// её низу: заголовок вырос, и нижняя кромка иначе ушла бы под панель.
     pub fn retitle_all(&mut self, status: &Status) {
-        let bottom = self.app_bottom();
-        for window in self.windows.iter_mut() {
+        let works: Vec<Rect> = self.windows.iter().map(|window| self.work_rect_under(window.rect)).collect();
+        for (window, work) in self.windows.iter_mut().zip(works) {
             window.retitle();
-            let overflow = window.rect.bottom() - bottom;
+            let overflow = window.rect.bottom() - work.bottom();
             if overflow > 0 {
-                window.rect.y = (window.rect.y - overflow).max(0);
+                window.rect.y = (window.rect.y - overflow).max(work.y);
             }
         }
         self.restyle(status);
@@ -3223,11 +3403,18 @@ impl Compositor {
     /// тронут, экран прежний. В обратном порядке отказ означал бы экран нового
     /// размера и стол, которому нечем на нём рисовать.
     pub fn prepare_screen(&self, width: u32, height: u32) -> Option<Layers> {
-        let rows = (BAND_BYTES / (width.max(1) * 4)).clamp(BAND_MIN, BAND_MAX);
-        let back = Surface::new(width, rows.min(height.max(1)), theme::palette().wall_top)?;
-        let panel = Panel::new(width, height, self.scale.min(2));
-        let top = panel.as_ref().map_or(height as i32, |panel| panel.rect.y);
-        let menu = Menu::new(top, self.scale.min(2), width);
+        self.prepare_layout(&[Rect::new(0, 0, width, height)], 0)
+    }
+
+    /// Собрать слои под новую раскладку мониторов: `rects` — их места на
+    /// столе (от (0, 0) охватывающего прямоугольника), `primary` — номер
+    /// основного. Ничего не меняет, как и [`Self::prepare_screen`].
+    pub fn prepare_layout(&self, rects: &[Rect], primary: usize) -> Option<Layers> {
+        let (union, primary, _) = layout_of_rects(rects, primary)?;
+        let back = band_buffer(union)?;
+        let panel = Panel::new(primary, self.scale.min(2));
+        let top = panel.as_ref().map_or(primary.bottom(), |panel| panel.rect.y);
+        let menu = Menu::new(primary, top, self.scale.min(2));
         let context = ContextMenu::new(self.scale.min(2));
         Some(Layers { back, panel, menu, context })
     }
@@ -3245,8 +3432,38 @@ impl Compositor {
     /// терминала, и строки, уже набранные человеком, переехали бы — это другая
     /// работа, и в эту фазу она не входит.
     pub fn adopt_screen(&mut self, screen: Screen, layers: Layers, status: &Status) {
-        let (width, height) = (screen.width(), screen.height());
-        self.screen = screen;
+        let backend = self
+            .outputs
+            .iter()
+            .find(|o| o.primary)
+            .map_or(crate::display::outputs::Backend::Firmware, |o| o.backend);
+        let rect = Rect::new(0, 0, screen.width(), screen.height());
+        self.adopt_outputs(alloc::vec![OutputSlot { screen, rect, backend, primary: true }], layers, status);
+    }
+
+    /// Перейти на новую раскладку мониторов — то же, что
+    /// [`Self::adopt_screen`], для нескольких. `layers` собраны
+    /// [`Self::prepare_layout`] под эти же места.
+    pub fn adopt_outputs(&mut self, outputs: Vec<OutputSlot>, layers: Layers, status: &Status) {
+        let Some((union, primary, out_rects)) = layout_of(&outputs) else {
+            return;
+        };
+        // Мониторов стало несколько — курсор адаптера прячется, стрелку
+        // дальше рисует стол (см. [`Self::hand_cursor`]). Остался один —
+        // курсор адаптера снова заведётся при первом движении мыши.
+        if self.hw_cursor && outputs.len() > 1 {
+            let (x, y) = self.pointer.position();
+            crate::display::cursor_visible(false, x, y);
+            self.hw_cursor = false;
+        }
+        self.outputs = outputs;
+        self.union = union;
+        self.primary = primary;
+        self.out_rects = out_rects;
+        // Обои мониторов, которых в новой раскладке нет, — лишние мегабайты.
+        let sizes: Vec<(u32, u32)> = self.output_rects().iter().map(|r| (r.w, r.h)).collect();
+        self.wall.borrow_mut().retain(|(_, made)| sizes.contains(&(made.width, made.height)));
+        let (width, height) = (primary.w, primary.h);
         self.back = layers.back;
         self.panel = layers.panel;
         self.menu = layers.menu;
@@ -3254,20 +3471,23 @@ impl Compositor {
         // Клавиатура собирается заново под новый экран: её ширина и место — от
         // него. Видимость вернёт ближайший кадр (см. [`Self::sync_keyboard`]).
         self.keyboard = Keyboard::new(width, height, self.scale);
-        self.pointer = Pointer::new(width, height);
+        self.pointer = Pointer::new(self.primary);
         self.pointer.set_scale(self.scale);
         self.under = None;
         self.under_valid = false;
         self.scene = None;
         self.drag = None;
         let bottom = self.work_bottom();
-        self.icons.set_area(bottom);
+        self.icons.set_origin(self.primary.x, self.primary.y);
+        self.icons.set_area(bottom - self.primary.y);
         self.icons.reload();
-        let bottom = self.app_bottom();
         // Развёрнутое на телефоне окно («на весь экран», 05.11) и после
         // смены режима — во весь новый экран, а не прежнего размера.
         let area = theme::is_mobile().then(|| self.app_area());
-        for window in self.windows.iter_mut() {
+        // Каждое окно вписывается в рабочую область монитора, на котором
+        // оно оказалось (по середине; в щели — ближайшего).
+        let works: Vec<Rect> = self.windows.iter().map(|window| self.work_rect_under(window.rect)).collect();
+        for (window, work) in self.windows.iter_mut().zip(works) {
             if let Some(area) = area.filter(|_| window.is_maximized() && !window.popup) {
                 if window.resize(area.w, area.h) {
                     window.rect.x = area.x;
@@ -3275,17 +3495,17 @@ impl Compositor {
                     continue;
                 }
             }
-            let fit_w = window.rect.w.min(width);
-            let fit_h = window.rect.h.min(bottom.max(1) as u32);
+            let fit_w = window.rect.w.min(work.w);
+            let fit_h = window.rect.h.min(work.h.max(1));
             if (fit_w, fit_h) != (window.rect.w, window.rect.h) {
                 // Отказ — окно программы или нехватка памяти: окно остаётся
                 // своего размера и только прижимается ниже.
                 let _ = window.resize(fit_w, fit_h);
             }
-            let max_x = (width as i32 - window.rect.w as i32).max(0);
-            let max_y = (bottom - window.rect.h as i32).max(0);
-            window.rect.x = window.rect.x.clamp(0, max_x);
-            window.rect.y = window.rect.y.clamp(0, max_y);
+            let max_x = (work.right() - window.rect.w as i32).max(work.x);
+            let max_y = (work.bottom() - window.rect.h as i32).max(work.y);
+            window.rect.x = window.rect.x.clamp(work.x, max_x);
+            window.rect.y = window.rect.y.clamp(work.y, max_y);
         }
         self.restyle(status);
         self.damage_count = 0;
@@ -3294,7 +3514,7 @@ impl Compositor {
 
     /// Перерисовать весь экран — то, что делает пункт «Refresh».
     pub fn repaint_all(&mut self) {
-        let all = self.screen.bounds();
+        let all = self.union;
         self.mark(all);
     }
 
@@ -3322,9 +3542,10 @@ impl Compositor {
     /// подсветкой ведает монитор, DPMS у нас нет — там картинка чёрная, лампа
     /// горит, как раньше.
     pub fn blank(&mut self) {
-        self.screen.fill(self.screen.bounds(), Color::rgb(0, 0, 0));
-        let all = self.screen.bounds();
-        crate::display::flush(all.x, all.y, all.w, all.h);
+        for out in &self.outputs {
+            out.screen.fill(out.screen.bounds(), Color::rgb(0, 0, 0));
+            crate::display::flush_output(out.backend, out.primary, 0, 0, out.rect.w, out.rect.h);
+        }
         crate::arch::backlight(false);
         if self.hw_cursor {
             let (x, y) = self.pointer.position();
@@ -3415,7 +3636,7 @@ impl Compositor {
         super::note_frame();
 
         if self.damage_overflow {
-            let all = self.screen.bounds();
+            let all = self.union;
             super::note_full_frame();
             self.compose(all);
             self.rects += 1;
@@ -3430,7 +3651,7 @@ impl Compositor {
 
         let mut points = 0u64;
         for index in 0..self.damage_count {
-            let rect = self.damage[index].intersect(&self.screen.bounds());
+            let rect = self.damage[index].intersect(&self.union);
             if !rect.is_empty() {
                 super::note_rect(u64::from(rect.w) * u64::from(rect.h));
                 points += u64::from(rect.w) * u64::from(rect.h);
@@ -3441,8 +3662,10 @@ impl Compositor {
         self.damage_count = 0;
         let spent = crate::time::uptime_ns().wrapping_sub(started);
         super::note_frame_ns(spent);
-        let screen = self.screen.bounds();
-        super::note_screen_cost(spent, points, u64::from(screen.w) * u64::from(screen.h));
+        // Площадь мониторов, а не охватывающего прямоугольника: щели между
+        // ними не показываются и в честную долю кадра не входят.
+        let screen: u64 = self.output_rects().iter().map(|r| u64::from(r.w) * u64::from(r.h)).sum();
+        super::note_screen_cost(spent, points, screen);
     }
 
     /// Собрать сцену под летящим окном, если она нужна и её ещё нет (фаза 64).
@@ -3450,7 +3673,7 @@ impl Compositor {
         if self.flight.is_none() || self.scene.is_some() || theme::is_mobile() {
             return;
         }
-        let bounds = self.screen.bounds();
+        let bounds = self.union;
         let Some(mut scene) = Surface::new(bounds.w, bounds.h, theme::palette().wall_top) else {
             return;
         };
@@ -3469,7 +3692,7 @@ impl Compositor {
     fn draw_lower(&self, back: &mut Surface, band: Rect, dy: i32) {
         let radius = theme::R_WINDOW * self.scale;
         self.draw_background(back, band, dy);
-        super::statusbar::draw(back, band, dy, self.screen.width(), self.scale);
+        super::statusbar::draw(back, band, dy, self.primary.w, self.scale);
         self.icons.draw(back, band, dy);
         for window in self.windows.iter().filter(|window| !window.minimized && !self.hidden_by_flight(window)) {
             let r = if window.popup { 0 } else { radius };
@@ -3497,6 +3720,10 @@ impl Compositor {
     /// оптимизация убрана целиком. Оптимизация, работающая не всегда, хуже её
     /// отсутствия: она превращает картинку в лотерею.
     fn compose(&mut self, rect: Rect) {
+        let rect = rect.intersect(&self.union);
+        if rect.is_empty() {
+            return;
+        }
         // Буфер вынимается на время сборки — иначе он занят изменяемой
         // ссылкой, пока читаются окна, значки и панель, то есть весь остальной
         // композитор. Тот же приём, что и у самого стола под замком.
@@ -3515,13 +3742,21 @@ impl Compositor {
             let t0 = crate::time::uptime_ns();
             self.compose_band(&mut back, band);
             let t1 = crate::time::uptime_ns();
-            // Буфер во всю ширину экрана, поэтому по горизонтали координаты
-            // совпадают, и сдвигать надо только начало по вертикали.
-            self.screen.blit(
-                &back,
-                (band.x, band.y),
-                Rect::new(band.x, 0, band.w, band.h),
-            );
+            // Буфер во всю ширину стола, поэтому по горизонтали координаты
+            // совпадают со столом, и сдвигать надо только начало по
+            // вертикали. Каждому монитору — его кусок полосы, в его же
+            // координатах; щели между мониторами не выводятся никуда.
+            for out in &self.outputs {
+                let part = band.intersect(&out.rect);
+                if part.is_empty() {
+                    continue;
+                }
+                out.screen.blit(
+                    &back,
+                    (part.x - out.rect.x, part.y - out.rect.y),
+                    Rect::new(part.x, part.y - band.y, part.w, part.h),
+                );
+            }
             let t2 = crate::time::uptime_ns();
             // Наружу, в атомики: спрашивают эти числа по кабелю, пока стол
             // занят, а занятый стол вынут из-под замка целиком (см.
@@ -3539,7 +3774,12 @@ impl Compositor {
         // изменении только так (фаза 67a); у stdvga и ramfb это ничего не
         // делает.
         let started = crate::time::uptime_ns();
-        crate::display::flush(rect.x, rect.y, rect.w, rect.h);
+        for out in &self.outputs {
+            let part = rect.intersect(&out.rect);
+            if !part.is_empty() {
+                crate::display::flush_output(out.backend, out.primary, part.x - out.rect.x, part.y - out.rect.y, part.w, part.h);
+            }
+        }
         super::note_flush(crate::time::uptime_ns().wrapping_sub(started));
     }
 
@@ -3558,7 +3798,16 @@ impl Compositor {
         let dy = -band.y;
         // Экран блокировки закрывает всё; поверх — только указатель.
         if let Some((_, picture)) = self.lock.as_ref() {
-            back.blit_from(picture, (band.x, band.y + dy), band);
+            // Картинка — размером с основной монитор; остальные мониторы на
+            // это время чёрные.
+            let p = self.primary;
+            if self.outputs.len() > 1 {
+                back.fill(Rect::new(band.x, band.y + dy, band.w, band.h), Color::rgb(0, 0, 0));
+            }
+            let part = band.intersect(&p);
+            if !part.is_empty() {
+                back.blit_from(picture, (part.x, part.y + dy), part.translate(-p.x, -p.y));
+            }
             if !theme::is_mobile() && !self.hw_cursor {
                 self.pointer.draw(back, dy);
             }
@@ -3611,7 +3860,7 @@ impl Compositor {
         // после обоев, до значков. На настольной машине не рисуется вовсе (см.
         // [`super::statusbar`]).
         if !covered && !cached {
-            super::statusbar::draw(back, band, dy, self.screen.width(), self.scale);
+            super::statusbar::draw(back, band, dy, self.primary.w, self.scale);
             if theme::is_mobile() {
                 self.draw_home(back, band, dy);
             }
@@ -3664,7 +3913,7 @@ impl Compositor {
         // светлая пилюля у самого низа, под клавиатурой, если та открыта.
         let front = self.app_in_front();
         if front {
-            let pill = super::gesture::pill(self.screen.width(), self.screen.height(), self.scale);
+            let pill = super::gesture::pill(self.primary.w, self.primary.h, self.scale);
             if !pill.intersect(&band).is_empty() {
                 let ink = theme::palette().ink;
                 draw::rounded(back, pill.translate(0, dy), pill.h / 2, ink, 220);
@@ -3795,7 +4044,7 @@ impl Compositor {
     /// нужна и здесь: на однородной заливке движение не читается.
     fn draw_background_flat(&self, back: &mut Surface, rect: Rect, dy: i32) {
         let p = theme::palette();
-        let height = self.screen.height().max(1) as i32;
+        let height = self.primary.h.max(1) as i32;
 
         // Готовые цвета основы: двести пятьдесят шесть оттенков перехода, и
         // цвет точки — это выбор из массива, а не смешивание.
@@ -4051,43 +4300,69 @@ impl Compositor {
             self.draw_background_flat(back, rect, dy);
             return;
         }
+        // Обои у каждого монитора свои, во весь монитор: картинка, растянутая
+        // на весь охватывающий прямоугольник, разрезала бы световые пятна по
+        // стыку мониторов и сдвигала бы их при каждой смене раскладки.
+        for out in self.output_rects() {
+            let part = rect.intersect(out);
+            if !part.is_empty() {
+                self.draw_wall_on(back, *out, part, dy);
+            }
+        }
+    }
+
+    /// Обои одного монитора: `out` — его место в координатах `back` (на столе
+    /// для кадра, (0, 0, w, h) для картинки экрана блокировки), `part` — что
+    /// нарисовать, в тех же координатах.
+    fn draw_wall_on(&self, back: &mut Surface, out: Rect, part: Rect, dy: i32) {
         let p = theme::palette();
         // Всё, от чего обои зависят: другой размер, тема или выбранные в
         // «Параметрах» обои — другая картинка.
         let key = WallKey {
-            width: self.screen.width(),
-            height: self.screen.height(),
+            width: out.w,
+            height: out.h,
             dark: theme::is_dark(),
             top: p.wall_top.pixel(),
             bottom: p.wall_bottom.pixel(),
         };
         {
-            let mut wall = self.wall.borrow_mut();
-            let fresh = wall.as_ref().is_some_and(|(_, made)| *made == key);
-            if !fresh {
-                *wall = None;
+            let mut walls = self.wall.borrow_mut();
+            if !walls.iter().any(|(_, made)| *made == key) {
+                // Картинки прежней темы и обоев больше не понадобятся; других
+                // размеров — нужны другим мониторам.
+                walls.retain(|(_, made)| made.dark == key.dark && made.top == key.top && made.bottom == key.bottom);
                 if let Some(mut picture) = Surface::new(key.width, key.height, p.wall_top) {
                     let drawn = theme::wallpaper() == theme::Wallpaper::Fossai && super::wallart::paint(&mut picture);
                     if !drawn {
-                        self.draw_wallpaper(&mut picture, Rect::new(0, 0, key.width, key.height), 0);
+                        let whole = Rect::new(0, 0, key.width, key.height);
+                        self.draw_wallpaper(&mut picture, whole, 0, 0, (key.width, key.height));
                     }
-                    *wall = Some((picture, key));
+                    walls.push((picture, key));
                 }
             }
-            if let Some((picture, ..)) = wall.as_ref() {
-                back.blit_from(picture, (rect.x, rect.y + dy), rect);
+            if let Some((picture, _)) = walls.iter().find(|(_, made)| *made == key) {
+                back.blit_from(
+                    picture,
+                    (part.x, part.y + dy),
+                    Rect::new(part.x - out.x, part.y - out.y, part.w, part.h),
+                );
                 return;
             }
         }
-        // Памяти под готовые обои не нашлось — считаем по точкам, как раньше.
-        self.draw_wallpaper(back, rect, dy);
+        // Памяти под готовые обои не нашлось — считаем по точкам, как раньше,
+        // в координатах монитора.
+        let local = Rect::new(part.x - out.x, part.y - out.y, part.w, part.h);
+        self.draw_wallpaper(back, local, out.x, dy + out.y, (out.w, out.h));
     }
 
     /// Обои настольного стола по точкам: см. [`Self::draw_background`].
-    fn draw_wallpaper(&self, back: &mut Surface, rect: Rect, dy: i32) {
+    ///
+    /// `rect` — в координатах монитора размером `size`; в `back` точка
+    /// `(x, y)` монитора ложится в `(x + dx, y + dy)`.
+    fn draw_wallpaper(&self, back: &mut Surface, rect: Rect, dx: i32, dy: i32, size: (u32, u32)) {
         let p = theme::palette();
-        let width = self.screen.width().max(1) as i32;
-        let height = self.screen.height().max(1) as i32;
+        let width = size.0.max(1) as i32;
+        let height = size.1.max(1) as i32;
 
         // Числа повторяют макет: эллипс шириной в три четверти экрана с центром
         // на трети ширины у самого верха, и два круга по противоположным углам.
@@ -4132,14 +4407,19 @@ impl Compositor {
             let cool_here = cool_row < UNIT && cool_peak > 0;
             let warm_here = warm_row < UNIT && warm_peak > 0;
             let target = (y + dy) as u32;
-            let from = rect.x.max(0) as usize;
-            let to = (rect.right().max(0) as usize).min(back.width() as usize);
-            let row = back.row_mut(target);
-            if from >= to || row.len() < to {
+            // Столбцы — в координатах монитора; в строку `back` — со сдвигом.
+            let from = rect.x.max(0).max(-dx);
+            let to = rect.right().min(back.width() as i32 - dx);
+            if from >= to {
                 continue;
             }
-            for (offset, slot) in row[from..to].iter_mut().enumerate() {
-                let x = from as i32 + offset as i32;
+            let row = back.row_mut(target);
+            let (at, end) = ((from + dx) as usize, (to + dx) as usize);
+            if row.len() < end {
+                continue;
+            }
+            for (offset, slot) in row[at..end].iter_mut().enumerate() {
+                let x = from + offset as i32;
                 let d2 = glow.at(x, glow_row).clamp(0, UNIT);
                 let weight = ramp[(d2 * (RAMP as i64) / UNIT) as usize];
                 let mut pixel = base[weight as usize];
@@ -4169,7 +4449,7 @@ impl Compositor {
             while x < rect.right() {
                 draw::blend_rect(
                     back,
-                    Rect::new(x, y + dy, size, size),
+                    Rect::new(x + dx, y + dy, size, size),
                     p.wall_dot.color,
                     p.wall_dot.alpha,
                 );

@@ -44,18 +44,19 @@ pub struct Thumbs {
 
 impl Thumbs {
     /// Разложить карточки над `button`: полоса по центру кнопки, не шире
-    /// экрана, низ — в `PAD` над `panel_top`.
+    /// основного монитора (`area` — его место на столе), низ — в `PAD` над
+    /// `panel_top`.
     #[must_use]
-    pub fn new(apps: Vec<App>, button: Rect, screen_w: u32, panel_top: i32, scale: u32) -> Self {
+    pub fn new(apps: Vec<App>, button: Rect, area: Rect, panel_top: i32, scale: u32) -> Self {
         let px = |value: u32| value * scale;
         let count = apps.len().max(1) as u32;
         let card_h = px(PAD + HEAD_H + SHOT_H + PAD);
         // Сколько карточек влезает в ширину экрана.
-        let fits = ((screen_w.saturating_sub(px(PAD))) / px(CARD_W + PAD)).max(1);
+        let fits = ((area.w.saturating_sub(px(PAD))) / px(CARD_W + PAD)).max(1);
         let shown = count.min(fits);
         let width = px(PAD) + shown * px(CARD_W + PAD);
         let height = card_h + px(PAD) * 2;
-        let x = (button.x + button.w as i32 / 2 - width as i32 / 2).clamp(0, (screen_w as i32 - width as i32).max(0));
+        let x = (button.x + button.w as i32 / 2 - width as i32 / 2).clamp(area.x, (area.right() - width as i32).max(area.x));
         let y = panel_top - px(PAD) as i32 - height as i32;
         let rect = Rect::new(x, y, width, height);
         let cards = (0..shown)

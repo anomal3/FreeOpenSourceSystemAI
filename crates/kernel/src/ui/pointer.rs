@@ -106,10 +106,18 @@ pub struct Pointer {
 }
 
 impl Pointer {
-    /// Указатель в середине экрана, ещё невидимый.
+    /// Указатель в середине основного монитора (`primary` — его место на
+    /// столе), ещё невидимый.
     #[must_use]
-    pub const fn new(width: u32, height: u32) -> Self {
-        Self { x: (width / 2) as i32, y: (height / 2) as i32, visible: false, busy_until: 0, shape: Shape::Arrow, large: false }
+    pub const fn new(primary: Rect) -> Self {
+        Self {
+            x: primary.x + (primary.w / 2) as i32,
+            y: primary.y + (primary.h / 2) as i32,
+            visible: false,
+            busy_until: 0,
+            shape: Shape::Arrow,
+            large: false,
+        }
     }
 
     /// Картинки для экрана с этим множителем геометрии.
@@ -190,13 +198,12 @@ impl Pointer {
     /// Возвращает `true`, если положение действительно изменилось: отчёт мыши
     /// без движения (нажали кнопку, не шевельнув рукой) не должен требовать
     /// перерисовки.
-    pub fn move_by(&mut self, dx: i32, dy: i32, width: u32, height: u32) -> bool {
+    pub fn move_by(&mut self, dx: i32, dy: i32, outs: &[Rect]) -> bool {
         // Кончик стрелки обязан остаться на экране, иначе указатель уходит за
         // край и вернуть его нечем. Ограничение — по последней точке экрана, а
         // не по картинке: стрелка вправе высовываться за край, как в любой
-        // оконной системе.
-        let x = (self.x + dx).clamp(0, width.saturating_sub(1) as i32);
-        let y = (self.y + dy).clamp(0, height.saturating_sub(1) as i32);
+        // оконной системе. Мониторов несколько — на каком-нибудь из них.
+        let (x, y) = clamp_to_outputs(self.x + dx, self.y + dy, (self.x, self.y), outs);
         if x == self.x && y == self.y {
             return false;
         }
@@ -210,9 +217,8 @@ impl Pointer {
     /// Существует ради планшета: он сообщает не сдвиг, а положение, и «навести»
     /// для него — это буквально поставить, а не привезти. Возвращает `true`,
     /// если положение изменилось, по той же причине, что и [`Pointer::move_by`].
-    pub fn move_to(&mut self, x: i32, y: i32, width: u32, height: u32) -> bool {
-        let x = x.clamp(0, width.saturating_sub(1) as i32);
-        let y = y.clamp(0, height.saturating_sub(1) as i32);
+    pub fn move_to(&mut self, x: i32, y: i32, outs: &[Rect]) -> bool {
+        let (x, y) = clamp_to_outputs(x, y, (self.x, self.y), outs);
         if x == self.x && y == self.y {
             return false;
         }
@@ -262,4 +268,42 @@ impl Pointer {
             image.draw(surface, Rect::new(x - hx as i32, y - hy as i32, image.width, image.height));
         });
     }
+}
+
+/// Точка `(x, y)`, оставленная на каком-нибудь мониторе (`outs` — их места на
+/// столе): последняя точка прямоугольника, как прежнее «ширина − 1».
+///
+/// Монитор один — это ровно прежний `clamp` по экрану. Мониторов несколько —
+/// между ними бывают щели и ступеньки (разная высота), и указатель, упёршийся
+/// в такую ступеньку по диагонали, должен скользить вдоль края, а не
+/// застревать: сначала пробуется движение по одной оси, потом ближайшая точка
+/// ближайшего монитора.
+fn clamp_to_outputs(x: i32, y: i32, from: (i32, i32), outs: &[Rect]) -> (i32, i32) {
+    let inside = |px: i32, py: i32| outs.iter().any(|o| o.contains(px, py));
+    if outs.is_empty() || inside(x, y) {
+        return (x, y);
+    }
+    if outs.len() > 1 {
+        if inside(x, from.1) {
+            return (x, from.1);
+        }
+        if inside(from.0, y) {
+            return (from.0, y);
+        }
+    }
+    let mut best = from;
+    let mut best_d = i64::MAX;
+    for o in outs {
+        if o.is_empty() {
+            continue;
+        }
+        let cx = x.clamp(o.x, o.right() - 1);
+        let cy = y.clamp(o.y, o.bottom() - 1);
+        let d = i64::from(cx - x).pow(2) + i64::from(cy - y).pow(2);
+        if d < best_d {
+            best_d = d;
+            best = (cx, cy);
+        }
+    }
+    best
 }

@@ -89,13 +89,13 @@ pub fn ago(at_ms: u64) -> alloc::string::String {
 
 impl Toast {
     #[must_use]
-    pub fn new(caption: &str, art: &Art, start: String, rights: fpk::Rights, screen_w: u32, panel_top: i32, scale: u32) -> Option<Self> {
+    pub fn new(caption: &str, art: &Art, start: String, rights: fpk::Rights, area: Rect, panel_top: i32, scale: u32) -> Option<Self> {
         remember(&alloc::format!("{caption} установлен"), "Пакеты · программа готова к запуску");
         let ctx = Ctx::scaled(scale);
         let p = ctx.palette;
         let px = |value: u32| value * scale;
         let (w, h) = (px(364), px(16 + 20 + 12 + 40 + 16 + 32 + 16));
-        let rect = Rect::new(screen_w as i32 - px(12) as i32 - w as i32, panel_top - px(12) as i32 - h as i32, w, h);
+        let rect = Rect::new(area.right() - px(12) as i32 - w as i32, panel_top - px(12) as i32 - h as i32, w, h);
         let fill = p.tb1.over(p.tb2.color);
         let mut surface = Surface::new(w, h, fill)?;
         let ctx = ctx.on(fill);

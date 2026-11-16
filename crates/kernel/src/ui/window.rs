@@ -1936,13 +1936,32 @@ impl Window {
     ///
     /// Полностью уехавшее окно нельзя ни вернуть, ни закрыть мышью, которой на
     /// этой фазе нет, — поэтому часть заголовка обязана остаться видимой.
-    pub fn move_within(&mut self, dx: i32, dy: i32, screen_w: u32, bottom_limit: i32) {
+    ///
+    /// `areas` — рабочие области мониторов (у основного — до панели). Окно
+    /// прижимается к той из них, где прижатое место ближе всего к
+    /// запрошенному: так оно свободно переезжает с монитора на монитор, а
+    /// упирается только во внешние края. Монитор один — ровно прежнее правило
+    /// «по ширине экрана и до панели».
+    pub fn move_within(&mut self, dx: i32, dy: i32, areas: &[Rect]) {
         let keep = Self::title_height(self.scale) as i32 * 3;
-        let min_x = keep - self.rect.w as i32;
-        let max_x = screen_w as i32 - keep;
-        let max_y = (bottom_limit - keep).max(0);
-        self.rect.x = self.rect.x.saturating_add(dx).clamp(min_x, max_x.max(min_x));
-        self.rect.y = self.rect.y.saturating_add(dy).clamp(0, max_y);
+        let want_x = self.rect.x.saturating_add(dx);
+        let want_y = self.rect.y.saturating_add(dy);
+        let mut best: Option<(i64, i32, i32)> = None;
+        for area in areas {
+            let min_x = area.x + keep - self.rect.w as i32;
+            let max_x = area.right() - keep;
+            let max_y = (area.bottom() - keep).max(area.y);
+            let x = want_x.clamp(min_x, max_x.max(min_x));
+            let y = want_y.clamp(area.y, max_y);
+            let d = i64::from(x - want_x).pow(2) + i64::from(y - want_y).pow(2);
+            if best.is_none_or(|(bd, ..)| d < bd) {
+                best = Some((d, x, y));
+            }
+        }
+        if let Some((_, x, y)) = best {
+            self.rect.x = x;
+            self.rect.y = y;
+        }
     }
 
     /// Задать окну новый размер, сохранив содержимое.

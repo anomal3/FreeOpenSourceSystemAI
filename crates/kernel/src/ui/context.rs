@@ -545,18 +545,18 @@ pub struct ContextMenu {
     open: bool,
     mode: Mode,
     damage: Rect,
-    /// Верх панели задач: ниже него карточке выезжать нельзя.
+    /// Рабочая область монитора, на котором открыто меню (низ — верх панели
+    /// задач): за неё карточке выезжать нельзя.
     ///
-    /// Запоминается при открытии, потому что подгонять высоту приходится и
-    /// позже — когда меню сменило список пунктов на поле ввода имени.
-    work_bottom: i32,
+    /// Запоминается при открытии, потому что подгонять размер приходится и
+    /// позже — когда меню сменило список пунктов на поле ввода имени, а
+    /// расширенная карточка не должна уехать за край монитора.
     /// Ответ последнего действия — показывается строкой внизу меню.
     note: Option<String>,
     /// Программы «Открыть с помощью» для файла этого открытия: подпись и
     /// команда, к которой допишется путь.
     handlers: Vec<(String, String)>,
-    /// Ширина экрана при открытии: расширенная карточка не уезжает за край.
-    screen_w: u32,
+    area: Rect,
     /// Указатель стоит на крестике выбранной строки окна.
     cross: bool,
     /// Пункты, погашенные этим открытием (у одного окна «Закрыть все окна»).
@@ -620,10 +620,9 @@ impl ContextMenu {
             open: false,
             mode: Mode::Menu,
             damage: Rect::EMPTY,
-            work_bottom: i32::MAX,
+            area: Rect::new(0, 0, (i32::MAX / 2) as u32, (i32::MAX / 2) as u32),
             note: None,
             handlers: Vec::new(),
-            screen_w: u32::MAX / 2,
             cross: false,
             off: Vec::new(),
             sub_surface,
@@ -681,12 +680,13 @@ impl ContextMenu {
         let row_y = layout.rows.get(index).map_or(0, |slot| slot.rect.y);
         let gap = ctx.px(CARD_PAD) as i32;
         let mut x = self.rect.right() + gap;
-        if x + width as i32 > self.screen_w as i32 {
+        if x + width as i32 > self.area.right() {
             x = self.rect.x - gap - width as i32;
         }
-        let y = (self.rect.y + row_y - ctx.px(CARD_PAD) as i32).clamp(0, (self.work_bottom - height as i32).max(0));
+        let y = (self.rect.y + row_y - ctx.px(CARD_PAD) as i32)
+            .clamp(self.area.y, (self.area.bottom() - height as i32).max(self.area.y));
         self.sub_items = items;
-        self.sub_rect = Rect::new(x.max(0), y, width, height);
+        self.sub_rect = Rect::new(x.max(self.area.x), y, width, height);
         self.sub_parent = Some(index);
         self.sub_selected = usize::MAX;
         self.sub_focus = false;
@@ -807,26 +807,19 @@ impl ContextMenu {
         Ctx::scaled(self.scale).on(theme::wall_average(theme::palette()))
     }
 
-    /// Открыть меню в точке экрана, не выпуская его за края.
-    pub fn open_at(
-        &mut self,
-        x: i32,
-        y: i32,
-        screen: (u32, u32),
-        work_bottom: i32,
-        items: &[Action],
-    ) {
+    /// Открыть меню в точке стола, не выпуская его за края `area` — рабочей
+    /// области монитора под точкой.
+    pub fn open_at(&mut self, x: i32, y: i32, area: Rect, items: &[Action]) {
         self.items.clear();
         self.items.extend_from_slice(items);
-        self.work_bottom = work_bottom;
-        self.screen_w = screen.0;
+        self.area = area;
         let ctx = self.ctx();
         self.rect.w = self.width_of(ctx, &self.items);
         self.rect.h = rows_height(ctx, &self.items).min(self.surface.height());
-        let max_x = (screen.0 as i32 - self.rect.w as i32).max(0);
-        let max_y = (work_bottom - self.rect.h as i32).max(0);
-        self.rect.x = x.clamp(0, max_x);
-        self.rect.y = y.clamp(0, max_y);
+        let max_x = (area.right() - self.rect.w as i32).max(area.x);
+        let max_y = (area.bottom() - self.rect.h as i32).max(area.y);
+        self.rect.x = x.clamp(area.x, max_x);
+        self.rect.y = y.clamp(area.y, max_y);
         self.selected = 0;
         self.cross = false;
         self.mode = Mode::Menu;
@@ -892,8 +885,8 @@ impl ContextMenu {
         let wide = self.surface.width();
         if self.rect.w < wide {
             self.rect.w = wide;
-            let max_x = (self.screen_w as i32 - wide as i32).max(0);
-            self.rect.x = self.rect.x.clamp(0, max_x);
+            let max_x = (self.area.right() - wide as i32).max(self.area.x);
+            self.rect.x = self.rect.x.clamp(self.area.x, max_x);
         }
     }
 
@@ -905,8 +898,8 @@ impl ContextMenu {
         let before = self.rect.h;
         self.rect.h = height.min(self.surface.height());
         if self.rect.h > before {
-            let limit = self.work_bottom - self.rect.h as i32;
-            self.rect.y = self.rect.y.min(limit.max(0));
+            let limit = self.area.bottom() - self.rect.h as i32;
+            self.rect.y = self.rect.y.min(limit.max(self.area.y));
         }
     }
 

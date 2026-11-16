@@ -191,6 +191,10 @@ pub struct Icons {
     /// Ширина экрана и верх сетки — на телефоне (см. [`Icons::set_span`]).
     width: u32,
     top: u32,
+    /// Левый верхний угол основного монитора на столе: сетка значков стоит на
+    /// нём (мониторов несколько — стол начинается не с основного). На одном
+    /// мониторе — (0, 0).
+    origin: (i32, i32),
     /// Имена записей реестра пакетов при последнем перечитывании: сменились —
     /// значки пакетов пора перечитать (см. [`Icons::packages_changed`]).
     packages: String,
@@ -278,6 +282,7 @@ impl Icons {
             face_at: Rect::EMPTY,
             width: 0,
             top: 0,
+            origin: (0, 0),
             packages: String::new(),
         };
         icons.items = system_items();
@@ -365,7 +370,14 @@ impl Icons {
         self.rebuild();
     }
 
-    /// Задать высоту рабочей области — от неё считается длина столбца.
+    /// Поставить сетку на основной монитор: его левый верхний угол на столе.
+    /// Зовётся до [`Self::set_area`], которая и перерисует сетку.
+    pub fn set_origin(&mut self, x: i32, y: i32) {
+        self.origin = (x, y);
+    }
+
+    /// Задать высоту рабочей области (от верха основного монитора) — от неё
+    /// считается длина столбца.
     pub fn set_area(&mut self, work_bottom: i32) {
         let ctx = self.ctx();
         let usable = (work_bottom - ctx.px(theme::ICON_MARGIN) as i32).max(0) as u32;
@@ -525,8 +537,8 @@ impl Icons {
         let column = slot as u32 / self.rows.max(1);
         let row = slot as u32 % self.rows.max(1);
         Rect::new(
-            margin + (column * step_x) as i32,
-            margin + (row * step_y) as i32,
+            self.origin.0 + margin + (column * step_x) as i32,
+            self.origin.1 + margin + (row * step_y) as i32,
             ctx.px(theme::ICON_CELL_W),
             ctx.px(theme::ICON_CELL_H),
         )
@@ -583,8 +595,8 @@ impl Icons {
         let last = self.slots.iter().copied().max().unwrap_or(0).max(self.items.len().saturating_sub(1));
         let columns = (last as u32 + 1).div_ceil(self.rows.max(1)).max(1);
         Rect::new(
-            ctx.px(theme::ICON_MARGIN) as i32,
-            ctx.px(theme::ICON_MARGIN) as i32,
+            self.origin.0 + ctx.px(theme::ICON_MARGIN) as i32,
+            self.origin.1 + ctx.px(theme::ICON_MARGIN) as i32,
             columns * ctx.px(theme::ICON_CELL_W + theme::ICON_GAP),
             self.rows * ctx.px(theme::ICON_CELL_H + theme::ICON_GAP),
         )
