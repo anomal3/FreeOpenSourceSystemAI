@@ -4133,10 +4133,37 @@ fn with_storage<R>(handle: StorageHandle, f: impl FnOnce(&mut Controller, usize)
     Ok(f(controller, index))
 }
 
+/// То же, что [`with_storage`], но пока контроллеры «в руках» у перечисления
+/// портов — ждать (до [`STORAGE_TIMEOUT_MS`]), а не сдаваться.
+///
+/// 16.11, ПК Романа: соседние устройства, которые не поднимаются, гоняют
+/// перечисление каждые несколько секунд, и чтение с флешки в этот момент
+/// получало «устройство пропало» — установка OBSOS с живой флешки обрывалась.
+fn with_storage_patient<R>(handle: StorageHandle, f: impl FnOnce(&mut Controller, usize) -> R) -> Result<R, Reach> {
+    let mut timeout = Timeout::new(STORAGE_TIMEOUT_MS);
+    loop {
+        {
+            let mut list = CONTROLLERS.lock();
+            if let Some(controller) = list.get_mut(handle.controller) {
+                let index = controller
+                    .devices
+                    .iter()
+                    .position(|d| d.serial == handle.serial && d.storage.is_some())
+                    .ok_or(Reach::Gone)?;
+                return Ok(f(controller, index));
+            }
+        }
+        if timeout.expired() {
+            return Err(Reach::Busy);
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Размер окна данных накопителя.
 #[must_use]
 pub fn storage_window(handle: StorageHandle) -> Option<usize> {
-    with_storage(handle, |c, i| c.devices[i].storage.as_ref().map_or(0, |s| s.window.1)).ok()
+    with_storage_patient(handle, |c, i| c.devices[i].storage.as_ref().map_or(0, |s| s.window.1)).ok()
 }
 
 /// Доступ к блоку команды (CBW), блоку состояния (CSW) и окну данных — под
@@ -4145,7 +4172,7 @@ pub fn with_storage_buffers<R>(
     handle: StorageHandle,
     f: impl FnOnce(&mut [u8], &mut [u8], &mut [u8]) -> R,
 ) -> Option<R> {
-    with_storage(handle, |c, i| {
+    with_storage_patient(handle, |c, i| {
         let device = &c.devices[i];
         let storage = device.storage.as_ref()?;
         // SAFETY: страница устройства и буфер данных выделены и живут, пока

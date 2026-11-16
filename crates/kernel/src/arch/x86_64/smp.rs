@@ -526,8 +526,8 @@ const FLUSH_PATIENCE_MS: u64 = 1_000;
 pub fn shootdown() {
     super::interrupts::without_interrupts(|| {
         let me = current_index();
-        let others = crate::smp::online_mask() & !(1u32 << me);
-        if others == 0 {
+        let others = |cpu: usize| cpu != me && crate::smp::is_online(cpu);
+        if !(0..crate::smp::MAX_CPUS).any(others) {
             return;
         }
         let ticket = FLUSH_ASKED.fetch_add(1, Ordering::AcqRel) + 1;
@@ -538,14 +538,14 @@ pub fn shootdown() {
         loop {
             serve_flush();
             let behind = (0..crate::smp::MAX_CPUS)
-                .filter(|&cpu| others & (1u32 << cpu) != 0)
+                .filter(|&cpu| others(cpu))
                 .find(|&cpu| FLUSH_DONE[cpu].load(Ordering::Acquire) < ticket);
             let Some(cpu) = behind else {
                 break;
             };
             if patience != 0 && super::tsc::counter().wrapping_sub(start) > patience {
                 crate::kprintln!(
-                    "  smp         : WARNING: cpu {cpu} did not flush its translations within {FLUSH_PATIENCE_MS} ms                      (ticket {ticket}, mask {others:#x}, done {:?}, interrupts {:?})",
+                    "  smp         : WARNING: cpu {cpu} did not flush its translations within {FLUSH_PATIENCE_MS} ms                      (ticket {ticket}, done {:?}, interrupts {:?})",
                     FLUSH_DONE.each_ref().map(|done| done.load(Ordering::Relaxed)),
                     FLUSH_IRQS.each_ref().map(|count| count.load(Ordering::Relaxed)),
                 );

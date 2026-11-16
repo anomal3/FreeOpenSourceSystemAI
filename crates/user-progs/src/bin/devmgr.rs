@@ -379,8 +379,56 @@ fn display_name(device: &Device) -> String {
     match device.bus {
         Bus::Sys if device.what == "processor" => format!("Процессор {} · {}", device.place.trim_start_matches("cpu "), device.id),
         Bus::Disk => format!("{} {}", russian(&device.what), device.place),
+        // 16.11, Роман: «в диспетчере не нашёл RTX 3060» — у PCI было одно
+        // «Видеоадаптер VGA». Теперь производитель и, где знаем, модель.
+        Bus::Pci => match pci_model(&device.id) {
+            Some(model) => model.to_string(),
+            None => match pci_vendor(&device.id) {
+                Some(vendor) => format!("{} ({vendor})", russian(&device.what)),
+                None => russian(&device.what),
+            },
+        },
         _ => russian(&device.what),
     }
+}
+
+/// Производитель по коду PCI (`10de:2504` → NVIDIA).
+fn pci_vendor(id: &str) -> Option<&'static str> {
+    Some(match id.get(..4)? {
+        "10de" => "NVIDIA",
+        "1002" | "1022" => "AMD",
+        "8086" => "Intel",
+        "10ec" => "Realtek",
+        "14e4" => "Broadcom",
+        "168c" | "17cb" => "Qualcomm",
+        "15b7" => "Western Digital",
+        "144d" => "Samsung",
+        "1e4b" => "MAXIO",
+        "1b21" => "ASMedia",
+        "1af4" => "VirtIO",
+        "1234" => "QEMU",
+        "15ad" => "VMware",
+        "80ee" => "VirtualBox",
+        _ => return None,
+    })
+}
+
+/// Известные модели — видеокарты, которые драйвер NVIDIA уже знает, и
+/// частые соседи.
+fn pci_model(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "10de:2503" | "10de:2504" | "10de:2544" | "10de:2487" | "10de:2571" => "NVIDIA GeForce RTX 3060",
+        "10de:2486" | "10de:2489" => "NVIDIA GeForce RTX 3060 Ti",
+        "10de:2484" | "10de:2488" => "NVIDIA GeForce RTX 3070",
+        "10de:2206" | "10de:2216" => "NVIDIA GeForce RTX 3080",
+        "10de:2204" => "NVIDIA GeForce RTX 3090",
+        "10de:1f08" | "10de:1f03" | "10de:1e89" => "NVIDIA GeForce RTX 2060",
+        "10de:1d01" => "NVIDIA GeForce GT 1030",
+        "10de:13bb" => "NVIDIA Quadro K620",
+        "10de:228e" => "NVIDIA HD Audio (HDMI/DP)",
+        "10ec:8125" => "Realtek RTL8125 2.5GbE",
+        _ => return None,
+    })
 }
 
 fn devices_word(count: usize) -> &'static str {

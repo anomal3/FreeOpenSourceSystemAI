@@ -11648,6 +11648,13 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   RPC. Kepler и старше (K620 — Maxwell GM107, но Kepler-карты вроде GT 710 —
   отдельно) — только простой фреймбуфер от прошивки. Источники — только
   открытые: open-gpu-doc, nouveau, linux-firmware.
+- **Перезагрузка без выключения питания.** После GSP-RM карта держит
+  защищённую область WPR2 до снятия питания, и после тёплой перезагрузки
+  FossAi драйвер не стартует (`auto start skipped - WPR2 already set`).
+  Нужно, как у nouveau/open-gpu-kernel-modules, при выключении и перезагрузке
+  выгрузить GSP: RPC `UNLOADING_GUEST_DRIVER`, дождаться остановки RISC-V,
+  запустить `booter_unload` на SEC2 (снимает WPR2). Прошивка
+  `booter_unload-570.144.bin` — в linux-firmware рядом с `booter_load`.
 - Заодно: `wl_output` на каждый монитор для программ Wayland, кнопка
   «Определить» (номер на каждом мониторе), прокрутка страницы «Дисплей» с
   кликабельной схемой, MSI-прерывания у RTL8125.

@@ -4223,11 +4223,15 @@ fn run_layout(desktop: &mut Compositor, plan: Option<Vec<LayoutEntry>>, status: 
     let mut primary_fb = current;
     for e in &ordered {
         let known = registry.iter().find(|o| o.backend == e.backend);
-        let ready = known.and_then(|o| o.surface).filter(|s| (s.width, s.height) == (e.w, e.h));
+        // Та же частота — или её не просили. 16.11: 180 Гц из «Параметров»
+        // сохранились, а карта осталась на 60 — сверялся только размер.
+        let same_rate = e.refresh_mhz == 0
+            || known.and_then(|o| o.current).is_none_or(|(_, _, r)| r.abs_diff(e.refresh_mhz) <= 20);
+        let ready = known.and_then(|o| o.surface).filter(|s| (s.width, s.height) == (e.w, e.h) && same_rate);
         let fb = if let Some(fb) = ready {
             // Режим тот же — картинка та же.
             fb
-        } else if e.backend == old_main && (current.width, current.height) == (e.w, e.h) {
+        } else if e.backend == old_main && (current.width, current.height) == (e.w, e.h) && same_rate {
             current
         } else if e.backend == Backend::Firmware {
             // Экран без нескольких выходов (stdvga, VMSVGA, ramfb, Intel):

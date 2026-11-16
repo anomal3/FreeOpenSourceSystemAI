@@ -45,7 +45,7 @@
 //! сократило бы эту задержку ценой выхода из гостя на каждое пробуждение; пока
 //! задержки не видно ни в одном сценарии, платить нечем.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::{arch, kprintln, sched, time};
 
@@ -81,7 +81,16 @@ static ONLINE: AtomicUsize = AtomicUsize::new(1);
 /// Числа [`ONLINE`] мало тому, кто ждёт ответа от каждого: процессор, не
 /// доложивший о запуске, оставляет в нумерации дыру, и «первые N» были бы не
 /// те N. Загрузочный — нулевой бит, взведён с самого начала.
-static ONLINE_MASK: AtomicU32 = AtomicU32::new(1);
+///
+/// По слову на 64 процессора: при `u32` и пределе 256 (16.11) процессор №32
+/// и выше сдвигом `1u32 << cpu` попадал в чужой бит, и сброс трансляций на
+/// 16-поточном Ryzen ждал по секунде несуществующий «cpu 32» — система
+/// подвисала на каждом многопоточном приложении.
+static ONLINE_MASK: [AtomicU64; MAX_CPUS / 64] = {
+    let mut words = [const { AtomicU64::new(0) }; MAX_CPUS / 64];
+    words[0] = AtomicU64::new(1);
+    words
+};
 
 /// Номер процессора, на котором исполняется вызывающий код.
 ///
@@ -110,8 +119,8 @@ pub fn online() -> usize {
 /// аппаратно, и ждать ответа там не от кого.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[must_use]
-pub fn online_mask() -> u32 {
-    ONLINE_MASK.load(Ordering::Acquire)
+pub fn is_online(cpu: usize) -> bool {
+    cpu < MAX_CPUS && ONLINE_MASK[cpu / 64].load(Ordering::Acquire) & (1u64 << (cpu % 64)) != 0
 }
 
 /// Что нашлось в таблицах прошивки.
@@ -252,7 +261,7 @@ pub fn start(one_cpu: bool) {
 /// дальше процессор навсегда становится холостой задачей планировщика.
 pub fn secondary_main(index: usize) -> ! {
     ONLINE.fetch_add(1, Ordering::AcqRel);
-    ONLINE_MASK.fetch_or(1 << index, Ordering::AcqRel);
+    ONLINE_MASK[index / 64].fetch_or(1u64 << (index % 64), Ordering::AcqRel);
     kprintln!("  smp         : cpu {index} online");
 
     arch::interrupts::enable();
@@ -288,7 +297,8 @@ pub fn stop_others() -> usize {
 
 /// Обработчик просьбы остановиться. Не возвращается.
 pub fn on_stop() -> ! {
-    ONLINE_MASK.fetch_and(!(1 << cpu()), Ordering::AcqRel);
+    let me = cpu();
+    ONLINE_MASK[me / 64].fetch_and(!(1u64 << (me % 64)), Ordering::AcqRel);
     ONLINE.fetch_sub(1, Ordering::AcqRel);
     arch::halt()
 }
