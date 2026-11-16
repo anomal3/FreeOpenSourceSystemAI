@@ -188,6 +188,18 @@ fn falcon_dma(bar: Bar0, base: usize, src: u64, src_offset: usize, dst: usize, l
     Ok(())
 }
 
+/// Выбрать ядро Falcon вместо RISC-V (`select` у nouveau, `select_core` у
+/// nova): пока работает RISC-V, регистры DMA Falcon закрыты (`0xbadf…`).
+fn falcon_select(bar: Bar0, base2: usize) -> Res<()> {
+    if bar.rd(base2 + 0x668) & 0x10 != 0 {
+        bar.wr(base2 + 0x668, 0);
+        if !bar.wait(10_000, |b| b.rd(base2 + 0x668) & 1 != 0) {
+            return Err(format!("falcon {base2:#x}: did not switch to the Falcon core"));
+        }
+    }
+    Ok(())
+}
+
 fn falcon_start(bar: Bar0, base: usize) {
     if bar.rd(base + 0x100) & 0x40 != 0 {
         bar.wr(base + 0x130, 2);
@@ -769,7 +781,9 @@ fn run_sequencer(bar: Bar0, payload: &[u8], libos: u64, app_version: u32) -> Res
     let dwords = le32(payload, 0)? as usize;
     let end = (le32(payload, 4)? as usize).min(dwords);
     let word = |i: usize| le32(payload, 0x28 + i * 4);
-    let mut ops = Vec::new();
+    let available = payload.len().saturating_sub(0x28) / 4;
+    let end = end.min(available);
+    let mut ops: Vec<String> = Vec::new();
     let mut i = 0;
     while i < end {
         let op = word(i)?;
@@ -783,6 +797,12 @@ fn run_sequencer(bar: Bar0, payload: &[u8], libos: u64, app_version: u32) -> Res
             _ => return Err(format!("sequencer: unknown opcode {op} at {i}")),
         };
         let a = |k: usize| word(i + 1 + k);
+        let mut text = format!("{op}");
+        for k in 0..args {
+            text.push_str(&format!(":{:#x}", a(k).unwrap_or(0)));
+        }
+        ops.push(text);
+        let fail = |why: String, ops: &Vec<String>| Err(format!("{why}; sequence so far [{}]", ops.join(" ")));
         match op {
             0 => bar.wr(a(0)? as usize, a(1)?),
             1 => {
@@ -793,7 +813,7 @@ fn run_sequencer(bar: Bar0, payload: &[u8], libos: u64, app_version: u32) -> Res
                 let (addr, mask, val, timeout) = (a(0)? as usize, a(1)?, a(2)?, a(3)?);
                 let us = if timeout == 0 { 4_000_000 } else { u64::from(timeout) };
                 if !bar.wait(us, |b| b.rd(addr) & mask == val) {
-                    return Err(format!("sequencer: poll {addr:#x} & {mask:#x} == {val:#x} timed out ({:#x})", bar.rd(addr)));
+                    return fail(format!("sequencer: poll {addr:#x} & {mask:#x} == {val:#x} timed out ({:#x})", bar.rd(addr)), &ops);
                 }
             }
             3 => spin_us(u64::from(a(0)?)),
@@ -801,18 +821,23 @@ fn run_sequencer(bar: Bar0, payload: &[u8], libos: u64, app_version: u32) -> Res
                 let _ = bar.rd(a(0)? as usize);
             }
             5 => {
+                // `nvkm_falcon_reset` / nova `reset`: сброс, ядро Falcon, RM.
                 falcon_reset(bar, GSP)?;
+                falcon_select(bar, GSP2)?;
+                bar.wr(GSP + 0x84, bar.rd(0));
                 bar.wr(GSP + 0x624, bar.rd(GSP + 0x624) | 0x80);
                 bar.wr(GSP + 0x10c, 0);
             }
             6 => falcon_start(bar, GSP),
             7 => {
                 if !bar.wait(2_000_000, |b| b.rd(GSP + 0x100) & 0x10 != 0) {
-                    return Err("sequencer: GSP core did not halt".into());
+                    return fail("sequencer: GSP core did not halt".into(), &ops);
                 }
             }
             8 => {
+                // `ga102_gsp_reset`: сброс и снова RISC-V.
                 falcon_reset(bar, GSP)?;
+                bar.wr(GSP2 + 0x668, bar.rd(GSP2 + 0x668) | 0x111);
                 bar.wr(GSP + 0x40, libos as u32);
                 bar.wr(GSP + 0x44, (libos >> 32) as u32);
                 falcon_start(bar, SEC2);
@@ -826,7 +851,6 @@ fn run_sequencer(bar: Bar0, payload: &[u8], libos: u64, app_version: u32) -> Res
             }
             _ => {}
         }
-        ops.push(format!("{op}"));
         i += 1 + args;
     }
     Ok(format!("sequencer: {} op(s) [{}]", ops.len(), ops.join(" ")))
