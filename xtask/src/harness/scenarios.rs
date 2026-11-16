@@ -233,6 +233,10 @@ pub enum Step {
     Wait(u64),
     /// Снять экран.
     Shot(&'static str),
+    /// Снять один выход видеокарты с несколькими мониторами: имя снимка и
+    /// номер выхода. Устройство обязано быть заведено с `id=gpu0` (см.
+    /// сценарий `multihead`).
+    ShotHead(&'static str, u32),
     /// Проверить размер кадра, который показывает устройство, — по монитору
     /// QEMU, а не по словам гостя (фаза С6a).
     Screen(u32, u32),
@@ -2634,7 +2638,7 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "multihead",
-        about: "Два монитора virtio-gpu с паспортами EDID (16.11): реестр мониторов видит оба выхода, их режимы и частоты.",
+        about: "Два монитора virtio-gpu с паспортами EDID (16.11): реестр видит оба выхода, стол растягивается на оба (панель — на основном, на втором — обои), указатель и окно переезжают на второй, раскладка меняется командой `outputs`.",
         target: Target::Live,
         usb_only: false,
         tablet: false,
@@ -2653,13 +2657,55 @@ pub const ALL: &[Scenario] = &[
         big_file: false,
         ssh_key: false,
         memory: "",
-        extra: &["-device", "virtio-gpu-pci,max_outputs=2,edid=on,xres=1280,yres=800"],
+        // `id=gpu0` — по нему монитор QEMU снимает второй выход
+        // (`Step::ShotHead`).
+        extra: &["-device", "virtio-gpu-pci,id=gpu0,max_outputs=2,edid=on,xres=1280,yres=800"],
         steps: &[
             Step::AwaitAny("virtio-gpu  : at ", BOOT),
             Step::Await("virtio-gpu  : output 1: ", 30_000),
             Step::Await("outputs     : Virtio(0)", 60_000),
             Step::Await("outputs     : Virtio(1)", 10_000),
+            // Второй выход получает картинку и встаёт справа от основного, а
+            // стол растягивается на оба.
+            Step::Await("outputs     : Virtio(1) attached, 1280x800 at 1280,0", 10_000),
+            // Стол переезжает на оба своим тактом — до приглашения оболочки
+            // или после, как успеет.
             Step::Await(PROMPT, BOOT),
+            Step::AwaitAny("desktop     : 2 outputs, desktop 2560x800", 30_000),
+            Step::AwaitAny("desktop     : output 1 at 1280,0 1280x800", 5_000),
+            Step::Wait(3_000),
+            // Оба выхода нарисованы: на основном панель и терминал, на втором
+            // — обои (снимок требует больше 32 цветов).
+            Step::ShotHead("00-head0", 0),
+            Step::ShotHead("01-head1", 1),
+            // Указатель уходит за правый край основного — на второй монитор.
+            Step::Aim(Aim::Corner),
+            Step::Move(1600, 300),
+            Step::Line("ui"),
+            Step::Await("pointer  1600,300 visible", 15_000),
+            Step::Wait(1_000),
+            Step::ShotHead("02-pointer-head1", 1),
+            // Окно терминала — за заголовок на второй монитор.
+            Step::Aim(Aim::Title("Terminal")),
+            Step::Press,
+            Step::Await("desktop     : drag 'Terminal'", 15_000),
+            Step::Move(1300, 0),
+            Step::Release,
+            Step::Await("desktop     : moved 'Terminal' to ", 15_000),
+            Step::Wait(1_500),
+            Step::ShotHead("03-dragged-head0", 0),
+            Step::ShotHead("04-dragged-head1", 1),
+            // Раскладка из оболочки: второй монитор — 1024×768, вплотную
+            // справа. Окно на нём вписывается в новый размер.
+            Step::Line("outputs"),
+            Step::Await("1: Virtio(1)", 10_000),
+            Step::Line("outputs set 1 1024x768 1280 0"),
+            Step::Await("desktop     : layout applied", 30_000),
+            Step::AwaitAny("desktop     : output 1 at 1280,0 1024x768", 5_000),
+            Step::Wait(2_000),
+            Step::ShotHead("05-head1-1024x768", 1),
+            Step::Absent("layout refused"),
+            Step::Absent("virtio-gpu  : flush of output"),
             Step::Absent("KERNEL PANIC"),
         ],
     },

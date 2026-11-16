@@ -1165,6 +1165,7 @@ fn run_builtin(line: &str) -> bool {
         "ui" => ui_status(argument),
         "tasks" => tasks(),
         "gpu" => gpu(argument),
+        "outputs" => outputs(argument),
         #[cfg(target_arch = "x86_64")]
         "lxstat" => linux_stat(argument),
         // Вызовы программ Linux и (N4) родных программ — на обеих архитектурах.
@@ -2164,6 +2165,99 @@ fn linux_stat(argument: &str) {
 
 /// Видеокарта NVIDIA, если есть (13.11): что за чип и в каком состоянии —
 /// в терминал, чтобы на настоящей машине не нужна была серийная линия.
+/// Мониторы (16.11): `outputs` — реестр выходов и раскладка стола;
+/// `outputs set <номер> <w>x<h>[@<гц>] <x> <y>` — выставить выходу режим и
+/// место (координаты реестра: основной в 0,0), `outputs off <номер>` —
+/// погасить, `outputs primary <номер>` — сделать основным. Заказ исполняет
+/// стол; итог — строкой `desktop : layout applied` в журнале.
+fn outputs(argument: &str) {
+    use crate::display::outputs::{self as reg, default_mode};
+    let list = reg::list();
+    let mut words = argument.split_whitespace();
+    let verb = words.next().unwrap_or("");
+    if verb.is_empty() {
+        if list.is_empty() {
+            sprintln!("  outputs: none in the registry (one firmware screen)");
+        }
+        for (i, o) in list.iter().enumerate() {
+            let (w, h, r) = o.current.unwrap_or((0, 0, 0));
+            sprintln!(
+                "  {i}: {:?} '{}' {}x{}@{}.{:03} at {},{}{}{}, {} mode(s)",
+                o.backend,
+                o.name,
+                w,
+                h,
+                r / 1000,
+                r % 1000,
+                o.x,
+                o.y,
+                if o.enabled { "" } else { " off" },
+                if o.primary { " primary" } else { "" },
+                o.modes.len()
+            );
+        }
+        let (dw, dh) = crate::ui::desktop_size();
+        let (sw, sh) = crate::ui::screen_size();
+        sprintln!("  desktop {dw}x{dh}, primary {sw}x{sh}");
+        return;
+    }
+    let index: Option<usize> = words.next().and_then(|n| n.parse().ok());
+    let Some(index) = index.filter(|i| *i < list.len()) else {
+        sprintln!("  outputs: which output? (see `outputs`)");
+        return;
+    };
+    // План — вся раскладка: что не меняется, остаётся как в реестре.
+    let mut plan: alloc::vec::Vec<crate::ui::LayoutEntry> = list
+        .iter()
+        .map(|o| {
+            let (w, h, refresh_mhz) = default_mode(o);
+            crate::ui::LayoutEntry {
+                backend: o.backend,
+                x: o.x,
+                y: o.y,
+                w,
+                h,
+                refresh_mhz,
+                enabled: o.enabled && (o.surface.is_some() || o.primary),
+                primary: o.primary,
+            }
+        })
+        .collect();
+    match verb {
+        "set" => {
+            let mode = words.next().unwrap_or("");
+            let (size, hz) = mode.split_once('@').unwrap_or((mode, ""));
+            let parsed = size.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)));
+            let Some((w, h)) = parsed else {
+                sprintln!("  outputs: set <index> <w>x<h>[@<hz>] [<x> <y>]");
+                return;
+            };
+            let entry = &mut plan[index];
+            entry.w = w;
+            entry.h = h;
+            entry.refresh_mhz = hz.parse::<u32>().map_or(0, |hz| hz * 1000);
+            entry.enabled = true;
+            if let (Some(x), Some(y)) = (words.next().and_then(|v| v.parse().ok()), words.next().and_then(|v| v.parse().ok())) {
+                entry.x = x;
+                entry.y = y;
+            }
+        }
+        "off" => plan[index].enabled = false,
+        "primary" => {
+            for (i, entry) in plan.iter_mut().enumerate() {
+                entry.primary = i == index;
+            }
+            plan[index].enabled = true;
+        }
+        _ => {
+            sprintln!("  outputs: unknown '{verb}' (set, off, primary)");
+            return;
+        }
+    }
+    sprintln!("  outputs: layout sent to the desktop");
+    crate::ui::apply_layout(plan);
+}
+
 fn gpu(argument: &str) {
     // Этап 5 (15.11): запуск GSP-RM; число — размер кучи WPR2 в МиБ,
     // `check` — только разобрать прошивку (работает и без карты).

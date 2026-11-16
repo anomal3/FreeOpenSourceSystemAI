@@ -226,6 +226,22 @@ impl Monitor {
         self.command_silent_within(&format!("screendump {text}"), SCREENDUMP_TIMEOUT)?;
         Ok(started.elapsed())
     }
+
+    /// Снять один выход видеокарты с несколькими мониторами (16.11):
+    /// `device` — `id=` устройства в строке QEMU, `head` — номер выхода.
+    ///
+    /// Простой [`Self::screendump`] снимает только первую консоль — нулевой
+    /// выход, и второй монитор без этого не увидеть. Синтаксис HMP:
+    /// `screendump <файл> [<устройство> [<выход>]]`.
+    pub fn screendump_head(&mut self, path: &Path, device: &str, head: u32) -> Result<Duration> {
+        let text = path.to_string_lossy().replace('\\', "/");
+        if text.chars().any(char::is_whitespace) {
+            bail!("путь снимка содержит пробел: {text}");
+        }
+        let started = Instant::now();
+        self.command_silent_within(&format!("screendump {text} {device} {head}"), SCREENDUMP_TIMEOUT)?;
+        Ok(started.elapsed())
+    }
 }
 
 /// Последние знаки непрочитанного — для сообщения об ошибке.

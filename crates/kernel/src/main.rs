@@ -537,6 +537,11 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
         let outputs = display::outputs::probe_virtio();
         display::outputs::log_outputs(&outputs);
         display::outputs::replace(outputs);
+        // Остальные мониторы — на стол (16.11): стол поднят на основном, и
+        // теперь, когда реестр знает выходы, растягивается на все.
+        if ui::graphics() {
+            ui::attach_outputs();
+        }
     }
 
     // Сеть поднимается до служб, и это не порядок ради порядка: первая же

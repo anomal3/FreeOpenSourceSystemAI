@@ -1588,6 +1588,23 @@ fn play(
                 say!("             {w}x{h} -> {}", png.display());
                 shots.push(png);
             }
+            Step::ShotHead(name, head) => {
+                say!("  [{at:>6} мс] шаг {index}: снимок '{name}' выхода {head}");
+                let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
+                let png = ppm.with_extension("png");
+                std::fs::create_dir_all(paths::test_dir()).ok();
+                let took = hmp.screendump_head(&ppm, "gpu0", *head).with_context(|| format!("шаг {index}"))?;
+                report_slow_shot(index, took);
+                let (w, h, colors) =
+                    shot::ppm_to_png_colors(&ppm, &png).with_context(|| format!("шаг {index}"))?;
+                say!("             {w}x{h}, {colors} цвет(ов) -> {}", png.display());
+                shots.push(png);
+                // Выход, на котором стол, — это обои: чёрный кадр в пару
+                // цветов значит, что монитор не подключён к столу.
+                if colors < 32 {
+                    bail!("шаг {index}: на выходе {head} {colors} цвет(ов) — монитор не нарисован");
+                }
+            }
             Step::Tone(hz) => {
                 say!("  [{at:>6} мс] шаг {index}: в звуке гостя — тон {hz} Гц");
                 let (found, loud_ms) = tone::dominant(&sound_file(prefix))

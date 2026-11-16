@@ -70,6 +70,7 @@ pub mod wallart;
 pub mod window;
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mini_ui::theme;
@@ -737,6 +738,10 @@ pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
         (u64::from(desktop.screen_width()) << 32) | u64::from(desktop.screen_height()),
         core::sync::atomic::Ordering::Relaxed,
     );
+    {
+        let (w, h) = desktop.desktop_size();
+        DESKTOP_SIZE.store((u64::from(w) << 32) | u64::from(h), core::sync::atomic::Ordering::Relaxed);
+    }
 
     // Родное разрешение панели, которое прошивка не дала (фаза 70c), — сразу,
     // до первого окна программы: переезжать столу потом дороже.
@@ -806,7 +811,19 @@ static SHELL_CELLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 /// виновата была бы гонка, а не программа.
 static SCREEN_SIZE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Размер экрана в точках. `(0, 0)` — графики на этой машине нет.
+/// Размер всего стола — прямоугольника, охватывающего все мониторы (16.11).
+/// На одном мониторе — то же, что [`screen_size`].
+static DESKTOP_SIZE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Размер всего стола в точках (см. [`DESKTOP_SIZE`]).
+#[must_use]
+pub fn desktop_size() -> (u32, u32) {
+    let packed = DESKTOP_SIZE.load(core::sync::atomic::Ordering::Relaxed);
+    ((packed >> 32) as u32, packed as u32)
+}
+
+/// Размер **основного** монитора в точках. `(0, 0)` — графики на этой
+/// машине нет. Весь стол — [`desktop_size`].
 #[must_use]
 pub fn screen_size() -> (u32, u32) {
     let packed = SCREEN_SIZE.load(core::sync::atomic::Ordering::Relaxed);
@@ -1815,9 +1832,17 @@ static WIFI_SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 pub fn tick() {
     let status = status_now();
     let request = MODE_REQUEST.swap(0, core::sync::atomic::Ordering::Relaxed);
+    let layout = LAYOUT_REQUEST.lock().take();
     with_desktop(|desktop| {
         if request != 0 {
             change_mode(desktop, ((request >> 32) as u32, request as u32), &status);
+        }
+        if let Some(plan) = layout {
+            match run_layout(desktop, plan, &status) {
+                Ok(()) => kprintln!("  desktop     : layout applied"),
+                Err(why) => kprintln!("  desktop     : layout refused: {why}"),
+            }
+            desktop.present();
         }
         desktop.refresh_panel(&status);
         check_gesture_hold(desktop, &status);
@@ -3852,32 +3877,42 @@ fn change_mode(desktop: &mut Compositor, (width, height): (u32, u32), status: &S
 /// Порядок — от того, что может отказать без последствий, к тому, что
 /// отменить нельзя: слои нового размера, адаптер, переезд стола.
 fn switch_mode(desktop: &mut Compositor, width: u32, height: u32, status: &Status) -> Result<(), String> {
-    let layers = desktop
-        .prepare_screen(width, height)
-        .ok_or_else(|| String::from("no memory for the new frame buffer"))?;
+    // Мониторов несколько — меняется основной, остальные стоят, где стояли
+    // (те, что были правее или ниже, сдвигаются на разницу размеров).
     let current = *FRAMEBUFFER.lock();
-    let fb = crate::display::set_mode(&current, width, height).map_err(|err| alloc::format!("{err}"))?;
-    // Размер буфера посчитан драйвером от того же режима, поэтому отказ здесь —
-    // ошибка в драйвере, а не свойство машины. Сказать о ней всё равно надо.
-    let Some(screen) = Screen::new(&fb) else {
-        return Err(String::from("the new frame buffer does not add up"));
+    let old = (current.width, current.height);
+    let main = desktop_plan(&current, None).first().map(|p| p.backend);
+    shift_registry(main, old, (width, height));
+    let plan = desktop_plan(&current, Some((width, height)));
+    let rects: Vec<Rect> = plan.iter().map(|p| p.rect).collect();
+    let attempt = (|| {
+        let layers = desktop
+            .prepare_layout(&rects, 0)
+            .ok_or_else(|| String::from("no memory for the new frame buffer"))?;
+        let fb = crate::display::set_mode(&current, width, height).map_err(|err| alloc::format!("{err}"))?;
+        // Размер буфера посчитан драйвером от того же режима, поэтому отказ
+        // здесь — ошибка в драйвере, а не свойство машины. Сказать о ней всё
+        // равно надо.
+        if Screen::new(&fb).is_none() {
+            return Err(String::from("the new frame buffer does not add up"));
+        }
+        Ok((layers, fb))
+    })();
+    let (layers, fb) = match attempt {
+        Ok(done) => done,
+        Err(why) => {
+            // Адаптер не тронут — раскладка в реестре обратно.
+            shift_registry(main, (width, height), old);
+            return Err(why);
+        }
     };
     *FRAMEBUFFER.lock() = fb;
     crate::console::adopt(&fb);
-    desktop.adopt_screen(screen, layers, status);
-
-    let cells = match desktop.find(App::Terminal) {
-        Some(window) => window.size_in_cells(),
-        None => (0, 0),
-    };
-    SHELL_CELLS.store(
-        (u64::from(cells.0) << 32) | u64::from(cells.1),
-        core::sync::atomic::Ordering::Relaxed,
-    );
-    SCREEN_SIZE.store(
-        (u64::from(width) << 32) | u64::from(height),
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    // Драйвер мог дать не совсем то (NVIDIA — режим из паспорта монитора).
+    if (fb.width, fb.height) != (width, height) {
+        shift_registry(main, (width, height), (fb.width, fb.height));
+    }
+    adopt_plan(desktop, desktop_plan(&fb, None), Some((rects, layers)), status)?;
 
     kprintln!("  display     : {width}x{height} set now by {}", crate::display::driver());
     // Та же строка, что при запуске: по последней такой стенд наводит мышь.
@@ -3891,6 +3926,271 @@ fn switch_mode(desktop: &mut Compositor, width: u32, height: u32, status: &Statu
     for entry in desktop.buttons() {
         log_window(desktop, entry.app, entry.focused);
     }
+    Ok(())
+}
+
+/// Монитор в раскладке стола: кто его показывает, место на столе (от
+/// левого верхнего угла охватывающего прямоугольника) и картинка.
+struct PlanEntry {
+    backend: crate::display::outputs::Backend,
+    rect: Rect,
+    fb: boot_info::Framebuffer,
+}
+
+/// Раскладка стола по реестру мониторов: основной — первым, с картинкой
+/// `primary` (размер — `size`, если он только будет выставлен), за ним
+/// включённые мониторы с картинками.
+///
+/// Реестра нет (экран прошивки, stdvga, VMSVGA, ramfb) — один монитор в
+/// (0, 0), ровно как до мониторов.
+fn desktop_plan(primary: &boot_info::Framebuffer, size: Option<(u32, u32)>) -> Vec<PlanEntry> {
+    use crate::display::outputs;
+    let (pw, ph) = size.unwrap_or((primary.width, primary.height));
+    let registry = outputs::list();
+    // Основной — тот, чья картинка и есть буфер стола (NVIDIA), иначе тот,
+    // кого реестр так назвал (virtio-gpu: выход 0, его буфер у стола).
+    let main = registry
+        .iter()
+        .position(|o| o.surface.is_some_and(|s| s.base == primary.base))
+        .or_else(|| registry.iter().position(|o| o.primary && o.enabled));
+    let mut plan = Vec::new();
+    let (px, py) = main.map_or((0, 0), |i| (registry[i].x, registry[i].y));
+    plan.push(PlanEntry {
+        backend: main.map_or_else(primary_backend, |i| registry[i].backend),
+        rect: Rect::new(px, py, pw, ph),
+        fb: *primary,
+    });
+    for (i, o) in registry.iter().enumerate() {
+        if Some(i) == main || !o.enabled || plan.len() >= compositor::MAX_OUTPUTS {
+            continue;
+        }
+        // Та же память, что у основного, — второй раз её не выводить.
+        let Some(fb) = o.surface.filter(|s| s.base != primary.base) else { continue };
+        plan.push(PlanEntry { backend: o.backend, rect: Rect::new(o.x, o.y, fb.width, fb.height), fb });
+    }
+    // Мониторы не должны налезать друг на друга: налезли (раскладку не
+    // задавали, а основной вырос) — остальные встают в ряд справа от него.
+    let overlaps = plan.iter().enumerate().any(|(i, a)| plan.iter().skip(i + 1).any(|b| !a.rect.intersect(&b.rect).is_empty()));
+    if overlaps {
+        let mut x = plan[0].rect.right();
+        for entry in plan.iter_mut().skip(1) {
+            entry.rect.x = x;
+            entry.rect.y = py;
+            x += entry.rect.w as i32;
+        }
+    }
+    // Стол начинается в левом верхнем углу охватывающего прямоугольника.
+    let min_x = plan.iter().map(|p| p.rect.x).min().unwrap_or(0);
+    let min_y = plan.iter().map(|p| p.rect.y).min().unwrap_or(0);
+    for entry in &mut plan {
+        entry.rect = entry.rect.translate(-min_x, -min_y);
+    }
+    plan
+}
+
+/// Основной монитор сменил размер `from` → `to`: мониторы правее и ниже
+/// него сдвигаются на разницу, чтобы раскладка не разъехалась щелью или
+/// наложением.
+fn shift_registry(primary: Option<crate::display::outputs::Backend>, from: (u32, u32), to: (u32, u32)) {
+    use crate::display::outputs;
+    let Some(primary) = primary else { return };
+    let registry = outputs::list();
+    let Some(main) = registry.iter().find(|o| o.backend == primary) else { return };
+    let (right, bottom) = (main.x + from.0 as i32, main.y + from.1 as i32);
+    let (dx, dy) = (to.0 as i32 - from.0 as i32, to.1 as i32 - from.1 as i32);
+    for o in &registry {
+        if o.backend == primary {
+            continue;
+        }
+        let (nx, ny) = (if o.x >= right { o.x + dx } else { o.x }, if o.y >= bottom { o.y + dy } else { o.y });
+        if (nx, ny) != (o.x, o.y) {
+            outputs::update(o.backend, |out| {
+                out.x = nx;
+                out.y = ny;
+            });
+        }
+    }
+    outputs::update(primary, |out| {
+        let refresh = out.current.map_or(60_000, |c| c.2);
+        out.current = Some((to.0, to.1, refresh));
+    });
+}
+
+/// Перевезти стол на раскладку `plan`. `prepared` — слои, уже собранные под
+/// какие-то места: подходят, если места те же, иначе собираются заново.
+fn adopt_plan(
+    desktop: &mut Compositor,
+    plan: Vec<PlanEntry>,
+    prepared: Option<(Vec<Rect>, compositor::Layers)>,
+    status: &Status,
+) -> Result<(), String> {
+    let rects: Vec<Rect> = plan.iter().map(|p| p.rect).collect();
+    let layers = match prepared {
+        Some((was, layers)) if was == rects => layers,
+        _ => desktop.prepare_layout(&rects, 0).ok_or_else(|| String::from("no memory for the desktop of these monitors"))?,
+    };
+    let mut slots = Vec::new();
+    for (i, entry) in plan.into_iter().enumerate() {
+        let screen = Screen::new(&entry.fb).ok_or_else(|| alloc::format!("the picture of {:?} does not add up", entry.backend))?;
+        slots.push(compositor::OutputSlot { screen, rect: entry.rect, backend: entry.backend, primary: i == 0 });
+    }
+    let count = slots.len();
+    desktop.adopt_outputs(slots, layers, status);
+    remember_sizes(desktop);
+    if count > 1 {
+        log_outputs(desktop);
+    }
+    Ok(())
+}
+
+/// Размеры, которые спрашивают без захвата стола: окно оболочки в знаках,
+/// основной монитор, весь стол.
+fn remember_sizes(desktop: &mut Compositor) {
+    let cells = match desktop.find(App::Terminal) {
+        Some(window) => window.size_in_cells(),
+        None => (0, 0),
+    };
+    SHELL_CELLS.store((u64::from(cells.0) << 32) | u64::from(cells.1), Ordering::Relaxed);
+    SCREEN_SIZE.store(
+        (u64::from(desktop.screen_width()) << 32) | u64::from(desktop.screen_height()),
+        Ordering::Relaxed,
+    );
+    let (w, h) = desktop.desktop_size();
+    DESKTOP_SIZE.store((u64::from(w) << 32) | u64::from(h), Ordering::Relaxed);
+}
+
+/// Мониторы стола — в журнал (по этим строкам стенд узнаёт раскладку).
+fn log_outputs(desktop: &Compositor) {
+    let (w, h) = desktop.desktop_size();
+    let rects = desktop.output_rects();
+    kprintln!("  desktop     : {} outputs, desktop {w}x{h}", rects.len());
+    for (i, r) in rects.iter().enumerate() {
+        kprintln!(
+            "  desktop     : output {i} at {},{} {}x{}{}",
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            if *r == desktop.primary_rect() { " (primary)" } else { "" }
+        );
+    }
+}
+
+/// Подключить к столу мониторы, которые реестр узнал после его запуска
+/// (16.11): остальные выходы virtio-gpu получают картинки, и стол
+/// растягивается на все. Зовётся при загрузке, когда реестр заполнен.
+pub fn attach_outputs() {
+    if crate::display::outputs::attach_secondary() == 0 {
+        return;
+    }
+    LAYOUT_REQUEST.lock().replace(None);
+}
+
+/// Монитор в раскладке, которую заказывают «Параметры» (или команда
+/// `outputs set`): место в координатах реестра (основной в (0, 0), прочие
+/// где угодно вокруг), режим, включён ли, основной ли.
+#[derive(Clone, Copy, Debug)]
+pub struct LayoutEntry {
+    pub backend: crate::display::outputs::Backend,
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub refresh_mhz: u32,
+    pub enabled: bool,
+    pub primary: bool,
+}
+
+/// Заказ раскладки столу: `Some(None)` — перечитать реестр как есть,
+/// `Some(Some(план))` — выставить режимы и места. Исполняет [`tick`]: стол в
+/// этот миг может быть занят, а режимы меняются только под ним.
+static LAYOUT_REQUEST: SpinLock<Option<Option<Vec<LayoutEntry>>>> = SpinLock::new(None);
+
+/// Заказать раскладку мониторов (см. [`LayoutEntry`]); итог — строкой в
+/// журнале (`desktop : layout applied` или `layout refused: …`).
+pub fn apply_layout(plan: Vec<LayoutEntry>) {
+    LAYOUT_REQUEST.lock().replace(Some(plan));
+}
+
+/// Исполнить заказ раскладки.
+fn run_layout(desktop: &mut Compositor, plan: Option<Vec<LayoutEntry>>, status: &Status) -> Result<(), String> {
+    use crate::display::outputs::{self, Backend};
+    let current = *FRAMEBUFFER.lock();
+    let Some(plan) = plan else {
+        return adopt_plan(desktop, desktop_plan(&current, None), None, status);
+    };
+    let enabled: Vec<&LayoutEntry> = plan.iter().filter(|e| e.enabled).collect();
+    let primaries = enabled.iter().filter(|e| e.primary).count();
+    if primaries != 1 {
+        return Err(alloc::format!("{primaries} primary monitors enabled, need exactly one"));
+    }
+    if enabled.len() > compositor::MAX_OUTPUTS {
+        return Err(String::from("too many monitors"));
+    }
+    // Память — до того, как тронут адаптер (как у смены режима): места
+    // стола уже известны из плана.
+    let min_x = enabled.iter().map(|e| e.x).min().unwrap_or(0);
+    let min_y = enabled.iter().map(|e| e.y).min().unwrap_or(0);
+    let mut ordered: Vec<&LayoutEntry> = enabled.iter().filter(|e| e.primary).copied().collect();
+    ordered.extend(enabled.iter().filter(|e| !e.primary).copied());
+    let rects: Vec<Rect> = ordered.iter().map(|e| Rect::new(e.x - min_x, e.y - min_y, e.w, e.h)).collect();
+    let layers = desktop.prepare_layout(&rects, 0).ok_or_else(|| String::from("no memory for the desktop of these monitors"))?;
+
+    let registry = outputs::list();
+    // Сначала гасятся выключенные: их память нужна включаемым.
+    for e in plan.iter().filter(|e| !e.enabled) {
+        if registry.iter().any(|o| o.backend == e.backend && (o.enabled || o.surface.is_some())) {
+            outputs::release_output(e.backend);
+            kprintln!("  outputs     : {:?} switched off", e.backend);
+        }
+    }
+    // Кто основной сейчас: его картинка — буфер стола, а в реестре у
+    // virtio-gpu её нет (выход 0 заведён до реестра).
+    let old_main = registry.iter().find(|o| o.primary && o.enabled).map_or_else(primary_backend, |o| o.backend);
+    let mut primary_fb = current;
+    for e in &ordered {
+        let known = registry.iter().find(|o| o.backend == e.backend);
+        let ready = known.and_then(|o| o.surface).filter(|s| (s.width, s.height) == (e.w, e.h));
+        let fb = if let Some(fb) = ready {
+            // Режим тот же — картинка та же.
+            fb
+        } else if e.backend == old_main && (current.width, current.height) == (e.w, e.h) {
+            current
+        } else if e.backend == Backend::Firmware {
+            // Экран без нескольких выходов (stdvga, VMSVGA, ramfb, Intel):
+            // прежний путь смены режима.
+            crate::display::set_mode(&current, e.w, e.h).map_err(|err| alloc::format!("{err}"))?
+        } else {
+            outputs::set_output_mode(e.backend, e.w, e.h, e.refresh_mhz).map_err(|err| alloc::format!("{:?}: {err}", e.backend))?
+        };
+        if e.primary {
+            primary_fb = fb;
+        }
+        kprintln!("  outputs     : {:?} {}x{} at {},{}{}", e.backend, fb.width, fb.height, e.x, e.y, if e.primary { " (primary)" } else { "" });
+    }
+    // Реестр — новая раскладка; основной — один.
+    for e in &plan {
+        outputs::update(e.backend, |out| {
+            out.x = e.x;
+            out.y = e.y;
+            out.primary = e.primary && e.enabled;
+            if e.enabled {
+                out.enabled = true;
+            }
+        });
+    }
+    if primary_fb.base != current.base || (primary_fb.width, primary_fb.height) != (current.width, current.height) {
+        *FRAMEBUFFER.lock() = primary_fb;
+        crate::console::adopt(&primary_fb);
+    }
+    adopt_plan(desktop, desktop_plan(&primary_fb, None), Some((rects, layers)), status)?;
+    kprintln!(
+        "  desktop     : {}x{}, ui scale {}, panel {} px",
+        desktop.screen_width(),
+        desktop.screen_height(),
+        desktop.scale(),
+        desktop.primary_rect().bottom() - desktop.work_bottom(),
+    );
     Ok(())
 }
 

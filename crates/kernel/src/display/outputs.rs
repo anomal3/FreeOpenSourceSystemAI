@@ -137,6 +137,108 @@ pub fn probe_virtio() -> Vec<Output> {
     out
 }
 
+/// Режим, в котором выход включается, если его не выбирали: выставленный,
+/// родной режим монитора из EDID, первый из списка — и 1024×768 на крайний
+/// случай.
+#[must_use]
+pub fn default_mode(o: &Output) -> (u32, u32, u32) {
+    if let Some(current) = o.current.filter(|c| c.0 != 0 && c.1 != 0) {
+        return current;
+    }
+    let best = o.monitor.as_ref().and_then(edid::Monitor::preferred).or_else(|| o.modes.first());
+    best.map_or((1024, 768, 60_000), |m| (m.width, m.height, m.refresh_mhz()))
+}
+
+/// Подключить к столу остальные мониторы virtio-gpu (16.11): каждому
+/// подключённому выходу, кроме основного, — картинка в его режиме, место
+/// справа от уже стоящих. Возвращает, сколько выходов включено.
+///
+/// Подключён — значит, хост отдал паспорт монитора или сам включил выход:
+/// у QEMU с `max_outputs=2` второй выход «выключен», пока гость не поставит
+/// на него картинку, но EDID у него есть.
+///
+/// NVIDIA здесь не нужна: её выходы приходят в реестр уже с картинками
+/// ([`nvidia_lit`]).
+pub fn attach_secondary() -> usize {
+    let mut attached = 0;
+    for o in list() {
+        let Backend::Virtio(scanout) = o.backend else { continue };
+        if o.primary || o.surface.is_some() {
+            continue;
+        }
+        if !o.enabled && o.monitor.is_none() {
+            continue;
+        }
+        let (w, h, refresh) = default_mode(&o);
+        match crate::virtio::gpu::take_scanout(scanout, w, h) {
+            Ok(fb) => {
+                let x = {
+                    let outputs = OUTPUTS.lock();
+                    outputs
+                        .iter()
+                        .filter(|other| other.backend != o.backend && (other.enabled || other.surface.is_some()))
+                        .map(|other| other.x + other.size().0 as i32)
+                        .max()
+                        .unwrap_or(0)
+                };
+                update(o.backend, |out| {
+                    out.current = Some((w, h, refresh));
+                    out.surface = Some(fb);
+                    out.enabled = true;
+                    out.x = x;
+                    out.y = 0;
+                });
+                crate::kprintln!("  outputs     : {:?} attached, {w}x{h} at {x},0", o.backend);
+                attached += 1;
+            }
+            Err(err) => crate::kprintln!("  outputs     : {:?} could not show {w}x{h}: {err}", o.backend),
+        }
+    }
+    attached
+}
+
+/// Выставить режим одному выходу через его драйвер и отдать картинку, в
+/// которую рисовать. Основной экран у адаптеров без нескольких выходов
+/// (stdvga, VMSVGA, ramfb, Intel) меняет [`super::set_mode`], не это.
+pub fn set_output_mode(backend: Backend, w: u32, h: u32, refresh_mhz: u32) -> Result<boot_info::Framebuffer, super::DisplayError> {
+    if w < 320 || h < 200 || w > 4096 || h > 4096 {
+        return Err(super::DisplayError::Refused("mode outside 320x200..4096x4096"));
+    }
+    match backend {
+        Backend::Virtio(scanout) => {
+            let fb = crate::virtio::gpu::take_scanout(scanout, w, h)?;
+            update(backend, |out| {
+                let refresh = out.monitor.as_ref().and_then(|m| m.find(w, h, if refresh_mhz == 0 { 60_000 } else { refresh_mhz })).map_or(60_000, edid::Mode::refresh_mhz);
+                out.current = Some((w, h, refresh));
+                out.surface = Some(fb);
+                out.enabled = true;
+            });
+            Ok(fb)
+        }
+        Backend::Nvidia(id) => {
+            let _ = super::nvidia_disp::modeset(&[(id, w, h, refresh_mhz)]);
+            list()
+                .into_iter()
+                .find(|o| o.backend == backend)
+                .and_then(|o| o.surface)
+                .ok_or(super::DisplayError::Refused("the NVIDIA output is not lit"))
+        }
+        Backend::Firmware => Err(super::DisplayError::NoDriver("the firmware picture has one fixed mode")),
+    }
+}
+
+/// Погасить выход (у virtio-gpu — снять картинку и вернуть память).
+pub fn release_output(backend: Backend) {
+    if let Backend::Virtio(scanout) = backend {
+        crate::virtio::gpu::release_scanout(scanout);
+    }
+    update(backend, |out| {
+        out.enabled = false;
+        out.surface = None;
+        out.current = None;
+    });
+}
+
 /// Описание выходов для журнала загрузки.
 pub fn log_outputs(outputs: &[Output]) {
     for o in outputs {
