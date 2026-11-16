@@ -2168,7 +2168,8 @@ fn linux_stat(argument: &str) {
 /// Мониторы (16.11): `outputs` — реестр выходов и раскладка стола;
 /// `outputs set <номер> <w>x<h>[@<гц>] <x> <y>` — выставить выходу режим и
 /// место (координаты реестра: основной в 0,0), `outputs off <номер>` —
-/// погасить, `outputs primary <номер>` — сделать основным. Заказ исполняет
+/// погасить, `outputs primary <номер>` — сделать основным, `outputs restore`
+/// — вернуть раскладку, сохранённую в «Параметрах». Заказ исполняет
 /// стол; итог — строкой `desktop : layout applied` в журнале.
 fn outputs(argument: &str) {
     use crate::display::outputs::{self as reg, default_mode};
@@ -2199,6 +2200,18 @@ fn outputs(argument: &str) {
         let (dw, dh) = crate::ui::desktop_size();
         let (sw, sh) = crate::ui::screen_size();
         sprintln!("  desktop {dw}x{dh}, primary {sw}x{sh}");
+        return;
+    }
+    // Сохранённая раскладка («Параметры → Дисплей → Сохранить») — та же,
+    // что стол берёт при запуске.
+    if verb == "restore" {
+        match crate::ui::saved_layout() {
+            Some(plan) => {
+                sprintln!("  outputs: saved layout ({} output(s)) sent to the desktop", plan.len());
+                crate::ui::apply_layout(plan);
+            }
+            None => sprintln!("  outputs: no saved layout for these monitors"),
+        }
         return;
     }
     let index: Option<usize> = words.next().and_then(|n| n.parse().ok());

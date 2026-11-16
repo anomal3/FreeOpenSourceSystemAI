@@ -1188,8 +1188,16 @@ pub fn auto_task() {
     if !log.iter().any(|l| l == "GSP-RM: running") {
         return;
     }
+    // Режимы мониторов — сохранённые «Параметрами» (modeset берёт их сам по
+    // паспорту монитора, а не предложенный — родной). Места, основной и
+    // выключенные — раскладкой стола; режимы в ней те же, что уже стоят, и
+    // второй раз карту не трогают. Нет сохранённой раскладки для этих
+    // мониторов — как раньше: стол переезжает на основной.
     let _ = super::nvidia_disp::modeset(&[]);
-    if let Some((w, h)) = super::nvidia_disp::primary_size() {
+    if let Some(plan) = crate::ui::saved_layout() {
+        crate::kprintln!("  nvidia-gsp  : auto start: saved monitor layout ({} output(s))", plan.len());
+        crate::ui::apply_layout(plan);
+    } else if let Some((w, h)) = super::nvidia_disp::primary_size() {
         crate::ui::request_mode(w, h);
         crate::kprintln!("  nvidia-gsp  : auto start: desktop moves to {w}x{h}");
     }

@@ -90,6 +90,14 @@ pub fn adopt() {
     if let Some(list) = sysconf::value(text, "open_with") {
         *OPEN_WITH.lock() = alloc::string::String::from(list);
     }
+    // Раскладка мониторов (16.11, «Параметры → Дисплей»): только в память —
+    // мониторов в реестре ещё нет, стол переезжает на неё, когда их узнает
+    // (`ui::attach_outputs`, автозапуск NVIDIA).
+    if let Some(list) = sysconf::value(text, "outputs") {
+        let saved = crate::display::outputs::parse_saved(list);
+        crate::kprintln!("  desktop     : monitor layout for {} monitor(s) from {}", saved.len(), path);
+        crate::display::outputs::set_saved(saved);
+    }
     // Ярлыки, убранные со стола «Удалить ярлык» (24.10).
     if let Some(list) = sysconf::value(text, "hidden_shortcuts") {
         super::icons::set_hidden(list);
@@ -175,6 +183,15 @@ pub fn store_open_with(ext: &str, command: &str) -> Result<(), crate::vfs::VfsEr
     let list = sysconf::filetypes::with_choice(&OPEN_WITH.lock(), ext, command);
     *OPEN_WITH.lock() = list.clone();
     store_key("open_with", &list)
+}
+
+/// Запомнить раскладку мониторов: и в файл, и в память (её же берёт
+/// `outputs restore` и автозапуск NVIDIA без перезагрузки).
+pub fn store_outputs(list: alloc::vec::Vec<crate::display::outputs::Saved>) -> Result<alloc::string::String, crate::vfs::VfsError> {
+    let text = crate::display::outputs::format_saved(&list);
+    crate::display::outputs::set_saved(list);
+    store_key("outputs", &text)?;
+    Ok(text)
 }
 
 /// Запомнить громкость.

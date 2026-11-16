@@ -64,10 +64,125 @@ impl Output {
     #[must_use]
     pub fn key(&self) -> String {
         match &self.monitor {
-            Some(m) => alloc::format!("{}{:04x}{:08x}", m.maker_str(), m.product, m.serial),
+            Some(m) => monitor_key(m),
             None => alloc::format!("{:?}", self.backend),
         }
     }
+}
+
+/// Ключ монитора по его паспорту (см. [`Output::key`]).
+#[must_use]
+pub fn monitor_key(m: &edid::Monitor) -> String {
+    alloc::format!("{}{:04x}{:08x}", m.maker_str(), m.product, m.serial)
+}
+
+/// Ключи всех выходов по порядку реестра. Два одинаковых монитора без
+/// серийного номера (у QEMU оба выхода отдают один и тот же паспорт) дали бы
+/// один ключ — второму и следующим дописывается `#2`, `#3`.
+#[must_use]
+pub fn keys(list: &[Output]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for o in list {
+        let base = o.key();
+        let same = out.iter().filter(|k| **k == base || k.starts_with(&alloc::format!("{base}#"))).count();
+        out.push(if same == 0 { base } else { alloc::format!("{base}#{}", same + 1) });
+    }
+    out
+}
+
+/// Сохранённое место монитора (строка `outputs=` в `desktop.cfg`): ключ
+/// монитора, режим, место, включён ли, основной ли.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Saved {
+    pub key: String,
+    pub w: u32,
+    pub h: u32,
+    pub refresh_mhz: u32,
+    pub x: i32,
+    pub y: i32,
+    pub enabled: bool,
+    pub primary: bool,
+}
+
+/// Раскладка, подтверждённая в «Параметрах» (читается при запуске стола).
+static SAVED: SpinLock<Vec<Saved>> = SpinLock::new(Vec::new());
+
+/// Разобрать строку `outputs=`: записи через `;`, каждая —
+/// `ключ:ШxВ@мГц,x,y,вкл,осн`. Испорченная запись пропускается молча —
+/// опечатка в одной не обязана отменять остальные.
+#[must_use]
+pub fn parse_saved(text: &str) -> Vec<Saved> {
+    let mut out = Vec::new();
+    for entry in text.split(';') {
+        let Some((key, rest)) = entry.trim().rsplit_once(':') else { continue };
+        let mut parts = rest.split(',');
+        let mode = parts.next().unwrap_or("");
+        let (size, hz) = mode.split_once('@').unwrap_or((mode, "0"));
+        let Some((w, h)) = size.split_once('x') else { continue };
+        let (Ok(w), Ok(h), Ok(refresh_mhz)) = (w.parse(), h.parse(), hz.parse()) else { continue };
+        let nums: Vec<i32> = parts.filter_map(|p| p.trim().parse().ok()).collect();
+        let [x, y, enabled, primary] = nums[..] else { continue };
+        out.push(Saved { key: String::from(key), w, h, refresh_mhz, x, y, enabled: enabled != 0, primary: primary != 0 });
+    }
+    out
+}
+
+/// Строка `outputs=` из записей (обратное [`parse_saved`]).
+#[must_use]
+pub fn format_saved(list: &[Saved]) -> String {
+    let mut out = String::new();
+    for s in list {
+        if !out.is_empty() {
+            out.push(';');
+        }
+        out.push_str(&alloc::format!(
+            "{}:{}x{}@{},{},{},{},{}",
+            s.key,
+            s.w,
+            s.h,
+            s.refresh_mhz,
+            s.x,
+            s.y,
+            u8::from(s.enabled),
+            u8::from(s.primary)
+        ));
+    }
+    out
+}
+
+/// Запомнить подтверждённую раскладку (без записи в файл — это `prefs`).
+pub fn set_saved(list: Vec<Saved>) {
+    *SAVED.lock() = list;
+}
+
+#[must_use]
+pub fn saved() -> Vec<Saved> {
+    SAVED.lock().clone()
+}
+
+/// Сохранённый режим монитора с таким паспортом — если монитор его ещё
+/// предлагает. Нужен драйверу NVIDIA, который зажигает мониторы сам, до
+/// раскладки: иначе он поставил бы родной режим, а потом стол менял бы его
+/// второй раз.
+#[must_use]
+pub fn saved_mode(m: &edid::Monitor) -> Option<edid::Mode> {
+    let key = monitor_key(m);
+    let saved = SAVED.lock();
+    let s = saved.iter().find(|s| s.key == key && s.enabled)?;
+    m.find(s.w, s.h, s.refresh_mhz).copied()
+}
+
+/// Режим из сохранённой записи, если монитор его предлагает; иначе — тот,
+/// в котором выход включается сам ([`default_mode`]).
+#[must_use]
+pub fn mode_or_default(o: &Output, w: u32, h: u32, refresh_mhz: u32) -> (u32, u32, u32) {
+    if let Some(m) = o.monitor.as_ref().and_then(|m| m.find(w, h, refresh_mhz)) {
+        return (m.width, m.height, m.refresh_mhz());
+    }
+    if o.monitor.is_none() && o.modes.iter().any(|m| m.width == w && m.height == h) {
+        return (w, h, refresh_mhz);
+    }
+    default_mode(o)
 }
 
 static OUTPUTS: SpinLock<Vec<Output>> = SpinLock::new(Vec::new());
@@ -263,7 +378,9 @@ pub fn log_outputs(outputs: &[Output]) {
 
 /// NVIDIA зажгла выход `id` головкой `head` в режиме `mode`; картинка лежит по
 /// адресу `base` (окно BAR1). Выход появляется в реестре или обновляется.
-pub fn nvidia_lit(id: u32, head: u32, mode: edid::Mode, base: usize) {
+/// `monitor` — паспорт монитора: по нему «Параметры» дают список режимов, а
+/// сохранённая раскладка узнаёт монитор (ключ [`Output::key`]).
+pub fn nvidia_lit(id: u32, head: u32, mode: edid::Mode, base: usize, monitor: &edid::Monitor) {
     let pitch = (mode.width * 4).div_ceil(64) * 64;
     let surface = boot_info::Framebuffer {
         base: base as u64,
@@ -283,11 +400,12 @@ pub fn nvidia_lit(id: u32, head: u32, mode: edid::Mode, base: usize) {
         return;
     }
     let primary = !outputs.iter().any(|o| o.primary && o.enabled);
+    let name = if monitor.name.is_empty() { alloc::format!("NVIDIA output {id:#x} (head {head})") } else { monitor.name.clone() };
     outputs.push(Output {
         backend: Backend::Nvidia(id),
-        name: alloc::format!("NVIDIA output {id:#x} (head {head})"),
-        monitor: None,
-        modes: alloc::vec![mode],
+        name,
+        monitor: Some(monitor.clone()),
+        modes: if monitor.modes.is_empty() { alloc::vec![mode] } else { monitor.modes.clone() },
         current,
         x,
         y: 0,

@@ -292,9 +292,15 @@ fn light(rm: &mut Rm, log: &mut Log, disp: &mut Disp, wanted: &[(u32, u32, u32, 
         let r = rm.disp(0x0073_0245, &edid)?;
         let size = le32(&r, 8)? as usize;
         let monitor = edid::parse(r.get(16..16 + size.min(2048)).unwrap_or(&[])).map_err(|e| format!("EDID of {id:#x}: {e:?}"))?;
+        // Без явного выбора — режим, сохранённый «Параметрами» для этого
+        // монитора (по паспорту), а если монитор его больше не предлагает или
+        // сохранённого нет — родной.
         let mode = match wanted.iter().find(|w| w.0 == id) {
             Some(&(_, w, h, r)) => monitor.find(w, h, r).copied().ok_or(format!("{w}x{h} not offered by the monitor"))?,
-            None => *monitor.preferred().ok_or("monitor has no modes")?,
+            None => match super::outputs::saved_mode(&monitor) {
+                Some(saved) => saved,
+                None => *monitor.preferred().ok_or("monitor has no modes")?,
+            },
         };
         if disp.heads.iter().any(|(h, o, m)| *h == head && *o == id && *m == mode) {
             log.push(format!("head {head}: output {id:#x} already at {}x{}", mode.width, mode.height));
@@ -316,7 +322,7 @@ fn light(rm: &mut Rm, log: &mut Log, disp: &mut Disp, wanted: &[(u32, u32, u32, 
         disp.heads.retain(|(h, _, _)| *h != head);
         disp.heads.push((head, id, mode));
         // Видно на экране: реестр мониторов и стол получают картинку.
-        super::outputs::nvidia_lit(id, head, mode, disp.vram.base + (fb(head) - VRAM_MAP_START) as usize);
+        super::outputs::nvidia_lit(id, head, mode, disp.vram.base + (fb(head) - VRAM_MAP_START) as usize, &monitor);
     }
     Ok(())
 }

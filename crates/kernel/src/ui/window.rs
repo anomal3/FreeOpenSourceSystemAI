@@ -1636,15 +1636,16 @@ impl Window {
 
     /// Передать клавишу содержимому. `true` — окно её обработало.
     pub fn handle_key(&mut self, code: KeyCode) -> bool {
-        self.handle_typed(code, None)
+        self.handle_typed(code, None, false)
     }
 
     /// То же, что [`Self::handle_key`], но с символом, который клавиша даёт в
     /// текущей раскладке: «Параметрам» он нужен для поля поиска (фаза 69b).
-    pub fn handle_typed(&mut self, code: KeyCode, ch: Option<char>) -> bool {
+    /// `ctrl` — зажат ли Ctrl: Ctrl+стрелки двигают монитор в «Дисплее».
+    pub fn handle_typed(&mut self, code: KeyCode, ch: Option<char>, ctrl: bool) -> bool {
         match &mut self.content {
             Content::Settings(view) => {
-                if !view.handle(code, ch) {
+                if !view.handle(code, ch, ctrl) {
                     return false;
                 }
                 self.redraw_content();
@@ -1725,6 +1726,44 @@ impl Window {
     /// показывают снаружи (состояние Wi-Fi, 03.11).
     pub fn refresh_settings(&mut self) {
         if matches!(self.content, Content::Settings(_)) {
+            self.redraw_content();
+        }
+    }
+
+    /// Такт стола для «Параметров»: отсчёт «Сохранить эти параметры
+    /// дисплея?». Перерисовывает окно, если на странице что-то сменилось.
+    pub fn settings_tick(&mut self) {
+        if let Content::Settings(view) = &mut self.content {
+            if view.tick() {
+                self.redraw_content();
+            }
+        }
+    }
+
+    /// Тянут ли сейчас монитор в «Параметрах → Дисплей».
+    #[must_use]
+    pub fn settings_dragging(&self) -> bool {
+        matches!(&self.content, Content::Settings(view) if view.dragging())
+    }
+
+    /// Указатель с зажатой кнопкой в точке экрана `x`, `y`: тянуть монитор
+    /// за ним. `true` — монитор сдвинулся и окно перерисовано.
+    pub fn settings_drag(&mut self, x: i32, y: i32) -> bool {
+        let local = (x - self.rect.x, y - self.rect.y);
+        let moved = match &mut self.content {
+            Content::Settings(view) => view.drag_to(local.0, local.1),
+            _ => false,
+        };
+        if moved {
+            self.redraw_content();
+        }
+        moved
+    }
+
+    /// Кнопку отпустили — монитор встал на место.
+    pub fn settings_drop(&mut self) {
+        if let Content::Settings(view) = &mut self.content {
+            view.drop_drag();
             self.redraw_content();
         }
     }

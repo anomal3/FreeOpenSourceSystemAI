@@ -27,6 +27,7 @@
 //! ([`kit::Pass`]), и проход этот либо рисует, либо только запоминает, куда
 //! можно нажать и в каком порядке по пунктам ходит клавиатура.
 
+mod displays;
 mod kit;
 mod pages;
 
@@ -241,7 +242,7 @@ impl Section {
         match self {
             Section::Home => "Обзор машины и быстрые настройки",
             Section::System => "Дисплей, питание, хранилище, сведения",
-            Section::Display => "Разрешение экрана и масштаб",
+            Section::Display => "Мониторы, разрешение, частота, масштаб",
             Section::Power => "Гашение экрана, выключение, перезагрузка",
             Section::Storage => "Диски, тома, проверка файловых систем",
             Section::About => "Версия, архитектура, оборудование",
@@ -271,7 +272,7 @@ impl Section {
         match self {
             Section::Home => "главная обзор",
             Section::System => "система уведомления",
-            Section::Display => "дисплей экран разрешение масштаб режим монитор",
+            Section::Display => "дисплей экран разрешение масштаб режим монитор мониторы частота основной расположение",
             Section::Power => "питание выключить перезагрузить гасить экран сон",
             Section::Storage => "хранилище диск том проверка fsck смонтировано место",
             Section::About => "о системе версия архитектура процессор память время работы сборка",
@@ -390,6 +391,25 @@ enum Deed {
     Launch(&'static str),
     /// Следующая программа для расширения (программы по умолчанию).
     OpenWith(&'static str),
+    // ── «Дисплей» с несколькими мониторами (16.11, см. `displays`) ──
+    /// Монитор на холсте (номер в реестре): выбрать.
+    PickOutput(usize),
+    /// «Расширить эти экраны» (`None`) или «Показать только на N».
+    Project(Option<usize>),
+    /// Сделать выбранный монитор основным.
+    MakePrimary,
+    /// Открыть или закрыть список разрешений или частот.
+    OutList(displays::List),
+    /// Разрешение выбранного монитора.
+    OutMode(u32, u32),
+    /// Частота выбранного монитора, мГц.
+    OutRate(u32),
+    DisplaysApply,
+    DisplaysCancel,
+    /// «Сохранить» в «Сохранить эти параметры дисплея?».
+    DisplaysKeep,
+    /// «Отменить изменения» там же.
+    DisplaysRevert,
 }
 
 /// Какое из двух полей раздела «Сеть» правится.
@@ -524,6 +544,8 @@ pub struct SettingsView {
     page_open: bool,
     cache: Cache,
     seen: Cell<Option<Seen>>,
+    /// Черновик раскладки мониторов («Дисплей», 16.11).
+    displays: displays::Displays,
 }
 
 /// Что вернул проход.
@@ -558,6 +580,7 @@ impl SettingsView {
             page_open: false,
             cache: Cache::default(),
             seen: Cell::new(None),
+            displays: displays::Displays::load(),
         };
         view.refresh();
         view
@@ -633,6 +656,7 @@ impl SettingsView {
             }
             Section::Usb | Section::About => self.cache.devices = crate::devices::report(),
             Section::Update | Section::Recovery => self.cache.slots = crate::slot::state(),
+            Section::Display => self.displays.reload(),
             _ => {}
         }
     }
@@ -709,7 +733,8 @@ impl SettingsView {
 
     /// Разобрать клавишу. `ch` — символ, который она даёт в текущей раскладке.
     /// `true` — окно её использовало.
-    pub fn handle(&mut self, code: KeyCode, ch: Option<char>) -> bool {
+    /// `ctrl` — зажат ли Ctrl (Ctrl+стрелки двигают монитор в «Дисплее»).
+    pub fn handle(&mut self, code: KeyCode, ch: Option<char>, ctrl: bool) -> bool {
         if self.net.editing == Some(Field::WifiPassword) {
             return self.type_password(code, ch);
         }
@@ -718,11 +743,66 @@ impl SettingsView {
                 return true;
             }
         }
+        if ctrl && self.arrange(code) {
+            return true;
+        }
         let used = self.key(code, ch);
         if used {
             self.follow_focus();
         }
         used
+    }
+
+    /// Ctrl+стрелка на «Дисплее» с несколькими мониторами: выбранный монитор
+    /// — к этой стороне остальных. `true` — клавиша использована.
+    fn arrange(&mut self, code: KeyCode) -> bool {
+        if self.page != Section::Display || !self.search.is_empty() || !self.displays.multi() || self.displays.confirming() {
+            return false;
+        }
+        if !matches!(code, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down) {
+            return false;
+        }
+        if self.displays.nudge(code) {
+            let index = self.displays.selected;
+            let head = &self.displays.heads[index];
+            kprintln!("  settings    : display {} moved to {},{}", index + 1, head.x, head.y);
+            self.report = None;
+        }
+        true
+    }
+
+    /// Такт стола (раз в секунду): отсчёт «Сохранить эти параметры
+    /// дисплея?». `true` — окно надо перерисовать.
+    pub fn tick(&mut self) -> bool {
+        match self.displays.tick(crate::time::uptime_ms()) {
+            Some(true) => {
+                kprintln!("  settings    : displays reverted (no answer in {} s)", displays::CONFIRM_MS / 1000);
+                self.report = Some(Report::ok(String::from("прежние параметры дисплея возвращены")));
+                self.action = 0;
+                self.scroll = 0;
+                self.page == Section::Display
+            }
+            Some(false) => self.page == Section::Display,
+            None => false,
+        }
+    }
+
+    /// Тянут ли монитор на холсте «Дисплея».
+    #[must_use]
+    pub fn dragging(&self) -> bool {
+        self.displays.dragging()
+    }
+
+    /// Монитор тянут: указатель в точке окна `x`, `y`.
+    pub fn drag_to(&mut self, x: i32, y: i32) -> bool {
+        self.displays.drag_to(x, y)
+    }
+
+    /// Монитор отпустили.
+    pub fn drop_drag(&mut self) {
+        if let Some((index, x, y)) = self.displays.drop_drag() {
+            kprintln!("  settings    : display {} moved to {x},{y}", index + 1);
+        }
     }
 
     fn key(&mut self, code: KeyCode, ch: Option<char>) -> bool {
@@ -956,6 +1036,11 @@ impl SettingsView {
                 if let Some(index) = self.deeds().iter().position(|other| *other == deed) {
                     self.action = index;
                 }
+                // Монитор на холсте не только выбирается, но и берётся:
+                // дальше его тянут, пока кнопка зажата (`drag_to`).
+                if let Deed::PickOutput(index) = deed {
+                    self.displays.grab(index, x, y);
+                }
                 self.perform(deed);
                 true
             }
@@ -1007,6 +1092,13 @@ impl SettingsView {
             }
             Err(err) => Report::bad(format!("{host}/{bits} применён, но не записан: {err}")),
         });
+    }
+
+    /// Поставить клавиатурный фокус на пункт (если он есть на странице).
+    fn focus_on(&mut self, deed: &Deed) {
+        if let Some(index) = self.deeds().iter().position(|other| other == deed) {
+            self.action = index;
+        }
     }
 
     fn activate(&mut self) {
@@ -1285,6 +1377,71 @@ impl SettingsView {
             Deed::Shutdown => self.request = Some(Request::Shutdown),
             Deed::Restart => self.request = Some(Request::Restart),
             Deed::Launch(path) => self.report = Some(pages::run(path, path)),
+            Deed::PickOutput(index) => {
+                self.displays.select(index);
+                kprintln!("  settings    : display {} selected", index + 1);
+            }
+            Deed::Project(only) => {
+                self.displays.project(only);
+                match only {
+                    Some(index) => kprintln!("  settings    : show only on display {}", index + 1),
+                    None => kprintln!("  settings    : extend to all displays"),
+                }
+            }
+            Deed::MakePrimary => self.displays.make_primary(),
+            Deed::OutList(list) => {
+                self.displays.open = if self.displays.open == Some(list) { None } else { Some(list) };
+                if self.displays.open.is_some() {
+                    kprintln!("  settings    : display {} offers {}", self.displays.selected + 1, self.displays.offer());
+                }
+            }
+            Deed::OutMode(w, h) => {
+                self.displays.set_resolution(w, h);
+                kprintln!("  settings    : display {} resolution {w}x{h}", self.displays.selected + 1);
+                self.focus_on(&Deed::OutList(displays::List::Resolution));
+            }
+            Deed::OutRate(mhz) => {
+                self.displays.set_refresh(mhz);
+                kprintln!("  settings    : display {} refresh {}.{:03} Hz", self.displays.selected + 1, mhz / 1000, mhz % 1000);
+                self.focus_on(&Deed::OutList(displays::List::Refresh));
+            }
+            Deed::DisplaysApply => {
+                match self.displays.apply(crate::time::uptime_ms()) {
+                    Ok(layout) => {
+                        kprintln!("  settings    : displays applied: {layout}");
+                        self.report = None;
+                    }
+                    Err(why) => self.report = Some(Report::bad(why)),
+                }
+                // Фокус — на «Сохранить»: Enter сразу отвечает «да».
+                self.action = 0;
+                self.scroll = 0;
+            }
+            Deed::DisplaysCancel => {
+                self.displays = displays::Displays::load();
+                kprintln!("  settings    : display changes cancelled");
+                self.report = None;
+            }
+            Deed::DisplaysKeep => {
+                self.report = Some(match self.displays.keep() {
+                    Ok(text) => {
+                        kprintln!("  settings    : displays saved: outputs={text}");
+                        Report::ok(String::from("параметры дисплея сохранены"))
+                    }
+                    Err((text, err)) => {
+                        kprintln!("  settings    : displays saved until reboot only ({err}): outputs={text}");
+                        Report::bad(format!("сохранено до перезагрузки: файл не записан ({err})"))
+                    }
+                });
+                self.action = 0;
+            }
+            Deed::DisplaysRevert => {
+                if self.displays.revert() {
+                    kprintln!("  settings    : displays reverted");
+                    self.report = Some(Report::ok(String::from("прежние параметры дисплея возвращены")));
+                }
+                self.action = 0;
+            }
             Deed::OpenWith(ext) => {
                 // По кругу — в порядке подписей, а не списка: выбранная
                 // программа в списке всегда первая, и «следующая» по нему

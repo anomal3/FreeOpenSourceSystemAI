@@ -187,6 +187,15 @@ impl SettingsView {
     fn display(&self, pass: &mut Pass, x: i32, y: i32, w: u32) {
         let ctx = pass.ctx;
         let switchable = crate::display::can_switch();
+        // Мониторов несколько — раскладка, как в Windows (см. `displays`); с
+        // одним — прежний список разрешений.
+        if self.displays.multi() {
+            let y = self.displays.page(pass, x, y, w);
+            if !self.displays.confirming() {
+                self.scale_rows(pass, x, y, w);
+            }
+            return;
+        }
         let mut y = pass.group(x, y, w, "Разрешение экрана");
         if switchable {
             for (width, height) in crate::display::modes(&MODES) {
@@ -200,7 +209,13 @@ impl SettingsView {
             y = row(pass, x, y, w, Some(Fi::Monitor), "Разрешение", "Задаёт прошивка (UEFI GOP) до загрузки ядра", Ctl::Mono(&label), None);
             y = pass.note(x, y + ctx.px(4) as i32, w, "Сменить режим может только драйвер видеокарты — для этой его в системе пока нет.");
         }
-        y = pass.group(x, y, w, "Масштаб и макет");
+        self.scale_rows(pass, x, y, w);
+    }
+
+    /// «Масштаб и макет» — общая часть обеих страниц «Дисплея».
+    fn scale_rows(&self, pass: &mut Pass, x: i32, y: i32, w: u32) {
+        let ctx = pass.ctx;
+        let mut y = pass.group(x, y, w, "Масштаб и макет");
         let scale = if ctx.scale >= 2 { "200 %" } else { "100 %" };
         y = row(pass, x, y, w, Some(Fi::Sliders), "Масштаб сейчас", "", Ctl::Value(scale), None);
         // Выбор действует с перезагрузки: стол перестраивается целиком.

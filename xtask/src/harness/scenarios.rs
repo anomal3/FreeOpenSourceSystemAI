@@ -2704,6 +2704,110 @@ pub const ALL: &[Scenario] = &[
             Step::AwaitAny("desktop     : output 1 at 1280,0 1024x768", 5_000),
             Step::Wait(2_000),
             Step::ShotHead("05-head1-1024x768", 1),
+            // «Параметры → Дисплей» (как в Windows): холст с мониторами «1» и
+            // «2», под ним «Применить»/«Отмена», «Несколько дисплеев» и
+            // параметры выбранного. Пункты по порядку: монитор 1, монитор 2,
+            // «Применить», «Отмена», «Расширить», «Только на 1», «Только на
+            // 2», «Сделать основным», «Разрешение», «Частота».
+            Step::Key("f1"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Key("down"),
+            Step::Key("ret"),
+            Step::Await("desktop     : opened 'Settings'", 15_000),
+            Step::Key("down"),
+            Step::Key("ret"),
+            Step::Key("ret"),
+            Step::Wait(2_000),
+            Step::ShotHead("06-display-page", 0),
+            // Мышью: монитор 2 (на холсте около 853,240) тянут влево-вниз —
+            // он прилипает под монитором 1, к левому краю (0,800). «Отмена»
+            // возвращает как было.
+            // Стенд считает указатель сам, а после перетаскивания окна за
+            // край и смены раскладки его счёт расходится с гостем: в угол —
+            // упором (гость не пускает указатель за край стола), оттуда — на
+            // монитор 2.
+            Step::Move(-3000, -3000),
+            Step::Move(853, 240),
+            Step::Press,
+            Step::Await("settings    : display 2 selected", 15_000),
+            Step::Move(-80, 50),
+            Step::Move(-80, 60),
+            Step::Release,
+            Step::Await("settings    : display 2 moved to 0,800", 15_000),
+            Step::Wait(1_000),
+            Step::ShotHead("07-dragged", 0),
+            Step::Repeat("down", 2),
+            Step::Key("ret"),
+            Step::Await("settings    : display changes cancelled", 15_000),
+            // Клавиатурой: монитор 2 — родное 1280×800 (первое в списке
+            // разрешений), частота — первая в списке, место — под монитором
+            // 1 (Ctrl+↓), «Применить».
+            Step::Repeat("up", 20),
+            Step::Key("down"),
+            Step::Key("ret"),
+            Step::Await("settings    : display 2 selected", 15_000),
+            Step::Repeat("down", 7),
+            Step::Key("ret"),
+            Step::Await("settings    : display 2 offers 1280x800 (native), ", 15_000),
+            Step::Wait(1_000),
+            Step::ShotHead("08-resolutions", 0),
+            Step::Key("down"),
+            Step::Key("ret"),
+            Step::Await("settings    : display 2 resolution 1280x800", 15_000),
+            Step::Key("down"),
+            Step::Key("ret"),
+            Step::Await("settings    : display 2 offers ", 15_000),
+            Step::Key("down"),
+            Step::Key("ret"),
+            Step::Await("settings    : display 2 refresh ", 15_000),
+            Step::Key("ctrl-down"),
+            Step::Await("settings    : display 2 moved to 0,800", 15_000),
+            Step::Repeat("up", 20),
+            Step::Repeat("down", 2),
+            Step::Key("ret"),
+            Step::Await("settings    : displays applied: 1: 1280x800@", 15_000),
+            Step::Await("desktop     : output 1 at 0,800 1280x800", 30_000),
+            Step::Await("desktop     : layout applied", 15_000),
+            Step::Wait(2_000),
+            // «Сохранить эти параметры дисплея?» с отсчётом — фокус на
+            // «Сохранить».
+            Step::ShotHead("09-confirm-head0", 0),
+            Step::ShotHead("10-below-head1", 1),
+            Step::Key("ret"),
+            // Живая система пишет `/etc` на носитель, если он записываемый;
+            // нет — раскладка запомнена до перезагрузки (строка об этом).
+            Step::Await("settings    : displays saved", 15_000),
+            Step::Await("outputs=", 5_000),
+            Step::Expect(":1280x800@74993,0,800,1,0"),
+            // Ещё раз: монитор 2 — справа (Ctrl+→), «Применить» — и без
+            // ответа через 15 с прежняя раскладка возвращается сама.
+            Step::Key("ctrl-right"),
+            Step::Await("settings    : display 2 moved to 1280,0", 15_000),
+            Step::Repeat("up", 20),
+            Step::Repeat("down", 2),
+            Step::Key("ret"),
+            Step::Await("settings    : displays applied: ", 15_000),
+            Step::Await("desktop     : output 1 at 1280,0 1280x800", 30_000),
+            Step::Await("desktop     : layout applied", 15_000),
+            Step::Await("settings    : displays reverted (no answer in 15 s)", 30_000),
+            Step::Await("desktop     : output 1 at 0,800 1280x800", 30_000),
+            Step::Await("desktop     : layout applied", 15_000),
+            Step::Wait(2_000),
+            Step::ShotHead("11-reverted-head0", 0),
+            // Сохранённая раскладка — та, что стол берёт при запуске:
+            // `outputs restore` возвращает её после ручной смены. Строки
+            // линии идут окну в фокусе — сначала терминал вперёд.
+            Step::Key("f1"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Key("ret"),
+            Step::Await("desktop     : focus 'Terminal'", 15_000),
+            Step::Line("outputs set 1 1024x768 1280 0"),
+            Step::Await("desktop     : output 1 at 1280,0 1024x768", 30_000),
+            Step::Await("desktop     : layout applied", 15_000),
+            Step::Line("outputs restore"),
+            Step::Await("outputs: saved layout (2 output(s)) sent", 15_000),
+            Step::Await("desktop     : output 1 at 0,800 1280x800", 30_000),
+            Step::Await("desktop     : layout applied", 15_000),
             Step::Absent("layout refused"),
             Step::Absent("virtio-gpu  : flush of output"),
             Step::Absent("KERNEL PANIC"),

@@ -1844,6 +1844,12 @@ pub fn tick() {
             }
             desktop.present();
         }
+        // «Сохранить эти параметры дисплея?» считает секунды сам: без ответа
+        // раскладка возвращается (как в Windows), а отсчёт на странице
+        // перерисовывается раз в секунду.
+        if let Some(window) = desktop.find(App::Settings) {
+            window.settings_tick();
+        }
         desktop.refresh_panel(&status);
         check_gesture_hold(desktop, &status);
         desktop.reload_icons_if_packages_changed();
@@ -2462,6 +2468,13 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
 
     let (x, y) = desktop.pointer_position();
     if (dx != 0 || dy != 0) && event.buttons.contains(Buttons::LEFT) {
+        // Монитор в «Параметрах → Дисплей» тянут мышью: он едет за ней и
+        // прилипает к краю соседнего.
+        if let Some(window) = desktop.find(App::Settings).filter(|w| w.settings_dragging()) {
+            if window.settings_drag(x, y) {
+                desktop.present();
+            }
+        }
         // Палец ведут по экранной клавиатуре: путь копится до отпускания.
         desktop.keyboard_stroke_to(x, y);
     }
@@ -2672,6 +2685,10 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         icon_gesture_end(desktop);
         SHADE_PULL.store(0, Ordering::Relaxed);
         *CONTENT_DRAG.lock() = None;
+        if let Some(window) = desktop.find(App::Settings).filter(|w| w.settings_dragging()) {
+            window.settings_drop();
+            desktop.present();
+        }
         // Отложенное нажатие «Параметров»: палец не ушёл — это нажатие.
         let pending = PENDING_CLICK.lock().take();
         if let Some((px, py)) = pending {
@@ -3829,7 +3846,7 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
             if event.pressed {
                 let ch = keymap::char_for(event);
                 let outcome = desktop.focused_mut().map(|window| {
-                    let handled = window.handle_typed(event.code, ch);
+                    let handled = window.handle_typed(event.code, ch, event.mods.contains(Modifiers::CTRL));
                     (
                         handled,
                         window.took_theme_change(),
@@ -4080,10 +4097,66 @@ fn log_outputs(desktop: &Compositor) {
 /// (16.11): остальные выходы virtio-gpu получают картинки, и стол
 /// растягивается на все. Зовётся при загрузке, когда реестр заполнен.
 pub fn attach_outputs() {
-    if crate::display::outputs::attach_secondary() == 0 {
+    let attached = crate::display::outputs::attach_secondary();
+    // Раскладка, подтверждённая в «Параметрах» (строка `outputs=`), — поверх
+    // той, что выходы получили сами: сначала они зажигаются как обычно (если
+    // сохранённая окажется негодной, стол всё равно на всех мониторах), потом
+    // стол переезжает на сохранённую.
+    if let Some(plan) = saved_layout() {
+        kprintln!("  outputs     : saved layout for {} output(s)", plan.len());
+        LAYOUT_REQUEST.lock().replace(Some(plan));
+        return;
+    }
+    if attached == 0 {
         return;
     }
     LAYOUT_REQUEST.lock().replace(None);
+}
+
+/// План стола из сохранённой раскладки (`outputs=` в `desktop.cfg`) для
+/// мониторов, которые сейчас в реестре. `None` — сохранённой раскладки нет,
+/// ни один монитор в ней не узнан или из неё не выходит ровно один
+/// включённый основной: тогда остаётся раскладка по умолчанию.
+///
+/// Монитор узнаётся по паспорту ([`crate::display::outputs::keys`]); режим —
+/// сохранённый, если монитор его ещё предлагает, иначе родной. Монитор, о
+/// котором в записи ничего нет (подключили новый), встаёт справа от
+/// остальных.
+#[must_use]
+pub fn saved_layout() -> Option<Vec<LayoutEntry>> {
+    use crate::display::outputs::{self, default_mode, mode_or_default};
+    let saved = outputs::saved();
+    if saved.is_empty() {
+        return None;
+    }
+    let registry = outputs::list();
+    let keys = outputs::keys(&registry);
+    let mut plan: Vec<LayoutEntry> = Vec::new();
+    let mut unknown: Vec<usize> = Vec::new();
+    for (o, key) in registry.iter().zip(&keys) {
+        match saved.iter().find(|s| s.key == *key) {
+            Some(s) => {
+                let (w, h, refresh_mhz) = mode_or_default(o, s.w, s.h, s.refresh_mhz);
+                plan.push(LayoutEntry { backend: o.backend, x: s.x, y: s.y, w, h, refresh_mhz, enabled: s.enabled, primary: s.primary && s.enabled });
+            }
+            None => {
+                let (w, h, refresh_mhz) = default_mode(o);
+                unknown.push(plan.len());
+                plan.push(LayoutEntry { backend: o.backend, x: 0, y: 0, w, h, refresh_mhz, enabled: o.enabled, primary: false });
+            }
+        }
+    }
+    if unknown.len() == plan.len() || plan.iter().filter(|e| e.primary).count() != 1 {
+        return None;
+    }
+    for i in unknown {
+        let me = plan[i].backend;
+        let right = plan.iter().filter(|e| e.enabled && e.backend != me).map(|e| e.x + e.w as i32).max().unwrap_or(0);
+        let top = plan.iter().find(|e| e.primary).map_or(0, |e| e.y);
+        plan[i].x = right;
+        plan[i].y = top;
+    }
+    Some(plan)
 }
 
 /// Монитор в раскладке, которую заказывают «Параметры» (или команда
