@@ -1,0 +1,10 @@
+[package]
+name = "edid"
+description = "EDID (VESA E-EDID 1.4, CEA-861 and DisplayID extensions): which modes a monitor accepts - resolutions and refresh rates for the display settings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

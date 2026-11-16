@@ -12,6 +12,7 @@ members = [
     "crates/clr-meta",
     "crates/clr-vm",
     "crates/disk",
+    "crates/edid",
     "crates/ext2",
     "crates/filelocks",
     "crates/fdt",
