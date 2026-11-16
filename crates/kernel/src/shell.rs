@@ -2167,6 +2167,18 @@ fn linux_stat(argument: &str) {
 fn gpu(argument: &str) {
     // Этап 5 (15.11): запуск GSP-RM; число — размер кучи WPR2 в МиБ,
     // `check` — только разобрать прошивку (работает и без карты).
+    // Этап 6 (16.11): свой режим на мониторах DisplayPort через GSP-RM, затем
+    // стол переезжает на картинку основного монитора.
+    if argument == "display" {
+        for line in crate::display::nvidia_disp::modeset(&[]) {
+            sprintln!("  gpu: {line}");
+        }
+        if let Some((w, h)) = crate::display::nvidia_disp::primary_size() {
+            crate::ui::request_mode(w, h);
+            sprintln!("  gpu: desktop moves to {w}x{h}");
+        }
+        return;
+    }
     if argument == "gsp" || argument.starts_with("gsp ") {
         for line in crate::display::nvidia_gsp::boot_gsp(argument.trim_start_matches("gsp")) {
             sprintln!("  gpu: {line}");

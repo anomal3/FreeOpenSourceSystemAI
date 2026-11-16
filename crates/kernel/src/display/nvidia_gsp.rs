@@ -32,8 +32,8 @@ use core::sync::atomic::{Ordering, fence};
 use super::nvidia::{Bar0, spin_us};
 use crate::mm::{FrameAllocator, PAGE_SIZE, PhysAddr};
 
-type Log = Vec<String>;
-type Res<T> = Result<T, String>;
+pub(crate) type Log = Vec<String>;
+pub(crate) type Res<T> = Result<T, String>;
 
 const GSP: usize = 0x0011_0000;
 const GSP2: usize = 0x0011_1000;
@@ -61,14 +61,18 @@ const STATIC_INFO_SIZE: usize = 0x678;
 /// для ядра. Страницы обнулены; память не возвращается — GSP пользуется ею
 /// всю свою жизнь.
 #[derive(Clone, Copy)]
-struct Mem {
-    phys: u64,
+pub(crate) struct Mem {
+    pub(crate) phys: u64,
     ptr: *mut u8,
     len: usize,
 }
 
+// SAFETY: кусок памяти машины, принадлежащий драйверу; доступ — под замком
+// сеанса GSP.
+unsafe impl Send for Mem {}
+
 impl Mem {
-    fn new(pages: usize) -> Res<Self> {
+    pub(crate) fn new(pages: usize) -> Res<Self> {
         let phys = crate::mm::frame::with(|f| f.allocate_contiguous(pages))
             .flatten()
             .ok_or_else(|| format!("no {pages} contiguous pages of memory"))?;
@@ -76,24 +80,24 @@ impl Mem {
         Ok(Self { phys: phys.as_u64(), ptr, len: pages * PAGE_SIZE })
     }
 
-    fn bytes(&self) -> &mut [u8] {
+    pub(crate) fn bytes(&self) -> &mut [u8] {
         // SAFETY: страницы выделены этим `Mem` и не возвращаются.
         unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
-    fn w32(&self, at: usize, v: u32) {
+    pub(crate) fn w32(&self, at: usize, v: u32) {
         // SAFETY: внутри куска; общая с картой память — запись `volatile`.
         unsafe { (self.ptr.add(at) as *mut u32).write_volatile(v) }
     }
-    fn w64(&self, at: usize, v: u64) {
+    pub(crate) fn w64(&self, at: usize, v: u64) {
         // SAFETY: см. `w32`.
         unsafe { (self.ptr.add(at) as *mut u64).write_volatile(v) }
     }
-    fn r32(&self, at: usize) -> u32 {
+    pub(crate) fn r32(&self, at: usize) -> u32 {
         // SAFETY: см. `w32`.
         unsafe { (self.ptr.add(at) as *const u32).read_volatile() }
     }
-    fn r64(&self, at: usize) -> u64 {
+    pub(crate) fn r64(&self, at: usize) -> u64 {
         // SAFETY: см. `w32`.
         unsafe { (self.ptr.add(at) as *const u64).read_volatile() }
     }
@@ -106,7 +110,7 @@ fn single_page() -> Res<u64> {
         .ok_or_else(|| "out of memory pages".into())
 }
 
-fn le32(b: &[u8], at: usize) -> Res<u32> {
+pub(crate) fn le32(b: &[u8], at: usize) -> Res<u32> {
     b.get(at..at + 4)
         .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
         .ok_or_else(|| format!("firmware too short at {at:#x}"))
@@ -211,7 +215,7 @@ fn falcon_start(bar: Bar0, base: usize) {
 // --- очереди сообщений -------------------------------------------------------
 
 /// Общая с GSP память очередей: страница PTE, очередь команд, очередь ответов.
-struct Queues {
+pub(crate) struct Queues {
     block: Mem,
     seq: u32,
 }
@@ -246,7 +250,7 @@ impl Queues {
     }
 
     /// Положить команду. Звонок (`0x110c00`) — если GSP уже работает.
-    fn send(&mut self, bar: Option<Bar0>, function: u32, payload: &[u8]) -> Res<()> {
+    pub(crate) fn send(&mut self, bar: Option<Bar0>, function: u32, payload: &[u8]) -> Res<()> {
         let total = ELEMENT_HEADER + RPC_HEADER + payload.len();
         let count = total.div_ceil(SLOT) as u32;
         let mut message = alloc::vec![0u8; count as usize * SLOT];
@@ -298,7 +302,7 @@ impl Queues {
     }
 
     /// Взять сообщение GSP, если есть: (функция, результат, полезная нагрузка).
-    fn receive(&mut self) -> Res<Option<(u32, u32, Vec<u8>)>> {
+    pub(crate) fn receive(&mut self) -> Res<Option<(u32, u32, Vec<u8>)>> {
         let wptr = self.block.r32(Self::MSGQ + 0x10);
         let rptr = self.block.r32(Self::CMDQ + 0x20);
         if wptr >= SLOTS {
@@ -710,7 +714,7 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
     // 11. GET_GSP_STATIC_INFO: имя карты от самой карты.
     queues.send(Some(bar), FN_GET_GSP_STATIC_INFO, &alloc::vec![0u8; STATIC_INFO_SIZE])?;
     let deadline = crate::time::uptime_ms() + 5000;
-    loop {
+    let internal = loop {
         match queues.receive()? {
             Some((FN_GET_GSP_STATIC_INFO, result, payload)) => {
                 if result != 0 {
@@ -743,13 +747,13 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
                     le32(&payload, 0x644).unwrap_or(0),
                     le32(&payload, 0x648).unwrap_or(0)
                 ));
-                break;
+                break (le32(&payload, 0x640).unwrap_or(0), le32(&payload, 0x648).unwrap_or(0));
             }
             Some((function, _, _)) => log.push(format!("event {function:#x} while waiting for static info")),
             None if crate::time::uptime_ms() > deadline => return Err("no GET_GSP_STATIC_INFO reply in 5 s".into()),
             None => spin_us(500),
         }
-    }
+    };
     bar.wr(GSP + 0x04, 0x40);
 
     // 12. Этап 6, опыт E1: GSP-RM переводит BAR1 в виртуальный режим со своими
@@ -765,7 +769,30 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
     let mut rm = Rm { queues: &mut queues, bar, log: Vec::new() };
     rm.probe_display();
     log.extend(rm.log);
+
+    // Сеанс живёт дальше: дисплей (`nvidia_disp`) продолжает разговор с RM.
+    // Память GSP (журналы, очереди, образ) не возвращается никогда.
+    *SESSION.lock() = Some(Session { queues, bar, internal_client: internal.0, internal_subdevice: internal.1 });
     Ok(())
+}
+
+/// Запущенный GSP-RM: очереди сообщений и внутренние хэндлы RM.
+pub(crate) struct Session {
+    pub(crate) queues: Queues,
+    pub(crate) bar: Bar0,
+    pub(crate) internal_client: u32,
+    pub(crate) internal_subdevice: u32,
+}
+
+// SAFETY: очереди — память машины, отданная GSP; ходит один владелец под замком.
+unsafe impl Send for Session {}
+
+pub(crate) static SESSION: crate::sync::SpinLock<Option<Session>> = crate::sync::SpinLock::new(None);
+
+/// Работает ли GSP-RM.
+#[must_use]
+pub fn running() -> bool {
+    SESSION.lock().is_some()
 }
 
 /// Состояние BAR1 и дисплейных головок — для журнала.
@@ -794,21 +821,21 @@ const FN_FREE: u32 = 10;
 const FN_RM_CONTROL: u32 = 76;
 const FN_RM_ALLOC: u32 = 103;
 
-const H_CLIENT: u32 = 0xc1d0_0001;
-const H_DEVICE: u32 = 0xde1d_0000;
+pub(crate) const H_CLIENT: u32 = 0xc1d0_0001;
+pub(crate) const H_DEVICE: u32 = 0xde1d_0000;
 const H_SUBDEVICE: u32 = 0x5d1d_0000;
-const H_DISP_COMMON: u32 = 0x0073_0000;
+pub(crate) const H_DISP_COMMON: u32 = 0x0073_0000;
 
 /// Разговор с GSP-RM: выделить объект, вызвать управление.
-struct Rm<'a> {
-    queues: &'a mut Queues,
-    bar: Bar0,
-    log: Log,
+pub(crate) struct Rm<'a> {
+    pub(crate) queues: &'a mut Queues,
+    pub(crate) bar: Bar0,
+    pub(crate) log: Log,
 }
 
 impl Rm<'_> {
     /// Послать RPC и дождаться ответа с той же функцией (события — мимо).
-    fn call(&mut self, function: u32, payload: &[u8]) -> Res<Vec<u8>> {
+    pub(crate) fn call(&mut self, function: u32, payload: &[u8]) -> Res<Vec<u8>> {
         self.queues.send(Some(self.bar), function, payload)?;
         let deadline = crate::time::uptime_ms() + 5000;
         loop {
@@ -827,7 +854,7 @@ impl Rm<'_> {
     }
 
     /// GSP_RM_ALLOC: объект `class` с хэндлом `object` под `parent`.
-    fn alloc(&mut self, parent: u32, object: u32, class: u32, params: &[u8]) -> Res<()> {
+    pub(crate) fn alloc(&mut self, parent: u32, object: u32, class: u32, params: &[u8]) -> Res<()> {
         let mut p = alloc::vec![0u8; 0x20 + params.len()];
         for (at, v) in [(0, H_CLIENT), (4, parent), (8, object), (12, class), (0x14, params.len() as u32)] {
             p[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -842,7 +869,7 @@ impl Rm<'_> {
     }
 
     /// GSP_RM_CONTROL: команда `cmd` объекту; возвращает ответные параметры.
-    fn control(&mut self, client: u32, object: u32, cmd: u32, params: &[u8]) -> Res<Vec<u8>> {
+    pub(crate) fn control(&mut self, client: u32, object: u32, cmd: u32, params: &[u8]) -> Res<Vec<u8>> {
         let mut p = alloc::vec![0u8; 0x18 + params.len()];
         for (at, v) in [(0, client), (4, object), (8, cmd), (0x10, params.len() as u32)] {
             p[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -856,7 +883,7 @@ impl Rm<'_> {
         Ok(reply.get(0x18..).unwrap_or(&[]).to_vec())
     }
 
-    fn disp(&mut self, cmd: u32, params: &[u8]) -> Res<Vec<u8>> {
+    pub(crate) fn disp(&mut self, cmd: u32, params: &[u8]) -> Res<Vec<u8>> {
         self.control(H_CLIENT, H_DISP_COMMON, cmd, params)
     }
 

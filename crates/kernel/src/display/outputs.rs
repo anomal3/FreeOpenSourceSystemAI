@@ -48,6 +48,8 @@ pub struct Output {
     pub y: i32,
     pub enabled: bool,
     pub primary: bool,
+    /// Картинка выхода, в которую рисует стол (если драйвер её завёл).
+    pub surface: Option<boot_info::Framebuffer>,
 }
 
 impl Output {
@@ -128,6 +130,7 @@ pub fn probe_virtio() -> Vec<Output> {
             y: 0,
             enabled: head.enabled || head.shown.is_some(),
             primary: head.scanout == 0,
+            surface: None,
         });
         x += width;
     }
@@ -154,4 +157,40 @@ pub fn log_outputs(outputs: &[Output]) {
             best.map_or(String::new(), |m| alloc::format!(", native {}x{}@{}", m.width, m.height, m.refresh_hz()))
         );
     }
+}
+
+/// NVIDIA зажгла выход `id` головкой `head` в режиме `mode`; картинка лежит по
+/// адресу `base` (окно BAR1). Выход появляется в реестре или обновляется.
+pub fn nvidia_lit(id: u32, head: u32, mode: edid::Mode, base: usize) {
+    let pitch = (mode.width * 4).div_ceil(64) * 64;
+    let surface = boot_info::Framebuffer {
+        base: base as u64,
+        size: u64::from(pitch) * u64::from(mode.height),
+        width: mode.width,
+        height: mode.height,
+        stride: pitch / 4,
+        format: boot_info::PixelFormat::Bgr,
+    };
+    let mut outputs = OUTPUTS.lock();
+    let x = outputs.iter().filter(|o| o.backend != Backend::Nvidia(id)).map(|o| o.x + o.size().0 as i32).max().unwrap_or(0);
+    let current = Some((mode.width, mode.height, mode.refresh_mhz()));
+    if let Some(o) = outputs.iter_mut().find(|o| o.backend == Backend::Nvidia(id)) {
+        o.current = current;
+        o.surface = Some(surface);
+        o.enabled = true;
+        return;
+    }
+    let primary = !outputs.iter().any(|o| o.primary && o.enabled);
+    outputs.push(Output {
+        backend: Backend::Nvidia(id),
+        name: alloc::format!("NVIDIA output {id:#x} (head {head})"),
+        monitor: None,
+        modes: alloc::vec![mode],
+        current,
+        x,
+        y: 0,
+        enabled: true,
+        primary,
+        surface: Some(surface),
+    });
 }

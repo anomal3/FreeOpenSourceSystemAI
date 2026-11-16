@@ -31,6 +31,7 @@ mod bochs;
 #[cfg(target_arch = "x86_64")]
 pub mod intel;
 pub mod nvidia;
+pub mod nvidia_disp;
 pub mod nvidia_gsp;
 pub mod outputs;
 #[cfg(target_arch = "x86_64")]
@@ -162,6 +163,10 @@ pub fn can_switch() -> bool {
     if crate::virtio::gpu::active() {
         return true;
     }
+    // NVIDIA (этап 6): режимы выставляет GSP-RM, когда он запущен.
+    if nvidia_gsp::running() {
+        return true;
+    }
     // VMSVGA (фаза 68h) — видеокарта VirtualBox по умолчанию и VMware;
     // Intel (фаза 70c) — только к родному разрешению панели.
     #[cfg(target_arch = "x86_64")]
@@ -257,6 +262,9 @@ pub fn set_mode(current: &Framebuffer, width: u32, height: u32) -> Result<Frameb
     }
     if crate::virtio::gpu::active() {
         return crate::virtio::gpu::take_screen(width, height);
+    }
+    if nvidia_gsp::running() {
+        return nvidia_disp::set_primary(width, height, 0);
     }
     #[cfg(target_arch = "x86_64")]
     {
