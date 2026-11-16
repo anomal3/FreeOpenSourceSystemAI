@@ -880,6 +880,13 @@ fn run_session(have_input: bool) -> ! {
         if let Err(err) = sched::spawn_daemon("usb", usb::xhci::service_task) {
             kprintln!("  spawn usb service failed: {err}");
         }
+        // Видеокарта NVIDIA (16.11): драйвер поднимается сам, когда найдётся
+        // прошивка.
+        if display::nvidia::found().is_some() {
+            if let Err(err) = sched::spawn_daemon("nvidia", display::nvidia_gsp::auto_task) {
+                kprintln!("  spawn nvidia failed: {err}");
+            }
+        }
         // Журнал на живую флешку (15.11): снимает кольцо с самого начала, пишет,
         // когда найдётся `\FREEOS\LOG.TXT`.
         if let Err(err) = sched::spawn_daemon("sticklog", usb::stick_log::task) {

@@ -354,6 +354,10 @@ fn checksum(bytes: &[u8]) -> u32 {
 /// Этап 5: запустить GSP-RM. Возвращает строки отчёта (они же — в журнал).
 pub fn boot_gsp(argument: &str) -> Log {
     let mut log = Log::new();
+    if running() {
+        log.push("GSP-RM: already running".into());
+        return log;
+    }
     let dry = argument.trim() == "check";
     let heap_mib: u64 = argument.trim().parse().unwrap_or(128).clamp(88, 512);
     match run(&mut log, heap_mib, dry) {
@@ -1145,4 +1149,48 @@ fn run_sequencer(bar: Bar0, payload: &[u8], libos: u64, app_version: u32) -> Res
         i += 1 + args;
     }
     Ok(format!("sequencer: {} op(s) [{}]", ops.len(), ops.join(" ")))
+}
+
+/// Автозапуск при загрузке (16.11, Роман: «система после запуска проверяет
+/// драйвера и устройства и сама применяет драйвер»): дождаться флешки или
+/// диска с прошивкой, запустить GSP-RM, зажечь мониторы и перевести стол на
+/// основной.
+///
+/// Не запускается, если в меню загрузки выбран «экран прошивки», если карта
+/// не из поддержанных (GA102–GA107) или если WPR2 уже задан (горячая
+/// перезагрузка без снятия питания: повторный запуск GSP невозможен).
+pub fn auto_task() {
+    if super::firmware_only() {
+        crate::kprintln!("  nvidia-gsp  : auto start skipped - firmware display asked in the boot menu");
+        return;
+    }
+    let Some((_, bar)) = super::nvidia::card() else { return };
+    let (chip, _) = super::nvidia::chip_of(bar.rd(0), bar.rd(0xa00));
+    if chip >> 4 != 0x17 || chip == 0x170 {
+        crate::kprintln!("  nvidia-gsp  : auto start: chip {chip:#x} is not done yet, staying on the firmware display");
+        return;
+    }
+    if bar.rd(0x001f_a828) >> 4 != 0 {
+        crate::kprintln!("  nvidia-gsp  : auto start skipped - WPR2 already set (warm reboot); power the machine off to use the driver");
+        return;
+    }
+    // Прошивку даёт флешка (Live) — она монтируется задачей USB чуть позже.
+    let deadline = crate::time::uptime_ms() + 90_000;
+    while open("GSP.BIN").is_err() {
+        if crate::time::uptime_ms() > deadline {
+            crate::kprintln!("  nvidia-gsp  : auto start: no NVIDIA firmware (FREEOS/NVIDIA) found in 90 s");
+            return;
+        }
+        crate::sched::sleep_ms(1000);
+    }
+    crate::kprintln!("  nvidia-gsp  : auto start: firmware found, starting GSP-RM");
+    let log = boot_gsp("");
+    if !log.iter().any(|l| l == "GSP-RM: running") {
+        return;
+    }
+    let _ = super::nvidia_disp::modeset(&[]);
+    if let Some((w, h)) = super::nvidia_disp::primary_size() {
+        crate::ui::request_mode(w, h);
+        crate::kprintln!("  nvidia-gsp  : auto start: desktop moves to {w}x{h}");
+    }
 }

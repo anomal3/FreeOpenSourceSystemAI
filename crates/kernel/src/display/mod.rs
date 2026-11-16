@@ -222,6 +222,7 @@ static NATIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::ne
 /// у которой экран от перенастройки гаснет.
 pub fn probe(current: &Framebuffer, boot_flags: u64) -> Option<(u32, u32)> {
     if boot_flags & boot_info::BOOT_FIRMWARE_DISPLAY != 0 {
+        FIRMWARE_ONLY.store(true, core::sync::atomic::Ordering::Relaxed);
         crate::kprintln!("  display     : keeping the firmware's mode, as the boot menu asked");
         return None;
     }
@@ -250,6 +251,15 @@ pub fn probe(current: &Framebuffer, boot_flags: u64) -> Option<(u32, u32)> {
         let _ = current;
         None
     }
+}
+
+/// В меню загрузки выбран «экран прошивки»: никаких драйверов видеокарт.
+static FIRMWARE_ONLY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Попросили ли оставить экран прошивки (тогда видеокарты не трогаются).
+#[must_use]
+pub fn firmware_only() -> bool {
+    FIRMWARE_ONLY.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Режим, который дала прошивка, — второй пункт списка у Intel.
