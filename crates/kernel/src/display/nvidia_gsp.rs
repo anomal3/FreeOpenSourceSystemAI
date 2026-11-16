@@ -1160,7 +1160,9 @@ fn run_sequencer(bar: Bar0, payload: &[u8], libos: u64, app_version: u32) -> Res
 /// не из поддержанных (GA102–GA107) или если WPR2 уже задан (горячая
 /// перезагрузка без снятия питания: повторный запуск GSP невозможен).
 /// Ставить ли режим сразу после автозапуска GSP-RM (см. `auto_task`).
-const AUTO_MODESET: bool = false;
+/// Снова да с 16.11: после флагов ctxdma 0x45 `gpu display` на ПК Романа
+/// зажёг оба монитора 2560x1440.
+const AUTO_MODESET: bool = true;
 
 pub fn auto_task() {
     if super::firmware_only() {
