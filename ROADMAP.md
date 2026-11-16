@@ -13316,7 +13316,12 @@ open-gpu-kernel-modules, open-gpu-doc; на Rust есть `drivers/gpu/nova-core
    180) → старт → MAILBOX0 == 0, 0x1438>>16 == 0, WPR2 lo == FRTS. Один раз за
    включение питания: повторно WPR2 уже задан.
    **ПРОВЕРЕНО на RTX 3060 (15.11): WPR2 0x2ffe00000, подпись 2 по фьюзу 0x3.**
-5. **Написано (15.11), ждёт проверки: `gpu gsp [куча МиБ | check]`**
+5. **ПРОВЕРЕНО на RTX 3060 (16.11): `gpu gsp` — GSP_INIT_DONE через 1,1 с,
+   секвенсор 420 команд (CORE_RESET обязан выбрать ядро Falcon — иначе
+   регистры DMA читаются 0xbadf5620), GET_GSP_STATIC_INFO: 'NVIDIA GeForce RTX
+   3060', 12288 MiB.** После запуска GSP-RM картинка GOP замирает (дисплей
+   переходит к RM; система жива — ввод и журнал идут): вывод — этап 6.
+   `gpu gsp [куча МиБ | check]`
    (`display/nvidia_gsp.rs`). Прошивка linux-firmware 570.144 (`ga102/gsp`:
    booter_load, bootloader, gsp) кладётся `xtask image` из `build/nvidia-fw`
    в `\FREEOS\NVIDIA\` живой флешки. `check` разбирает её без карты —
