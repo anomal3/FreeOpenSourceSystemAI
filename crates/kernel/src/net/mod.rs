@@ -611,6 +611,96 @@ pub fn status() -> Option<Status> {
     })
 }
 
+/// Интерфейс так, как его видят программы Linux (netlink, ioctl `SIOCGIF*`,
+/// `/proc/net`, `/sys/class/net`) — 16.11.2026.
+#[derive(Clone, Copy)]
+pub struct IfInfo {
+    /// Номер `ifindex`: петля — 1, карта — 2.
+    pub index: u32,
+    /// Имя Linux: `lo`, `eth0`. Имя драйвера наружу не отдаётся — программы
+    /// Linux ждут короткие привычные имена.
+    pub name: &'static str,
+    pub loopback: bool,
+    /// Тип `ARPHRD_*`: 1 — Ethernet, 772 — петля.
+    pub hwtype: u16,
+    pub mac: Mac,
+    pub mtu: u32,
+    /// Флаги `IFF_*` (с `IFF_RUNNING` и `IFF_LOWER_UP`, как в netlink).
+    pub flags: u32,
+    /// Адрес IPv4 и длина префикса; `None` — адреса ещё нет (ждём DHCP).
+    pub address: Option<(Ipv4, u8)>,
+    pub gateway: Ipv4,
+    pub stats: Stats,
+}
+
+impl IfInfo {
+    /// Есть ли связь (`IFF_RUNNING`).
+    pub fn running(&self) -> bool {
+        self.flags & 0x40 != 0
+    }
+
+    /// Широковещательный адрес сети интерфейса (без адреса — ноль).
+    pub fn broadcast(&self) -> Ipv4 {
+        match self.address {
+            Some((address, prefix)) => {
+                address.network_broadcast(Ipv4::from_prefix(u32::from(prefix)).unwrap_or(Ipv4::UNSPECIFIED))
+            }
+            None => Ipv4::UNSPECIFIED,
+        }
+    }
+}
+
+/// Интерфейсы для программ Linux — одним снимком: петля `lo` есть всегда, а
+/// карта `eth0` — если она есть ([`is_present`]). Петлю стек отдельным
+/// объектом не держит (кадры себе идут очередью `looped`), так что `lo`
+/// собирается здесь; без карты в [`INTERFACE`] стоит сама петля, и второго
+/// `127.0.0.1` не появляется.
+///
+/// Одно место на всех потребителей: номера и имена везде совпадают — glibc
+/// (`getifaddrs`) бросает список и начинает заново, если адрес ссылается на
+/// интерфейс, которого не было в списке интерфейсов. Сюда же добавлять вторую
+/// карту, когда их станет больше одной.
+pub fn interfaces() -> alloc::vec::Vec<IfInfo> {
+    const IFF_UP: u32 = 0x1;
+    const IFF_BROADCAST: u32 = 0x2;
+    const IFF_LOOPBACK: u32 = 0x8;
+    const IFF_RUNNING: u32 = 0x40;
+    const IFF_MULTICAST: u32 = 0x1000;
+    const IFF_LOWER_UP: u32 = 0x1_0000;
+    let mut list = alloc::vec![IfInfo {
+        index: 1,
+        name: "lo",
+        loopback: true,
+        hwtype: 772,
+        mac: [0; 6],
+        mtu: 65_536,
+        flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP,
+        address: Some((Ipv4::from_bytes([127, 0, 0, 1]), 8)),
+        gateway: Ipv4::UNSPECIFIED,
+        stats: Stats::default(),
+    }];
+    if let Some(status) = status().filter(|status| is_present() && status.name != LOOPBACK_NAME) {
+        let address = (!status.address.is_unspecified())
+            .then(|| (status.address, status.netmask.prefix().unwrap_or(0).min(32) as u8));
+        // Без адреса — поднят, но «не работает»: ни DHCP, ни ручной настройки
+        // ещё не было.
+        let running = if address.is_some() { IFF_RUNNING | IFF_LOWER_UP } else { 0 };
+        list.push(IfInfo {
+            index: 2,
+            name: "eth0",
+            loopback: false,
+            hwtype: 1,
+            mac: status.mac,
+            mtu: 1500,
+            flags: IFF_UP | IFF_BROADCAST | IFF_MULTICAST | running,
+            address,
+            gateway: status.gateway,
+            stats: status.link,
+        });
+    }
+    list
+}
+
 /// Задать адрес, маску и шлюз.
 ///
 /// Шлюз проверяется на принадлежность нашей сети: шлюз, до которого нельзя

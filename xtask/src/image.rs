@@ -292,6 +292,22 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     });
                 }
             }
+            // Proton с игрой (16.11, Роман: «Proton с игрой и браузером на
+            // флешку»): с `FOSSAI_WITH_PROTON=1` — корень Debian, Proton и
+            // Trackmania, ядро ставит их по очереди в `/opt` в памяти.
+            if built.release && crate::proton::enabled() {
+                for (path, esp) in [
+                    (crate::debian::package_path(), "DEBIAN.FPK"),
+                    (crate::proton::package_path(), "PROTON.FPK"),
+                    (crate::tmnf::package_path(), "TMNF.FPK"),
+                ] {
+                    if path.is_file() {
+                        payload.push(read_payload(&format!("{}/{esp}", arch::PAYLOAD_PKG_DIR), &path)?);
+                    } else {
+                        say!("на живую флешку не попал {}: нет файла", path.display());
+                    }
+                }
+            }
         }
         Kind::Installer => {
             let installer = built.get(Component::Installer).ok_or_else(|| {

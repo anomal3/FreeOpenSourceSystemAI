@@ -6,7 +6,7 @@
 //! Том живёт до перезагрузки.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use alloc::sync::Arc;
 
 use crate::mm::{FrameAllocator, PhysAddr};
@@ -15,17 +15,56 @@ use crate::mm::{FrameAllocator, PhysAddr};
 /// при первой ненулевой записи в него, нули не хранятся. Корень живой системы
 /// телефона — RAM-диск FAT32 только на чтение, а программам (OBSOS: профиль,
 /// кеш, база Servo) нужно куда-то писать; том живёт до перезагрузки.
+///
+/// Где лежит каждая страница — в двухуровневой таблице, как таблицы страниц:
+/// в куче только верхний уровень (8 байт на 2 МиБ тома), а адреса кадров
+/// данных — в кадрах-листах по 512. 16.11: прежняя `BTreeMap` в куче ядра
+/// на Proton (гигабайты в `/opt` живой флешки) съела 48 МиБ кучи — паника
+/// «memory allocation failed» посреди первого запуска Wine.
 pub struct Sparse {
     sectors: u64,
-    pages: BTreeMap<u64, PhysAddr>,
+    /// Кадры-листы: по 512 адресов кадров данных (0 — страницы нет).
+    leaves: Vec<Option<PhysAddr>>,
 }
 
 const SECTOR: usize = 512;
 const PER_PAGE: u64 = 4096 / SECTOR as u64;
+const PER_LEAF: u64 = 512;
 
 impl Sparse {
+    fn new(sectors: u64) -> Self {
+        let pages = sectors.div_ceil(PER_PAGE);
+        let mut leaves = Vec::new();
+        leaves.resize(pages.div_ceil(PER_LEAF) as usize, None);
+        Self { sectors, leaves }
+    }
+
+    fn slot(&self, index: u64) -> Option<*mut u64> {
+        let leaf = (*self.leaves.get((index / PER_LEAF) as usize)?)?;
+        // SAFETY: лист — наш кадр, 512 слов; номер внутри листа меньше 512.
+        Some(unsafe { leaf.to_direct_map().as_mut_ptr::<u64>().add((index % PER_LEAF) as usize) })
+    }
+
     fn page(&self, index: u64) -> Option<*mut u8> {
-        self.pages.get(&index).map(|frame| frame.to_direct_map().as_mut_ptr::<u8>())
+        let slot = self.slot(index)?;
+        // SAFETY: см. `slot`.
+        let frame = unsafe { slot.read() };
+        (frame != 0).then(|| PhysAddr::new(frame).to_direct_map().as_mut_ptr::<u8>())
+    }
+
+    /// Запомнить кадр страницы `index` (лист заводится по нужде).
+    fn insert(&mut self, index: u64, frame: PhysAddr) -> disk::Result<()> {
+        let at = (index / PER_LEAF) as usize;
+        if self.leaves[at].is_none() {
+            let leaf = crate::mm::frame::with(|frames| frames.allocate()).flatten().ok_or(disk::Error::NoSpace)?;
+            // SAFETY: свежий кадр, наш целиком.
+            unsafe { core::ptr::write_bytes(leaf.to_direct_map().as_mut_ptr::<u8>(), 0, 4096) };
+            self.leaves[at] = Some(leaf);
+        }
+        let slot = self.slot(index).ok_or(disk::Error::OutOfRange)?;
+        // SAFETY: см. `slot`.
+        unsafe { slot.write(frame.as_u64()) };
+        Ok(())
     }
 }
 
@@ -76,7 +115,11 @@ impl disk::BlockDevice for Sparse {
                 None if chunk.iter().all(|b| *b == 0) => continue,
                 None => {
                     let frame = crate::mm::frame::with(|frames| frames.allocate()).flatten().ok_or(disk::Error::NoSpace)?;
-                    self.pages.insert(page, frame);
+                    // Остальные семь секторов страницы обязаны читаться
+                    // нулями, как до записи, — кадр от пула не обнулён.
+                    // SAFETY: свежий кадр, наш целиком.
+                    unsafe { core::ptr::write_bytes(frame.to_direct_map().as_mut_ptr::<u8>(), 0, 4096) };
+                    self.insert(page, frame)?;
                     frame.to_direct_map().as_mut_ptr::<u8>()
                 }
             };
@@ -95,7 +138,7 @@ impl disk::BlockDevice for Sparse {
 /// Память берётся только под записанное.
 pub fn mount(path: &'static str, mib: u64, label: &str, uuid: [u8; 16]) -> bool {
     let sectors = mib * 2048;
-    let mut disk = Sparse { sectors, pages: BTreeMap::new() };
+    let mut disk = Sparse::new(sectors);
     let options = ext2::FormatOptions { label, uuid, time: 0 };
     if let Err(err) = ext2::format(&mut disk, 0, sectors, &options) {
         crate::kprintln!("  ramvol      : could not format the RAM volume for {path} ({err:?})");
@@ -123,13 +166,21 @@ static LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::ne
 /// профили программ. `/etc` и `/home` не трогаются: в образе RAM-диска там
 /// лежат настройки и учётные записи.
 pub fn mount_live_branches() {
-    let opt = mount("/opt", 4096, "live-opt", *b"fossai-live-opt0");
-    let var = mount("/var", 256, "live-var", *b"fossai-live-var0");
+    // Размеры — потолки, память берётся только под записанное: Proton с
+    // Mesa и корнем Debian раскладывается на несколько гигабайт, префикс
+    // Wine с игрой — ещё на пару (16.11: Proton и Trackmania на флешке).
+    let opt = mount("/opt", 16 * 1024, "live-opt", *b"fossai-live-opt0");
+    let var = mount("/var", 2048, "live-var", *b"fossai-live-var0");
+    // `/tmp` программ Linux — это `/var/tmp` (`linux_path`): wineserver
+    // держит там сокет.
+    if var {
+        let _ = super::mkdir_as(crate::vfs::perm::Credentials::ROOT, "/var/tmp", 0o1777);
+    }
     // Домашний каталог `root` (под ним живая система и работает): OBSOS
     // держит там профиль (`~/.config/obsos`) и без записи падает в Servo.
     // Настройки стола — в `/etc`, раскладка мониторов — на флешке, их это
     // не касается.
-    mount("/root", 1024, "live-root", *b"fossai-live-root");
+    mount("/root", 16 * 1024, "live-root", *b"fossai-live-root");
     LIVE.store(opt && var, core::sync::atomic::Ordering::Release);
 }
 

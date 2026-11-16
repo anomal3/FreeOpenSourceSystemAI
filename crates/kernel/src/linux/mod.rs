@@ -38,6 +38,8 @@ pub(crate) mod ipc;
 mod links;
 pub mod recent;
 mod net;
+mod netdev;
+mod netlink;
 mod process;
 pub mod profile;
 pub mod signal;
@@ -380,24 +382,40 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::READV => ipc::object_readv(a0, a1, a2).unwrap_or_else(|| readv(a0, a1, a2)),
             // `AF_INET` — родной стек (фаза 71f), остальное — `AF_UNIX`.
             nr::SOCKET if a0 == 2 => net::socket(a1),
+            // Netlink (16.11.2026): `NETLINK_ROUTE` — список интерфейсов для
+            // glibc и Wine. Дальше каждый вызов сокета сперва спрашивает
+            // netlink (он берёт только свои дескрипторы), потом `AF_INET`,
+            // потом `AF_UNIX`.
+            nr::SOCKET if a0 == usize::from(netlink::AF_NETLINK) => netlink::socket(a1, a2),
             nr::SOCKET => ipc::socket(a0, a1),
             nr::SOCKETPAIR => ipc::socketpair(a0, a1, a3),
-            nr::BIND => net::bind(a0, a1, a2).unwrap_or_else(|| ipc::bind(a0, a1, a2)),
-            nr::LISTEN => net::listen(a0).unwrap_or_else(|| ipc::listen(a0)),
-            nr::CONNECT => net::connect(a0, a1, a2).unwrap_or_else(|| ipc::connect(a0, a1, a2)),
-            nr::ACCEPT => net::accept(a0, a1, a2, 0).unwrap_or_else(|| ipc::accept(a0, a1, a2, 0)),
-            nr::ACCEPT4 => net::accept(a0, a1, a2, a3).unwrap_or_else(|| ipc::accept(a0, a1, a2, a3)),
-            nr::SHUTDOWN => net::shutdown(a0, a1).unwrap_or_else(|| ipc::shutdown(a0, a1)),
-            nr::GETSOCKNAME => net::sockname(a0, a1, a2, false).unwrap_or_else(|| ipc::sockname(a0, a1, a2, false)),
-            nr::GETPEERNAME => net::sockname(a0, a1, a2, true).unwrap_or_else(|| ipc::sockname(a0, a1, a2, true)),
-            nr::GETSOCKOPT => net::getsockopt(a0, a1, a2, a3, a4).unwrap_or_else(|| ipc::getsockopt(a0, a1, a2, a3, a4)),
-            nr::SETSOCKOPT if net::is_inet(a0) => 0,
+            nr::BIND => netlink::bind(a0, a1, a2).or_else(|| net::bind(a0, a1, a2)).unwrap_or_else(|| ipc::bind(a0, a1, a2)),
+            nr::LISTEN => netlink::listen(a0).or_else(|| net::listen(a0)).unwrap_or_else(|| ipc::listen(a0)),
+            nr::CONNECT => netlink::connect(a0, a1, a2).or_else(|| net::connect(a0, a1, a2)).unwrap_or_else(|| ipc::connect(a0, a1, a2)),
+            nr::ACCEPT => netlink::accept(a0).or_else(|| net::accept(a0, a1, a2, 0)).unwrap_or_else(|| ipc::accept(a0, a1, a2, 0)),
+            nr::ACCEPT4 => netlink::accept(a0).or_else(|| net::accept(a0, a1, a2, a3)).unwrap_or_else(|| ipc::accept(a0, a1, a2, a3)),
+            nr::SHUTDOWN => netlink::shutdown(a0).or_else(|| net::shutdown(a0, a1)).unwrap_or_else(|| ipc::shutdown(a0, a1)),
+            nr::GETSOCKNAME => netlink::sockname(a0, a1, a2, false)
+                .or_else(|| net::sockname(a0, a1, a2, false))
+                .unwrap_or_else(|| ipc::sockname(a0, a1, a2, false)),
+            nr::GETPEERNAME => netlink::sockname(a0, a1, a2, true)
+                .or_else(|| net::sockname(a0, a1, a2, true))
+                .unwrap_or_else(|| ipc::sockname(a0, a1, a2, true)),
+            nr::GETSOCKOPT => netlink::getsockopt(a0, a1, a2, a3, a4)
+                .or_else(|| net::getsockopt(a0, a1, a2, a3, a4))
+                .unwrap_or_else(|| ipc::getsockopt(a0, a1, a2, a3, a4)),
+            // Netlink принимает и забывает все (`SO_RCVBUF`, `SOL_NETLINK` …).
+            nr::SETSOCKOPT if net::is_inet(a0) || netlink::is_netlink(a0) => 0,
             nr::SETSOCKOPT => ipc::setsockopt(a0, a1, a2, a3, a4),
-            nr::SENDMSG => net::sendmsg(a0, a1, a2).unwrap_or_else(|| ipc::sendmsg(a0, a1, a2)),
+            nr::SENDMSG => netlink::sendmsg(a0, a1, a2).or_else(|| net::sendmsg(a0, a1, a2)).unwrap_or_else(|| ipc::sendmsg(a0, a1, a2)),
             nr::SENDMMSG => net::sendmmsg(a0, a1, a2, a3),
-            nr::RECVMSG => net::recvmsg(a0, a1, a2).unwrap_or_else(|| ipc::recvmsg(a0, a1, a2)),
-            nr::SENDTO => net::sendto(a0, a1, a2, a3, a4, args[5]).unwrap_or_else(|| ipc::sendto(a0, a1, a2, a3)),
-            nr::RECVFROM => net::recvfrom(a0, a1, a2, a3, a4, args[5]).unwrap_or_else(|| ipc::recvfrom(a0, a1, a2, a3, a4, args[5])),
+            nr::RECVMSG => netlink::recvmsg(a0, a1, a2).or_else(|| net::recvmsg(a0, a1, a2)).unwrap_or_else(|| ipc::recvmsg(a0, a1, a2)),
+            nr::SENDTO => netlink::sendto(a0, a1, a2, a3, a4, args[5])
+                .or_else(|| net::sendto(a0, a1, a2, a3, a4, args[5]))
+                .unwrap_or_else(|| ipc::sendto(a0, a1, a2, a3)),
+            nr::RECVFROM => netlink::recvfrom(a0, a1, a2, a3, a4, args[5])
+                .or_else(|| net::recvfrom(a0, a1, a2, a3, a4, args[5]))
+                .unwrap_or_else(|| ipc::recvfrom(a0, a1, a2, a3, a4, args[5])),
             nr::EVENTFD => ipc::eventfd(a0, 0),
             nr::EVENTFD2 => ipc::eventfd(a0, a1),
             nr::TIMERFD_CREATE => ipc::timerfd_create(a0, a1),
@@ -1924,6 +1942,11 @@ unsafe fn ioctl(fd: usize, request: usize, arg: usize) -> i64 {
     const FIONBIO: usize = 0x5421;
     // Звук ALSA (`/dev/snd`, шаг 7 Proton).
     if let Some(answer) = snd::ioctl(fd, request, arg) {
+        return answer;
+    }
+    // Интерфейсы сети (`SIOCGIF*`) на любом сокете — `nsiproxy.sys` Wine и
+    // `if_nametoindex` glibc (16.11.2026).
+    if let Some(answer) = netdev::ioctl(fd, request, arg) {
         return answer;
     }
     // Не терминальные: сокеты, каналы, объекты. Без `FIONREAD` Java на каждом

@@ -1,6 +1,7 @@
 //! Особые файлы программ Linux (фаза 71c): `/dev/null`, `/dev/zero`,
 //! `/dev/urandom`, `/proc/self/*`, `/proc/cpuinfo`, `/proc/meminfo` и
-//! `/sys/devices/system/cpu/*`.
+//! `/sys/devices/system/cpu/*`; файлы сети (`/proc/net`, `/sys/class/net`)
+//! собирает `netdev`.
 //!
 //! Это не файловая система, а ответы на несколько путей, которые glibc и
 //! большие программы читают на каждом запуске: `sysconf(_SC_NPROCESSORS_ONLN)`
@@ -144,7 +145,7 @@ fn directory(path: &str) -> Option<Vec<(String, NodeKind)>> {
     let file = |name: &str| (String::from(name), NodeKind::File);
     let dir = |name: &str| (String::from(name), NodeKind::Directory);
     match path {
-        "/proc" => Some(alloc::vec![dir("self"), file("cpuinfo"), file("meminfo"), file("version")]),
+        "/proc" => Some(alloc::vec![dir("self"), dir("net"), file("cpuinfo"), file("meminfo"), file("version")]),
         "/proc/self" | "/proc/thread-self" => Some(alloc::vec![
             file("maps"),
             file("status"),
@@ -165,7 +166,8 @@ fn directory(path: &str) -> Option<Vec<(String, NodeKind)>> {
             let tid = crate::sched::current().as_u32();
             Some(alloc::vec![(format!("{tid}"), NodeKind::Directory)])
         }
-        _ => None,
+        // `/proc/net`, `/sys/class/net/<имя>` (16.11.2026).
+        _ => super::netdev::directory(path),
     }
 }
 
@@ -179,6 +181,11 @@ fn text(path: &str) -> Option<String> {
     // Настройки сети для резолвера glibc (фаза 71f).
     if let Some(bytes) = super::net::special_file(path) {
         return String::from_utf8(bytes).ok();
+    }
+    // Интерфейсы сети: `/proc/net/*`, `/proc/sys/net/*`,
+    // `/sys/class/net/<имя>/*` (16.11.2026, `nsiproxy.sys` Wine).
+    if let Some(text) = super::netdev::special_file(path) {
+        return Some(text);
     }
     let cpus = crate::smp::online().max(1);
     if let Some(rest) = self_relative(path) {

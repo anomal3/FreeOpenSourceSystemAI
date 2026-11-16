@@ -145,6 +145,7 @@ fn live_packages(mount: &str) {
     let Some(Ok(entries)) = crate::fs::list(&dir) else {
         return;
     };
+    let mut queue: Vec<(usize, String, String)> = Vec::new();
     for entry in entries {
         let name = entry.name.to_ascii_lowercase();
         let Some(stem) = name.strip_suffix(".fpk") else {
@@ -153,10 +154,52 @@ fn live_packages(mount: &str) {
         if matches!(crate::fs::list(&alloc::format!("/opt/{stem}")), Some(Ok(_))) {
             continue;
         }
-        let line = alloc::format!("/bin/pkg install {dir}/{}", entry.name);
+        // Зависимые — после того, от чего зависят: `proton` стоит на
+        // `debian`, `tmnf` — на `proton` (16.11: Proton с игрой на флешке).
+        // По пути `pkg` зависимостей не тянет — порядок держим здесь.
+        let rank = LIVE_ORDER.iter().position(|n| *n == stem).unwrap_or(LIVE_ORDER.len());
+        queue.push((rank, alloc::format!("{dir}/{}", entry.name), String::from(stem)));
+    }
+    if queue.is_empty() {
+        return;
+    }
+    queue.sort();
+    LIVE_QUEUE.lock().extend(queue.into_iter().map(|(_, path, _)| path));
+    // По одному и не в задаче USB: Proton — гигабайт с флешки.
+    if !LIVE_RUNNING.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        if let Err(err) = crate::sched::spawn_daemon("live-pkg", live_install_task) {
+            kprintln!("  live pkg    : could not start the install task: {err:?}");
+            LIVE_RUNNING.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// Порядок установки пакетов живой флешки (кого нет в списке — в конце).
+const LIVE_ORDER: [&str; 4] = ["obsos", "debian", "proton", "tmnf"];
+
+static LIVE_QUEUE: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
+static LIVE_RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Ставит пакеты очереди по одному, дожидаясь каждого.
+fn live_install_task() {
+    loop {
+        let next = {
+            let mut queue = LIVE_QUEUE.lock();
+            if queue.is_empty() {
+                LIVE_RUNNING.store(false, core::sync::atomic::Ordering::Release);
+                return;
+            }
+            queue.remove(0)
+        };
+        let line = alloc::format!("/bin/pkg install {next}");
+        let started = crate::time::uptime_ms();
         match crate::user::spawn(&line, crate::vfs::perm::Credentials::ROOT) {
-            Ok(_) => kprintln!("  live pkg    : installing {dir}/{} into the RAM /opt", entry.name),
-            Err(err) => kprintln!("  live pkg    : could not start pkg for {}: {err:?}", entry.name),
+            Ok(task) => {
+                kprintln!("  live pkg    : installing {next} into the RAM /opt");
+                let code = crate::sched::wait(task);
+                kprintln!("  live pkg    : {next} done, code {code:?}, {} s", (crate::time::uptime_ms() - started) / 1000);
+            }
+            Err(err) => kprintln!("  live pkg    : could not start pkg for {next}: {err:?}"),
         }
     }
 }
