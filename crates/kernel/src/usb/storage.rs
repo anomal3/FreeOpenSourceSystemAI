@@ -126,10 +126,39 @@ fn bring_up(handle: StorageHandle) {
             kprintln!(
                 "  usb-storage : {kind} volume '{label}' ({origin}, LBA {first_lba}) mounted read-only at {path}"
             );
+            live_packages(path);
             return;
         }
     }
     kprintln!("  usb-storage : no FAT32 or ext2 volume on the device");
+}
+
+/// Пакеты живой флешки (16.11, Роман: «браузер обсос в образ … на живом
+/// проверить»): `\FREEOS\PKG\*.FPK` на носителе ставятся сами в тома
+/// `/opt` и `/var` в памяти ([`crate::fs::ramvol`]) — до перезагрузки.
+/// Уже стоящий пакет не ставится второй раз (флешку вынули и вставили).
+fn live_packages(mount: &str) {
+    if !crate::fs::ramvol::live() {
+        return;
+    }
+    let dir = alloc::format!("{mount}/FREEOS/PKG");
+    let Some(Ok(entries)) = crate::fs::list(&dir) else {
+        return;
+    };
+    for entry in entries {
+        let name = entry.name.to_ascii_lowercase();
+        let Some(stem) = name.strip_suffix(".fpk") else {
+            continue;
+        };
+        if matches!(crate::fs::list(&alloc::format!("/opt/{stem}")), Some(Ok(_))) {
+            continue;
+        }
+        let line = alloc::format!("/bin/pkg install {dir}/{}", entry.name);
+        match crate::user::spawn(&line, crate::vfs::perm::Credentials::ROOT) {
+            Ok(_) => kprintln!("  live pkg    : installing {dir}/{} into the RAM /opt", entry.name),
+            Err(err) => kprintln!("  live pkg    : could not start pkg for {}: {err:?}", entry.name),
+        }
+    }
 }
 
 /// Тома носителя: первый сектор, число секторов и откуда они взялись.

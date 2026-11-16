@@ -1039,6 +1039,13 @@ fn mount_disk_root(info: &BootInfo) {
     kprintln!();
     kprintln!("---- root filesystem --------------------------------------------");
 
+    // Живой флешке — `/opt` и `/var` в памяти до всякого перебора дисков:
+    // машина без своих дисков (или QEMU с одной флешкой) тоже должна уметь
+    // ставить пакеты с флешки.
+    if info.boot_flags & boot_info::BOOT_LIVE != 0 {
+        fs::ramvol::mount_live_branches();
+    }
+
     // Без ACPI шина бывает только из дерева устройств (фаза 51b).
     if info.acpi_rsdp == 0 && !pci::has_tree_host() {
         kprintln!("  disk        : no ACPI tables and no PCIe in the device tree: keeping the initrd as root");

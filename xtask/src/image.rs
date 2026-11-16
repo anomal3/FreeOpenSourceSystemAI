@@ -279,6 +279,19 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     payload.push(read_payload(esp, &source)?);
                 }
             }
+            // Браузер OBSOS (16.11, Роман: «в образ ещё браузер обсос запиши,
+            // хочу на ПК проверить на живом»). Корень живой системы только на
+            // чтение, поэтому пакет едет файлом `\FREEOS\PKG\OBSOS.FPK`, а ядро,
+            // увидев флешку, ставит его в `/opt` в памяти (`usb::storage`).
+            if built.release {
+                if let Some(bytes) = crate::package::servo(arch)? {
+                    payload.push(Payload {
+                        path: format!("{}/OBSOS.FPK", arch::PAYLOAD_PKG_DIR),
+                        data: bytes,
+                        source: PathBuf::from("(пакет OBSOS)"),
+                    });
+                }
+            }
         }
         Kind::Installer => {
             let installer = built.get(Component::Installer).ok_or_else(|| {

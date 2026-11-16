@@ -240,7 +240,7 @@ pub const SERVO_PACKAGE: &str = "obsos-0.1.fpk";
 /// Пакет `servo`: программы, собранные Linux-хостом сборки
 /// (`ports/servo/builder/build-jsprobe.sh` → `build/linux/<имя>-<арх>`).
 /// Нет их — пакета нет: без Docker система собирается как раньше.
-fn servo(arch: Arch) -> Result<Option<Vec<u8>>> {
+pub fn servo(arch: Arch) -> Result<Option<Vec<u8>>> {
     let Some(jsprobe) = crate::ruststd::linux_host_program("jsprobe", arch) else {
         say!("пакет servo пропущен: нет build/linux/jsprobe-{} — собрать: ports/servo/builder/build-jsprobe.sh", arch.name());
         return Ok(None);
