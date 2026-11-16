@@ -656,6 +656,7 @@ dependencies = [
  "calendar",
  "disk",
  "ed25519-dalek",
+ "edid",
  "ext2",
  "fdt",
  "filelocks",

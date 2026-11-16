@@ -20,11 +20,18 @@
 //! только в последовательной линии — как и задумано для машины без экрана до
 //! стола.
 //!
+//! # Несколько экранов и EDID (16.11.2026)
+//!
+//! Устройство называет до шестнадцати выходов (`GET_DISPLAY_INFO`) и, с
+//! возможностью `EDID`, отдаёт паспорт монитора каждого (`GET_EDID`). У
+//! каждого выхода свой ресурс — своя картинка; номера ресурсов `1 + 2·выход`
+//! и следующий чередуются при смене размера. Так стол с несколькими
+//! мониторами проверяется в QEMU (`max_outputs=2,edid=on`), без настоящей
+//! видеокарты.
+//!
 //! # Чего нет
 //!
-//! 3D (virgl, venus), нескольких экранов, EDID и смены размера окна хоста на
-//! ходу: стол берёт размер, который устройство назвало при запуске, или тот,
-//! что выбран в «Параметрах».
+//! 3D (virgl, venus) и смены размера окна хоста на ходу (очередь событий).
 //!
 //! # Аппаратный курсор (фаза 67b)
 //!
@@ -59,8 +66,16 @@ const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 const CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
 const CMD_UPDATE_CURSOR: u32 = 0x0300;
 const CMD_MOVE_CURSOR: u32 = 0x0301;
+const CMD_GET_EDID: u32 = 0x010a;
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+const RESP_OK_EDID: u32 = 0x1104;
+/// Возможность `VIRTIO_GPU_F_EDID`.
+const FEATURE_EDID: u64 = 1 << 1;
+/// Ответ на `GET_EDID`: заголовок, размер и до 1024 байт паспорта.
+const EDID_RESPONSE_SIZE: usize = HEADER_SIZE + 8 + 1024;
+/// Сколько выходов бывает у устройства.
+pub const MAX_SCANOUTS: usize = 16;
 
 /// Байт 0 — синий, 1 — зелёный, 2 — красный, 3 — не используется: ровно то,
 /// что `mini-ui` пишет в `u32` на little-endian (`0x00RRGGBB`).
@@ -70,8 +85,8 @@ const FORMAT_B8G8R8A8_UNORM: u32 = 1;
 
 /// Сторона картинки курсора: устройство принимает только 64×64.
 pub const CURSOR_SIDE: u32 = 64;
-/// Номер ресурса курсора — вне чередования ресурсов экрана (1 и 2).
-const CURSOR_RESOURCE: u32 = 10;
+/// Номер ресурса курсора — вне чередования ресурсов выходов (1..32).
+const CURSOR_RESOURCE: u32 = 100;
 /// Команда курсора: заголовок, место (экран, x, y, запас), ресурс, точка
 /// касания (x, y) и запас.
 const CURSOR_COMMAND_SIZE: usize = HEADER_SIZE + 32;
@@ -81,15 +96,19 @@ const HEADER_SIZE: usize = 24;
 /// Ответ на `GET_DISPLAY_INFO`: заголовок и шестнадцать экранов по 24 байта.
 const DISPLAY_INFO_SIZE: usize = HEADER_SIZE + 16 * 24;
 /// Где в буфере команды лежит ответ.
-const RESPONSE_AT: usize = 512;
+const RESPONSE_AT: usize = 2048;
+/// Буфер команды и ответа.
+const COMMAND_BUFFER: usize = 4096;
 
 /// Сколько раз опрашивать кольцо, прежде чем признать устройство зависшим.
 /// Команды исполняет поток QEMU сразу по уведомлению; предел — на случай,
 /// когда не исполнит вовсе.
 const POLL_LIMIT: u32 = 200_000_000;
 
-/// Номер единственного ресурса: экран один, и картинка у него одна.
-const RESOURCE: u32 = 1;
+/// Первый из двух номеров ресурса выхода `scanout`.
+const fn resource_base(scanout: usize) -> u32 {
+    1 + 2 * scanout as u32
+}
 
 /// Устройство, если оно нашлось и стол рисует в него.
 static GPU: crate::sync::SpinLock<Option<VirtioGpu>> = crate::sync::SpinLock::new(None);
@@ -102,10 +121,12 @@ struct VirtioGpu {
     command: DmaBuffer,
     /// Размер, который устройство предлагает для экрана 0.
     preferred: (u32, u32),
-    /// Ресурс, показанный на экране: его память и размер.
-    screen: Option<Screen>,
-    /// Номер показанного ресурса.
-    current: u32,
+    /// Выходы, как их назвало устройство: включён ли и предлагаемый размер.
+    heads: [(bool, u32, u32); MAX_SCANOUTS],
+    /// Паспорта мониторов по выходам (пусто — без `EDID`).
+    edids: [alloc::vec::Vec<u8>; MAX_SCANOUTS],
+    /// Показанный ресурс каждого выхода.
+    scans: [Option<Scan>; MAX_SCANOUTS],
     /// Очередь курсора и буфер её команды.
     cursor_queue: Queue,
     cursor_command: DmaBuffer,
@@ -130,10 +151,99 @@ struct Screen {
     height: u32,
 }
 
+/// Ресурс на выходе: картинка и её номер.
+#[derive(Clone, Copy)]
+struct Scan {
+    screen: Screen,
+    resource: u32,
+}
+
+/// Выход virtio-gpu, как его видит реестр мониторов.
+#[derive(Clone)]
+pub struct Head {
+    pub scanout: usize,
+    pub enabled: bool,
+    pub preferred: (u32, u32),
+    /// Паспорт монитора (пусто, если хост его не дал).
+    pub edid: alloc::vec::Vec<u8>,
+    /// Размер показанной картинки, если выход занят.
+    pub shown: Option<(u32, u32)>,
+}
+
 /// Есть ли virtio-gpu, в который рисует стол.
 #[must_use]
 pub fn active() -> bool {
-    GPU.lock().as_ref().is_some_and(|gpu| gpu.screen.is_some())
+    GPU.lock().as_ref().is_some_and(|gpu| gpu.scans[0].is_some())
+}
+
+/// Выходы устройства: какие включены, их размеры и паспорта мониторов.
+#[must_use]
+pub fn heads() -> alloc::vec::Vec<Head> {
+    let guard = GPU.lock();
+    let Some(gpu) = guard.as_ref() else {
+        return alloc::vec::Vec::new();
+    };
+    (0..MAX_SCANOUTS)
+        .filter(|&i| gpu.heads[i].0 || gpu.scans[i].is_some() || !gpu.edids[i].is_empty())
+        .map(|i| Head {
+            scanout: i,
+            enabled: gpu.heads[i].0,
+            preferred: (gpu.heads[i].1, gpu.heads[i].2),
+            edid: gpu.edids[i].clone(),
+            shown: gpu.scans[i].map(|scan| (scan.screen.width, scan.screen.height)),
+        })
+        .collect()
+}
+
+/// Завести картинку `width`×`height` на выходе `scanout` и показать её.
+pub fn take_scanout(scanout: usize, width: u32, height: u32) -> Result<Framebuffer, DisplayError> {
+    let mut guard = GPU.lock();
+    let gpu = guard.as_mut().ok_or(DisplayError::NoDriver("no virtio-gpu"))?;
+    if scanout >= MAX_SCANOUTS {
+        return Err(DisplayError::Refused("no such virtio-gpu output"));
+    }
+    gpu.make_screen(scanout, width, height)
+}
+
+/// Погасить выход: снять с него картинку и вернуть память.
+pub fn release_scanout(scanout: usize) {
+    let mut guard = GPU.lock();
+    let Some(gpu) = guard.as_mut() else { return };
+    if scanout >= MAX_SCANOUTS {
+        return;
+    }
+    if let Some(scan) = gpu.scans[scanout].take() {
+        let _ = gpu.set_scanout(scanout, 0, 0, 0);
+        let _ = gpu.detach_and_unref(scan.resource);
+        // SAFETY: ресурс снят, устройство память больше не читает.
+        crate::mm::frame::with(|frames| unsafe { frames.free_contiguous(scan.screen.memory, scan.screen.pages) });
+    }
+}
+
+/// Показать изменившийся прямоугольник выхода `scanout` (свои координаты).
+pub fn flush_scanout(scanout: usize, x: i32, y: i32, w: u32, h: u32) {
+    let mut guard = GPU.lock();
+    let Some(gpu) = guard.as_mut() else {
+        return;
+    };
+    let Some(scan) = gpu.scans.get(scanout).copied().flatten() else {
+        return;
+    };
+    let screen = scan.screen;
+    let left = x.max(0) as u32;
+    let top = y.max(0) as u32;
+    let right = (i64::from(x) + i64::from(w)).clamp(0, i64::from(screen.width)) as u32;
+    let bottom = (i64::from(y) + i64::from(h)).clamp(0, i64::from(screen.height)) as u32;
+    if left >= right || top >= bottom {
+        return;
+    }
+    let rect = (left, top, right - left, bottom - top);
+    if let Err(err) = gpu
+        .transfer(scan.resource, rect, screen.width)
+        .and_then(|()| gpu.resource_flush(rect, scan.resource))
+    {
+        kprintln!("  virtio-gpu  : flush of output {scanout} failed: {err}");
+    }
 }
 
 /// Найти устройство и поднять его — без экрана: экран заводит
@@ -158,6 +268,16 @@ pub unsafe fn probe(root: &pci::Root) -> bool {
                 gpu.preferred.0,
                 gpu.preferred.1
             );
+            for i in 0..MAX_SCANOUTS {
+                let (enabled, w, h) = gpu.heads[i];
+                if enabled || !gpu.edids[i].is_empty() {
+                    kprintln!(
+                        "  virtio-gpu  : output {i}: {} {w}x{h}, EDID {} bytes",
+                        if enabled { "enabled" } else { "disabled" },
+                        gpu.edids[i].len()
+                    );
+                }
+            }
             *GPU.lock() = Some(gpu);
             true
         }
@@ -180,33 +300,14 @@ pub fn preferred() -> Option<(u32, u32)> {
 pub fn take_screen(width: u32, height: u32) -> Result<Framebuffer, DisplayError> {
     let mut guard = GPU.lock();
     let gpu = guard.as_mut().ok_or(DisplayError::NoDriver("no virtio-gpu"))?;
-    gpu.make_screen(width, height)
+    gpu.make_screen(0, width, height)
 }
 
-/// Показать изменившийся прямоугольник. Зовёт композитор после того, как
-/// собрал его в буфере. Без устройства — ничего.
+/// Показать изменившийся прямоугольник экрана 0. Зовёт композитор после
+/// того, как собрал его в буфере. Без устройства — ничего. Прямоугольник
+/// обрезается по ресурсу: хост отвергает выходящий за край.
 pub fn flush(x: i32, y: i32, w: u32, h: u32) {
-    let mut guard = GPU.lock();
-    let Some(gpu) = guard.as_mut() else {
-        return;
-    };
-    let Some(screen) = gpu.screen else {
-        return;
-    };
-    // Прямоугольник обрезается по ресурсу: хост отвергает выходящий за край,
-    // и отказ стоил бы кадра.
-    let left = x.max(0) as u32;
-    let top = y.max(0) as u32;
-    let right = (i64::from(x) + i64::from(w)).clamp(0, i64::from(screen.width)) as u32;
-    let bottom = (i64::from(y) + i64::from(h)).clamp(0, i64::from(screen.height)) as u32;
-    if left >= right || top >= bottom {
-        return;
-    }
-    let rect = (left, top, right - left, bottom - top);
-    let current = gpu.current;
-    if let Err(err) = gpu.transfer(current, rect, screen.width).and_then(|()| gpu.resource_flush(rect)) {
-        kprintln!("  virtio-gpu  : flush failed: {err}");
-    }
+    flush_scanout(0, x, y, w, h);
 }
 
 /// Отдать хосту картинку курсора (`CURSOR_SIDE`² точек, `0xAARRGGBB`) с
@@ -217,7 +318,7 @@ pub fn cursor_show(image: &[u32], hot: (u32, u32), x: i32, y: i32) -> bool {
     let Some(gpu) = guard.as_mut() else {
         return false;
     };
-    if gpu.screen.is_none() {
+    if gpu.scans[0].is_none() {
         return false;
     }
     match gpu.make_cursor(image, hot).and_then(|()| gpu.cursor_command(CMD_UPDATE_CURSOR, CURSOR_RESOURCE, x, y)) {
@@ -276,12 +377,12 @@ impl VirtioGpu {
         unsafe { device.enable_bus_master() };
         // SAFETY: контракт функции.
         let transport = unsafe { Transport::open(device) }?;
-        // Просим одно — virtio 1.0. `VIRGL` и `EDID` требуют кода, которого
+        // virtio 1.0 и паспорта мониторов; `VIRGL` требует кода, которого
         // здесь нет.
-        transport.negotiate(FEATURE_VERSION_1)?;
+        let features = transport.negotiate(FEATURE_VERSION_1 | FEATURE_EDID)?;
         let control = Queue::new(&transport, 0)?;
         let cursor_queue = Queue::new(&transport, 1)?;
-        let command = dma::alloc(1024).map_err(VirtioError::NoMemory)?;
+        let command = dma::alloc(COMMAND_BUFFER).map_err(VirtioError::NoMemory)?;
         let cursor_command = dma::alloc(CURSOR_COMMAND_SIZE).map_err(VirtioError::NoMemory)?;
         transport.set_driver_ok();
 
@@ -290,31 +391,63 @@ impl VirtioGpu {
             control,
             command,
             preferred: (1280, 800),
-            screen: None,
-            current: 0,
+            heads: [(false, 0, 0); MAX_SCANOUTS],
+            edids: [const { alloc::vec::Vec::new() }; MAX_SCANOUTS],
+            scans: [None; MAX_SCANOUTS],
             cursor_queue,
             cursor_command,
             cursor: None,
             cursor_memory: None,
         };
-        if let Some(size) = gpu.display_info()? {
-            gpu.preferred = size;
+        gpu.display_info()?;
+        let (enabled, w, h) = gpu.heads[0];
+        if enabled && w >= 320 && h >= 200 {
+            gpu.preferred = (w, h);
+        }
+        if features & FEATURE_EDID != 0 {
+            // Паспорт спрашивается у каждого выхода: монитор может быть
+            // подключён к выключенному выходу (у QEMU без окна включён только
+            // первый). Ошибка — выходов больше нет.
+            for i in 0..MAX_SCANOUTS {
+                match gpu.get_edid(i) {
+                    Ok(edid) if !edid.is_empty() => gpu.edids[i] = edid,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
         }
         Ok(gpu)
     }
 
-    /// Размер экрана 0, если устройство называет его включённым.
-    fn display_info(&mut self) -> Result<Option<(u32, u32)>, VirtioError> {
+    /// Выходы: прямоугольник (x, y, w, h) и `enabled` по 24 байта на выход.
+    fn display_info(&mut self) -> Result<(), VirtioError> {
         self.header(CMD_GET_DISPLAY_INFO);
         self.submit(HEADER_SIZE, DISPLAY_INFO_SIZE, RESP_OK_DISPLAY_INFO)?;
-        // Первый экран: прямоугольник (x, y, w, h), затем `enabled`.
-        let width = self.response_u32(HEADER_SIZE + 8);
-        let height = self.response_u32(HEADER_SIZE + 12);
-        let enabled = self.response_u32(HEADER_SIZE + 16);
-        Ok((enabled != 0 && width >= 320 && height >= 200).then_some((width, height)))
+        for i in 0..MAX_SCANOUTS {
+            let at = HEADER_SIZE + i * 24;
+            let width = self.response_u32(at + 8);
+            let height = self.response_u32(at + 12);
+            let enabled = self.response_u32(at + 16) != 0;
+            self.heads[i] = (enabled, width, height);
+        }
+        Ok(())
     }
 
-    fn make_screen(&mut self, width: u32, height: u32) -> Result<Framebuffer, DisplayError> {
+    /// Паспорт монитора на выходе `scanout`.
+    fn get_edid(&mut self, scanout: usize) -> Result<alloc::vec::Vec<u8>, VirtioError> {
+        self.header(CMD_GET_EDID);
+        self.put_u32(HEADER_SIZE, scanout as u32);
+        self.submit(HEADER_SIZE + 8, EDID_RESPONSE_SIZE, RESP_OK_EDID)?;
+        let size = (self.response_u32(HEADER_SIZE) as usize).min(1024);
+        let mut out = alloc::vec![0u8; size];
+        for (i, byte) in out.iter_mut().enumerate() {
+            // SAFETY: ответ лежит в буфере команды целиком.
+            *byte = unsafe { self.command.as_ptr::<u8>().add(RESPONSE_AT + HEADER_SIZE + 8 + i).read() };
+        }
+        Ok(out)
+    }
+
+    fn make_screen(&mut self, scanout: usize, width: u32, height: u32) -> Result<Framebuffer, DisplayError> {
         let bytes = u64::from(width) * 4 * u64::from(height);
         let pages = (bytes as usize).div_ceil(PAGE_SIZE);
         let memory = crate::mm::frame::with(|frames| frames.allocate_contiguous(pages))
@@ -330,10 +463,12 @@ impl VirtioGpu {
         // экране, и совпасть они не могут. Считается от показанного номера, а
         // не от «есть ли экран» — иначе вторая смена режима снова просила бы
         // занятый номер (так и было: устройство отвечало «неверный ресурс»).
-        let id = if self.current == RESOURCE { RESOURCE + 1 } else { RESOURCE };
+        let base = resource_base(scanout);
+        let current = self.scans[scanout].map_or(0, |scan| scan.resource);
+        let id = if current == base { base + 1 } else { base };
         let made = self
             .create(id, width, height, memory, pages)
-            .and_then(|()| self.set_scanout(id, width, height));
+            .and_then(|()| self.set_scanout(scanout, id, width, height));
         if let Err(err) = made {
             kprintln!("  virtio-gpu  : {width}x{height} refused: {err}");
             // SAFETY: устройство буфер не показывает — экран остался на прежнем.
@@ -342,13 +477,12 @@ impl VirtioGpu {
         }
 
         // Экран показывает новый ресурс — старый можно снять.
-        if let Some(old) = self.screen.take() {
-            let _ = self.detach_and_unref(self.current);
+        if let Some(old) = self.scans[scanout].take() {
+            let _ = self.detach_and_unref(old.resource);
             // SAFETY: ресурс снят, устройство память больше не читает.
-            crate::mm::frame::with(|frames| unsafe { frames.free_contiguous(old.memory, old.pages) });
+            crate::mm::frame::with(|frames| unsafe { frames.free_contiguous(old.screen.memory, old.screen.pages) });
         }
-        self.screen = Some(Screen { memory, pages, width, height });
-        self.current = id;
+        self.scans[scanout] = Some(Scan { screen: Screen { memory, pages, width, height }, resource: id });
         Ok(Framebuffer {
             base: memory.to_direct_map().as_usize() as u64,
             size: (pages * PAGE_SIZE) as u64,
@@ -377,10 +511,10 @@ impl VirtioGpu {
         self.submit(HEADER_SIZE + 24, HEADER_SIZE, RESP_OK_NODATA)
     }
 
-    fn set_scanout(&mut self, id: u32, width: u32, height: u32) -> Result<(), VirtioError> {
+    fn set_scanout(&mut self, scanout: usize, id: u32, width: u32, height: u32) -> Result<(), VirtioError> {
         self.header(CMD_SET_SCANOUT);
         self.put_rect(HEADER_SIZE, (0, 0, width, height));
-        self.put_u32(HEADER_SIZE + 16, 0);
+        self.put_u32(HEADER_SIZE + 16, scanout as u32);
         self.put_u32(HEADER_SIZE + 20, id);
         self.submit(HEADER_SIZE + 24, HEADER_SIZE, RESP_OK_NODATA)
     }
@@ -409,10 +543,10 @@ impl VirtioGpu {
     }
 
     /// Показать перенесённый прямоугольник.
-    fn resource_flush(&mut self, rect: (u32, u32, u32, u32)) -> Result<(), VirtioError> {
+    fn resource_flush(&mut self, rect: (u32, u32, u32, u32), resource: u32) -> Result<(), VirtioError> {
         self.header(CMD_RESOURCE_FLUSH);
         self.put_rect(HEADER_SIZE, rect);
-        self.put_u32(HEADER_SIZE + 16, self.current);
+        self.put_u32(HEADER_SIZE + 16, resource);
         self.put_u32(HEADER_SIZE + 20, 0);
         self.submit(HEADER_SIZE + 24, HEADER_SIZE, RESP_OK_NODATA)
     }
@@ -485,8 +619,8 @@ impl VirtioGpu {
     // --- буфер команды -----------------------------------------------------
 
     fn header(&mut self, kind: u32) {
-        // SAFETY: буфер выделен на килобайт; заголовок — первые 24 байта.
-        unsafe { core::ptr::write_bytes(self.command.as_ptr::<u8>(), 0, RESPONSE_AT + DISPLAY_INFO_SIZE) };
+        // SAFETY: буфер выделен на `COMMAND_BUFFER`; заголовок — первые 24 байта.
+        unsafe { core::ptr::write_bytes(self.command.as_ptr::<u8>(), 0, RESPONSE_AT + EDID_RESPONSE_SIZE) };
         self.put_u32(0, kind);
     }
 

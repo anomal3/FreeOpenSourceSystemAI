@@ -77,6 +77,7 @@ osupdate = { path = "../osupdate" }
 # битовыми смещениями, а такую ошибку ловят тестом на хосте, а не курсором,
 # который ездит наискось в эмуляторе.
 usb-hid = { path = "../usb-hid" }
+edid = { path = "../edid" }
 # `default-features = false` drops the `std` and `unicode` features; what remains
 # is `font8x8::legacy`, a dependency-free table of `[u8; 8]` glyph rows. The
 # kernel still uses it directly for the boot console, which draws into the

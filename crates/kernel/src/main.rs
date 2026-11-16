@@ -531,6 +531,13 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
 
     let have_input = start_input(&info);
     start_graphics(&info, have_input);
+    // Реестр мониторов (16.11): выходы и их паспорта. Пока — virtio-gpu;
+    // NVIDIA добавляет свои после запуска GSP-RM.
+    {
+        let outputs = display::outputs::probe_virtio();
+        display::outputs::log_outputs(&outputs);
+        display::outputs::replace(outputs);
+    }
 
     // Сеть поднимается до служб, и это не порядок ради порядка: первая же
     // служба, которую система заведёт (клиент DHCP из фазы 35), обращается к
