@@ -587,6 +587,10 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
     put64(0x10, bar_phys(3));
     let address = device.address;
     put64(0x20, (u64::from(address.bus) << 8) | (u64::from(address.device) << 3) | u64::from(address.function));
+    // Картинка прошивки (GOP) лежит в начале видеопамяти: сказать GSP, что
+    // консоль есть и её место занято (как делает CPU-RM при efifb; 32 МиБ —
+    // с запасом на 4K). Этап 6, опыт E2.
+    put64(0x40, 32 << 20);
     put64(0x48, (1u64 << 47) - 4096);
     let mut put32 = |at: usize, v: u32| info[at..at + 4].copy_from_slice(&v.to_le_bytes());
     put32(0x50, 0x88000);
@@ -594,7 +598,9 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
     put32(0x58, device.config32(0));
     put32(0x5c, device.config32(0x2c));
     put32(0x60, u32::from(device.config8(8)));
+    info[0x380] = 1; // bIsPrimary: эта карта показывает загрузочный экран
     queues.send(None, FN_SET_SYSTEM_INFO, &info)?;
+    log.push(format!("before GSP: {}", snapshot(bar)));
     queues.send(None, FN_SET_REGISTRY, &registry())?;
 
     // 7. Процессор GSP: сброс, ядро RISC-V, адрес LIBOS в почтовых ящиках.
@@ -714,6 +720,29 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
                 let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
                 let fb_length = le64(&payload, 0x4c8).unwrap_or(0);
                 log.push(format!("GSP says: '{}', FB {} MiB", String::from_utf8_lossy(&name[..end]), fb_length >> 20));
+                // Области видеопамяти, как их видит RM.
+                let regions = le32(&payload, 0x158).unwrap_or(0).min(16) as usize;
+                for i in 0..regions {
+                    let at = 0x160 + i * 48;
+                    log.push(format!(
+                        "FB region {i}: {:#x}..{:#x} reserved {:#x} perf {} compr {} iso {} protected {}",
+                        le64(&payload, at).unwrap_or(0),
+                        le64(&payload, at + 8).unwrap_or(0),
+                        le64(&payload, at + 16).unwrap_or(0),
+                        le32(&payload, at + 24).unwrap_or(0),
+                        payload.get(at + 28).copied().unwrap_or(0),
+                        payload.get(at + 29).copied().unwrap_or(0),
+                        payload.get(at + 30).copied().unwrap_or(0)
+                    ));
+                }
+                log.push(format!(
+                    "BAR1 PDE {:#x}, BAR2 PDE {:#x}, internal client {:#x} device {:#x} subdevice {:#x}",
+                    le64(&payload, 0x600).unwrap_or(0),
+                    le64(&payload, 0x608).unwrap_or(0),
+                    le32(&payload, 0x640).unwrap_or(0),
+                    le32(&payload, 0x644).unwrap_or(0),
+                    le32(&payload, 0x648).unwrap_or(0)
+                ));
                 break;
             }
             Some((function, _, _)) => log.push(format!("event {function:#x} while waiting for static info")),
@@ -722,7 +751,242 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
         }
     }
     bar.wr(GSP + 0x04, 0x40);
+
+    // 12. Этап 6, опыт E1: GSP-RM переводит BAR1 в виртуальный режим со своими
+    // таблицами, и запись процессора в кадр прошивки больше не доходит до
+    // видеопамяти — картинка «замерзает». Вернуть BAR1 в физический режим
+    // (то, что пишет сам RM в `kbusBar1InstBlkBind_TU102`).
+    log.push(format!("after GSP: {}", snapshot(bar)));
+    bar.wr(0x00b8_0f40, 0);
+    let bound = bar.wait(2_000_000, |b| b.rd(0x00b8_0f50) & 3 == 0);
+    log.push(format!("BAR1 back to physical mode: {} ({})", if bound { "bound" } else { "bind did NOT finish" }, snapshot(bar)));
+
+    // 13. Этап 6: объекты дисплея GSP-RM и опрос выходов (только чтение).
+    let mut rm = Rm { queues: &mut queues, bar, log: Vec::new() };
+    rm.probe_display();
+    log.extend(rm.log);
     Ok(())
+}
+
+/// Состояние BAR1 и дисплейных головок — для журнала.
+fn snapshot(bar: Bar0) -> String {
+    let mut out = format!(
+        "BAR1_BLOCK {:#x} BAR2_BLOCK {:#x} BIND {:#x} 0x1704 {:#x} 0x1714 {:#x}",
+        bar.rd(0x00b8_0f40),
+        bar.rd(0x00b8_0f48),
+        bar.rd(0x00b8_0f50),
+        bar.rd(0x0000_1704),
+        bar.rd(0x0000_1714)
+    );
+    for head in 0..4usize {
+        let raster = bar.rd(0x0068_a064 + head * 0x400);
+        let line0 = bar.rd(0x0061_6330 + head * 0x800) & 0xffff;
+        spin_us(1000);
+        let line1 = bar.rd(0x0061_6330 + head * 0x800) & 0xffff;
+        out.push_str(&format!(" | head{head} raster {raster:#x} line {line0}->{line1}"));
+    }
+    out
+}
+
+// --- RM: объекты и управление (этап 6) --------------------------------------
+
+const FN_FREE: u32 = 10;
+const FN_RM_CONTROL: u32 = 76;
+const FN_RM_ALLOC: u32 = 103;
+
+const H_CLIENT: u32 = 0xc1d0_0001;
+const H_DEVICE: u32 = 0xde1d_0000;
+const H_SUBDEVICE: u32 = 0x5d1d_0000;
+const H_DISP_COMMON: u32 = 0x0073_0000;
+
+/// Разговор с GSP-RM: выделить объект, вызвать управление.
+struct Rm<'a> {
+    queues: &'a mut Queues,
+    bar: Bar0,
+    log: Log,
+}
+
+impl Rm<'_> {
+    /// Послать RPC и дождаться ответа с той же функцией (события — мимо).
+    fn call(&mut self, function: u32, payload: &[u8]) -> Res<Vec<u8>> {
+        self.queues.send(Some(self.bar), function, payload)?;
+        let deadline = crate::time::uptime_ms() + 5000;
+        loop {
+            match self.queues.receive()? {
+                Some((f, result, reply)) if f == function => {
+                    if result != 0 {
+                        return Err(format!("RPC {function} result {result:#x}"));
+                    }
+                    return Ok(reply);
+                }
+                Some((f, _, _)) => self.log.push(format!("event {f:#x} during RPC {function}")),
+                None if crate::time::uptime_ms() > deadline => return Err(format!("no reply to RPC {function} in 5 s")),
+                None => spin_us(200),
+            }
+        }
+    }
+
+    /// GSP_RM_ALLOC: объект `class` с хэндлом `object` под `parent`.
+    fn alloc(&mut self, parent: u32, object: u32, class: u32, params: &[u8]) -> Res<()> {
+        let mut p = alloc::vec![0u8; 0x20 + params.len()];
+        for (at, v) in [(0, H_CLIENT), (4, parent), (8, object), (12, class), (0x14, params.len() as u32)] {
+            p[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        p[0x20..].copy_from_slice(params);
+        let reply = self.call(FN_RM_ALLOC, &p)?;
+        let status = le32(&reply, 0x10)?;
+        if status != 0 {
+            return Err(format!("alloc class {class:#x} status {status:#x}"));
+        }
+        Ok(())
+    }
+
+    /// GSP_RM_CONTROL: команда `cmd` объекту; возвращает ответные параметры.
+    fn control(&mut self, client: u32, object: u32, cmd: u32, params: &[u8]) -> Res<Vec<u8>> {
+        let mut p = alloc::vec![0u8; 0x18 + params.len()];
+        for (at, v) in [(0, client), (4, object), (8, cmd), (0x10, params.len() as u32)] {
+            p[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        p[0x18..].copy_from_slice(params);
+        let reply = self.call(FN_RM_CONTROL, &p)?;
+        let status = le32(&reply, 0x0c)?;
+        if status != 0 {
+            return Err(format!("control {cmd:#x} status {status:#x}"));
+        }
+        Ok(reply.get(0x18..).unwrap_or(&[]).to_vec())
+    }
+
+    fn disp(&mut self, cmd: u32, params: &[u8]) -> Res<Vec<u8>> {
+        self.control(H_CLIENT, H_DISP_COMMON, cmd, params)
+    }
+
+    /// Создать клиента, устройство, подустройство и общий дисплей, затем
+    /// спросить у RM о выходах и мониторах. Только чтение — режимы не
+    /// меняются. Каждый шаг отчитывается сам; ошибка не обрывает остальные.
+    fn probe_display(&mut self) {
+        let mut root = alloc::vec![0u8; 0x6c];
+        root[0..4].copy_from_slice(&H_CLIENT.to_le_bytes());
+        root[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        root[8..14].copy_from_slice(b"fossai");
+        let mut device = alloc::vec![0u8; 0x38];
+        device[4..8].copy_from_slice(&H_CLIENT.to_le_bytes());
+        let steps: [(&str, u32, u32, u32, Vec<u8>); 4] = [
+            ("client", H_CLIENT, H_CLIENT, 0x0000, root),
+            ("device", H_CLIENT, H_DEVICE, 0x0080, device),
+            ("subdevice", H_DEVICE, H_SUBDEVICE, 0x2080, alloc::vec![0u8; 4]),
+            ("display common", H_DEVICE, H_DISP_COMMON, 0x0073, Vec::new()),
+        ];
+        for (name, parent, object, class, params) in steps {
+            match self.alloc(parent, object, class, &params) {
+                Ok(()) => self.log.push(format!("RM: {name} {object:#x} allocated")),
+                Err(why) => {
+                    self.log.push(format!("RM: {name} failed - {why}"));
+                    return;
+                }
+            }
+        }
+
+        let u32s = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        match self.disp(0x0073_0102, &u32s(&[0, 0, 0])) {
+            Ok(r) => self.log.push(format!("RM: {} head(s)", le32(&r, 8).unwrap_or(0))),
+            Err(why) => self.log.push(format!("RM: GET_NUM_HEADS - {why}")),
+        }
+        let supported = match self.disp(0x0073_0107, &u32s(&[0, 0, 0])) {
+            Ok(r) => {
+                let (mask, ddc) = (le32(&r, 4).unwrap_or(0), le32(&r, 8).unwrap_or(0));
+                self.log.push(format!("RM: outputs supported {mask:#x}, with DDC {ddc:#x}"));
+                mask
+            }
+            Err(why) => {
+                self.log.push(format!("RM: GET_SUPPORTED - {why}"));
+                return;
+            }
+        };
+        let connected = match self.disp(0x0073_0108, &u32s(&[0, 0, supported, 0])) {
+            Ok(r) => {
+                let mask = le32(&r, 8).unwrap_or(0);
+                self.log.push(format!("RM: outputs connected {mask:#x}"));
+                mask
+            }
+            Err(why) => {
+                self.log.push(format!("RM: GET_CONNECT_STATE - {why}"));
+                0
+            }
+        };
+        for bit in 0..32 {
+            let id = 1u32 << bit;
+            if supported & id == 0 {
+                continue;
+            }
+            let mut info = u32s(&[0, id]);
+            info.resize(0x38, 0);
+            let kind = match self.disp(0x0073_028b, &info) {
+                Ok(r) => {
+                    let (index, kind, protocol, location) =
+                        (le32(&r, 8).unwrap_or(0), le32(&r, 12).unwrap_or(0), le32(&r, 16).unwrap_or(0), le32(&r, 28).unwrap_or(0));
+                    let lit = r.get(0x30).copied().unwrap_or(0);
+                    self.log.push(format!(
+                        "RM: output {id:#x}: OR index {index} type {kind} protocol {protocol} location {location} lit by VBIOS {lit}{}",
+                        if connected & id != 0 { ", CONNECTED" } else { "" }
+                    ));
+                    protocol
+                }
+                Err(why) => {
+                    self.log.push(format!("RM: OR_GET_INFO {id:#x} - {why}"));
+                    continue;
+                }
+            };
+            let _ = kind;
+            if connected & id == 0 {
+                continue;
+            }
+            // EDID: у HDMI/DVI его отдаёт RM; у DisplayPort — только AUX (позже).
+            let mut edid = u32s(&[0, id, 2048, 0]);
+            edid.resize(16 + 2048, 0);
+            match self.disp(0x0073_0245, &edid) {
+                Ok(r) => {
+                    let size = le32(&r, 8).unwrap_or(0) as usize;
+                    let bytes = r.get(16..16 + size.min(2048)).unwrap_or(&[]);
+                    self.log.push(format!("RM: EDID of {id:#x}: {size} bytes, {}", describe_edid(bytes)));
+                }
+                Err(why) => self.log.push(format!("RM: EDID of {id:#x} - {why} (DisplayPort needs AUX)")),
+            }
+        }
+        for head in 0..4u32 {
+            if let Ok(r) = self.disp(0x0073_010c, &u32s(&[0, head, 0, 0])) {
+                let id = le32(&r, 12).unwrap_or(0);
+                if id != 0 {
+                    self.log.push(format!("RM: head {head} drives output {id:#x}"));
+                }
+            }
+        }
+        let _ = FN_FREE;
+    }
+}
+
+/// Производитель, модель и родной режим из EDID — для журнала.
+fn describe_edid(e: &[u8]) -> String {
+    if e.len() < 128 || e[0..8] != [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0] {
+        return "not a valid EDID".into();
+    }
+    let maker = u16::from_be_bytes([e[8], e[9]]);
+    let letters: String = [(maker >> 10) & 31, (maker >> 5) & 31, maker & 31]
+        .iter()
+        .map(|c| char::from(b'@' + *c as u8))
+        .collect();
+    let mut name = String::new();
+    for d in 0..4 {
+        let at = 54 + d * 18;
+        if e[at] == 0 && e[at + 1] == 0 && e[at + 3] == 0xfc {
+            name = String::from_utf8_lossy(&e[at + 5..at + 18]).trim().into();
+        }
+    }
+    // Первый подробный режим — родной.
+    let d = &e[54..72];
+    let clock = u32::from(u16::from_le_bytes([d[0], d[1]])) * 10;
+    let w = u32::from(d[2]) | (u32::from(d[4] & 0xf0) << 4);
+    let h = u32::from(d[5]) | (u32::from(d[7] & 0xf0) << 4);
+    format!("{letters} '{name}', native {w}x{h} pixel clock {clock} kHz")
 }
 
 /// FWSEC-FRTS (если в эту загрузку ещё не было) и раскладка верха
