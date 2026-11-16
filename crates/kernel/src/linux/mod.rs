@@ -40,6 +40,7 @@ pub mod recent;
 mod net;
 mod netdev;
 mod netlink;
+pub mod ntsync;
 mod process;
 pub mod profile;
 pub mod signal;
@@ -822,6 +823,11 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     if let Some(answer) = snd::open(&linux, flags) {
         return answer;
     }
+    // Объекты синхронизации Windows для Wine (16.11.2026); выключенное
+    // устройство отсюда не открывается — и дальше по цепочке его нет.
+    if let Some(answer) = ntsync::open(&linux, flags) {
+        return answer;
+    }
     if let Some((node, writable)) = special::node(&linux) {
         let directory = node.metadata().kind == NodeKind::Directory;
         return match crate::user::with_current(|program| {
@@ -1061,6 +1067,9 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
     if snd::exists(&linux) {
         let kind = if linux == "/dev/snd" { S_IFDIR } else { S_IFCHR };
         return put_stat(out, kind, 0o666, 0, 0, 0, 0, ino_of(&linux));
+    }
+    if ntsync::exists(&linux) {
+        return put_stat(out, S_IFCHR, 0o666, 0, 0, 0, 0, ino_of(&linux));
     }
     if special::exists(&linux) {
         let kind = if linux.starts_with("/dev/") { S_IFCHR } else { S_IFREG };
@@ -1940,6 +1949,10 @@ unsafe fn ioctl(fd: usize, request: usize, arg: usize) -> i64 {
     const TIOCGWINSZ: usize = 0x5413;
     const FIONREAD: usize = 0x541B;
     const FIONBIO: usize = 0x5421;
+    // `/dev/ntsync` — первым: `WAIT_ANY` Wine — самый частый ioctl игры.
+    if let Some(answer) = ntsync::ioctl(fd, request, arg) {
+        return answer;
+    }
     // Звук ALSA (`/dev/snd`, шаг 7 Proton).
     if let Some(answer) = snd::ioctl(fd, request, arg) {
         return answer;

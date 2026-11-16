@@ -1180,6 +1180,23 @@ fn run_builtin(line: &str) -> bool {
             crate::linux::wayland::set_trace(on);
             sprintln!("  wltrace: {}", if on { "on" } else { "off" });
         }
+        // `/dev/ntsync` для Wine (16.11.2026): `off` прячет устройство
+        // (`ENOENT`), и следующий запуск Wine/Proton уйдёт на fsync; уже
+        // открытые устройства работают дальше.
+        #[cfg(target_arch = "x86_64")]
+        "ntsync" => {
+            match argument.trim() {
+                "on" => crate::linux::ntsync::set_enabled(true),
+                "off" => crate::linux::ntsync::set_enabled(false),
+                "" => {}
+                _ => sprintln!("  ntsync: usage `ntsync [on|off]`"),
+            }
+            sprintln!(
+                "  ntsync: /dev/ntsync {} (boot default {})",
+                if crate::linux::ntsync::enabled() { "on" } else { "off" },
+                if crate::linux::ntsync::DEFAULT_ENABLED { "on" } else { "off" }
+            );
+        }
         "irq" => interrupt_wakes(argument),
         "beep" => beep(argument),
         "clear" => {
