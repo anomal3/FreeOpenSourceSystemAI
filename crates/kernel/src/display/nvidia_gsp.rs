@@ -1159,6 +1159,9 @@ fn run_sequencer(bar: Bar0, payload: &[u8], libos: u64, app_version: u32) -> Res
 /// Не запускается, если в меню загрузки выбран «экран прошивки», если карта
 /// не из поддержанных (GA102–GA107) или если WPR2 уже задан (горячая
 /// перезагрузка без снятия питания: повторный запуск GSP невозможен).
+/// Ставить ли режим сразу после автозапуска GSP-RM (см. `auto_task`).
+const AUTO_MODESET: bool = false;
+
 pub fn auto_task() {
     if super::firmware_only() {
         crate::kprintln!("  nvidia-gsp  : auto start skipped - firmware display asked in the boot menu");
@@ -1193,6 +1196,14 @@ pub fn auto_task() {
     // выключенные — раскладкой стола; режимы в ней те же, что уже стоят, и
     // второй раз карту не трогают. Нет сохранённой раскладки для этих
     // мониторов — как раньше: стол переезжает на основной.
+    // 16.11, первая проверка на ПК Романа: core UPDATE не завершился, оба
+    // монитора погасли, а стол жил вслепую. Пока свой модсет не прошёл на
+    // железе, сам он не запускается — картинка остаётся от прошивки, а
+    // проверка — командой `gpu display` (на ней и смотрим журнал).
+    if !AUTO_MODESET {
+        crate::kprintln!("  nvidia-gsp  : auto start: GSP-RM up; modeset is manual for now ('gpu display')");
+        return;
+    }
     let _ = super::nvidia_disp::modeset(&[]);
     if let Some(plan) = crate::ui::saved_layout() {
         crate::kprintln!("  nvidia-gsp  : auto start: saved monitor layout ({} output(s))", plan.len());

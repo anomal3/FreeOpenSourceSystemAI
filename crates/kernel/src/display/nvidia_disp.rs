@@ -18,6 +18,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 use core::sync::atomic::{Ordering, fence};
 
 use super::nvidia::Bar0;
@@ -276,6 +277,20 @@ fn light(rm: &mut Rm, log: &mut Log, disp: &mut Disp, wanted: &[(u32, u32, u32, 
         };
         plan.push((head, id));
     }
+    // Зажжённые прошивкой — первыми: их головы уже светятся, и первое
+    // UPDATE должно нести их состояние, а не гасить их (16.11: BenQ погас
+    // вместе с неудачным вторым монитором). Их SOR заняты — RM не должен
+    // отдать их другому выходу.
+    plan.sort_by_key(|(_, id)| !lit.iter().any(|(_, o)| o == id));
+    if disp.heads.is_empty() {
+        for (_, id) in &lit {
+            if let Ok(or) = old_sor(rm, *id) {
+                if or < 8 {
+                    disp.used_sors |= 1 << or;
+                }
+            }
+        }
+    }
 
     for (head, id) in plan {
         let mut info = u32s(&[0, id]);
@@ -387,9 +402,12 @@ fn bring_up(rm: &mut Rm, log: &mut Log, internal: (u32, u32), device: crate::pci
     wim.extend_from_slice(&0x10000u64.to_le_bytes());
     wim.extend_from_slice(&u32s(&[2, 2]));
     rm.control(internal.0, internal.1, 0x2080_0a49, &wim)?;
-    ctxdma(vram, OBJ_SYNC, 5, SYNC, SYNC + 0xfff);
-    ctxdma(vram, OBJ_VRAM, 5, 0, VRAM_MAP_END - 1);
-    ctxdma(vram, OBJ_FB, 5, 0, VRAM_MAP_END - 1);
+    // Флаги как у nouveau (`gv100_dmaobj_new`): 0x40 — страницы «по
+    // умолчанию»; без него (было 5) core UPDATE на RTX 3060 не завершался
+    // (16.11, первая проверка на ПК).
+    ctxdma(vram, OBJ_SYNC, 0x45, SYNC, SYNC + 0xfff);
+    ctxdma(vram, OBJ_VRAM, 0x45, 0, VRAM_MAP_END - 1);
+    ctxdma(vram, OBJ_FB, 0x45, 0, VRAM_MAP_END - 1);
 
     // Ручной DisplayPort: линию тренируем мы (через RM), а не RM сам.
     rm.disp(0x0073_1365, &u32s(&[0]))?;
@@ -412,6 +430,7 @@ fn bring_up(rm: &mut Rm, log: &mut Log, internal: (u32, u32), device: crate::pci
     core.kick(bar);
     core.idle(bar)?;
     log.push(format!("core channel up (GET {:#x})", bar.rd(0x0068_0004)));
+    log.push(format!("after core init: {}", diag(bar, vram, &[0])));
 
     // Окна главных плоскостей головок: 0, 2, 4, 6.
     let mut windows = [None; 8];
@@ -480,6 +499,78 @@ fn aux(rm: &mut Rm, id: u32, cmd: u32, addr: u32, data: &[u8], len: usize) -> Re
     Err(format!("AUX {addr:#x}: busy"))
 }
 
+/// Слепок состояния дисплея для журнала: указатели каналов, исключения,
+/// супервизор, уведомитель через BAR1 и через PRAMIN (видит ли дисплей то же,
+/// что процессор). Только чтение — подтверждать прерывания будет GSP-RM.
+fn diag(bar: Bar0, vram: Vram, heads: &[u32]) -> String {
+    let mut out = String::new();
+    let _ = write!(out, "core PUT {:#x} GET {:#x}", bar.rd(0x0068_0000), bar.rd(0x0068_0004));
+    for w in [0u32, 2, 4, 6] {
+        let at = 0x0069_0000 + w as usize * 0x1000;
+        let _ = write!(out, " w{w} {:#x}/{:#x}", bar.rd(at), bar.rd(at + 4));
+    }
+    for chid in [0usize, 1, 3] {
+        let _ = write!(
+            out,
+            " | ch{chid} ctl {:#x} pb {:#x} {:#x} {:#x} {:#x} exc {:#x} {:#x} {:#x}",
+            bar.rd(0x0061_04e0 + chid * 4),
+            bar.rd(0x0061_0b20 + chid * 16),
+            bar.rd(0x0061_0b24 + chid * 16),
+            bar.rd(0x0061_0b28 + chid * 16),
+            bar.rd(0x0061_0b2c + chid * 16),
+            bar.rd(0x0061_1020 + chid * 12),
+            bar.rd(0x0061_1024 + chid * 12),
+            bar.rd(0x0061_1028 + chid * 12),
+        );
+    }
+    let _ = write!(
+        out,
+        " | idle core {:#x} win {:#x} | intr {:#x} {:#x} {:#x} {:#x} {:#x} detail {:#x} | sv {:#x}",
+        bar.rd(0x0061_0630),
+        bar.rd(0x0061_0664),
+        bar.rd(0x0061_1ec0),
+        bar.rd(0x0061_184c),
+        bar.rd(0x0061_1850),
+        bar.rd(0x0061_1854),
+        bar.rd(0x0061_1c30),
+        bar.rd(0x0061_1848),
+        bar.rd(0x0061_07a8),
+    );
+    let _ = write!(out, " | inst {:#x} {:#x}", bar.rd(0x0061_0010), bar.rd(0x0061_0014));
+    for &h in heads {
+        let h = h as usize;
+        let _ = write!(
+            out,
+            " | head{h} sv {:#x} stat {:#x} {:#x} armed-ctl {:#x} {:#x} asy {:#x}",
+            bar.rd(0x0061_07ac + h * 4),
+            bar.rd(0x0061_1800 + h * 4),
+            bar.rd(0x0061_2078 + h * 0x800),
+            bar.rd(0x0068_8000 + 0x2004 + h * 0x400),
+            bar.rd(0x0068_8000 + 0x2064 + h * 0x400),
+            bar.rd(0x0068_0000 + 0x2064 + h * 0x400),
+        );
+    }
+    // Уведомитель и начало RAMHT глазами PRAMIN (окно 64 КиБ по 0x1700).
+    let saved = bar.rd(0x1700);
+    bar.wr(0x1700, (SYNC >> 16) as u32);
+    let ntfy = [bar.rd(0x0070_0000 + (SYNC & 0xffff) as usize), bar.rd(0x0070_0004 + (SYNC & 0xffff) as usize)];
+    bar.wr(0x1700, (INST >> 16) as u32);
+    let ramht = [bar.rd(0x0070_0000 + (INST & 0xffff) as usize), bar.rd(0x0070_0004 + (INST & 0xffff) as usize)];
+    bar.wr(0x1700, saved);
+    let _ = write!(
+        out,
+        " | ntfy bar1 {:#x} {:#x} pramin {:#x} {:#x} | inst0 bar1 {:#x} pramin {:#x}",
+        vram.r32(SYNC),
+        vram.r32(SYNC + 4),
+        ntfy[0],
+        ntfy[1],
+        vram.r32(INST),
+        ramht[0]
+    );
+    let _ = ramht[1];
+    out
+}
+
 /// Обновление core с уведомлением; `windows` — окна, сблокированные с ним.
 fn core_update(disp: &mut Disp, bar: Bar0, windows: u32) -> Res<()> {
     for i in 0..4 {
@@ -492,7 +583,9 @@ fn core_update(disp: &mut Disp, bar: Bar0, windows: u32) -> Res<()> {
     disp.core.kick(bar);
     let vram = disp.vram;
     if !bar.wait(2_000_000, |_| vram.r32(SYNC) >> 30 == 2) {
-        return Err(format!("core UPDATE did not finish (notifier {:#x}, {})", vram.r32(SYNC), disp.core.idle(bar).err().unwrap_or_default()));
+        let idle = disp.core.idle(bar).err().unwrap_or_default();
+        let heads: Vec<u32> = (0..4).collect();
+        return Err(format!("core UPDATE did not finish (notifier {:#x}, {idle}) | {}", vram.r32(SYNC), diag(bar, vram, &heads)));
     }
     disp.core.idle(bar)
 }
