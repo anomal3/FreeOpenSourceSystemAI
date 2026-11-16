@@ -13337,7 +13337,19 @@ open-gpu-kernel-modules, open-gpu-doc; на Rust есть `drivers/gpu/nova-core
    (booter_load, gsp-570.144 или 535.113.01 — сверить), radix3, LIBOS, очереди
    команд и сообщений, RPC `SET_SYSTEM_INFO`/`SET_REGISTRY`, ждать
    `GSP_INIT_DONE`, `GET_GSP_STATIC_INFO`. Структуры — строго той же версии.
-6. **Сервисы RM** (XL) — `GSP_RM_ALLOC`/`CONTROL`: дисплей (modeset), каналы
+6. **Дисплей и мониторы — написано (16.11), ждёт проверки на ПК Романа:**
+   `display/nvidia_disp.rs` (свой режим через GSP-RM: instmem/RAMHT/ctxdma,
+   root 0xc670, каналы core 0xc67d / window 0xc67e, DP: AUX, ASSIGN_SOR,
+   DP_CTRL, CONFIG_STREAM; растр из EDID), автозапуск при загрузке
+   (`nvidia_gsp::auto_task`), общий слой мониторов: крейт `edid`, реестр
+   `display/outputs.rs`, стол на несколько мониторов (композитор по
+   объединению выходов), «Параметры → Дисплей» как в Windows (схема с
+   перетаскиванием, разрешение и частота из EDID, основной, «Применить» +
+   откат за 15 с, раскладка в `desktop.cfg` или на флешке `LAYOUT.TXT`).
+   В QEMU проверено на virtio-gpu с двумя выходами (сценарий `multihead`).
+   Не сделано: HDMI на NVIDIA (только DP), масштаб на монитор, Wayland
+   `wl_output` на каждый монитор, Maxwell/Pascal/Volta (без GSP).
+   Было в плане: **Сервисы RM** (XL) — `GSP_RM_ALLOC`/`CONTROL`: дисплей (modeset), каналы
    `AMPERE_CHANNEL_GPFIFO_A` (0xC56F), страничные таблицы GPU, прерывания.
 7. **3D и вычисления** (XL) — классы `AMPERE_A` (0xC697), compute, copy.
 8. **DRM uAPI nouveau для Mesa NVK** (XL) — `GETPARAM`, `CHANNEL_ALLOC`,
