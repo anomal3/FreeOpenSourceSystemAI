@@ -1511,7 +1511,8 @@ fn mprotect(addr: usize, len: usize, prot: usize) -> i64 {
 /// заставил бы её гадать.
 pub(crate) fn mmap_errno(err: super::MmapError) -> i64 {
     match err {
-        super::MmapError::BadRequest => ERR_BAD_ADDRESS,
+        super::MmapError::BadRequest | super::MmapError::Unmapped => ERR_BAD_ADDRESS,
+        super::MmapError::Exists => user_abi::ERR_EXISTS,
         super::MmapError::Limit => ERR_LIMIT,
         super::MmapError::NoMemory => ERR_NO_SPACE,
         // Отказ дескриптора переводится общим переводчиком: «нет такого

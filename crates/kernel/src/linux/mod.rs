@@ -28,7 +28,7 @@ use core::mem::size_of;
 
 use user_abi::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, SYS_CLOCK, SYS_CLOSE, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_GETGID,
-    SYS_GETPID, SYS_GETUID, SYS_ISATTY, SYS_MPROTECT, SYS_MUNMAP, SYS_NANOSLEEP, SYS_RANDOM, SYS_READ, SYS_SEEK,
+    SYS_GETPID, SYS_GETUID, SYS_ISATTY, SYS_MUNMAP, SYS_NANOSLEEP, SYS_RANDOM, SYS_READ, SYS_SEEK,
     SYS_SET_TLS, SYS_WRITE, SYS_YIELD,
 };
 
@@ -56,6 +56,7 @@ use crate::kprintln;
 use crate::mm::PageFlags;
 use crate::user::files::FdKind;
 use crate::user::space;
+use crate::user::Place;
 use crate::vfs::NodeKind;
 use crate::vfs::perm::Access;
 
@@ -542,7 +543,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::FSTAT => fstat(a0, a1),
             nr::LSEEK => errno(native(SYS_SEEK, a0, a1, a2)),
             nr::MMAP => mmap(a0, a1, a2, a3, a4, args[5]),
-            nr::MPROTECT => errno(native(SYS_MPROTECT, a0, a1, a2)),
+            nr::MPROTECT => mprotect(a0, a1, a2),
             // Снять то, чего нет, у Linux не ошибка (12.11: Wine снимает
             // `KUSER_SHARED_DATA` на всякий случай и проверяет ответ).
             nr::MUNMAP => match errno(native(SYS_MUNMAP, a0, a1, 0)) {
@@ -1665,6 +1666,45 @@ unsafe fn writev(fd: usize, iov: usize, count: usize) -> i64 {
     total
 }
 
+/// Строки журнала об отказах `mprotect`/`mmap(MAP_FIXED)` — не больше стольких
+/// на систему: TrackMania и Chromium делают их тысячами, а отказ, ради которого
+/// журнал заведён, обычно один из первых.
+const VM_LOG_LIMIT: usize = 64;
+/// Отказы по диапазонам меньше этого не пишутся: «большой диапазон» — резерв
+/// кучи glibc (64 МиБ), стек потока (8 МиБ), куча Wine; страница-другая —
+/// обычные пробы Wine, которые и должны отказывать.
+const VM_LOG_MIN_BYTES: usize = 64 * 1024;
+
+/// Строка журнала об отказе работы с памятью (17.11.2026, разбор сбоя
+/// TrackMania: был ли отказ у `mprotect`, растящего кучу glibc).
+fn vm_log(line: core::fmt::Arguments<'_>) {
+    static SHOWN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if SHOWN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < VM_LOG_LIMIT {
+        kprintln!("  linux       : {} {line}", crate::sched::current());
+    }
+}
+
+/// `mprotect`. Дыра в диапазоне — `ENOMEM`, как у Linux (17.11.2026; родной
+/// ответ «плохой адрес» переводился в `EFAULT`, которого Linux здесь не даёт
+/// никогда). Отказ по большому диапазону — в журнал.
+fn mprotect(addr: usize, len: usize, prot: usize) -> i64 {
+    // Число областей — под тем же замком, строка журнала — уже без него.
+    let result = crate::user::with_current_shared(|program, shared| {
+        (program.linux_mprotect(addr, len, prot, shared), program.region_count())
+    });
+    if let Some((Err(err), regions)) = &result {
+        if len >= VM_LOG_MIN_BYTES {
+            vm_log(format_args!("mprotect {addr:#x}+{len:#x} prot {prot:#x} -> {err:?} (regions {regions})"));
+        }
+    }
+    match result.map(|(result, _)| result) {
+        Some(Ok(())) => 0,
+        Some(Err(crate::user::MmapError::Unmapped)) => -e::ENOMEM,
+        Some(Err(err)) => errno(crate::user::syscall::mmap_errno(err)),
+        None => -e::ESRCH,
+    }
+}
+
 /// `mmap`: безымянная память или кусок файла с любыми правами, кроме записи
 /// и исполнения сразу; `MAP_FIXED` — ровно по адресу (фаза 71b). Общая
 /// запись в файл (`MAP_SHARED` с `PROT_WRITE`) — отказ: в файл отображение не
@@ -1679,24 +1719,24 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
     const MAP_FIXED: usize = 0x10;
     const MAP_ANONYMOUS: usize = 0x20;
     const MAP_FIXED_NOREPLACE: usize = 0x10_0000;
-    let mut fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
     // Нижняя половина адресов — программам (ядро наверху, 31.10.2026):
     // `MAP_FIXED_NOREPLACE` на занятое — `EEXIST`, как у Linux; подсказка без
-    // `MAP_FIXED` в нижней области исполняется, если место свободно (Wine и Go
-    // просят адреса так).
+    // `MAP_FIXED` исполняется, если место свободно (Wine, Go и `new_heap`
+    // glibc просят адреса так). Свободно ли — решает `linux_mmap` под замком
+    // программы, в одном заходе с отображением (17.11.2026: проверка
+    // отдельным заходом пускала между ними чужой `mmap`, и подсказка
+    // становилась `MAP_FIXED` поверх него — см. [`crate::user::Place`]).
     let bytes = len.div_ceil(4096).saturating_mul(4096);
-    if flags & MAP_FIXED == 0 && addr != 0 && len != 0 {
-        let free = crate::user::with_current(|program| program.range_free(addr, bytes)).unwrap_or(false);
-        if flags & MAP_FIXED_NOREPLACE != 0 {
-            // Занято или не наше место — `EEXIST`, кроме адресов выше окна:
-            // там `ENOMEM` (ниже), как у Linux за концом пространства.
-            if !free && addr.checked_add(bytes).is_some_and(|end| end <= crate::user::WINDOW_BASE + (1 << 39)) {
-                return -e::EEXIST;
-            }
-        } else if free {
-            fixed = true;
-        }
-    }
+    let place = if flags & MAP_FIXED != 0 {
+        Place::Fixed
+    } else if flags & MAP_FIXED_NOREPLACE != 0 {
+        Place::NoReplace
+    } else if addr != 0 && len != 0 {
+        Place::Hint
+    } else {
+        Place::Anywhere
+    };
+    let fixed = matches!(place, Place::Fixed | Place::NoReplace);
     let shared_flag = flags & MAP_SHARED != 0;
     let mut shared = None;
     let file = if flags & MAP_ANONYMOUS != 0 {
@@ -1799,7 +1839,18 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
     if fixed && addr.checked_add(bytes).is_none_or(|end| end > crate::user::WINDOW_BASE + (1 << 39)) {
         return -e::ENOMEM;
     }
-    match crate::user::with_current(|program| program.linux_mmap(addr, len, prot, fixed, file, shared)) {
+    let result = crate::user::with_current(|program| {
+        (program.linux_mmap(addr, len, prot, place, file, shared), program.region_count())
+    });
+    // `MAP_FIXED` по большому диапазону, которое не прошло, — в журнал
+    // (17.11.2026, разбор сбоя TrackMania): без этого не видно, кто и почему
+    // не получил своё место. Не больше [`VM_LOG_LIMIT`] строк.
+    if let Some((Err(err), regions)) = &result {
+        if place == Place::Fixed && bytes >= VM_LOG_MIN_BYTES {
+            vm_log(format_args!("mmap(MAP_FIXED) {addr:#x}+{bytes:#x} prot {prot:#x} -> {err:?} (regions {regions})"));
+        }
+    }
+    match result.map(|(result, _)| result) {
         Some(Ok(base)) => base as i64,
         Some(Err(err)) => errno(crate::user::syscall::mmap_errno(err)),
         None => -e::ESRCH,
@@ -1839,7 +1890,7 @@ fn mremap(old: usize, old_size: usize, new_size: usize, flags: usize) -> i64 {
         const PROT_READ: usize = 1;
         const PROT_WRITE: usize = 2;
         let prot = if writable { PROT_READ | PROT_WRITE } else { PROT_READ };
-        let mapped = crate::user::with_current(|program| program.linux_mmap(0, new_size, prot, false, None, Some((mem, offset))));
+        let mapped = crate::user::with_current(|program| program.linux_mmap(0, new_size, prot, Place::Anywhere, None, Some((mem, offset))));
         let new = match mapped {
             Some(Ok(base)) => base,
             Some(Err(err)) => return errno(crate::user::syscall::mmap_errno(err)),

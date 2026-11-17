@@ -729,7 +729,8 @@ pub fn builtins(arch: Arch) -> PathBuf {
 
 /// Проверочные программы Linux (фаза 71a): исходники в `libc/linux`, путь в
 /// образе — `/compat/linux/bin/<имя>`.
-const LINUX_PROGRAMS: [&str; 7] = ["hello", "futexv", "sigasync", "shmprobe", "wow32probe", "netlinkprobe", "ntsyncprobe"];
+const LINUX_PROGRAMS: [&str; 8] =
+    ["hello", "futexv", "sigasync", "shmprobe", "wow32probe", "netlinkprobe", "ntsyncprobe", "heapgrow"];
 
 /// Общие флаги проверочных программ Linux.
 const LINUX_COMMON: [&str; 10] = [

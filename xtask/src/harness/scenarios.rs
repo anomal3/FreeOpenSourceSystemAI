@@ -7462,7 +7462,10 @@ pub const ALL: &[Scenario] = &[
         big_file: false,
         ssh_key: false,
         memory: "",
-        extra: &[],
+        // Четыре процессора (17.11.2026): `heapgrow` ловит гонки замка
+        // программы и сброса трансляций, а на одном процессоре потоки идут
+        // по очереди и гонок не бывает.
+        extra: &["-smp", "4"],
         steps: &[
             Step::Await(PROMPT, BOOT),
             Step::Line("run /compat/linux/bin/hello one two"),
@@ -7567,6 +7570,19 @@ pub const ALL: &[Scenario] = &[
             Step::Await("ntsyncprobe: 0 failed", 60_000),
             Step::Await("exited with code 0", 15_000),
             Step::Absent("ntsyncprobe: FAILED"),
+            // Куча потока glibc (17.11.2026, сбой TrackMania): new_heap,
+            // рост mprotect-ом, обе усадки, 8 потоков с кучами, гонка
+            // подсказок mmap.
+            Step::Line("run /compat/linux/bin/heapgrow"),
+            Step::Await("heapgrow: start", 30_000),
+            Step::Await("heapgrow: ok write at heap+0x800d58 (the faulting offset)", 15_000),
+            Step::Await("heapgrow: ok after MADV_DONTNEED the page reads zero", 15_000),
+            Step::Await("heapgrow: ok regrow after the mmap-branch shrink", 15_000),
+            Step::Await("heapgrow: ok no thread saw a failed mprotect/new_heap", 60_000),
+            Step::Await("heapgrow: ok no thread lost its pages to another's hinted mmap", 120_000),
+            Step::Await("heapgrow: 0 failed", 15_000),
+            Step::Await("exited with code 0", 15_000),
+            Step::Absent("heapgrow: FAILED"),
             Step::Absent("sigasync: FAILED"),
             Step::Absent("futexv: FAILED"),
             Step::Absent("linux: FAILED"),
