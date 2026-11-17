@@ -306,7 +306,25 @@ fn light(rm: &mut Rm, log: &mut Log, disp: &mut Disp, wanted: &[(u32, u32, u32, 
         edid.resize(16 + 2048, 0);
         let r = rm.disp(0x0073_0245, &edid)?;
         let size = le32(&r, 8)? as usize;
-        let monitor = edid::parse(r.get(16..16 + size.min(2048)).unwrap_or(&[])).map_err(|e| format!("EDID of {id:#x}: {e:?}"))?;
+        let mut monitor = edid::parse(r.get(16..16 + size.min(2048)).unwrap_or(&[])).map_err(|e| format!("EDID of {id:#x}: {e:?}"))?;
+        // Только режимы, которые пролезают в линию DisplayPort (24 бита на
+        // точку, 8b/10b: полезных 8 бит из 10 на каждый символ линии). 17.11:
+        // LHC P2410R предлагает 180 Гц (720 МГц), а его DP 1.2 — 4×5,4 Гбит/с,
+        // 17,28 Гбит/с полезных: тренировка линии не проходила ни на одной
+        // скорости, и монитор гас. Такие режимы «Параметры» больше не видят.
+        if let Ok(caps) = aux(rm, id, 9, 0, &[], 3) {
+            let rate = (u32::from(caps[1]) * 27_000).min(disp.gpu_max_rate);
+            let lanes = u64::from(caps[2] & 0x1f).min(4);
+            let budget = u64::from(rate) * 8 * lanes;
+            let before = monitor.modes.len();
+            monitor.modes.retain(|m| u64::from(m.clock_khz) * 24 <= budget);
+            if monitor.modes.len() != before {
+                log.push(format!(
+                    "output {id:#x}: {} mode(s) above the DP link ({rate} kHz x{lanes}) hidden",
+                    before - monitor.modes.len()
+                ));
+            }
+        }
         // Без явного выбора — режим, сохранённый «Параметрами» для этого
         // монитора (по паспорту), а если монитор его больше не предлагает или
         // сохранённого нет — родной.

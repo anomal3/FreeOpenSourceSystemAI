@@ -209,6 +209,8 @@ pub struct Rtl8125 {
     tx_pool: DmaBuffer,
     rx_next: usize,
     tx_next: usize,
+    /// Переполнение приёма уже сказано в журнал.
+    overflow_seen: bool,
     mac: [u8; 6],
     stats: Stats,
     device_id: u16,
@@ -296,6 +298,7 @@ impl Rtl8125 {
             tx_pool,
             rx_next: 0,
             tx_next: 0,
+            overflow_seen: false,
             mac,
             stats: Stats::default(),
             device_id: device.device,
@@ -629,6 +632,20 @@ impl Card for Rtl8125 {
         // SAFETY: дескриптор внутри кольца.
         let status = unsafe { desc.read_volatile() };
         if status & DESC_OWN != 0 {
+            // Кольцо пусто — заодно подтвердить события карты. Прерывания
+            // замаскированы (опрос), но биты состояния копятся, и после
+            // «нет свободных дескрипторов» (RDU, бит 4) или переполнения
+            // FIFO (бит 6) неподтверждённая карта может больше не принимать
+            // (17.11, ПК Романа: адрес по DHCP получен, дальше ни пинга, ни
+            // страниц — пока шла установка Proton, задача приёма отставала).
+            let events = self.regs.r32(INTR_STATUS);
+            if events != 0 {
+                self.regs.w32(INTR_STATUS, events);
+                if events & (1 << 4 | 1 << 6) != 0 && !self.overflow_seen {
+                    self.overflow_seen = true;
+                    crate::kprintln!("  rtl8125     : receive ring overflowed (status {events:#x}), acknowledged");
+                }
+            }
             return None;
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);

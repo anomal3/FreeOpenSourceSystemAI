@@ -737,7 +737,48 @@ pub fn configure_all(
         let mut guard = INTERFACE.lock();
         guard.as_mut().ok_or(NetError::NoDevice)?.dns = dns;
     }
+    if !DIAG_STARTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        let _ = crate::sched::spawn_daemon("net-diag", diag_task);
+    }
     Ok(())
+}
+
+static DIAG_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Самопроверка сети в журнал после первого адреса (17.11, ПК Романа:
+/// адрес по DHCP есть, а ни страниц, ни пинга с соседнего ПК — журнал о сети
+/// молчал). Пинг шлюза, имя через DNS, затем счётчики карты и стека раз в
+/// минуту первые десять минут: по ним видно, где рвётся — приём, ARP, DNS.
+fn diag_task() {
+    crate::sched::sleep_ms(3000);
+    let line = |what: &str| {
+        if let Some(s) = status() {
+            crate::kprintln!(
+                "  net-diag    : {what}: rx {} frames ({} dropped), tx {} ({} dropped); arp req in {} out {}, replies in {} out {}; ipv4 in {}, ignored {}; udp in {} out {} (no listener {}); tcp in {} out {} retrans {}",
+                s.link.rx_frames, s.link.rx_dropped, s.link.tx_frames, s.link.tx_dropped,
+                s.counters.arp_requests_in, s.counters.arp_requests_out, s.counters.arp_replies_in, s.counters.arp_replies_out,
+                s.counters.ipv4_in, s.counters.ignored, s.counters.udp_in, s.counters.udp_out, s.counters.udp_no_listener,
+                s.counters.tcp_in, s.counters.tcp_out, s.counters.tcp_retransmits
+            );
+        }
+    };
+    line("after DHCP");
+    if let Some(gateway) = status().map(|s| s.gateway).filter(|g| !g.is_unspecified()) {
+        for seq in 1..=3u16 {
+            match ping(gateway, seq, 2000) {
+                Ok(ms) => crate::kprintln!("  net-diag    : ping {gateway}: reply in {ms} ms"),
+                Err(err) => crate::kprintln!("  net-diag    : ping {gateway}: {err:?}"),
+            }
+        }
+    }
+    match resolve("ya.ru", 5000) {
+        Ok(ip) => crate::kprintln!("  net-diag    : ya.ru -> {ip}"),
+        Err(err) => crate::kprintln!("  net-diag    : ya.ru not resolved: {err:?}"),
+    }
+    for minute in 1..=10 {
+        crate::sched::sleep_ms(60_000);
+        line(&alloc::format!("{minute} min"));
+    }
 }
 
 /// Адрес сервера имён, если он известен.
