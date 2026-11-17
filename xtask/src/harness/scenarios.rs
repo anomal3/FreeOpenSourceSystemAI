@@ -7445,6 +7445,8 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("netlinkprobe: FAILED"),
             // `/dev/ntsync` (16.11.2026): объекты синхронизации Wine 11 /
             // GE-Proton11 в ядре — семафоры, мьютексы, события, WAIT_ANY/ALL.
+            // По умолчанию выключено (16.11: с ним Wine не готовил префикс).
+            Step::Line("ntsync on"),
             Step::Line("run /compat/linux/bin/ntsyncprobe"),
             Step::Await("ntsyncprobe: start", 30_000),
             Step::Await("ntsyncprobe: ok open /dev/ntsync", 15_000),

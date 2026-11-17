@@ -53,11 +53,12 @@ use crate::user::files::Object;
 
 pub const PATH: &str = "/dev/ntsync";
 
-/// Включено ли устройство после загрузки. Пробная программа `ntsyncprobe` и
-/// сценарий `linux` прошли — включено; если с ним что-то не так у Wine,
-/// выключить командой оболочки `ntsync off` (fsync Proton вернётся сам: его
-/// wineserver откатывается на fsync, когда `/dev/ntsync` не открывается).
-pub const DEFAULT_ENABLED: bool = true;
+/// Включено ли устройство после загрузки. Проба `ntsyncprobe` проходит, но
+/// 16.11 с настоящим Wine (Trackmania на живой флешке) `wineboot` трижды не
+/// приготовил префикс («could not load kernel32.dll», один процесс снят #DF),
+/// а без ntsync тот же шаг проходит. Пока не разобрано — выключено; включить
+/// командой оболочки `ntsync on` (Proton берёт его сам, fsync — запасной).
+pub const DEFAULT_ENABLED: bool = false;
 
 static ENABLED: AtomicBool = AtomicBool::new(DEFAULT_ENABLED);
 
@@ -622,6 +623,12 @@ fn wait(dev: &Arc<Device>, arg: usize, all: bool) -> i64 {
             break 0;
         }
         if super::signal::pending() {
+            break -e::EINTR;
+        }
+        // Процесс снимают (`exit_group`, kill) — поток в бесконечном
+        // ожидании обязан выйти, как в остальных долгих ожиданиях (`ipc`,
+        // `poll`). Без этого он переживал выход процесса (16.11, Wine).
+        if crate::user::kill_pending() {
             break -e::EINTR;
         }
         let until = match deadline {

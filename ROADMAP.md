@@ -11860,6 +11860,21 @@ eventfd, epoll, timerfd, memfd, ppoll, tgkill, sigaltstack, clone3. Чего н�
   не разобрано; `wineserver` при выходе — assert `obj->refcount`;
   `received delete_id for unknown id` от нашего сервера Wayland.
 
+- **16.11–17.11: живая флешка с Proton, сеть, ntsync.** Proton, Debian и
+  Trackmania едут на живой флешке (`FOSSAI_WITH_PROTON=1`) и ставятся сами
+  в тома памяти (Proton за 10 с). Слой Linux: `AF_NETLINK` (дампы линков,
+  адресов, маршрутов), `SIOCGIF*`, `/proc/net`, `/sys/class/net` —
+  `nsiproxy.sys` снова включён. `/dev/ntsync` по mainline (проба
+  `ntsyncprobe` зелёная), но **по умолчанию выключен** (`ntsync on` в
+  оболочке): с ним `wineboot` не готовил префикс, 32-битный `rundll32`
+  (Wow64Install) снят #DF на нарочном чтении NULL в `__TRY` — подозрение на
+  доставку #PF из режима совместимости (CS 0x23) / гонку `TSS.RSP0`, разбор
+  в рабочей папке `ntsync-wine-debug.md` (добавить в обработчик #DF вывод
+  cs/rsp/RSP0 и границ стека задачи; тесты T1–T5 для пробы). Исправлено по
+  пути: ожидание ntsync не видело снятия процесса; кадр сигнала на стеке,
+  разделённом `fork`, падал в ядре (`prepare_write` до записи); диск в
+  памяти держал таблицу страниц в куче ядра (паника на Proton).
+
 ### Проверить на ПК Романа при следующей прошивке (Proton + игра + OBSOS на флешке)
 
 Роман 16.11: «не критично, на основную работу не влияет — напомни, когда

@@ -791,6 +791,12 @@ fn enter_handler(
         // SAFETY: из системного вызова или исключения третьего кольца.
         unsafe { crate::arch::return_to_kernel(128 + sig as i64) }
     }
+    // Стек мог стать разделённым после `fork` соседнего потока: своя копия
+    // страниц — до записи (`user::prepare_write`). 16.11, Trackmania на живой
+    // флешке: запись кадра из возврата прерывания упала в ядре («page fault:
+    // write … protection violation») — на этом пути отказ ядра копией не
+    // разбирается.
+    crate::user::prepare_write(sp, fpstate + fp_bytes - sp);
     // SAFETY: выровнено и проверено на запись строкой выше.
     unsafe { save_fpu(fpstate) };
     let uc = sp + 8;
