@@ -30,6 +30,7 @@
 mod bochs;
 #[cfg(target_arch = "x86_64")]
 pub mod intel;
+pub mod amd;
 pub mod nvidia;
 pub mod nvidia_disp;
 pub mod nvidia_gsp;

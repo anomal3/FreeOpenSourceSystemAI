@@ -562,6 +562,9 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
         // Видеокарта NVIDIA (13.11, этапы 1–2): только узнать, что за чип.
         // SAFETY: см. выше.
         unsafe { display::nvidia::probe(&root) };
+        // Видеокарта AMD (17.11, этап A1): только разведка, ничего не пишется.
+        // SAFETY: см. выше.
+        unsafe { display::amd::probe(&root) };
         // Видеокарты, у которых драйвер в ядре (фаза 68h): режим им меняется
         // по просьбе, а «свои» они с загрузки.
         display::claim_adapters();
