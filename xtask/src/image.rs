@@ -160,6 +160,7 @@ pub fn build_with_key(built: &Built, kind: Kind, live_key: Option<&Path>) -> Res
     payload.push(build_file(build.number));
     if kind == Kind::System {
         payload.push(live_file());
+        payload.push(display_file());
     }
     let bytes = assemble(&payload, kind)?;
 
@@ -203,6 +204,21 @@ fn build_file(number: u32) -> Payload {
         path: String::from("FREEOS/BUILD"),
         data: format!("{number}\n").into_bytes(),
         source: PathBuf::from("(номер сборки)"),
+    }
+}
+
+/// Режим экрана для загрузчика на живой флешке `\FREEOS\DISPLAY.CFG`
+/// (17.11): заранее на один сектор, из пробелов после «none» — загрузчик
+/// читает первую строку, «none» для него — «ничего не просили». Ядро
+/// переписывает его на месте (`usb::stick_log::store_display`), когда в
+/// «Параметрах» выбирают разрешение: создавать файлы на FAT оно не умеет.
+fn display_file() -> Payload {
+    let mut data = vec![b' '; 512];
+    data[..5].copy_from_slice(b"none\n");
+    Payload {
+        path: String::from("FREEOS/DISPLAY.CFG"),
+        data,
+        source: PathBuf::from("(режим экрана для загрузчика)"),
     }
 }
 
