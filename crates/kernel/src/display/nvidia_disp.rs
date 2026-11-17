@@ -312,7 +312,7 @@ fn light(rm: &mut Rm, log: &mut Log, disp: &mut Disp, wanted: &[(u32, u32, u32, 
         // LHC P2410R предлагает 180 Гц (720 МГц), а его DP 1.2 — 4×5,4 Гбит/с,
         // 17,28 Гбит/с полезных: тренировка линии не проходила ни на одной
         // скорости, и монитор гас. Такие режимы «Параметры» больше не видят.
-        if let Ok(caps) = aux(rm, id, 9, 0, &[], 3) {
+        if let Ok(caps) = dpcd_caps(rm, id) {
             let rate = (u32::from(caps[1]) * 27_000).min(disp.gpu_max_rate);
             let lanes = u64::from(caps[2] & 0x1f).min(4);
             let budget = u64::from(rate) * 8 * lanes;
@@ -492,6 +492,25 @@ fn new_channel(rm: &mut Rm, internal: (u32, u32), class: u32, instance: u32, use
     Ok(Channel { pb, user, cur: 0, chn })
 }
 
+/// Возможности приёмника DisplayPort: первые 15 байт DPCD, а если приёмник
+/// объявил расширенный блок (бит 7 байта `0x000E`), — они же из `0x2200`.
+///
+/// 17.11, LHC P2410R: в старом поле монитор пишет «DP 1.2, 5,4 Гбит/с», а
+/// настоящие возможности (DP 1.4, 8,1 Гбит/с на линию) — только в `0x2200`;
+/// так делают мониторы DP 1.4 ради старых источников. Без этого 180 Гц при
+/// 2560x1440 (720 МГц) не помещались в линию, хотя в Windows работают.
+fn dpcd_caps(rm: &mut Rm, id: u32) -> Res<Vec<u8>> {
+    let base = aux(rm, id, 9, 0, &[], 15)?;
+    if base.get(0x0e).is_some_and(|b| b & 0x80 != 0) {
+        if let Ok(ext) = aux(rm, id, 9, 0x2200, &[], 15) {
+            if ext.len() >= 4 && ext[0] >= base[0] {
+                return Ok(ext);
+            }
+        }
+    }
+    Ok(base)
+}
+
 /// AUX DisplayPort: прочитать (`cmd` 9) или записать (8) до 16 байт DPCD.
 fn aux(rm: &mut Rm, id: u32, cmd: u32, addr: u32, data: &[u8], len: usize) -> Res<Vec<u8>> {
     let mut p = alloc::vec![0u8; 0x30];
@@ -617,8 +636,8 @@ fn set_head(rm: &mut Rm, log: &mut Log, disp: &mut Disp, head: u32, id: u32, lin
         return Err(format!("no window channel {w} for head {head}"));
     }
 
-    // DPCD: возможности приёмника.
-    let dpcd = aux(rm, id, 9, 0, &[], 15)?;
+    // DPCD: возможности приёмника (с расширенным блоком DP 1.4).
+    let dpcd = dpcd_caps(rm, id)?;
     let (max_rate, max_lanes, ef) = (u32::from(dpcd[1]) * 27_000, u32::from(dpcd[2] & 0x1f).min(4), dpcd[2] & 0x80 != 0);
     log.push(format!("DPCD rev {:#x}, max {} kHz x{}, enhanced framing {ef}", dpcd[0], max_rate, max_lanes));
 
