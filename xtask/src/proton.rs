@@ -11,8 +11,9 @@
 //! WoW64, шаг 4 плана), DXVK и VKD3D-Proton, `share/wine`. Не берётся:
 //! `lib/wine/i386-unix` и `lib/i386-linux-gnu` (32-битный код Linux — его ядро
 //! не исполняет; 32-битные программы Windows пойдут новым WoW64 внутри
-//! 64-битного процесса), `share/default_pfx` (шаблон префикса Steam: префикс
-//! создаёт `wineboot`), `wine-preloader` (см. `wine.rs`).
+//! 64-битного процесса), `share/default_pfx` (шаблон префикса Steam под
+//! X11: свой шаблон снимает сценарий `proton-prefix`, см. [`PREFIX_SNAPSHOT`]),
+//! `wine-preloader` (см. `wine.rs`).
 //!
 //! # Свои зависимости
 //!
@@ -187,6 +188,109 @@ fn patch_interp(data: &mut [u8]) -> bool {
     data[at..at + INTERP_OLD.len()].fill(0);
     data[at..at + INTERP_NEW.len()].copy_from_slice(INTERP_NEW);
     true
+}
+
+/// Имя снимка шаблона префикса (`build/proton-prefix/win64.*`). Шаблон один
+/// на `WINEARCH=win64` (`fossai-proton`) и `wow64` (`bin/tmnf`): `wineboot`
+/// GE строит их одинаково — `#arch=win64` и `syswow64` у обоих, разница
+/// только во временах ключей реестра (сверено 17.11).
+const PREFIX_SNAPSHOT: &str = "win64";
+
+/// Снимок шаблона префикса на хосте: `build/proton-prefix/<имя>.list` и
+/// `.blob`. Список — строки через табуляцию: `d путь права`, `l путь цель`,
+/// `f путь права размер`; содержимое файлов — подряд в `.blob`, в порядке
+/// строк `f`. Не tar и не дерево каталогов: имена префикса Wine длиннее
+/// MAX_PATH и различаются регистром, NTFS хоста их не держит.
+fn template_paths(name: &str) -> (PathBuf, PathBuf) {
+    let dir = crate::paths::build_dir().join("proton-prefix");
+    (dir.join(format!("{name}.list")), dir.join(format!("{name}.blob")))
+}
+
+/// Снять шаблон префикса с раздела состояния диска стенда (шаг `Fetch` сценария
+/// `proton-prefix`, гость уже погас): каталог `guest_dir` целиком и его
+/// символические ссылки из таблицы ядра (`/etc/linux-links`).
+pub fn save_template(disk: &std::path::Path, guest_dir: &str, name: &str) -> Result<()> {
+    let Some(tree) = crate::statefs::read_tree(disk, guest_dir)? else {
+        bail!("у гостя нет /{guest_dir}");
+    };
+    let mut list = String::new();
+    let mut blob: Vec<u8> = Vec::new();
+    for node in &tree {
+        if node.path.contains(['\t', '\n']) {
+            bail!("имя с табуляцией или переводом строки: {:?}", node.path);
+        }
+        match &node.data {
+            None => list.push_str(&format!("d\t{}\t{:o}\n", node.path, node.mode)),
+            Some(data) => {
+                list.push_str(&format!("f\t{}\t{:o}\t{}\n", node.path, node.mode, data.len()));
+                blob.extend_from_slice(data);
+            }
+        }
+    }
+    let table = crate::statefs::read_file(disk, "etc/linux-links")?.unwrap_or_default();
+    let base = format!("/{}/", guest_dir.trim_matches('/'));
+    let mut links = 0;
+    for line in String::from_utf8_lossy(&table).lines() {
+        let Some((path, target)) = line.split_once('\t') else { continue };
+        if let Some(rel) = path.strip_prefix(&base) {
+            list.push_str(&format!("l\t{rel}\t{target}\n"));
+            links += 1;
+        }
+    }
+    let (list_path, blob_path) = template_paths(name);
+    fs::create_dir_all(list_path.parent().unwrap())?;
+    fs::write(&list_path, list)?;
+    fs::write(&blob_path, &blob)?;
+    say!(
+        "proton: шаблон {name} с /{guest_dir}: {} узлов, ссылок {links}, {} МиБ -> {}",
+        tree.len(),
+        blob.len() / (1024 * 1024),
+        list_path.display()
+    );
+    Ok(())
+}
+
+/// Шаблон префикса в пакет: файлы — `share/fossai/prefix/…`, пустые каталоги
+/// и ссылки (их у fpk нет) — списком `share/fossai/prefix.list` (`d путь`,
+/// `l путь цель`), его разбирает `fossai-proton`. `false` — снимка нет.
+fn add_template(name: &str, files: &mut Vec<(String, Vec<u8>, u32)>) -> Result<bool> {
+    let (list_path, blob_path) = template_paths(name);
+    let (Ok(list), Ok(blob)) = (fs::read_to_string(&list_path), fs::read(&blob_path)) else {
+        return Ok(false);
+    };
+    let root = String::from("share/fossai/prefix");
+    let mut extra = String::new();
+    let mut parents: BTreeSet<String> = BTreeSet::new();
+    let mut dirs: Vec<String> = Vec::new();
+    let (mut at, mut count) = (0usize, 0usize);
+    for line in list.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        match parts.as_slice() {
+            ["d", path, _] => dirs.push((*path).to_string()),
+            ["l", path, target] => extra.push_str(&format!("l\t{path}\t{target}\n")),
+            ["f", path, mode, size] => {
+                let size: usize = size.parse().with_context(|| format!("{}: {line}", list_path.display()))?;
+                let mode = u32::from_str_radix(mode, 8).unwrap_or(0o644);
+                let data = blob.get(at..at + size).with_context(|| format!("{}: короче списка", blob_path.display()))?;
+                at += size;
+                // Каталоги файла — уже не пустые.
+                let mut dir = *path;
+                while let Some((up, _)) = dir.rsplit_once('/') {
+                    parents.insert(up.to_string());
+                    dir = up;
+                }
+                files.push((format!("{root}/{path}"), data.to_vec(), mode | 0o600));
+                count += 1;
+            }
+            _ => bail!("{}: непонятная строка {line:?}", list_path.display()),
+        }
+    }
+    // Пустые каталоги — `mkdir` в скрипте (первыми: в них ложатся ссылки).
+    let mut empty: String = dirs.iter().filter(|dir| !parents.contains(*dir)).map(|dir| format!("d\t{dir}\n")).collect();
+    empty.push_str(&extra);
+    files.push((format!("{root}.list"), empty.into_bytes(), 0o644));
+    say!("proton: шаблон префикса {name} — {count} файлов, {} МиБ", at / (1024 * 1024));
+    Ok(true)
 }
 
 /// Библиотеки GE-Proton в архиве.
@@ -434,11 +538,36 @@ pub fn build(arch: Arch) -> Result<()> {
         # кладутся в префикс поверх wined3d и включаются как native.\n\
         # Новый префикс — заранее и до конца (13.11): в QEMU он строится дольше\n\
         # ожидания Wine («boot event wait timed out» → программа без kernel32).\n\
+        # С 17.11 — из готового шаблона пакета (`share/fossai/prefix/`, снят\n\
+        # стендом `proton-prefix`; один на win64 и wow64): секунды вместо минут\n\
+        # `wineboot -i`; без шаблона — по-старому. Пустые каталоги и ссылки\n\
+        # (`dosdevices/c:`) — списком `prefix.list`: в пакете их не бывает.\n\
         case \"$1\" in --server-debug=*) ;; *)\n\
             if [ ! -f \"$WINEPREFIX/system.reg\" ]; then\n\
-                $P/lib/wine/x86_64-unix/wine wineboot -i\n\
-                $P/bin/wineserver -w\n\
+                T=$P/share/fossai/prefix\n\
+                if [ -f \"$T.list\" ]; then\n\
+                    LD_LIBRARY_PATH= mkdir -p \"$WINEPREFIX\"\n\
+                    LD_LIBRARY_PATH= cp -r \"$T/.\" \"$WINEPREFIX/\"\n\
+                    d=(); l=()\n\
+                    while IFS=$'\\t' read -r k a b; do\n\
+                        case $k in d) d+=(\"$WINEPREFIX/$a\") ;; l) l+=(\"$a\" \"$b\") ;; esac\n\
+                    done < \"$T.list\"\n\
+                    [ ${#d[@]} -gt 0 ] && LD_LIBRARY_PATH= mkdir -p \"${d[@]}\"\n\
+                    for ((i = 0; i < ${#l[@]}; i += 2)); do\n\
+                        LD_LIBRARY_PATH= ln -sfn \"${l[i+1]}\" \"$WINEPREFIX/${l[i]}\"\n\
+                    done\n\
+                    # `.update-timestamp` — из шаблона как есть: его пишет сам Wine\n\
+                    # (время `wine.inf`, у файлов пакета 0). Своё значение от `stat`\n\
+                    # Debian с ним не совпало, и первый `wineboot` переделывал\n\
+                    # префикс заново (+3,5 мин в QEMU, 17.11).\n\
+                    echo \"fossai-proton: prefix from template\"\n\
+                else\n\
+                    $P/lib/wine/x86_64-unix/wine wineboot -i\n\
+                    $P/bin/wineserver -w\n\
+                fi\n\
             fi ;; esac\n\
+        # `--prefix` - только приготовить префикс (`bin/tmnf`).\n\
+        case \"$1\" in --prefix) exit 0 ;; esac\n\
         case \"$1\" in --dxvk) shift\n\
             s=\"$WINEPREFIX/drive_c/windows\"\n\
             # `cp` Debian - со своей glibc, без нашего LD_LIBRARY_PATH (2.41).\n\
@@ -462,6 +591,12 @@ pub fn build(arch: Arch) -> Result<()> {
     // Проба DirectX 9/11 (`tools/d3dprobe`, программа Windows) - для сценариев
     // wined3d и DXVK (12.11).
     files.push((String::from("share/fossai/d3dprobe.exe"), d3dprobe()?, 0o755));
+    // Шаблоны префикса (17.11): их снимает сценарий `proton-prefix` (настоящий
+    // `wineboot` в QEMU) в `build/proton-prefix/`. Нет снимка — пакет без
+    // шаблона, префикс создаёт `wineboot` при первом запуске (минуты).
+    if !add_template(PREFIX_SNAPSHOT, &mut files)? {
+        say!("proton: нет шаблона префикса — его создаст wineboot (сценарий proton-prefix)");
+    }
 
     let mut builder = Builder::new(Kind::Package, "proton", "11");
     builder.field("summary", "GE-Proton11-12 without Steam: Wine with fsync, DXVK and VKD3D-Proton; windows through the kernel Wayland server");

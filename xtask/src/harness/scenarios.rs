@@ -310,6 +310,11 @@ pub enum Step {
     /// диска. Читает наш же крейт, поэтому это согласованность, а не формат, —
     /// подробности в [`super::datavol`].
     DataVolume(VolumeCheck),
+    /// Снять с раздела состояния установленного диска **на хост** шаблон
+    /// префикса Wine — после [`Step::Exits`] (17.11): пары «каталог у гостя» →
+    /// имя снимка (`crate::proton::save_template`). Префикс создаёт настоящий
+    /// Wine в QEMU, стенд забирает его вместе со ссылками, пакет везёт.
+    PrefixTemplate(&'static [(&'static str, &'static str)]),
     /// Спросить у гостя страницу по HTTP и проверить, что он ответил.
     ///
     /// Клиент здесь свой, а не `TcpStream` с готовым HTTP: половина проверок —
@@ -6690,6 +6695,103 @@ pub const ALL: &[Scenario] = &[
             Step::Move(1, 0),
             Step::Wait(2_000),
             Step::Painted("proton-notepad32"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "proton-prefix",
+        about: "Шаблон префикса Wine (17.11): после `install` с Proton (FOSSAI_WITH_PROTON=1) - Proton ставится, префикс создаётся настоящим `wineboot` в QEMU, после выключения забираются с диска со ссылками в build/proton-prefix/ (их кладёт в пакет `thirdparty --only proton`).",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "8G",
+        extra: &["-cpu", "max", "-smp", "4"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::Line("power never"),
+            Step::Await("screen off: never", 15_000),
+            Step::Line("pkg install proton"),
+            Step::Await("pkg: installed proton 11, ", 2_400_000),
+            // Уведомление «установлен» съедало набор следующей строки.
+            Step::Wait(10_000),
+            Step::Line("run /opt/debian/bin/rm -rf /home/roman/p64"),
+            Step::Await("rm: exited with code 0", 300_000),
+            // Фиксация btrfs после `rm` держит гостя секунду-другую, а приём
+            // серийной линии - 64 байта: длинная строка обрывалась на середине.
+            Step::Wait(10_000),
+            // 64-битный префикс (как у `fossai-proton`): `--prefix` - `wineboot -i`
+            // и `wineserver -w`, и выход. Строку о выходе оболочка печатает только
+            // у программы без `-b` (у фоновых и у детей Wine её нет); время шага
+            // в журнале - время создания префикса без шаблона. Шаблон в пакете
+            // уже есть - снять заново: убрать build/proton-prefix, пересобрать
+            // пакет, `install`, этот сценарий.
+            Step::Line("run /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=WINEPREFIX=/home/roman/p64 --prefix"),
+            Step::Await(": exited with code", 3_600_000),
+            Step::Wait(10_000),
+            // WoW64 (`bin/tmnf`) отдельно не снимается: `wineboot` строит его
+            // таким же (`#arch=win64`, `syswow64`; сверено 17.11, 1062 с против
+            // 610 с у win64).
+            // Что внутри - в журнал: имя пользователя Wine и ссылки дисков.
+            Step::Line("run /opt/debian/bin/ls -la /home/roman/p64/drive_c/users /home/roman/p64/dosdevices /home/roman/p64/drive_c/windows/syswow64/kernel32.dll"),
+            Step::Await("ls: exited with code", 60_000),
+            Step::Wait(5_000),
+            Step::Line("shutdown"),
+            Step::Await("shutting down", 60_000),
+            Step::Exits(300_000),
+            Step::PrefixTemplate(&[("home/roman/p64", "win64")]),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "proton-prefix-fetch",
+        about: "Только снять шаблон префикса (после `proton-prefix`, сорвавшегося после создания префиксов): загрузка, чистое выключение, build/proton-prefix/ с диска.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "8G",
+        extra: &["-cpu", "max", "-smp", "4"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::Wait(5_000),
+            Step::Line("run /opt/debian/bin/ls -la /home/roman/p64/drive_c/users /home/roman/p64/dosdevices"),
+            Step::Await("ls: exited with code", 60_000),
+            Step::Wait(5_000),
+            Step::Line("shutdown"),
+            Step::Await("shutting down", 60_000),
+            Step::Exits(300_000),
+            Step::PrefixTemplate(&[("home/roman/p64", "win64")]),
             Step::Absent("KERNEL PANIC"),
         ],
     },

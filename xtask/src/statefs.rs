@@ -72,6 +72,75 @@ pub fn read_file(disk_path: &Path, path: &str) -> Result<Option<Vec<u8>>> {
     Ok(Some(data))
 }
 
+/// Узел дерева, прочитанного [`read_tree`]: путь от корня дерева (через `/`),
+/// права и содержимое (`None` — каталог).
+pub struct TreeNode {
+    pub path: String,
+    pub mode: u16,
+    pub data: Option<Vec<u8>>,
+}
+
+/// Прочитать каталог раздела состояния целиком (17.11, шаблон префикса Wine):
+/// каталоги и обычные файлы, родитель раньше детей. Прочее (сокеты,
+/// устройства) пропускается; символических ссылок на томе нет — они в таблице
+/// ядра `/etc/linux-links`. `None` — каталога нет.
+pub fn read_tree(disk_path: &Path, path: &str) -> Result<Option<Vec<TreeNode>>> {
+    let mut dev = DiskFile::open(disk_path, 512)?;
+    let lba = state_lba(&mut dev, disk_path)?;
+    let path = format!("/{}", path.trim_start_matches('/'));
+    let mut out = Vec::new();
+    if btrfs::detect(&mut dev, lba) {
+        let mut fs = btrfs::Btrfs::mount(&mut dev, lba).map_err(|err| anyhow!("раздел состояния не монтируется: {err}"))?;
+        let Ok(top) = fs.resolve(&mut dev, &path) else { return Ok(None) };
+        let mut todo = vec![(String::new(), top)];
+        while let Some((at, dir)) = todo.pop() {
+            for entry in fs.list(&mut dev, &dir).map_err(|err| anyhow!("{path}/{at}: {err}"))? {
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+                let rel = if at.is_empty() { entry.name.clone() } else { format!("{at}/{}", entry.name) };
+                let inode = fs.inode(&mut dev, entry.inode).map_err(|err| anyhow!("{path}/{rel}: {err}"))?;
+                match inode.kind {
+                    btrfs::FileType::Directory => {
+                        out.push(TreeNode { path: rel.clone(), mode: inode.mode & 0o7777, data: None });
+                        todo.push((rel, inode));
+                    }
+                    btrfs::FileType::Regular => {
+                        let data = fs.read_file(&mut dev, &inode).map_err(|err| anyhow!("{path}/{rel}: {err}"))?;
+                        out.push(TreeNode { path: rel, mode: inode.mode & 0o7777, data: Some(data) });
+                    }
+                    btrfs::FileType::Other => {}
+                }
+            }
+        }
+        return Ok(Some(out));
+    }
+    let fs = ext2::Ext2::mount(&mut dev, lba).map_err(|err| anyhow!("раздел состояния не монтируется: {err}"))?;
+    let Ok(top) = fs.resolve(&mut dev, &path) else { return Ok(None) };
+    let mut todo = vec![(String::new(), top)];
+    while let Some((at, dir)) = todo.pop() {
+        for entry in fs.list(&mut dev, &dir).map_err(|err| anyhow!("{path}/{at}: {err}"))? {
+            if entry.name == "." || entry.name == ".." {
+                continue;
+            }
+            let rel = if at.is_empty() { entry.name.clone() } else { format!("{at}/{}", entry.name) };
+            let inode = fs.inode(&mut dev, entry.inode).map_err(|err| anyhow!("{path}/{rel}: {err}"))?;
+            match inode.kind {
+                ext2::FileType::Directory => {
+                    out.push(TreeNode { path: rel.clone(), mode: inode.mode & 0o7777, data: None });
+                    todo.push((rel, inode));
+                }
+                ext2::FileType::Regular => {
+                    let data = fs.read_file(&mut dev, &inode).map_err(|err| anyhow!("{path}/{rel}: {err}"))?;
+                    out.push(TreeNode { path: rel, mode: inode.mode & 0o7777, data: Some(data) });
+                }
+                ext2::FileType::Other => {}
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
 /// Права, владелец и вид узла — для проверок стенда.
 #[cfg(test)]
 pub fn stat(disk_path: &Path, path: &str) -> Result<Option<(bool, u16, u32, u32)>> {

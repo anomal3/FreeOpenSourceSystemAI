@@ -680,8 +680,13 @@ fn execute(
     let drives = prepare_drives(scenario, built, arch, ports)?;
     // Диск с томом btrfs, если он у сценария есть: шаг `DataVolume` читает его
     // с хоста, когда гость уже погас.
-    let data_disk = matches!(scenario.target, Target::LiveAndBtrfs | Target::DeviceTree)
-        .then(|| paths::btrfs_disk(arch, built.release));
+    // У установленной системы — её диск: шаг `PrefixTemplate` снимает с него
+    // шаблон префикса Wine.
+    let data_disk = match scenario.target {
+        Target::LiveAndBtrfs | Target::DeviceTree => Some(paths::btrfs_disk(arch, built.release)),
+        Target::Installed => Some(paths::target_disk(arch, built.release)),
+        _ => None,
+    };
 
     // Слушаем мы, подключается QEMU: порт 0 отдаёт свободный номер, и гонки за
     // фиксированный порт с другим процессом на машине не существует.
@@ -1313,6 +1318,19 @@ fn play(
                 }
                 say!("  [{at:>6} мс] шаг {index}: том btrfs {} с хоста", path.display());
                 datavol::check(path, expect).with_context(|| format!("шаг {index}"))?;
+            }
+            Step::PrefixTemplate(prefixes) => {
+                let Some(disk) = data_disk else {
+                    bail!("шаг {index}: у сценария нет установленного диска");
+                };
+                // Как и у `DataVolume`: читается только погасший гость.
+                if child.try_wait().with_context(|| format!("шаг {index}"))?.is_none() {
+                    bail!("шаг {index}: QEMU ещё работает — диск читается только после выключения");
+                }
+                for (guest, name) in *prefixes {
+                    say!("  [{at:>6} мс] шаг {index}: шаблон префикса {name} с /{guest}");
+                    crate::proton::save_template(disk, guest, name).with_context(|| format!("шаг {index}"))?;
+                }
             }
             Step::Http(get) => {
                 let Some(port) = hostfwd else {

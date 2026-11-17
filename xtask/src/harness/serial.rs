@@ -105,6 +105,10 @@ impl SerialLine {
             // четыре знака замены вместо двух русских букв, и стенд, ждавший
             // `unknown command 'ав'`, не дожидался.
             let mut pending: Vec<u8> = Vec::new();
+            // Копия линии в файл по ходу прогона (17.11): журнал пишется только в
+            // конце, а многочасовой сценарий (`proton-prefix`) иначе слеп —
+            // `FOSSAI_SERIAL_TEE=путь`.
+            let mut tee = std::env::var_os("FOSSAI_SERIAL_TEE").and_then(|path| std::fs::File::create(path).ok());
             while !thread_stop.load(Ordering::Relaxed) {
                 match reader_stream.read(&mut chunk) {
                     Ok(0) => {
@@ -112,6 +116,9 @@ impl SerialLine {
                         return;
                     }
                     Ok(count) => {
+                        if let Some(file) = tee.as_mut() {
+                            let _ = std::io::Write::write_all(file, &chunk[..count]);
+                        }
                         pending.extend_from_slice(&chunk[..count]);
                         let text = take_decoded(&mut pending);
                         let mut guard = thread_buffer.lock().expect("буфер линии");

@@ -38,8 +38,11 @@ if [ ! -f \"$G/TmForever.exe\" ]; then\n\
     echo \"tmnf: installing into $WINEPREFIX\"\n\
     # Префикс — заранее и до конца: создание WoW64-префикса в QEMU дольше\n\
     # ожидания Wine («boot event wait timed out» → установщик без kernel32).\n\
+    # Первая попытка — `--prefix` (17.11): шаблон из пакета Proton за секунды,\n\
+    # без него — `wineboot`; дальше — `wineboot` ещё раз.\n\
     for try in 1 2 3; do\n\
         [ -f \"$WINEPREFIX/drive_c/windows/syswow64/kernel32.dll\" ] && [ -f \"$WINEPREFIX/system.reg\" ] && break\n\
+        if [ $try = 1 ]; then echo \"tmnf: prefix\"; /opt/debian/bin/bash $P --prefix; continue; fi\n\
         echo \"tmnf: wineboot, try $try\"\n\
         /opt/debian/bin/bash $P wineboot -i\n\
         /opt/debian/bin/bash $P --run=wineserver -w\n\
