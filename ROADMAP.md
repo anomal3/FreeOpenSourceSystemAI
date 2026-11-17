@@ -11712,13 +11712,25 @@ egui/eframe 0.37, MIT OR Apache-2.0) — **родными программами
   `pkg remove` + `pkg install` (подпись пакета сверяет `pkg`).
   `craftupd --check | --all | --from <папка> | <app>…`.
 
-### Состояние (по приложениям)
-- **GridCraft v0.19.1 — работает** (35 МБ): окно 1240×640, лента, сетка,
-  ввод числа в A1, Enter, заголовок «Book1 — Edited»
-  (photos/craft-gridcraft-window.png, photos/craft-gridcraft-typed.png).
-- **WordCraft v0.18.1 — окно и документ открываются** (72 МБ): стартовый экран с
-  шаблонами, «Пустой документ» мышью, ввод (счётчик слов растёт); текст на
-  странице не был виден до правки кеша текстур — проверить после пересборки.
+### Состояние (по приложениям) — проверено живой флешкой в QEMU 18.11
+Все четыре собираются (`cargo xtask craft`, x86_64), ставятся с флешки сами
+(`pkg: <app> signature ok`), открывают окно и рисуются (снимки — photos/,
+в git не идут):
+- **GridCraft v0.19.1** (35 МБ) — лента, сетка, ввод `12345` в A1, Enter →
+  A2, заголовок «Book1 — Edited» (craft-gridcraft-window.png, -typed.png).
+- **WordCraft v0.18.1** (72 МБ) — стартовый экран с шаблонами, «Пустой
+  документ» мышью, набранный текст на странице с подчёркиванием орфографии
+  (craft-wordcraft-start.png, -typed.png). Шрифт документа Aptos не
+  установлен — подставляется свой (строка «1 font not installed»).
+- **PdfCraft v0.21.1** (64 МБ) — стартовый экран, инструменты; шрифт
+  интерфейса — DejaVu из /usr/share/fonts; «Open file» — окно выбора файла
+  rfd FossAi (craft-pdfcraft-window.png, -open-dialog.png). Фильтры вида
+  `[pP][dD][fF]` разбираются в `pdf`.
+- **MailCraft v0.13.0** (50 МБ) — главное окно и «Add Account»
+  (craft-mailcraft-window.png).
+- Мелочи: `chmod`/права каталогов (ENOSYS 88 у родных программ), `try_lock`
+  не поддержан (защиты от второго окна нет), проверка обновлений приложений
+  (craft-update) не видит сеть сразу после старта живой системы.
 
 ### Проверка
 Сценарии стенда `craft-gridcraft`, `craft-wordcraft`, `craft-pdfcraft`,

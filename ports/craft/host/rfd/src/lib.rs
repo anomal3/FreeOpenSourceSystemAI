@@ -49,7 +49,7 @@ impl FileDialog {
     }
 
     pub fn add_filter(mut self, name: impl Into<String>, extensions: &[impl ToString]) -> Self {
-        let extensions = extensions.iter().map(|e| e.to_string().trim_start_matches("*.").trim_start_matches('.').to_lowercase()).collect();
+        let extensions = extensions.iter().map(|e| plain_extension(&e.to_string())).collect();
         self.filters.push(Filter { name: name.into(), extensions });
         self
     }
@@ -113,6 +113,26 @@ impl FileDialog {
             None
         }
     }
+}
+
+/// Расширение без `*.`/`.`, в нижнем регистре; классы знаков, которыми
+/// приложения пишут «без учёта регистра» (`[pP][dD][fF]` у PdfCraft), — первой
+/// буквой: `pdf`.
+pub(crate) fn plain_extension(pattern: &str) -> String {
+    let pattern = pattern.trim_start_matches("*.").trim_start_matches('.');
+    let mut out = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            let class: String = chars.by_ref().take_while(|&c| c != ']').collect();
+            if let Some(first) = class.chars().next() {
+                out.push(first);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.to_lowercase()
 }
 
 /// Окно выбора файла (асинхронное: показывается при первом опросе).
@@ -348,5 +368,15 @@ impl AsyncMessageDialog {
     pub fn show(self) -> impl Future<Output = MessageDialogResult> + Send {
         let dialog = self.dialog;
         async move { dialog.show() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn extensions_are_plain() {
+        assert_eq!(super::plain_extension("[pP][dD][fF]"), "pdf");
+        assert_eq!(super::plain_extension("*.XLSX"), "xlsx");
+        assert_eq!(super::plain_extension(".csv"), "csv");
     }
 }
