@@ -1,0 +1,28 @@
+[package]
+edition = "2024"
+name = "egui_software_backend"
+# 0.0.3 из crates.io, перенесённый на egui 0.37 (приложения Craft; см. FREEOS.md).
+version = "0.0.3-freeos.37"
+description = "A CPU software render backend for egui (FossAi copy for egui 0.37)"
+homepage = "https://github.com/DGriffin91/egui_software_backend"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DGriffin91/egui_software_backend"
+publish = false
+
+[lib]
+name = "egui_software_backend"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+log = ["dep:log"]
+raster_stats = ["std"]
+
+[dependencies]
+constify = "0.0.1"
+# Версию egui задаёт рабочее пространство приложения (у Craft — форк storytold
+# через [patch.crates-io]); здесь только требование «0.37».
+egui = { version = "0.37", default-features = false }
+log = { version = "0.4", optional = true }
+strength_reduce = "0.2.4"

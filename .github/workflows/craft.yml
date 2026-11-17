@@ -1,0 +1,119 @@
+# Приложения Craft (GridCraft, WordCraft, PdfCraft, MailCraft) для FossAi —
+# нативные пакеты .fpk без форка: каждую ночь (и вручную) берётся последний
+# выпуск каждого приложения с GitHub, на него накладываются правки
+# ports/craft/<app>, сборка идёт в том же контейнере fossai-builder, что и
+# на ПК (ports/servo/builder/Dockerfile), пакеты подписываются ключом выпуска
+# и выкладываются в выпуск `craft-packages` вместе с подписанным индексом
+# `<арх>-craft-index.json(.sig)`. Система обновляет их программой `craftupd`.
+#
+# Не собралось новое (правки не легли) — xtask пробует закреплённый тег из
+# ports/craft/versions.toml; не собралось и оно — пакет этого приложения в
+# выпуске остаётся прежним (assets заменяются только собранными).
+#
+# Секрет UPDATE_ENTROPY — base64 файла build/keys/update-entropy с машины
+# выпуска (из него xtask выводит ключ подписи, см. xtask/src/keys.rs). Без
+# секрета пакеты подписались бы случайным ключом и система их отвергла бы —
+# поэтому без него работа останавливается.
+#
+# СОСТОЯНИЕ (17.11.2026): написан, ещё ни разу не запускался — первый запуск
+# руками (workflow_dispatch), смотреть шаги «Набор FreeOS» и «std для freeos».
+
+name: craft
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Одно приложение (пусто — все)"
+        required: false
+        default: ""
+      latest:
+        description: "Брать последний выпуск с GitHub (иначе — теги из versions.toml)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: craft
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      ARCH: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ключ подписи выпуска
+        env:
+          UPDATE_ENTROPY: ${{ secrets.UPDATE_ENTROPY }}
+        run: |
+          if [ -z "$UPDATE_ENTROPY" ]; then
+            echo "::error::нет секрета UPDATE_ENTROPY — пакеты нечем подписать"
+            exit 1
+          fi
+          mkdir -p build/keys
+          echo "$UPDATE_ENTROPY" | base64 -d > build/keys/update-entropy
+
+      - name: LLVM 22 и Rust (тот же ночной, что на ПК)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y clang-22 lld-22 llvm-22 llvm-22-dev libclang-22-dev ninja-build cmake meson python3
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
+          rustup toolchain install nightly-2026-08-11 --profile minimal --component rust-src
+          rustup override set nightly-2026-08-11
+
+      - name: Кеш набора FreeOS и std
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/toolchain
+            build/rust-std/src
+            build/rust-std/src.stamp
+          key: freeos-sdk-${{ hashFiles('libc/**', 'ports/rust-std/**', 'xtask/src/ruststd.rs', 'xtask/src/cbuild.rs') }}
+
+      - name: Набор FreeOS (picolibc, libc++, sysroot)
+        run: |
+          cargo xtask toolchain
+          cargo xtask thirdparty --only libcxx
+          cargo xtask sdk
+
+      - name: std для freeos (build/rust-std/src и patches.toml)
+        run: cargo xtask test -s rust-std --no-run || cargo xtask build --release
+
+      - name: Контейнер сборки
+        run: |
+          docker build -t fossai-builder ports/servo/builder
+          docker volume create fossai-craft
+          docker volume create fossai-cargo-registry
+
+      - name: Сборка приложений Craft
+        run: |
+          ARGS="--arch $ARCH --out dist"
+          if [ -n "${{ github.event.inputs.app }}" ]; then ARGS="$ARGS --app ${{ github.event.inputs.app }}"; fi
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.latest }}" = "true" ]; then ARGS="$ARGS --latest"; fi
+          cargo xtask craft $ARGS || echo "::warning::не все приложения собрались — выкладывается то, что есть"
+          ls -la dist
+
+      - name: Имена файлов выпуска (<арх>-…)
+        run: |
+          mkdir -p upload
+          for f in dist/*; do cp "$f" "upload/$ARCH-$(basename "$f")"; done
+          ls -la upload
+
+      - name: Выложить в выпуск craft-packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view craft-packages >/dev/null 2>&1 || \
+            gh release create craft-packages --title "Craft packages for FossAi" \
+              --notes "Нативные пакеты GridCraft, WordCraft, PdfCraft, MailCraft для FossAi (собираются ночью). Обновление в системе: craftupd." --prerelease
+          gh release upload craft-packages upload/* --clobber

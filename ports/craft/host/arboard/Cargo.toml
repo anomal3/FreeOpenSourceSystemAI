@@ -1,0 +1,21 @@
+[package]
+name = "arboard"
+# Вместо arboard 3.6/3.7 у приложений Craft (`[patch.crates-io]` в --config сборки).
+version = "3.7.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "FossAi (FreeOS) clipboard with the arboard 3.x API: text in the system clipboard (SYS_CLIPBOARD), HTML and images inside the program"
+publish = false
+
+# Имена возможностей — как у arboard, чтобы `features = [...]` приложений разрешались.
+[features]
+default = ["image-data"]
+core-graphics = []
+image = []
+image-data = []
+wayland-data-control = []
+windows-sys = []
+wl-clipboard-rs = []
+
+[dependencies]
+eframe = { path = "../eframe", default-features = false }

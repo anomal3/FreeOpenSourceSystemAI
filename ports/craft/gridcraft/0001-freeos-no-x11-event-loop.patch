@@ -1,0 +1,14 @@
+diff --git a/apps/gridcraft/src/main.rs b/apps/gridcraft/src/main.rs
+index f05b421d..8dc41969 100644
+--- a/apps/gridcraft/src/main.rs
++++ b/apps/gridcraft/src/main.rs
+@@ -362,7 +362,8 @@ fn main() -> eframe::Result<()> {
+     // winit has no file drag-and-drop on Wayland (only on X11), so dropping files from the file
+     // manager showed a "no" cursor. Run through XWayland when it's there; GRIDCRAFT_WAYLAND=1
+     // keeps the native Wayland backend.
+-    #[cfg(all(unix, not(target_os = "macos")))]
++    // FossAi (FreeOS): no winit/X11 — the eframe host opens a native FreeOS window.
++    #[cfg(all(unix, not(any(target_os = "macos", target_os = "freeos"))))]
+     if std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) && std::env::var_os("GRIDCRAFT_WAYLAND").is_none() {
+         options.event_loop_builder = Some(Box::new(|b| {
+             use winit::platform::x11::EventLoopBuilderExtX11;

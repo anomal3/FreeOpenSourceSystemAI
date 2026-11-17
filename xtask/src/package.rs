@@ -156,6 +156,11 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     if let Some(engine) = servo(arch)? {
         samples.push((SERVO_PACKAGE, engine));
     }
+    // Приложения Craft (ports/craft, `cargo xtask craft`): что собрано — то и
+    // едет. Имя файла с версией выпуска, поэтому строка, а не константа.
+    for (file_name, bytes) in crate::craft::packages(arch)? {
+        samples.push((Box::leak(file_name.into_boxed_str()), bytes));
+    }
     // Корень программ Linux (фаза 71b) — готовым пакетом от `xtask thirdparty`.
     if arch == Arch::X86_64 {
         let path = crate::debian::package_path();

@@ -175,7 +175,9 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
         // системы он не по карману — он едет только на установочный носитель.
         if !programs.is_empty() {
             for package in crate::package::build_samples(opts.arch, opts.release)? {
-                if crate::package::GAMES.contains(&package.file_name.as_str()) {
+                // Приложения Craft (десятки мегабайт) — тоже только носитель
+                // установки; на живую флешку они едут файлами ESP (image.rs).
+                if crate::package::GAMES.contains(&package.file_name.as_str()) || crate::craft::is_package_file(&package.file_name) {
                     continue;
                 }
                 extra.push((format!("media/{}", package.file_name), package.path));

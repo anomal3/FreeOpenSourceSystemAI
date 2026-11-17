@@ -1,0 +1,47 @@
+# Приложения Craft (storytold / UCS-Care-Group) для FossAi — НАТИВНО под
+# <арх>-unknown-freeos, без слоя Linux (ROADMAP: «Приложения Craft»).
+#
+# `tag` — закреплённый выпуск, под который написаны правки ports/craft/<app>/*.patch.
+# `cargo xtask craft --latest` (и ночная сборка .github/workflows/craft.yml)
+# спрашивает GitHub о самом новом теге и пробует его; правки не легли или не
+# собралось — остаётся этот тег (пакет прошлой версии не заменяется).
+#
+# `package` — имя пакета .fpk и программы, `bin` — бинарник cargo,
+# `caption` — подпись в «Пуске», `icon` — PNG значка в исходниках приложения,
+# `permissions` — права пакета.
+
+[gridcraft]
+repo = "storytold/gridcraft"
+tag = "v0.19.1"
+bin = "gridcraft"
+cargo_package = "gridcraft"
+caption = "GridCraft — Таблицы"
+icon = "assets/app-icon/hicolor/256x256/apps/ai.storyteller.gridcraft.png"
+permissions = "windows files"
+
+[wordcraft]
+repo = "storytold/wordcraft"
+tag = "v0.18.1"
+bin = "wordcraft"
+cargo_package = "wordcraft"
+caption = "WordCraft — Документы"
+icon = "assets/app-icon/hicolor/256x256/apps/ai.storyteller.wordcraft.png"
+permissions = "windows files"
+
+[pdfcraft]
+repo = "storytold/pdfcraft"
+tag = "v0.21.1"
+bin = "pdfcraft"
+cargo_package = "pdfcraft"
+caption = "PdfCraft — PDF"
+icon = "assets/app-icon/hicolor/256x256/apps/ai.storyteller.pdfcraft.png"
+permissions = "windows files"
+
+[mailcraft]
+repo = "UCS-Care-Group/mailcraft"
+tag = "v0.13.0"
+bin = "mailcraft"
+cargo_package = "mailcraft"
+caption = "MailCraft — Почта"
+icon = "assets/app-icon/hicolor/256x256/apps/io.github.billsecond.mailcraft.png"
+permissions = "windows files net"

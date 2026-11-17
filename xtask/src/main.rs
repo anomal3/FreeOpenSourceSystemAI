@@ -19,6 +19,7 @@ mod arch;
 mod btrfsfix;
 mod build;
 mod cbuild;
+mod craft;
 mod clrcheck;
 mod numcheck;
 mod diskfile;
@@ -175,6 +176,10 @@ enum Command {
     /// только сторожит найденное. Этой командой ищут новое — после всякой
     /// правки разборщика и просто временами, с другим зерном.
     Fuzz(FuzzArgs),
+    /// Приложения Craft (GridCraft, WordCraft, PdfCraft, MailCraft) нативно
+    /// под FreeOS: исходник выпуска с GitHub + правки `ports/craft`, сборка в
+    /// Docker, пакеты `.fpk` и подписанный `craft-index.json` в `build/craft`.
+    Craft(CraftArgs),
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -193,6 +198,28 @@ struct FuzzArgs {
     /// Сколько входов на цель.
     #[arg(long, short = 'i', default_value_t = 20_000)]
     iterations: u64,
+}
+
+#[derive(Args, Debug)]
+struct CraftArgs {
+    /// Целевая архитектура.
+    #[arg(long, short = 'a', value_enum, default_value = "x86_64")]
+    arch: Arch,
+    /// Одно приложение (имя секции ports/craft/versions.toml).
+    #[arg(long)]
+    app: Option<String>,
+    /// Тег выпуска вместо закреплённого в versions.toml.
+    #[arg(long)]
+    tag: Option<String>,
+    /// Взять последний выпуск с GitHub (не собрался — закреплённый).
+    #[arg(long)]
+    latest: bool,
+    /// Не собирать — только упаковать уже собранное и написать индекс.
+    #[arg(long)]
+    no_build: bool,
+    /// Каталог пакетов и индекса (по умолчанию build/craft/<арх>).
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -976,6 +1003,15 @@ fn real_main() -> Result<()> {
                 say!("выложите этот каталог на сервер как есть; система читает index, index.sig и образ");
             }
         }
+
+        Command::Craft(args) => craft::run(&craft::Options {
+            arch: args.arch,
+            app: args.app,
+            tag: args.tag,
+            latest: args.latest,
+            no_build: args.no_build,
+            out: args.out,
+        })?,
 
         Command::Clean => build::clean()?,
     }

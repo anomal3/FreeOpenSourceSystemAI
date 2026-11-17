@@ -308,6 +308,20 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     });
                 }
             }
+            // Приложения Craft (17.11): GridCraft, WordCraft, PdfCraft,
+            // MailCraft — так же файлами `\FREEOS\PKG\<8 знаков>.FPK`, ядро
+            // ставит их после OBSOS (`LIVE_ORDER` в usb/storage.rs).
+            if built.release {
+                for app in crate::craft::apps()? {
+                    if let Some((file, bytes)) = crate::craft::package(&app, arch)? {
+                        payload.push(Payload {
+                            path: format!("{}/{}", arch::PAYLOAD_PKG_DIR, crate::craft::esp_name(&app.name)),
+                            data: bytes,
+                            source: PathBuf::from(format!("(пакет {file})")),
+                        });
+                    }
+                }
+            }
             // Proton с игрой (16.11, Роман: «Proton с игрой и браузером на
             // флешку»): с `FOSSAI_WITH_PROTON=1` — корень Debian, Proton и
             // Trackmania, ядро ставит их по очереди в `/opt` в памяти.
