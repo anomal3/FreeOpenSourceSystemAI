@@ -321,6 +321,13 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                         });
                     }
                 }
+                if let Some((file, bytes)) = crate::craft::updater_package(arch)? {
+                    payload.push(Payload {
+                        path: format!("{}/CRAFTUPD.FPK", arch::PAYLOAD_PKG_DIR),
+                        data: bytes,
+                        source: PathBuf::from(format!("(пакет {file})")),
+                    });
+                }
             }
             // Proton с игрой (16.11, Роман: «Proton с игрой и браузером на
             // флешку»): с `FOSSAI_WITH_PROTON=1` — корень Debian, Proton и

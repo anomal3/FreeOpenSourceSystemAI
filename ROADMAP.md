@@ -11647,6 +11647,100 @@ WebRender на wgpu (не существует), softpipe (слишком мед
   чего не хватает), фича `webgl`, затем сценарий с three.js.
 - Пока этого нет — оставить передачу в Chromium и экран «чего не хватает».
 
+## Приложения Craft — НАТИВНО (GridCraft, WordCraft, PdfCraft, MailCraft) — 17–18.11.2026
+
+Роман 17.11 (ночь, полная самостоятельность): четыре программы проекта Craft
+(storytold/gridcraft — таблицы, storytold/wordcraft — документы,
+storytold/pdfcraft — PDF, UCS-Care-Group/mailcraft — почта; Rust 2024,
+egui/eframe 0.37, MIT OR Apache-2.0) — **родными программами FreeOS**
+(`x86_64-unknown-freeos`, наш `std`), без слоя Linux. Авторы (Discord ArtCraft)
+разрешили собирать под исходными именами (soft fork) с указанием авторства и
+ссылками. Всё — в `ports/craft/` (README там же).
+
+### Как устроено
+- **Без форка.** `ports/craft/versions.toml` — репозиторий и закреплённый тег
+  выпуска каждого приложения; `ports/craft/builder/build-craft.sh <app>`
+  (контейнер `fossai-builder`, как OBSOS) клонирует тег, накладывает
+  `ports/craft/<app>/*.patch` и `<app>/patch.sh` (условия компиляции — sed:
+  FreeOS исключается из веток «настольный Linux» `all(unix, not(macos))` —
+  X11/Wayland/D-Bus/xdg-mime), подменяет крейты через `--config`:
+  - `host/eframe` — **eframe 0.37 для FreeOS**: окно `freeos_window_*`,
+    события (клавиши с латинской клавишей ядра, Ctrl+C/X/V → события egui,
+    колесо, указатель `SYS_WINCURSOR`), egui рисует процессор, вызовы как у
+    eframe (`raw_input_hook` → `logic` → `ui`, `CancelClose`, `Title`,
+    `InnerSize`, `RequestPaste`), дочерние окна (viewport) встраиваются в
+    главное, хранилище `~/.config/<app>/app.ron`, ссылки → OBSOS. Типы
+    `wgpu`/`egui_wgpu::RenderState`/`Error::Wgpu`/`winit_window()` —
+    заглушки (всегда `None`), чтобы код приложений вокруг них собирался без
+    правок;
+  - `host/egui-software-backend` — рендер OBSOS, перенесённый на egui 0.37
+    (`TexturesDelta` — список правок на текстуру, без `ahash`) + **номер
+    правки текстуры в хеше кеша фигур** (иначе страница WordCraft после
+    ввода не перерисовывалась);
+  - `host/rfd` — окна выбора файла/сообщения (API rfd 0.17): отдельное окно
+    стола со своим egui (папки, фильтры по расширению, имя для сохранения,
+    новая папка); асинхронные — при первом опросе (поток `craft-dialogs`);
+  - `host/arboard` — буфер обмена (API arboard 3.7): текст — `SYS_CLIPBOARD`,
+    HTML/картинка — внутри программы, пока текст в буфере тот же;
+  - `host/winit` — пустая заглушка с типами окна/монитора.
+- **Крейты экосистемы** (`builder/patch-craft-crates.sh`): getrandom 0.3 (как
+  Vita), aws-lc-sys 0.46 (getentropy, как у Servo), filetime (ветка wasm —
+  времена файлов не ставятся); libc — копия нашей с версией 0.2.999. Грабли:
+  **подмена с версией, отличной от записанной в Cargo.lock, молча не
+  применяется** («patch was not used») — запись переводится `cargo update -p
+  <крейт>@<версия> --precise <версия подмены>` (только в пределах semver;
+  готовый Cargo.lock кешируется в `/cache/locks`). `dash` не передаёт
+  аргументы в `.` — `set -- "$ARCH"` перед `freeos-env.sh`.
+- **xtask:** `cargo xtask craft [--app X] [--tag vN | --latest] [--no-build]`
+  (`xtask/src/craft.rs`): сборка в Docker, пакеты `<app>-<версия>.fpk`
+  (программа, LICENSE-MIT/APACHE, NOTICE, ATTRIBUTION.md, `share/FOSSAI.md` —
+  записка об авторстве и ссылках, значок PNG → `icon.fimg`, `caption`,
+  `start`, права; подпись ключом выпуска) и `craft-index.json` +
+  `craft-index.json.sig` (Ed25519 по `osupdate::index::digest`). Пакеты
+  едут на носитель установки (`/media`, как игры — не в RAM-диск) и на живую
+  флешку `\FREEOS\PKG\GRIDCRAF.FPK`, `WORDCRAF.FPK`, `PDFCRAFT.FPK`,
+  `MAILCRAF.FPK` (`LIVE_ORDER` ядра: после OBSOS).
+- **Обновления:** `.github/workflows/craft.yml` — ночью и вручную
+  `cargo xtask craft --latest` на ubuntu+Docker, выкладка в выпуск
+  `craft-packages` (`x86_64-<файл>`, индекс `x86_64-craft-index.json(.sig)`).
+  **Ещё ни разу не запускался**: нужен секрет `UPDATE_ENTROPY` (base64
+  `build/keys/update-entropy`), и неясно, соберётся ли набор FreeOS
+  (`xtask toolchain/sdk/thirdparty`) на Linux — первый запуск руками.
+  В системе — `craftupd` (`ports/craft/craftupd`, std + rustls/ring + корни
+  webpki): индекс по HTTPS, подпись ключами `/os-keys`, версии из
+  `/var/lib/pkg`, скачивание, SHA-256 и размер, «пакет подписан», затем
+  `pkg remove` + `pkg install` (подпись пакета сверяет `pkg`).
+  `craftupd --check | --all | --from <папка> | <app>…`.
+
+### Состояние (по приложениям)
+- **GridCraft v0.19.1 — работает** (35 МБ): окно 1240×640, лента, сетка,
+  ввод числа в A1, Enter, заголовок «Book1 — Edited»
+  (photos/craft-gridcraft-window.png, photos/craft-gridcraft-typed.png).
+- **WordCraft v0.18.1 — окно и документ открываются** (72 МБ): стартовый экран с
+  шаблонами, «Пустой документ» мышью, ввод (счётчик слов растёт); текст на
+  странице не был виден до правки кеша текстур — проверить после пересборки.
+
+### Проверка
+Сценарии стенда `craft-gridcraft`, `craft-wordcraft`, `craft-pdfcraft`,
+`craft-mailcraft` (установленная система: `cargo xtask test -s install`,
+затем `-s craft-…`; пакет ставится с `/media` по имени). Ночью 17.11 гонялось
+не стендом (установленный диск общий с соседним агентом), а живой флешкой в
+QEMU — скрипт в рабочей папке `craft-live.ps1`: образ как USB-носитель, ядро
+само ставит пакеты с `\FREEOS\PKG`, `run /opt/<app>/bin/<app>`, снимки
+`screendump`, щелчок — мышь PS/2 (относительные `mouse_move` от угла), ввод
+`sendkey`. Второй носитель QEMU vvfat (`fat:` каталог хоста) ядро не монтирует
+(MBR/FAT16, а не GPT) — пакеты только в образе.
+
+### Осталось
+- Подпись выпуска в CI (секрет), первый прогон workflow; `craftupd` в пакете.
+- MailCraft: паролей не хранит (keyring только Linux/BSD — на FreeOS
+  `secrets::store()` = None); вход OAuth открывает браузер через `Command`
+  (у родных программ `std::process` нет) — вход только паролем.
+- PdfCraft: печать/OCR/LibreOffice — через `Command`, на FreeOS нет.
+- Открытие ссылок GridCraft/WordCraft (`xdg-open` через `Command`) — нет;
+  у eframe FossAi ссылки egui (`OpenUrl`) открывает OBSOS.
+- aarch64 — не собиралось.
+
 ## Мониторы и NVIDIA: чего пока нет — TODO (Роман 16.11)
 
 Драйвер GSP-RM + модсет (Turing и новее, по DisplayPort) и настройка

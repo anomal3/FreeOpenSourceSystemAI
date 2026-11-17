@@ -176,13 +176,10 @@ impl Frame {
         &self.info
     }
 
-    pub fn set_ui_language(&self, lang: Option<&str>) {
-        if let Some(ctx) = &self.egui_ctx
-            && ctx.options(|o| o.language.as_deref() != lang)
-        {
-            ctx.set_language(lang.map(ToOwned::to_owned));
-        }
-    }
+    /// У eframe форка storytold — язык интерфейса egui (`Context::set_language`
+    /// есть только в форке; MailCraft собирается с egui crates.io). Никто из
+    /// приложений Craft его не зовёт — здесь ничего не делает.
+    pub fn set_ui_language(&self, _lang: Option<&str>) {}
 
     pub fn set_text_input_language(&mut self, _lang: Option<&str>) {}
 
@@ -265,3 +262,29 @@ pub const STORAGE_EGUI_MEMORY_KEY: &str = "egui";
 pub const STORAGE_WINDOW_KEY: &str = "window";
 /// Обычный ключ данных приложения (как у eframe).
 pub const APP_KEY: &str = "app";
+
+// Дескрипторы окна (raw-window-handle): у окон FreeOS их нет — как у eframe
+// без окна, `NotSupported`. Нужны, чтобы `rfd::…::set_parent(frame)` собирался.
+impl raw_window_handle::HasWindowHandle for Frame {
+    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        Err(raw_window_handle::HandleError::NotSupported)
+    }
+}
+
+impl raw_window_handle::HasDisplayHandle for Frame {
+    fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Err(raw_window_handle::HandleError::NotSupported)
+    }
+}
+
+impl raw_window_handle::HasWindowHandle for CreationContext<'_> {
+    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        Err(raw_window_handle::HandleError::NotSupported)
+    }
+}
+
+impl raw_window_handle::HasDisplayHandle for CreationContext<'_> {
+    fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Err(raw_window_handle::HandleError::NotSupported)
+    }
+}

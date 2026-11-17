@@ -233,7 +233,27 @@ fn about_text(app: &CraftApp, tag: &str) -> String {
     )
 }
 
-/// Пакеты всех собранных приложений (для образа и носителя установки).
+/// Пакет `craftupd` — обновление приложений Craft в системе
+/// (`ports/craft/craftupd`, `builder/build-craftupd.sh`). Нет программы — `None`.
+pub fn updater_package(arch: Arch) -> Result<Option<(String, Vec<u8>)>> {
+    let Some(program) = crate::ruststd::linux_host_program("craftupd", arch) else {
+        say!("пакет craftupd пропущен: нет build/linux/craftupd-{} — собрать: ports/craft/builder/build-craftupd.sh", arch.name());
+        return Ok(None);
+    };
+    let mut pkg = Builder::new(Kind::Package, "craftupd", "0.1");
+    pkg.field("summary", "craftupd: updates GridCraft, WordCraft, PdfCraft, MailCraft from the signed craft-index.json");
+    pkg.field("about", "обновление приложений Craft по подписанному индексу (craftupd --check | --all | <app>)");
+    // Сеть (HTTPS к GitHub) и файлы (~/Downloads, /opt через pkg).
+    pkg.field("permissions", "files net");
+    let data = fs::read(&program).with_context(|| format!("не удалось прочитать {}", program.display()))?;
+    pkg.file(&Entry { path: String::from("bin/craftupd"), mode: 0o755, uid: 0, gid: 0, data });
+    let mut bytes = pkg.finish();
+    crate::keys::sign(&mut bytes, &crate::keys::release()?);
+    Ok(Some((String::from("craftupd-0.1.fpk"), bytes)))
+}
+
+/// Пакеты всех собранных приложений и `craftupd` (для образа и носителя
+/// установки).
 pub fn packages(arch: Arch) -> Result<Vec<(String, Vec<u8>)>> {
     let mut out = Vec::new();
     for app in apps()? {
@@ -241,12 +261,15 @@ pub fn packages(arch: Arch) -> Result<Vec<(String, Vec<u8>)>> {
             out.push(p);
         }
     }
+    if let Some(p) = updater_package(arch)? {
+        out.push(p);
+    }
     Ok(out)
 }
 
 /// Файл пакета Craft (`gridcraft-0.19.1.fpk` и т. п.)?
 pub fn is_package_file(file_name: &str) -> bool {
-    ["gridcraft-", "wordcraft-", "pdfcraft-", "mailcraft-"].iter().any(|p| file_name.starts_with(p)) && file_name.ends_with(".fpk")
+    ["gridcraft-", "wordcraft-", "pdfcraft-", "mailcraft-", "craftupd-"].iter().any(|p| file_name.starts_with(p)) && file_name.ends_with(".fpk")
 }
 
 /// Имя пакета на ESP живой флешки (8.3: ≤ 8 знаков имени).
@@ -307,6 +330,11 @@ pub fn run(opts: &Options) -> Result<()> {
             fs::write(&path, &bytes).with_context(|| format!("не записать {}", path.display()))?;
             say!("пакет: {} ({} байт)", path.display(), bytes.len());
         }
+    }
+    if let Some((file, bytes)) = updater_package(opts.arch)? {
+        let path = out.join(&file);
+        fs::write(&path, &bytes).with_context(|| format!("не записать {}", path.display()))?;
+        say!("пакет: {} ({} байт)", path.display(), bytes.len());
     }
     write_index(&out, opts.arch)?;
     if !failed.is_empty() {

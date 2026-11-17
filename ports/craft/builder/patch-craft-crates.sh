@@ -55,8 +55,9 @@ done
 # crate_sed <имя> <файл в крейте> <выражение sed>: каждую версию крейта из
 # Cargo.lock — копией с правкой (метка `freeos` в файле — правка уже есть).
 crate_sed() {
-    name=$1; file=$2; expr=$3
+    name=$1; file=$2; expr=$3; only=$4
     for v in $(awk -v n="$name" '$0 == "name = \"" n "\"" { getline; gsub(/version = |"/, ""); print }' Cargo.lock); do
+        [ -n "$only" ] && [ "$v" != "$only" ] && continue
         dst=/cache/src/$name-$v
         if ! grep -q freeos "$dst/$file" 2>/dev/null; then
             rm -rf "$dst"
@@ -73,6 +74,10 @@ crate_sed() {
 # filetime (tar/zip у craft-update): у FreeOS нет utimensat/lutimes — ветка
 # wasm («не поддерживается»): время файлов при распаковке не ставится.
 crate_sed filetime src/lib.rs 's/if #\[cfg(all(target_family = "wasm", not(target_os = "emscripten")))\]/if #[cfg(any(target_os = "freeos", all(target_family = "wasm", not(target_os = "emscripten"))))]/'
+
+# rand 0.8 (MailCraft): защита от fork через pthread_atfork — fork у FreeOS нет,
+# и pthread_atfork в libc нет: ветка «не Unix» (без обработчика).
+crate_sed rand src/rngs/adapter/reseeding.rs 's/all(unix, not(target_os = "emscripten"))/all(unix, not(any(target_os = "emscripten", target_os = "freeos")))/g' 0.8.8
 
 # getrandom 0.3 (craft-update, tempfile…): как у Vita — getentropy().
 if grep -q '^version = "0.3.4"' Cargo.lock && grep -B1 '^version = "0.3.4"' Cargo.lock | grep -q 'name = "getrandom"'; then

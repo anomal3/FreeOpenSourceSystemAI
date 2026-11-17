@@ -132,6 +132,11 @@ pub enum ColorFieldOrder {
 /// Software render backend for egui.
 pub struct EguiSoftwareRender {
     textures: HashMap<egui::TextureId, EguiTexture>,
+    /// FreeOS (Craft): номер правки каждой текстуры — входит в хеш кешированной
+    /// фигуры. Без него картинка, перерисованная в ту же текстуру (страница
+    /// WordCraft после ввода, `TextureHandle::set`), оставалась прежней: сетка
+    /// и UV те же — хеш тот же — в холст шла старая растеризация.
+    texture_versions: HashMap<egui::TextureId, u32>,
     cached_primitives: HashMap<u32, CachedPrimitive>,
     tiles_dim: [usize; 2],
     dirty_tiles: Vec<u8>,
@@ -155,6 +160,7 @@ impl EguiSoftwareRender {
     pub fn new(output_field_order: ColorFieldOrder) -> Self {
         EguiSoftwareRender {
             textures: Default::default(),
+            texture_versions: Default::default(),
             cached_primitives: Default::default(),
             tiles_dim: Default::default(),
             dirty_tiles: Default::default(),
@@ -633,6 +639,7 @@ impl EguiSoftwareRender {
                             egui::TextureId::Managed(id) => id as u32,
                             egui::TextureId::User(id) => id as u32 + 9358476,
                         });
+                        hasher.hash_wrap(self.texture_versions.get(&px_mesh.texture_id).copied().unwrap_or(0));
                         for ind in &px_mesh.indices {
                             let v = px_mesh.vertices[*ind as usize];
 
@@ -876,6 +883,8 @@ impl EguiSoftwareRender {
         let start = std::time::Instant::now();
         // egui 0.37: на текстуру — список правок (SmallVec), по порядку.
         for (id, delta) in textures_delta.set.iter().flat_map(|(id, deltas)| deltas.iter().map(move |d| (id, d))) {
+            let version = self.texture_versions.entry(*id).or_default();
+            *version = version.wrapping_add(1);
             if delta.options.magnification != delta.options.minification {
                 // Would need helper lanes to impl?
                 #[cfg(feature = "log")]

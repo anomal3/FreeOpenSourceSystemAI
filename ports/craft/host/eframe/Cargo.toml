@@ -41,3 +41,6 @@ ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 # Только типы для `Frame::winit_window()` (всегда `None`): заглушка ../winit.
 winit = { path = "../winit" }
+# Как у eframe: Frame и CreationContext — «окна» для rfd::set_parent (у нас без
+# дескриптора: родителя у диалога FreeOS нет).
+raw-window-handle = "0.6"
