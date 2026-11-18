@@ -1165,7 +1165,7 @@ fn run_builtin(line: &str) -> bool {
         "ui" => ui_status(argument),
         "tasks" => tasks(),
         "gpu" => gpu(argument),
-        "amd" => amd(),
+        "amd" => amd(argument),
         "outputs" => outputs(argument),
         #[cfg(target_arch = "x86_64")]
         "lxstat" => linux_stat(argument),
@@ -1912,7 +1912,7 @@ fn help() {
     sprintln!("  panic now     stop this machine with a kernel panic (to test the snapshot)");
     sprintln!("  pci           every device on the bus, with its identifiers");
     sprintln!("  acpidump SIG  an ACPI table (DSDT, FACP, APIC...) in hex to the kernel log");
-    sprintln!("  amd           AMD graphics card: PCI, IP discovery, VBIOS (read-only)");
+    sprintln!("  amd [vbios]   AMD graphics card: PCI, IP discovery or Polaris registers; vbios reads the ROM");
     sprintln!("  ui [reset]    compositor state and frame timing; reset zeroes it");
     sprintln!("  tasks         scheduler state");
     sprintln!("  ls [path]     list a directory of the mounted filesystem");
@@ -2292,7 +2292,15 @@ fn outputs(argument: &str) {
 
 /// `amd`: что разведка (этап A1) узнала о видеокарте AMD — те же строки,
 /// что ушли в журнал на загрузке.
-fn amd() {
+fn amd(argument: &str) {
+    // `amd vbios` — прочитать VBIOS Polaris из ПЗУ карты (пишет индексные
+    // регистры SMC, поэтому не на загрузке, а по команде).
+    if argument.trim() == "vbios" {
+        for line in crate::display::amd::polaris_vbios() {
+            sprintln!("  amd: {line}");
+        }
+        return;
+    }
     let lines = crate::display::amd::report();
     if lines.is_empty() {
         sprintln!("  amd: no AMD display card found");
