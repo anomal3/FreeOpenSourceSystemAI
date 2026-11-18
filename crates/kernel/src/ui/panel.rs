@@ -1309,6 +1309,212 @@ pub(super) fn list_packages() -> Vec<Launcher> {
     launchers
 }
 
+// ── Программы Windows из префиксов Proton (P12, 18.11.2026) ─────────────────
+
+/// Ярлык программы Windows: `.desktop`, который `winemenubuilder` установщика
+/// записал в `ПРЕФИКС/drive_c/proton_shortcuts/` (так у Proton: не в
+/// `~/.local/share/applications/wine`). Читает его и запускает сценарий
+/// `fossai-proton --shortcut=…`; здесь — только имя, значок и путь.
+pub(super) struct WinShortcut {
+    pub(super) caption: String,
+    /// Путь файла `.desktop`.
+    pub(super) file: String,
+    /// Префикс Wine — каталог с `drive_c`.
+    pub(super) prefix: String,
+    /// FIMG значка, если он уже сделан из PNG; иначе пусто.
+    pub(super) icon: String,
+    /// Ярлык удаления («Uninstall …» — его кладут Inno Setup, NSIS и подобные).
+    pub(super) uninstall: bool,
+}
+
+/// Сценарий пакета `proton`.
+const PROTON_SCRIPT: &str = "/opt/proton/bin/fossai-proton";
+
+/// Где в префиксе лежат ярлыки.
+const SHORTCUTS: &str = "drive_c/proton_shortcuts";
+
+/// Командная строка `fossai-proton` с аргументами.
+pub(super) fn proton_line(args: &str) -> String {
+    alloc::format!("/opt/debian/bin/bash {PROTON_SCRIPT} {args}")
+}
+
+/// Путь для командной строки: ядро делит её по пробелам и кавычек не знает,
+/// поэтому пробел — `%20`, `%` — `%25` (раскодируют `fossai-proton` и
+/// `png2fimg`).
+pub(super) fn pct(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for ch in path.chars() {
+        match ch {
+            ' ' => out.push_str("%20"),
+            '%' => out.push_str("%25"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn exists(path: &str) -> bool {
+    matches!(crate::fs::read(path, 0), Some(Ok(_)))
+}
+
+/// Ярлыки во всех префиксах дома (`~/.proton`, `~/.tmnf`, … — каталоги с
+/// точкой, в которых есть `drive_c/proton_shortcuts`). Дом — того, кто вошёл,
+/// и `/root` (живая флешка и `run` из оболочки ставят туда). Без пакета
+/// `proton` — пусто: запускать ярлыки нечем.
+pub(super) fn windows_shortcuts() -> Vec<WinShortcut> {
+    const LIMIT: usize = 16 * 1024;
+    let mut out = Vec::new();
+    if !exists(PROTON_SCRIPT) {
+        return out;
+    }
+    let mut homes = alloc::vec![super::context::home_dir()];
+    if homes[0] != "/root" {
+        homes.push(String::from("/root"));
+    }
+    for home in &homes {
+        let Some(Ok(entries)) = crate::fs::list(home) else {
+            continue;
+        };
+        for entry in entries {
+            if entry.kind != crate::vfs::NodeKind::Directory || !entry.name.starts_with('.') || entry.name.len() < 2 {
+                continue;
+            }
+            let prefix = alloc::format!("{home}/{}", entry.name);
+            let dir = alloc::format!("{prefix}/{SHORTCUTS}");
+            let Some(Ok(files)) = crate::fs::list(&dir) else {
+                continue;
+            };
+            for file in files {
+                if file.kind != crate::vfs::NodeKind::File || !file.name.ends_with(".desktop") {
+                    continue;
+                }
+                let path = alloc::format!("{dir}/{}", file.name);
+                let Some(Ok((bytes, _))) = crate::fs::read(&path, LIMIT) else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&bytes);
+                let field = |key: &str| {
+                    text.lines().find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('='))).map(str::trim)
+                };
+                if field("NoDisplay") == Some("true") {
+                    continue;
+                }
+                let caption = String::from(field("Name").unwrap_or_else(|| file.name.trim_end_matches(".desktop")));
+                let lower = caption.to_lowercase();
+                let uninstall = lower.starts_with("uninstall") || lower.starts_with("удалить") || file.name.to_lowercase().starts_with("uninstall");
+                let icon = shortcut_icon(&dir, field("Icon").unwrap_or(""));
+                out.push(WinShortcut { caption, file: path, prefix: prefix.clone(), icon, uninstall });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.caption.cmp(&b.caption));
+    out
+}
+
+/// Префиксы Wine в доме (каталоги с точкой, в которых есть `system.reg`):
+/// для «Установка и удаление программ» в «Параметрах». Путь с пробелом не
+/// берётся — его не передать строкой запуска. Без пакета `proton` — пусто.
+pub(super) fn windows_prefixes() -> Vec<String> {
+    let mut out = Vec::new();
+    if !exists(PROTON_SCRIPT) {
+        return out;
+    }
+    let mut homes = alloc::vec![super::context::home_dir()];
+    if homes[0] != "/root" {
+        homes.push(String::from("/root"));
+    }
+    for home in &homes {
+        let Some(Ok(entries)) = crate::fs::list(home) else {
+            continue;
+        };
+        for entry in entries {
+            if entry.kind != crate::vfs::NodeKind::Directory || !entry.name.starts_with('.') || entry.name.contains(' ') {
+                continue;
+            }
+            let prefix = alloc::format!("{home}/{}", entry.name);
+            if exists(&alloc::format!("{prefix}/system.reg")) {
+                out.push(prefix);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// FIMG значка ярлыка. `Icon=` у winemenubuilder — имя картинки в
+/// `proton_shortcuts/icons/` (по размерам `ШxВ/apps/`) или полный путь. PNG
+/// стол не читает: если FIMG рядом ещё нет, запускается `png2fimg`, и значок
+/// появится при следующем открытии меню; пока — общий значок Windows.
+fn shortcut_icon(dir: &str, icon: &str) -> String {
+    if icon.is_empty() {
+        return String::new();
+    }
+    let mut candidates = Vec::new();
+    if icon.starts_with('/') {
+        candidates.push(if icon.ends_with(".png") { String::from(icon) } else { alloc::format!("{icon}.png") });
+    } else {
+        let name = icon.trim_end_matches(".png");
+        for size in ["256x256", "128x128", "64x64", "48x48", "32x32"] {
+            candidates.push(alloc::format!("{dir}/icons/{size}/apps/{name}.png"));
+        }
+        candidates.push(alloc::format!("{dir}/icons/{name}.png"));
+    }
+    let Some(png) = candidates.into_iter().find(|png| exists(png)) else {
+        return String::new();
+    };
+    let fimg = alloc::format!("{}.fimg", png.trim_end_matches(".png"));
+    if exists(&fimg) {
+        return fimg;
+    }
+    convert_icon(&png, &fimg);
+    String::new()
+}
+
+/// PNG, для которых `png2fimg` уже запускался в эту загрузку: не вышло
+/// однажды — не запускать на каждом открытии меню.
+static ICON_JOBS: crate::sync::SpinLock<Vec<String>> = crate::sync::SpinLock::new(Vec::new());
+
+fn convert_icon(png: &str, fimg: &str) {
+    {
+        let mut jobs = ICON_JOBS.lock();
+        if jobs.iter().any(|known| known == png) {
+            return;
+        }
+        jobs.push(String::from(png));
+    }
+    let line = alloc::format!("/bin/png2fimg {} {}", pct(png), pct(fimg));
+    match crate::user::spawn(&line, crate::user::session::credentials()) {
+        Ok(id) => crate::kprintln!("  desktop     : started '{line}' as {id}"),
+        Err(err) => crate::kprintln!("  desktop     : cannot start '{line}': {err}"),
+    }
+}
+
+/// Строки «Пуска» для программ Windows: запуск ярлыка с правами пакета
+/// `proton` (у него `windows files net jit`). Ярлыки удаления — не здесь, а
+/// в «Параметры → Пакеты».
+fn windows_launchers(packages: &[Launcher]) -> Vec<Launcher> {
+    let Some(proton) = packages.iter().find(|launcher| launcher.name == "proton") else {
+        return Vec::new();
+    };
+    windows_shortcuts()
+        .into_iter()
+        .filter(|shortcut| !shortcut.uninstall)
+        .map(|shortcut| {
+            let place = shortcut.prefix.rsplit('/').next().unwrap_or("");
+            Launcher {
+                name: alloc::format!("windows:{}", shortcut.file),
+                about: alloc::format!("Windows · {place}"),
+                start: proton_line(&alloc::format!("--shortcut={}", pct(&shortcut.file))),
+                rights: proton.rights,
+                desktop: false,
+                icon: if shortcut.icon.is_empty() { String::from("windows-apps") } else { shortcut.icon },
+                opens: String::new(),
+                caption: shortcut.caption,
+            }
+        })
+        .collect()
+}
+
 /// Программа из `/bin`, у которой есть окно, — то, что стоит в «Пуске».
 ///
 /// Список, а не признак в самом файле, и это названный предел: исполняемый
@@ -1553,7 +1759,10 @@ impl Menu {
             }
         }
         // Программы из пакетов — после своих и до строк питания (фаза N8).
-        let packages = list_packages();
+        let mut packages = list_packages();
+        // Программы Windows, поставленные в префиксы Proton (P12, 18.11).
+        let windows = windows_launchers(&packages);
+        packages.extend(windows);
         items.extend((0..packages.len()).map(Item::Package));
         items.extend([Item::App(App::Shutdown), Item::App(App::Restart)]);
 
@@ -2058,7 +2267,8 @@ fn draw_item_icon(ctx: Ctx, s: &mut Surface, rect: Rect, item: Item, packages: &
     // Пакет со своим значком (поле `icon` манифеста, 08.11.2026).
     if let Item::Package(index) = item {
         if let Some(launcher) = packages.get(index) {
-            if launcher.icon.starts_with('/') {
+            // И значок макета по имени (`windows-apps` у программ Windows, 18.11).
+            if launcher.icon.starts_with('/') || super::appicon::design(&launcher.icon).is_some() {
                 super::appicon::of_manifest(&launcher.icon).draw(ctx, s, rect);
                 return;
             }

@@ -484,6 +484,31 @@ impl SettingsView {
         next
     }
 
+    // ── Программы Windows (P12, 18.11) ──────────────────────────────────────
+
+    /// Программы, поставленные в префиксы Proton: ярлыки удаления, которые
+    /// записал их установщик («Uninstall …»), и для каждого префикса —
+    /// «Установка и удаление программ» Wine (`uninstaller`: всё, что есть в
+    /// реестре префикса, в том числе MSI без ярлыков). Без пакета `proton` и
+    /// префиксов — раздела нет.
+    fn windows_programs(&self, pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
+        use super::super::panel::{pct, proton_line, windows_prefixes, windows_shortcuts};
+        let prefixes = windows_prefixes();
+        if prefixes.is_empty() {
+            return y;
+        }
+        let mut y = pass.group(x, y, w, "Программы Windows");
+        for shortcut in windows_shortcuts().into_iter().filter(|shortcut| shortcut.uninstall) {
+            let line = proton_line(&format!("--shortcut={}", pct(&shortcut.file)));
+            y = row(pass, x, y, w, Some(Fi::Package), &shortcut.caption, &shortcut.prefix, Ctl::Button("Удалить", Weight::Normal), Some(Deed::Run(line)));
+        }
+        for prefix in prefixes {
+            let line = proton_line(&format!("--env=WINEPREFIX={prefix} uninstaller"));
+            y = row(pass, x, y, w, Some(Fi::Folder), "Установка и удаление программ", &prefix, Ctl::Button("Открыть", Weight::Normal), Some(Deed::Run(line)));
+        }
+        y
+    }
+
     // ── Приложения ───────────────────────────────────────────────────────────
 
     fn apps(&self, pass: &mut Pass, x: i32, y: i32, w: u32) {
@@ -521,6 +546,7 @@ impl SettingsView {
                         y = row(pass, x, y, w, Some(Fi::Warning), "Реестр пакетов", &err, Ctl::Chip("ОШИБКА", Tone::Bad), None);
                     }
                 }
+                y = self.windows_programs(pass, x, y, w);
                 y = pass.group(x, y, w, "Установка");
                 y = row(pass, x, y, w, Some(Fi::Download), "Установить пакет из файла", "Файлы .fpk с носителя, из домашнего каталога и со стола", Ctl::Button("Обзор…", Weight::Primary), Some(Deed::ChooseFile));
                 y = pass.group(x, y, w, "Источник");

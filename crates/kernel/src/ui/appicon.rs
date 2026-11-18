@@ -124,6 +124,10 @@ pub fn of_manifest(icon: &str) -> Art {
         }
         return Art::glyph(Icon::Package);
     }
+    // Значок макета по имени (`windows-apps` — программы Windows, 18.11).
+    if let Some(image) = design(icon) {
+        return Art::Image(image);
+    }
     Art::glyph(named(icon))
 }
 

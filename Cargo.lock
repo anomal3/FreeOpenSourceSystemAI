@@ -1245,6 +1245,7 @@ dependencies = [
  "http",
  "linked_list_allocator",
  "mini-ui",
+ "miniz_oxide",
  "osupdate",
  "ssh",
  "sysconf",

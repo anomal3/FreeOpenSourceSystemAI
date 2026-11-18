@@ -389,6 +389,8 @@ enum Deed {
     Restart,
     /// Запустить программу (проводник).
     Launch(&'static str),
+    /// Запустить командную строку (удаление программы Windows, 18.11).
+    Run(String),
     /// Следующая программа для расширения (программы по умолчанию).
     OpenWith(&'static str),
     // ── «Дисплей» с несколькими мониторами (16.11, см. `displays`) ──
@@ -1377,6 +1379,7 @@ impl SettingsView {
             Deed::Shutdown => self.request = Some(Request::Shutdown),
             Deed::Restart => self.request = Some(Request::Restart),
             Deed::Launch(path) => self.report = Some(pages::run(path, path)),
+            Deed::Run(line) => self.report = Some(pages::run(&line, "Proton")),
             Deed::PickOutput(index) => {
                 self.displays.select(index);
                 kprintln!("  settings    : display {} selected", index + 1);

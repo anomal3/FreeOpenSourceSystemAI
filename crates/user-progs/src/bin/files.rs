@@ -1204,6 +1204,18 @@ impl Files {
             }
             return true;
         }
+        // P12 (18.11): программа Windows — запустить её, а не показать байты.
+        if let Some(line) = windows_command(&target) {
+            let id = spawn(&line);
+            if id < 0 {
+                println(&format!("files: cannot start '{line}': error {id}"));
+                self.note = Some(format!("Не удалось запустить «{name}»: {}", error_text(id)));
+            } else {
+                println(&format!("files: started '{line}' as #{id}"));
+                self.note = Some(format!("Запущено «{name}» (Windows)"));
+            }
+            return true;
+        }
         // Выбор человека («Всегда открывать этой программой») — первым.
         if let Some(command) = chosen_program(&name) {
             let line = format!("{command} {target}");
@@ -3994,6 +4006,90 @@ fn dotnet_command(path: &str) -> Option<String> {
         return None;
     }
     Some(format!("/bin/dotnet {dll}"))
+}
+
+/// Запуск Proton из пакета `proton` (`xtask/src/proton.rs`).
+const PROTON: &str = "/opt/proton/bin/fossai-proton";
+/// Запуск Wine из пакета `wine` (`xtask/src/wine.rs`).
+const WINE: &str = "/opt/wine/bin/fossai-wine";
+/// Оболочка Debian, которой исполняются оба сценария.
+const BASH: &str = "/opt/debian/bin/bash";
+
+/// Командная строка, которой запускается программа Windows, если `path` — она
+/// (P12, 18.11): `.exe` без заголовка CLI (машинный код Windows), `.msi`
+/// (установщик — `msiexec /i`), `.lnk`, `.bat`, `.cmd`.
+///
+/// Чем: Proton, если стоит пакет `proton` (`fossai-proton --open=ПУТЬ`, общий
+/// префикс `~/.proton`); иначе — Wine из пакета `wine`. Сборка .NET Framework
+/// (заголовок CLI есть, `runtimeconfig.json` нет — её ловит [`dotnet_command`])
+/// уходит в `/bin/mono`, если он есть: Mono в префиксах Proton выключен.
+///
+/// Путь с пробелом: ядро делит строку по пробелам, поэтому Proton получает
+/// путь с `%20` и раскодирует его сам. У Wine такого разбора нет — путь с
+/// пробелом им не запускается (названный предел, как у [`dotnet_command`]).
+fn windows_command(path: &str) -> Option<String> {
+    let lower = path.to_ascii_lowercase();
+    let ext = lower.rsplit_once('.').map_or("", |(_, ext)| ext);
+    if !matches!(ext, "exe" | "msi" | "lnk" | "bat" | "cmd") {
+        return None;
+    }
+    let mut info = Stat::default();
+    let has = |file: &str, info: &mut Stat| stat(file, info) >= 0;
+    if ext == "exe" && pe_has_cli(path) && !path.contains(' ') && has("/bin/mono", &mut info) {
+        return Some(format!("/bin/mono {path}"));
+    }
+    if has(PROTON, &mut info) {
+        let mut encoded = String::with_capacity(path.len());
+        for ch in path.chars() {
+            match ch {
+                ' ' => encoded.push_str("%20"),
+                '%' => encoded.push_str("%25"),
+                _ => encoded.push(ch),
+            }
+        }
+        return Some(format!("{BASH} {PROTON} --open={encoded}"));
+    }
+    if has(WINE, &mut info) && !path.contains(' ') {
+        return Some(match ext {
+            "msi" => format!("{BASH} {WINE} msiexec /i {path}"),
+            "exe" => format!("{BASH} {WINE} {path}"),
+            _ => format!("{BASH} {WINE} start /unix {path}"),
+        });
+    }
+    None
+}
+
+/// Есть ли у PE-файла заголовок CLI (каталог данных 14, `COM_DESCRIPTOR`) —
+/// сборка .NET, а не машинный код. Не PE или не прочиталось — `false`.
+fn pe_has_cli(path: &str) -> bool {
+    let fd = open(path);
+    if fd < 0 {
+        return false;
+    }
+    let mut head = [0u8; 1024];
+    let got = read(fd, &mut head);
+    close(fd);
+    if got < 64 || &head[..2] != b"MZ" {
+        return false;
+    }
+    let got = got as usize;
+    let u16_at = |at: usize| head.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at = |at: usize| head.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let Some(pe) = u32_at(0x3c).map(|v| v as usize).filter(|&pe| pe + 24 < got) else {
+        return false;
+    };
+    if head.get(pe..pe + 4) != Some(b"PE\0\0".as_slice()) {
+        return false;
+    }
+    let optional = pe + 24;
+    // Каталоги данных: у PE32 с 96-го байта необязательного заголовка, у PE32+ — со 112-го.
+    let dirs = match u16_at(optional) {
+        Some(0x10b) => optional + 96,
+        Some(0x20b) => optional + 112,
+        _ => return false,
+    };
+    let count = u32_at(optional + if dirs == optional + 96 { 92 } else { 108 }).unwrap_or(0);
+    count > 14 && u32_at(dirs + 14 * 8).is_some_and(|rva| rva != 0)
 }
 
 /// Прочитать файл для просмотра.
