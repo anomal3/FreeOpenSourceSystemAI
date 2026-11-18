@@ -180,6 +180,11 @@ enum Command {
     /// под FreeOS: исходник выпуска с GitHub + правки `ports/craft`, сборка в
     /// Docker, пакеты `.fpk` и подписанный `craft-index.json` в `build/craft`.
     Craft(CraftArgs),
+    /// Только подготовить исходники std для `<арх>-unknown-freeos`
+    /// (`build/rust-std/src`: library/ с правками, libc, крейты экосистемы и
+    /// patches.toml) — без сборки программ. Нужна контейнеру fossai-builder
+    /// (Craft, Servo) там, где систему целиком не собирают: в CI.
+    RustStdSrc,
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -1012,6 +1017,11 @@ fn real_main() -> Result<()> {
             no_build: args.no_build,
             out: args.out,
         })?,
+
+        Command::RustStdSrc => {
+            let library = ruststd::prepare()?;
+            say!("исходники std для freeos: {}", library.display());
+        }
 
         Command::Clean => build::clean()?,
     }

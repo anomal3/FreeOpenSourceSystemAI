@@ -146,6 +146,12 @@ fn docker() -> PathBuf {
     if desktop.is_file() { desktop } else { PathBuf::from("docker") }
 }
 
+/// Источник монтирования кеша контейнера: том Docker по умолчанию или то, что
+/// задано переменной (в CI — каталог раннера, который сохраняет actions/cache).
+fn cache_mount(var: &str, volume: &str) -> String {
+    std::env::var(var).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| volume.to_string())
+}
+
 /// Собрать приложение в контейнере fossai-builder (`build-craft.sh`).
 pub fn build(app: &CraftApp, arch: Arch, tag: &str) -> Result<()> {
     let root = paths::workspace_root();
@@ -157,9 +163,9 @@ pub fn build(app: &CraftApp, arch: Arch, tag: &str) -> Result<()> {
         .arg("-v")
         .arg(format!("{}:/work", root.display()))
         .arg("-v")
-        .arg("fossai-craft:/cache")
+        .arg(format!("{}:/cache", cache_mount("FOSSAI_CRAFT_CACHE", "fossai-craft")))
         .arg("-v")
-        .arg("fossai-cargo-registry:/opt/cargo/registry")
+        .arg(format!("{}:/opt/cargo/registry", cache_mount("FOSSAI_CARGO_REGISTRY", "fossai-cargo-registry")))
         .arg("fossai-builder")
         .arg("sh")
         .arg("/work/ports/craft/builder/build-craft.sh")
