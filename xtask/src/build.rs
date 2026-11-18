@@ -835,6 +835,9 @@ mod tests {
             .chain(crate::cbuild::C_PROGRAMS.iter().map(|program| program.name))
             .chain(crate::cbuild::FOREIGN_PROGRAMS)
             .chain([crate::cbuild::LINUX_VDSO])
+            // Проба std Rust: из трёх программ `ruststd::PROGRAMS` на носитель
+            // едет одна `rstd` (сценарий `rust-std` на установленной системе).
+            .chain(crate::ruststd::PROGRAMS.iter().copied().filter(|name| *name == "rstd"))
             .collect();
 
         let missing: Vec<&&str> = expected

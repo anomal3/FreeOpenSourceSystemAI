@@ -54,10 +54,11 @@ if [ ! -f \"$G/TmForever.exe\" ]; then\n\
 fi\n\
 cd \"$G\"\n\
 # Отрисовка (18.11): видеокарты у Wine пока нет, кадры рисует процессор.\n\
-# По умолчанию DXVK (Direct3D 9 -> Vulkan на lavapipe) со счётчиком кадров\n\
-# на экране; `--wined3d` - Direct3D 9 -> OpenGL (llvmpipe), счётчик кадров -\n\
-# в журнал (`trace:fps`). Какой быстрее на машине - видно по цифрам.\n\
-MODE=--dxvk\n\
+# По умолчанию wined3d (Direct3D 9 -> OpenGL на llvmpipe, кадры/с - в\n\
+# журнал): замер 18.11 в QEMU на 8 ЦП - 11 к/с в 1280x720 и 10 в 2560x1440\n\
+# против 3-4 и 2,7 у DXVK на lavapipe. `--dxvk` - Vulkan (счётчик на экране),\n\
+# пригодится, когда у Vulkan будет видеокарта.\n\
+MODE=\n\
 # Размер (P2, 18.11): игра сама берёт размер монитора (2560x1440 на ПК\n\
 # Романа - вчетверо больше точек, чем 720p, и всё на процессоре).\n\
 # `--720p` - виртуальный рабочий стол Wine 1280x720, `--1080p` - 1920x1080,\n\
@@ -71,7 +72,7 @@ BENCH=\n\
 while :; do\n\
     case \"$1\" in\n\
         --wined3d) MODE=; shift ;;\n\
-        --dxvk) shift ;;\n\
+        --dxvk) MODE=--dxvk; shift ;;\n\
         --720p) SIZE=1280x720; shift ;;\n\
         --1080p) SIZE=1920x1080; shift ;;\n\
         --desktop=*) SIZE=${1#--desktop=}; shift ;;\n\
