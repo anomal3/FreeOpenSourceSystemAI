@@ -5602,8 +5602,17 @@ pub fn resize_window(task: u32, slot: u32, pixels: Surface) -> Result<(), Window
         let Some(window) = desktop.find(app) else {
             return Err(WindowError::NoWindow);
         };
+        let size = (pixels.width(), pixels.height());
         if !window.replace_pixels(pixels, focused) {
             return Err(WindowError::NoMemory);
+        }
+        // Программа сама стала размером с монитор (игра под Wine «на весь
+        // экран»: 18.11, Trackmania на ПК Романа стала 2560x1440 там, где
+        // стояла, — полосой через два монитора). Такое окно разворачивается
+        // на свой монитор, а не висит между ними; «восстановить» вернёт его.
+        let monitor_sized = desktop.output_rects().iter().any(|r| (r.w, r.h) == size);
+        if monitor_sized && !desktop.find(app).is_some_and(|w| w.is_maximized()) && desktop.toggle_maximize(app) {
+            kprintln!("  desktop     : '{}' is monitor-sized, maximized on its monitor", name_of(desktop, app));
         }
         log_window(desktop, app, focused);
         // Окно могло сжаться: открывшееся под ним место рисуется заново.

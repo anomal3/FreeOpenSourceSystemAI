@@ -1038,7 +1038,9 @@ impl Client {
                     }
                     // Рамку Chromium рисует сам (окно без рамки стола), и о
                     // перетаскивании, размере и кнопках просит стол он.
-                    5 | 6 | 9 | 10 | 13 => {
+                    // 11/12 — `set_fullscreen`/`unset_fullscreen` (18.11): на
+                    // весь экран — как развернуть, на свой монитор (игры Wine).
+                    5 | 6 | 9 | 10 | 11 | 12 | 13 => {
                         // `resize(seat, serial, edges)`: у Wayland верх 1, низ 2,
                         // лево 4, право 8 — у стола свои биты.
                         let edges = if opcode == 6 {
@@ -1063,8 +1065,8 @@ impl Client {
                             let _ = match opcode {
                                 5 => crate::ui::begin_move(pid, slot),
                                 6 => crate::ui::begin_resize(pid, slot, edges),
-                                9 => crate::ui::maximize_window(pid, slot, true),
-                                10 => crate::ui::maximize_window(pid, slot, false),
+                                9 | 11 => crate::ui::maximize_window(pid, slot, true),
+                                10 | 12 => crate::ui::maximize_window(pid, slot, false),
                                 _ => crate::ui::minimize_window(pid, slot),
                             };
                         }

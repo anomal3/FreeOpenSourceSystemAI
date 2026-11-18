@@ -254,11 +254,39 @@ pub fn present() -> bool {
 ///
 /// Ядро должно исполняться на собственных таблицах страниц.
 pub unsafe fn probe(root: &pci::Root) -> bool {
+    // Все контроллеры HDA по порядку, до первого, где есть путь к выходу
+    // (18.11, ПК Романа: первым стоит звук HDMI/DP видеокарты NVIDIA — без
+    // подключённой колонки там «no DAC path», — а до звука на плате AMD
+    // `1022:15e3` дело не доходило, и звука не было вовсе).
+    let mut devices = alloc::vec::Vec::new();
     // SAFETY: контракт функции.
-    let Some(device) = (unsafe { pci::find_by_class(root, CLASS_MULTIMEDIA, SUBCLASS_HDA, 0) })
-    else {
-        return false;
-    };
+    unsafe {
+        pci::for_each(root, |device| {
+            if device.class == CLASS_MULTIMEDIA && device.subclass == SUBCLASS_HDA && device.prog_if == 0 {
+                devices.push(*device);
+            }
+            true
+        });
+    }
+    // Звук видеокарт (HDMI/DP: NVIDIA 10de, Radeon/встроенная графика AMD
+    // 1002) — последним: колонки обычно на плате (AMD 1022, Intel 8086).
+    devices.sort_by_key(|d| matches!(d.vendor, 0x10de | 0x1002));
+    for device in devices {
+        // SAFETY: контракт функции.
+        if unsafe { attach_one(&device) } {
+            return true;
+        }
+    }
+    false
+}
+
+/// Поднять один контроллер; `false` — им звук не вывести.
+///
+/// # Safety
+///
+/// См. [`probe`].
+unsafe fn attach_one(device: &pci::Device) -> bool {
+    let device = *device;
     // SAFETY: контракт функции.
     match unsafe { Hda::attach(&device) } {
         Ok(hda) => {

@@ -299,7 +299,11 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // хочу на ПК проверить на живом»). Корень живой системы только на
             // чтение, поэтому пакет едет файлом `\FREEOS\PKG\OBSOS.FPK`, а ядро,
             // увидев флешку, ставит его в `/opt` в памяти (`usb::storage`).
-            if built.release {
+            // `FOSSAI_LIVE_APPS=0` (18.11, Роман: «редакторы и OBSOS пока на
+            // флешку не грузить, проверяем только Proton и игры») — без OBSOS
+            // и Craft: флешка меньше, пакеты ставятся быстрее.
+            let live_apps = std::env::var("FOSSAI_LIVE_APPS").map_or(true, |v| v != "0");
+            if built.release && live_apps {
                 if let Some(bytes) = crate::package::servo(arch)? {
                     payload.push(Payload {
                         path: format!("{}/OBSOS.FPK", arch::PAYLOAD_PKG_DIR),
@@ -311,7 +315,7 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // Приложения Craft (17.11): GridCraft, WordCraft, PdfCraft,
             // MailCraft — так же файлами `\FREEOS\PKG\<8 знаков>.FPK`, ядро
             // ставит их после OBSOS (`LIVE_ORDER` в usb/storage.rs).
-            if built.release {
+            if built.release && live_apps {
                 for app in crate::craft::apps()? {
                     if let Some((file, bytes)) = crate::craft::package(&app, arch)? {
                         payload.push(Payload {
