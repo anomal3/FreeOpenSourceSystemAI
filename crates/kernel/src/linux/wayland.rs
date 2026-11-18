@@ -104,6 +104,26 @@ static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 /// Печатать запросы клиентов и события сервера (`kernel wltrace on`).
 static TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Темп ответов на `frame` (P8) и `ping` клиентам (P4) — включаемы
+/// командами `wlpace`/`wlping`: сравнить с прежним поведением на железе.
+static PACE: AtomicBool = AtomicBool::new(true);
+static PING: AtomicBool = AtomicBool::new(true);
+
+pub fn set_pace(on: bool) {
+    PACE.store(on, Ordering::Relaxed);
+}
+#[must_use]
+pub fn pace() -> bool {
+    PACE.load(Ordering::Relaxed)
+}
+pub fn set_ping(on: bool) {
+    PING.store(on, Ordering::Relaxed);
+}
+#[must_use]
+pub fn ping() -> bool {
+    PING.load(Ordering::Relaxed)
+}
+
 /// Включить или выключить трассировку протокола.
 pub fn set_trace(on: bool) {
     TRACE.store(on, Ordering::Relaxed);
@@ -149,8 +169,10 @@ fn run() {
             }
             alive
         });
-        // События окон приходят без уведомления — опрос раз в кадр.
-        crate::io_events::wait(seen, Some(now + 16));
+        // События окон приходят без уведомления — опрос раз в кадр; раньше —
+        // если у клиента отложен ответ на `frame` (темп экрана, P8).
+        let due = clients.iter().filter_map(Client::frames_due_at).min().unwrap_or(u64::MAX);
+        crate::io_events::wait(seen, Some(due.clamp(now + 1, now + 16)));
     }
 }
 
@@ -274,6 +296,19 @@ const MOD_CONTROL: u32 = 4;
 const MOD_ALT: u32 = 8;
 const MOD_NUM: u32 = 16;
 const MOD_SUPER: u32 = 64;
+/// Темп ответов на `wl_surface.frame` — кадр экрана 60 Гц (P8): клиент в
+/// режиме FIFO (DXVK, Mesa WSI) рисует не чаще, чем стол показывает.
+const FRAME_MS: u64 = 16;
+/// Дольше этого ответ на `frame` не откладывается, даже если окно ещё не
+/// показано (стол занят): клиент не должен стоять.
+const FRAME_HOLD_MAX_MS: u64 = 100;
+/// Окно не закрылось за столько после просьбы — стол спросит «Программа не
+/// отвечает» (P4, 18.11.2026; как `HUNG_AFTER_MS` у родных окон).
+const CLOSE_GRACE_MS: u64 = 10_000;
+/// `xdg_wm_base.ping` — раз в столько, пока у клиента есть окна…
+const PING_EVERY_MS: u64 = 5_000;
+/// …и столько ждать `pong`: дольше — клиент не разбирает свою очередь.
+const PING_PATIENCE_MS: u64 = 5_000;
 const XDG_TOPLEVEL_MAXIMIZED: u32 = 1;
 const XDG_TOPLEVEL_ACTIVATED: u32 = 4;
 const BTN_LEFT: u32 = 0x110;
@@ -497,6 +532,9 @@ struct Win {
     active: bool,
     /// Заголовок не дошёл до стола (он был занят) — повторить.
     title_due: bool,
+    /// Когда стол попросил окно закрыться (мс работы системы); ноль — не
+    /// просил или уже спрошено «не отвечает» (P4).
+    close_asked: u64,
 }
 
 /// Всплывающее окно стола за `xdg_popup`.
@@ -632,6 +670,18 @@ struct Client {
     keys_down: Vec<u32>,
     seat_version: u32,
     broken: bool,
+    /// `xdg_wm_base` клиента — ему идут `ping` (P4).
+    wm_base: Option<u32>,
+    /// Посланный и ещё не отвеченный `ping`: номер и когда послан.
+    ping: Option<(u32, u64)>,
+    /// Когда послан последний `ping`.
+    ping_sent: u64,
+    /// О молчании на `ping` уже сказано в журнале.
+    ping_silence_told: bool,
+    /// Когда клиенту последний раз ответили на `frame` (темп, P8) и с какого
+    /// мига ответ отложен.
+    frame_answered: u64,
+    frames_held_since: u64,
 }
 
 impl Client {
@@ -666,6 +716,12 @@ impl Client {
             keys_down: Vec::new(),
             seat_version: 1,
             broken: false,
+            wm_base: None,
+            ping: None,
+            ping_sent: 0,
+            ping_silence_told: false,
+            frame_answered: 0,
+            frames_held_since: 0,
         }
     }
 
@@ -702,7 +758,7 @@ impl Client {
     /// Один виток: прочитать, разобрать, отправить. `false` — соединения нет.
     fn step(&mut self, now: u64) -> bool {
         let time = now as u32;
-        self.answer_frames(time);
+        self.answer_frames(now);
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             match self.conn.recv(&mut buf) {
@@ -755,8 +811,10 @@ impl Client {
                     self.present_popup(index);
                 }
             }
-            // Кадры этого витка показаны — ответить сразу.
-            self.answer_frames(time);
+            self.watch_answers(now);
+            // Кадры этого витка показаны — ответить, но не чаще кадра
+            // экрана (P8).
+            self.answer_frames(now);
         }
         self.flush();
         !self.broken || !self.out.is_empty()
@@ -996,6 +1054,17 @@ impl Client {
                     let surface = args.u32()?;
                     self.objects.insert(new, Obj::XdgSurface(surface));
                 }
+                // `pong(serial)` (P4).
+                3 => {
+                    let serial = args.u32()?;
+                    if self.ping.is_some_and(|(sent, _)| sent == serial) {
+                        if self.ping_silence_told {
+                            kprintln!("  wayland     : client #{} answers ping again", self.pid);
+                        }
+                        self.ping = None;
+                        self.ping_silence_told = false;
+                    }
+                }
                 _ => {}
             },
             Obj::Positioner(old) => {
@@ -1131,6 +1200,9 @@ impl Client {
             _ => Obj::Output,
         };
         self.objects.insert(new, object);
+        if name == 4 {
+            self.wm_base = Some(new);
+        }
         match name {
             3 => {
                 self.send(Msg::new(new, 0).u32(SHM_ARGB8888));
@@ -1231,6 +1303,7 @@ impl Client {
                     see_through: false,
                     active: true,
                     title_due: false,
+                    close_asked: 0,
                 });
             }
             2 => {
@@ -1363,6 +1436,7 @@ impl Client {
     }
 
     fn commit(&mut self, id: u32) {
+        super::perfdiag::WL_COMMITS.fetch_add(1, Ordering::Relaxed);
         let (pending, frames) = match self.objects.get_mut(&id) {
             Some(Obj::Surface(state)) => (state.pending.take(), core::mem::take(&mut state.frames)),
             _ => return,
@@ -1466,11 +1540,92 @@ impl Client {
     /// Ответить на `wl_surface.frame` всех показанных кадров — сразу, а не на
     /// следующем витке (13.11): клиент в режиме FIFO (DXVK, Mesa WSI) ждал
     /// на каждом кадре сон сервера в 16 мс.
-    fn answer_frames(&mut self, time: u32) {
+    ///
+    /// Темп (P8, 18.11.2026): не чаще кадра экрана ([`FRAME_MS`]) и только
+    /// когда окно действительно показано (перерисовка не отложена занятым
+    /// столом), но не дольше [`FRAME_HOLD_MAX_MS`]. Раньше ответ уходил на
+    /// каждом витке: игра в меню рисовала сотни кадров в секунду, и каждый
+    /// копировался и собирался столом, а показывались из них шестьдесят.
+    fn answer_frames(&mut self, now: u64) {
+        if self.frames_due.is_empty() {
+            self.frames_held_since = 0;
+            return;
+        }
+        if self.frames_held_since == 0 {
+            self.frames_held_since = now;
+        }
+        let held = now.saturating_sub(self.frames_held_since);
+        let unshown = self.wins.iter().any(|win| win.dirty) || self.pops.iter().any(|pop| pop.dirty);
+        let early = now < self.frame_answered.saturating_add(FRAME_MS);
+        if PACE.load(Ordering::Relaxed) && held < FRAME_HOLD_MAX_MS && (unshown || early) {
+            return;
+        }
+        let time = now as u32;
         for callback in core::mem::take(&mut self.frames_due) {
             if self.objects.contains_key(&callback) {
                 self.send(Msg::new(callback, 0).u32(time));
                 self.delete(callback);
+                super::perfdiag::WL_FRAMES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.frame_answered = now;
+        self.frames_held_since = 0;
+    }
+
+    /// Когда этому клиенту пора ответить на отложенные `frame` — чтобы
+    /// задача сервера проснулась к сроку, а не на следующем опросе.
+    fn frames_due_at(&self) -> Option<u64> {
+        (!self.frames_due.is_empty()).then(|| self.frame_answered.saturating_add(FRAME_MS))
+    }
+
+    /// `ping` клиенту и «не отвечает» столу (P4, 18.11.2026).
+    ///
+    /// Просьба закрыть окно (крестик, Alt+F4, меню панели) уходит клиенту
+    /// событием `xdg_toplevel.close` — а дальше решает программа. TrackMania
+    /// на ПК Романа просьбу трижды пропустила, и снять игру можно было только
+    /// из Диспетчера задач, по процессу. Теперь: окно не закрылось за
+    /// [`CLOSE_GRACE_MS`] — или клиент молчит на `ping` дольше
+    /// [`PING_PATIENCE_MS`] после просьбы — стол спрашивает «Программа не
+    /// отвечает — Завершить / Подождать». Молчание на `ping` без просьбы
+    /// закрыть только пишется в журнал: игра, компилирующая шейдеры, —
+    /// не повод для вопроса.
+    fn watch_answers(&mut self, now: u64) {
+        let Some(base) = self.wm_base.filter(|_| PING.load(Ordering::Relaxed)) else {
+            return;
+        };
+        if self.wins.is_empty() {
+            return;
+        }
+        let asked_since_ping = self.wins.iter().any(|win| win.close_asked > self.ping_sent);
+        if self.ping.is_none() && (now.saturating_sub(self.ping_sent) >= PING_EVERY_MS || asked_since_ping) {
+            let serial = self.next_serial();
+            self.send(Msg::new(base, 0).u32(serial));
+            self.ping = Some((serial, now));
+            self.ping_sent = now;
+        }
+        let silent = self.ping.map_or(0, |(_, sent)| now.saturating_sub(sent));
+        if silent >= PING_PATIENCE_MS && !self.ping_silence_told {
+            self.ping_silence_told = true;
+            kprintln!("  wayland     : client #{} does not answer ping for {} s", self.pid, silent / 1000);
+        }
+        for index in 0..self.wins.len() {
+            let win = &self.wins[index];
+            if win.close_asked == 0 || win.open.is_none() {
+                continue;
+            }
+            let waited = now.saturating_sub(win.close_asked);
+            if waited >= CLOSE_GRACE_MS || (silent >= PING_PATIENCE_MS && waited >= PING_PATIENCE_MS) {
+                kprintln!(
+                    "  wayland     : #{} window '{}' still open {} s after close was asked{}",
+                    self.pid,
+                    win.title,
+                    waited / 1000,
+                    if silent > 0 { alloc::format!(", ping unanswered for {} s", silent / 1000) } else { String::new() },
+                );
+                crate::ui::report_unresponsive(self.pid, win.slot, waited / 1000);
+                // Следующий вопрос — не раньше чем через столько же
+                // («Подождать» в диалоге).
+                self.wins[index].close_asked = now;
             }
         }
     }
@@ -1542,7 +1697,21 @@ impl Client {
         let alpha = has_alpha(&layers);
         let single = layers.len() == 1;
         let mut clear = false;
-        let painted = crate::ui::paint_window(pid, win.slot, area, |target| clear = paint(target, &layers, swap, area, alpha));
+        // Копия буфера клиента в окно стола — отдельно от сборки и вывода,
+        // которые `paint_window` делает тут же (P1: `perf-diag`).
+        let mut copy_ns = 0u64;
+        let painted = crate::ui::paint_window(pid, win.slot, area, |target| {
+            let started = crate::time::uptime_ns();
+            clear = paint(target, &layers, swap, area, alpha);
+            copy_ns = crate::time::uptime_ns().saturating_sub(started);
+        });
+        if painted.is_ok() {
+            super::perfdiag::WL_PAINTS.fetch_add(1, Ordering::Relaxed);
+            super::perfdiag::WL_PAINT_NS.fetch_add(copy_ns, Ordering::Relaxed);
+            super::perfdiag::WL_PAINT_PX.fetch_add(u64::from(area.w) * u64::from(area.h), Ordering::Relaxed);
+        } else {
+            super::perfdiag::WL_BUSY.fetch_add(1, Ordering::Relaxed);
+        }
         win.dirty = painted.is_err();
         if painted.is_ok() {
             // Прозрачность помнится до перерисовки целиком: частичная видит
@@ -1961,6 +2130,11 @@ impl Client {
                     user_abi::WIN_CLOSE => {
                         let toplevel = self.wins[index].toplevel;
                         self.send(Msg::new(toplevel, 1));
+                        // Отсчёт «не отвечает» — с первой просьбы (P4).
+                        if self.wins[index].close_asked == 0 {
+                            self.wins[index].close_asked = crate::time::uptime_ms().max(1);
+                            kprintln!("  wayland     : #{} asked to close '{}'", self.pid, self.wins[index].title);
+                        }
                     }
                     _ => {}
                 }
@@ -2263,6 +2437,8 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
     if row.try_reserve_exact(area.w as usize * 4).is_err() {
         return false;
     }
+    // Строк, ушедших одной копией (P8, `perf-diag`).
+    let mut direct = 0u64;
     row.resize(area.w as usize * 4, 0u8);
     for layer in layers {
         let buf = &layer.buf;
@@ -2294,6 +2470,15 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
                     return false;
                 }
                 let or = if buf.format == SHM_XRGB8888 { 0xff00_0000 } else { 0 };
+                if !swap && !alpha {
+                    // Непрозрачное окно без перестановки каналов (P8,
+                    // 18.11.2026): старший байт стол у такого окна не читает
+                    // (`stack` копирует, `over` красит только цвет), и
+                    // проход по точкам ради него — второй проход по кадру
+                    // (14,7 МБ на 2560x1440). Строка — одной копией.
+                    direct += 1;
+                    continue;
+                }
                 if swap {
                     for pixel in out.iter_mut() {
                         *pixel = to_screen(u32::from_le(*pixel) | or) & keep;
@@ -2318,6 +2503,9 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
                 *pixel = if layer.blend { mini_ui::over(src, *pixel) } else { src } & keep;
             }
         }
+    }
+    if direct > 0 {
+        super::perfdiag::WL_DIRECT.fetch_add(1, Ordering::Relaxed);
     }
     alpha && (ay0..ay1).any(|y| target.row(y as u32)[ax0 as usize..ax1 as usize].iter().any(|pixel| pixel >> 24 != 0xff))
 }

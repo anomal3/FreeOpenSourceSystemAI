@@ -331,6 +331,8 @@ unsafe fn put(page: *mut u8, at: usize, value: u64) {
 /// причины — свойства машины, а не сбои: запускать их на такой машине этим
 /// способом нельзя.
 pub fn prepare() -> Result<(), &'static str> {
+    // Зовётся загрузочным процессором — его номер для [`kick`].
+    APIC_IDS[current_index()].store(apic::local_id(), Ordering::Relaxed);
     let start = (&raw const smp_trampoline_start) as usize;
     let size = (&raw const smp_trampoline_end) as usize - start;
     if size > TRAMPOLINE_STACK - 64 {
@@ -406,6 +408,9 @@ pub fn start_cpu(index: usize, id: u64, _extra: u64, stack_top: usize) -> bool {
     let Ok(apic_id) = u32::try_from(id) else {
         return false;
     };
+    if let Some(cell) = APIC_IDS.get(index) {
+        cell.store(apic_id, Ordering::Relaxed);
+    }
 
     gdt::prepare_secondary(index);
 
@@ -534,6 +539,9 @@ pub fn shootdown() {
         apic::send_to_others(apic::VECTOR_IPI_FLUSH);
 
         let start = super::tsc::counter();
+        // Сколько ждали ответов — в `perf-diag` (P1): число сбросов без цены
+        // не говорит, тормозят ли они.
+        let _spent = Spent(start);
         let patience = super::tsc::frequency() / 1000 * FLUSH_PATIENCE_MS;
         loop {
             serve_flush();
@@ -565,6 +573,57 @@ pub fn shootdown() {
 /// о молчащем: «не дошло» и «дошло, но не туда» различаются только им.
 static FLUSH_IRQS: [AtomicU64; crate::smp::MAX_CPUS] =
     [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// Тактов TSC, ушедших на ожидание ответов в [`shootdown`].
+static FLUSH_WAIT_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// Засчитывает ожидание при выходе из [`shootdown`] любой ветвью.
+struct Spent(u64);
+
+impl Drop for Spent {
+    fn drop(&mut self) {
+        FLUSH_WAIT_TSC.fetch_add(super::tsc::counter().wrapping_sub(self.0), Ordering::Relaxed);
+    }
+}
+
+/// Сбросы трансляций на всех процессорах с загрузки и суммарное ожидание
+/// ответов в наносекундах — для `perf-diag` (P1, 18.11.2026).
+#[must_use]
+pub fn shootdown_stats() -> (u64, u64) {
+    let hz = super::tsc::frequency().max(1);
+    let ticks = FLUSH_WAIT_TSC.load(Ordering::Relaxed);
+    (FLUSH_ASKED.load(Ordering::Relaxed), (u128::from(ticks) * 1_000_000_000 / u128::from(hz)) as u64)
+}
+
+/// Номера APIC процессоров по их индексам — для адресного [`kick`].
+static APIC_IDS: [core::sync::atomic::AtomicU32; crate::smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; crate::smp::MAX_CPUS];
+
+/// Сколько пинков послано и сколько принято — `perf-diag`.
+static KICKS_SENT: AtomicU64 = AtomicU64::new(0);
+static KICKS_TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// Пнуть процессор `cpu` (P9): у планировщика для него готовая задача, а он,
+/// возможно, стоит в `hlt` до тика.
+pub fn kick(cpu: usize) {
+    let id = APIC_IDS.get(cpu).map_or(u32::MAX, |id| id.load(Ordering::Relaxed));
+    if id == u32::MAX || cpu == current_index() {
+        return;
+    }
+    KICKS_SENT.fetch_add(1, Ordering::Relaxed);
+    super::interrupts::without_interrupts(|| apic::send_to(id, apic::VECTOR_IPI_KICK));
+}
+
+/// Обработчик [`apic::VECTOR_IPI_KICK`].
+pub fn on_kick() {
+    KICKS_TAKEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Пинки: посланные и принятые.
+#[must_use]
+pub fn kick_stats() -> (u64, u64) {
+    (KICKS_SENT.load(Ordering::Relaxed), KICKS_TAKEN.load(Ordering::Relaxed))
+}
 
 /// Обработчик [`apic::VECTOR_IPI_FLUSH`].
 pub fn on_flush_interrupt() {

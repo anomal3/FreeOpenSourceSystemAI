@@ -1197,6 +1197,67 @@ fn run_builtin(line: &str) -> bool {
                 if crate::linux::ntsync::DEFAULT_ENABLED { "on" } else { "off" }
             );
         }
+        // Отчёт `perf-diag` в журнал раз в 30 с, пока работают программы
+        // Linux (P1, 18.11.2026); `now` — напечатать накопленное сразу.
+        #[cfg(target_arch = "x86_64")]
+        "perfdiag" => {
+            match argument.trim() {
+                "on" => crate::linux::perfdiag::set_enabled(true),
+                "off" => crate::linux::perfdiag::set_enabled(false),
+                "now" => crate::linux::perfdiag::request_now(),
+                "" => {}
+                _ => sprintln!("  perfdiag: usage `perfdiag [on|off|now]`"),
+            }
+            sprintln!("  perfdiag: {}", crate::linux::perfdiag::status());
+        }
+        // Темп ответов на `wl_surface.frame` (P8) и `ping` клиентам Wayland
+        // (P4), RWX поверх разделяемой памяти (P5) — включаемы для сравнения.
+        #[cfg(target_arch = "x86_64")]
+        "wlpace" | "wlping" | "lxshrwx" | "lxcfr" => {
+            let on = match argument.trim() {
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => None,
+            };
+            if let Some(on) = on {
+                match command {
+                    "wlpace" => crate::linux::wayland::set_pace(on),
+                    "wlping" => crate::linux::wayland::set_ping(on),
+                    "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.store(on, core::sync::atomic::Ordering::Relaxed),
+                    _ => crate::user::set_shared_rwx(on),
+                }
+            }
+            let now = match command {
+                "wlpace" => crate::linux::wayland::pace(),
+                "wlping" => crate::linux::wayland::ping(),
+                "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.load(core::sync::atomic::Ordering::Relaxed),
+                _ => crate::user::shared_rwx(),
+            };
+            sprintln!("  {command}: {}", if now { "on" } else { "off" });
+        }
+        // Пинок простаивающих процессоров при пробуждении (P9, 18.11.2026).
+        "schedkick" => {
+            match argument.trim() {
+                "on" => crate::sched::set_kicks(true),
+                "off" => crate::sched::set_kicks(false),
+                "" => {}
+                _ => sprintln!("  schedkick: usage `schedkick [on|off]`"),
+            }
+            sprintln!("  schedkick: {}", if crate::sched::kicks() { "on" } else { "off" });
+        }
+        // Право `jit` проверочным программам Linux из `/compat/linux/bin`
+        // (P5, 18.11.2026): там нет пакета, который назвал бы его, а проба
+        // `rwxprobe` проверяет именно память «на запись и исполнение».
+        #[cfg(target_arch = "x86_64")]
+        "lxjit" => {
+            match argument.trim() {
+                "on" => crate::user::set_probe_jit(true),
+                "off" => crate::user::set_probe_jit(false),
+                "" => {}
+                _ => sprintln!("  lxjit: usage `lxjit [on|off]`"),
+            }
+            sprintln!("  lxjit: /compat/linux/bin programs {} the jit right", if crate::user::probe_jit() { "have" } else { "do not have" });
+        }
         "irq" => interrupt_wakes(argument),
         "beep" => beep(argument),
         "clear" => {

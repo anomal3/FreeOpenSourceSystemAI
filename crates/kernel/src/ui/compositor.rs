@@ -3730,15 +3730,23 @@ impl Compositor {
             // совпадают со столом, и сдвигать надо только начало по
             // вертикали. Каждому монитору — его кусок полосы, в его же
             // координатах; щели между мониторами не выводятся никуда.
-            for out in &self.outputs {
+            for (index, out) in self.outputs.iter().enumerate() {
                 let part = band.intersect(&out.rect);
                 if part.is_empty() {
                     continue;
                 }
+                let started = crate::time::uptime_ns();
                 out.screen.blit(
                     &back,
                     (part.x - out.rect.x, part.y - out.rect.y),
                     Rect::new(part.x, part.y - band.y, part.w, part.h),
+                );
+                // По монитору порознь (P1): сканаут во VRAM и в обычной
+                // памяти стоят по-разному.
+                super::note_output_blit(
+                    index,
+                    crate::time::uptime_ns().wrapping_sub(started),
+                    u64::from(part.w) * u64::from(part.h),
                 );
             }
             let t2 = crate::time::uptime_ns();

@@ -875,6 +875,13 @@ pub struct Program {
     /// Номер родителя (`getppid`, фаза 71d): кто сделал `fork`; ноль —
     /// запущен системой.
     pub linux_ppid: u32,
+    /// Задание (P4, 18.11.2026): номер процесса, с которого начался запуск
+    /// из системы (меню, ярлык, `run`), — у всех его потомков один, и
+    /// `setsid`/`setpgid` его не меняют (как область `systemd` у Linux).
+    /// Ноль — задание этого процесса начинается с него самого. По нему
+    /// «Завершить» в «Программа не отвечает» снимает игру под Wine вместе с
+    /// `wineserver` и служебными процессами префикса.
+    pub linux_job: u32,
     /// Процесс снят сигналом (фаза 71d): `wait4` родителя узнаёт номер
     /// сигнала, а не код выхода.
     pub linux_signal: Option<u8>,
@@ -1135,7 +1142,10 @@ impl Program {
         let jit = prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0;
         // Частное отображение файла «на запись и исполнение» — у программы
         // Linux с правом `jit` сразу RWX (12.11, секции PE под Wine).
-        let file_rwx = jit && self.rwx_code() && file.is_some() && shared.is_none();
+        // Разделяемая память — так же (P5, 18.11.2026: секция Wine без
+        // файла — `memfd` под `MAP_SHARED`).
+        let file_rwx =
+            jit && self.rwx_code() && (file.is_some() || (shared.is_some() && SHARED_RWX.load(Ordering::Relaxed)));
         if jit && !file_rwx && (!self.jit_allowed || file.is_some() || shared.is_some()) {
             return Err(MmapError::WriteExecute);
         }
@@ -1724,7 +1734,16 @@ impl Program {
             // образа у программы Linux с правом `jit` (12.11: Wine делает
             // секции PE «на запись и исполнение» — упакованный установщик
             // Trackmania распаковывает себя поверх своего кода).
-            let image_rwx = self.rwx_code() && matches!(region.source, Source::Image(_));
+            //
+            // И разделяемая память (P5, 18.11.2026): в журнале TrackMania 64
+            // отказа `mprotect … prot 0x7` на 32-битных адресах — Wine делает
+            // RWX вид секции (`NtMapViewOfSection` с PAGE_EXECUTE_READWRITE),
+            // а секция без файла у него — `memfd`, отображённый `MAP_SHARED`.
+            // Переключения «по обращению» у программы с `rwx_code` нет —
+            // страницы сразу RWX у этого владельца, права второго не меняются.
+            let image_rwx = self.rwx_code()
+                && (matches!(region.source, Source::Image(_))
+                    || (matches!(region.source, Source::Shared(_)) && SHARED_RWX.load(Ordering::Relaxed)));
             if jit && !matches!(region.source, Source::Anonymous(_)) && !image_rwx {
                 return Err(MmapError::WriteExecute);
             }
@@ -1771,6 +1790,9 @@ impl Program {
                     if flags.contains(PageFlags::USER) { flags } else { PageFlags::READ }
                 }
                 Source::Shared(memory) => {
+                    // «Запись и исполнение» — сразу RWX с пометкой JIT, как у
+                    // сегмента образа выше.
+                    let flags = if jit { RWX_CODE } else { flags };
                     memory.flags = flags;
                     if flags.contains(PageFlags::USER) { flags } else { PageFlags::READ }
                 }
@@ -1826,6 +1848,29 @@ impl Program {
     /// Сколько областей у программы — для журнала сбоев.
     pub(crate) fn region_count(&self) -> usize {
         self.mappings.len()
+    }
+
+    /// Задание процесса ([`Program::linux_job`]): его собственный номер,
+    /// если запуск начался с него.
+    #[must_use]
+    pub fn job(&self) -> u32 {
+        if self.linux_job != 0 { self.linux_job } else { self.linux_pid }
+    }
+
+    /// Области, задетые `[addr, addr + len)`, — строкой для журнала отказа
+    /// `mprotect` (P5): «WriteExecute» без вида области не говорил, какая
+    /// память его не приняла. Не больше трёх.
+    pub(crate) fn describe_range(&self, addr: usize, len: usize) -> alloc::string::String {
+        let end = addr.saturating_add(len);
+        let first = self.mappings.partition_point(|region| region.end() <= addr);
+        let mut text = alloc::string::String::new();
+        for region in self.mappings[first..].iter().take_while(|region| region.base < end).take(3) {
+            if !text.is_empty() {
+                text.push_str("; ");
+            }
+            text.push_str(&Self::region_line(region));
+        }
+        text
     }
 
     /// Снять область `index` целиком — просьба совпала с ней адрес в адрес и
@@ -3056,7 +3101,38 @@ fn package_rights(path: &str) -> Option<Rights> {
 /// бывает чужой файл (`start=` у Chromium — это `bash` корня Debian, пакета
 /// без прав). Файл не из пакета права не получает никогда.
 fn jit_of_path(path: &str) -> bool {
-    package_rights(path).is_some_and(|rights| rights.contains(Rights::JIT))
+    probe_jit_path(path) || package_rights(path).is_some_and(|rights| rights.contains(Rights::JIT))
+}
+
+/// Право `jit` проверочным программам Linux (`lxjit on`, консоль ядра):
+/// у `/compat/linux/bin` нет манифеста, а проба памяти «на запись и
+/// исполнение» без права проверяла бы только отказ (P5, 18.11.2026).
+static PROBE_JIT: AtomicBool = AtomicBool::new(false);
+
+/// RWX поверх разделяемой памяти (P5) — `lxshrwx on|off`.
+static SHARED_RWX: AtomicBool = AtomicBool::new(true);
+
+pub fn set_shared_rwx(on: bool) {
+    SHARED_RWX.store(on, Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn shared_rwx() -> bool {
+    SHARED_RWX.load(Ordering::Relaxed)
+}
+
+pub fn set_probe_jit(on: bool) {
+    PROBE_JIT.store(on, Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn probe_jit() -> bool {
+    PROBE_JIT.load(Ordering::Relaxed)
+}
+
+/// Файл проверочной программы Linux при включённом `lxjit`.
+fn probe_jit_path(path: &str) -> bool {
+    PROBE_JIT.load(Ordering::Relaxed) && path.starts_with("/compat/linux/bin/") && !path[18..].contains('/')
 }
 
 /// Что разрешено программе, исполняющейся сейчас.
@@ -4026,6 +4102,7 @@ fn run(
             linux_cwd: alloc::string::String::from("/"),
             linux_pid: sched::current().as_u32(),
             linux_ppid: 0,
+            linux_job: 0,
             linux_signal: None,
             linux_dirs: Vec::new(),
             linux_actions: [LinuxAction::default(); 65],
@@ -4364,6 +4441,12 @@ pub fn futex_key(addr: usize) -> Option<usize> {
     if addr % 4 != 0 {
         return None;
     }
+    // Слово на странице, ещё не тронутой или разделённой `fork` (копия при
+    // записи, только чтение): у Linux ожидание её доводит само, а здесь
+    // ответом был `EFAULT` — и поток `futex_waitv` ребёнка после `fork`
+    // крутился на нём без сна (18.11.2026, проба `hangprobe`). Довести как
+    // запись из программы.
+    prepare_write(addr, 4);
     if !space::user_can(addr, 4, PageFlags::READ | PageFlags::WRITE | PageFlags::USER) {
         return None;
     }
@@ -4728,6 +4811,7 @@ impl Program {
             linux_cwd: self.linux_cwd.clone(),
             linux_pid: 0,
             linux_ppid: self.linux_pid,
+            linux_job: self.job(),
             linux_signal: None,
             linux_dirs: self.linux_dirs.clone(),
             linux_actions: self.linux_actions,
@@ -4910,7 +4994,7 @@ pub fn exec(frame: &mut arch::TrapFrame, path: &str, args: &[&str], env: &[&str]
     // своему манифесту, как раньше.
     let jit_allowed = match package_rights(path) {
         Some(rights) => rights.contains(Rights::JIT),
-        None => process.lock().jit_allowed,
+        None => probe_jit_path(path) || process.lock().jit_allowed,
     };
 
     // Дальше пути назад нет — но сначала остальные потоки: их задачи стоят
@@ -6102,6 +6186,96 @@ pub fn request_kill(id: sched::TaskId) -> Result<(), KillError> {
         }
         None => Err(KillError::NotAProgram),
     }
+}
+
+/// Снять программу задачи `id` вместе с её группой (P4, 18.11.2026):
+/// «Завершить» в «Программа не отвечает».
+///
+/// Окно игры под Wine принадлежит одному процессу, но игра — это ещё
+/// `wineserver`, `explorer.exe`, `services.exe`, `winedevice.exe`: снять
+/// только окно значило оставить их (в журнале 9c пришлось снимать три
+/// задачи из Диспетчера, и у главной оставалось 86 потоков). Группа — все
+/// процессы Linux того же задания ([`Program::linux_job`]), кроме предков
+/// окна, которые не Wine: скрипт запуска (`tmnf`) или `bash` терминала,
+/// из которого игру запустили, живут дальше — первый закончится сам, когда
+/// закончится Wine. Каждый процесс получает просьбу о снятии, и будятся все
+/// его потоки — спящий без срока иначе не дошёл бы до выхода.
+///
+/// Программа не Linux — как [`request_kill`]. Ответ — сколько процессов
+/// получили просьбу.
+pub fn end_program_group(id: sched::TaskId) -> Result<usize, KillError> {
+    if sched::is_idle(id) {
+        return Err(KillError::NotAProgram);
+    }
+    let (slot, _) = sched::lookup(id).ok_or(KillError::NoSuchTask)?;
+    let process_of = |slot: usize| PROGRAMS.lock().get(slot).and_then(Option::as_ref).cloned();
+    let target = process_of(slot).ok_or(KillError::NotAProgram)?;
+    let (linux, job, mut parent) = {
+        let program = target.lock();
+        (program.linux, program.job(), program.linux_ppid)
+    };
+    if !linux {
+        request_kill(id)?;
+        return Ok(1);
+    }
+    // Предки окна: номер процесса и путь программы.
+    let mut ancestors: Vec<u32> = Vec::new();
+    for _ in 0..32 {
+        if parent == 0 || ancestors.contains(&parent) {
+            break;
+        }
+        ancestors.push(parent);
+        let Some((pslot, _)) = sched::lookup(sched::TaskId::new(parent)) else {
+            break;
+        };
+        parent = match process_of(pslot) {
+            Some(process) => process.lock().linux_ppid,
+            None => break,
+        };
+    }
+    // Процессы задания — по одному на `Arc`, со всеми слотами потоков.
+    let table: Vec<(usize, Arc<Mutex<Program>>)> = {
+        let table = PROGRAMS.lock();
+        table.iter().enumerate().filter_map(|(slot, entry)| entry.as_ref().map(|p| (slot, Arc::clone(p)))).collect()
+    };
+    let mut groups: Vec<(Arc<Mutex<Program>>, Vec<usize>)> = Vec::new();
+    for (slot, process) in table {
+        match groups.iter_mut().find(|(known, _)| Arc::ptr_eq(known, &process)) {
+            Some((_, slots)) => slots.push(slot),
+            None => groups.push((process, alloc::vec![slot])),
+        }
+    }
+    let mut ended = 0usize;
+    let mut names = alloc::string::String::new();
+    for (process, slots) in groups {
+        let chosen = {
+            let mut program = process.lock();
+            let same_job = program.linux && program.job() == job;
+            // Предок, который не Wine (скрипт, оболочка), остаётся.
+            let keep = ancestors.contains(&program.linux_pid) && !program.path.contains("wine");
+            if Arc::ptr_eq(&process, &target) || (same_job && !keep) {
+                program.kill_requested = true;
+                if names.len() < 400 {
+                    let short = program.path.rsplit('/').next().unwrap_or("");
+                    let _ = core::fmt::Write::write_fmt(&mut names, format_args!(" #{} {short}", program.linux_pid));
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if chosen {
+            ended += 1;
+            for slot in slots {
+                if let Some(task) = sched::id_of_slot(slot) {
+                    sched::wake(task);
+                }
+            }
+        }
+    }
+    sched::wake_input();
+    kprintln!("  user        : ending job #{job} of {id}: {ended} process(es):{names}");
+    Ok(ended)
 }
 
 /// Снять остальные потоки процесса, чей главный поток в слоте `slot` только

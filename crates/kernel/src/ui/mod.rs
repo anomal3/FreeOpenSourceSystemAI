@@ -1492,6 +1492,44 @@ pub fn note_flush(ns: u64) {
     FLUSH_NS.fetch_add(ns, Ordering::Relaxed);
 }
 
+/// Перенос к хосту, наносекунды с загрузки (`perf-diag`).
+#[must_use]
+pub fn flush_ns() -> u64 {
+    FLUSH_NS.load(Ordering::Relaxed)
+}
+
+/// Мониторов, о которых ведётся счёт вывода порознь.
+pub const OUTPUT_STATS: usize = 4;
+/// Вывод полос на каждый монитор: наносекунды и точки (P1, 18.11.2026) —
+/// на ПК Романа два монитора 2560x1440, и общий `blit` не говорил, какой
+/// из них дорог (сканаут во VRAM через BAR1 против обычной памяти).
+static OUTPUT_BLIT_NS: [AtomicU64; OUTPUT_STATS] = [const { AtomicU64::new(0) }; OUTPUT_STATS];
+static OUTPUT_POINTS: [AtomicU64; OUTPUT_STATS] = [const { AtomicU64::new(0) }; OUTPUT_STATS];
+
+/// Записать вывод куска полосы на монитор `index`.
+pub fn note_output_blit(index: usize, ns: u64, points: u64) {
+    if let (Some(time), Some(count)) = (OUTPUT_BLIT_NS.get(index), OUTPUT_POINTS.get(index)) {
+        time.fetch_add(ns, Ordering::Relaxed);
+        count.fetch_add(points, Ordering::Relaxed);
+    }
+}
+
+/// Вывод на монитор `index`: наносекунды и точки с загрузки.
+#[must_use]
+pub fn output_blit(index: usize) -> (u64, u64) {
+    match (OUTPUT_BLIT_NS.get(index), OUTPUT_POINTS.get(index)) {
+        (Some(time), Some(count)) => (time.load(Ordering::Relaxed), count.load(Ordering::Relaxed)),
+        _ => (0, 0),
+    }
+}
+
+/// Худший кадр с прошлого вопроса — и забыть его (`perf-diag` спрашивает раз
+/// в полминуты и хочет худший именно за них).
+#[must_use]
+pub fn take_worst_frame_ns() -> u64 {
+    WORST_FRAME_NS.swap(0, Ordering::Relaxed)
+}
+
 /// Записать, во что обошлась одна полоса кадра. Зовётся из композитора.
 pub fn note_band(draw_ns: u64, blit_ns: u64, points: u64) {
     BANDS.fetch_add(1, Ordering::Relaxed);
@@ -1871,8 +1909,10 @@ pub fn tick() {
     // «Завершить программу» — вне замка стола: снятие задачи берёт свои.
     let task = HUNG_KILL.swap(0, Ordering::Relaxed);
     if task != 0 {
-        match crate::user::request_kill(crate::sched::TaskId::new(task)) {
-            Ok(()) => kprintln!("  desktop     : killed #{task}, it did not respond"),
+        // Вместе с группой (P4): у игры под Wine это ещё `wineserver` и
+        // служебные процессы префикса.
+        match crate::user::end_program_group(crate::sched::TaskId::new(task)) {
+            Ok(count) => kprintln!("  desktop     : killed #{task} ({count} process(es)), it did not respond"),
             Err(_) => kprintln!("  desktop     : #{task} could not be ended"),
         }
     }
@@ -3515,6 +3555,9 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
             }
         }
         *HUNG.lock() = None;
+        // Пока вопрос был открыт, сервер Wayland мог сказать о том же окне
+        // снова — ответ уже дан.
+        *UNANSWERED.lock() = None;
         return;
     }
     let choice = if app == App::OpenWith && answer == Answer::Open {
@@ -5227,6 +5270,19 @@ static HUNG: SpinLock<Option<App>> = SpinLock::new(None);
 /// Задача, которую велено снять, — снимает [`tick`] вне замка стола.
 static HUNG_KILL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Окно, о котором сервер Wayland сказал «не отвечает» (P4): задача, номер
+/// окна, сколько секунд. Просьбу закрыться он читает сразу и передаёт
+/// клиенту — непрочитанной в очереди окна она не лежит, и [`watch_hung`]
+/// по очереди её бы не увидел никогда.
+static UNANSWERED: SpinLock<Option<(u32, u32, u64)>> = SpinLock::new(None);
+
+/// Сервер Wayland: окно `slot` задачи `task` не закрылось на просьбу за
+/// `seconds` секунд или клиент не отвечает на `ping`. Стол спросит
+/// «Программа не отвечает — Завершить / Подождать».
+pub fn report_unresponsive(task: u32, slot: u32, seconds: u64) {
+    *UNANSWERED.lock() = Some((task, slot, seconds));
+}
+
 /// Найти окно, не прочитавшее просьбу закрыться за [`HUNG_AFTER_MS`], и
 /// спросить о нём (макет 18).
 fn watch_hung(desktop: &mut Compositor) {
@@ -5243,7 +5299,14 @@ fn watch_hung(desktop: &mut Compositor) {
     }
     let now = crate::time::uptime_ms();
     let mut found = None;
-    for app in desktop.program_apps() {
+    if let Some((task, slot, seconds)) = UNANSWERED.lock().take() {
+        let app = App::Program(task, slot);
+        if desktop.find(app).is_some() {
+            found = Some((app, seconds));
+        }
+    }
+    let apps = if found.is_none() { desktop.program_apps() } else { Vec::new() };
+    for app in apps {
         let Some(window) = desktop.find(app) else {
             continue;
         };

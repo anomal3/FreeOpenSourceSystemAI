@@ -1172,7 +1172,93 @@ pub fn wake_futex(key: usize, count: usize) -> usize {
             }
         }
     }
+    drop(sched);
+    // Пинок — только адресному пробуждению (futex программы: передача работы
+    // потоку). «Всех» (`count` 0) будит `io_events::notify` на каждое событие
+    // ввода-вывода — с пинком это было 10 тыс. IPI в секунду и вдвое больше
+    // переключений на запуске Wine (Блокнот 56 с вместо 36 с, 18.11).
+    if count != 0 {
+        kick_idle(woken);
+    }
     woken
+}
+
+/// Пинки включены (`schedkick on|off` — сравнить на железе с прежним
+/// поведением, P9).
+static KICKS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_kicks(on: bool) {
+    KICKS.store(on, Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn kicks() -> bool {
+    KICKS.load(Ordering::Relaxed)
+}
+
+/// Процессор уже пнут и ещё не заходил в планировщик — второй пинок ему не
+/// нужен.
+static KICKED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Пнуть до `count` простаивающих процессоров (P9, 18.11.2026).
+///
+/// Задача, ставшая готовой, раньше ждала, пока какой-нибудь процессор
+/// сам зайдёт в планировщик, — у простаивающего это ближайший тик таймера,
+/// до миллисекунды. На передачу работы между потоками (futex лавапайпа,
+/// ответ wineserver через сокет) это ложилось на каждый шаг. Пинок — один
+/// IPI на процессор, и только тем, кто стоит в `hlt`: занятый процессор
+/// заберёт задачу на своём переключении.
+fn kick_idle(count: usize) {
+    if count == 0 || !KICKS.load(Ordering::Relaxed) || !RUNNING.load(Ordering::Relaxed) || smp::online() <= 1 {
+        return;
+    }
+    let me = smp::cpu();
+    let mut left = count;
+    for cpu in 0..MAX_CPUS {
+        if left == 0 {
+            break;
+        }
+        if cpu == me || !smp::is_online(cpu) || !ON_IDLE[cpu].load(Ordering::Relaxed) {
+            continue;
+        }
+        if !KICKED[cpu].swap(true, Ordering::AcqRel) {
+            arch::smp::kick(cpu);
+            left -= 1;
+        }
+    }
+}
+
+/// Снимок очереди для `perf-diag` (P1): сколько задач готово и ждёт
+/// процессора и сколько исполняется прямо сейчас (холостые не в счёт).
+#[must_use]
+pub fn queue_facts() -> (usize, usize) {
+    let sched = SCHED.lock();
+    let (mut ready, mut running) = (0, 0);
+    for (slot, task) in sched.tasks.iter().enumerate() {
+        if is_idle_slot(slot) {
+            continue;
+        }
+        match task.as_ref().map(|task| task.state) {
+            Some(TaskState::Ready) => ready += 1,
+            Some(TaskState::Running) => running += 1,
+            _ => {}
+        }
+    }
+    (ready, running)
+}
+
+/// Тики простоя всех процессоров с запуска планировщика — для доли простоя
+/// в `perf-diag`.
+#[must_use]
+pub fn idle_ticks_total() -> u64 {
+    IDLE_TICKS.iter().map(|ticks| ticks.load(Ordering::Relaxed)).sum()
+}
+
+/// Отложенные пробуждения: сколько было и сколько не нашло ячейки (тогда
+/// будятся все спящие — см. [`defer_wake`]).
+#[must_use]
+pub fn deferred_wake_stats() -> (u64, u64) {
+    (DEFERRED_COUNT.load(Ordering::Relaxed), DEFERRED_OVERFLOWS.load(Ordering::Relaxed))
 }
 
 /// Заблокироваться сразу на нескольких ключах (`futex_waitv`, 12.11).
@@ -1276,10 +1362,16 @@ pub fn wake(id: TaskId) {
         .enumerate()
         .find(|(slot, entry)| !is_idle_slot(*slot) && entry.as_ref().is_some_and(|t| t.id == id))
         .and_then(|(_, entry)| entry.as_mut());
+    let mut woke = false;
     if let Some(task) = found {
         if matches!(task.state, TaskState::Blocked(_)) {
             task.state = TaskState::Ready;
+            woke = true;
         }
+    }
+    drop(sched);
+    if woke {
+        kick_idle(1);
     }
 }
 
@@ -1287,19 +1379,38 @@ pub fn wake(id: TaskId) {
 static DEFERRED_WAKES: [core::sync::atomic::AtomicU32; 64] = [const { core::sync::atomic::AtomicU32::new(0) }; 64];
 static DEFERRED_WAKES_ANY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Сколько пробуждений отложено и сколько из них не нашло ячейки.
+static DEFERRED_COUNT: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+/// Ячеек не хватило — ближайшее переключение будит всех спящих (P9).
+static DEFERRED_OVERFLOW: AtomicBool = AtomicBool::new(false);
+
 fn defer_wake(id: TaskId) {
     let raw = id.as_u32();
     if raw == 0 {
         return;
     }
+    DEFERRED_COUNT.fetch_add(1, Ordering::Relaxed);
+    let mut placed = false;
     for cell in &DEFERRED_WAKES {
         let current = cell.load(Ordering::Relaxed);
         if current == raw {
+            placed = true;
             break;
         }
         if current == 0 && cell.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            placed = true;
             break;
         }
+    }
+    if !placed {
+        // Все 64 ячейки заняты (P9, 18.11.2026): раньше пробуждение здесь
+        // молча терялось, и поток в ожидании без срока спал до чужого
+        // пробуждения. Кого именно будили, уже не записать — разбудить всех
+        // спящих: всякое ожидание здесь — цикл с перепроверкой условия, и
+        // лишнее пробуждение стоит одного витка.
+        DEFERRED_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        DEFERRED_OVERFLOW.store(true, Ordering::Release);
     }
     DEFERRED_WAKES_ANY.store(true, Ordering::Release);
     ask_reschedule();
@@ -1341,8 +1452,21 @@ fn schedule_with(cause: Cause) {
         // Номер процессора стабилен до конца блока: прерывания запрещены, и
         // перенести эту задачу на другой процессор нечем.
         let cpu = smp::cpu();
+        KICKED[cpu].store(false, Ordering::Release);
         // Пробуждения, отложенные `wake` при занятом замке (13.11).
         if DEFERRED_WAKES_ANY.swap(false, Ordering::AcqRel) {
+            if DEFERRED_OVERFLOW.swap(false, Ordering::AcqRel) {
+                for (slot, entry) in sched.tasks.iter_mut().enumerate() {
+                    if is_idle_slot(slot) {
+                        continue;
+                    }
+                    if let Some(task) = entry.as_mut() {
+                        if matches!(task.state, TaskState::Blocked(_)) {
+                            task.state = TaskState::Ready;
+                        }
+                    }
+                }
+            }
             for cell in &DEFERRED_WAKES {
                 let raw = cell.swap(0, Ordering::AcqRel);
                 if raw == 0 {
