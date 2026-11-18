@@ -187,6 +187,16 @@ impl Handle {
         }
     }
 
+    /// Объект слоя Linux за дескриптором (18.11.2026): dma-buf, пришедший
+    /// серверу Wayland через `SCM_RIGHTS` (`zwp_linux_dmabuf_v1`, NVK).
+    #[must_use]
+    pub fn object(&self) -> Option<&Arc<dyn Object>> {
+        match &self.0 {
+            Slot::Object(object, _) => Some(object),
+            _ => None,
+        }
+    }
+
     /// Дескриптор на узел, открытый ядром, — чтобы отдать его программе
     /// (`SCM_RIGHTS`; раскладка клавиатуры Wayland, фаза 71i).
     #[must_use]

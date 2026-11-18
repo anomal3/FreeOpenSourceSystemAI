@@ -59,6 +59,10 @@ use crate::sync::Mutex;
 use crate::user::files::Handle;
 use crate::user::shm::SharedMem;
 
+/// `zwp_linux_dmabuf_v1` (NVK, веха M7) — отдельным файлом.
+#[path = "wayland_dmabuf.rs"]
+mod dmabuf;
+
 /// Имя сокета: `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` у программ Linux
 /// (`XDG_RUNTIME_DIR=/run/user/0`, `WAYLAND_DISPLAY=wayland-0`).
 pub const SOCKET: &[u8] = b"/run/user/0/wayland-0";
@@ -258,7 +262,7 @@ impl Args<'_> {
 // ---- объекты --------------------------------------------------------------------
 
 /// Глобальные объекты: номер в реестре, интерфейс, версия.
-const GLOBALS: [(u32, &str, u32); 8] = [
+const GLOBALS: [(u32, &str, u32); 9] = [
     (1, "wl_compositor", 4),
     (2, "wl_subcompositor", 1),
     (3, "wl_shm", 1),
@@ -281,6 +285,9 @@ const GLOBALS: [(u32, &str, u32); 8] = [
     // to the … interface» в `libawt_wlawt.so`). Масштаба экрана у нас нет —
     // окно приходит в размер буфера, и `set_destination` его не меняет.
     (8, "wp_viewporter", 1),
+    // Буферы dma-buf (18.11.2026): аппаратный Vulkan (Mesa NVK) показывает
+    // кадры только так (`wayland_dmabuf.rs`).
+    (9, dmabuf::INTERFACE, dmabuf::VERSION),
 ];
 
 const SHM_ARGB8888: u32 = 0;
@@ -590,6 +597,8 @@ enum Obj {
     DataOffer,
     Viewporter,
     Viewport,
+    Dmabuf,
+    DmabufParams(dmabuf::Params),
 }
 
 impl Obj {
@@ -622,6 +631,8 @@ impl Obj {
             Self::DataOffer => "wl_data_offer",
             Self::Viewporter => "wp_viewporter",
             Self::Viewport => "wp_viewport",
+            Self::Dmabuf => "zwp_linux_dmabuf_v1",
+            Self::DmabufParams(_) => "zwp_linux_buffer_params_v1",
         }
     }
 }
@@ -1005,6 +1016,71 @@ impl Client {
                     _ => {}
                 }
             }
+            // `destroy`, `create_params(id)`.
+            Obj::Dmabuf => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let new = args.u32()?;
+                    self.objects.insert(new, Obj::DmabufParams(dmabuf::Params::default()));
+                }
+                _ => {}
+            },
+            // `destroy`, `add(fd, plane, offset, stride, mod_hi, mod_lo)`,
+            // `create(w, h, format, flags)`, `create_immed(id, w, h, format, flags)`.
+            Obj::DmabufParams(_) => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let Some(fd) = self.fds.pop_front() else {
+                        self.fail(id, dmabuf::ERR_INCOMPLETE, "add without a descriptor");
+                        return Ok(());
+                    };
+                    let (plane, offset, stride) = (args.u32()?, args.u32()?, args.u32()?);
+                    let modifier = (u64::from(args.u32()?) << 32) | u64::from(args.u32()?);
+                    let added = match self.objects.get_mut(&id) {
+                        Some(Obj::DmabufParams(params)) => params.add(&fd, plane, offset, stride, modifier),
+                        _ => Ok(()),
+                    };
+                    if let Err(dmabuf::Fail(code, text)) = added {
+                        self.fail(id, code, text);
+                    }
+                }
+                2 | 3 => {
+                    let new = if opcode == 3 { Some(args.u32()?) } else { None };
+                    let (width, height, format, flags) = (args.i32()?, args.i32()?, args.u32()?, args.u32()?);
+                    let made = match self.objects.get_mut(&id) {
+                        Some(Obj::DmabufParams(params)) => params.create(width, height, format, flags),
+                        _ => return Ok(()),
+                    };
+                    if let Ok(buffer) = &made {
+                        kprintln!(
+                            "  wayland     : client #{} dmabuf buffer {}x{} stride {} format {:#x}",
+                            self.pid,
+                            buffer.width,
+                            buffer.height,
+                            buffer.stride,
+                            format
+                        );
+                    }
+                    match (made, new) {
+                        (Ok(buffer), Some(new)) => {
+                            self.objects.insert(new, Obj::Buffer(buffer));
+                        }
+                        // `create`: буфер с номером сервера и событие `created`.
+                        (Ok(buffer), None) => {
+                            let server = self.next_server_id;
+                            self.next_server_id = self.next_server_id.wrapping_add(1).max(0xff00_0000);
+                            self.objects.insert(server, Obj::Buffer(buffer));
+                            self.send(Msg::new(id, 0).u32(server));
+                        }
+                        (Err(dmabuf::Fail(code, text)), None) if dmabuf::soft_failure(code) => {
+                            kprintln!("  wayland     : client #{} dmabuf import failed: {text}", self.pid);
+                            self.send(Msg::new(id, 1));
+                        }
+                        (Err(dmabuf::Fail(code, text)), _) => self.fail(id, code, text),
+                    }
+                }
+                _ => {}
+            },
             Obj::Shm => {
                 if opcode == 0 {
                     let new = args.u32()?;
@@ -1200,6 +1276,7 @@ impl Client {
             5 => Obj::Seat,
             7 => Obj::DataDeviceManager,
             8 => Obj::Viewporter,
+            9 => Obj::Dmabuf,
             _ => Obj::Output,
         };
         self.objects.insert(new, object);
@@ -1210,6 +1287,17 @@ impl Client {
             3 => {
                 self.send(Msg::new(new, 0).u32(SHM_ARGB8888));
                 self.send(Msg::new(new, 0).u32(SHM_XRGB8888));
+            }
+            // Версия 3: `format` (устаревшее, но его ждут старые клиенты) и
+            // `modifier` — только LINEAR.
+            9 => {
+                for (format, _) in dmabuf::FORMATS {
+                    self.send(Msg::new(new, 0).u32(format));
+                    if version >= 3 {
+                        let linear = dmabuf::MOD_LINEAR;
+                        self.send(Msg::new(new, 1).u32(format).u32((linear >> 32) as u32).u32(linear as u32));
+                    }
+                }
             }
             5 => {
                 self.seat_version = version;

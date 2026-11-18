@@ -13971,14 +13971,30 @@ SoftGpu), M5 — с настоящим бэкендом WP-A на RTX 3060.
   nvkprobe и nvkprobe-fixed, «0 failed»), `nvk-soft-vk` (установленная
   с Proton: vkprobe на NVK поверх SoftGpu).
 
-Ждёт: `nvk soft on` и узел (WP-C) + SoftGpu (WP-B) — до них сценарии
-красные по построению; пересборка пакета Proton
-(`FOSSAI_WITH_PROTON=1 cargo xtask thirdparty --only proton`); M7 —
-`zwp_linux_dmabuf_v1` в `linux/wayland.rs` (после коммита правок кадров
-в нём).
-Риск: на ПК Романа, пока NVK не доведён до M5, узел renderD128 (если ядро
-его покажет при работающем GSP) заставит DXVK выбрать NVK вместо lavapipe —
-тогда `FOSSAI_VULKAN=lvp` или не показывать узел без явного включения.
+18.11, вечер: `nvk-soft` зелёный (drmprobe, nvkprobe, nvkprobe-fixed —
+0 failed; PRIME отдаёт только BO без NO_SHARE, NO_SHARE → EPERM как в Linux).
+Пакет Proton пересобран с NVK и vkprobe.
+
+**M7 — написано, собирается, в QEMU ещё не запускалось:**
+`linux/wayland_dmabuf.rs` (подмодуль `wayland.rs`) — `zwp_linux_dmabuf_v1`
+версии 3: глобал 9, события `format`/`modifier` (AR24, XR24; только LINEAR),
+`zwp_linux_buffer_params_v1` (`add` одной плоскости, `create` → буфер с
+номером сервера и `created` либо `failed`, `create_immed`), ошибки протокола
+по спецификации. Буфер — тот же `Buffer`, что у `wl_shm` (память из
+`drm::dmabuf_memory`, WP-C), дальше общий путь стола. `Handle::object()` в
+`user/files.rs` — объект за пришедшим дескриптором. В журнал:
+`wayland : client #N dmabuf buffer WxH stride S format F`.
+Не сделано: ожидание заборов dma-buf перед чтением (на SoftGpu не нужно,
+на карте — нужно), обратная связь версии 4.
+
+`nvk-soft-vk` (vkprobe + vkcube на NVK поверх SoftGpu) пока не прошёл: на
+установленном диске Proton без NVK (pkg ставит копию, положенную при
+`install`), а `install` сейчас падает не у нас — имя пакета
+`gridcraft-0.19.1.fpk` не влезает в 8.3 носителя FAT (`FOSSAI_LIVE_APPS=0`
+этот путь не трогает), плюс rust-std на ПК не скачивается (отзыв
+сертификата недоступен). Сценарий сам переставляет Proton
+(`pkg remove/install`) и проверяет `nouveau_icd.x86_64.json`.
+Риск DXVK на настоящей карте снят WP-C: узел скрыт до `nvk hw on`.
 
 ### WP-A: RM и железо (M1 + M2 в коде, ждут проверки на RTX 3060) — 18.11
 

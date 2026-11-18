@@ -6541,6 +6541,16 @@ pub const ALL: &[Scenario] = &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // На диске может стоять Proton без NVK (до 18.11): поставить заново
+            // из пакета образа и убедиться, что описатель NVK на месте.
+            Step::Line("pkg remove proton"),
+            Step::Await("pkg: removed proton", 900_000),
+            Step::Wait(5_000),
+            Step::Line("pkg install proton"),
+            Step::Await("pkg: installed proton 11, ", 2_400_000),
+            Step::Wait(10_000),
+            Step::Line("run /opt/debian/bin/ls /opt/proton/share/vulkan/icd.d"),
+            Step::Await("nouveau_icd.x86_64.json", 30_000),
             Step::Line("nvk soft on"),
             Step::Wait(1_000),
             Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --run=vkprobe NVK"),
@@ -6550,7 +6560,14 @@ pub const ALL: &[Scenario] = &[
             Step::Await("vkprobe: ok vkCreateDevice", 300_000),
             Step::Await("vkprobe: ok vkWaitForFences (5 s)", 60_000),
             Step::Await("vkprobe: 0 failed", 120_000),
+            // Показ кадров NVK (M7): vkcube только на NVK, кадры - буферами
+            // zwp_linux_dmabuf_v1. SoftGpu шейдеры не выполняет - картинка
+            // не проверяется, только путь буферов.
+            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=VK_DRIVER_FILES=/opt/proton/share/vulkan/icd.d/nouveau_icd.x86_64.json --run=vkcube --wsi wayland"),
+            Step::Await("dmabuf buffer", 300_000),
+            Step::Wait(20_000),
             Step::Absent("vkprobe: FAILED"),
+            Step::Absent("protocol error"),
             Step::Absent("KERNEL PANIC"),
         ],
     },
