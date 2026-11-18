@@ -12040,6 +12040,71 @@ eventfd, epoll, timerfd, memfd, ppoll, tgkill, sigaltstack, clone3. Чего н�
   Дальше: шаблон занимает память дважды (пакет + префикс) — ссылки или
   сжатие, когда в корне появится распаковщик.
 
+- **18.11: замеры, кеши, «Пуск» для программ Windows (план закрытия P1–P3,
+  P12; e8679c7, 6149b93 и следующий).**
+  - **P3, кеши шейдеров:** `fossai-proton` кладёт кеши в
+    `~/.cache/fossai-proton`: `MESA_SHADER_CACHE_DIR` (Mesa 25.0.7 кеширует
+    машинный код и llvmpipe, и lavapipe — `get_disk_shader_cache`, база
+    `mesa_shader_cache_db`; после первого d3dprobe в QEMU — 1559 КиБ),
+    `DXVK_SHADER_CACHE_PATH` (у DXVK GE-Proton11 кеша состояний
+    `DXVK_STATE_CACHE_PATH` больше нет; свой кеш DXVK на lavapipe остался
+    пустым), `DXVK_LOG_PATH` (журнал не в каталог игры). На живой флешке дом в
+    памяти — кеш до перезагрузки. `LP_NUM_THREADS` по умолчанию — физические
+    ядра: `cpu cores`, если `siblings` больше; наше `/proc/cpuinfo` пишет
+    `cpu cores` = все ЦП и без `siblings` — тогда половина при 8+ ЦП (на ПК
+    Романа 8 из 16), `--env=LP_NUM_THREADS=N` — своё. Ядру (не сделано):
+    `siblings`/`core id` в cpuinfo по CPUID.
+  - **P1, замер:** `fossai-proton --bench=СЕК[,ПОДПИСЬ]` — вывод Wine через
+    сборщик: строки `+fps` (Wine 11 печатает их и для Vulkan/DXVK — канал
+    `fps` в `win32u.so`, и для wined3d) или d3dprobe; окно замера — от первых
+    кадров, первое значение (прогрев) в среднее не идёт; итог в журнал:
+    `bench: ПОДПИСЬ avg N fps (min, max, K samples from …), first frames
+    after X s`. Программа, которая выходит сама, не снимается (после
+    `wineserver -k` следующий запуск в префиксе ловил «Invalid window
+    handle»); игра — через 60 с. `tmnf --bench[=N]`. `bin/proton-bench
+    [СЕК] [all|cache|size|threads]` — матрица одной строкой (`run -b
+    /opt/debian/bin/bash /opt/proton/bin/proton-bench`): кеш холодный/тёплый,
+    D3D9 DXVK и wined3d 640x480…2560x1440, `--desktop`, `LP_NUM_THREADS`
+    2…16; один `d3dprobe hold` (скрытое окно) держит `explorer` на все
+    замеры. d3dprobe: размер `ШxВ` третьим аргументом, `hold`, перезапуск
+    себя, если `explorer` не поднялся.
+  - **Цифры (QEMU, TCG, без ускорения):** живая флешка 0.8.961, 8 ЦП, D3D9
+    DXVK 640x480 холодный кеш — **9,8 к/с** (9,4–10,0), первые кадры через
+    86,6 с после запуска Wine; диск стенда (ядро 17.11), 4 ЦП — ~6,2 к/с.
+    Остальная матрица не снята: см. «Открыто».
+  - **P2, виртуальный стол:** `fossai-proton --desktop=ШxВ` (`explorer
+    /desktop=FossAi,ШxВ`), `tmnf --720p/--1080p/--desktop=`. **Не работает
+    пока:** в QEMU winewayland показал «стол» отдельным окном 665x434, окно
+    d3dprobe — своим, кадров DXVK не было, и Wine просит
+    `zwp_pointer_constraints_v1` (ClipCursor стола, P10). Поэтому у `tmnf`
+    по умолчанию — родной размер, `--720p` — опыт. Дальше: P2.2
+    (`wp_viewport` + режимы `wl_output`) или размер в настройках самой игры.
+  - **P12, программы Windows со стола:** «Файлы» — `.exe` без заголовка CLI,
+    `.msi`, `.lnk`, `.bat`, `.cmd` → `fossai-proton --open=ПУТЬ` (пробел —
+    `%20`: ядро делит строку по пробелам), без пакета `proton` — пакет `wine`,
+    сборка .NET Framework — `/bin/mono`. «Пуск»: ярлыки, которые
+    `winemenubuilder` установщика пишет в `ПРЕФИКС/drive_c/proton_shortcuts/`
+    (у Proton — туда, не в `~/.local/share/applications/wine`; префиксы —
+    каталоги с точкой в доме и в `/root`), запуск `fossai-proton
+    --shortcut=ФАЙЛ.desktop` (`Exec=… start.exe /Unix ЯРЛЫК.lnk`, экранирование
+    winemenubuilder `\\ ` и `\\\\` разбирается), права пакета `proton`;
+    значок — PNG ярлыка, один раз переведённый новой `/bin/png2fimg`
+    (miniz_oxide) в FIMG рядом, до того — значок «windows-apps».
+    «Параметры → Пакеты → Программы Windows»: ярлыки «Uninstall …» с кнопкой
+    «Удалить» и для каждого префикса «Установка и удаление программ»
+    (`uninstaller` Wine, MSI тоже). В QEMU не проверено (см. «Открыто»).
+  - **Открыто:** (1) на живых образах 0.8.962–0.8.964 (ядро с
+    незакоммиченными правками соседней работы: `linux/wayland.rs` — темп
+    ответов на `frame`, `sched`, `smp`, `user/mod.rs`) `explorer` Wine
+    подключается к Wayland и не доходит до окна стола минутами (поток держит
+    `loader_section` > 60 с), все d3dprobe — «The explorer process failed to
+    start»; на диске стенда (ядро 17.11) и на 0.8.961 окна есть. Проверить,
+    что `wl_display.sync`/`wl_callback` не попадают под отложенные ответы
+    `frame`. (2) Матрица `proton-bench` и TMNF `--bench` — снять после (1);
+    сценарий: `build/pfx-test/live-bench.ps1`. (3) P12 в QEMU: двойной щелчок
+    по d3dprobe.exe в «Файлах», установщик → пункт в «Пуске» → «Удалить».
+    (4) `winemenubuilder -a` на каждом входе — не выключен.
+
 ### Проверить на ПК Романа при следующей прошивке (Proton + игра + OBSOS на флешке)
 
 Роман 16.11: «не критично, на основную работу не влияет — напомни, когда
