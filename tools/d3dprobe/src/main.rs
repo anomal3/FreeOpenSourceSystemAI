@@ -1,6 +1,10 @@
 //! Проба DirectX для Proton в FossAi (12.11.2026, шаг 6 плана Proton).
 //!
-//! `d3dprobe.exe [11|9] [секунды]` открывает окно 640x480, каждый кадр заливает его
+//! `d3dprobe.exe hold [секунды]` (18.11) - скрытое окно держит `explorer` Wine живым
+//! между замерами `proton-bench`.
+//!
+//! `d3dprobe.exe [11|9] [секунды] [ШxВ]` открывает окно (640x480 или ШxВ, 18.11 - замеры
+//! размера кадра, P2), каждый кадр заливает его
 //! меняющимся цветом через Direct3D 11 (по умолчанию) или Direct3D 9 и показывает.
 //! В stderr: имя адаптера, затем раз в 2 с строка `d3dprobe: N frames ... FPS` -
 //! сценарий ждёт её. Через заданное время (по умолчанию 0 = бесконечно) выходит сам.
@@ -27,12 +31,12 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DispatchMessageW, PeekMessageW, PostQuitMessage,
-    RegisterClassW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, MSG, PM_REMOVE, SW_SHOW,
+    RegisterClassW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, MSG, PM_REMOVE, SW_HIDE, SW_SHOW,
     WINDOW_EX_STYLE, WM_DESTROY, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
-const WIDTH: u32 = 640;
-const HEIGHT: u32 = 480;
+/// Размер окна и кадра по умолчанию.
+const SIZE: (u32, u32) = (640, 480);
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_DESTROY {
@@ -42,7 +46,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-fn window(title: windows::core::PCWSTR) -> Result<HWND> {
+fn window(title: windows::core::PCWSTR, (width, height): (u32, u32)) -> Result<HWND> {
     unsafe {
         let instance: HMODULE = GetModuleHandleW(None)?;
         let class = WNDCLASSW {
@@ -53,9 +57,9 @@ fn window(title: windows::core::PCWSTR) -> Result<HWND> {
             ..Default::default()
         };
         RegisterClassW(&class);
-        let mut rect = RECT { left: 0, top: 0, right: WIDTH as i32, bottom: HEIGHT as i32 };
+        let mut rect = RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        let hwnd = CreateWindowExW(
+        let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("d3dprobe"),
             title,
@@ -68,10 +72,62 @@ fn window(title: windows::core::PCWSTR) -> Result<HWND> {
             None,
             Some(instance.into()),
             None,
-        )?;
+        ) {
+            Ok(hwnd) => hwnd,
+            Err(err) => relaunch(err),
+        };
         let _ = ShowWindow(hwnd, SW_SHOW);
         Ok(hwnd)
     }
+}
+
+/// Окна нет (18.11): окно стола Wine поднимает `explorer`, и Wine ждёт его
+/// ограниченное время (10 с). В QEMU без ускорения он не успевает - «The
+/// explorer process failed to start», `CreateWindowEx` даёт ошибку 1400, и
+/// процесс до конца остаётся без драйвера окон (повтор в нём не помогает).
+/// Сам `explorer` при этом поднимается дальше (в QEMU - больше минуты, держа
+/// замок загрузчика): проба через 20 с запускает себя заново (до 8 раз,
+/// `D3DPROBE_RELAUNCH`) - потомок наследует stderr, и замер
+/// `fossai-proton --bench` читает его строки как свои. Родитель ждёт ещё 5 с,
+/// чтобы Wine не погасил `explorer` между ними (он живёт, пока есть программы).
+/// Надёжнее - `d3dprobe hold`, см. [`hold`].
+fn relaunch(err: windows::core::Error) -> ! {
+    let done: u32 = std::env::var("D3DPROBE_RELAUNCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    if done >= 8 {
+        eprintln!("d3dprobe: error {err}");
+        std::process::exit(1);
+    }
+    eprintln!("d3dprobe: no window ({err}), starting again in 20 s ({})", done + 1);
+    std::thread::sleep(Duration::from_secs(20));
+    let exe = std::env::current_exe().unwrap_or_else(|_| "d3dprobe.exe".into());
+    let spawned = std::process::Command::new(exe)
+        .args(std::env::args().skip(1))
+        .env("D3DPROBE_RELAUNCH", (done + 1).to_string())
+        .spawn();
+    if let Err(spawn) = spawned {
+        eprintln!("d3dprobe: error {err}, relaunch failed: {spawn}");
+        std::process::exit(1);
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    std::process::exit(0);
+}
+
+/// `d3dprobe hold [секунды]` (18.11): скрытое окно, которое держит `explorer`
+/// (окно стола Wine) живым, пока идут замеры `proton-bench`: каждый запуск
+/// пробы иначе поднимал бы `explorer` заново и в QEMU не дожидался его. Когда
+/// окно есть - строка `d3dprobe: holding the desktop`, её ждёт `proton-bench`.
+fn hold(seconds: u64) -> Result<()> {
+    let hwnd = window(w!("d3dprobe hold"), (64, 64))?;
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    eprintln!("d3dprobe: holding the desktop for {seconds} s");
+    let start = Instant::now();
+    while pump() && start.elapsed() < Duration::from_secs(seconds) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!("d3dprobe: hold done");
+    Ok(())
 }
 
 /// Разбирает очередь сообщений; `false` - окно закрыто.
@@ -118,10 +174,10 @@ fn run(seconds: u64, mut draw: impl FnMut(u64) -> Result<()>) -> Result<()> {
     Ok(())
 }
 
-fn d3d11(seconds: u64) -> Result<()> {
-    let hwnd = window(w!("d3dprobe D3D11"))?;
+fn d3d11(seconds: u64, size: (u32, u32)) -> Result<()> {
+    let hwnd = window(w!("d3dprobe D3D11"), size)?;
     let desc = DXGI_SWAP_CHAIN_DESC {
-        BufferDesc: DXGI_MODE_DESC { Width: WIDTH, Height: HEIGHT, Format: DXGI_FORMAT_R8G8B8A8_UNORM, ..Default::default() },
+        BufferDesc: DXGI_MODE_DESC { Width: size.0, Height: size.1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, ..Default::default() },
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: 1,
@@ -169,8 +225,8 @@ fn d3d11(seconds: u64) -> Result<()> {
     })
 }
 
-fn d3d9(seconds: u64) -> Result<()> {
-    let hwnd = window(w!("d3dprobe D3D9"))?;
+fn d3d9(seconds: u64, size: (u32, u32)) -> Result<()> {
+    let hwnd = window(w!("d3dprobe D3D9"), size)?;
     let d3d = unsafe { Direct3DCreate9(D3D_SDK_VERSION) }.ok_or_else(windows::core::Error::empty)?;
     unsafe {
         let mut id = D3DADAPTER_IDENTIFIER9::default();
@@ -179,8 +235,8 @@ fn d3d9(seconds: u64) -> Result<()> {
         eprintln!("d3dprobe: D3D9 adapter '{}'", String::from_utf8_lossy(&name));
     }
     let mut params = D3DPRESENT_PARAMETERS {
-        BackBufferWidth: WIDTH,
-        BackBufferHeight: HEIGHT,
+        BackBufferWidth: size.0,
+        BackBufferHeight: size.1,
         BackBufferFormat: D3DFMT_UNKNOWN,
         BackBufferCount: 1,
         SwapEffect: D3DSWAPEFFECT_DISCARD,
@@ -272,6 +328,14 @@ fn tone(hz: u32, seconds: u32) -> std::result::Result<(), String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("hold") {
+        let seconds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3600);
+        if let Err(err) = hold(seconds) {
+            eprintln!("d3dprobe: error {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("tone") {
         let hz = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(440);
         let seconds = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
@@ -285,8 +349,14 @@ fn main() {
     }
     let api = args.get(1).map(String::as_str).unwrap_or("11");
     let seconds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    eprintln!("d3dprobe: start, Direct3D {api}");
-    let result = if api == "9" { d3d9(seconds) } else { d3d11(seconds) };
+    let size = args
+        .get(3)
+        .and_then(|s| s.split_once('x'))
+        .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+        .filter(|&(w, h): &(u32, u32)| w > 0 && h > 0)
+        .unwrap_or(SIZE);
+    eprintln!("d3dprobe: start, Direct3D {api}, {}x{}", size.0, size.1);
+    let result = if api == "9" { d3d9(seconds, size) } else { d3d11(seconds, size) };
     if let Err(err) = result {
         eprintln!("d3dprobe: error {err}");
         std::process::exit(1);

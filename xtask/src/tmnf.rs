@@ -58,10 +58,34 @@ cd \"$G\"\n\
 # на экране; `--wined3d` - Direct3D 9 -> OpenGL (llvmpipe), счётчик кадров -\n\
 # в журнал (`trace:fps`). Какой быстрее на машине - видно по цифрам.\n\
 MODE=--dxvk\n\
-case \"$1\" in --wined3d) MODE=; shift ;; --dxvk) shift ;; esac\n\
+# Размер (P2, 18.11): игра сама берёт размер монитора (2560x1440 на ПК\n\
+# Романа - вчетверо больше точек, чем 720p, и всё на процессоре). По\n\
+# умолчанию - виртуальный рабочий стол Wine 1280x720 (`--720p`), `--1080p` -\n\
+# 1920x1080, `--desktop=ШxВ` - свой, `--native` - без стола, как раньше.\n\
+# `--bench[=СЕКУНДЫ]` - замер: через СЕКУНДЫ (60) в журнал строка\n\
+# `bench: tmnf dxvk 1280x720 avg N fps`, игра снимается.\n\
+SIZE=1280x720\n\
+BENCH=\n\
+while :; do\n\
+    case \"$1\" in\n\
+        --wined3d) MODE=; shift ;;\n\
+        --dxvk) shift ;;\n\
+        --720p) SIZE=1280x720; shift ;;\n\
+        --1080p) SIZE=1920x1080; shift ;;\n\
+        --desktop=*) SIZE=${1#--desktop=}; shift ;;\n\
+        --native) SIZE=; shift ;;\n\
+        --bench) BENCH=60; shift ;;\n\
+        --bench=*) BENCH=${1#--bench=}; shift ;;\n\
+        *) break ;;\n\
+    esac\n\
+done\n\
 if [ -n \"$MODE\" ]; then export DXVK_HUD=${DXVK_HUD:-fps,frametimes}; else export WINEDEBUG=${WINEDEBUG:-fixme-all,+fps}; fi\n\
-echo \"tmnf: starting TmForever.exe (${MODE:-wined3d})\"\n\
-exec /opt/debian/bin/bash $P \"$@\" $MODE \"$G/TmForever.exe\"\n";
+A=()\n\
+[ -n \"$SIZE\" ] && A+=(\"--desktop=$SIZE\")\n\
+R=dxvk; [ -z \"$MODE\" ] && R=wined3d\n\
+[ -n \"$BENCH\" ] && A+=(\"--bench=$BENCH,tmnf $R ${SIZE:-native}\")\n\
+echo \"tmnf: starting TmForever.exe (${MODE:-wined3d}, ${SIZE:-native size})\"\n\
+exec /opt/debian/bin/bash $P \"${A[@]}\" \"$@\" $MODE \"$G/TmForever.exe\"\n";
 
 /// Собрать пакет.
 pub fn build() -> Result<()> {

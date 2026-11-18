@@ -477,7 +477,7 @@ pub fn build(arch: Arch) -> Result<()> {
     // OpenGL и Vulkan на процессоре (шаги 5-6, 12.11).
     crate::mesa::add(&cache, &mut files, patch_interp)?;
 
-    let script = "#!/bin/bash\n\
+    let script = concat!("#!/bin/bash\n\
         # GE-Proton (12.11.2026): программы и игры Windows без Steam, окна —\n\
         # через сервер Wayland ядра, синхронизация — fsync (futex_waitv).\n\
         P=/opt/proton\n\
@@ -527,7 +527,93 @@ pub fn build(arch: Arch) -> Result<()> {
         # `--env=ИМЯ=ЗНАЧЕНИЕ` (сколько угодно, первыми) — своя переменная: у\n\
         # `run` оболочки окружения нет (WAYLAND_DEBUG=client и подобные).\n\
         while case \"$1\" in --env=*) true ;; *) false ;; esac; do export \"${1#--env=}\"; shift; done\n\
-        case \"$1\" in --debug=*) export WINEDEBUG=\"${1#--debug=}\"; shift ;; esac\n\
+        case \"$1\" in --debug=*) export WINEDEBUG=\"${1#--debug=}\"; shift ;; esac\n", r#"
+# Кеши шейдеров (P3, 18.11): первый запуск игры - чёрное окно, пока LLVM
+# лавапайпа/llvmpipe компилирует шейдеры. Mesa 25.0.7 кладёт готовый машинный
+# код llvmpipe и lavapipe в дисковый кеш (`get_disk_shader_cache`, база
+# `mesa_shader_cache_db`), DXVK GE-Proton11 - свой кеш шейдеров
+# (`DXVK_SHADER_CACHE_PATH`; кеша состояний `DXVK_STATE_CACHE_PATH` в нём
+# уже нет). Всё - в домашнем каталоге, один на все префиксы: на установленной
+# системе второй запуск берёт готовое; на живой флешке дом в памяти, и кеш
+# живёт до перезагрузки. Журнал DXVK - туда же, а не `ИГРА_d3d9.log` в
+# каталог игры (строки журнала по-прежнему идут и в stderr).
+C=$HOME/.cache/fossai-proton
+export MESA_SHADER_CACHE_DIR=${MESA_SHADER_CACHE_DIR:-$C/mesa}
+export MESA_SHADER_CACHE_MAX_SIZE=${MESA_SHADER_CACHE_MAX_SIZE:-1G}
+export DXVK_SHADER_CACHE_PATH=${DXVK_SHADER_CACHE_PATH:-$C/dxvk}
+export DXVK_STATE_CACHE_PATH=${DXVK_STATE_CACHE_PATH:-$C/dxvk}
+export DXVK_LOG_PATH=${DXVK_LOG_PATH:-$C/log}
+LD_LIBRARY_PATH= mkdir -p "$MESA_SHADER_CACHE_DIR" "$DXVK_SHADER_CACHE_PATH" "$DXVK_LOG_PATH"
+# Потоки рисования llvmpipe/lavapipe (P3/P9): без переменной Mesa берёт все
+# ЦП (16 на Ryzen 8 ядер/16 потоков), и каждый кадр будит 16 потоков через
+# futex. По умолчанию - физические ядра: `cpu cores` из /proc/cpuinfo, если
+# `siblings` больше (SMT, как у Linux); ядро FossAi пишет `cpu cores` = все
+# ЦП и без `siblings` - тогда половина при 8 ЦП и больше, иначе все.
+# Своё значение - `--env=LP_NUM_THREADS=N`.
+if [ -z "$LP_NUM_THREADS" ]; then
+    n=0; c=0; s=0
+    while IFS=: read -r k v; do
+        v=${v//[[:space:]]/}
+        case $k in processor*) n=$((n + 1)) ;; 'cpu cores'*) c=${v:-0} ;; siblings*) s=${v:-0} ;; esac
+    done < /proc/cpuinfo
+    if [ "$s" -gt "$c" ] && [ "$c" -gt 0 ]; then t=$c; elif [ $n -ge 8 ]; then t=$((n / 2)); else t=$n; fi
+    [ "$t" -gt 0 ] && export LP_NUM_THREADS=$t
+fi
+# `--desktop=ШxВ` (P2, 18.11) - программа в виртуальном рабочем столе Wine
+# этого размера (`explorer /desktop=`): игра видит монитор ШxВ и рисует
+# меньше точек (720p - вчетверо меньше 1440p), окно стола - одно.
+# `--bench=СЕКУНДЫ[,ПОДПИСЬ]` (P1) - замер: строки кадров Wine (`+fps`:
+# wined3d и Vulkan/DXVK через win32u) или d3dprobe собираются, и через
+# СЕКУНДЫ в журнал уходит `bench: ПОДПИСЬ avg N fps ...`, программа снимается.
+D=; B=; R=wined3d
+while :; do
+    case "$1" in
+        --desktop=*) D=${1#--desktop=}; shift ;;
+        --bench=*) B=${1#--bench=}; shift ;;
+        *) break ;;
+    esac
+done
+# Путь от стола (P12): ядро делит строку запуска по пробелам и кавычек не
+# знает, поэтому путь приходит с `%20` (и `%25` вместо `%`).
+unpct() { local e=${1//\%/\\x}; printf -v U '%b' "$e"; }
+# `--open=ФАЙЛ` - двойной щелчок по .exe/.msi/.lnk/.bat в «Файлах»: в общем
+# префиксе (`$WINEPREFIX`, по умолчанию ~/.proton), из каталога файла.
+# `--shortcut=ФАЙЛ.desktop` - пункт «Пуска» из ярлыка, который
+# winemenubuilder установщика записал в `ПРЕФИКС/drive_c/proton_shortcuts/`:
+# префикс - по пути ярлыка, команда - `start /unix ЯРЛЫК.lnk` из `Exec=`.
+case "$1" in
+    --open=*)
+        unpct "${1#--open=}"; f=$U; shift
+        cd "${f%/*}" 2>/dev/null
+        case "${f,,}" in
+            *.msi) set -- msiexec /i "$f" "$@" ;;
+            *.lnk|*.bat|*.cmd) set -- start /wait /unix "$f" "$@" ;;
+            *) set -- "$f" "$@" ;;
+        esac
+        echo "fossai-proton: open $f" ;;
+    --shortcut=*)
+        unpct "${1#--shortcut=}"; f=$U; shift
+        export WINEPREFIX=${f%/drive_c/proton_shortcuts/*}
+        x=; w=
+        while IFS= read -r l; do
+            case $l in Exec=*) x=${l#Exec=} ;; Path=*) w=${l#Path=} ;; esac
+        done < "$f"
+        # `Exec=env WINEPREFIX="…" wine …start.exe /Unix ПУТЬ`: winemenubuilder
+        # экранирует пробел и прочее как `\\ `, обратную косую - как `\\\\`.
+        case $x in *' /Unix '*|*' /unix '*) ;; *) echo "fossai-proton: no /Unix in $f: $x"; exit 1 ;; esac
+        x=${x#* /[Uu]nix }; u=; i=0
+        while [ $i -lt ${#x} ]; do
+            if [ "${x:i:4}" = '\\\\' ]; then u+='\'; i=$((i + 4))
+            elif [ "${x:i:2}" = '\\' ]; then u+=${x:i+2:1}; i=$((i + 3))
+            elif [ "${x:i:1}" = '\' ]; then u+=${x:i+1:1}; i=$((i + 2))
+            elif [ "${x:i:1}" = ' ' ]; then break
+            else u+=${x:i:1}; i=$((i + 1)); fi
+        done
+        [ -n "$w" ] && cd "$w" 2>/dev/null
+        echo "fossai-proton: shortcut $f -> $u (prefix $WINEPREFIX)"
+        set -- start /wait /unix "$u" "$@" ;;
+esac
+"#, "\
         # `--run=ПРОГРАММА` - проба из bin/ пакета (es2gears_wayland, vkcube) с\n\
         # тем же окружением.\n\
         case \"$1\" in --run=*) n=\"${1#--run=}\"; shift; exec \"$P/bin/$n\" \"$@\" ;; esac\n\
@@ -568,7 +654,7 @@ pub fn build(arch: Arch) -> Result<()> {
             fi ;; esac\n\
         # `--prefix` - только приготовить префикс (`bin/tmnf`).\n\
         case \"$1\" in --prefix) exit 0 ;; esac\n\
-        case \"$1\" in --dxvk) shift\n\
+        case \"$1\" in --dxvk) shift; R=dxvk\n\
             s=\"$WINEPREFIX/drive_c/windows\"\n\
             # `cp` Debian - со своей glibc, без нашего LD_LIBRARY_PATH (2.41).\n\
             LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/x86_64-windows/*.dll \"$s/system32/\"\n\
@@ -577,8 +663,83 @@ pub fn build(arch: Arch) -> Result<()> {
         [ $# -eq 0 ] && set -- notepad\n\
         # Загрузчик архитектуры напрямую: `bin/wine` GE ищет `ntdll.so` в\n\
         # `lib/wine/`, а не в `lib/wine/x86_64-unix/` (12.11).\n\
-        exec $P/lib/wine/x86_64-unix/wine \"$@\"\n";
+        W=$P/lib/wine/x86_64-unix/wine\n", r#"
+if [ -n "$D" ]; then
+    echo "fossai-proton: virtual desktop $D"
+    set -- explorer "/desktop=FossAi,$D" "$@"
+fi
+[ -z "$B" ] && exec $W "$@"
+# Замер (`--bench`): вывод Wine идёт через этот цикл и дальше в stderr как
+# был; значения кадров - сотыми, арифметика bash целая. Источник один:
+# первый встреченный (`trace:fps:ФУНКЦИЯ`), но d3dprobe важнее строк Wine.
+secs=${B%%,*}; label=${B#*,}
+[ "$label" = "$B" ] && { p=${1##*/}; [ "$p" = explorer ] && p=${3##*/}; label="${p##*\\} $R ${D:-window}"; }
+case ,$WINEDEBUG, in *,+fps,*) ;; *) export WINEDEBUG="${WINEDEBUG:+$WINEDEBUG,}+fps" ;; esac
+echo "bench: $label for $secs s, LP_NUM_THREADS=$LP_NUM_THREADS"
+t0=${EPOCHREALTIME/[.,]/}
+$W "$@" 2>&1 | {
+    # СЕКУНДЫ считаются от первых кадров (запуск Wine в QEMU - десятки
+    # секунд); не дождались кадров за 10 минут - конец.
+    # Первое значение (прогрев, компиляция шейдеров) в среднее не идёт.
+    n=0; sum=0; lo=; hi=0; first=; src=; skip=1; end=$((SECONDS + 600))
+    while :; do
+        if IFS= read -r -t 5 line; then
+            printf '%s\n' "$line" >&2
+            v=; s=
+            case $line in
+                *'d3dprobe: '*' FPS'*) v=${line##*= }; v=${v%% FPS*}; s=d3dprobe ;;
+                *'trace:fps:'*'approx '*) v=${line#*approx }; v=${v%%fps*}; s=${line#*trace:fps:}; s=${s%% *} ;;
+            esac
+            case $v in ''|*[!0-9.]*|.*) v= ;; esac
+            if [ -n "$v" ]; then
+                if [ -z "$first" ]; then first=$(( (${EPOCHREALTIME/[.,]/} - t0) / 100000 )); end=$((SECONDS + secs)); fi
+                if [ "$s" = d3dprobe ] && [ "$src" != d3dprobe ]; then src=; n=0; sum=0; lo=; hi=0; skip=1; fi
+                [ -z "$src" ] && src=$s
+                if [ "$s" = "$src" ] && [ -n "$skip" ]; then
+                    skip=
+                elif [ "$s" = "$src" ]; then
+                    i=${v%%.*}; f=${v#*.}; [ "$f" = "$v" ] && f=0; f=${f}00
+                    c=$((10#$i * 100 + 10#${f:0:2}))
+                    n=$((n + 1)); sum=$((sum + c))
+                    if [ -z "$lo" ] || [ $c -lt $lo ]; then lo=$c; fi
+                    [ $c -gt $hi ] && hi=$c
+                fi
+            fi
+        elif [ $? -le 128 ]; then
+            eof=1
+            break
+        fi
+        [ $SECONDS -ge $end ] && break
+    done
+    if [ $n -gt 0 ]; then
+        a=$((sum / n))
+        printf -v a '%d.%02d' $((a / 100)) $((a % 100))
+        printf -v lo '%d.%02d' $((lo / 100)) $((lo % 100))
+        printf -v hi '%d.%02d' $((hi / 100)) $((hi % 100))
+        echo "bench: $label avg $a fps (min $lo, max $hi, $n samples from $src), first frames after $((first / 10)).$((first % 10)) s, LP_NUM_THREADS=$LP_NUM_THREADS"
+    else
+        echo "bench: $label no frames in $secs s"
+    fi
+    # Программа, которая выходит сама (d3dprobe со своим сроком), - дождаться:
+    # после `wineserver -k` следующий запуск в том же префиксе получал
+    # «Invalid window handle» (замер 18.11, живая флешка в QEMU). Не вышла за
+    # 60 с (игра) - снять префикс и подождать сервер, не дольше 30 с (снятие
+    # задач ядром может застрять, P4).
+    grace=$((SECONDS + 60))
+    while [ -z "$eof" ] && [ $SECONDS -lt $grace ]; do
+        if IFS= read -r -t 5 line; then printf '%s\n' "$line" >&2; elif [ $? -le 128 ]; then eof=1; fi
+    done
+    if [ -z "$eof" ]; then
+        echo "bench: $label still running after the measurement, wineserver -k"
+        $P/bin/wineserver -k 2>/dev/null
+        $P/bin/wineserver -w 2>/dev/null & w=$!
+        for i in {1..30}; do kill -0 $w 2>/dev/null || break; LD_LIBRARY_PATH= sleep 1; done
+        [ $i -ge 30 ] && echo "bench: wineserver still alive after 30 s"
+    fi
+}
+"#);
     files.push((String::from("bin/fossai-proton"), script.as_bytes().to_vec(), 0o755));
+    files.push((String::from("bin/proton-bench"), BENCH.as_bytes().to_vec(), 0o755));
     // Новый 64-битный процесс (`wineboot`, программа из программы) ntdll GE
     // запускает загрузчиком `i386-unix/wine64`; 32-битной части Linux у нас
     // нет — переходник отдаёт запуск 64-битному загрузчику. Интерпретатор —
@@ -615,6 +776,73 @@ pub fn build(arch: Arch) -> Result<()> {
     say!("proton: {} — {} файлов, {} МиБ", out.display(), files.len(), bytes / (1024 * 1024));
     Ok(())
 }
+
+/// `bin/proton-bench [СЕКУНДЫ] [all|cache|size|threads]` (P1/P2/P3, 18.11):
+/// матрица замеров одной командой — на стенде и на живой флешке Романа
+/// (`run -b /opt/debian/bin/bash /opt/proton/bin/proton-bench`), итог — строки
+/// `bench:` в журнале. d3dprobe (Direct3D 9, как у TMNF) через DXVK и wined3d:
+/// холодный и тёплый кеш шейдеров, размеры кадра, потоки lavapipe.
+const BENCH: &str = r#"#!/bin/bash
+P=/opt/proton/bin/fossai-proton
+X=/opt/proton/share/fossai/d3dprobe.exe
+B=/opt/debian/bin/bash
+export PATH=/opt/debian/bin:$PATH
+S=${1:-20}; WHAT=${2:-all}
+n=0; while IFS=: read -r k v; do case $k in processor*) n=$((n + 1)) ;; esac; done < /proc/cpuinfo
+echo "bench: start, $S s per run, $n CPUs, what=$WHAT"
+# подпись, --env=… или -, --dxvk или -, затем аргументы d3dprobe (API, размер)
+one() {
+    local label=$1 env=$2 mode=$3 api=$4 size=$5 a=()
+    [ "$env" != - ] && a+=("--env=$env")
+    a+=("--bench=$S,$label")
+    case $mode in -) ;; *) a+=($mode) ;; esac
+    $B $P "${a[@]}" $X $api $((S + 15)) $size
+    sleep 3
+}
+C=$HOME/.cache/fossai-proton
+mkdir -p "$C"
+# Один `explorer` (окно стола Wine) на все замеры: его держит скрытое окно
+# `d3dprobe hold`. Иначе каждый запуск поднимал его заново, а в QEMU он
+# поднимается дольше, чем Wine его ждёт («The explorer process failed to
+# start», 18.11), и в замер шёл бы ещё и запуск explorer.
+H=$C/hold.log
+rm -f "$H"
+$B $P $X hold 14400 2> "$H" &
+for i in {1..120}; do
+    held=; [ -f "$H" ] && while IFS= read -r l; do case $l in *'holding the desktop'*) held=1 ;; esac; done < "$H"
+    [ -n "$held" ] && break
+    sleep 5
+done
+echo "bench: desktop holder ${held:+up}${held:-NOT up} after $((i * 5)) s"
+if [ $WHAT = all ] || [ $WHAT = cache ]; then
+    # Кеш шейдеров (P3): первый запуск - с пустым кешем, второй - с тёплым.
+    rm -rf "$C/mesa" "$C/dxvk"
+    one "d3d9 dxvk 640x480 cold-cache" - --dxvk 9 640x480
+    one "d3d9 dxvk 640x480 warm-cache" - --dxvk 9 640x480
+    echo "bench: cache $(du -sk "$C/mesa" 2>/dev/null | cut -f1) KiB mesa, $(du -sk "$C/dxvk" 2>/dev/null | cut -f1) KiB dxvk"
+fi
+if [ $WHAT = all ] || [ $WHAT = size ]; then
+    # Размер кадра (P2): цена каждой точки на процессоре.
+    for r in dxvk wined3d; do
+        m=-; [ $r = dxvk ] && m=--dxvk
+        for size in 640x480 1280x720 1920x1080 2560x1440; do
+            one "d3d9 $r $size" - $m 9 $size
+        done
+    done
+    # Виртуальный рабочий стол Wine (`--desktop=`), как у `tmnf --720p`.
+    $B $P --desktop=1280x720 --bench=$S,"d3d9 dxvk desktop-1280x720" --dxvk $X 9 $((S + 15)) 1280x720
+    sleep 3
+fi
+if [ $WHAT = all ] || [ $WHAT = threads ]; then
+    # Потоки lavapipe (P9): по умолчанию - половина ЦП (см. fossai-proton).
+    for t in 2 4 8 12 16; do
+        [ $t -gt $n ] && break
+        one "d3d9 dxvk 1280x720 LP_NUM_THREADS=$t" LP_NUM_THREADS=$t --dxvk 9 1280x720
+    done
+fi
+$B $P --run=wineserver -k
+echo "bench: done"
+"#;
 
 /// Убрать `.` и `..` из относительного пути.
 /// Собирает `tools/d3dprobe` (Rust, x86_64-pc-windows-msvc, статический CRT)
