@@ -40,6 +40,8 @@ pub mod recent;
 mod net;
 mod netdev;
 mod netlink;
+// Узел DRM nouveau для Mesa NVK (18.11.2026, `nvk-spec.md`).
+pub mod drm;
 pub mod ntsync;
 pub mod perfdiag;
 mod process;
@@ -833,6 +835,10 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     if let Some(answer) = ntsync::open(&linux, flags) {
         return answer;
     }
+    // `/dev/dri/renderD128` (NVK, 18.11.2026): есть, только пока стоит бэкенд.
+    if let Some(answer) = drm::open(&linux, flags) {
+        return answer;
+    }
     if let Some((node, writable)) = special::node(&linux) {
         let directory = node.metadata().kind == NodeKind::Directory;
         return match crate::user::with_current(|program| {
@@ -1076,6 +1082,10 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
     if ntsync::exists(&linux) {
         return put_stat(out, S_IFCHR, 0o666, 0, 0, 0, 0, ino_of(&linux));
     }
+    // Узел DRM: `st_rdev` = 226:128 — по нему libdrm узнаёт устройство.
+    if let Some(rdev) = drm::rdev(&linux) {
+        return put_stat(out, S_IFCHR, 0o666, 0, 0, 0, 0, rdev);
+    }
     if special::exists(&linux) {
         let kind = if linux.starts_with("/dev/") { S_IFCHR } else { S_IFREG };
         // Настоящие номера Linux у известных устройств (`makedev(1, 3)` …).
@@ -1120,6 +1130,8 @@ fn fstat(fd: usize, out: usize) -> i64 {
     // Объект слоя Linux (фаза 71e): сокет или «анонимный узел».
     if let Some(Some((object, _))) = crate::user::with_current(|program| program.files.object(fd)) {
         let ino = alloc::sync::Arc::as_ptr(&object) as *const () as usize as u64;
+        // Узел DRM — со своим `st_rdev` (`drmGetDevice2` libdrm).
+        let ino = drm::object_rdev(&*object).unwrap_or(ino);
         return put_stat(out, object.mode(), 0o600, 0, 0, 0, 0, ino);
     }
     // Стандартный поток — на каком бы номере он ни стоял (фаза 71d): канал
@@ -1336,6 +1348,10 @@ fn readlink(dir: usize, ptr: usize, buf: usize, size: usize) -> i64 {
         Err(err) => return err,
     };
     if let Some(answer) = links::read(&path, buf, size) {
+        return answer;
+    }
+    // Ссылки sysfs узла DRM (`…/device/subsystem` → `…/bus/pci`).
+    if let Some(answer) = drm::readlink(&path, buf, size) {
         return answer;
     }
     if path == "/proc/self/exe" {
@@ -1757,6 +1773,15 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
             shared = Some((crate::user::shm::SharedMem::new(len as u64), 0));
         }
         None
+    } else if let Some(found) = drm::mmap_object(fd, offset as u64, len) {
+        // Буфер DRM или dma-buf (NVK, 18.11.2026): кадры буфера.
+        match found {
+            Ok(mem) => {
+                shared = Some(mem);
+                None
+            }
+            Err(err) => return err,
+        }
     } else {
         let node = match crate::user::with_current(|program| program.files.node(fd)) {
             Some(Ok(node)) => node,
@@ -2073,6 +2098,10 @@ unsafe fn ioctl(fd: usize, request: usize, arg: usize) -> i64 {
     const FIONBIO: usize = 0x5421;
     // `/dev/ntsync` — первым: `WAIT_ANY` Wine — самый частый ioctl игры.
     if let Some(answer) = ntsync::ioctl(fd, request, arg) {
+        return answer;
+    }
+    // DRM nouveau, dma-buf, syncobj (NVK, 18.11.2026).
+    if let Some(answer) = drm::ioctl(fd, request, arg) {
         return answer;
     }
     // Звук ALSA (`/dev/snd`, шаг 7 Proton).

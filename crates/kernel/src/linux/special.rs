@@ -1,7 +1,7 @@
 //! Особые файлы программ Linux (фаза 71c): `/dev/null`, `/dev/zero`,
 //! `/dev/urandom`, `/proc/self/*`, `/proc/cpuinfo`, `/proc/meminfo` и
 //! `/sys/devices/system/cpu/*`; файлы сети (`/proc/net`, `/sys/class/net`)
-//! собирает `netdev`.
+//! собирает `netdev`, `/dev/dri` и sysfs узла DRM — `drm::sysfs`.
 //!
 //! Это не файловая система, а ответы на несколько путей, которые glibc и
 //! большие программы читают на каждом запуске: `sysconf(_SC_NPROCESSORS_ONLN)`
@@ -166,14 +166,17 @@ fn directory(path: &str) -> Option<Vec<(String, NodeKind)>> {
             let tid = crate::sched::current().as_u32();
             Some(alloc::vec![(format!("{tid}"), NodeKind::Directory)])
         }
-        // `/proc/net`, `/sys/class/net/<имя>` (16.11.2026).
-        _ => super::netdev::directory(path),
+        // `/proc/net`, `/sys/class/net/<имя>` (16.11.2026); `/dev/dri` и
+        // каталоги sysfs узла DRM (NVK, 18.11.2026).
+        _ => super::netdev::directory(path).or_else(|| super::drm::sysfs::directory(path)),
     }
 }
 
 /// Есть ли такой особый путь — для `stat` и `access`.
 pub fn exists(path: &str) -> bool {
-    matches!(path, "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random") || text(path).is_some()
+    matches!(path, "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random")
+        || text(path).is_some()
+        || super::drm::sysfs::exists(path)
 }
 
 /// Содержимое файла `/proc` или `/sys`.
@@ -185,6 +188,10 @@ fn text(path: &str) -> Option<String> {
     // Интерфейсы сети: `/proc/net/*`, `/proc/sys/net/*`,
     // `/sys/class/net/<имя>/*` (16.11.2026, `nsiproxy.sys` Wine).
     if let Some(text) = super::netdev::special_file(path) {
+        return Some(text);
+    }
+    // `/sys/dev/char/226:128/device/*` для libdrm (NVK, 18.11.2026).
+    if let Some(text) = super::drm::sysfs::text(path) {
         return Some(text);
     }
     let cpus = crate::smp::online().max(1);

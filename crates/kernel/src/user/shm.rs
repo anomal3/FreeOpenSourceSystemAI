@@ -52,6 +52,15 @@ pub struct SharedMem {
     size: AtomicU64,
     /// Файл, кусок которого отображён на запись: куда возвращать записанное.
     file: Option<FileBack>,
+    /// Чужие кадры (буфер DRM, [`SharedMem::from_frames`]).
+    borrowed: Option<Borrowed>,
+}
+
+/// Кадры страниц `0..pages` принадлежат не объекту, а владельцу `keep`
+/// (буфер GPU): объект их не возвращает в пул, а держит владельца живым.
+struct Borrowed {
+    pages: usize,
+    _keep: Arc<dyn core::any::Any + Send + Sync>,
 }
 
 /// Кусок файла `[start, end)` за объектом.
@@ -97,7 +106,22 @@ const MAX_FILE_MAP: usize = 64 << 20;
 impl SharedMem {
     #[must_use]
     pub fn new(size: u64) -> Arc<Self> {
-        Arc::new(Self { frames: Mutex::new(BTreeMap::new()), size: AtomicU64::new(size), file: None })
+        Arc::new(Self { frames: Mutex::new(BTreeMap::new()), size: AtomicU64::new(size), file: None, borrowed: None })
+    }
+
+    /// Память над готовыми кадрами чужого владельца (буфер DRM, NVK,
+    /// 18.11.2026, `nvk-spec.md` 3.3): страница `i` — кадр `frames[i]`.
+    /// Кадры в пул не возвращаются — их вернёт владелец `keep`, которого
+    /// объект держит живым, пока жив сам (то есть пока буфер отображён).
+    /// Страниц за `frames` у такого объекта не бывает: `mmap` проверяет длину.
+    pub fn from_frames(frames: &[PhysAddr], size: u64, keep: Arc<dyn core::any::Any + Send + Sync>) -> Arc<Self> {
+        let map: BTreeMap<usize, PhysAddr> = frames.iter().copied().enumerate().collect();
+        Arc::new(Self {
+            frames: Mutex::new(map),
+            size: AtomicU64::new(size),
+            file: None,
+            borrowed: Some(Borrowed { pages: frames.len(), _keep: keep }),
+        })
     }
 
     /// Кусок файла `[offset, offset + len)` для `MAP_SHARED` на запись:
@@ -113,6 +137,7 @@ impl SharedMem {
             frames: Mutex::new(BTreeMap::new()),
             size: AtomicU64::new(size),
             file: Some(FileBack { node: Arc::clone(&node), start: offset, end: AtomicU64::new(end), clean: Mutex::new(BTreeMap::new()) }),
+            borrowed: None,
         });
         // Кусками по [`FILE_RUN`]: одно чтение файловой системы вместо
         // шестидесяти четырёх.
@@ -160,6 +185,7 @@ impl SharedMem {
                     frames: Mutex::new(BTreeMap::new()),
                     size: AtomicU64::new(node.metadata().size),
                     file: Some(FileBack { node: Arc::clone(&node), start: 0, end: AtomicU64::new(0), clean: Mutex::new(BTreeMap::new()) }),
+                    borrowed: None,
                 });
                 files.push((id, Arc::downgrade(&mem)));
                 mem
@@ -320,7 +346,11 @@ impl SharedMem {
 impl Drop for SharedMem {
     fn drop(&mut self) {
         self.flush();
-        let frames = core::mem::take(&mut *self.frames.lock());
+        let mut frames = core::mem::take(&mut *self.frames.lock());
+        // Чужие кадры остаются владельцу (буфер GPU).
+        if let Some(borrowed) = &self.borrowed {
+            frames.retain(|page, _| *page >= borrowed.pages);
+        }
         crate::mm::frame::with(|pool| {
             for frame in frames.into_values() {
                 // SAFETY: кадры выданы этим же пулом под этот объект; ссылок на

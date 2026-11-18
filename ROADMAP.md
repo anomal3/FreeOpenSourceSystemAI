@@ -13819,6 +13819,59 @@ nvgpu` — 44 теста; собирается и для `x86_64/aarch64-unknown
 Дальше: что понадобится WP-C/WP-D в `nvk-soft`/`nvk-soft-vk` (по их
 отчётам); возможная асинхронность исполнения (сейчас синхронно).
 
+### WP-C: слой Linux (`/dev/dri/renderD128`) — M3 и M4 на SoftGpu, 18.11
+
+Новый модуль `crates/kernel/src/linux/drm/` (`mod`, `sysfs`, `gem`, `sync`,
+`nouveau`, `nvif`, `vm`, `soft`); крючки — строками в `linux/mod.rs` (open,
+stat/`st_rdev`, fstat, readlink, mmap, ioctl), маршруты sysfs в
+`linux/special.rs`, `SharedMem::from_frames` в `user/shm.rs`, команда
+`nvk` в `shell.rs`. `user/mod.rs` не тронут: страницы буфера в системной
+памяти идут с правами из `prot` (WB) — этого и надо.
+- **Когда узел есть.** Бэкенд настоящей карты регистрирует WP-A
+  (`linux::drm::set_backend`), но узел показывается только после
+  `nvk hw on` (по умолчанию выключено — решение ведущего: пока M5 не
+  пройден, DXVK выбрал бы сломанный NVK вместо lavapipe). `nvk soft on` —
+  SoftGpu (WP-B) над кадрами пула ядра (`KernelHost`); `nvk trace on` —
+  каждый ioctl и NVIF в журнал. Без бэкенда нет ни `/dev/dri`, ни sysfs.
+- **Обнаружение libdrm**: `/dev/dri` (каталог), `stat` узла — `S_IFCHR`,
+  `st_rdev = makedev(226,128)` (и у `fstat` — `drmGetDevice2`),
+  `/sys/dev/char/226:128/{dev,uevent}`, `device/{uevent (PCI_SLOT_NAME),
+  vendor,device,subsystem_*,revision,class}`, каталог `device/drm`, ссылка
+  `device/subsystem` → `../../../../bus/pci`; то же под
+  `/sys/class/drm/renderD128`.
+- **ioctl ядра DRM**: VERSION (nouveau 1.4.0, два захода), GET_CAP (PRIME 3,
+  SYNCOBJ, TIMELINE, TIMESTAMP_MONOTONIC; прочее EINVAL), SET_CLIENT_CAP
+  (EOPNOTSUPP), GET_UNIQUE (пусто), мастер/magic — EACCES, GEM_CLOSE,
+  PRIME туда-обратно (dma-buf — объект; `mmap` dma-buf; NO_SHARE — EPERM как
+  `nouveau_gem_prime_export`; повторный импорт — та же ручка), все syncobj
+  (CREATE/DESTROY/WAIT/TIMELINE_WAIT/RESET/SIGNAL/TIMELINE_SIGNAL/QUERY/
+  TRANSFER, fd: непрозрачный и sync_file; EVENTFD — EOPNOTSUPP).
+- **nouveau**: GETPARAM (раздел 2.1; неизвестный — EINVAL), CHANNEL_ALLOC/
+  FREE (до VM_INIT — ENODEV и uvmm файла выключен, как у Linux), NVIF как
+  `nouveau_abi16_ioctl` (разбор по nr 0x47; NEW NV_DEVICE / движок в канале,
+  MTHD INFO, SCLASS; DEL с телом 8 байт тоже снимает объект — у Linux он
+  тихо оставался), VM_INIT, VM_BIND (учёт — `nvgpu::vaspace`, атомарная
+  пачка; ссылки на BO держит VM, пока отображены), EXEC (до 510 сегментов;
+  ожидания с чужих каналов ждутся процессором, своего — порядок GPFIFO;
+  пустой EXEC — ENODEV у убитого канала), GEM_NEW/INFO/CPU_PREP/CPU_FINI,
+  GEM_PUSHBUF — ENOSYS (режим uvmm).
+- **Заборы**: `nvgpu::syncobj` + реестр каналов (контекст → слабая ссылка;
+  снятый канал — «выполнено»); кэш выполненного номера у канала, освежается
+  ожиданиями вне замков; прерываний нет — опрос раз в 1 мс.
+- **Память буфера**: всё отображаемое — в системной памяти; `mmap(map_handle)`
+  отдаёт одну `SharedMem` на буфер над его кадрами (`from_frames`: кадры
+  не возвращаются в пул, объект держит `Arc<Bo>`). Для M7 (WP-D):
+  `linux::drm::dmabuf_memory(&dyn Object)` — память dma-buf.
+- **Закрытие файла**: каналы (ждут заборы до 2 с) → VM (снять всё,
+  `vm_destroy`) → ручки BO.
+
+Проверено (QEMU, `cargo xtask test -r -a x86_64 -s nvk-soft`): drmprobe soft
+— «0 failed» (M3); nvkprobe soft — всё, кроме PRIME_HANDLE_TO_FD: проба
+экспортирует буфер NO_SHARE (у Linux тоже EPERM) — правка пробы за WP-D.
+Копия 64 КиБ sysmem → VRAM → sysmem движком C7B5 — 0 расхождений.
+Дальше: M4 целиком после правки пробы, `nvk-soft-vk` (vkprobe на NVK поверх
+SoftGpu), M5 — с настоящим бэкендом WP-A на RTX 3060.
+
 ### WP-D: упаковка, пробы, сценарии QEMU
 
 Сделано (18.11):

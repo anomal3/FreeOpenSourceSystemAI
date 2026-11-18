@@ -1197,6 +1197,34 @@ fn run_builtin(line: &str) -> bool {
                 if crate::linux::ntsync::DEFAULT_ENABLED { "on" } else { "off" }
             );
         }
+        // Узел DRM для Mesa NVK (18.11.2026): `nvk soft on` — программная
+        // видеокарта SoftGpu (QEMU, пробы), `nvk hw on` — показать узел
+        // настоящей карты (по умолчанию скрыт, пока NVK на ней не работает),
+        // `nvk trace on` — каждый ioctl в журнал.
+        #[cfg(target_arch = "x86_64")]
+        "nvk" => {
+            let mut words = argument.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("soft"), Some(on @ ("on" | "off"))) => {
+                    if !crate::linux::drm::set_soft(on == "on") {
+                        sprintln!("  nvk: SoftGpu is not available");
+                    }
+                }
+                (Some("hw"), Some(on @ ("on" | "off"))) => crate::linux::drm::set_hw(on == "on"),
+                (Some("trace"), Some(on @ ("on" | "off"))) => crate::linux::drm::set_trace(on == "on"),
+                (None, None) => {}
+                _ => sprintln!("  nvk: usage `nvk [soft|hw|trace on|off]`"),
+            }
+            let (real, soft) = crate::linux::drm::backend_state();
+            sprintln!(
+                "  nvk: /dev/dri/renderD128 {} (real backend {}, hw {}, soft {}, trace {})",
+                if crate::linux::drm::node_visible() { "present" } else { "absent" },
+                if real { "registered" } else { "none" },
+                if crate::linux::drm::hw() { "on" } else { "off" },
+                if soft { "on" } else { "off" },
+                if crate::linux::drm::trace() { "on" } else { "off" }
+            );
+        }
         // Отчёт `perf-diag` в журнал раз в 30 с, пока работают программы
         // Linux (P1, 18.11.2026); `now` — напечатать накопленное сразу.
         #[cfg(target_arch = "x86_64")]
