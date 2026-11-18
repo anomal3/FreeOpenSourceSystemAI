@@ -22,9 +22,12 @@
 //! Что исполняется: методы канала (SET_OBJECT, SEMAPHOREA..D, SEM_ADDR/
 //! PAYLOAD/EXECUTE — выпуск, проверка захвата, редукции), копировальный
 //! движок C6B5/C7B5 (линейное копирование, многострочное с шагом, REMAP с
-//! константами — заливка, семафоры после копирования, физические адреса).
-//! Методы 3D/compute/2D/M2MF принимаются и пропускаются (счётчик в
-//! [`SoftStats`]). Обращение по неотображённому адресу, незнакомый
+//! константами — заливка, семафоры после копирования, физические адреса),
+//! у 3D/compute/I2M — запись из пушбуфера (LINE_LENGTH_IN..LOAD_INLINE_DATA,
+//! так NVK заливает мелкие данные) и семафор отчёта (SET_REPORT_SEMAPHORE,
+//! счётчики запросов = 0, время — настоящее). Остальные методы 3D/compute/2D
+//! принимаются и пропускаются (счётчик в [`SoftStats`]): шейдеры SoftGpu не
+//! исполняет. Обращение по неотображённому адресу, незнакомый
 //! заголовок, метод без объекта, блочная раскладка CE, захват семафора,
 //! который не выполнен, — канал «убит» (`chan_seq_done` -> `ENODEV`),
 //! причина — [`SoftGpu::chan_killed`].
@@ -258,6 +261,50 @@ struct CeState {
     regs: Box<[u32; 0x1000]>,
 }
 
+/// Общая у 3D, compute и I2M часть: запись в память из пушбуфера
+/// (LINE_LENGTH_IN 0x180 .. LOAD_INLINE_DATA 0x1b4) и семафор отчёта
+/// (SET_REPORT_SEMAPHORE_A..D 0x1b00..0x1b0c). Так NVK заливает мелкие
+/// данные (`vkCmdUpdateBuffer`, дескрипторы) и пишет запросы/время.
+#[derive(Default)]
+struct EngState {
+    regs: BTreeMap<u32, u32>,
+    inline: Option<Inline>,
+}
+
+struct Inline {
+    buf: Vec<u8>,
+    need: usize,
+    line: u64,
+    lines: u64,
+    dst: u64,
+    pitch: u64,
+}
+
+/// Методы общей части 3D/compute/I2M.
+pub mod eng {
+    pub const LINE_LENGTH_IN: u32 = 0x180;
+    pub const LINE_COUNT: u32 = 0x184;
+    pub const OFFSET_OUT_UPPER: u32 = 0x188;
+    pub const OFFSET_OUT: u32 = 0x18c;
+    pub const PITCH_OUT: u32 = 0x190;
+    pub const LAUNCH_DMA: u32 = 0x1b0;
+    pub const LAUNCH_DMA_DST_PITCH: u32 = 1 << 0;
+    pub const LOAD_INLINE_DATA: u32 = 0x1b4;
+    pub const SET_REPORT_SEMAPHORE_A: u32 = 0x1b00;
+    pub const SET_REPORT_SEMAPHORE_B: u32 = 0x1b04;
+    pub const SET_REPORT_SEMAPHORE_C: u32 = 0x1b08;
+    pub const SET_REPORT_SEMAPHORE_D: u32 = 0x1b0c;
+    pub const REPORT_OP_MASK: u32 = 0x3;
+    pub const REPORT_OP_RELEASE: u32 = 0;
+    pub const REPORT_OP_ACQUIRE: u32 = 1;
+    pub const REPORT_OP_REPORT_ONLY: u32 = 2;
+    pub const REPORT_REDUCTION_ENABLE: u32 = 1 << 3;
+    pub const REPORT_REDUCTION_SHIFT: u32 = 9;
+    /// Поле REPORT 27:23: 0 = NONE (пишется полезная нагрузка).
+    pub const REPORT_SHIFT: u32 = 23;
+    pub const REPORT_ONE_WORD: u32 = 1 << 28;
+}
+
 struct Chan {
     vm: u32,
     chid: u32,
@@ -281,6 +328,7 @@ struct Chan {
     sem_addr: u64,
     sem_payload: u64,
     ce: CeState,
+    eng: BTreeMap<u32, EngState>,
 }
 
 struct State {
@@ -651,8 +699,87 @@ impl Exec<'_> {
             if mthd == ce::LAUNCH_DMA {
                 self.ce_launch(ch, data)?;
             }
+        } else if matches!(class & 0xff, 0x97 | 0xc0 | 0x40 | 0x39) {
+            self.eng_method(ch, class, mthd, data)?;
         } else {
             self.stats.ignored_methods += 1;
+        }
+        Ok(())
+    }
+
+    /// 3D/compute/I2M: запись из пушбуфера и семафор отчёта; остальное —
+    /// пропускается.
+    fn eng_method(&mut self, ch: &mut Chan, class: u32, mthd: u32, data: u32) -> Result<(), String> {
+        let st = ch.eng.entry(class).or_default();
+        let reg = |st: &EngState, m: u32| st.regs.get(&m).copied().unwrap_or(0);
+        match mthd {
+            eng::LAUNCH_DMA => {
+                if data & eng::LAUNCH_DMA_DST_PITCH == 0 {
+                    return Err(format!("класс {class:#x}: LAUNCH_DMA в блочную раскладку не поддержан в SoftGpu"));
+                }
+                let line = reg(st, eng::LINE_LENGTH_IN) as u64;
+                let lines = reg(st, eng::LINE_COUNT) as u64;
+                let need = (line * lines) as usize;
+                st.inline = (need > 0).then(|| Inline {
+                    buf: Vec::with_capacity(need + 3),
+                    need,
+                    line,
+                    lines,
+                    dst: ((reg(st, eng::OFFSET_OUT_UPPER) as u64 & 0x1ffff) << 32) | reg(st, eng::OFFSET_OUT) as u64,
+                    pitch: reg(st, eng::PITCH_OUT) as u64,
+                });
+            }
+            eng::LOAD_INLINE_DATA => {
+                let Some(inl) = &mut st.inline else { return Ok(()) };
+                inl.buf.extend_from_slice(&data.to_le_bytes());
+                if inl.buf.len() >= inl.need {
+                    let inl = st.inline.take().unwrap();
+                    for l in 0..inl.lines {
+                        let s = (l * inl.line) as usize;
+                        let d = &inl.buf[s..s + inl.line as usize];
+                        gpu_write(self.vram, self.host, self.pd3, inl.dst + l * inl.pitch, d).map_err(|f| format!("LOAD_INLINE_DATA {:#x}: {}", f.0, f.1))?;
+                    }
+                    self.stats.ce_bytes += inl.need as u64;
+                }
+            }
+            eng::SET_REPORT_SEMAPHORE_D => {
+                let addr = ((reg(st, eng::SET_REPORT_SEMAPHORE_A) as u64 & 0xff) << 32) | reg(st, eng::SET_REPORT_SEMAPHORE_B) as u64;
+                let payload = reg(st, eng::SET_REPORT_SEMAPHORE_C);
+                let fault = |f: Fault| format!("семафор отчёта {:#x}: {}", f.0, f.1);
+                match data & eng::REPORT_OP_MASK {
+                    op @ (eng::REPORT_OP_RELEASE | eng::REPORT_OP_REPORT_ONLY) => {
+                        // Счётчиков у нас нет: REPORT_NONE пишет нагрузку, прочие — 0.
+                        let mut v = if op == eng::REPORT_OP_RELEASE && (data >> eng::REPORT_SHIFT) & 0x1f == 0 { payload as u64 } else { 0 };
+                        if data & eng::REPORT_REDUCTION_ENABLE != 0 {
+                            let old = self.r32(addr).map_err(fault)? as u64;
+                            v = reduce((data >> eng::REPORT_REDUCTION_SHIFT) & 7, old, v, data & (1 << 17) == 0, false);
+                        }
+                        self.stats.sem_releases += 1;
+                        if data & eng::REPORT_ONE_WORD != 0 {
+                            self.w32(addr, v as u32).map_err(fault)?;
+                        } else {
+                            let t = self.host.now_ns();
+                            self.w64(addr, v).map_err(fault)?;
+                            self.w64(addr + 8, t).map_err(fault)?;
+                        }
+                    }
+                    eng::REPORT_OP_ACQUIRE => {
+                        let v = self.r32(addr).map_err(fault)?;
+                        // COMPARISON (бит 16): 0 = EQ, 1 = GE.
+                        let ok = if data & (1 << 16) != 0 { v >= payload } else { v == payload };
+                        if !ok {
+                            return Err(format!("захват семафора отчёта {addr:#x}: {v:#x} против {payload:#x} — ждать некого"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            m => {
+                st.regs.insert(m, data);
+                if !matches!(m, eng::LINE_LENGTH_IN..=eng::PITCH_OUT | eng::SET_REPORT_SEMAPHORE_A..=eng::SET_REPORT_SEMAPHORE_C) {
+                    self.stats.ignored_methods += 1;
+                }
+            }
         }
         Ok(())
     }
@@ -1185,6 +1312,7 @@ impl GpuBackend for SoftGpu {
                 sem_addr: 0,
                 sem_payload: 0,
                 ce: CeState { regs: Box::new([0; 0x1000]) },
+                eng: BTreeMap::new(),
             },
         );
         Ok(ChanHandle(id))
@@ -1422,6 +1550,37 @@ mod tests {
         assert!(gpu.chan_killed(ch).unwrap().contains("захват"));
         assert_eq!(gpu.chan_seq_done(ch), Err(Errno::ENODEV));
         assert_eq!(gpu.chan_submit(ch, &[]), Err(Errno::ENODEV));
+    }
+
+    #[test]
+    fn inline_data_and_report_semaphore() {
+        let (_h, gpu, vm, ch) = setup();
+        let buf = gpu.bo_alloc(PAGE, Place::Sysmem).unwrap();
+        gpu.vm_map(vm, 0x9000, buf, 0, PAGE, 0).unwrap();
+        gpu.chan_obj(ch, class::AMPERE_COMPUTE_B).unwrap();
+        gpu.chan_obj(ch, class::AMPERE_B).unwrap();
+        let mut p = PushBuilder::new();
+        p.set_object(1, class::AMPERE_COMPUTE_B).set_object(0, class::AMPERE_B);
+        // Две строки по 6 байт с шагом 0x10 — как NVK: 1INC LAUNCH_DMA + данные.
+        p.inc(1, eng::LINE_LENGTH_IN, &[6, 2, 0, 0x9100, 0x10]);
+        p.words.push(gpfifo::mthd_1inc(1, eng::LAUNCH_DMA, 4));
+        p.words.extend_from_slice(&[1, 0x0403_0201, 0x0807_0605, 0x0c0b_0a09]);
+        // Неизвестные методы 3D пропускаются.
+        p.inc(0, 0x1234 * 4 & 0x3ffc, &[1, 2, 3]);
+        // Семафор отчёта: один 32-битный и 16-байтный с временем.
+        p.inc(0, eng::SET_REPORT_SEMAPHORE_A, &[0, 0x9000, 77, eng::REPORT_ONE_WORD]);
+        p.inc(1, eng::SET_REPORT_SEMAPHORE_A, &[0, 0x9010, 78, 0]);
+        submit(&gpu, vm, ch, 0x10_0000, &p).unwrap();
+        assert_eq!(gpu.chan_killed(ch), None);
+        let mut b = vec![0u8; 0x120];
+        gpu.bo_read(buf, 0, &mut b).unwrap();
+        assert_eq!(&b[0x100..0x106], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&b[0x106..0x110], &[0; 10]);
+        assert_eq!(&b[0x110..0x116], &[7, 8, 9, 10, 11, 12]);
+        assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 77);
+        assert_eq!(u64::from_le_bytes(b[0x10..0x18].try_into().unwrap()), 78);
+        assert_ne!(u64::from_le_bytes(b[0x18..0x20].try_into().unwrap()), 0, "время");
+        assert_eq!(gpu.stats().ignored_methods, 3);
     }
 
     #[test]
