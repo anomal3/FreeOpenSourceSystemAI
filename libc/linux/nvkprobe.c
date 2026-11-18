@@ -267,14 +267,19 @@ __attribute__((used)) void start_c(u64 *sp) {
     r = io(DRM_IOCTL_NOUVEAU_EXEC, &x);
     check_v(r == 0, "an empty EXEC after work is 0 (channel alive)", r);
 
-    /* PRIME: так NVK отдаёт изображения WSI. */
-    struct drm_prime_handle ph = {dst.handle, DRM_CLOEXEC | O_RDWR, -1};
+    /* PRIME: так NVK отдаёт изображения WSI. Отдаётся только BO без
+     * NO_SHARE (Linux `nouveau_gem_prime_export`: иначе EPERM) — `src`. */
+    struct drm_prime_handle ns = {dst.handle, DRM_CLOEXEC | O_RDWR, -1};
+    r = io(DRM_IOCTL_PRIME_HANDLE_TO_FD, &ns);
+    check_v(r == -EPERM, "PRIME_HANDLE_TO_FD of a NO_SHARE BO is EPERM", r);
+    if (r == 0) sys3(SYS_close, ns.fd, 0, 0);
+    struct drm_prime_handle ph = {src.handle, DRM_CLOEXEC | O_RDWR, -1};
     r = io(DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph);
-    check_v(r == 0 && ph.fd >= 0, "PRIME_HANDLE_TO_FD", r);
+    check_v(r == 0 && ph.fd >= 0, "PRIME_HANDLE_TO_FD of a shareable BO", r);
     if (r == 0) {
         struct drm_prime_handle back = {0, 0, ph.fd};
         r = io(DRM_IOCTL_PRIME_FD_TO_HANDLE, &back);
-        check_v(r == 0 && back.handle == dst.handle, "PRIME_FD_TO_HANDLE in the same file gives the same handle", r ? r : (i64)back.handle);
+        check_v(r == 0 && back.handle == src.handle, "PRIME_FD_TO_HANDLE in the same file gives the same handle", r ? r : (i64)back.handle);
         memset(&gi, 0, sizeof gi);
         gi.handle = back.handle;
         r = io(DRM_IOCTL_NOUVEAU_GEM_INFO, &gi);
