@@ -11,11 +11,13 @@
 //! `cargo test -p nvgpu` на хосте.
 //!
 //! * [`backend`] — трейт [`GpuBackend`] (договор WP-A/WP-B/WP-C) и его типы.
+//! * [`uapi`] — структуры DRM/nouveau/NVIF, номера ioctl, разбор NVIF.
 
 #![no_std]
 
 extern crate alloc;
 
 pub mod backend;
+pub mod uapi;
 
 pub use backend::{BoHandle, ChanHandle, Errno, GpuBackend, GpuInfo, ObjHandle, PciSlot, Place, Push, VmHandle};
