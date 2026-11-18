@@ -78,6 +78,10 @@ osupdate = { path = "../osupdate" }
 # который ездит наискось в эмуляторе.
 usb-hid = { path = "../usb-hid" }
 edid = { path = "../edid" }
+# NVK поверх GSP-RM: договор GpuBackend, раскладки uAPI nouveau, таблицы GMMU,
+# GPFIFO и программный GPU для QEMU. Чистая логика без ядра — проверяется на
+# хосте (`cargo test -p nvgpu`); реальный бэкенд — `display/nvidia_rm_*.rs`.
+nvgpu = { path = "../nvgpu" }
 # `default-features = false` drops the `std` and `unicode` features; what remains
 # is `font8x8::legacy`, a dependency-free table of `[u8; 8]` glyph rows. The
 # kernel still uses it directly for the boot console, which draws into the
