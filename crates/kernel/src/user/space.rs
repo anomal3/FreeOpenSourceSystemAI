@@ -472,7 +472,7 @@ impl Space {
 
             // Шаг второй: никто больше не ходит по этим трансляциям.
             if everywhere && held > 0 {
-                arch::flush_user_translations();
+                arch::flush_user_translations(Some(root));
             }
 
             // Шаг третий: кадры — в пул.

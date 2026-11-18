@@ -2325,7 +2325,7 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usi
                 let uptime = u128::from(crate::time::uptime_ns());
                 Some(if command == FUTEX_WAIT_BITSET {
                     if op & FUTEX_CLOCK_REALTIME != 0 {
-                        let now = u128::from(crate::time::now_unix().unwrap_or(0)) * 1_000_000_000 + uptime % 1_000_000_000;
+                        let now = u128::from(crate::time::realtime_ns().unwrap_or(0));
                         uptime + wanted.saturating_sub(now)
                     } else {
                         wanted
@@ -2622,7 +2622,7 @@ unsafe fn futex_waitv(waiters: usize, count: usize, flags: usize, timeout: usize
         let wanted = u128::from(seconds) * 1_000_000_000 + u128::from(nanos);
         let uptime = u128::from(crate::time::uptime_ns());
         Some(if clock == CLOCK_REALTIME {
-            let now = u128::from(crate::time::now_unix().unwrap_or(0)) * 1_000_000_000 + uptime % 1_000_000_000;
+            let now = u128::from(crate::time::realtime_ns().unwrap_or(0));
             uptime + wanted.saturating_sub(now)
         } else {
             wanted
@@ -2739,8 +2739,14 @@ fn membarrier(cmd: usize) -> i64 {
     const REGISTER_PRIVATE_EXPEDITED: usize = 16;
     match cmd {
         QUERY => (GLOBAL | PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED) as i64,
-        GLOBAL | PRIVATE_EXPEDITED => {
-            crate::arch::flush_user_translations();
+        // Глобальный — всем процессорам; частный — только тем, где сейчас
+        // идут потоки этого процесса (19.11: адресный сброс).
+        GLOBAL => {
+            crate::arch::flush_user_translations(None);
+            0
+        }
+        PRIVATE_EXPEDITED => {
+            crate::arch::flush_user_translations(crate::user::current_space_root());
             0
         }
         REGISTER_PRIVATE_EXPEDITED => 0,

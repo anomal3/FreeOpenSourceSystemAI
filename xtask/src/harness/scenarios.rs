@@ -7719,6 +7719,13 @@ pub const ALL: &[Scenario] = &[
             // P1: отчёт `perf-diag` по требованию.
             Step::Line("perfdiag now"),
             Step::Await("perf-diag   : ", 15_000),
+            // `memcpy`/`memset` ядра (19.11.2026): замер всех способов, все
+            // копируют верно (иначе WARNING), выбран лучший.
+            Step::Line("copybench"),
+            Step::Await("copy        : memcpy ", 30_000),
+            Step::Await("copybench   : 1280x720 frame MB/s", 60_000),
+            Step::Absent("copied wrong bytes"),
+            Step::Absent("filled wrong bytes"),
             Step::Absent("rwxprobe: FAILED"),
             Step::Absent("futexlat: FAILED"),
             Step::Absent("sigasync: FAILED"),

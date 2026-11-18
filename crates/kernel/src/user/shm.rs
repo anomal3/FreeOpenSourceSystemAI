@@ -299,7 +299,11 @@ impl SharedMem {
     /// Кадр страницы `page`: есть — его, нет — новый, с нулями. `None` —
     /// кадров не осталось (с учётом запаса ядра).
     pub fn frame(&self, page: usize) -> Option<PhysAddr> {
-        let mut frames = self.frames.lock();
+        Self::frame_in(&mut self.frames.lock(), page)
+    }
+
+    /// [`Self::frame`] под уже взятым замком.
+    fn frame_in(frames: &mut BTreeMap<usize, PhysAddr>, page: usize) -> Option<PhysAddr> {
         if let Some(frame) = frames.get(&page) {
             return Some(*frame);
         }
@@ -317,23 +321,28 @@ impl SharedMem {
     /// Прочитать `buf.len()` байт с `offset` — без оглядки на длину файла
     /// (сервер Wayland читает буфер в пределах пула, который ему объявили).
     /// `false` — кадров не осталось.
+    ///
+    /// Так сервер Wayland читает строки буфера клиента (19.11.2026): замок
+    /// кадров — один на вызов, а не на страницу, и копия — [`crate::mm::copy`]
+    /// (`memcpy` ядра в TCG давала ~450 МБ/с).
     pub fn read(&self, offset: u64, buf: &mut [u8]) -> bool {
         let out = buf.as_mut_ptr();
         self.copy(offset, buf.len(), |frame, done, take| {
             // SAFETY: `done + take <= buf.len()`; кадр — см. `copy`.
-            unsafe { core::ptr::copy_nonoverlapping(frame, out.add(done), take) };
+            unsafe { crate::mm::copy::copy(out.add(done), frame, take) };
         })
         .is_ok()
     }
 
     fn copy(&self, offset: u64, len: usize, mut each: impl FnMut(*mut u8, usize, usize)) -> VfsResult<()> {
         let mut done = 0;
+        let mut frames = self.frames.lock();
         while done < len {
             let at = offset as usize + done;
             let page = at / PAGE_SIZE;
             let inside = at % PAGE_SIZE;
             let take = (PAGE_SIZE - inside).min(len - done);
-            let frame = self.frame(page).ok_or(VfsError::NoSpace)?;
+            let frame = Self::frame_in(&mut frames, page).ok_or(VfsError::NoSpace)?;
             // SAFETY: кадр принадлежит объекту и жив, пока жив он; виден через
             // прямое отображение, смещение и длина — внутри страницы.
             each(unsafe { super::frame_bytes(frame).add(inside) }, done, take);
@@ -341,6 +350,53 @@ impl SharedMem {
         }
         Ok(())
     }
+}
+
+/// Замер `copybench` (19.11.2026): кадр 1280x720 (3,6 МБ) строками из
+/// разделяемой памяти — как его читает сервер Wayland — и тот же объём одной
+/// копией из кучи в кучу. МБ/с в журнал.
+pub fn bench_frame() {
+    const STRIDE: usize = 1280 * 4;
+    const ROWS: usize = 720;
+    const LEN: usize = STRIDE * ROWS;
+    let mem = SharedMem::new(LEN as u64);
+    let mut src = Vec::new();
+    let mut dst = Vec::new();
+    if src.try_reserve_exact(LEN).is_err() || dst.try_reserve_exact(LEN).is_err() {
+        return;
+    }
+    src.resize(LEN, 0x5au8);
+    dst.resize(LEN, 0u8);
+    // Кадры объекта — касанием, как у клиента, нарисовавшего кадр.
+    if ShmNode(Arc::clone(&mem)).write_at(0, &src).is_err() {
+        return;
+    }
+    let mb_s = |ns: u64| LEN as u64 * 1000 / ns.max(1);
+    let mut line = String::new();
+    for method in crate::mm::copy::methods() {
+        let (rows_ns, flat_ns) = crate::mm::copy::with_copy(method, || {
+            let mut rows_ns = u64::MAX;
+            let mut flat_ns = u64::MAX;
+            for _ in 0..3 {
+                let started = crate::time::uptime_ns();
+                for row in 0..ROWS {
+                    if !mem.read((row * STRIDE) as u64, &mut dst[row * STRIDE..(row + 1) * STRIDE]) {
+                        return (0, 0);
+                    }
+                }
+                rows_ns = rows_ns.min(crate::time::uptime_ns().saturating_sub(started));
+                let started = crate::time::uptime_ns();
+                dst.copy_from_slice(&src);
+                flat_ns = flat_ns.min(crate::time::uptime_ns().saturating_sub(started));
+            }
+            (rows_ns, flat_ns)
+        });
+        let _ = core::fmt::Write::write_fmt(
+            &mut line,
+            format_args!(" {} {}/{}", method.name(), mb_s(rows_ns), mb_s(flat_ns)),
+        );
+    }
+    crate::kprintln!("  copybench   : 1280x720 frame MB/s shm rows/heap flat:{line}");
 }
 
 impl Drop for SharedMem {
@@ -378,14 +434,14 @@ impl Node for ShmNode {
         let out = buf.as_mut_ptr();
         self.0.copy(offset, len, |frame, done, take| {
             // SAFETY: `done + take <= len <= buf.len()`; кадр — см. `copy`.
-            unsafe { core::ptr::copy_nonoverlapping(frame, out.add(done), take) };
+            unsafe { crate::mm::copy::copy(out.add(done), frame, take) };
         })?;
         Ok(len)
     }
     fn write_at(&self, offset: u64, data: &[u8]) -> VfsResult<usize> {
         self.0.copy(offset, data.len(), |frame, done, take| {
             // SAFETY: см. `read_at`.
-            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(done), frame, take) };
+            unsafe { crate::mm::copy::copy(frame, data.as_ptr().add(done), take) };
         })?;
         let end = offset + data.len() as u64;
         self.0.size.fetch_max(end, Ordering::Relaxed);

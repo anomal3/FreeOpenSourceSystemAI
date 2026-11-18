@@ -474,6 +474,10 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     // по-прежнему делает один загрузочный.
     smp::start(info.one_cpu());
 
+    // Способ `memcpy`/`memset` ядра — замером (19.11.2026): часы, куча и
+    // векторы всех процессоров уже есть.
+    mm::copy::init();
+
     let stats = mm::frame::stats();
     kprintln!();
     kprintln!(

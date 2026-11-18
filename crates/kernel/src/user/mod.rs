@@ -1826,7 +1826,7 @@ impl Program {
             }
         }
         if shared {
-            arch::flush_user_translations();
+            arch::flush_user_translations(Some(self.space.root()));
         }
         // Отказ построителя здесь возможен только на исчерпании кадров под
         // промежуточные таблицы — а они у присутствующей страницы уже есть.
@@ -2199,7 +2199,7 @@ impl Program {
         // SAFETY: страница принадлежит области этой программы.
         unsafe { self.space.unmap_range_keep(virt, 1) };
         if shared {
-            arch::flush_user_translations();
+            arch::flush_user_translations(Some(self.space.root()));
         }
         // SAFETY: адрес свободен (снят строкой выше), кадр наш.
         if unsafe { self.space.remap(virt, fresh, flags) }.is_err() {
@@ -2444,7 +2444,7 @@ impl Program {
                 return Flip::Refused;
             }
             if shared {
-                arch::flush_user_translations();
+                arch::flush_user_translations(Some(self.space.root()));
             }
             arch::sync_instructions(phys);
             self.jit.to_execute += 1;
@@ -2492,7 +2492,7 @@ impl Program {
             return Flip::Refused;
         }
         if shared {
-            arch::flush_user_translations();
+            arch::flush_user_translations(Some(self.space.root()));
         }
         if flags.contains(PageFlags::EXEC) {
             arch::sync_instructions(phys);
@@ -4788,7 +4788,7 @@ impl Program {
         // Страницы родителя стали только на чтение — его потоки на других
         // процессорах не должны писать по старым трансляциям.
         if downgraded {
-            arch::flush_user_translations();
+            arch::flush_user_translations(Some(self.space.root()));
         }
         Ok(Self {
             space,
@@ -6422,7 +6422,7 @@ fn release_region(space: &mut Space, region: &Mapping, shared: bool) -> usize {
         // держит эта же запись; в пул они не уходят.
         let removed = unsafe { space.unmap_range_keep(VirtAddr::new(region.base), region.pages) };
         if shared && removed > 0 {
-            arch::flush_user_translations();
+            arch::flush_user_translations(Some(space.root()));
         }
         return removed;
     }

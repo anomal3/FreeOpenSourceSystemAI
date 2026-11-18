@@ -54,6 +54,11 @@ pub static WL_BUSY: AtomicU64 = AtomicU64::new(0);
 /// Перерисовки по короткому пути: строки клиента — одной копией, без
 /// прохода по точкам (P8).
 pub static WL_DIRECT: AtomicU64 = AtomicU64::new(0);
+/// Самая быстрая копия за окно, нс на мегаточку (19.11.2026): среднее — это
+/// время по часам, и на загруженной машине в него входит вытеснение задачи
+/// Wayland посреди копии (очередь из пяти-шести готовых потоков llvmpipe по
+/// 10 мс кванта); лучшая — сколько стоит сама копия.
+pub static WL_PAINT_BEST: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Включить или выключить отчёт.
 pub fn set_enabled(on: bool) {
@@ -86,7 +91,8 @@ pub fn ensure_started() {
 struct Mark {
     at_ms: u64,
     calls: Vec<(u64, u64)>,
-    shootdowns: (u64, u64),
+    /// `(просьб, ожидание нс, худшее нс, без адресатов, адресатов)`.
+    shootdowns: (u64, u64, u64, u64, u64),
     kicks: (u64, u64),
     futex: [u64; 4],
     deferred: (u64, u64),
@@ -231,13 +237,20 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     }
     let shoot = new.shootdowns.0.saturating_sub(old.shootdowns.0);
     let shoot_ns = new.shootdowns.1.saturating_sub(old.shootdowns.1);
+    // Худшее — за окно (счётчик забывается при каждом снимке); без адресатов
+    // — сбросы, которым прерывания не понадобились вовсе (19.11).
+    let shoot_worst = new.shootdowns.2;
+    let shoot_local = new.shootdowns.3.saturating_sub(old.shootdowns.3);
+    let shoot_cpus = new.shootdowns.4.saturating_sub(old.shootdowns.4);
     let kicks = (new.kicks.0.saturating_sub(old.kicks.0), new.kicks.1.saturating_sub(old.kicks.1));
     let futex: [u64; 4] = core::array::from_fn(|i| new.futex[i].saturating_sub(old.futex[i]));
     let deferred = (new.deferred.0.saturating_sub(old.deferred.0), new.deferred.1.saturating_sub(old.deferred.1));
     let _ = write!(
         line,
-        " tlb shootdowns {shoot} (wait {} ms); kick IPIs {} sent {} taken; futex wait {} wake {} woke {} waitv {}; deferred wakes {} (overflow {})",
+        " tlb shootdowns {shoot} to {shoot_cpus} cpus (wait {} ms, {} us each, worst {} us), {shoot_local} needed no IPI; kick IPIs {} sent {} taken; futex wait {} wake {} woke {} waitv {}; deferred wakes {} (overflow {})",
         ms(shoot_ns),
+        shoot_ns / shoot.max(1) / 1000,
+        shoot_worst / 1000,
         kicks.0,
         kicks.1,
         futex[0],
@@ -280,13 +293,20 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     let mut line = String::new();
     let _ = write!(
         line,
-        "{secs} s frames: wayland {} commits ({}/s), {} paints ({} direct), copy {} ms/paint ({} Kpx), {} frame callbacks, {} busy; desktop {frames} frames ({}/s): compose {} ms, blit {} ms, flush {} ms per frame, {} Kpx/frame, worst {} ms",
+        "{secs} s frames: wayland {} commits ({}/s), {} paints ({} direct), copy {} ms/paint ({} Kpx, {} MB/s, best {} MB/s), {} frame callbacks, {} busy; desktop {frames} frames ({}/s): compose {} ms, blit {} ms, flush {} ms per frame, {} Kpx/frame, worst {} ms",
         wl[0],
         rate(wl[0]),
         wl[1],
         wl[6],
         ms(wl[2] / paints),
         wl[3] / paints / 1000,
+        // Байт за микросекунду — это и есть МБ/с (по 4 байта на точку).
+        if wl[2] == 0 { 0 } else { wl[3] * 4 * 1000 / wl[2] },
+        // нс на мегаточку → МБ/с: 4 МБ за столько нс.
+        match WL_PAINT_BEST.swap(u64::MAX, Ordering::Relaxed) {
+            u64::MAX | 0 => 0,
+            best => 4_000_000_000 / best,
+        },
         wl[4],
         wl[5],
         rate(frames),

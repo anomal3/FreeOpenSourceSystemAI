@@ -108,6 +108,9 @@ static TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::n
 /// командами `wlpace`/`wlping`: сравнить с прежним поведением на железе.
 static PACE: AtomicBool = AtomicBool::new(true);
 static PING: AtomicBool = AtomicBool::new(true);
+/// Непрозрачные строки смешиваемых слоёв — копией (19.11.2026);
+/// `wlopaque off` — через `over` по точкам, как раньше.
+pub static OPAQUE_ROWS: AtomicBool = AtomicBool::new(true);
 
 pub fn set_pace(on: bool) {
     PACE.store(on, Ordering::Relaxed);
@@ -1708,7 +1711,13 @@ impl Client {
         if painted.is_ok() {
             super::perfdiag::WL_PAINTS.fetch_add(1, Ordering::Relaxed);
             super::perfdiag::WL_PAINT_NS.fetch_add(copy_ns, Ordering::Relaxed);
-            super::perfdiag::WL_PAINT_PX.fetch_add(u64::from(area.w) * u64::from(area.h), Ordering::Relaxed);
+            let px = u64::from(area.w) * u64::from(area.h);
+            super::perfdiag::WL_PAINT_PX.fetch_add(px, Ordering::Relaxed);
+            // Лучшая копия — только по крупным (от 0,1 Мточки): у мелких
+            // кусков цена вызова больше цены точек.
+            if px >= 100_000 {
+                super::perfdiag::WL_PAINT_BEST.fetch_min(copy_ns * 1_000_000 / px, Ordering::Relaxed);
+            }
         } else {
             super::perfdiag::WL_BUSY.fetch_add(1, Ordering::Relaxed);
         }
@@ -2433,13 +2442,15 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
             target.row_mut(y as u32)[ax0 as usize..ax1 as usize].fill(fill);
         }
     }
-    let mut row = Vec::new();
-    if row.try_reserve_exact(area.w as usize * 4).is_err() {
+    // Точки, а не байты: строку смешиваемого слоя проверяем на прозрачность
+    // словами (см. ниже), и ей нужно выравнивание `u32`.
+    let mut row: Vec<u32> = Vec::new();
+    if row.try_reserve_exact(area.w as usize).is_err() {
         return false;
     }
     // Строк, ушедших одной копией (P8, `perf-diag`).
     let mut direct = 0u64;
-    row.resize(area.w as usize * 4, 0u8);
+    row.resize(area.w as usize, 0u32);
     for layer in layers {
         let buf = &layer.buf;
         let x0 = layer.x.max(ax0);
@@ -2479,23 +2490,32 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
                     direct += 1;
                     continue;
                 }
-                if swap {
-                    for pixel in out.iter_mut() {
-                        *pixel = to_screen(u32::from_le(*pixel) | or) & keep;
-                    }
-                } else if or != 0 || keep != u32::MAX {
-                    for pixel in out.iter_mut() {
-                        *pixel = (u32::from_le(*pixel) | or) & keep;
-                    }
+                if swap || or != 0 || keep != u32::MAX {
+                    fix_row(out, swap, or, keep);
                 }
                 continue;
             }
-            if !buf.mem.read(at, &mut row[..count * 4]) {
+            let src_row = &mut row[..count];
+            // SAFETY: байты тех же `count` точек.
+            let bytes = unsafe { core::slice::from_raw_parts_mut(src_row.as_mut_ptr().cast::<u8>(), count * 4) };
+            if !buf.mem.read(at, bytes) {
                 return false;
             }
             let out = &mut target.row_mut(ty as u32)[x0 as usize..x1 as usize];
-            for (pixel, bytes) in out.iter_mut().zip(row.chunks_exact(4)) {
-                let mut src = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            // Строка смешиваемого слоя целиком непрозрачна — `over` вернул бы
+            // её саму: копия и тот же проход, что у нижнего слоя (19.11.2026).
+            // Так winewayland кладёт кадр OpenGL (wined3d) — подповерхностью
+            // ARGB над окном, — и по точкам через `over` шёл каждый кадр:
+            // 12,5 мс на 0,9 Мточки даже в лучшем случае.
+            if OPAQUE_ROWS.load(Ordering::Relaxed) && row_opaque(src_row) {
+                out.copy_from_slice(src_row);
+                if swap || keep != u32::MAX {
+                    fix_row(out, swap, 0, keep);
+                }
+                continue;
+            }
+            for (pixel, &src) in out.iter_mut().zip(src_row.iter()) {
+                let mut src = u32::from_le(src);
                 if buf.format == SHM_XRGB8888 {
                     src |= 0xff00_0000;
                 }
@@ -2507,6 +2527,44 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
     if direct > 0 {
         super::perfdiag::WL_DIRECT.fetch_add(1, Ordering::Relaxed);
     }
-    alpha && (ay0..ay1).any(|y| target.row(y as u32)[ax0 as usize..ax1 as usize].iter().any(|pixel| pixel >> 24 != 0xff))
+    alpha && (ay0..ay1).any(|y| !row_opaque(&target.row(y as u32)[ax0 as usize..ax1 as usize]))
+}
+
+/// Привести строку клиента к виду стола: старший байт (`or`, `keep`) и, при
+/// `swap`, красный с синим местами.
+///
+/// Точки — по две за раз (19.11.2026): ядро без векторов, и проход по одной
+/// точке — вдвое больше шагов; в QEMU без ускорения каждый шаг дорог.
+fn fix_row(row: &mut [u32], swap: bool, or: u32, keep: u32) {
+    let or2 = u64::from(or) * 0x1_0000_0001;
+    let keep2 = u64::from(keep) * 0x1_0000_0001;
+    let swap2 = |p: u64| (p & 0xff00_ff00_ff00_ff00) | ((p >> 16) & 0x0000_00ff_0000_00ff) | ((p & 0x0000_00ff_0000_00ff) << 16);
+    let swap1 = |p: u32| (p & 0xff00_ff00) | ((p >> 16) & 0xff) | ((p & 0xff) << 16);
+    // SAFETY: `u64` — две точки `u32` подряд; `align_to_mut` берёт только
+    // выровненную середину, края (по точке, не больше) остаются точками.
+    let (head, middle, tail) = unsafe { row.align_to_mut::<u64>() };
+    if swap {
+        for pair in middle.iter_mut() {
+            *pair = swap2(*pair | or2) & keep2;
+        }
+        for pixel in head.iter_mut().chain(tail.iter_mut()) {
+            *pixel = swap1(*pixel | or) & keep;
+        }
+    } else {
+        for pair in middle.iter_mut() {
+            *pair = (*pair | or2) & keep2;
+        }
+        for pixel in head.iter_mut().chain(tail.iter_mut()) {
+            *pixel = (*pixel | or) & keep;
+        }
+    }
+}
+
+/// Все ли точки строки непрозрачны (альфа 0xff) — по две за раз.
+fn row_opaque(row: &[u32]) -> bool {
+    // SAFETY: см. [`fix_row`].
+    let (head, middle, tail) = unsafe { row.align_to::<u64>() };
+    const ALPHA2: u64 = 0xff00_0000_ff00_0000;
+    head.iter().chain(tail).all(|pixel| pixel >> 24 == 0xff) && middle.iter().all(|pair| pair & ALPHA2 == ALPHA2)
 }
 

@@ -1225,6 +1225,18 @@ fn run_builtin(line: &str) -> bool {
                 if crate::linux::drm::trace() { "on" } else { "off" }
             );
         }
+        // Способ `memcpy`/`memset` ядра (19.11.2026): без аргумента — замер
+        // всех и выбор лучшего, с именем — задать руками для сравнения.
+        "copybench" => match argument.trim() {
+            "" | "auto" => {
+                crate::mm::copy::force(None);
+                crate::user::shm::bench_frame();
+            }
+            name => match crate::mm::copy::parse(name) {
+                Some(method) => crate::mm::copy::force(Some(method)),
+                None => sprintln!("  copybench: usage `copybench [auto|rep-q|rep-b|words|sse]`"),
+            },
+        },
         // Отчёт `perf-diag` в журнал раз в 30 с, пока работают программы
         // Linux (P1, 18.11.2026); `now` — напечатать накопленное сразу.
         #[cfg(target_arch = "x86_64")]
@@ -1241,7 +1253,10 @@ fn run_builtin(line: &str) -> bool {
         // Темп ответов на `wl_surface.frame` (P8) и `ping` клиентам Wayland
         // (P4), RWX поверх разделяемой памяти (P5) — включаемы для сравнения.
         #[cfg(target_arch = "x86_64")]
-        "wlpace" | "wlping" | "lxshrwx" | "lxcfr" => {
+        // Адресный сброс TLB и непрозрачные строки подповерхностей (19.11) —
+        // тоже: `off` — как до них, для сравнения на одном образе.
+        "wlpace" | "wlping" | "lxshrwx" | "lxcfr" | "tlbtarget" | "wlopaque" => {
+            use core::sync::atomic::Ordering::Relaxed;
             let on = match argument.trim() {
                 "on" => Some(true),
                 "off" => Some(false),
@@ -1251,14 +1266,18 @@ fn run_builtin(line: &str) -> bool {
                 match command {
                     "wlpace" => crate::linux::wayland::set_pace(on),
                     "wlping" => crate::linux::wayland::set_ping(on),
-                    "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.store(on, core::sync::atomic::Ordering::Relaxed),
+                    "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.store(on, Relaxed),
+                    "tlbtarget" => crate::arch::smp::FLUSH_TARGETED.store(on, Relaxed),
+                    "wlopaque" => crate::linux::wayland::OPAQUE_ROWS.store(on, Relaxed),
                     _ => crate::user::set_shared_rwx(on),
                 }
             }
             let now = match command {
                 "wlpace" => crate::linux::wayland::pace(),
                 "wlping" => crate::linux::wayland::ping(),
-                "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.load(core::sync::atomic::Ordering::Relaxed),
+                "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.load(Relaxed),
+                "tlbtarget" => crate::arch::smp::FLUSH_TARGETED.load(Relaxed),
+                "wlopaque" => crate::linux::wayland::OPAQUE_ROWS.load(Relaxed),
                 _ => crate::user::shared_rwx(),
             };
             sprintln!("  {command}: {}", if now { "on" } else { "off" });

@@ -1072,10 +1072,16 @@ fn leaf_flags(bits: u64) -> PageFlags {
 /// содержать все отображения ядра: код, стек и обработчики продолжают
 /// исполняться сразу после записи регистра.
 pub unsafe fn activate_space(root: PhysAddr) {
-    // SAFETY: условие делегировано вызывающему. Запись CR3 сбрасывает TLB
-    // целиком — глобальных страниц ядро не заводит (см. `leaf_bits`), поэтому
-    // трансляции покинутого пространства не переживут переключение.
-    unsafe { write_cr3(root) };
+    // Корень — в список «кто где» до записи CR3 (адресный сброс трансляций,
+    // см. `smp::shootdown`); обе записи — на одном процессоре.
+    super::interrupts::without_interrupts(|| {
+        super::smp::note_active_root(root.as_u64());
+        // SAFETY: условие делегировано вызывающему. Запись CR3 сбрасывает TLB
+        // целиком — глобальных страниц ядро не заводит (см. `leaf_bits`),
+        // поэтому трансляции покинутого пространства не переживут
+        // переключение.
+        unsafe { write_cr3(root) };
+    });
 }
 
 /// Вернуть процессор на таблицы ядра.
@@ -1085,8 +1091,23 @@ pub unsafe fn activate_space(root: PhysAddr) {
 /// Вызывать только после [`AddressSpace::activate`]: до неё корня ядра ещё не
 /// существует.
 pub unsafe fn activate_kernel_space() {
-    // SAFETY: см. контракт функции; дерево ядра отображает исполняющийся код и
-    // стек по тем же адресам, что и покидаемое.
+    super::interrupts::without_interrupts(|| {
+        super::smp::note_active_root(kernel_root().as_u64());
+        // SAFETY: см. контракт функции; дерево ядра отображает исполняющийся
+        // код и стек по тем же адресам, что и покидаемое.
+        unsafe { write_cr3(kernel_root()) };
+    });
+}
+
+/// То же до загрузки таблиц дескрипторов (проснувшийся процессор): номера
+/// процессора ещё не прочесть, и корень не запоминается — программ на нём
+/// ещё не было.
+///
+/// # Safety
+///
+/// См. [`activate_kernel_space`].
+pub(super) unsafe fn activate_kernel_space_early() {
+    // SAFETY: см. контракт функции.
     unsafe { write_cr3(kernel_root()) };
 }
 
@@ -1310,13 +1331,14 @@ pub fn flush_local_translations() {
     unsafe { asm!("mov {tmp}, cr3", "mov cr3, {tmp}", tmp = out(reg) _, options(nostack)) };
 }
 
-/// Сбросить трансляции программ на **всех** процессорах (фаза 56).
+/// Сбросить трансляции пространства `root` на процессорах, где оно сейчас
+/// стоит (фаза 56; адресно — 19.11.2026); `None` — на всех.
 ///
 /// Зовётся после снятия страниц или смены прав у многопоточного процесса; на
 /// этом процессоре трансляции сброшены уже по ходу (`invlpg`). См.
 /// [`super::smp::shootdown`].
-pub fn flush_user_translations() {
-    super::smp::shootdown();
+pub fn flush_user_translations(root: Option<PhysAddr>) {
+    super::smp::shootdown(root.map(PhysAddr::as_u64));
 }
 
 /// Подготовить кадр к исполнению после записи в него (фаза 56).

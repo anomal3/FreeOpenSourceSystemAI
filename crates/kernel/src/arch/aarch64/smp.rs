@@ -52,8 +52,8 @@ pub fn kick_stats() -> (u64, u64) {
 
 /// Сбросы трансляций: `tlbi …is` рассылается аппаратно, считать нечего.
 #[must_use]
-pub fn shootdown_stats() -> (u64, u64) {
-    (0, 0)
+pub fn shootdown_stats() -> (u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0)
 }
 
 /// Номер текущего процессора — из `TPIDR_EL1`.

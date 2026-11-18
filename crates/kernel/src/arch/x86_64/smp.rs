@@ -38,7 +38,7 @@
 //! даёт процессор, ушедший по адресу, у которого обрезано старшее слово.
 
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::{apic, gdt, paging, rdmsr};
 use crate::mm::PhysAddr;
@@ -466,7 +466,7 @@ extern "sysv64" fn secondary_entry(index: usize) -> ! {
     // С корня запуска (нижняя страница трамплина плюс верхняя половина) — на
     // корень ядра: он содержит всё то же наверху, а трамплин больше не нужен.
     // SAFETY: таблицы ядра построены и активны на загрузочном процессоре.
-    unsafe { paging::activate_kernel_space() };
+    unsafe { paging::activate_kernel_space_early() };
     // SAFETY: загрузочный подготовил TSS этого процессора до запуска, и это
     // первый код на нём; ни одного лока до этой строки не взято.
     unsafe { gdt::load_secondary(index) };
@@ -528,15 +528,59 @@ const FLUSH_PATIENCE_MS: u64 = 1_000;
 /// Сбрасывается всё, а не страница: перезапись `CR3` тем же значением стоит
 /// одного обхода таблиц на каждый следующий промах, и это дешевле, чем
 /// передавать другим процессорам список адресов.
-pub fn shootdown() {
+///
+/// # Только тем, кто в этом пространстве (19.11.2026)
+///
+/// `root` — корень пространства, которое поменяли; `None` — всем (глобальный
+/// `membarrier`). Раньше просьба шла всем процессорам и ждала всех — и
+/// простаивающих в `hlt`, и занятых чужими программами, которым сброс не
+/// нужен: `CR3` у нас без PCID, и смена пространства сама уносит все
+/// трансляции программ. В QEMU (TCG на Windows) спящий процессор — поток
+/// хоста, который будится по таймеру хоста; perf-diag видел ожидание до
+/// 5 мс на сброс. Теперь прерывание получают только процессоры, у которых
+/// в `CR3` сейчас стоит `root` ([`ACTIVE_ROOT`]), и ждём только их.
+///
+/// Почему не опоздать: процессор сначала пишет свой корень в
+/// [`ACTIVE_ROOT`], потом `CR3` (сериализующая запись), а мы — таблицы,
+/// затем полный барьер, затем читаем [`ACTIVE_ROOT`]. Либо мы видим его
+/// корень и шлём просьбу, либо его обход таблиц начнётся после нашей
+/// записи и увидит новые записи.
+pub fn shootdown(root: Option<u64>) {
+    let root = root.filter(|_| FLUSH_TARGETED.load(Ordering::Relaxed));
     super::interrupts::without_interrupts(|| {
         let me = current_index();
-        let others = |cpu: usize| cpu != me && crate::smp::is_online(cpu);
-        if !(0..crate::smp::MAX_CPUS).any(others) {
+        // Записи таблиц — до чтения корней чужих процессоров (см. выше).
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let mut targets = [false; crate::smp::MAX_CPUS];
+        let mut any = false;
+        for (cpu, target) in targets.iter_mut().enumerate() {
+            if cpu == me || !crate::smp::is_online(cpu) {
+                continue;
+            }
+            if root.is_some_and(|root| ACTIVE_ROOT[cpu].load(Ordering::SeqCst) != root) {
+                continue;
+            }
+            *target = true;
+            any = true;
+        }
+        if !any {
+            FLUSH_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let ticket = FLUSH_ASKED.fetch_add(1, Ordering::AcqRel) + 1;
-        apic::send_to_others(apic::VECTOR_IPI_FLUSH);
+        let mut sent = 0u64;
+        for (cpu, _) in targets.iter().enumerate().filter(|(_, target)| **target) {
+            let id = APIC_IDS[cpu].load(Ordering::Relaxed);
+            if id == u32::MAX {
+                // Номера не знаем — тогда уж всем, как раньше.
+                apic::send_to_others(apic::VECTOR_IPI_FLUSH);
+                sent = crate::smp::MAX_CPUS as u64;
+                break;
+            }
+            apic::send_to(id, apic::VECTOR_IPI_FLUSH);
+            sent += 1;
+        }
+        FLUSH_TARGETS.fetch_add(sent.min(crate::smp::MAX_CPUS as u64), Ordering::Relaxed);
 
         let start = super::tsc::counter();
         // Сколько ждали ответов — в `perf-diag` (P1): число сбросов без цены
@@ -546,7 +590,7 @@ pub fn shootdown() {
         loop {
             serve_flush();
             let behind = (0..crate::smp::MAX_CPUS)
-                .filter(|&cpu| others(cpu))
+                .filter(|&cpu| targets[cpu])
                 .find(|&cpu| FLUSH_DONE[cpu].load(Ordering::Acquire) < ticket);
             let Some(cpu) = behind else {
                 break;
@@ -577,22 +621,54 @@ static FLUSH_IRQS: [AtomicU64; crate::smp::MAX_CPUS] =
 /// Тактов TSC, ушедших на ожидание ответов в [`shootdown`].
 static FLUSH_WAIT_TSC: AtomicU64 = AtomicU64::new(0);
 
+/// Адресный сброс (19.11.2026); `tlbtarget off` — всем, как раньше.
+pub static FLUSH_TARGETED: AtomicBool = AtomicBool::new(true);
+
+/// Самое долгое ожидание одного сброса (тактов TSC) с прошлого вопроса.
+static FLUSH_WORST_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// Сбросов, которым не нашлось ни одного процессора в том же пространстве
+/// (прерываний не было вовсе), и сколько процессоров получили просьбу всего.
+static FLUSH_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static FLUSH_TARGETS: AtomicU64 = AtomicU64::new(0);
+
+/// Корень пространства, стоящий сейчас в `CR3` каждого процессора (0 —
+/// ещё не знаем). Пишет [`note_active_root`] перед каждой записью `CR3`.
+static ACTIVE_ROOT: [AtomicU64; crate::smp::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// Этот процессор переходит на корень `root` — запомнить **до** записи
+/// `CR3` (см. [`shootdown`]). Прерывания должны быть закрыты: иначе
+/// задачу унесут на другой процессор между записью и `CR3`.
+pub fn note_active_root(root: u64) {
+    ACTIVE_ROOT[current_index()].store(root, Ordering::SeqCst);
+}
+
 /// Засчитывает ожидание при выходе из [`shootdown`] любой ветвью.
 struct Spent(u64);
 
 impl Drop for Spent {
     fn drop(&mut self) {
-        FLUSH_WAIT_TSC.fetch_add(super::tsc::counter().wrapping_sub(self.0), Ordering::Relaxed);
+        let spent = super::tsc::counter().wrapping_sub(self.0);
+        FLUSH_WAIT_TSC.fetch_add(spent, Ordering::Relaxed);
+        FLUSH_WORST_TSC.fetch_max(spent, Ordering::Relaxed);
     }
 }
 
-/// Сбросы трансляций на всех процессорах с загрузки и суммарное ожидание
-/// ответов в наносекундах — для `perf-diag` (P1, 18.11.2026).
+/// Сбросы трансляций с загрузки: `(просьб с прерываниями, суммарное
+/// ожидание нс, худшее ожидание нс с прошлого вопроса — и забыть его,
+/// сбросов без адресатов, процессоров-адресатов всего)` — для `perf-diag`
+/// (P1, 18.11.2026; адресаты — 19.11).
 #[must_use]
-pub fn shootdown_stats() -> (u64, u64) {
-    let hz = super::tsc::frequency().max(1);
-    let ticks = FLUSH_WAIT_TSC.load(Ordering::Relaxed);
-    (FLUSH_ASKED.load(Ordering::Relaxed), (u128::from(ticks) * 1_000_000_000 / u128::from(hz)) as u64)
+pub fn shootdown_stats() -> (u64, u64, u64, u64, u64) {
+    let hz = u128::from(super::tsc::frequency().max(1));
+    let ns = |ticks: u64| (u128::from(ticks) * 1_000_000_000 / hz) as u64;
+    (
+        FLUSH_ASKED.load(Ordering::Relaxed),
+        ns(FLUSH_WAIT_TSC.load(Ordering::Relaxed)),
+        ns(FLUSH_WORST_TSC.swap(0, Ordering::Relaxed)),
+        FLUSH_SKIPPED.load(Ordering::Relaxed),
+        FLUSH_TARGETS.load(Ordering::Relaxed),
+    )
 }
 
 /// Номера APIC процессоров по их индексам — для адресного [`kick`].
