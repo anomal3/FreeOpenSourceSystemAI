@@ -2432,6 +2432,22 @@ fn gpu(argument: &str) {
         }
         return;
     }
+    // NVK поверх GSP-RM (18.11, WP-A): `gpu info` — веха M1 (арены
+    // видеопамяти, движки, GPC/TPC, PTIMER); `gpu nvktest [ce|gr]
+    // [skip-pdes]` — веха M2 (канал, объект копирования, копия 1 МиБ через
+    // GPU). Строки `nvgpu:` идут и в журнал на флешке.
+    if argument == "info" || argument == "nvktest" || argument.starts_with("nvktest ") {
+        let log = if argument == "info" {
+            crate::display::nvidia_rm_chan::info_report()
+        } else {
+            crate::display::nvidia_rm_chan::nvktest(argument.trim_start_matches("nvktest"))
+        };
+        for line in log {
+            sprintln!("  gpu: {line}");
+        }
+        crate::usb::stick_log::flush_now();
+        return;
+    }
     let Some(card) = crate::display::nvidia::found() else {
         sprintln!("  gpu: no NVIDIA card found");
         return;
@@ -2444,7 +2460,7 @@ fn gpu(argument: &str) {
         return;
     }
     if !argument.is_empty() {
-        sprintln!("  usage: gpu [boot | gsp [heap MiB] | unload | display]   (boot = FWSEC-FRTS; gsp = start GSP-RM; unload = stop GSP-RM and release WPR2)");
+        sprintln!("  usage: gpu [boot | gsp [heap MiB] | unload | display | info | nvktest [ce|gr] [skip-pdes]]   (boot = FWSEC-FRTS; gsp = start GSP-RM; unload = stop GSP-RM and release WPR2; info/nvktest = NVK self-tests)");
         return;
     }
     let (chip, revision) = crate::display::nvidia::chip_of(card.boot0, card.boot42);

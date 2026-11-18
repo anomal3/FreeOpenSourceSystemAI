@@ -818,7 +818,7 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
                     le32(&payload, 0x644).unwrap_or(0),
                     le32(&payload, 0x648).unwrap_or(0)
                 ));
-                break (le32(&payload, 0x640).unwrap_or(0), le32(&payload, 0x648).unwrap_or(0));
+                break (le32(&payload, 0x640).unwrap_or(0), le32(&payload, 0x648).unwrap_or(0), StaticInfo::parse(&payload));
             }
             Some((function, _, _)) => log.push(format!("event {function:#x} while waiting for static info")),
             None if crate::time::uptime_ms() > deadline => return Err("no GET_GSP_STATIC_INFO reply in 5 s".into()),
@@ -843,7 +843,8 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
 
     // Сеанс живёт дальше: дисплей (`nvidia_disp`) продолжает разговор с RM.
     // Память GSP (журналы, очереди, образ) не возвращается никогда.
-    *SESSION.lock() = Some(Session { queues, bar, internal_client: internal.0, internal_subdevice: internal.1 });
+    *SESSION.lock() =
+        Some(Session { queues, bar, internal_client: internal.0, internal_subdevice: internal.1, info: internal.2 });
     Ok(())
 }
 
@@ -853,17 +854,211 @@ pub(crate) struct Session {
     pub(crate) bar: Bar0,
     pub(crate) internal_client: u32,
     pub(crate) internal_subdevice: u32,
+    /// Разобранный ответ GET_GSP_STATIC_INFO (NVK, 18.11).
+    pub(crate) info: StaticInfo,
 }
 
 // SAFETY: очереди — память машины, отданная GSP; ходит один владелец под замком.
 unsafe impl Send for Session {}
 
-pub(crate) static SESSION: crate::sync::SpinLock<Option<Session>> = crate::sync::SpinLock::new(None);
+/// Область видеопамяти, как её описал RM (`fbRegion[]` статических сведений).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FbRegion {
+    pub(crate) base: u64,
+    /// Последний байт включительно.
+    pub(crate) limit: u64,
+    pub(crate) reserved: u64,
+    pub(crate) perf: u32,
+    pub(crate) compr: u8,
+    pub(crate) iso: u8,
+    pub(crate) protected: u8,
+}
+
+/// Что из статических сведений нужно NVK (`nvidia_rm_*`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StaticInfo {
+    pub(crate) name: String,
+    pub(crate) fb_length: u64,
+    pub(crate) regions: Vec<FbRegion>,
+    pub(crate) bar1_pde: u64,
+    pub(crate) bar2_pde: u64,
+}
+
+impl StaticInfo {
+    fn parse(payload: &[u8]) -> Self {
+        let name = payload.get(0x4ec..0x52c).unwrap_or(&[]);
+        let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+        let count = le32(payload, 0x158).unwrap_or(0).min(16) as usize;
+        let regions = (0..count)
+            .map(|i| {
+                let at = 0x160 + i * 48;
+                FbRegion {
+                    base: le64(payload, at).unwrap_or(0),
+                    limit: le64(payload, at + 8).unwrap_or(0),
+                    reserved: le64(payload, at + 16).unwrap_or(0),
+                    perf: le32(payload, at + 24).unwrap_or(0),
+                    compr: payload.get(at + 28).copied().unwrap_or(0),
+                    iso: payload.get(at + 29).copied().unwrap_or(0),
+                    protected: payload.get(at + 30).copied().unwrap_or(0),
+                }
+            })
+            .collect();
+        Self {
+            name: String::from_utf8_lossy(&name[..end]).into_owned(),
+            fb_length: le64(payload, 0x4c8).unwrap_or(0),
+            regions,
+            bar1_pde: le64(payload, 0x600).unwrap_or(0),
+            bar2_pde: le64(payload, 0x608).unwrap_or(0),
+        }
+    }
+}
+
+/// Замок сеанса GSP-RM (NVK, 18.11; спецификация, риск 9).
+///
+/// Раньше сеанс лежал под `SpinLock`, и ожидание ответа RM (до 5 с) шло с
+/// запрещёнными прерываниями. Теперь это флаг занятости: ждущая задача
+/// засыпает по миллисекунде, а держатель работает с разрешёнными
+/// прерываниями. Если звать из места, где спать нельзя (держится спин-лок или
+/// прерывания запрещены), ожидание крутится, как раньше. API тот же
+/// (`lock`/`try_lock`), чтобы дисплей (`nvidia_disp`) и выгрузка не менялись.
+pub(crate) struct SessionLock {
+    busy: core::sync::atomic::AtomicBool,
+    value: core::cell::UnsafeCell<Option<Session>>,
+}
+
+// SAFETY: доступ к `value` — только через `SessionGuard`, который выдаётся
+// после захвата флага `busy` и существует в единственном экземпляре.
+unsafe impl Sync for SessionLock {}
+
+impl SessionLock {
+    const fn new() -> Self {
+        Self { busy: core::sync::atomic::AtomicBool::new(false), value: core::cell::UnsafeCell::new(None) }
+    }
+
+    /// Захватить, если свободен.
+    pub(crate) fn try_lock(&self) -> Option<SessionGuard<'_>> {
+        self.busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+            .then_some(SessionGuard { lock: self })
+    }
+
+    /// Захватить, дождавшись освобождения.
+    pub(crate) fn lock(&self) -> SessionGuard<'_> {
+        loop {
+            if let Some(guard) = self.lock_within(60_000) {
+                return guard;
+            }
+            crate::kprintln!("  nvidia-gsp  : GSP-RM session busy for 60 s - still waiting");
+        }
+    }
+
+    /// Захватить, ожидая не дольше `ms` миллисекунд.
+    pub(crate) fn lock_within(&self, ms: u64) -> Option<SessionGuard<'_>> {
+        let deadline = crate::time::uptime_ms() + ms;
+        loop {
+            if let Some(guard) = self.try_lock() {
+                return Some(guard);
+            }
+            if crate::time::uptime_ms() > deadline {
+                return None;
+            }
+            pause_briefly();
+        }
+    }
+}
+
+/// Доступ к сеансу на время удержания [`SessionLock`].
+pub(crate) struct SessionGuard<'a> {
+    lock: &'a SessionLock,
+}
+
+impl core::ops::Deref for SessionGuard<'_> {
+    type Target = Option<Session>;
+    fn deref(&self) -> &Option<Session> {
+        // SAFETY: охранник существует только при захваченном флаге.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl core::ops::DerefMut for SessionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Option<Session> {
+        // SAFETY: см. `Deref`.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: охранник ещё держит флаг — сеанс читается без гонки.
+        let alive = unsafe { (*self.lock.value.get()).is_some() };
+        RUNNING.store(alive, Ordering::Release);
+        self.lock.busy.store(false, Ordering::Release);
+    }
+}
+
+/// Можно ли здесь уснуть: прерывания разрешены, спин-локов не держим,
+/// планировщик идёт.
+fn may_sleep() -> bool {
+    crate::arch::interrupts::enabled() && !crate::sync::spin_held() && crate::sched::is_running()
+}
+
+/// Короткая пауза ожидания: миллисекунда сна, если можно спать, иначе 100 мкс
+/// активного ожидания.
+pub(crate) fn pause_briefly() {
+    if may_sleep() {
+        crate::sched::sleep_ms(1);
+    } else {
+        spin_us(100);
+    }
+}
+
+pub(crate) static SESSION: SessionLock = SessionLock::new();
+/// Есть ли сеанс — без захвата замка (его спрашивают из композитора).
+static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Работает ли GSP-RM.
 #[must_use]
 pub fn running() -> bool {
-    SESSION.lock().is_some()
+    RUNNING.load(Ordering::Acquire)
+}
+
+/// Окно BAR1 (физический режим: смещение окна == адрес видеопамяти) для
+/// процессора: `[BAR1_WINDOW_START, BAR1_WINDOW_END)` с объединением записи.
+/// Отображается один раз на всю жизнь ядра и общее для дисплея
+/// (`nvidia_disp`) и NVK (`nvidia_rm_vram`): повторное `map_active` того же
+/// куска отвечает `AlreadyMapped` (2-МиБ страницы), и второй потребитель
+/// раньше падал.
+pub(crate) const BAR1_WINDOW_START: u64 = 0x0600_0000;
+pub(crate) const BAR1_WINDOW_END: u64 = 0x1000_0000;
+static BAR1_VIRT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Виртуальный адрес, под которым процессор видит видеопамять
+/// `BAR1_WINDOW_START`; отображает окно при первом вызове.
+pub(crate) fn bar1_window(device: crate::pci::Device) -> Res<usize> {
+    let known = BAR1_VIRT.load(Ordering::Acquire);
+    if known != 0 {
+        return Ok(known);
+    }
+    let bar1 = device.memory_bar(1).ok_or("no BAR1")?.as_u64();
+    let phys = PhysAddr::new(bar1 + BAR1_WINDOW_START);
+    let virt = phys.to_direct_map();
+    // SAFETY: окно видеопамяти карты; запись с объединением (WC), как у дисплея.
+    let mapped = unsafe {
+        crate::arch::map_active(
+            virt,
+            phys,
+            (BAR1_WINDOW_END - BAR1_WINDOW_START) as usize,
+            crate::mm::PageFlags::READ | crate::mm::PageFlags::WRITE | crate::mm::PageFlags::WRITE_COMBINE,
+        )
+    };
+    match mapped {
+        // Уже отображено (прошлый сеанс GSP после `gpu unload`): то же окно.
+        Ok(()) | Err(crate::mm::MapError::AlreadyMapped) => {}
+        Err(why) => return Err(format!("could not map BAR1: {why}")),
+    }
+    BAR1_VIRT.store(virt.as_usize(), Ordering::Release);
+    Ok(virt.as_usize())
 }
 
 /// Состояние BAR1 и дисплейных головок — для журнала.
@@ -884,6 +1079,81 @@ fn snapshot(bar: Bar0) -> String {
         out.push_str(&format!(" | head{head} raster {raster:#x} line {line0}->{line1}"));
     }
     out
+}
+
+// --- события GSP (NVK, 18.11) ----------------------------------------------
+//
+// Номера — r570.144 (`rm/r570/nvrm/msgfn.h` в Linux): у r535 часть
+// номеров после 0x101a сдвинута, поэтому только эти.
+
+const EV_POST_EVENT: u32 = 0x1003;
+const EV_RC_TRIGGERED: u32 = 0x1004;
+const EV_MMU_FAULT_QUEUED: u32 = 0x1005;
+const EV_OS_ERROR_LOG: u32 = 0x1006;
+const EV_UCODE_LIBOS_PRINT: u32 = 0x100c;
+const EV_GSP_LOCKDOWN_NOTICE: u32 = 0x101c;
+const EV_GSP_POST_NOCAT_RECORD: u32 = 0x1020;
+const EV_FECS_ERROR: u32 = 0x1021;
+
+/// Каналы, которые RM объявил убитыми (RC_TRIGGERED): (chid, тип исключения).
+/// Читает и очищает `nvidia_rm_chan`.
+pub(crate) static RC_CHIDS: crate::sync::SpinLock<Vec<(u32, u32)>> = crate::sync::SpinLock::new(Vec::new());
+static EVENTS_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Первые `n` байт в шестнадцатеричном виде — для журнала.
+pub(crate) fn hex_head(bytes: &[u8], n: usize) -> String {
+    let mut out = String::new();
+    for (i, b) in bytes.iter().take(n).enumerate() {
+        if i > 0 && i % 4 == 0 {
+            out.push(' ');
+        }
+        out.push_str(&format!("{b:02x}"));
+    }
+    if bytes.len() > n {
+        out.push_str("..");
+    }
+    out
+}
+
+/// Печатный текст из байтов (строки ошибок RM).
+fn printable(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    bytes[..end].iter().map(|b| if (0x20..0x7f).contains(b) { char::from(*b) } else { '.' }).collect()
+}
+
+/// Разобрать событие GSP, пришедшее без запроса. Строка — для журнала
+/// (`nvgpu: gsp event ...`); `None` — событие нам неизвестно. RC_TRIGGERED
+/// запоминается в [`RC_CHIDS`] (канал убит — `chan_seq_done` вернёт ENODEV).
+pub(crate) fn gsp_event(function: u32, result: u32, p: &[u8]) -> Option<String> {
+    let w = |at: usize| le32(p, at).unwrap_or(0);
+    let line = match function {
+        EV_RC_TRIGGERED => {
+            let (engine, chid, level, kind) = (w(0), w(4), w(12), w(16));
+            RC_CHIDS.lock().push((chid, kind));
+            format!(
+                "RC_TRIGGERED chid {chid} engine {engine} exceptLevel {level} exceptType {kind:#x} scope {} mmu fault {:#x} type {} (head {})",
+                w(20),
+                u64::from(w(28)) | (u64::from(w(32)) << 32),
+                w(36),
+                hex_head(p, 0x30)
+            )
+        }
+        EV_MMU_FAULT_QUEUED => format!("MMU_FAULT_QUEUED ({} B: {})", p.len(), hex_head(p, 0x40)),
+        EV_OS_ERROR_LOG => format!("OS_ERROR_LOG exceptType {:#x} '{}'", w(0), printable(p.get(8..).unwrap_or(&[]))),
+        EV_POST_EVENT => format!("POST_EVENT ({} B: {})", p.len(), hex_head(p, 0x20)),
+        EV_UCODE_LIBOS_PRINT => format!("UCODE_LIBOS_PRINT engine {:#x} ({} B: {})", w(0), p.len(), hex_head(p, 0x20)),
+        EV_GSP_LOCKDOWN_NOTICE => format!("GSP_LOCKDOWN_NOTICE {:#x}", w(0)),
+        EV_GSP_POST_NOCAT_RECORD => format!("GSP_POST_NOCAT_RECORD ({} B)", p.len()),
+        EV_FECS_ERROR => format!("FECS_ERROR ({} B: {})", p.len(), hex_head(p, 0x20)),
+        _ => return None,
+    };
+    let line = format!("nvgpu: gsp event {function:#x} (result {result:#x}) {line}");
+    // Журнал не топится: первые 64 события и каждое RC — сразу на флешку.
+    let n = EVENTS_LOGGED.fetch_add(1, Ordering::Relaxed);
+    if n < 64 || function == EV_RC_TRIGGERED {
+        crate::kprintln!("  {line}");
+    }
+    Some(line)
 }
 
 // --- RM: объекты и управление (этап 6) --------------------------------------
@@ -911,9 +1181,14 @@ impl Rm<'_> {
     }
 
     /// То же, но ждать ответа не дольше `ms` миллисекунд.
+    ///
+    /// Ждёт сначала 2 мс активно (ответы RM обычно быстрее), потом засыпает
+    /// по миллисекунде, если здесь можно спать (замок сеанса — не спин-лок).
+    /// События GSP, пришедшие по дороге, разбирает [`gsp_event`].
     pub(crate) fn call_within(&mut self, function: u32, payload: &[u8], ms: u64) -> Res<Vec<u8>> {
         self.queues.send(Some(self.bar), function, payload)?;
-        let deadline = crate::time::uptime_ms() + ms;
+        let start = crate::time::uptime_ms();
+        let deadline = start + ms;
         loop {
             match self.queues.receive()? {
                 Some((f, result, reply)) if f == function => {
@@ -922,24 +1197,67 @@ impl Rm<'_> {
                     }
                     return Ok(reply);
                 }
-                Some((f, _, _)) => self.log.push(format!("event {f:#x} during RPC {function}")),
+                Some((f, result, payload)) => {
+                    if let Some(line) = gsp_event(f, result, &payload) {
+                        self.log.push(line);
+                    } else {
+                        self.log.push(format!("event {f:#x} during RPC {function}"));
+                    }
+                }
                 None if crate::time::uptime_ms() > deadline => return Err(format!("no reply to RPC {function} in {ms} ms")),
-                None => spin_us(200),
+                None if crate::time::uptime_ms() < start + 2 => spin_us(50),
+                None => pause_briefly(),
             }
         }
     }
 
-    /// GSP_RM_ALLOC: объект `class` с хэндлом `object` под `parent`.
+    /// Разобрать пришедшие без запроса события (NVK: перед каждым витком
+    /// ожидания забора). Ничего не ждёт.
+    pub(crate) fn pump(&mut self) -> Res<usize> {
+        let mut seen = 0;
+        while let Some((f, result, payload)) = self.queues.receive()? {
+            seen += 1;
+            if let Some(line) = gsp_event(f, result, &payload) {
+                self.log.push(line);
+            } else {
+                self.log.push(format!("unsolicited message {f:#x} (result {result:#x}, {} B)", payload.len()));
+            }
+        }
+        Ok(seen)
+    }
+
+    /// GSP_RM_ALLOC: объект `class` с хэндлом `object` под `parent` нашего
+    /// клиента дисплея.
     pub(crate) fn alloc(&mut self, parent: u32, object: u32, class: u32, params: &[u8]) -> Res<()> {
+        self.alloc_in(H_CLIENT, parent, object, class, params).map(|_| ())
+    }
+
+    /// GSP_RM_ALLOC от имени клиента `client` (NVK: у каждого адресного
+    /// пространства свой клиент). Возвращает ответные параметры (RM пишет в
+    /// них, например, выбранные значения). При ошибке — статус и начало
+    /// сырого ответа (раскладки 570 против 535 сверяются по ним).
+    pub(crate) fn alloc_in(&mut self, client: u32, parent: u32, object: u32, class: u32, params: &[u8]) -> Res<Vec<u8>> {
         let mut p = alloc::vec![0u8; 0x20 + params.len()];
-        for (at, v) in [(0, H_CLIENT), (4, parent), (8, object), (12, class), (0x14, params.len() as u32)] {
+        for (at, v) in [(0, client), (4, parent), (8, object), (12, class), (0x14, params.len() as u32)] {
             p[at..at + 4].copy_from_slice(&v.to_le_bytes());
         }
         p[0x20..].copy_from_slice(params);
         let reply = self.call(FN_RM_ALLOC, &p)?;
         let status = le32(&reply, 0x10)?;
         if status != 0 {
-            return Err(format!("alloc class {class:#x} status {status:#x}"));
+            return Err(format!("alloc class {class:#x} handle {object:#x} status {status:#x} (reply head {})", hex_head(&reply, 0x40)));
+        }
+        Ok(reply.get(0x20..).unwrap_or(&[]).to_vec())
+    }
+
+    /// RPC FREE: снять объект `object` (с потомками) у клиента `client`.
+    /// Клиент снимается так: `client, 0, client`.
+    pub(crate) fn free_in(&mut self, client: u32, parent: u32, object: u32) -> Res<()> {
+        let free = [client, parent, object, 0].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let reply = self.call_within(FN_FREE, &free, 2000)?;
+        let status = le32(&reply, 12).unwrap_or(u32::MAX);
+        if status != 0 {
+            return Err(format!("free {object:#x} status {status:#x}"));
         }
         Ok(())
     }
@@ -954,7 +1272,7 @@ impl Rm<'_> {
         let reply = self.call(FN_RM_CONTROL, &p)?;
         let status = le32(&reply, 0x0c)?;
         if status != 0 {
-            return Err(format!("control {cmd:#x} status {status:#x}"));
+            return Err(format!("control {cmd:#x} status {status:#x} (reply head {})", hex_head(&reply, 0x40)));
         }
         Ok(reply.get(0x18..).unwrap_or(&[]).to_vec())
     }
@@ -1416,6 +1734,11 @@ pub fn unload(reason: &str) -> Log {
     if let Some(mut session) = session {
         super::nvidia_disp::forget();
         let mut rm = Rm { queues: &mut session.queues, bar, log: Vec::new() };
+        // 0. NVK: бэкенд больше не принимает вызовов, клиенты RM адресных
+        // пространств (с каналами под ними) снимаются первыми.
+        for line in super::nvidia_rm_chan::shutdown(&mut rm) {
+            steps.push(line);
+        }
         // 1. Наш клиент RM (с устройством, дисплеем и каналами под ним).
         let free = [H_CLIENT, 0, H_CLIENT, 0].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
         match rm.call_within(FN_FREE, &free, 1000) {
@@ -1515,6 +1838,12 @@ pub fn auto_task() {
     let log = boot_gsp("");
     if !log.iter().any(|l| l == "GSP-RM: running") {
         return;
+    }
+    // NVK (18.11): бэкенд GPU для слоя DRM — только сведения и арены, на
+    // карте ничего не создаётся; узел /dev/dri включается отдельно.
+    let mut nvk = Log::new();
+    if let Err(why) = super::nvidia_rm_chan::attach(&mut nvk) {
+        crate::kprintln!("  nvgpu: backend not attached - {why}");
     }
     // Режимы мониторов — сохранённые «Параметрами» (modeset берёт их сам по
     // паспорту монитора, а не предложенный — родной). Места, основной и

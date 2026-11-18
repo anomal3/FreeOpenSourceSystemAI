@@ -13980,6 +13980,62 @@ SoftGpu), M5 — с настоящим бэкендом WP-A на RTX 3060.
 его покажет при работающем GSP) заставит DXVK выбрать NVK вместо lavapipe —
 тогда `FOSSAI_VULKAN=lvp` или не показывать узел без явного включения.
 
+### WP-A: RM и железо (M1 + M2 в коде, ждут проверки на RTX 3060) — 18.11
+
+Файлы: `display/nvidia_gsp.rs` (правки), новые `display/nvidia_rm_{vram,
+info,vmm,gr,chan}.rs`, `gpu info` / `gpu nvktest` в `shell.rs`. Кодирование
+таблиц, кольца, забора и копии — из `nvgpu` (WP-B), здесь — память, RM,
+регистры.
+- **Сеанс GSP без спин-лока** (риск 9): `SESSION` — свой замок с тем же API
+  (`lock`/`try_lock` + `lock_within(ms)`); ждущий спит по 1 мс, ожидание
+  ответа RM — 2 мс активно, дальше сон (если можно спать). `running()` —
+  атомик (его спрашивает композитор). Дисплей и `unload` не менялись.
+- **Окно BAR1 одно на всех** (`nvidia_gsp::bar1_window`): второе
+  `map_active` того же окна давало AlreadyMapped — дисплей (`nvidia_disp`
+  — одна строка) и NVK берут общее; заодно `gpu display` после `gpu unload`
+  + `gpu gsp` больше не падает на «could not map BAR1».
+- **RM**: `Rm::alloc_in(client, ..)` (ответ RM возвращается), `free_in`,
+  при отказе — статус и начало сырого ответа; события GSP r570
+  (RC_TRIGGERED 0x1004 → `RC_CHIDS`, MMU_FAULT_QUEUED, OS_ERROR_LOG,
+  LIBOS_PRINT, LOCKDOWN, NOCAT, FECS_ERROR) — строками `nvgpu: gsp event`;
+  `StaticInfo` (FB-области, BAR1/BAR2 PDE, имя) в сеансе.
+- **Видеопамять** (`nvidia_rm_vram`): **поправка к спецификации 2.7** —
+  `[0x0800_0000, 0x1000_0000)` заняты кадрами дисплея (`fb(head) = 0x0800_0000
+  + head * 0x0220_0000`), CPU-арена — `[0x0610_0000, 0x0800_0000)` (31 МиБ:
+  PD/PT, inst, USERD, golden inst), bulk — с `0x1000_0000` до конца свободной
+  области RM (у Романа область 2 до `0x2f06dffff`). Проверка по FB-областям
+  при старте, запись/чтение через окно.
+- **Пространство** (`nvidia_rm_vmm`): клиент `0xc1d0_0010+id`, device,
+  subdevice, FERMI_VASPACE_A; резерв RM 512 МиБ в начале kernel-managed
+  (`1<<39`), COPY_SERVER_RESERVED_PDES (2 уровня, если у PD2[0] нет PD1;
+  в журнале PD2[i] до/после — видно, переписал ли RM); **отображения ядра —
+  под следующей записью PD2** (`kernel + 1<<38`), чтобы не делить таблицу с
+  RM; таблицы через `nvgpu::gmmu` поверх окна BAR1; join, сброс TLB.
+- **GR** (`nvidia_rm_gr`): golden context как `r535_gr_oneinit` (r570 его же
+  зовёт): пространство, привилегированный канал chid 1 (`rsvd_chids` r570),
+  `GET_CONTEXT_BUFFERS_INFO` (0x1a записей у r570), таблица 9 буферов,
+  PROMOTE_CTX, 3D-объект, снятие; на канал пользователя — свои MAIN/PATCH,
+  глобальные общие, PROMOTE при первом объекте GR.
+- **Канал и бэкенд** (`nvidia_rm_chan`): `NV_CHANNEL_ALLOC_PARAMS` 0x170 (r570:
+  + `tpcConfigID`, TSG не нужен), BIND + SCHEDULE (у r570 по-прежнему), жетон
+  RM против расчётного, PDB до/после; chid = 8 × страница USERD; GPFIFO,
+  `USERD+0x8c`, звонок `0xbb0090`; забор — сегмент SEMAPHOREA..D; сторож 10 с;
+  `RmBackend: GpuBackend` (BO в VRAM/памяти машины, VM, каналы, объекты,
+  отправка, PTIMER, VRAM_USED). `attach()` — в `auto_task` после GSP (только
+  сведения и арены); `shutdown()` — из `unload` до клиента дисплея.
+- **Самопроверки**: `gpu info` → `nvgpu: SELFTEST m1 PASS|FAIL` (арены,
+  движки, GPC/TPC, PTIMER идёт); `gpu nvktest [ce|gr] [skip-pdes]` → копия 1
+  МиБ память машины → VRAM → память машины через CE C7B5 с семафором CE и
+  забором канала, `nvgpu: SELFTEST m2 ce-copy AsyncCopy|Gr PASS|FAIL`. По
+  умолчанию сначала канал на runlist асинхронного CE (без GR), потом канал GR
+  (golden, 3D, compute, copy).
+
+Ждёт: проверки на ПК Романа (порядок — в отчёте WP-A ведущему). Слою DRM
+бэкенд отдаётся `linux::drm::set_backend` из `attach()` (и `None` при выгрузке).
+Не сделано: разреженность только по PTE/PD0 через gmmu без проверки на
+железе; таблицы и kernel-VA не возвращаются до снятия пространства;
+прерывания (nonstall) — M8.
+
 ## Стенд: `Expect` сразу за ожиданием начала строки
 
 `Step::Expect` смотрит в уже прочитанное, а ожидание перед ним находит

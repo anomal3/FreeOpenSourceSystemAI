@@ -23,7 +23,6 @@ use core::sync::atomic::{Ordering, fence};
 
 use super::nvidia::Bar0;
 use super::nvidia_gsp::{H_CLIENT, H_DEVICE, Log, Mem, Res, Rm, SESSION, le32};
-use crate::mm::PageFlags;
 
 // --- раскладка видеопамяти (область 2 RM: свободная, с 0x5150000) ----------
 
@@ -374,19 +373,10 @@ fn bring_up(rm: &mut Rm, log: &mut Log, internal: (u32, u32), device: crate::pci
     let bar = rm.bar;
     // BAR1 (физический режим) → видеопамять для процессора.
     let bar1 = device.memory_bar(1).ok_or("no BAR1")?.as_u64();
-    let phys = crate::mm::PhysAddr::new(bar1 + VRAM_MAP_START);
-    let virt = phys.to_direct_map();
-    // SAFETY: окно видеопамяти карты; запись с объединением (WC).
-    unsafe {
-        crate::arch::map_active(
-            virt,
-            phys,
-            (VRAM_MAP_END - VRAM_MAP_START) as usize,
-            PageFlags::READ | PageFlags::WRITE | PageFlags::WRITE_COMBINE,
-        )
-    }
-    .map_err(|_| "could not map BAR1")?;
-    let vram = Vram { base: virt.as_usize() };
+    // Окно общее с NVK (`nvidia_rm_vram`) и отображается один раз: второе
+    // `map_active` того же куска отвечает AlreadyMapped (18.11).
+    const _: () = assert!(VRAM_MAP_START == super::nvidia_gsp::BAR1_WINDOW_START && VRAM_MAP_END == super::nvidia_gsp::BAR1_WINDOW_END);
+    let vram = Vram { base: super::nvidia_gsp::bar1_window(device)? };
     vram.zero(INST, 0x10000);
     vram.zero(SYNC, 0x1000);
     vram.w32(INST + 0x8000, 0x1234_5678);
