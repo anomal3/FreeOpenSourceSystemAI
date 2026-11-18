@@ -13766,6 +13766,58 @@ CUDA/драйвер NVIDIA и расскажет своими словами, к
 по его рассказу и открытым исходникам NVIDIA (open-gpu-kernel-modules,
 MIT/GPL). Декомпилированный код не читается и в репозиторий не попадает.
 
+## Видеокарта для игр: NVK поверх GSP-RM
+
+Цель (18.11.2026): Mesa NVK (`libvulkan_nouveau.so` Debian 25.0.7, без
+изменений) на RTX 3060 — ядро изображает uAPI DRM nouveau
+(`/dev/dri/renderD128`) поверх своего GSP-RM. Спецификация — nvk-spec.md
+(вехи M0–M8, пакеты работ A–D). Здесь — что сделано по пакетам.
+
+### WP-D: упаковка, пробы, сценарии QEMU
+
+Сделано (18.11):
+- **Пробы** (`libc/linux`, без libc, `/compat/linux/bin/`):
+  - `drmprobe [soft|hw]` (M3): обнаружение как у libdrm 2.4.124 (`/dev/dri`,
+    226:128, sysfs `device/drm`, ссылка `subsystem` на pci, `uevent`,
+    `vendor/device/subsystem_*/revision`), `VERSION` в два вызова (nouveau
+    >= 1.3.1), `GET_CAP`, `VM_INIT`, NVIF NEW NV_DEVICE + INFO, все
+    GETPARAM NVK (и EINVAL на неизвестный), канал + SCLASS (6 классов GA106)
+    + NVIF NEW/DEL пяти объектов ручками Mesa, пустой EXEC, syncobj
+    (двоичный/timeline, ETIME/EINVAL как в Linux);
+  - `nvkprobe [soft|hw]` (M4/M5): GEM_NEW (3 в системной памяти + 1 в VRAM),
+    mmap по `map_handle`, VM_BIND (RUN_ASYNC + syncobj), один EXEC: копия
+    64 КиБ sysmem → VRAM → sysmem через NVC7B5 (подканал 4) и освобождение
+    семафора методами канала; TIMELINE_WAIT, сверка байт; GEM_INFO,
+    CPU_PREP, PRIME туда-обратно, ошибки VM_BIND (невыровненный адрес, окно
+    ядра, за концом BO), разреженная область (в `soft` — чтение нулей
+    копированием), UNMAP, GEM_CLOSE, CHANNEL_FREE;
+  - общий `drmprobe.h`: структуры uAPI с `_Static_assert` размеров из
+    спецификации (3.4); NVIF шлётся как `DRM_IOW` (так делает libdrm), ядро
+    обязано разбирать только nr. Ловушка: статическая PIE без кода
+    перемещений — никаких таблиц указателей на строки (и `switch` со
+    строками — clang делает из него таблицу); `readelf -r` пуст;
+  - `vkprobe [имя]` (M6): клиент загрузчика Vulkan на glibc (dlopen
+    `libvulkan.so.1`), список устройств с драйвером, устройство, пустая
+    отправка с забором, `vkCmdFillBuffer` + `vkCmdCopyBuffer` 1 МиБ.
+    Собирается `debian::build_glibc_probe`, едет в `bin/` пакета Proton.
+- **Пакет Proton** (`mesa.rs`): `libvulkan_nouveau.so` больше не
+  отбрасывается, рядом с `lvp_icd` пишется `nouveau_icd.x86_64.json`.
+  `fossai-proton`: есть `/dev/dri/renderD128` — `VK_DRIVER_FILES` = NVK, затем
+  lavapipe (DXVK возьмёт дискретную), иначе только lavapipe;
+  `FOSSAI_VULKAN=lvp|nvk` — принудительно.
+- **Сценарии**: `nvk-soft` (живая система: `nvk soft on`, drmprobe,
+  nvkprobe и nvkprobe-fixed, «0 failed»), `nvk-soft-vk` (установленная
+  с Proton: vkprobe на NVK поверх SoftGpu).
+
+Ждёт: `nvk soft on` и узел (WP-C) + SoftGpu (WP-B) — до них сценарии
+красные по построению; пересборка пакета Proton
+(`FOSSAI_WITH_PROTON=1 cargo xtask thirdparty --only proton`); M7 —
+`zwp_linux_dmabuf_v1` в `linux/wayland.rs` (после коммита правок кадров
+в нём).
+Риск: на ПК Романа, пока NVK не доведён до M5, узел renderD128 (если ядро
+его покажет при работающем GSP) заставит DXVK выбрать NVK вместо lavapipe —
+тогда `FOSSAI_VULKAN=lvp` или не показывать узел без явного включения.
+
 ## Стенд: `Expect` сразу за ожиданием начала строки
 
 `Step::Expect` смотрит в уже прочитанное, а ожидание перед ним находит

@@ -729,9 +729,11 @@ pub fn builtins(arch: Arch) -> PathBuf {
 
 /// Проверочные программы Linux (фаза 71a): исходники в `libc/linux`, путь в
 /// образе — `/compat/linux/bin/<имя>`.
-const LINUX_PROGRAMS: [&str; 11] = [
+/// `drmprobe`/`nvkprobe` (18.11.2026) — узел DRM nouveau для NVK (общий
+/// `drmprobe.h` рядом).
+const LINUX_PROGRAMS: [&str; 13] = [
     "hello", "futexv", "sigasync", "shmprobe", "wow32probe", "netlinkprobe", "ntsyncprobe", "heapgrow", "rwxprobe",
-    "futexlat", "hangprobe",
+    "futexlat", "hangprobe", "drmprobe", "nvkprobe",
 ];
 
 /// Общие флаги проверочных программ Linux.

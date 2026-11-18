@@ -522,7 +522,19 @@ pub fn build(arch: Arch) -> Result<()> {
         export LIBGL_DRIVERS_PATH=$P/lib/dri\n\
         export LIBGL_ALWAYS_SOFTWARE=1\n\
         export GALLIUM_DRIVER=llvmpipe\n\
-        export VK_DRIVER_FILES=$P/share/vulkan/icd.d/lvp_icd.x86_64.json\n\
+        # NVK (18.11.2026): есть узел nouveau ядра /dev/dri/renderD128 - оба\n\
+        # драйвера, NVK первым (DXVK берёт дискретную видеокарту, lavapipe -\n\
+        # запасной); FOSSAI_VULKAN=lvp - только lavapipe, =nvk - только NVK.\n\
+        V=$P/share/vulkan/icd.d\n\
+        case \"${FOSSAI_VULKAN:-auto}\" in\n\
+        \tlvp) export VK_DRIVER_FILES=$V/lvp_icd.x86_64.json ;;\n\
+        \tnvk) export VK_DRIVER_FILES=$V/nouveau_icd.x86_64.json ;;\n\
+        \t*) if [ -e /dev/dri/renderD128 ] && [ -e $V/nouveau_icd.x86_64.json ]; then\n\
+        \t\texport VK_DRIVER_FILES=$V/nouveau_icd.x86_64.json:$V/lvp_icd.x86_64.json\n\
+        \telse\n\
+        \t\texport VK_DRIVER_FILES=$V/lvp_icd.x86_64.json\n\
+        \tfi ;;\n\
+        esac\n\
         export VK_ICD_FILENAMES=$VK_DRIVER_FILES\n\
         # `--env=ИМЯ=ЗНАЧЕНИЕ` (сколько угодно, первыми) — своя переменная: у\n\
         # `run` оболочки окружения нет (WAYLAND_DEBUG=client и подобные).\n\
