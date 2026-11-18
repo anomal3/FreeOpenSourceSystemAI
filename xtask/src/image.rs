@@ -449,6 +449,13 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     .collect::<String>()
                     .to_uppercase();
                 if short.len() > 8 {
+                    // Приложения Craft (19.11): установщик их не знает
+                    // (`payload.rs` PACKAGES), ставятся они живой флешкой и
+                    // `craftupd` — на установочный носитель не кладутся.
+                    if crate::craft::apps()?.iter().any(|app| package.file_name.starts_with(&format!("{}-", app.name))) {
+                        say!("{}: приложение Craft, на установочный носитель не кладётся", package.file_name);
+                        continue;
+                    }
                     bail!("имя пакета {} не помещается в 8.3 на FAT: {short}", package.file_name);
                 }
                 let target = format!("{}/{short}.FPK", arch::PAYLOAD_PKG_DIR);
