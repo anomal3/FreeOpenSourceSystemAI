@@ -101,6 +101,14 @@ unsafe impl Send for Disp {}
 
 static DISP: crate::sync::SpinLock<Option<Disp>> = crate::sync::SpinLock::new(None);
 
+/// Забыть каналы и головки: GSP-RM выгружается (`nvidia_gsp::unload`), и
+/// всё, что создано на карте, разбирает он сам вместе с нашим клиентом.
+pub(crate) fn forget() {
+    if let Some(mut disp) = DISP.try_lock() {
+        *disp = None;
+    }
+}
+
 /// Канал дисплея: буфер команд в памяти машины и его регистры в BAR0.
 #[derive(Clone, Copy)]
 struct Channel {

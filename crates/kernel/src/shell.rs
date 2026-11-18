@@ -2364,6 +2364,21 @@ fn gpu(argument: &str) {
         }
         return;
     }
+    // 18.11: выгрузить GSP-RM и снять WPR2 — то же, что делает перезагрузка
+    // (проверка без перезагрузки); затем `gpu gsp` может запустить его снова.
+    if argument == "unload" {
+        if let Some((lo, hi)) = crate::display::nvidia::wpr2_now() {
+            sprintln!("  gpu: before: WPR2 {lo:#010x}..{hi:#010x}, GSP-RM {}", if crate::display::nvidia_gsp::running() { "running" } else { "not running" });
+        }
+        for line in crate::display::nvidia_gsp::unload("gpu unload") {
+            sprintln!("  gpu: {line}");
+        }
+        if let Some((lo, hi)) = crate::display::nvidia::wpr2_now() {
+            sprintln!("  gpu: after: WPR2 {lo:#010x}..{hi:#010x} ({})", if hi >> 4 == 0 { "not set" } else { "SET" });
+        }
+        crate::usb::stick_log::flush_now();
+        return;
+    }
     if argument == "gsp" || argument.starts_with("gsp ") {
         for line in crate::display::nvidia_gsp::boot_gsp(argument.trim_start_matches("gsp")) {
             sprintln!("  gpu: {line}");
@@ -2382,7 +2397,7 @@ fn gpu(argument: &str) {
         return;
     }
     if !argument.is_empty() {
-        sprintln!("  usage: gpu [boot | gsp [heap MiB]]   (boot = FWSEC-FRTS, stage 4; gsp = start GSP-RM, stage 5)");
+        sprintln!("  usage: gpu [boot | gsp [heap MiB] | unload | display]   (boot = FWSEC-FRTS; gsp = start GSP-RM; unload = stop GSP-RM and release WPR2)");
         return;
     }
     let (chip, revision) = crate::display::nvidia::chip_of(card.boot0, card.boot42);

@@ -289,6 +289,8 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                 ("booter_load-570.144.bin", "FREEOS/NVIDIA/BOOTER.BIN"),
                 ("bootloader-570.144.bin", "FREEOS/NVIDIA/BOOTLDR.BIN"),
                 ("gsp-570.144.bin", "FREEOS/NVIDIA/GSP.BIN"),
+                // 18.11: снимает WPR2 при перезагрузке (`gpu unload`).
+                ("booter_unload-570.144.bin", "FREEOS/NVIDIA/BOOTUNLD.BIN"),
             ] {
                 let source = firmware.join(name);
                 if source.is_file() {

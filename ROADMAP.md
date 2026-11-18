@@ -11795,16 +11795,52 @@ QEMU — скрипт в рабочей папке `craft-live.ps1`: образ 
   RPC. Kepler и старше (K620 — Maxwell GM107, но Kepler-карты вроде GT 710 —
   отдельно) — только простой фреймбуфер от прошивки. Источники — только
   открытые: open-gpu-doc, nouveau, linux-firmware.
-- **Перезагрузка без выключения питания.** После GSP-RM карта держит
-  защищённую область WPR2 до снятия питания, и после тёплой перезагрузки
-  FossAi драйвер не стартует (`auto start skipped - WPR2 already set`).
-  Нужно, как у nouveau/open-gpu-kernel-modules, при выключении и перезагрузке
-  выгрузить GSP: RPC `UNLOADING_GUEST_DRIVER`, дождаться остановки RISC-V,
-  запустить `booter_unload` на SEC2 (снимает WPR2). Прошивка
-  `booter_unload-570.144.bin` — в linux-firmware рядом с `booter_load`.
+- ~~Перезагрузка без выключения питания~~ — сделано 18.11, см. ниже
+  «NVIDIA: выгрузка GSP-RM».
 - Заодно: `wl_output` на каждый монитор для программ Wayland, кнопка
   «Определить» (номер на каждом мониторе), прокрутка страницы «Дисплей» с
   кликабельной схемой, MSI-прерывания у RTL8125.
+
+## NVIDIA: выгрузка GSP-RM, перезагрузка без выключения питания — сделано 18.11 (ждёт проверки на железе)
+
+Было: после GSP-RM WPR2 держался до снятия питания, после тёплой
+перезагрузки `auto start skipped - WPR2 already set`. Сделано (только по
+открытым источникам: nouveau `nvkm/subdev/gsp/tu102.c` `tu102_gsp_fini`,
+`tu102_gsp_booter_unload`; `rm/r535/gsp.c` `r535_gsp_fini`,
+`r535_gsp_rpc_unloading_guest_driver`; `rm/r535/alloc.c`
+`r535_gsp_rpc_rm_free`; `gsp/fwsec.c` `nvkm_gsp_fwsec_sb`,
+`nvkm_gsp_fwsec_patch`; nova-core `gsp/boot.rs` `unload`/`shutdown_gsp`,
+`gsp/hal/tu102.rs` `Sec2UnloadBundle::run`):
+- **Выгрузка** `nvidia_gsp::unload` — зовётся из `power::shut_down` (и при
+  перезагрузке, и при выключении; до сброса журнала на флешку) и командой
+  `gpu unload`. Шаги: RPC FREE нашего клиента RM (1 с) → RPC 47
+  `UNLOADING_GUEST_DRIVER` {bInPMTransition 0, bGc6Entering 0, newLevel 0}
+  (ответ до 3 с) → бит 31 MAILBOX0 GSP (до 3 с) → FWSEC-SB на GSP (init_cmd
+  0x19, только `read_vbios`; ошибка — младшие 16 бит 0x1454) →
+  `booter_unload` на SEC2 c 0xff/0xff в почтовых ящиках (MAILBOX0 должен
+  стать 0) → проверка 0x1fa828. Каждый шаг ограничен, неудача только пишется
+  (`nvidia-gsp  : unload: …`), перезагрузка идёт дальше. Худший случай ~15 с.
+- **Прошивка заранее:** `booter_unload-570.144.bin` (linux-firmware
+  `nvidia/ga102/gsp`, 41080 Б, sha256 8e63db5b…) кладётся `xtask image` из
+  `build/nvidia-fw` в `\FREEOS\NVIDIA\BOOTUNLD.BIN`; при запуске GSP-RM он
+  читается и готовится (подпись по фьюзу) в памяти, FWSEC-SB тоже готовится
+  из VBIOS заранее (`nvidia::prepare_fwsec_sb`) — к выключению флешки может
+  уже не быть. FWSEC в `nvidia.rs` разделён на «приготовить образ» и
+  «запустить на GSP»; booter (load и unload) — общий `Booter` на SEC2.
+- **Восстановление на загрузке** (`recover_stale_wpr2`, опыт: ни nouveau,
+  ни nova так не делают — nova пишет «GPU needs to be reset»): если WPR2 уже
+  поднят, автозапуск ждёт флешку, готовит BOOTUNLD.BIN и FWSEC-SB и делает
+  FWSEC-SB + booter_unload (очередей старого RM нет, RPC не шлётся). Снялся —
+  обычный запуск; нет — прежнее сообщение «power the machine off».
+- **Команда `gpu unload`:** WPR2 и состояние GSP до/после, все шаги; после
+  неё `gpu gsp` может запустить GSP-RM снова (память прошлого сеанса не
+  возвращается — для проверки это неважно). Монитор после выгрузки может
+  погаснуть: каналы дисплея разбирает RM.
+- **Не проверено на железе.** Что смотреть в LOG.TXT: строки
+  `nvidia-gsp  : unload:` (при перезагрузке) и `(boot recovery)` на
+  следующей загрузке; итог — `WPR2 released` или `FAILED`. Если FWSEC-SB или
+  booter_unload откажут — следующий шаг: горячий сброс карты через мост PCIe
+  (secondary bus reset) перед FWSEC-FRTS.
 
 ## Установщик с мышью и выбором компонентов — TODO (Роман 07.11)
 
