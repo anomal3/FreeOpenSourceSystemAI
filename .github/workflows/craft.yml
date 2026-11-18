@@ -26,6 +26,9 @@
 #   * build/rust-std/src — `cargo xtask rust-std-src`.
 # Готовый набор (sysroot + исходники std) кешируется целиком по точному ключу.
 #
+# СОСТОЯНИЕ (18.11.2026): работает — прогон 44275478841 за 26 мин (набор с
+# нуля ~4 мин, четыре приложения ~19 мин), в выпуске 5 пакетов и индекс.
+#
 # Пути: проект смонтирован ещё и в /work — тот же путь, что внутри контейнера,
 # поэтому абсолютные пути в build/rust-std/src/patches.toml верны и там, и тут.
 
@@ -80,8 +83,7 @@ jobs:
         run: |
           sudo mkdir -p /work
           sudo mount --bind "$GITHUB_WORKSPACE" /work
-          # Сборки Craft (release, -Zbuild-std) занимают гигабайты.
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          # Сборка всех четырёх занимает ~10 ГБ; у раннера свободно ~100 ГБ.
           mkdir -p "$FOSSAI_CRAFT_CACHE" "$FOSSAI_CARGO_REGISTRY"
           df -h /
 
@@ -203,6 +205,12 @@ jobs:
           cargo xtask craft $ARGS || echo "::warning::не все приложения собрались — выкладывается то, что есть"
           ls -la dist
           df -h /
+
+      # Контейнер пишет от root (крейты в реестре — с правами 600): tar кеша
+      # работает от runner и без этого их не читает.
+      - name: Права на кеш контейнера
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$FOSSAI_CRAFT_CACHE" "$FOSSAI_CARGO_REGISTRY"
 
       - name: Сохранить кеш контейнера
         if: always()
