@@ -53,8 +53,15 @@ if [ ! -f \"$G/TmForever.exe\" ]; then\n\
     echo \"tmnf: installed\"\n\
 fi\n\
 cd \"$G\"\n\
-echo \"tmnf: starting TmForever.exe\"\n\
-exec /opt/debian/bin/bash $P \"$@\" --dxvk \"$G/TmForever.exe\"\n";
+# Отрисовка (18.11): видеокарты у Wine пока нет, кадры рисует процессор.\n\
+# По умолчанию DXVK (Direct3D 9 -> Vulkan на lavapipe) со счётчиком кадров\n\
+# на экране; `--wined3d` - Direct3D 9 -> OpenGL (llvmpipe), счётчик кадров -\n\
+# в журнал (`trace:fps`). Какой быстрее на машине - видно по цифрам.\n\
+MODE=--dxvk\n\
+case \"$1\" in --wined3d) MODE=; shift ;; --dxvk) shift ;; esac\n\
+if [ -n \"$MODE\" ]; then export DXVK_HUD=${DXVK_HUD:-fps,frametimes}; else export WINEDEBUG=${WINEDEBUG:-fixme-all,+fps}; fi\n\
+echo \"tmnf: starting TmForever.exe (${MODE:-wined3d})\"\n\
+exec /opt/debian/bin/bash $P \"$@\" $MODE \"$G/TmForever.exe\"\n";
 
 /// Собрать пакет.
 pub fn build() -> Result<()> {
