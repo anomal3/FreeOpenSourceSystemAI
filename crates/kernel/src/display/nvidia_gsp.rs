@@ -1839,11 +1839,21 @@ pub fn auto_task() {
     if !log.iter().any(|l| l == "GSP-RM: running") {
         return;
     }
+    for line in after_boot() {
+        crate::kprintln!("  nvidia-gsp  : auto start: {line}");
+    }
+}
+
+/// Что делается после подъёма GSP-RM (автозапуск и перезапуск после `gpu
+/// unload`): бэкенд NVK, режимы мониторов, стол на основной монитор.
+fn after_boot() -> Log {
+    let mut log = Log::new();
     // NVK (18.11): бэкенд GPU для слоя DRM — только сведения и арены, на
     // карте ничего не создаётся; узел /dev/dri включается отдельно.
     let mut nvk = Log::new();
-    if let Err(why) = super::nvidia_rm_chan::attach(&mut nvk) {
-        crate::kprintln!("  nvgpu: backend not attached - {why}");
+    match super::nvidia_rm_chan::attach(&mut nvk) {
+        Ok(_) => log.push("NVK backend attached".into()),
+        Err(why) => log.push(format!("NVK backend not attached - {why}")),
     }
     // Режимы мониторов — сохранённые «Параметрами» (modeset берёт их сам по
     // паспорту монитора, а не предложенный — родной). Места, основной и
@@ -1855,15 +1865,68 @@ pub fn auto_task() {
     // железе, сам он не запускается — картинка остаётся от прошивки, а
     // проверка — командой `gpu display` (на ней и смотрим журнал).
     if !AUTO_MODESET {
-        crate::kprintln!("  nvidia-gsp  : auto start: GSP-RM up; modeset is manual for now ('gpu display')");
-        return;
+        log.push("GSP-RM up; modeset is manual for now ('gpu display')".into());
+        return log;
     }
-    let _ = super::nvidia_disp::modeset(&[]);
+    let modeset = super::nvidia_disp::modeset(&[]);
+    if let Some(stop) = modeset.iter().find(|l| l.starts_with("display: stopped")) {
+        log.push(format!("modeset: {stop}"));
+    }
     if let Some(plan) = crate::ui::saved_layout() {
-        crate::kprintln!("  nvidia-gsp  : auto start: saved monitor layout ({} output(s))", plan.len());
+        log.push(format!("saved monitor layout ({} output(s))", plan.len()));
         crate::ui::apply_layout(plan);
     } else if let Some((w, h)) = super::nvidia_disp::primary_size() {
         crate::ui::request_mode(w, h);
-        crate::kprintln!("  nvidia-gsp  : auto start: desktop moves to {w}x{h}");
+        log.push(format!("desktop moves to {w}x{h}"));
+    } else {
+        log.push("no monitor lit - the desktop stays where it was".into());
     }
+    log
+}
+
+/// Перезапуск GSP-RM после выгрузки (`gpu unload`, 19.11): цель выгрузки —
+/// тёплая перезагрузка без снятия питания, а проверка без перезагрузки
+/// оставляла чёрный экран (hw-log10: головы разобрал RM вместе с клиентом,
+/// GOP-кадра больше нет — он жил в видеопамяти). Здесь — то же, что на
+/// загрузке после снятого WPR2: FWSEC-FRTS, booter, GSP-RM, затем режимы и
+/// стол (кадры стола лежат в тех же местах видеопамяти — картинка
+/// возвращается как была). Удачный перезапуск заодно доказывает, что
+/// следующая тёплая перезагрузка поднимет карту.
+pub fn restart(reason: &str) -> Log {
+    let mut log = Log::new();
+    let Some((_, bar)) = super::nvidia::card() else { return log };
+    let started = crate::time::uptime_ms();
+    if running() {
+        log.push(format!("({reason}) restart: GSP-RM is already running"));
+        return log;
+    }
+    if wpr2_set(bar) {
+        log.push(format!("({reason}) restart: {} - GSP-RM cannot start until power-off", wpr2_text(bar)));
+        return log;
+    }
+    if open("GSP.BIN").is_err() {
+        log.push(format!("({reason}) restart: no NVIDIA firmware (FREEOS/NVIDIA) - stays off"));
+        return log;
+    }
+    log.push(format!("({reason}) restart: starting GSP-RM again ({})", wpr2_text(bar)));
+    let boot = boot_gsp("");
+    let up = boot.iter().any(|l| l == "GSP-RM: running");
+    log.push(format!(
+        "({reason}) restart: GSP-RM {} after {} ms{}",
+        if up { "running" } else { "did NOT start" },
+        crate::time::uptime_ms() - started,
+        if up { String::new() } else { format!(" - last: {}", boot.iter().rev().take(3).cloned().collect::<Vec<_>>().join(" | ")) }
+    ));
+    if up {
+        log.extend(after_boot());
+        log.push(format!(
+            "({reason}) restart: display {} in {} ms total",
+            super::nvidia_disp::describe(),
+            crate::time::uptime_ms() - started
+        ));
+    }
+    for line in &log {
+        crate::kprintln!("  nvidia-gsp  : {line}");
+    }
+    log
 }

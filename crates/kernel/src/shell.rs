@@ -2412,8 +2412,10 @@ fn gpu(argument: &str) {
         return;
     }
     // 18.11: выгрузить GSP-RM и снять WPR2 — то же, что делает перезагрузка
-    // (проверка без перезагрузки); затем `gpu gsp` может запустить его снова.
-    if argument == "unload" {
+    // (проверка без перезагрузки). 19.11: следом GSP-RM поднимается снова
+    // и мониторы зажигаются (иначе экран чёрный — головы разобрал RM);
+    // `gpu unload off` — оставить выгруженным (дальше `gpu gsp`, `gpu display`).
+    if argument == "unload" || argument == "unload off" {
         if let Some((lo, hi)) = crate::display::nvidia::wpr2_now() {
             sprintln!("  gpu: before: WPR2 {lo:#010x}..{hi:#010x}, GSP-RM {}", if crate::display::nvidia_gsp::running() { "running" } else { "not running" });
         }
@@ -2422,6 +2424,11 @@ fn gpu(argument: &str) {
         }
         if let Some((lo, hi)) = crate::display::nvidia::wpr2_now() {
             sprintln!("  gpu: after: WPR2 {lo:#010x}..{hi:#010x} ({})", if hi >> 4 == 0 { "not set" } else { "SET" });
+        }
+        if argument == "unload" {
+            for line in crate::display::nvidia_gsp::restart("gpu unload") {
+                sprintln!("  gpu: {line}");
+            }
         }
         crate::usb::stick_log::flush_now();
         return;

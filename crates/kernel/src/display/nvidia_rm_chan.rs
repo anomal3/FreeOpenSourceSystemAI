@@ -192,6 +192,10 @@ struct Chan {
     kpush: u32,
     seq: u64,
     token: u32,
+    /// Жетон, который вернул GSP-RM (`GET_WORK_SUBMIT_TOKEN`), — для опыта.
+    rm_token: Option<u32>,
+    /// Начало регистров runlist (`RUNLIST_PRI_BASE` таблицы движков).
+    pri_base: u32,
     killed: bool,
     /// (ручка бэкенда, хэндл RM, класс)
     objs: Vec<(u32, u32, u32)>,
@@ -228,6 +232,80 @@ static BACKEND: SpinLock<Option<Arc<RmBackend>>> = SpinLock::new(None);
 /// GSP-RM выгружается — бэкенд больше не трогает карту.
 static DEAD: AtomicBool = AtomicBool::new(false);
 
+/// Какой жетон звонка брать (19.11, hw-log10: CE2 на runlist 1 молчал с
+/// жетоном RM 0x8, расчётный 0x10008).
+///
+/// Почему расчётный: `NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN` у
+/// nvidia.ko обрабатывает CPU-RM (`kfifoGenerateWorkSubmitTokenHal_GA100`,
+/// ветка `!RMCFG_FEATURE_PLATFORM_GSP`): `RUNLIST_ID << 16 | VECTOR = chid`
+/// — этим жетоном звонят CUDA и UVM. Мы же спрашиваем сам GSP-RM, а у него
+/// ветка `PLATFORM_GSP` — `kfifoGenerateInternalWorkSubmitToken` (внутренний
+/// жетон, без runlist). nouveau r535 (`r535_chan_doorbell_handle`) звонит
+/// `runl->id << 16 | chid`, где `runl->id` — RUNLIST из той же таблицы
+/// движков. На runlist 0 они совпадают (потому GR и работал).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TokenKind {
+    /// `runlist << 16 | chid` (как nouveau r535 и CPU-RM nvidia.ko).
+    Calc,
+    /// Что вернул GSP-RM.
+    Rm,
+    /// `DOORBELL_CONFIG` runlist (`pri + 0x8`, биты 31:16) `<< 16 | chid` —
+    /// как nouveau без GSP (`ga100_runl_new`).
+    Dbcfg,
+}
+
+/// Выбор руками (`gpu nvktest ... token-rm|token-dbcfg`); `None` — сперва
+/// выученный для runlist, иначе расчётный.
+static FORCED_TOKEN: SpinLock<Option<TokenKind>> = SpinLock::new(None);
+/// Что сработало на железе: (runlist, жетон). Новые каналы берут его.
+static LEARNED_TOKEN: SpinLock<Vec<(u32, TokenKind)>> = SpinLock::new(Vec::new());
+
+fn token_of(kind: TokenKind, runlist: u32, chid: u32, rm: Option<u32>, pri_base: u32) -> Option<u32> {
+    match kind {
+        TokenKind::Calc => Some(gpfifo::doorbell_token(runlist, chid)),
+        TokenKind::Rm => rm,
+        TokenKind::Dbcfg => {
+            let (_, bar) = info::card().ok()?;
+            let dbcfg = runlist_reg(bar, pri_base, 0x8)?;
+            Some((dbcfg & 0xffff_0000) | chid)
+        }
+    }
+}
+
+/// Регистр runlist `pri + off`, если адрес похож на правду (окно BAR0 —
+/// 16 МиБ; у SOFTWARE `pri` = 0).
+fn runlist_reg(bar: super::nvidia::Bar0, pri_base: u32, off: u32) -> Option<u32> {
+    if pri_base == 0 || pri_base >= 0x0100_0000 - 0x400 {
+        return None;
+    }
+    Some(bar.rd((pri_base + off) as usize))
+}
+
+/// Регистры runlist и запись канала в его CHRAM — для журнала: включён ли
+/// канал (CHRAM бит 1 ENABLE, 8 PENDING? — пишем сырьём), куда смотрит звонок.
+fn runlist_state(pri_base: u32, chid: u32) -> String {
+    let Ok((_, bar)) = info::card() else { return "no card".into() };
+    let Some(chcfg) = runlist_reg(bar, pri_base, 0x4) else { return format!("runlist pri {pri_base:#x}: not readable") };
+    let dbcfg = runlist_reg(bar, pri_base, 0x8).unwrap_or(0);
+    let chram = chcfg & 0xffff_fff0;
+    let entry = if chram != 0 && chram < 0x0100_0000 - 0x1000 && chcfg != 0xffff_ffff && chcfg >> 16 != 0xbadf {
+        format!("{:#010x}", bar.rd((chram + chid * 4) as usize))
+    } else {
+        "-".into()
+    };
+    format!(
+        "runlist pri {pri_base:#x}: chcfg {chcfg:#x} (chram {chram:#x}, {} ch) dbcfg {dbcfg:#x} (doorbell id {:#x}) submit {:#x} chram[{chid}] {entry}",
+        1u32 << (chcfg & 0xf),
+        dbcfg >> 16,
+        runlist_reg(bar, pri_base, 0x88).unwrap_or(0),
+    )
+}
+
+/// `gpu nvktest ... token-rm|token-calc|token-dbcfg`.
+pub(crate) fn force_token(kind: Option<TokenKind>) {
+    *FORCED_TOKEN.lock() = kind;
+}
+
 fn errno(log: &mut Log, what: &str, why: String) -> Errno {
     say(log, format!("nvgpu: {what} - {why}"));
     if why.contains("not running") || why.contains("busy") { Errno::EIO } else if why.contains("full") || why.contains("no ") && why.contains("pages") { Errno::ENOMEM } else { Errno::EINVAL }
@@ -242,7 +320,11 @@ pub fn backend() -> Option<Arc<RmBackend>> {
 /// Ничего на карте не создаёт.
 pub fn attach(log: &mut Log) -> Res<Arc<RmBackend>> {
     if let Some(b) = backend() {
-        return Ok(b);
+        // После выгрузки GSP-RM старый бэкенд мёртв — нужен новый.
+        if !DEAD.load(Ordering::Acquire) {
+            return Ok(b);
+        }
+        *BACKEND.lock() = None;
     }
     let stat = info::static_info().ok_or("GSP-RM is not running (gpu gsp first)")?;
     let (device, _) = info::card()?;
@@ -316,6 +398,7 @@ impl RmBackend {
                 (e.rm_type, e.rm_type, e.runlist)
             }
         };
+        let pri_base = st.hw.engines.iter().find(|e| e.rm_type == engine).map_or(0, |e| e.pri_base);
         // GR: golden context до первого канала (nouveau делает его перед
         // любым каналом; для опыта AsyncCopy — не обязательно).
         if runlist == Runlist::Gr && !super::nvidia_rm_gr::ready() {
@@ -362,6 +445,8 @@ impl RmBackend {
                 kpush: 0,
                 seq: 0,
                 token: gpfifo::doorbell_token(runlist_id, chid),
+                rm_token: None,
+                pri_base,
                 killed: false,
                 objs: Vec::new(),
                 grctx: None,
@@ -424,9 +509,16 @@ impl RmBackend {
                 for l in lines {
                     say(log, l);
                 }
-                if let Some(t) = token {
+                chan.rm_token = token;
+                // Жетон: заданный руками, выученный на этом runlist, иначе
+                // расчётный (см. `TokenKind`).
+                let forced = *FORCED_TOKEN.lock();
+                let learned = LEARNED_TOKEN.lock().iter().find(|(r, _)| *r == runlist_id).map(|(_, k)| *k);
+                let kind = forced.or(learned).unwrap_or(TokenKind::Calc);
+                if let Some(t) = token_of(kind, runlist_id, chid, token, pri_base) {
                     chan.token = t;
                 }
+                say(log, format!("nvgpu: chan chid {chid} runl {runlist_id} rings token {:#x} ({kind:?}{}); {}", chan.token, if forced.is_some() { ", forced" } else if learned.is_some() { ", learned" } else { "" }, runlist_state(pri_base, chid)));
             }
             Err(why) => {
                 release_chan(chan, vmm);
@@ -463,7 +555,9 @@ impl RmBackend {
     pub(crate) fn chan_state(&self, ch: ChanHandle) -> String {
         let st = self.state.lock();
         let Some(c) = st.chans.get(&ch.0) else { return "no such channel".into() };
-        let bar = info::card().map(|(_, b)| format!("doorbell token {:#x}, 0xb830b0 {:#x}", c.token, b.rd(0x00b8_30b0))).unwrap_or_default();
+        let bar = info::card()
+            .map(|(_, b)| format!("doorbell token {:#x} (rm {:x?}), 0xb830b0 {:#x}; {}", c.token, c.rm_token, b.rd(0x00b8_30b0), runlist_state(c.pri_base, c.chid)))
+            .unwrap_or_default();
         format!(
             "chid {} runlist {} engine {} GP_GET {} GP_PUT {} (ours {}) fence {} seq {} killed {} inst PDB {:#x} rc {:x?}; {}; {bar}",
             c.chid,
@@ -479,6 +573,63 @@ impl RmBackend {
             super::nvidia_gsp::RC_CHIDS.lock().clone(),
             st.vms.get(&c.vm.0).map_or_else(|| "no vm".into(), Vmm::describe)
         )
+    }
+
+    /// Канал стоит (GP_GET не двигается) — позвонить другими жетонами по
+    /// очереди и записать, какой сдвинул GP_GET (19.11: один прогон на
+    /// железе должен решить вопрос). Сработавший запоминается для runlist.
+    /// Звонок чужим жетоном безвреден: он лишь просит планировщик проверить
+    /// GP_PUT того канала.
+    pub(crate) fn doorbell_rescue(&self, ch: ChanHandle, seq: u64, log: &mut Log) -> Option<TokenKind> {
+        let (runlist, chid, current, rm_token, pri_base, userd) = {
+            let st = self.state.lock();
+            let c = st.chans.get(&ch.0)?;
+            (c.runlist, c.chid, c.token, c.rm_token, c.pri_base, c.userd)
+        };
+        let get0 = vram::r32(userd + GP_GET);
+        say(log, format!("nvgpu: doorbell runlist {runlist} chid {chid}: token {current:#x} gave no progress (GP_GET {get0}); {}", runlist_state(pri_base, chid)));
+        let mut tried = alloc::vec![current];
+        for kind in [TokenKind::Calc, TokenKind::Rm, TokenKind::Dbcfg] {
+            let Some(token) = token_of(kind, runlist, chid, rm_token, pri_base) else {
+                say(log, format!("nvgpu: doorbell runlist {runlist}: token {kind:?} unknown - skipped"));
+                continue;
+            };
+            if tried.contains(&token) {
+                continue;
+            }
+            tried.push(token);
+            let Ok((_, bar)) = info::card() else { return None };
+            fence(Ordering::SeqCst);
+            bar.wr(gpfifo::DOORBELL as usize, token);
+            let deadline = crate::time::uptime_ms() + 1500;
+            let mut moved = false;
+            while crate::time::uptime_ms() < deadline {
+                if vram::r32(userd + GP_GET) != get0 || self.chan_seq_done(ch).is_ok_and(|d| d >= seq) {
+                    moved = true;
+                    break;
+                }
+                super::nvidia_gsp::pause_briefly();
+            }
+            say(
+                log,
+                format!(
+                    "nvgpu: doorbell runlist {runlist} chid {chid} token {token:#x} ({kind:?}): {} (GP_GET {}); {}",
+                    if moved { "WORKS" } else { "no progress" },
+                    vram::r32(userd + GP_GET),
+                    runlist_state(pri_base, chid)
+                ),
+            );
+            if moved {
+                if let Some(c) = self.state.lock().chans.get_mut(&ch.0) {
+                    c.token = token;
+                }
+                let mut learned = LEARNED_TOKEN.lock();
+                learned.retain(|(r, _)| *r != runlist);
+                learned.push((runlist, kind));
+                return Some(kind);
+            }
+        }
+        None
     }
 
     /// Карта Bo → кадры/видеопамять (для самопроверки).
@@ -732,6 +883,11 @@ impl GpuBackend for RmBackend {
                 return Err(Errno::EINVAL);
             }
         }
+        // Канал простаивал (всё прежнее выполнено) — сторож считает от этой
+        // отправки, а не от создания канала.
+        if gpfifo::widen_seq(c.seq, c.fence.r32(0)) >= c.seq {
+            c.progress = (c.seq, crate::time::uptime_ms());
+        }
         // Место в кольце: записи пользователя + сегмент забора.
         let need = pushes.len() as u32 + 1;
         let deadline = crate::time::uptime_ms() + 2000;
@@ -957,7 +1113,14 @@ fn copy_test(b: &RmBackend, runlist: Runlist, log: &mut Log) -> Res<(u64, u64)> 
         fence(Ordering::SeqCst);
         let t0 = b.time_ns();
         let seq = b.chan_submit(ch, &[Push { va: pb_va, len: words.len() as u32 * 4, flags: 0 }]).map_err(e("chan_submit"))?;
-        let waited = b.wait_seq(ch, seq, 5000, log);
+        // Сперва 1,5 с выбранным жетоном; стоит — перебор жетонов (обе
+        // попытки в журнале), потом ещё 3,5 с.
+        let mut waited = b.wait_seq(ch, seq, 1500, log);
+        if waited == Err(Errno::ETIMEDOUT) {
+            let rescued = b.doorbell_rescue(ch, seq, log);
+            say(log, format!("nvgpu: nvktest {runlist:?}: doorbell rescue -> {}", rescued.map_or_else(|| "nothing moved the channel".into(), |k| format!("{k:?} token works"))));
+            waited = b.wait_seq(ch, seq, 3500, log);
+        }
         let t1 = b.time_ns();
         // SAFETY: кадр семафора.
         let sem_value = unsafe { frame_ptr(sem_frame).read_volatile() };
@@ -1008,6 +1171,15 @@ pub fn nvktest(argument: &str) -> Log {
     let mut log = Log::new();
     let words: Vec<&str> = argument.split_whitespace().collect();
     super::nvidia_rm_vmm::SKIP_PDES.store(words.contains(&"skip-pdes"), Ordering::Relaxed);
+    force_token(if words.contains(&"token-rm") {
+        Some(TokenKind::Rm)
+    } else if words.contains(&"token-dbcfg") {
+        Some(TokenKind::Dbcfg)
+    } else if words.contains(&"token-calc") {
+        Some(TokenKind::Calc)
+    } else {
+        None
+    });
     let modes: &[Runlist] = if words.contains(&"ce") {
         &[Runlist::AsyncCopy]
     } else if words.contains(&"gr") {
