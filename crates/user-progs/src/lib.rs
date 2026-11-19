@@ -246,6 +246,23 @@ impl Window {
         insist(|| unsafe { syscall(user_abi::SYS_WINSTYLE, self.id as usize, flags, 0) })
     }
 
+    /// Сменить имя окна ([`user_abi::SYS_WINTITLE`]): кнопка на панели задач
+    /// и миниатюра меняются вместе с ним. Имя длиннее
+    /// [`user_abi::MAX_TITLE`] байт обрезается по границе знака — ядро такое
+    /// отвергло бы целиком.
+    pub fn set_title(&self, title: &str) -> i64 {
+        let mut end = title.len().min(user_abi::MAX_TITLE);
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        let title = &title[..end];
+        if title.is_empty() {
+            return user_abi::ERR_LIMIT;
+        }
+        // SAFETY: строка живёт в памяти программы, длина — её собственная.
+        insist(|| unsafe { syscall(user_abi::SYS_WINTITLE, self.id as usize, title.as_ptr() as usize, title.len()) })
+    }
+
     /// Сменить размер окна (фаза N7d). После успеха прежние пиксели
     /// недействительны: поверхность у окна новая, и [`Window::pixels`] отдаёт
     /// уже её. Ошибка — код отказа, и окно остаётся прежним.

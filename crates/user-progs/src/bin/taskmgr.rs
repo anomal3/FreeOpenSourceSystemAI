@@ -457,6 +457,9 @@ struct Manager {
     log: Vec<String>,
     log_error: Option<String>,
     last_summary: String,
+    /// Прокрутка таблицы открытого раздела (20.11): колесо и полоса двигают
+    /// вид, а не выбранную строку.
+    scroll: kit::Scroll,
 }
 
 impl Manager {
@@ -487,6 +490,7 @@ impl Manager {
             log: Vec::new(),
             log_error: None,
             last_summary: String::new(),
+            scroll: kit::Scroll::new(),
         };
         manager.refresh();
         manager
@@ -628,6 +632,70 @@ impl Manager {
         let at = self.selected_index().and_then(|index| order.iter().position(|other| *other == index)).unwrap_or(0);
         let next = (at as isize + delta).clamp(0, order.len() as isize - 1) as usize;
         self.select_task(order[next]);
+        // Выбор клавишей — вид едет за ним (20.11). В «Процессах» строка —
+        // это место в списке с заголовками групп, в «Подробностях» — номер.
+        let line = match self.section {
+            Section::Details => Some(order[next]),
+            _ => self.lines().iter().position(|line| *line == Line::Task(order[next])),
+        };
+        if let Some(line) = line {
+            self.scroll.follow(line);
+        }
+    }
+
+    /// Высота строки таблицы процессов.
+    fn line_height(ctx: Ctx, line: &Line) -> u32 {
+        match line {
+            Line::Group(..) => ctx.px(GROUP_H),
+            Line::Task(_) => ctx.px(ROW_H),
+        }
+    }
+
+    /// Видимая часть таблицы открытого раздела, высота всего содержимого и
+    /// шаг строки — для прокрутки (20.11). Высота `0` — листать нечего.
+    fn view_metrics(&self, ctx: Ctx, plan: &Plan) -> (Rect, u32, u32) {
+        let rows = plan.rows_area(ctx);
+        let row_h = ctx.px(ROW_H);
+        match self.section {
+            Section::Processes => (rows, self.line_y(ctx, &self.lines()).max(0) as u32, row_h),
+            Section::Details => (rows, self.tasks.len() as u32 * row_h, row_h),
+            Section::Users => (rows, self.user_count() as u32 * row_h, row_h),
+            // Под таблицей служб — строка пояснения.
+            Section::Services | Section::Startup => {
+                let view = Rect::new(rows.x, rows.y, rows.w, rows.h.saturating_sub(ctx.px(34)));
+                (view, self.services.len() as u32 * row_h, row_h)
+            }
+            Section::BootLog => {
+                let (view, step) = Self::log_view(ctx, plan);
+                (view, self.log.len() as u32 * step, step)
+            }
+            Section::Performance => (rows, 0, row_h),
+        }
+    }
+
+    /// Журнал: видимая часть и шаг строки.
+    fn log_view(ctx: Ctx, plan: &Plan) -> (Rect, u32) {
+        let pad = ctx.px(16);
+        let step = (line_h(ctx, Role::Mono) + ctx.px(4) as i32).max(1) as u32;
+        let body = plan.body;
+        (Rect::new(body.x, body.y + pad as i32, body.w, body.h.saturating_sub(pad * 2)), step)
+    }
+
+    /// Сколько разных пользователей у задач — строк раздела «Пользователи».
+    fn user_count(&self) -> usize {
+        let mut uids: Vec<Option<u32>> = Vec::new();
+        for task in &self.tasks {
+            if !uids.contains(&task.uid) {
+                uids.push(task.uid);
+            }
+        }
+        uids.len()
+    }
+
+    /// Полоса прокрутки открытого раздела, если всё не помещается.
+    fn bar(&self, ctx: Ctx, plan: &Plan) -> Option<kit::ScrollBar> {
+        let (view, content, _) = self.view_metrics(ctx, plan);
+        kit::ScrollBar::vertical(ctx, view, content, &self.scroll)
     }
 
     fn set_section(&mut self, section: Section) {
@@ -638,6 +706,7 @@ impl Manager {
         self.menu = None;
         self.searching = false;
         self.cursor = 0;
+        self.scroll.reset();
         println(&format!("taskmgr: tab {}", section.log_name()));
         match section {
             Section::Services => {
@@ -773,12 +842,11 @@ impl Manager {
             let plan = Plan::new(ctx, area, self.folded);
             let rows = plan.rows_area(ctx);
             let lines = self.lines();
-            let first = self.first_line(ctx, rows, &lines);
             let at = self
                 .selected_index()
                 .and_then(|index| lines.iter().position(|line| *line == Line::Task(index)))
                 .unwrap_or(0);
-            let y = rows.y + self.line_y(ctx, &lines[first..at.max(first)]) + ctx.px(ROW_H) as i32;
+            let y = rows.y + self.line_y(ctx, &lines[..at]) - self.scroll.offset() + ctx.px(ROW_H) as i32;
             (rows.x + ctx.px(80) as i32, y)
         });
         Some(kit::place(at, size, area))
@@ -786,40 +854,21 @@ impl Manager {
 
     /// Высота куска строк.
     fn line_y(&self, ctx: Ctx, lines: &[Line]) -> i32 {
-        lines.iter().map(|line| match line {
-            Line::Group(..) => ctx.px(GROUP_H) as i32,
-            Line::Task(_) => ctx.px(ROW_H) as i32,
-        }).sum()
+        lines.iter().map(|line| Self::line_height(ctx, line) as i32).sum()
     }
 
-    /// Первая показанная строка: выбранная задача всегда видна.
-    fn first_line(&self, ctx: Ctx, rows: Rect, lines: &[Line]) -> usize {
-        let Some(at) = self.selected_index().and_then(|index| lines.iter().position(|line| *line == Line::Task(index))) else {
-            return 0;
-        };
-        let mut first = 0;
-        while first < at && self.line_y(ctx, &lines[first..=at]) > rows.h as i32 {
-            first += 1;
-        }
-        first
-    }
-
-    /// Строка таблицы процессов под точкой.
+    /// Строка таблицы процессов под точкой. Строки едут по точкам (20.11):
+    /// верх первой — начало таблицы минус прокрутка.
     fn line_at(&self, ctx: Ctx, plan: &Plan, x: i32, y: i32) -> Option<Line> {
         let rows = plan.rows_area(ctx);
         if !rows.contains(x, y) {
             return None;
         }
-        let lines = self.lines();
-        let first = self.first_line(ctx, rows, &lines);
-        let mut top = rows.y;
-        for line in &lines[first..] {
-            let h = match line {
-                Line::Group(..) => ctx.px(GROUP_H),
-                Line::Task(_) => ctx.px(ROW_H),
-            } as i32;
+        let mut top = rows.y - self.scroll.offset();
+        for line in self.lines() {
+            let h = Self::line_height(ctx, &line) as i32;
             if y >= top && y < top + h {
-                return Some(*line);
+                return Some(line);
             }
             top += h;
         }
@@ -898,8 +947,53 @@ impl Manager {
     fn draw_processes(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
         let p = ctx.palette;
         let cols = process_columns(ctx, plan.body);
+
+        // ── Строки ──────────────────────────────────────────────────────────
+        // Первыми (20.11): строки едут по точкам, и край строки, ушедшей
+        // вверх, закрывает шапка, нарисованная поверх.
+        let (rows, content, _) = self.view_metrics(ctx, plan);
+        let lines = self.lines();
+        self.scroll.sync_with(rows.h, content, |at| {
+            let line = lines.get(at)?;
+            Some((self.line_y(ctx, &lines[..at]), Self::line_height(ctx, line)))
+        });
+        let mut y = rows.y - self.scroll.offset();
+        let group_fill = ctx.flat(p.panel);
+        for line in &lines {
+            let h = Self::line_height(ctx, line);
+            let rect = Rect::new(rows.x, y, rows.w, h);
+            y += h as i32;
+            if rect.bottom() <= rows.y {
+                continue;
+            }
+            if rect.y >= rows.bottom() {
+                break;
+            }
+            match *line {
+                Line::Group(kind, count) => {
+                    s.fill(rect, group_fill);
+                    draw::hline(s, rect.x, rect.bottom() - 1, rect.w, p.line.color, p.line.alpha);
+                    let g = ctx.px(14);
+                    let chevron = if self.collapsed[kind.index()] { Fi::ChevronRight } else { Fi::ChevronDown };
+                    iconset::draw(s, chevron, rect.x + ctx.px(14) as i32, rect.y + (rect.h - g) as i32 / 2, g, p.ink3, 255);
+                    let tx = rect.x + ctx.px(36) as i32;
+                    let w = paint::text(ctx, s, Role::Strong, tx, paint::baseline(ctx, Role::Strong, rect), kind.group(), p.ink);
+                    paint::text(ctx, s, Role::Body, tx + w as i32 + ctx.px(8) as i32, paint::baseline(ctx, Role::Body, rect), &format!("({count})"), p.ink4);
+                }
+                Line::Task(index) => self.draw_task_row(s, ctx, rect, &cols, &self.tasks[index]),
+            }
+        }
+        if self.tasks.is_empty() {
+            let rect = Rect::new(rows.x + ctx.px(16) as i32, rows.y, rows.w, ctx.px(ROW_H));
+            paint::text(ctx, s, Role::Body, rect.x, paint::baseline(ctx, Role::Body, rect), "Список задач пуст — ядро не ответило", p.bad_ink);
+        } else if lines.is_empty() {
+            let rect = Rect::new(rows.x + ctx.px(16) as i32, rows.y, rows.w, ctx.px(ROW_H));
+            paint::text(ctx, s, Role::Body, rect.x, paint::baseline(ctx, Role::Body, rect), "Ничего не нашлось", p.ink4);
+        }
+
         // ── Шапка: итоги сверху, имена колонок снизу ─────────────────────────
         let head = Rect::new(plan.body.x, plan.body.y, plan.body.w, ctx.px(HEAD_H));
+        s.fill(head, theme::window_bg());
         draw::hline(s, head.x, head.bottom() - 1, head.w, p.line.color, p.line.alpha);
         let total_cpu = self.cpu_total();
         let used = self.info.frames_total.saturating_sub(self.info.frames_free);
@@ -930,48 +1024,6 @@ impl Manager {
                 let x = if index == 0 { col.x + ctx.px(18) as i32 } else { col.x };
                 paint::text(ctx, s, Role::Caption, x, bottom, name, p.ink4);
             }
-        }
-
-        // ── Строки ──────────────────────────────────────────────────────────
-        let rows = plan.rows_area(ctx);
-        let lines = self.lines();
-        let first = self.first_line(ctx, rows, &lines);
-        let mut y = rows.y;
-        let group_fill = ctx.flat(p.panel);
-        for line in &lines[first..] {
-            match *line {
-                Line::Group(kind, count) => {
-                    let rect = Rect::new(rows.x, y, rows.w, ctx.px(GROUP_H));
-                    if rect.bottom() > rows.bottom() {
-                        break;
-                    }
-                    s.fill(rect, group_fill);
-                    draw::hline(s, rect.x, rect.bottom() - 1, rect.w, p.line.color, p.line.alpha);
-                    let g = ctx.px(14);
-                    let chevron = if self.collapsed[kind.index()] { Fi::ChevronRight } else { Fi::ChevronDown };
-                    iconset::draw(s, chevron, rect.x + ctx.px(14) as i32, rect.y + (rect.h - g) as i32 / 2, g, p.ink3, 255);
-                    let tx = rect.x + ctx.px(36) as i32;
-                    let w = paint::text(ctx, s, Role::Strong, tx, paint::baseline(ctx, Role::Strong, rect), kind.group(), p.ink);
-                    paint::text(ctx, s, Role::Body, tx + w as i32 + ctx.px(8) as i32, paint::baseline(ctx, Role::Body, rect), &format!("({count})"), p.ink4);
-                    y = rect.bottom();
-                }
-                Line::Task(index) => {
-                    let rect = Rect::new(rows.x, y, rows.w, ctx.px(ROW_H));
-                    if rect.bottom() > rows.bottom() {
-                        break;
-                    }
-                    let task = &self.tasks[index];
-                    self.draw_task_row(s, ctx, rect, &cols, task);
-                    y = rect.bottom();
-                }
-            }
-        }
-        if self.tasks.is_empty() {
-            let rect = Rect::new(rows.x + ctx.px(16) as i32, rows.y, rows.w, ctx.px(ROW_H));
-            paint::text(ctx, s, Role::Body, rect.x, paint::baseline(ctx, Role::Body, rect), "Список задач пуст — ядро не ответило", p.bad_ink);
-        } else if lines.is_empty() {
-            let rect = Rect::new(rows.x + ctx.px(16) as i32, rows.y, rows.w, ctx.px(ROW_H));
-            paint::text(ctx, s, Role::Body, rect.x, paint::baseline(ctx, Role::Body, rect), "Ничего не нашлось", p.ink4);
         }
     }
 
@@ -1136,7 +1188,6 @@ impl Manager {
         let p = ctx.palette;
         let body = plan.body;
         let head = Rect::new(body.x, body.y, body.w, ctx.px(HEAD_H));
-        draw::hline(s, head.x, head.bottom() - 1, head.w, p.line.color, p.line.alpha);
         // Колонки справа налево фиксированной ширины, первая — что осталось.
         let mut cols: Vec<Rect> = Vec::new();
         let mut x = body.right() - ctx.px(12) as i32;
@@ -1147,18 +1198,15 @@ impl Manager {
         let first_x = body.x + ctx.px(16) as i32;
         cols.push(Rect::new(first_x, body.y, (x - first_x).max(0) as u32, body.h));
         cols.reverse();
-        let base = head.bottom() - ctx.px(10) as i32 - line_h(ctx, Role::Caption);
-        for (col, title) in cols.iter().zip(titles) {
-            let tx = if col.x == first_x { col.x + ctx.px(28) as i32 } else { col.x };
-            paint::text_clipped(ctx, s, Role::Caption, tx, base, col.w, title, p.ink4);
-        }
-        let area = plan.rows_area(ctx);
-        let row_h = ctx.px(ROW_H);
-        let shown = (area.h / row_h) as usize;
-        let first = selected.map_or(0, |at| kit::first_visible(at, shown.max(1)));
-        for (offset, (icon, tint, cells)) in rows.iter().enumerate().skip(first).take(shown).enumerate().map(|(o, (_, r))| (o, r)) {
-            let rect = Rect::new(area.x, area.y + (offset as u32 * row_h) as i32, area.w, row_h);
-            if selected == Some(first + offset) {
+        // Строки — первыми и по точкам (20.11); края, ушедшие за вид,
+        // закрывают шапка и полоса под таблицей.
+        let (area, content, row_h) = self.view_metrics(ctx, plan);
+        self.scroll.sync(area.h, content, row_h);
+        let at = self.scroll.offset();
+        for index in self.scroll.rows(area.h, row_h, rows.len()) {
+            let (icon, tint, cells) = &rows[index];
+            let rect = Rect::new(area.x, area.y + (index as u32 * row_h) as i32 - at, area.w, row_h);
+            if selected == Some(index) {
                 draw::blend_rect(s, rect, p.acctint.color, p.acctint.alpha);
                 draw::vline(s, rect.x, rect.y, rect.h, p.acc, 255);
             }
@@ -1178,6 +1226,15 @@ impl Manager {
         if rows.is_empty() {
             let rect = Rect::new(area.x + ctx.px(16) as i32, area.y, area.w, row_h);
             paint::text(ctx, s, Role::Body, rect.x, paint::baseline(ctx, Role::Body, rect), "Пусто", p.ink4);
+        }
+        let below = Rect::new(body.x, area.bottom(), body.w, (body.bottom() - area.bottom()).max(0) as u32);
+        s.fill(below, theme::window_bg());
+        s.fill(head, theme::window_bg());
+        draw::hline(s, head.x, head.bottom() - 1, head.w, p.line.color, p.line.alpha);
+        let base = head.bottom() - ctx.px(10) as i32 - line_h(ctx, Role::Caption);
+        for (col, title) in cols.iter().zip(titles) {
+            let tx = if col.x == first_x { col.x + ctx.px(28) as i32 } else { col.x };
+            paint::text_clipped(ctx, s, Role::Caption, tx, base, col.w, title, p.ink4);
         }
     }
 
@@ -1295,13 +1352,19 @@ impl Manager {
             paint::text(ctx, s, Role::Body, rect.x + ctx.px(30) as i32, paint::baseline(ctx, Role::Body, rect), error, p.ink2);
             return;
         }
-        let step = line_h(ctx, Role::Mono) + ctx.px(4) as i32;
-        let shown = ((body.h as i32 - pad * 2) / step).max(1) as usize;
-        let first = kit::first_visible(self.cursor, shown);
-        for (offset, line) in self.log.iter().skip(first).take(shown).enumerate() {
-            let y = body.y + pad + offset as i32 * step;
+        // Прокрутка по точкам (20.11): колесо листает журнал, курсор стоит.
+        let (view, content, step_u) = self.view_metrics(ctx, plan);
+        self.scroll.sync(view.h, content, step_u);
+        let step = step_u as i32;
+        let at = self.scroll.offset();
+        for index in self.scroll.rows(view.h, step_u, self.log.len()) {
+            let line = &self.log[index];
+            let y = view.y + index as i32 * step - at;
+            if y < view.y - ctx.px(2) as i32 || y + step > view.bottom() + ctx.px(2) as i32 {
+                continue;
+            }
             let row = Rect::new(body.x, y - ctx.px(2) as i32, body.w, step as u32);
-            if first + offset == self.cursor {
+            if index == self.cursor {
                 draw::blend_rect(s, row, p.acctint.color, p.acctint.alpha);
             }
             // «  usb         : текст» — тег цветом акцента, как в макете.
@@ -1367,25 +1430,29 @@ impl App for Manager {
             Section::BootLog => self.draw_log(s, ctx, &plan),
         }
 
+        if let Some(bar) = self.bar(ctx, &plan) {
+            bar.draw(ctx, s, &self.scroll);
+        }
+
+        // Строка состояния единого вида (20.11): части через черту.
         let programs = self.tasks.iter().filter(|task| task.kind != Kind::Kernel).count();
         let used = self.info.frames_total.saturating_sub(self.info.frames_free);
-        let left = match &self.note {
-            Some(note) => note.clone(),
-            None => format!(
-                "Процессов: {} · программ и служб: {programs} · ЦП {} · память {}",
-                self.tasks.len(),
-                percent_text(self.cpu_total()),
-                percent_text(u32::from(permille(used, self.info.frames_total)))
-            ),
-        };
-        kit::status_bar(ctx, s, plan.status, &left);
+        let mut parts = vec![
+            format!("Процессов: {}", self.tasks.len()),
+            format!("Программ и служб: {programs}"),
+            format!("ЦП: {}", percent_text(self.cpu_total())),
+            format!("Память: {}", percent_text(u32::from(permille(used, self.info.frames_total)))),
+        ];
+        if let Some(note) = &self.note {
+            parts.push(note.clone());
+        }
         let right = match (self.section, self.selected_task()) {
             (Section::Processes | Section::Details, Some(task)) => format!("#{} {}", task.id, task.label()),
             (Section::Processes | Section::Details, None) => String::from("Выберите задачу"),
             _ => String::from("1–7 — разделы    R — обновить"),
         };
-        let p = ctx.palette;
-        paint::text_right(ctx, s, Role::Caption, plan.status.right() - ctx.px(14) as i32, paint::baseline(ctx, Role::Caption, plan.status), &right, p.ink4);
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        kit::status_line(ctx, s, plan.status, &parts, &right, 0);
 
         if let (Some(menu), Some(rect)) = (self.menu.as_ref(), self.menu_rect(ctx, area)) {
             kit::draw_menu(ctx, s, rect, &ENTRIES, menu.selected);
@@ -1498,6 +1565,7 @@ impl App for Manager {
                     WIN_KEY_END => self.cursor = last,
                     _ => return false,
                 }
+                self.scroll.follow(self.cursor);
             }
             _ if !matches!(self.section, Section::Processes | Section::Details) => return false,
             WIN_KEY_UP => self.step(-1),
@@ -1543,6 +1611,11 @@ impl App for Manager {
             }
         }
         self.searching = false;
+        // Полоса прокрутки (20.11): бегунок тянут, по дорожке листают.
+        if let Some(bar) = self.bar(ctx, &plan).filter(|bar| bar.contains(x, y)) {
+            bar.press(&self.scroll, x, y);
+            return true;
+        }
         if matches!(self.section, Section::Processes | Section::Details) {
             if plan.has_search(ctx) && plan.search.contains(x, y) {
                 self.searching = true;
@@ -1571,16 +1644,23 @@ impl App for Manager {
                 }
                 None => false,
             },
-            Section::Details => {
-                let rows = plan.rows_area(ctx);
+            Section::Details | Section::Services | Section::Startup => {
+                let (rows, _, row_h) = self.view_metrics(ctx, &plan);
                 if !rows.contains(x, y) {
                     return false;
                 }
-                let shown = (rows.h / ctx.px(ROW_H)) as usize;
-                let first = self.selected_index().map_or(0, |at| kit::first_visible(at, shown.max(1)));
-                let index = first + ((y - rows.y) as u32 / ctx.px(ROW_H)) as usize;
-                if index < self.tasks.len() {
-                    self.select_task(index);
+                let Some(index) = self.scroll.row_at(y, rows.y, row_h) else {
+                    return false;
+                };
+                if self.section == Section::Details {
+                    if index < self.tasks.len() {
+                        self.select_task(index);
+                        self.scroll.follow(index);
+                        return true;
+                    }
+                } else if index < self.services.len() {
+                    self.cursor = index;
+                    self.scroll.follow(index);
                     return true;
                 }
                 false
@@ -1617,18 +1697,33 @@ impl App for Manager {
         false
     }
 
-    fn wheel(&mut self, clicks: i32) -> bool {
-        // Колесо от себя — вверх по списку, как в любом окне.
-        let delta = if clicks > 0 { -3 } else { 3 };
-        match self.section {
-            Section::Processes | Section::Details => self.step(delta),
-            Section::Services | Section::Startup | Section::BootLog => {
-                let count = if self.section == Section::BootLog { self.log.len() } else { self.services.len() };
-                self.cursor = (self.cursor as isize + delta * 2).clamp(0, count.saturating_sub(1) as isize) as usize;
-            }
-            _ => return false,
+    /// Колесо двигает вид, а не выбранную строку (20.11, как в Windows).
+    fn wheel_at(&mut self, area: Rect, ctx: Ctx, clicks: i32) -> bool {
+        if self.menu.is_some() || self.run.is_some() {
+            return false;
         }
-        true
+        let plan = Plan::new(ctx, area, self.folded);
+        let (view, content, line) = self.view_metrics(ctx, &plan);
+        self.scroll.wheel(clicks, view.h, content, line)
+    }
+
+    fn drag(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        let plan = Plan::new(ctx, area, self.folded);
+        self.bar(ctx, &plan).is_some_and(|bar| bar.drag(&self.scroll, x, y))
+    }
+
+    fn release(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
+        self.scroll.release()
+    }
+
+    fn hover(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        let plan = Plan::new(ctx, area, self.folded);
+        let bar = self.bar(ctx, &plan);
+        self.scroll.hover(bar.as_ref(), x, y)
+    }
+
+    fn leave(&mut self) -> bool {
+        self.scroll.hover(None, 0, 0)
     }
 
     fn tick(&mut self, info: &SysInfo) -> bool {
@@ -1858,7 +1953,7 @@ fn error_text(code: i64) -> String {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
-    let size = app::two_thirds(&info);
+    let size = app::window_size(&info, app::size::TASKMGR);
     let fresh = sysinfo().unwrap_or(info);
     app::run(&SPEC, &info, size, move |_, _| Manager::new(fresh))
 }

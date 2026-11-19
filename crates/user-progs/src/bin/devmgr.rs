@@ -431,14 +431,6 @@ fn pci_model(id: &str) -> Option<&'static str> {
     })
 }
 
-fn devices_word(count: usize) -> &'static str {
-    match (count % 10, count % 100) {
-        (1, rest) if rest != 11 => "устройство",
-        (2..=4, rest) if !(12..=14).contains(&rest) => "устройства",
-        _ => "устройств",
-    }
-}
-
 fn list_devices() -> Vec<Device> {
     let mut buffer = Vec::new();
     if buffer.try_reserve_exact(DEVICES_LIMIT).is_err() {
@@ -625,6 +617,8 @@ struct Manager {
     last_log: String,
     logged_selection: bool,
     hostname: String,
+    /// Прокрутка дерева (20.11): колесо и полоса двигают вид, а не выбор.
+    scroll: kit::Scroll,
 }
 
 impl Manager {
@@ -647,6 +641,7 @@ impl Manager {
             last_log: String::new(),
             logged_selection: false,
             hostname: String::from("freeos"),
+            scroll: kit::Scroll::new(),
         };
         manager.refresh();
         manager.read_log();
@@ -784,6 +779,24 @@ impl Manager {
         let at = order.iter().position(|index| *index == self.selected).unwrap_or(0);
         let next = (at as isize + delta).clamp(0, order.len() as isize - 1) as usize;
         self.select(order[next]);
+        // Выбор клавишей — вид едет за ним (20.11).
+        if let Some(row) = self.rows().iter().position(|row| *row == Row::Device(order[next])) {
+            self.scroll.follow(row);
+        }
+    }
+
+    /// Видимая часть дерева, высота всех его строк и шаг строки.
+    fn tree_view(&self, ctx: Ctx, plan: &Plan) -> (Rect, u32, u32) {
+        let row_h = ctx.px(TREE_ROW_H);
+        let tree = plan.tree;
+        let view = Rect::new(tree.x, tree.y + ctx.px(6) as i32, tree.w.saturating_sub(1), tree.h.saturating_sub(ctx.px(8)));
+        (view, self.rows().len() as u32 * row_h, row_h)
+    }
+
+    /// Полоса прокрутки дерева, если оно не помещается.
+    fn bar(&self, ctx: Ctx, plan: &Plan) -> Option<kit::ScrollBar> {
+        let (view, content, _) = self.tree_view(ctx, plan);
+        kit::ScrollBar::vertical(ctx, view, content, &self.scroll)
     }
 
     fn set_tab(&mut self, tab: Tab) {
@@ -804,11 +817,6 @@ impl Manager {
         let word = device.driver.clone().unwrap_or_else(|| device.place.clone());
         let word = word.split_whitespace().next().unwrap_or("").to_string();
         self.events = Some((self.selected, kernel_log(&word)));
-    }
-
-    fn first_row(&self, rows: &[Row], shown: usize) -> usize {
-        let at = rows.iter().position(|row| *row == Row::Device(self.selected)).unwrap_or(0);
-        kit::first_visible(at, shown.max(1))
     }
 
     fn group_title(&self, group: usize) -> (&'static str, Fi) {
@@ -865,39 +873,17 @@ impl Manager {
 
     fn draw_left(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
         let p = ctx.palette;
-        draw::vline(s, plan.left.right() - 1, plan.left.y, plan.left.h, p.line.color, p.line.alpha);
-        // ── Пилюли-фильтры ──────────────────────────────────────────────────
-        for (filter, rect) in Filter::ALL.into_iter().zip(&plan.chips) {
-            let count = self.devices.iter().filter(|device| filter.passes(device)).count();
-            let on = filter == self.filter;
-            let r = rect.h / 2;
-            if on {
-                draw::rounded(s, *rect, r, ctx.flat(p.acctint), 255);
-                draw::rounded_stroke(s, *rect, r, p.accedge, 255);
-            } else {
-                draw::rounded_stroke(s, *rect, r, p.line3.color, p.line3.alpha);
-            }
-            let dot = match filter {
-                Filter::All => p.ink4,
-                Filter::Working => p.ok,
-                Filter::Attention => p.warn,
-                Filter::Quiet => p.ink5,
-            };
-            draw::circle(s, rect.x + ctx.px(12) as i32, rect.y + rect.h as i32 / 2, ctx.px(3), dot, 255);
-            let tx = rect.x + ctx.px(22) as i32;
-            let w = paint::text(ctx, s, Role::Caption, tx, paint::baseline(ctx, Role::Caption, *rect), filter.title(), if on { p.ink } else { p.ink2 });
-            paint::text(ctx, s, Role::MonoSmall, tx + w as i32 + ctx.px(6) as i32, paint::baseline(ctx, Role::MonoSmall, *rect), &format!("{count}"), p.ink4);
-        }
-        draw::hline(s, plan.tree.x, plan.tree.y - 1, plan.tree.w.saturating_sub(1), p.line.color, p.line.alpha);
-
         // ── Дерево ──────────────────────────────────────────────────────────
+        // Первым (20.11): строки едут по точкам, и край строки, ушедшей вверх,
+        // закрывают пилюли, нарисованные поверх.
         let rows = self.rows();
-        let row_h = ctx.px(TREE_ROW_H);
-        let shown = (plan.tree.h.saturating_sub(ctx.px(8)) / row_h) as usize;
-        let first = self.first_row(&rows, shown);
+        let (view, content, row_h) = self.tree_view(ctx, plan);
+        self.scroll.sync(view.h, content, row_h);
+        let at = self.scroll.offset();
         let g = ctx.px(18);
-        for (offset, row) in rows.iter().skip(first).take(shown).enumerate() {
-            let rect = Rect::new(plan.tree.x + ctx.px(8) as i32, plan.tree.y + ctx.px(6) as i32 + (offset as u32 * row_h) as i32, plan.tree.w.saturating_sub(ctx.px(16)), row_h);
+        for index in self.scroll.rows(view.h, row_h, rows.len()) {
+            let row = &rows[index];
+            let rect = Rect::new(plan.tree.x + ctx.px(8) as i32, view.y + (index as u32 * row_h) as i32 - at, plan.tree.w.saturating_sub(ctx.px(16)), row_h);
             let mid = rect.y + (rect.h - g) as i32 / 2;
             match *row {
                 Row::Root(count) => {
@@ -940,6 +926,37 @@ impl Manager {
             let rect = Rect::new(plan.tree.x + ctx.px(20) as i32, plan.tree.y + ctx.px(6) as i32 + row_h as i32, plan.tree.w, row_h);
             let text = if self.devices.is_empty() { "Перепись пуста — ядро не ответило" } else { "Ничего не подходит под фильтр" };
             paint::text(ctx, s, Role::Body, rect.x, paint::baseline(ctx, Role::Body, rect), text, p.ink4);
+        }
+        // Под деревом — журнал (рисуется следом и закрывает низ), над ним —
+        // пилюли: место под них заливается заново.
+        let top = Rect::new(plan.left.x, plan.left.y, plan.left.w.saturating_sub(1), (view.y - plan.left.y).max(0) as u32);
+        s.fill(top, mini_ui::theme::window_bg());
+        draw::vline(s, plan.left.right() - 1, plan.left.y, plan.left.h, p.line.color, p.line.alpha);
+        // ── Пилюли-фильтры ──────────────────────────────────────────────────
+        for (filter, rect) in Filter::ALL.into_iter().zip(&plan.chips) {
+            let count = self.devices.iter().filter(|device| filter.passes(device)).count();
+            let on = filter == self.filter;
+            let r = rect.h / 2;
+            if on {
+                draw::rounded(s, *rect, r, ctx.flat(p.acctint), 255);
+                draw::rounded_stroke(s, *rect, r, p.accedge, 255);
+            } else {
+                draw::rounded_stroke(s, *rect, r, p.line3.color, p.line3.alpha);
+            }
+            let dot = match filter {
+                Filter::All => p.ink4,
+                Filter::Working => p.ok,
+                Filter::Attention => p.warn,
+                Filter::Quiet => p.ink5,
+            };
+            draw::circle(s, rect.x + ctx.px(12) as i32, rect.y + rect.h as i32 / 2, ctx.px(3), dot, 255);
+            let tx = rect.x + ctx.px(22) as i32;
+            let w = paint::text(ctx, s, Role::Caption, tx, paint::baseline(ctx, Role::Caption, *rect), filter.title(), if on { p.ink } else { p.ink2 });
+            paint::text(ctx, s, Role::MonoSmall, tx + w as i32 + ctx.px(6) as i32, paint::baseline(ctx, Role::MonoSmall, *rect), &format!("{count}"), p.ink4);
+        }
+        draw::hline(s, plan.tree.x, plan.tree.y - 1, plan.tree.w.saturating_sub(1), p.line.color, p.line.alpha);
+        if let Some(bar) = self.bar(ctx, plan) {
+            bar.draw(ctx, s, &self.scroll);
         }
     }
 
@@ -1184,14 +1201,20 @@ impl App for Manager {
             self.drawer = !self.drawer;
             return true;
         }
+        // Полоса прокрутки дерева (20.11): бегунок тянут, по дорожке листают.
+        if let Some(bar) = self.bar(ctx, &plan).filter(|bar| bar.contains(x, y)) {
+            bar.press(&self.scroll, x, y);
+            return true;
+        }
         if plan.tree.contains(x, y) {
             let rows = self.rows();
-            let row_h = ctx.px(TREE_ROW_H);
-            let shown = (plan.tree.h.saturating_sub(ctx.px(8)) / row_h) as usize;
-            let first = self.first_row(&rows, shown);
-            let offset = ((y - plan.tree.y - ctx.px(6) as i32).max(0) as u32 / row_h) as usize;
-            match rows.get(first + offset) {
-                Some(Row::Device(index)) => self.select(*index),
+            let (view, _, row_h) = self.tree_view(ctx, &plan);
+            let at = self.scroll.row_at(y.max(view.y), view.y, row_h).unwrap_or(0);
+            match rows.get(at) {
+                Some(Row::Device(index)) => {
+                    self.select(*index);
+                    self.scroll.follow(at);
+                }
                 Some(Row::Group(group, _)) => {
                     let key = (self.view, *group);
                     if let Some(at) = self.collapsed.iter().position(|other| *other == key) {
@@ -1207,9 +1230,30 @@ impl App for Manager {
         false
     }
 
-    fn wheel(&mut self, clicks: i32) -> bool {
-        self.step(if clicks > 0 { -3 } else { 3 });
-        true
+    /// Колесо двигает вид дерева, а не выбор (20.11, как в Windows).
+    fn wheel_at(&mut self, area: Rect, ctx: Ctx, clicks: i32) -> bool {
+        let plan = Plan::new(ctx, area, self.drawer);
+        let (view, content, row_h) = self.tree_view(ctx, &plan);
+        self.scroll.wheel(clicks, view.h, content, row_h)
+    }
+
+    fn drag(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        let plan = Plan::new(ctx, area, self.drawer);
+        self.bar(ctx, &plan).is_some_and(|bar| bar.drag(&self.scroll, x, y))
+    }
+
+    fn release(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
+        self.scroll.release()
+    }
+
+    fn hover(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        let plan = Plan::new(ctx, area, self.drawer);
+        let bar = self.bar(ctx, &plan);
+        self.scroll.hover(bar.as_ref(), x, y)
+    }
+
+    fn leave(&mut self) -> bool {
+        self.scroll.hover(None, 0, 0)
     }
 
     fn tick(&mut self, _info: &SysInfo) -> bool {
@@ -1222,7 +1266,6 @@ impl App for Manager {
     }
 
     fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
-        let p = ctx.palette;
         s.fill(area, mini_ui::theme::window_bg());
         let plan = Plan::new(ctx, area, self.drawer);
         self.draw_toolbar(s, ctx, &plan);
@@ -1232,13 +1275,15 @@ impl App for Manager {
 
         let total = self.devices.len();
         let attention = self.devices.iter().filter(|device| matches!(device.state, State::Missing)).count();
-        let left = format!("{total} {} · без драйвера: {attention}", devices_word(total));
-        kit::status_bar(ctx, s, plan.status, &left);
+        // Строка состояния единого вида (20.11).
+        let shown = self.order().len();
+        let parts = [format!("Устройств: {total}"), format!("Показано: {shown}"), format!("Без драйвера: {attention}")];
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
         let right = match self.devices.get(self.selected) {
             Some(device) => format!("{} · {}", device.id, device.location()),
             None => String::from("R — обновить    V — вид    / — поиск"),
         };
-        paint::text_right(ctx, s, Role::Mono, plan.status.right() - ctx.px(14) as i32, paint::baseline(ctx, Role::Mono, plan.status), &right, p.ink4);
+        kit::status_line(ctx, s, plan.status, &parts, &right, 0);
     }
 }
 
@@ -1321,7 +1366,7 @@ fn log_lines(ctx: Ctx, s: &mut Surface, area: Rect, lines: &[String], last: usiz
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
-    let size = app::two_thirds(&info);
+    let size = app::window_size(&info, app::size::DEVMGR);
     let screen_h = info.screen_h;
     app::run(&SPEC, &info, size, move |_, _| Manager::new(screen_h))
 }

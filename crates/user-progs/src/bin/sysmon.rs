@@ -141,8 +141,9 @@ fn uptime_text(ms: u64) -> String {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
-    // Окно не больше экрана: на крошечном экране монитор всё равно откроется.
-    let size = (WIDTH.min(info.screen_w.max(320)), HEIGHT.min(info.screen_h.max(200)));
+    // Размер — по общему правилу каркаса (20.11): умноженный на масштаб, как
+    // рамка стола, и не больше рабочей области.
+    let size = app::window_size(&info, (WIDTH, HEIGHT));
     app::run(&SPEC, &info, size, move |_, _| {
         // Первые числа — в журнал, по одному разу и после строки об окне. Это
         // и есть доказательство, что счётчики ядра доехали до программы.
