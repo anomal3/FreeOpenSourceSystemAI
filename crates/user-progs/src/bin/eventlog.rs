@@ -961,7 +961,8 @@ fn report_dir() -> String {
     if stat(&desktop, &mut info) >= 0 && info.kind == KIND_DIRECTORY {
         return desktop;
     }
-    home
+    // Живая система без домашней папки (у root на флешке её нет) — /tmp.
+    if stat(&home, &mut info) >= 0 && info.kind == KIND_DIRECTORY { home } else { String::from("/tmp") }
 }
 
 fn home_dir() -> String {

@@ -814,7 +814,7 @@ fn pretty_font(file: &str) -> String {
         previous_lower = ch.is_lowercase();
         out.push(ch);
     }
-    out
+    out.replace("Deja Vu", "DejaVu").replace("I B M", "IBM")
 }
 
 /// Перенос по словам: сколько точек по высоте заняло.

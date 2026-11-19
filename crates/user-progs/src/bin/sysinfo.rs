@@ -639,7 +639,11 @@ fn report_dir() -> String {
     };
     let desktop = format!("{home}/Desktop");
     let mut info = user_abi::Stat::default();
-    if stat(&desktop, &mut info) >= 0 && info.kind == KIND_DIRECTORY { desktop } else { home }
+    if stat(&desktop, &mut info) >= 0 && info.kind == KIND_DIRECTORY {
+        return desktop;
+    }
+    // Живая система без домашней папки (у root на флешке её нет) — /tmp.
+    if stat(&home, &mut info) >= 0 && info.kind == KIND_DIRECTORY { home } else { String::from("/tmp") }
 }
 
 fn list_dirs(path: &str) -> Vec<String> {
