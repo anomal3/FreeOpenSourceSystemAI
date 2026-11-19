@@ -448,7 +448,7 @@ impl Compositor {
         };
         compositor.panel = Panel::new(compositor.primary, scale.min(2));
         let panel_top = compositor.work_bottom();
-        compositor.menu = Menu::new(compositor.primary, panel_top, scale.min(2));
+        compositor.menu = compositor.new_menu();
         // Шторка заводится только на телефоне — [`Shade::new`] сам вернёт
         // `None` на настольной машине.
         compositor.shade = Shade::new(compositor.primary.w, panel_top, scale);
@@ -456,8 +456,11 @@ impl Compositor {
         // Длина столбца значков считается от рабочей области, а не от экрана:
         // ячейка, заехавшая под панель задач, щёлкается панелью, а не значком.
         // Сетка — на основном мониторе.
-        compositor.icons.set_origin(compositor.primary.x, compositor.primary.y);
-        compositor.icons.set_area(panel_top - compositor.primary.y);
+        // С 20.11 панель стоит у любой стороны: сетка — от угла рабочей
+        // области, а не экрана.
+        let work = compositor.primary_work();
+        compositor.icons.set_origin(work.x, work.y);
+        compositor.icons.set_area(work.h as i32);
         // Ширина экрана и верх сетки — телефону (см. [`Icons::set_span`]). На
         // столе вызов безвреден: мобильная раскладка спрашивает эти числа, а
         // настольная о них не знает.
@@ -467,11 +470,143 @@ impl Compositor {
         Some(compositor)
     }
 
-    /// Нижняя граница области, в которой живут окна: верх панели.
+    /// Нижняя граница области, в которой живут окна: верх нижней панели.
     pub fn work_bottom(&self) -> i32 {
-        match self.panel.as_ref() {
-            Some(panel) => panel.rect.y,
-            None => self.primary.bottom(),
+        self.primary_work().bottom()
+    }
+
+    /// Рабочая область основного монитора: экран без того, что панель
+    /// отнимает у своей стороны (20.11: панель и Dock стоят у любой стороны,
+    /// со скрытием — не отнимают ничего).
+    #[must_use]
+    pub fn primary_work(&self) -> Rect {
+        let p = self.primary;
+        let Some(panel) = self.panel.as_ref() else {
+            return p;
+        };
+        if theme::is_mobile() {
+            return Rect::new(p.x, p.y, p.w, (panel.rect.y - p.y).max(0) as u32);
+        }
+        let (edge, t) = panel.reserve();
+        let t = t.min(p.w.min(p.h) / 2);
+        match edge {
+            super::deskcfg::Edge::Bottom => Rect::new(p.x, p.y, p.w, p.h - t),
+            super::deskcfg::Edge::Top => Rect::new(p.x, p.y + t as i32, p.w, p.h - t),
+            super::deskcfg::Edge::Left => Rect::new(p.x + t as i32, p.y, p.w - t, p.h),
+            super::deskcfg::Edge::Right => Rect::new(p.x, p.y, p.w - t, p.h),
+        }
+    }
+
+    /// «Пуск» под нынешнюю панель.
+    fn new_menu(&self) -> Option<Menu> {
+        let (home, cfg) = self.panel.as_ref().map_or((Rect::EMPTY, super::deskcfg::taskbar()), |panel| (panel.home(), panel.config()));
+        Menu::new(self.primary, home, cfg, self.scale.min(2))
+    }
+
+    /// Пересобрать панель и «Пуск» под новые настройки (`deskcfg`, 20.11):
+    /// сторона, вид, скрытие, размер значков. Окна вписываются в новую
+    /// рабочую область, развёрнутые — занимают её целиком.
+    pub fn rebuild_taskbar(&mut self) {
+        if theme::is_mobile() {
+            return;
+        }
+        let Some(panel) = Panel::new(self.primary, self.scale.min(2)) else {
+            return;
+        };
+        if let Some(old) = self.panel.as_ref() {
+            let rect = old.rect;
+            self.mark_layer(rect);
+        }
+        self.panel = Some(panel);
+        if let Some(menu) = self.new_menu() {
+            self.menu = Some(menu);
+        }
+        let work = self.primary_work();
+        self.icons.set_origin(work.x, work.y);
+        self.icons.set_area(work.h as i32);
+        self.icons.reload();
+        let works: Vec<Rect> = self.windows.iter().map(|window| self.work_rect_under(window.rect)).collect();
+        for (window, work) in self.windows.iter_mut().zip(works) {
+            if window.is_maximized() && !window.popup && window.resize(work.w, work.h) {
+                window.rect.x = work.x;
+                window.rect.y = work.y;
+                continue;
+            }
+            let max_x = (work.right() - window.rect.w as i32).max(work.x);
+            let max_y = (work.bottom() - window.rect.h as i32).max(work.y);
+            window.rect.x = window.rect.x.clamp(work.x, max_x);
+            window.rect.y = window.rect.y.clamp(work.y, max_y);
+        }
+        self.under_valid = false;
+        self.repaint_all();
+        crate::kprintln!("  desktop     : taskbar {} (work area {},{} {}x{})", super::deskcfg::describe(), work.x, work.y, work.w, work.h);
+    }
+
+    /// Указатель сдвинулся: автоскрытие панели.
+    pub fn taskbar_pointer(&mut self, x: i32, y: i32) {
+        let busy = self.menu_open() || self.context_open() || self.thumbs_open() || self.tray_pop.is_some();
+        let now = crate::time::uptime_ms();
+        if let Some(panel) = self.panel.as_mut() {
+            panel.autohide_pointer(x, y, busy, now);
+            if panel.autohide_pending() {
+                super::set_animating(true);
+            }
+        }
+    }
+
+    /// Шаг автоскрытия перед кадром. `true` — ещё едет или ждёт срока.
+    fn advance_taskbar(&mut self) -> bool {
+        let busy = self.menu_open() || self.context_open() || self.thumbs_open() || self.tray_pop.is_some();
+        let now = crate::time::uptime_ms();
+        let Some(panel) = self.panel.as_mut() else {
+            return false;
+        };
+        if busy {
+            panel.hold(now);
+        }
+        let moved = panel.autohide_tick(now);
+        let pending = panel.autohide_pending();
+        if let Some(rect) = moved {
+            self.mark_layer(rect);
+        }
+        pending
+    }
+
+    /// Закреплённая на панели программа под кнопкой `index`.
+    #[must_use]
+    pub fn panel_pin_choice(&self, index: usize) -> Option<super::panel::Choice> {
+        self.panel.as_ref()?.pin_choice(index)
+    }
+
+    #[must_use]
+    pub fn panel_pin_key(&self, index: usize) -> Option<alloc::string::String> {
+        self.panel.as_ref()?.pin_key(index)
+    }
+
+    #[must_use]
+    pub fn panel_pin_caption(&self, index: usize) -> alloc::string::String {
+        self.panel.as_ref().map(|panel| alloc::string::String::from(panel.pin_caption(index))).unwrap_or_default()
+    }
+
+    /// Всплывающее у панели (трей, уведомление, миниатюры): поставленное
+    /// «над нижней панелью» `rect` переносится к панели у другой стороны —
+    /// под верхнюю, правее левой, левее правой; `anchor` — кнопка, к которой
+    /// оно относится.
+    #[must_use]
+    pub fn beside_panel(&self, rect: Rect, anchor: Rect) -> Rect {
+        let Some(panel) = self.panel.as_ref().filter(|_| !theme::is_mobile()) else {
+            return rect;
+        };
+        let home = panel.home();
+        let gap = mini_ui::paint::Ctx::scaled(self.scale).px(12) as i32;
+        let p = self.primary;
+        let fit_y = |y: i32| y.clamp(p.y + gap, (p.bottom() - rect.h as i32 - gap).max(p.y + gap));
+        let center_y = anchor.y + anchor.h as i32 / 2 - rect.h as i32 / 2;
+        match panel.config().edge {
+            super::deskcfg::Edge::Bottom => rect,
+            super::deskcfg::Edge::Top => Rect::new(rect.x, home.bottom() + gap, rect.w, rect.h),
+            super::deskcfg::Edge::Left => Rect::new(home.right() + gap, fit_y(center_y), rect.w, rect.h),
+            super::deskcfg::Edge::Right => Rect::new(home.x - gap - rect.w as i32, fit_y(center_y), rect.w, rect.h),
         }
     }
 
@@ -492,8 +627,8 @@ impl Compositor {
     pub fn app_area(&self) -> Rect {
         let width = self.primary.w;
         if !theme::is_mobile() {
-            let p = self.primary;
-            return Rect::new(p.x, p.y, width, (self.app_bottom() - p.y).max(0) as u32);
+            let _ = width;
+            return self.primary_work();
         }
         let top = mini_ui::paint::Ctx::scaled(self.scale).px(theme::M_STATUS_H) as i32;
         Rect::new(0, top, width, self.app_bottom().saturating_sub(top).max(1) as u32)
@@ -650,6 +785,9 @@ impl Compositor {
     fn area_of(&self, i: usize, bottom: i32) -> Rect {
         let r = self.output_rects().get(i).copied().unwrap_or(self.primary);
         if r == self.primary && self.outputs.get(i).is_some_and(|o| o.primary) {
+            if !theme::is_mobile() {
+                return self.primary_work();
+            }
             Rect::new(r.x, r.y, r.w, (bottom - r.y).max(0) as u32)
         } else {
             r
@@ -1588,8 +1726,8 @@ impl Compositor {
             let fresh = packages.iter().find(|launcher| !known.contains(&launcher.name) && !launcher.start.is_empty());
             if let Some(launcher) = fresh {
                 let art = super::appicon::of_manifest(&launcher.icon);
-                let panel_top = self.panel.as_ref().map_or(self.primary.bottom(), |panel| panel.rect.y);
-                if let Some(toast) = super::toast::Toast::new(
+                let panel_top = self.panel.as_ref().map_or(self.primary.bottom(), |panel| panel.home().y);
+                if let Some(mut toast) = super::toast::Toast::new(
                     &launcher.caption,
                     &art,
                     launcher.start.clone(),
@@ -1598,6 +1736,7 @@ impl Compositor {
                     panel_top,
                     self.scale,
                 ) {
+                    toast.rect = self.beside_panel(toast.rect, toast.rect);
                     self.close_toast();
                     self.mark_layer(toast.rect);
                     self.toast = Some(toast);
@@ -2147,7 +2286,7 @@ impl Compositor {
         if self.menu_open() {
             return;
         }
-        if let Some(menu) = Menu::new(self.primary, self.work_bottom(), self.scale.min(2)) {
+        if let Some(menu) = self.new_menu() {
             self.menu = Some(menu);
         }
     }
@@ -2189,6 +2328,10 @@ impl Compositor {
                 self.invalidate_under_rect(bar);
                 self.mark(bar);
             }
+        }
+        // Настройки панели сменились («Параметры», 20.11) — пересобрать.
+        if !theme::is_mobile() && self.panel.as_ref().is_some_and(|panel| panel.config() != super::deskcfg::taskbar()) {
+            self.rebuild_taskbar();
         }
         let buttons = self.buttons();
         let menu_open = self.menu_open();
@@ -3047,9 +3190,15 @@ impl Compositor {
 
         if let Some(panel) = self.panel.as_mut() {
             let damage = panel.take_damage();
+            // Dock сменил длину — старое место стереть вместе с тенью.
+            let vacated = panel.take_vacated();
+            let whole = panel.rect;
             if !damage.is_empty() {
                 let rect = damage.translate(panel.rect.x, panel.rect.y);
                 self.mark(rect);
+            }
+            if !vacated.is_empty() {
+                self.mark_layer(vacated.union(&whole));
             }
         }
 
@@ -3310,10 +3459,11 @@ impl Compositor {
     pub fn open_tray_pop(&mut self, kind: super::traypop::Kind, item: super::panel::TrayItem) -> bool {
         let Some(panel) = self.panel.as_ref() else { return false };
         let Some(anchor) = panel.tray_rect(item) else { return false };
-        let panel_top = panel.rect.y;
-        let Some(pop) = super::traypop::TrayPop::new(kind, anchor, self.primary, panel_top, self.scale) else {
+        let panel_top = panel.home().y;
+        let Some(mut pop) = super::traypop::TrayPop::new(kind, anchor, self.primary, panel_top, self.scale) else {
             return false;
         };
+        pop.rect = self.beside_panel(pop.rect, anchor);
         self.mark_layer(pop.rect);
         self.tray_pop = Some(pop);
         true
@@ -3726,8 +3876,8 @@ impl Compositor {
         let (union, primary, _) = layout_of_rects(rects, primary)?;
         let back = band_buffer(union)?;
         let panel = Panel::new(primary, self.scale.min(2));
-        let top = panel.as_ref().map_or(primary.bottom(), |panel| panel.rect.y);
-        let menu = Menu::new(primary, top, self.scale.min(2));
+        let (home, cfg) = panel.as_ref().map_or((Rect::EMPTY, super::deskcfg::taskbar()), |panel| (panel.home(), panel.config()));
+        let menu = Menu::new(primary, home, cfg, self.scale.min(2));
         let context = ContextMenu::new(self.scale.min(2));
         Some(Layers { back, panel, menu, context })
     }
@@ -3779,9 +3929,9 @@ impl Compositor {
         self.under_valid = false;
         self.scene = None;
         self.drag = None;
-        let bottom = self.work_bottom();
-        self.icons.set_origin(self.primary.x, self.primary.y);
-        self.icons.set_area(bottom - self.primary.y);
+        let work = self.primary_work();
+        self.icons.set_origin(work.x, work.y);
+        self.icons.set_area(work.h as i32);
         self.icons.reload();
         // Развёрнутое на телефоне окно («на весь экран», 05.11) и после
         // смены режима — во весь новый экран, а не прежнего размера.
@@ -3898,6 +4048,7 @@ impl Compositor {
         }
         self.advance_flight();
         let shade_moving = self.advance_shade();
+        let taskbar_moving = self.advance_taskbar();
         self.build_scene();
         // След пальца по клавиатуре и язык её подписей. Анимация идёт, пока
         // летит окно или тлеет след: оболочка будит стол по этому признаку.
@@ -3925,7 +4076,7 @@ impl Compositor {
         // Палец держат на полоске жеста — задержку считает `ui::tick`, и
         // будить его надо кадрами, как и долгое нажатие на значок.
         super::set_animating(
-            self.flight.is_some() || trail || spinning || shade_moving || super::icon_holding() || super::gesture_holding(),
+            self.flight.is_some() || trail || spinning || shade_moving || taskbar_moving || super::icon_holding() || super::gesture_holding(),
         );
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
@@ -4249,8 +4400,9 @@ impl Compositor {
             if !panel.rect.intersect(&band).is_empty() {
                 super::note_dock_band();
                 let t0 = crate::time::uptime_ns();
-                // Панель ПК — во всю ширину и без скругления (72b).
-                let r = if theme::is_mobile() { radius } else { 0 };
+                // Панель ПК — во всю ширину и без скругления (72b); Dock —
+                // плашка со скруглёнными углами (20.11).
+                let r = if theme::is_mobile() { radius } else { panel.corner() };
                 self.drop_shadow(back, panel.rect, band, dy, r);
                 self.stack(back, panel.surface(), panel.rect, band, dy, r);
                 // Док считается отдельно от прочих верхних слоёв: он попадает

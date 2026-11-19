@@ -2202,6 +2202,16 @@ fn ui_status(argument: &str) {
         sprintln!("  ui       no framebuffer; the shell runs on the serial console");
         return;
     }
+    // Вид панели и «Пуска» (20.11): `ui taskbar dock left autohide`,
+    // `ui start wide`.
+    if let Some(words) = argument.trim().strip_prefix("taskbar") {
+        ui::taskbar_command(words);
+        return;
+    }
+    if let Some(words) = argument.trim().strip_prefix("start") {
+        ui::start_command(words);
+        return;
+    }
     if argument.trim() == "reset" {
         ui::reset_timing();
         sprintln!("  ui       frame counters reset");

@@ -67,6 +67,8 @@ pub enum Section {
     Wallpaper,
     Colors,
     Dock,
+    /// «Пуск» (20.11): ширина, разделы, закреплённые.
+    Start,
     Explorer,
     Apps,
     Packages,
@@ -100,7 +102,7 @@ const NAV: [Section; 13] = [
 ];
 
 /// Все страницы — для поиска.
-const ALL: [Section; 24] = [
+const ALL: [Section; 25] = [
     Section::Home,
     Section::System,
     Section::Display,
@@ -115,6 +117,7 @@ const ALL: [Section; 24] = [
     Section::Wallpaper,
     Section::Colors,
     Section::Dock,
+    Section::Start,
     Section::Explorer,
     Section::Apps,
     Section::Packages,
@@ -145,6 +148,7 @@ impl Section {
             Section::Wallpaper => "Фон",
             Section::Colors => "Цвета",
             Section::Dock => "Dock и панель задач",
+            Section::Start => "Пуск",
             Section::Explorer => "Проводник",
             Section::Apps => "Приложения",
             Section::Packages => "Пакеты",
@@ -174,6 +178,7 @@ impl Section {
             }
             Section::Keyboard | Section::Usb => Some(Section::Devices),
             Section::Wallpaper | Section::Colors => Some(Section::Personal),
+            Section::Start => Some(Section::Dock),
             Section::Packages | Section::Services | Section::DefaultApps => Some(Section::Apps),
             _ => None,
         }
@@ -201,6 +206,7 @@ impl Section {
             Section::Personal | Section::Colors => Fi::Palette,
             Section::Wallpaper => Fi::Image,
             Section::Dock => Fi::Dock,
+            Section::Start => Fi::Apps,
             Section::Explorer => Fi::Folder,
             Section::Apps => Fi::Apps,
             Section::Packages => Fi::Package,
@@ -253,7 +259,8 @@ impl Section {
             Section::Personal => "Фон, цвета, тема",
             Section::Wallpaper => "Градиент рабочего стола",
             Section::Colors => "Тема, акцентный цвет, заголовок окна",
-            Section::Dock => "Что показывает панель задач",
+            Section::Dock => "Вид, сторона экрана, автоскрытие, значки",
+            Section::Start => "Ширина, разделы и закреплённые программы",
             Section::Explorer => "Файловый менеджер",
             Section::Apps => "Пакеты и службы",
             Section::Packages => "Установленные .fpk в /opt",
@@ -283,7 +290,8 @@ impl Section {
             Section::Personal => "персонализация оформление",
             Section::Wallpaper => "фон обои градиент",
             Section::Colors => "цвета тема тёмная светлая акцент заголовок",
-            Section::Dock => "панель задач dock аптайм дата часы",
+            Section::Dock => "панель задач dock аптайм дата часы расположение скрывать автоскрытие сверху слева справа значки",
+            Section::Start => "пуск меню закреплённые недавние все программы ширина широкий",
             Section::Explorer => "проводник файлы папки files",
             Section::Apps => "приложения программы",
             Section::Packages => "пакеты fpk установить удалить pkg",
@@ -360,6 +368,10 @@ enum Deed {
     TitleBar(u32),
     ScreenOff(u32),
     Panel(PanelPref, bool),
+    /// Панель задач и Dock (20.11, `deskcfg`).
+    Taskbar(super::deskcfg::TaskbarDeed),
+    /// «Пуск» (20.11).
+    Start(super::deskcfg::StartDeed),
     Layout(crate::input::keymap::Layout),
     Timezone(i32),
     NetDhcp,
@@ -1212,6 +1224,23 @@ impl SettingsView {
                         kprintln!("  settings    : panel {tag} {} saved", if on { "on" } else { "off" });
                         Report::ok(String::from("панель запомнила"))
                     }
+                    Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
+                });
+            }
+            Deed::Taskbar(deed) => {
+                self.request = Some(Request::Panel);
+                let (text, result) = super::deskcfg::apply_taskbar(deed);
+                kprintln!("  settings    : taskbar {}", super::deskcfg::describe());
+                self.report = Some(match result {
+                    Ok(()) => Report::ok(text),
+                    Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
+                });
+            }
+            Deed::Start(deed) => {
+                let (text, result) = super::deskcfg::apply_start(deed);
+                kprintln!("  settings    : start {}", super::deskcfg::describe_start());
+                self.report = Some(match result {
+                    Ok(()) => Report::ok(text),
                     Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
                 });
             }

@@ -1,0 +1,220 @@
+//! Манифест программ «Пуска» (20.11.2026).
+//!
+//! До этого «Пуск» знал программы по двум местам: окна стола — строками в
+//! `Menu::new`, программы из `/bin` — таблицей `PROGRAMS` в `panel.rs`, а
+//! панель, рабочий стол и «Параметры» спрашивали подписи и значки каждый
+//! своим путём. Новая программа требовала правки во всех. Теперь всё, что
+//! «Пуск» показывает, кроме пакетов, — строка здесь: ключ, подпись, папка,
+//! значок и чем запускать. Пакеты (`/var/lib/pkg`) приходят своим манифестом и
+//! ключом `pkg:имя`.
+//!
+//! Папка — тоже строка манифеста, а не свойство программы: «Системные
+//! утилиты» и «SDK C#» закрепляются, открепляются и стоят в списке «Все
+//! программы» как одна строка, раскрывающая своё содержимое.
+
+use mini_ui::glyphicon::Icon;
+
+use super::window::App;
+
+/// Чем запускается строка.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Launch {
+    /// Окно, которое открывает сам стол.
+    App(App),
+    /// Программа из `/bin` и хвост её команды (сборка для `mono`/`dotnet`).
+    Program(&'static str, &'static str),
+}
+
+/// Программа в манифесте.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// Ключ — по нему строка закрепляется (`start_pins=`, `taskbar_pins=`).
+    pub key: &'static str,
+    pub caption: &'static str,
+    pub about: &'static str,
+    /// Папка (ключ из [`FOLDERS`]) или пусто — строка верхнего уровня.
+    pub folder: &'static str,
+    /// Значок макета (`assets/icons/app`), если есть.
+    pub art: &'static str,
+    /// Значок набора — когда значка макета нет.
+    pub icon: Icon,
+    pub launch: Launch,
+    /// Файл, без которого строка не показывается (сборка примера). Пусто —
+    /// хватает самой программы в `/bin`.
+    pub needs: &'static str,
+    /// Ключ группы окон на панели задач: по нему закреплённая кнопка
+    /// узнаёт открытое окно своей программы.
+    pub group: &'static str,
+}
+
+/// Папка «Пуска».
+#[derive(Debug, PartialEq, Eq)]
+pub struct Folder {
+    pub key: &'static str,
+    pub caption: &'static str,
+    pub about: &'static str,
+}
+
+pub static FOLDERS: [Folder; 2] = [
+    Folder { key: "folder:utils", caption: "Системные утилиты", about: "калькулятор, блокнот и другие" },
+    Folder { key: "folder:sdk", caption: "SDK C#", about: "примеры WinForms и .NET" },
+];
+
+/// Всё, что ставит в «Пуск» сама система. Порядок — порядок клавиатурного
+/// обхода: первые четыре строки («Терминал», «Параметры», «О системе»,
+/// «Файлы») стоят на своих местах с фазы С3 — на них считают нажатия
+/// сценарии стенда.
+pub static ENTRIES: [Entry; 11] = [
+    Entry {
+        key: "terminal",
+        caption: "Терминал",
+        about: "командная строка",
+        folder: "",
+        art: "terminal",
+        icon: Icon::Terminal,
+        launch: Launch::App(App::Terminal),
+        needs: "",
+        group: "Terminal",
+    },
+    Entry {
+        key: "settings",
+        caption: "Параметры",
+        about: "система, экран, панель задач",
+        folder: "",
+        art: "settings",
+        icon: Icon::Settings,
+        launch: Launch::App(App::Settings),
+        needs: "",
+        group: "Settings",
+    },
+    Entry {
+        key: "about",
+        caption: "О системе",
+        about: "версия и сведения",
+        folder: "",
+        art: "about",
+        icon: Icon::Info,
+        launch: Launch::App(App::About),
+        needs: "",
+        group: "About",
+    },
+    Entry {
+        key: "files",
+        caption: "Файлы",
+        about: "папки и файлы на дисках",
+        folder: "",
+        art: "files",
+        icon: Icon::Folder,
+        launch: Launch::Program("files", ""),
+        needs: "",
+        group: "/bin/files",
+    },
+    // Диспетчер задач, а не монитор системы (фаза С5): `sysmon` остался в
+    // `/bin` ради стенда, но человеку нужен тот, из которого задачу снимают.
+    Entry {
+        key: "taskmgr",
+        caption: "Диспетчер задач",
+        about: "процессы, память и службы",
+        folder: "",
+        art: "task-manager",
+        icon: Icon::Chart,
+        launch: Launch::Program("taskmgr", ""),
+        needs: "",
+        group: "/bin/taskmgr",
+    },
+    Entry {
+        key: "devmgr",
+        caption: "Диспетчер устройств",
+        about: "устройства и их драйверы",
+        folder: "",
+        art: "device-manager",
+        icon: Icon::Devices,
+        launch: Launch::Program("devmgr", ""),
+        needs: "",
+        group: "/bin/devmgr",
+    },
+    Entry {
+        key: "notepad",
+        caption: "Блокнот",
+        about: "простой текстовый редактор",
+        folder: "folder:utils",
+        art: "notepad",
+        icon: Icon::File,
+        launch: Launch::Program("notepad", ""),
+        needs: "",
+        group: "/bin/notepad",
+    },
+    Entry {
+        key: "calc",
+        caption: "Калькулятор",
+        about: "обычный калькулятор",
+        folder: "folder:utils",
+        art: "calculator",
+        icon: Icon::Grid,
+        launch: Launch::Program("calc", ""),
+        needs: "",
+        group: "/bin/calc",
+    },
+    // Примеры WinForms (фазы 62a–62b) и витрина своей среды .NET. Строки нет,
+    // если нет файла примера.
+    Entry {
+        key: "forms",
+        caption: "Форма WinForms",
+        about: "пример Mono: кнопка, поле, флажок",
+        folder: "folder:sdk",
+        art: "code-editor",
+        icon: Icon::Grid,
+        launch: Launch::Program("mono", "/usr/share/mono/forms.exe"),
+        needs: "/usr/share/mono/forms.exe",
+        group: "/bin/mono",
+    },
+    Entry {
+        key: "popups",
+        caption: "Меню и списки",
+        about: "пример Mono: всплывающие окна, вопрос",
+        folder: "folder:sdk",
+        art: "code-editor",
+        icon: Icon::Grid,
+        launch: Launch::Program("mono", "/usr/share/mono/popups.exe"),
+        needs: "/usr/share/mono/popups.exe",
+        group: "/bin/mono",
+    },
+    Entry {
+        key: "gallery",
+        caption: "Примеры .NET",
+        about: "формы WinForms своей среды",
+        folder: "folder:sdk",
+        art: "code-editor",
+        icon: Icon::Grid,
+        launch: Launch::Program("dotnet", "/usr/share/dotnet/samples/gallery.dll"),
+        needs: "/usr/share/dotnet/samples/gallery.dll",
+        group: "",
+    },
+];
+
+/// Закреплённое в «Пуске», пока человек ничего не менял.
+pub static DEFAULT_PINS: [&str; 7] = ["terminal", "settings", "about", "files", "taskmgr", "folder:utils", "folder:sdk"];
+
+/// Закреплённое на панели задач по умолчанию.
+pub static DEFAULT_TASK_PINS: [&str; 3] = ["files", "terminal", "settings"];
+
+/// Строка манифеста по ключу.
+#[must_use]
+pub fn entry(key: &str) -> Option<&'static Entry> {
+    ENTRIES.iter().find(|entry| entry.key == key)
+}
+
+/// Папка по ключу.
+#[must_use]
+pub fn folder(key: &str) -> Option<&'static Folder> {
+    FOLDERS.iter().find(|folder| folder.key == key)
+}
+
+/// Значок строки: картинка макета, если есть, иначе знак набора на плитке.
+#[must_use]
+pub fn art(entry: &Entry) -> super::appicon::Art {
+    match super::appicon::design(entry.art) {
+        Some(image) => super::appicon::Art::Image(image),
+        None => super::appicon::Art::glyph(entry.icon),
+    }
+}

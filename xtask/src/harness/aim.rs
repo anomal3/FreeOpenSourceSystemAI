@@ -62,6 +62,9 @@ pub enum Aim {
     Icon(usize),
     /// Пустое место стола — правее значков и выше панели.
     Empty,
+    /// Середина места, которое «Пуск» напечатал строкой `start spot <имя> at
+    /// X,Y WxH` (20.11): плитка, папка, кнопка пользователя, строка меню.
+    Spot(&'static str),
     /// Пустое место ниже [`Aim::Empty`]: туда не попадает меню, открытое в нём.
     EmptyBelow,
     /// Трей: часы у правого края панели задач. Область попадания часов
@@ -445,6 +448,15 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
             (rect.x + (8 + n * 224 + 108) * scale, rect.y + (8 + 90) * scale)
         }
         Aim::Point(x, y) => (x, y),
+        Aim::Spot(name) => {
+            let key = format!("start spot {name} at ");
+            let rect = log
+                .lines()
+                .filter_map(|line| line.split(&key).nth(1).and_then(parse_placement))
+                .last()
+                .with_context(|| format!("в журнале нет места «Пуска» '{name}'"))?;
+            (rect.x + rect.w / 2, rect.y + rect.h / 2)
+        }
     };
 
     if point.0 < 0 || point.1 < 0 || point.0 >= width || point.1 >= height {

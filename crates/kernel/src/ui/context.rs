@@ -520,7 +520,6 @@ impl Action {
                 | Action::SortType
                 | Action::SortDate
                 | Action::RunAsAdmin
-                | Action::PinTaskbar
                 | Action::PinStart
                 | Action::PinQuick
                 | Action::Compress
@@ -530,6 +529,10 @@ impl Action {
         )
     }
 }
+
+/// Пункт «Закрепить на панели задач» открытого меню открепляет: кнопка уже
+/// закреплена (ставит стол перед открытием меню кнопки, 20.11).
+pub static UNPIN_TASKBAR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Чем меню занято прямо сейчас.
 enum Mode {
@@ -784,6 +787,8 @@ impl ContextMenu {
     /// Подпись пункта: у «Открыть с помощью» — с именем программы.
     fn label(&self, action: Action) -> String {
         match action {
+            // Кнопка уже закреплена — пункт открепляет (20.11).
+            Action::PinTaskbar if UNPIN_TASKBAR.load(core::sync::atomic::Ordering::Relaxed) => String::from("Открепить от панели задач"),
             Action::OpenWith(index) | Action::Window(index) | Action::Recent(index) => match self.handlers.get(usize::from(index)) {
                 Some((name, _)) => name.clone(),
                 None => String::from(action.title()),

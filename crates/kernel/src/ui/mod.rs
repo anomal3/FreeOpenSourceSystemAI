@@ -45,6 +45,7 @@
 pub mod appicon;
 pub mod compositor;
 pub mod context;
+pub mod deskcfg;
 pub mod dialog;
 pub mod icons;
 pub mod lock;
@@ -59,6 +60,7 @@ pub mod home;
 pub mod keyboard;
 pub mod shade;
 pub mod start;
+pub mod startapps;
 pub mod tray;
 pub mod statusbar;
 pub mod term;
@@ -345,9 +347,22 @@ fn open_close_menu(desktop: &mut Compositor, app: App, status: &Status) {
     items.extend_from_slice(&context::Action::ON_BUTTON);
     desktop.context_handlers(recent.iter().map(|(_, path)| (String::from(context::base_name(path)), path.clone())).collect());
     *RECENT_MENU.lock() = recent;
+    // «Закрепить на панели задач» (20.11): ключ программы окна; без ключа
+    // (окно .NET, задача без пути) пункт серый.
+    let key = pin_key_of_group(&group);
+    context::UNPIN_TASKBAR.store(key.as_deref().is_some_and(deskcfg::task_pinned), Ordering::Relaxed);
+    let unkeyed = key.is_none();
+    *PIN_KEY.lock() = key;
     desktop.open_context(button.x, button.y, &items);
+    let mut off = alloc::vec::Vec::new();
     if single {
-        desktop.context_set_off(alloc::vec![context::Action::CloseAll]);
+        off.push(context::Action::CloseAll);
+    }
+    if unkeyed {
+        off.push(context::Action::PinTaskbar);
+    }
+    if !off.is_empty() {
+        desktop.context_set_off(off);
     }
     desktop.context_select_none();
     if let Some(rect) = desktop.context_rect() {
@@ -356,8 +371,44 @@ fn open_close_menu(desktop: &mut Compositor, app: App, status: &Status) {
     desktop.refresh_panel(status);
 }
 
+/// Ключ закрепления программы, чьи окна собираются в группу `group`
+/// (`deskcfg`, 20.11): строка манифеста «Пуска» или пакет из `/opt`.
+fn pin_key_of_group(group: &str) -> Option<String> {
+    if group.is_empty() {
+        return None;
+    }
+    if let Some(entry) = startapps::ENTRIES.iter().find(|entry| entry.group == group) {
+        return Some(String::from(entry.key));
+    }
+    let name = group.strip_prefix("/opt/")?.split('/').next()?;
+    Some(alloc::format!("pkg:{name}"))
+}
+
+/// Ключ программы, для которой открыто меню кнопки панели.
+static PIN_KEY: SpinLock<Option<String>> = SpinLock::new(None);
+
+/// Меню закреплённой кнопки без окон: только «Открепить».
+fn open_pin_menu(desktop: &mut Compositor, index: usize, x: i32, y: i32, status: &Status) {
+    let Some(key) = desktop.panel_pin_key(index) else {
+        return;
+    };
+    context::UNPIN_TASKBAR.store(true, Ordering::Relaxed);
+    *PIN_KEY.lock() = Some(key);
+    desktop.open_context(x, y, &[context::Action::PinTaskbar]);
+    desktop.context_select_none();
+    if let Some(rect) = desktop.context_rect() {
+        kprintln!("  desktop     : context menu at {},{} {}x{} for pinned button", rect.x, rect.y, rect.w, rect.h);
+    }
+    desktop.refresh_panel(status);
+}
+
 /// Файлы, открытые столом (команда программы и путь), — новые первыми.
 static RECENT: SpinLock<alloc::vec::Vec<(String, String)>> = SpinLock::new(alloc::vec::Vec::new());
+/// Недавние файлы для «Пуска» (команда и путь), новые первыми.
+pub(crate) fn recent_files() -> alloc::vec::Vec<(String, String)> {
+    RECENT.lock().iter().take(8).cloned().collect()
+}
+
 /// «Недавние» открытого меню кнопки.
 static RECENT_MENU: SpinLock<alloc::vec::Vec<(String, String)>> = SpinLock::new(alloc::vec::Vec::new());
 
@@ -1069,7 +1120,8 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
     if theme::is_mobile() {
         return desktop.mobile_rect();
     }
-    let p = desktop.primary_rect();
+    // От угла рабочей области: панель может стоять сверху или слева (20.11).
+    let p = desktop.primary_work();
     layout_local(desktop, app).translate(p.x, p.y)
 }
 
@@ -1078,8 +1130,8 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
     // Раскладка считается от размера экрана, а не задана числами: прошивка
     // вправе дать и 800×600, и 1920×1080, и окно, не помещающееся на экран,
     // выглядело бы как испорченная графика.
-    let width = desktop.screen_width();
-    let work = (desktop.work_bottom() - desktop.primary_rect().y).max(1) as u32;
+    let width = desktop.primary_work().w;
+    let work = desktop.primary_work().h.max(1);
     let margin = width / 24;
 
     // На телефоне окно занимает экран целиком — от строки состояния до
@@ -2430,6 +2482,18 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
             toggle_menu(desktop, status);
             return None;
         }
+        // Ctrl+Shift+Esc — диспетчер задач, как в Windows (20.11).
+        KeyCode::Escape if event.mods.contains(Modifiers::CTRL) && event.mods.contains(Modifiers::SHIFT) => {
+            run_choice(desktop, panel::Choice::Program("taskmgr", ""));
+            desktop.refresh_panel(status);
+            return None;
+        }
+        // Win+R — «Выполнить», как в Windows (фаза П1, 20.11): /bin/run.
+        KeyCode::R if event.mods.contains(Modifiers::META) => {
+            run_choice(desktop, panel::Choice::Program("run", ""));
+            desktop.refresh_panel(status);
+            return None;
+        }
         // Win+L — заблокировать, как в Windows (72h-4).
         KeyCode::L if event.mods.contains(Modifiers::META) => {
             desktop.lock_screen();
@@ -2582,6 +2646,13 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
         }
         return;
     }
+    // Автоскрытие панели: край экрана выдвигает её, уход — прячет (20.11).
+    desktop.taskbar_pointer(x, y);
+    if desktop.menu_open() && !desktop.context_open() {
+        if desktop.menu_mut().is_some_and(|menu| menu.hover(x, y)) {
+            desktop.present();
+        }
+    }
     if desktop.context_open() {
         hover_context(desktop, x, y, status);
     } else if desktop.thumbs_open() {
@@ -2650,6 +2721,13 @@ fn resize_shape(edges: u8) -> pointer::Shape {
 /// окном, держится, — ему (фаза 68c, `user_abi::WIN_WHEEL`). Окнам стола
 /// колесо пока ничего не делает.
 fn wheel(desktop: &mut Compositor, x: i32, y: i32, clicks: i32) {
+    // Открытый «Пуск» прокручивает колонку под указателем (20.11).
+    if desktop.menu_open() && !desktop.context_open() {
+        if desktop.menu_mut().is_some_and(|menu| menu.wheel(x, y, clicks)) {
+            desktop.present();
+        }
+        return;
+    }
     let target = if let Some((app, _)) = desktop.captured() {
         Some(app)
     } else if desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open() {
@@ -2870,7 +2948,12 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         // в окно или в кнопку панели: у них своего меню пока нет.
         // «Открыть с помощью ›» у каждого файла свой — программы приходят
         // меню перед открытием (`context_handlers`).
-        let target: Option<(&[context::Action], &str)> = if desktop.context_open() {
+        let in_start = desktop.menu_open() && desktop.menu_mut().is_some_and(|menu| menu.context(x, y));
+        let target: Option<(&[context::Action], &str)> = if in_start {
+            // Правая кнопка над «Пуском» — его собственное меню программы.
+            desktop.present();
+            None
+        } else if desktop.context_open() {
             desktop.close_context();
             None
         } else if let Some(hit) = desktop.panel_at(x, y) {
@@ -2885,6 +2968,10 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                         desktop.close_thumbs();
                     }
                     open_close_menu(desktop, app, status);
+                    None
+                }
+                PanelHit::Pin(index) => {
+                    open_pin_menu(desktop, index, x, y, status);
                     None
                 }
                 PanelHit::Menu
@@ -2991,6 +3078,11 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 desktop.refresh_panel(status);
             }
             desktop.open_context(x, y, items);
+            // Ярлык программы на столе на панель пока не закрепляется — из
+            // «Пуска» (20.11).
+            if items.contains(&context::Action::PinTaskbar) {
+                desktop.context_set_off(alloc::vec![context::Action::PinTaskbar]);
+            }
             // Печатается **место, куда меню встало**, а не точка щелчка: у
             // края экрана оно сдвигается, чтобы не выехать, и стенд, целящийся
             // по точке щелчка, попадал бы мимо пунктов.
@@ -3499,13 +3591,13 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         }
     }
 
-    // 1. Открытое меню.
+    // 1. Открытое меню. Щелчок внутри может и не запускать: раскрыть
+    // папку, открыть меню пользователя, закрепить (20.11).
     if desktop.menu_open() {
-        let choice = desktop.menu_mut().and_then(|menu| menu.choice_at(x, y));
-        match choice {
-            Some(choice) => {
+        let click = desktop.menu_mut().map_or(panel::MenuClick::Close, |menu| menu.click(x, y));
+        match click {
+            panel::MenuClick::Launch(choice) => {
                 if let Some(menu) = desktop.menu_mut() {
-                    menu.select_at(x, y);
                     menu.close();
                 }
                 kprintln!("  desktop     : menu closed");
@@ -3514,10 +3606,15 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                 desktop.refresh_panel(status);
                 return;
             }
+            panel::MenuClick::Stay => {
+                desktop.refresh_panel(status);
+                desktop.present();
+                return;
+            }
             // Щелчок мимо меню закрывает его и на этом заканчивается: это то,
             // чего человек ждёт от щелчка вне открытого меню, и заодно
             // единственный способ закрыть его мышью.
-            None => {
+            panel::MenuClick::Close => {
                 if let Some(menu) = desktop.menu_mut() {
                     menu.close();
                 }
@@ -3587,6 +3684,14 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
             PanelHit::Missing("phone") => start(desktop, icons::PHONE_COMMAND),
             PanelHit::Missing(what) => {
                 kprintln!("  desktop     : {what} -- no program for it on this machine yet");
+            }
+            // Закреплённая программа без окна — запустить (20.11).
+            PanelHit::Pin(index) => {
+                if let Some(choice) = desktop.panel_pin_choice(index) {
+                    kprintln!("  desktop     : taskbar pin '{}' launched", desktop.panel_pin_caption(index));
+                    run_choice(desktop, choice);
+                }
+                desktop.refresh_panel(status);
             }
             PanelHit::Empty => {}
         }
@@ -4693,6 +4798,39 @@ fn apply_look_change(desktop: &mut Compositor, look: bool, title: bool, status: 
     }
 }
 
+/// `ui taskbar …` и `ui start …` оболочки (20.11): сменить вид панели и
+/// «Пуска» без «Параметров» — так их меняет стенд.
+pub fn taskbar_command(words: &str) {
+    let status = status_now();
+    if words.trim() == "settings" {
+        with_desktop(|desktop| {
+            open_settings(desktop, Section::Dock, &status);
+            desktop.present();
+        });
+        return;
+    }
+    deskcfg::command(words);
+    with_desktop(|desktop| {
+        desktop.refresh_panel(&status);
+        desktop.present();
+    });
+}
+
+pub fn start_command(words: &str) {
+    let status = status_now();
+    if words.trim() == "settings" {
+        with_desktop(|desktop| {
+            open_settings(desktop, Section::Start, &status);
+            desktop.present();
+        });
+        return;
+    }
+    deskcfg::start_command(words);
+    with_desktop(|desktop| {
+        desktop.reload_menu();
+    });
+}
+
 /// Открыть или закрыть меню запуска.
 fn toggle_menu(desktop: &mut Compositor, status: &Status) {
     // Открывается — значит пересобирается (фаза N8): пакет, поставленный после
@@ -4712,6 +4850,14 @@ fn toggle_menu(desktop: &mut Compositor, status: &Status) {
     );
     if !packages.is_empty() {
         kprintln!("  desktop     : start menu offers packages: {packages}");
+    }
+    // Где что стоит — для стенда (`Aim::Spot`).
+    if opened {
+        if let Some(menu) = desktop.menu_mut() {
+            for spot in menu.spots() {
+                kprintln!("  desktop     : start spot {spot}");
+            }
+        }
     }
     if !opened {
         // Закрытое меню надо стереть: под ним фон и окна, которые никто не
@@ -4745,6 +4891,8 @@ fn handle_menu(desktop: &mut Compositor, event: KeyEvent, status: &Status) {
             menu.close();
             closed = true;
         }
+        // Escape сперва закрывает всплывшее над «Пуском» меню (20.11).
+        KeyCode::Escape if menu.dismiss_popup() => {}
         KeyCode::Escape | KeyCode::LeftMeta | KeyCode::RightMeta | KeyCode::F1 => {
             menu.close();
             closed = true;
@@ -4780,6 +4928,22 @@ fn handle_menu(desktop: &mut Compositor, event: KeyEvent, status: &Status) {
 fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
     match choice {
         panel::Choice::App(app) => launch(desktop, app),
+        // Меню пользователя в «Пуске» (20.11).
+        panel::Choice::Settings(section) => {
+            launch(desktop, App::Settings);
+            if let Some(window) = desktop.find(App::Settings) {
+                window.show_settings(section);
+            }
+            kprintln!("  desktop     : settings opened on {section:?}");
+        }
+        panel::Choice::Lock => {
+            desktop.lock_screen();
+            kprintln!("  desktop     : locked");
+        }
+        panel::Choice::Recent(command, path) => {
+            kprintln!("  desktop     : opening recent '{path}'");
+            open_file(desktop, &command, &path);
+        }
         panel::Choice::Program(name, args) => {
             let path = if args.is_empty() {
                 alloc::format!("/bin/{name}")
@@ -5012,7 +5176,6 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         | context::Action::SortType
         | context::Action::SortDate
         | context::Action::RunAsAdmin
-        | context::Action::PinTaskbar
         | context::Action::PinStart
         | context::Action::PinQuick
         | context::Action::Compress
@@ -5198,6 +5361,15 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             members.retain(|member| desktop.index_of(*member).is_some());
             if let Some(anchor) = members.first().copied() {
                 open_list_of(desktop, anchor, members, status, hovered, false);
+            }
+            desktop.refresh_panel(status);
+        }
+        // Закрепить или открепить программу кнопки (20.11).
+        context::Action::PinTaskbar => {
+            desktop.close_context();
+            if let Some(key) = PIN_KEY.lock().take() {
+                let pinned = deskcfg::toggle_task_pin(&key);
+                kprintln!("  desktop     : taskbar {} '{key}'", if pinned { "pinned" } else { "unpinned" });
             }
             desktop.refresh_panel(status);
         }
@@ -5755,9 +5927,9 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         let full_h = if framed { h.saturating_add(Window::title_height(scale)) } else { h };
         // Окно программы открывается на основном мониторе, по центру его
         // рабочей области.
-        let p = desktop.primary_rect();
-        let screen = desktop.screen_width();
-        let work = (desktop.app_bottom() - p.y).max(1) as u32;
+        let p = desktop.primary_work();
+        let screen = p.w;
+        let work = p.h.max(1);
         // На телефоне окно программы открывается во весь экран, как у Android
         // (05.11): рамку держит стол, пиксели лежат в ней по центру или
         // срезаны (NetSurf просит 800×600 на экране шириной 720), а умеющей
