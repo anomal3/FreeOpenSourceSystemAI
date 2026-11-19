@@ -11047,6 +11047,32 @@ aarch64 выстрел, сделанный через 4 с после выбор
 уточняются версии GC/SDMA/PSP/SMU/DCN и список прошивок для A2–A3. Версия GC
 10.3.6 у Raphael — предположение, не из таблицы.
 
+**Polaris (RX 590, 18–19.11): A1 ПРОВЕРЕНА НА ЖЕЛЕЗЕ.** Машина Романа с этим
+репозиторием — ПК с **RX 590 GME** (`1002:6fdf` rev `e7`, шина 03:00.0, Polaris 10,
+VI/GFX8), а не Ryzen `13c0`; IP discovery у Polaris нет, поэтому в `amd.rs` есть
+отдельная ветка `polaris()` (по списку PCI-ID; регистры — dword-индексы
+`vi.c`/`gmc_v8_0.c`/`*_d.h` Linux 6.12) и команда `amd vbios` (ПЗУ через
+`SMC_IND_INDEX_11`, как `vi_read_bios_from_rom`; пишет индексные регистры, не
+PCI config). Что прочитано с живой карты (`LOG.TXT`, образ 0.8.2): BAR0
+`0xe0000000` (VRAM, окно 256 МиБ), BAR2 `0xf0000000`, BAR5 `0xfbe00000`;
+`CONFIG_MEMSIZE` 8192 МиБ; VRAM в адресах GPU `0xf400000000..0xf5ffffffff`;
+`BIOS_SCRATCH_7` = `0x41220301` → карту уже POST'нула прошивка (Linux POST не
+делает); `GB_ADDR_CONFIG` `0x22011003`. **Состояние блоков:** GFX простаивает,
+RLC остановлен (`RLC_CNTL`=0), CE/PFP/ME остановлены (`CP_ME_CNTL`=`0x15000000`),
+оба SDMA остановлены, IH выключен, VM: `VM_L2_CNTL` бит 0 = 0 и
+`VM_CONTEXT0_CNTL` бит 0 = 0 (кэш L2 и контекст 0 выключены). То есть UEFI
+оставил только вывод картинки (GOP), движки не запущены — их поднимать нам.
+VFCT в ACPI нет (у дискретной карты и не ожидалось). Прошивки, которые запросил
+бы Linux для 6FDF/E7: `polaris10_{ce,pfp,me,mec,mec2}_2.bin` (откат на
+`*.bin`), `polaris10_rlc.bin`, `polaris10_sdma{,1}.bin`, `polaris10_mc.bin`,
+`polaris10_k_smc.bin` (`ASICID_IS_P20`), UVD/VCE — только для видео. На VI
+микрокод CP/RLC/SDMA грузит SMC сообщением `LoadUcodes`
+(`AMDGPU_FW_LOAD_SMU`), поэтому порядок работ: **SMC (залить образ в SRAM,
+запустить) → MC-ucode → таблица ucode + `LoadUcodes` → RLC/CP/SDMA → кольца → IH
+и VM**. Файлы `polaris10_*.bin` — из `linux-firmware`, в репозиторий не
+коммитить (`build/amd-fw/`). Не прочитано: `amd vbios` (вывод Роман не
+присылал).
+
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
 `drmGetDevices2`, ioctl для `vulkaninfo` и для рендера, поля
