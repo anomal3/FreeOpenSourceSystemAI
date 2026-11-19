@@ -200,6 +200,13 @@ fn script_step(run: &mut Run) {
                     pending.drain(..=end);
                     let text = text.trim_end_matches('\r');
                     kprintln!("  gametest| {text}");
+                    // Первые вызовы NVK к карте — в журнал (vkCreateDevice:
+                    // каналы, объекты, первые EXEC): если споткнётся, видно где.
+                    if text.starts_with("gametest: run vkprobe") {
+                        crate::linux::drm::trace_next(800);
+                    } else if text.starts_with("gametest: PASS vkprobe") || text.starts_with("gametest: FAIL vkprobe") {
+                        crate::linux::drm::trace_next(0);
+                    }
                     if text.starts_with("gametest: summary") {
                         summary = Some(String::from(text));
                     }

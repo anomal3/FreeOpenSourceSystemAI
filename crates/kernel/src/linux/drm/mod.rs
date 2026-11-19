@@ -159,7 +159,16 @@ pub fn set_trace(on: bool) {
 
 #[must_use]
 pub fn trace() -> bool {
-    TRACE.load(Ordering::Relaxed)
+    TRACE.load(Ordering::Relaxed) || TRACE_LEFT.load(Ordering::Relaxed) > 0
+}
+
+/// Трассировка следующих `ioctls` вызовов (потом сама гаснет): `gpu
+/// gametest` включает её на vkprobe, чтобы журнал на флешке показал, на каком
+/// вызове NVK споткнулся о настоящую карту, не забив кольцо журнала.
+static TRACE_LEFT: AtomicU64 = AtomicU64::new(0);
+
+pub fn trace_next(ioctls: u64) {
+    TRACE_LEFT.store(ioctls, Ordering::Relaxed);
 }
 
 // ---- открытый файл ------------------------------------------------------------
@@ -378,6 +387,7 @@ static ERRORS_LOGGED: AtomicU64 = AtomicU64::new(0);
 const ERROR_LOG_LIMIT: u64 = 64;
 
 fn log_ioctl(request: u32, answer: i64) {
+    let _ = TRACE_LEFT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1));
     if !trace() && ERRORS_LOGGED.fetch_add(1, Ordering::Relaxed) >= ERROR_LOG_LIMIT {
         return;
     }
