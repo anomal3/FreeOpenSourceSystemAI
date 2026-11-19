@@ -264,6 +264,11 @@ pub struct Compositor {
     /// этом не меняется. Свёрнутое тоже показывается — иначе не узнать,
     /// какое из одинаково названных окон какое.
     peek: Option<App>,
+    /// Подложка подсмотра (20.11, как Aero Peek): весь стол с окнами,
+    /// уменьшенный в [`PEEK_STEP`] раз, размытый и приглушённый. Собирается
+    /// один раз, когда подсмотр начался; пока он идёт, всё под подсмотренным
+    /// окном рисуется из неё растяжением.
+    peek_back: Option<Surface>,
     /// Миниатюры окон над кнопкой панели (72e).
     thumbs: Option<super::thumbs::Thumbs>,
     /// Окно трея (72h-1).
@@ -420,6 +425,7 @@ impl Compositor {
             resize_edges: 0,
             hovered: None,
             peek: None,
+            peek_back: None,
             thumbs: None,
             tray_pop: None,
             toast: None,
@@ -881,6 +887,18 @@ impl Compositor {
         if self.peek == app {
             return;
         }
+        // Подсмотр начался или кончился: стол целиком меняет вид - размытый
+        // под окном или обычный.
+        match app {
+            Some(_) if self.peek_back.is_none() => {
+                self.build_peek_back();
+                if self.peek_back.is_some() {
+                    self.mark_layer(self.union);
+                }
+            }
+            None if self.peek_back.take().is_some() => self.mark_layer(self.union),
+            _ => {}
+        }
         for old in [self.peek, app].into_iter().flatten() {
             if let Some(rect) = self.windows.iter().find(|window| window.app == old).map(|window| window.rect) {
                 self.mark_layer(rect);
@@ -1032,7 +1050,7 @@ impl Compositor {
             .filter(|(_, window)| !window.popup)
             .map(|(index, window)| super::panel::Entry {
                 app: window.app,
-                caption: window.caption().into(),
+                caption: window.label(),
                 focused: index == self.focus,
                 minimized: window.minimized,
                 art: window.icon_art(),
@@ -1219,6 +1237,7 @@ impl Compositor {
             return None;
         }
         let window = self.windows.remove(self.focus);
+        Self::forget_terminal(&window);
         self.focus = self.windows.len().saturating_sub(1);
         self.refresh_decorations();
         // На месте закрытого окна снова виден фон и то, что было под ним.
@@ -1961,7 +1980,7 @@ impl Compositor {
         // при появлении и уходе, см. [`Self::sync_keyboard`]).
         // Так же окно программы, которому клавиатуру открыли кнопкой (05.11).
         let lifted = self.windows.get(index).is_some_and(|window| window.keyboard);
-        if theme::is_mobile() && (app == App::Terminal || lifted) {
+        if theme::is_mobile() && (app.is_terminal() || lifted) {
             if let Some(keyboard) = self.keyboard.as_ref().filter(|keyboard| keyboard.is_visible()) {
                 let bottom = keyboard.rect.y.saturating_sub(mini_ui::paint::Ctx::scaled(self.scale).px(keyboard::GAP) as i32);
                 area.h = bottom.saturating_sub(area.y).max(1) as u32;
@@ -2051,6 +2070,7 @@ impl Compositor {
             self.repaint_all();
         }
         let window = self.windows.remove(index);
+        Self::forget_terminal(&window);
         self.invalidate_recent();
         // Окно ниже активного уехало из списка — номер активного съехал на одно.
         // Раньше закрывали почти всегда верхнее, активное, окно; всплывающие
@@ -2605,7 +2625,7 @@ impl Compositor {
                 app: window.app,
                 title: alloc::string::String::from(window.caption()),
                 note: match window.app {
-                    App::Terminal => alloc::string::String::from("оболочка"),
+                    App::Terminal | App::TermWin(_) => alloc::string::String::from("оболочка"),
                     App::Settings => alloc::string::String::from("параметры системы"),
                     App::About => alloc::string::String::from("о системе"),
                     App::Shutdown | App::Restart => alloc::string::String::from("вопрос о питании"),
@@ -2748,7 +2768,7 @@ impl Compositor {
         // И «Параметры» с открытым полем ввода — пароль Wi-Fi (03.11).
         let settings_typing = focused == Some(App::Settings)
             && self.windows.iter().any(|window| window.app == App::Settings && window.wants_text());
-        let want = focused == Some(App::Terminal) || self.start_focused() || settings_typing || program_typing;
+        let want = focused.is_some_and(App::is_terminal) || self.start_focused() || settings_typing || program_typing;
         let keyboard = self.keyboard.as_ref()?;
         if keyboard.is_visible() == want {
             self.lift_program_windows();
@@ -3339,6 +3359,164 @@ impl Compositor {
         self.tray_pop.as_ref().is_some_and(|pop| pop.rect.contains(x, y))
     }
 
+    /// Окно терминала, в полосе которого вкладка сессии `session` (20.11:
+    /// окон терминала может быть несколько - вкладки уносят в новые окна).
+    pub fn terminal_of(&mut self, session: usize) -> Option<&mut Window> {
+        self.windows.iter_mut().find(|window| window.app.is_terminal() && window.tab_sessions().contains(&session))
+    }
+
+    /// Какое окно терминала держит вкладку `session`.
+    #[must_use]
+    pub fn terminal_app_of(&self, session: usize) -> Option<App> {
+        self.windows.iter().find(|window| window.app.is_terminal() && window.tab_sessions().contains(&session)).map(|window| window.app)
+    }
+
+    /// Сессии всех вкладок всех окон терминала.
+    #[must_use]
+    pub fn terminal_sessions(&self) -> Vec<usize> {
+        self.windows.iter().filter(|window| window.app.is_terminal()).flat_map(|window| window.tab_sessions().iter().copied()).collect()
+    }
+
+    /// Окно терминала, ближайшее к человеку: активное, если это терминал,
+    /// иначе верхнее из окон терминала.
+    #[must_use]
+    pub fn front_terminal(&self) -> Option<App> {
+        match self.focused_app() {
+            Some(app) if app.is_terminal() => Some(app),
+            _ => self.windows.iter().rev().find(|window| window.app.is_terminal() && !window.minimized).map(|window| window.app),
+        }
+    }
+
+    /// Окно терминала, на полосу вкладок которого указывает точка, - если
+    /// оно верхнее в этой точке, не считая окна `except` (его и несут).
+    #[must_use]
+    pub fn terminal_strip_at(&self, x: i32, y: i32, except: App) -> Option<App> {
+        let window = self
+            .windows
+            .iter()
+            .rev()
+            .filter(|window| window.app != except && !window.minimized && !window.popup)
+            .find(|window| window.rect.contains(x, y))?;
+        (window.app.is_terminal() && window.strip_contains(x, y)).then_some(window.app)
+    }
+
+    /// Окна терминала уходят со стола: их вкладки - тоже (оболочки сессий,
+    /// кроме первой, которая живёт всегда, просят закрыться).
+    fn forget_terminal(window: &Window) {
+        if window.app.is_terminal() {
+            for &session in window.tab_sessions() {
+                if session != 0 {
+                    super::request_tab(super::TabRequest::Close(session));
+                }
+            }
+        }
+    }
+
+    /// Собрать подложку подсмотра ([`Self::peek_back`]): стол полосами по
+    /// [`PEEK_STRIP`] строк - обои и значки отдельно, окна отдельно, - каждая
+    /// полоса сразу уменьшается. Окна на подложке - вполовину прозрачные
+    /// (среднее с обоями), всё размыто и приглушено. Полный кадр во весь стол
+    /// не держится: на 2560x1440 это 14 МБ ради одного наведения.
+    fn build_peek_back(&mut self) {
+        if theme::is_mobile() {
+            return;
+        }
+        let bounds = self.union;
+        let (sw, sh) = (bounds.w.div_ceil(PEEK_STEP), bounds.h.div_ceil(PEEK_STEP));
+        let started = crate::time::uptime_ns();
+        let (Some(mut small), Some(mut wall), Some(mut strip)) = (
+            Surface::new(sw, sh, Color::rgb(0, 0, 0)),
+            Surface::new(sw, sh, Color::rgb(0, 0, 0)),
+            Surface::new(bounds.w, PEEK_STRIP, theme::palette().wall_top),
+        ) else {
+            return;
+        };
+        let radius = theme::R_WINDOW * self.scale;
+        let mut top = bounds.y;
+        while top < bounds.bottom() {
+            let h = PEEK_STRIP.min((bounds.bottom() - top) as u32);
+            let band = Rect::new(bounds.x, top, bounds.w, h);
+            let dy = -top;
+            self.draw_background(&mut strip, band, dy);
+            super::statusbar::draw(&mut strip, band, dy, self.primary.w, self.scale);
+            self.icons.draw(&mut strip, band, dy);
+            let row = ((top - bounds.y) as u32) / PEEK_STEP;
+            shrink_into(&strip, h, &mut wall, row);
+            for window in self.windows.iter().filter(|window| !window.minimized && !window.popup) {
+                if !window.shaped {
+                    self.drop_shadow(&mut strip, window.rect, band, dy, radius);
+                }
+                self.stack_window(&mut strip, window, band, dy, radius);
+            }
+            shrink_into(&strip, h, &mut small, row);
+            top += h as i32;
+        }
+        // Окна - вполовину сквозь (среднее с обоями под ними), всё темнее на
+        // четверть: подсмотренное окно читается сразу.
+        for y in 0..sh {
+            let under = wall.row(y);
+            let line = small.row_mut(y);
+            for (pixel, &back) in line.iter_mut().zip(under) {
+                let mixed = ((*pixel >> 1) & 0x7F7F_7F7F) + ((back >> 1) & 0x7F7F_7F7F);
+                *pixel = darken(mixed) | 0xFF00_0000;
+            }
+        }
+        box_blur(&mut small, 3);
+        box_blur(&mut small, 3);
+        crate::kprintln!(
+            "  desktop     : peek backdrop {}x{} built in {} us",
+            sw,
+            sh,
+            crate::time::uptime_ns().wrapping_sub(started) / 1000
+        );
+        self.peek_back = Some(small);
+    }
+
+    /// Подложка подсмотра в полосу кадра: растяжение в [`PEEK_STEP`] раз с
+    /// линейной интерполяцией - сначала по вертикали в строку, потом по
+    /// горизонтали.
+    fn draw_peek_back(&self, back: &mut Surface, band: Rect, dy: i32, small: &Surface) {
+        let bounds = self.union;
+        let (sw, sh) = (small.width(), small.height());
+        if sw == 0 || sh == 0 {
+            return;
+        }
+        let step = PEEK_STEP as i32;
+        let mut line = Vec::new();
+        if line.try_reserve_exact(sw as usize).is_err() {
+            return;
+        }
+        line.resize(sw as usize, 0u32);
+        for y in band.y..band.bottom() {
+            let ty = back.height() as i32;
+            let out_y = y + dy;
+            if out_y < 0 || out_y >= ty {
+                continue;
+            }
+            // Центр точки подложки - в середине её клетки.
+            let v = (((y - bounds.y) * 256 + 128) / step - 128).max(0);
+            let (r0, fy) = ((v >> 8) as u32, (v & 255) as u32);
+            let r0 = r0.min(sh - 1);
+            let r1 = (r0 + 1).min(sh - 1);
+            let (a, b) = (small.row(r0), small.row(r1));
+            for (index, slot) in line.iter_mut().enumerate() {
+                *slot = lerp(a[index], b[index], fy);
+            }
+            // Буфер полосы - в координатах стола по горизонтали (см.
+            // [`Self::compose`]).
+            let out = back.row_mut(out_y as u32);
+            let from = band.x.max(0);
+            let to = band.right().min(out.len() as i32);
+            for x in from..to {
+                let u = (((x - bounds.x) * 256 + 128) / step - 128).max(0);
+                let (c0, fx) = ((u >> 8) as u32, (u & 255) as u32);
+                let c0 = c0.min(sw - 1);
+                let c1 = (c0 + 1).min(sw - 1);
+                out[x as usize] = lerp(line[c0 as usize], line[c1 as usize], fx);
+            }
+        }
+    }
+
     /// Убрать миниатюры.
     pub fn close_thumbs(&mut self) {
         if let Some(thumbs) = self.thumbs.take() {
@@ -3424,7 +3602,7 @@ impl Compositor {
             let text_x = icon.right() + px(8) as i32;
             let room = (cross.x - px(4) as i32 - text_x).max(0) as u32;
             let head = Rect::new(at.x, at.y + px(4) as i32, at.w, px(HEAD_H));
-            mini_ui::paint::text_clipped(ctx, back, Role::Body, text_x, mini_ui::paint::baseline(ctx, Role::Body, head), room, window.caption(), p.ink);
+            mini_ui::paint::text_clipped(ctx, back, Role::Body, text_x, mini_ui::paint::baseline(ctx, Role::Body, head), room, &window.label(), p.ink);
             if hovered {
                 let plate = if thumbs.cross { Color::rgb(0xE8, 0x3B, 0x2C) } else { p.bad };
                 draw::rounded(back, cross, px(4), plate, 255);
@@ -3972,6 +4150,16 @@ impl Compositor {
             None => false,
         };
         let covered = covered || scene;
+        // Подсмотр окна из миниатюр (20.11): всё, что под ним, - размытая
+        // приглушённая подложка, собранная один раз при наведении.
+        let peeking = match self.peek_back.as_ref().filter(|_| !scene && self.peek.is_some()) {
+            Some(small) => {
+                self.draw_peek_back(back, band, dy, small);
+                true
+            }
+            None => false,
+        };
+        let covered = covered || peeking;
         // Телефон: всё, что под окнами, — одним копированием из готовой картинки.
         let cached = match self.under.as_ref() {
             // Во время полёта — и устаревшая: пересобирать её в кадре полёта
@@ -4001,7 +4189,7 @@ impl Compositor {
         let t_icons = crate::time::uptime_ns();
         let mut shadow_ns = 0u64;
         // Окна уже в сцене, если она есть.
-        for window in self.windows.iter().filter(|window| !scene && !window.minimized && !self.hidden_by_flight(window)) {
+        for window in self.windows.iter().filter(|window| !scene && !peeking && !window.minimized && !self.hidden_by_flight(window)) {
             let t0 = crate::time::uptime_ns();
             // Углы всплывающего окна не скругляются: меню рисует свою рамку
             // прямоугольником, и срезанный угол вырезал бы её.
@@ -4768,4 +4956,110 @@ fn uncovered(from: Rect, to: Rect) -> impl Iterator<Item = Rect> {
 /// Затемняет ли окно стол под собой: диалоги, которые ждут ответа (макет 18).
 fn dims(app: App) -> bool {
     matches!(app, App::OpenWith | App::Hung | App::DeleteAsk | App::Shutdown | App::Restart)
+}
+
+/// Во сколько раз подложка подсмотра меньше стола (20.11).
+const PEEK_STEP: u32 = 4;
+/// Высота полосы, которой собирается подложка подсмотра (кратна шагу).
+const PEEK_STRIP: u32 = PEEK_STEP * 16;
+
+/// Уменьшить `h` верхних строк `strip` в [`PEEK_STEP`] раз (среднее по
+/// клетке) и положить в `out` начиная со строки `row`.
+fn shrink_into(strip: &Surface, h: u32, out: &mut Surface, row: u32) {
+    let step = PEEK_STEP;
+    let rows = h.div_ceil(step);
+    let width = strip.width();
+    for sy in 0..rows {
+        let target = row + sy;
+        if target >= out.height() {
+            break;
+        }
+        let y0 = sy * step;
+        let y1 = (y0 + step).min(h);
+        let line = out.row_mut(target);
+        for (sx, slot) in line.iter_mut().enumerate() {
+            let x0 = sx as u32 * step;
+            if x0 >= width {
+                break;
+            }
+            let x1 = (x0 + step).min(width);
+            let (mut c0, mut c1, mut c2, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for y in y0..y1 {
+                for &pixel in &strip.row(y)[x0 as usize..x1 as usize] {
+                    c0 += pixel & 0xFF;
+                    c1 += (pixel >> 8) & 0xFF;
+                    c2 += (pixel >> 16) & 0xFF;
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            *slot = 0xFF00_0000 | ((c2 / n) << 16) | ((c1 / n) << 8) | (c0 / n);
+        }
+    }
+}
+
+/// Приглушить точку на четверть (каждый канал * 3/4).
+const fn darken(pixel: u32) -> u32 {
+    let c0 = (pixel & 0xFF) * 3 / 4;
+    let c1 = ((pixel >> 8) & 0xFF) * 3 / 4;
+    let c2 = ((pixel >> 16) & 0xFF) * 3 / 4;
+    (c2 << 16) | (c1 << 8) | c0
+}
+
+/// Смесь двух точек: `f` из 256 - доля второй.
+const fn lerp(a: u32, b: u32, f: u32) -> u32 {
+    let g = 256 - f;
+    let c0 = ((a & 0xFF) * g + (b & 0xFF) * f) >> 8;
+    let c1 = (((a >> 8) & 0xFF) * g + ((b >> 8) & 0xFF) * f) >> 8;
+    let c2 = (((a >> 16) & 0xFF) * g + ((b >> 16) & 0xFF) * f) >> 8;
+    0xFF00_0000 | (c2 << 16) | (c1 << 8) | c0
+}
+
+/// Размыть поверхность ящиком радиуса `r`: сначала строки, потом столбцы
+/// (скользящая сумма, края - повтором крайней точки).
+fn box_blur(surface: &mut Surface, r: u32) {
+    let (w, h) = (surface.width() as usize, surface.height() as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let r = r as i32;
+    let span = (2 * r + 1) as u32;
+    let mut tmp: Vec<u32> = Vec::new();
+    if tmp.try_reserve_exact(w.max(h)).is_err() {
+        return;
+    }
+    tmp.resize(w.max(h), 0);
+    let blur_line = |get: &dyn Fn(usize) -> u32, len: usize, out: &mut [u32]| {
+        let at = |i: i32| get(i.clamp(0, len as i32 - 1) as usize);
+        let (mut s0, mut s1, mut s2) = (0u32, 0u32, 0u32);
+        for i in -r..=r {
+            let p = at(i);
+            s0 += p & 0xFF;
+            s1 += (p >> 8) & 0xFF;
+            s2 += (p >> 16) & 0xFF;
+        }
+        for i in 0..len as i32 {
+            out[i as usize] = 0xFF00_0000 | ((s2 / span) << 16) | ((s1 / span) << 8) | (s0 / span);
+            let (add, sub) = (at(i + r + 1), at(i - r));
+            s0 = s0 + (add & 0xFF) - (sub & 0xFF);
+            s1 = s1 + ((add >> 8) & 0xFF) - ((sub >> 8) & 0xFF);
+            s2 = s2 + ((add >> 16) & 0xFF) - ((sub >> 16) & 0xFF);
+        }
+    };
+    for y in 0..h {
+        {
+            let row = surface.row(y as u32);
+            blur_line(&|i| row[i], w, &mut tmp[..w]);
+        }
+        surface.row_mut(y as u32).copy_from_slice(&tmp[..w]);
+    }
+    for x in 0..w {
+        {
+            let s = &*surface;
+            blur_line(&|i| s.row(i as u32)[x], h, &mut tmp[..h]);
+        }
+        for y in 0..h {
+            surface.row_mut(y as u32)[x] = tmp[y];
+        }
+    }
 }

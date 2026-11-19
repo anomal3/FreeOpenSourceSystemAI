@@ -114,6 +114,16 @@ pub enum Aim {
     SubItem(usize, i32),
     /// Середина окна.
     Middle(&'static str),
+    /// Вкладка терминала в полосе-заголовке окна с таким именем (20.11):
+    /// номер слева с нуля и сколько вкладок в полосе - ширина вкладки
+    /// зависит от их числа (как `Window::strip_layout`).
+    Tab(&'static str, i32, i32),
+    /// Кнопка окна на панели задач - место из строки `desktop     : button of
+    /// '<имя>' at` (её печатает стол, когда уносят вкладку в новое окно).
+    Button(&'static str),
+    /// Карточка номер `n` открытых миниатюр над панелью - место полосы из
+    /// строки `desktop     : thumbnails at` (карточка 216, поле 8, макет 04).
+    Thumb(i32),
     /// Точка экрана как есть. Для раскладок, которые стенд не пересчитывает, —
     /// экранной клавиатуры телефона: её место зависит только от размера экрана,
     /// а сценарий `mobile` задаёт его сам.
@@ -403,6 +413,36 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         Aim::Middle(title) => {
             let rect = window(log, title)?;
             (rect.x + rect.w / 2, rect.y + rect.h / 2)
+        }
+        Aim::Tab(title, index, count) => {
+            let rect = window(log, title)?;
+            let scale = ui_scale(log)?;
+            // Полоса от 8 до левого края «свернуть» минус 8; справа «+» 28
+            // и зазор 4; вкладка не шире 200 и не уже 60, шаг - ширина + 2.
+            let right = rect.w - 3 * TITLE_BTN * scale - 8 * scale;
+            let room = right - (8 + 28 + 4) * scale;
+            let tab = (room / count.max(1)).min(200 * scale).max(60 * scale);
+            (rect.x + 8 * scale + index * (tab + 2 * scale) + tab / 3, rect.y + TITLE_H * scale / 2 + 2 * scale)
+        }
+        Aim::Button(title) => {
+            let marker = format!("button of '{title}' at ");
+            let rect = log
+                .lines()
+                .filter_map(|line| line.split(marker.as_str()).nth(1))
+                .filter_map(parse_placement)
+                .last()
+                .with_context(|| format!("в журнале нет кнопки окна '{title}'"))?;
+            (rect.x + rect.w / 2, rect.y + rect.h / 2)
+        }
+        Aim::Thumb(n) => {
+            let rect = log
+                .lines()
+                .filter_map(|line| line.split("thumbnails at ").nth(1))
+                .filter_map(parse_placement)
+                .last()
+                .context("в журнале нет открытых миниатюр")?;
+            let scale = ui_scale(log)?;
+            (rect.x + (8 + n * 224 + 108) * scale, rect.y + (8 + 90) * scale)
         }
         Aim::Point(x, y) => (x, y),
     };

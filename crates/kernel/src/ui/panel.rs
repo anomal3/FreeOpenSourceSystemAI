@@ -594,7 +594,7 @@ impl Panel {
                     p.ink3
                 }
             };
-            let icon = if *app == App::Terminal { Icon::Prompt } else { app.icon() };
+            let icon = if app.is_terminal() { Icon::Prompt } else { app.icon() };
             centered_icon(&mut self.surface, rect, icon, glyph, ink);
         }
 

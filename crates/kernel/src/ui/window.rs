@@ -55,6 +55,10 @@ use crate::input::KeyCode;
 pub enum App {
     /// Оболочка.
     Terminal,
+    /// Ещё одно окно терминала (20.11): в него унесли вкладку из полосы
+    /// (как в Windows Terminal). Номер - порядковый, окна ищут по [`App`], и
+    /// второму окну терминала нужно своё имя.
+    TermWin(u32),
     /// Что это за система.
     About,
     /// Параметры: сведения о системе, экран, программы, обновление.
@@ -124,6 +128,12 @@ impl App {
         }
     }
 
+    /// Окно терминала - первое или унесённое из полосы вкладок.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, App::Terminal | App::TermWin(_))
+    }
+
     /// Как окно называется для человека.
     ///
     /// Отдельно от [`App::title`], а не вместо него: `title` попадает в журнал,
@@ -133,7 +143,7 @@ impl App {
     #[must_use]
     pub const fn caption(self) -> &'static str {
         match self {
-            App::Terminal => "Терминал",
+            App::Terminal | App::TermWin(_) => "Терминал",
             App::About => "О системе",
             App::Settings => "Параметры",
             App::Shutdown => "Выключение",
@@ -156,7 +166,7 @@ impl App {
     #[must_use]
     pub const fn tone(self) -> mini_ui::paint::Tone {
         match self {
-            App::Terminal => mini_ui::paint::Tone::Ok,
+            App::Terminal | App::TermWin(_) => mini_ui::paint::Tone::Ok,
             App::Shutdown | App::Restart => mini_ui::paint::Tone::Bad,
             _ => mini_ui::paint::Tone::Accent,
         }
@@ -171,14 +181,14 @@ impl App {
     /// у такого окна не рисуется: нарисованный, он обещал бы то, чего нет.
     #[must_use]
     pub const fn resizable(self) -> bool {
-        matches!(self, App::Terminal | App::Settings)
+        matches!(self, App::Terminal | App::TermWin(_) | App::Settings)
     }
 
     /// Значок программы: на столе, в меню запуска и в заголовке окна.
     #[must_use]
     pub const fn icon(self) -> Icon {
         match self {
-            App::Terminal => Icon::Terminal,
+            App::Terminal | App::TermWin(_) => Icon::Terminal,
             App::About => Icon::Info,
             App::Settings => Icon::Settings,
             App::Shutdown | App::Restart => Icon::Power,
@@ -194,6 +204,8 @@ impl App {
     pub const fn title(self) -> &'static str {
         match self {
             App::Terminal => "Terminal",
+            // Стенд целится в унесённое окно по этому имени.
+            App::TermWin(_) => "Terminal window",
             App::About => "About",
             App::Settings => "Settings",
             App::Shutdown => "Shut down",
@@ -211,7 +223,7 @@ impl App {
     #[must_use]
     pub const fn about(self) -> &'static str {
         match self {
-            App::Terminal => "оболочка и команды ядра",
+            App::Terminal | App::TermWin(_) => "оболочка и команды ядра",
             App::About => "что это за система",
             App::Settings => "экран, программы, обновление",
             App::Shutdown => "закрыть том и выключить",
@@ -268,6 +280,26 @@ pub enum Hit {
 pub struct TermTab {
     pub session: usize,
     pub grid: TextGrid,
+}
+
+/// Вкладка, вынутая из окна (20.11): её сетка и имя едут в другое окно
+/// терминала, а оболочка сессии живёт дальше - о переезде она не знает, её
+/// вывод находит окно по номеру сессии.
+pub struct LooseTab {
+    pub session: usize,
+    grid: TextGrid,
+    title: Option<String>,
+    renamed: bool,
+}
+
+/// Что сделала клавиша с именем вкладки, которое правят в полосе.
+pub enum RenameStep {
+    /// Набор продолжается (или клавиша проглочена).
+    Typing,
+    /// Enter: сессия и новое имя (пустое - имя снова даёт программа).
+    Done(usize, String),
+    /// Esc: имя прежнее.
+    Cancelled,
 }
 
 /// Высота полосы вкладок терминала (как у Windows Terminal — под
@@ -403,6 +435,14 @@ pub struct Window {
     session: usize,
     /// Подписи вкладок: сессия и что в ней идёт.
     tab_titles: Vec<(usize, String)>,
+    /// Вкладки, которым человек дал имя сам (20.11): подпись от программы
+    /// его больше не перекрывает.
+    renamed: Vec<usize>,
+    /// Вкладка, имя которой правят прямо в полосе: сессия и набранное.
+    tab_edit: Option<(usize, String)>,
+    /// Имя выделено целиком (правку только начали): первый знак заменяет
+    /// его, как в Windows Terminal.
+    tab_edit_all: bool,
     /// По чему окна складываются в одну кнопку панели задач: путь программы.
     /// Пусто — окно ядра, группа по [`App`].
     pub group: String,
@@ -547,7 +587,7 @@ impl Window {
         // Windows Terminal (T5); заливка окна остаётся под заголовком.
         let back = mini_ui::text::TERM_BG;
         let mut surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
-        let strip = app == App::Terminal && !theme::is_mobile();
+        let strip = app.is_terminal() && !theme::is_mobile();
         surface.fill(content_area(&surface, Window::title_height(scale)), back);
         let grid = TextGrid::new(
             grid_area(&surface, scale, strip),
@@ -672,6 +712,9 @@ impl Window {
             tabs: Vec::new(),
             session: 0,
             tab_titles: Vec::new(),
+            renamed: Vec::new(),
+            tab_edit: None,
+            tab_edit_all: false,
             born: BORN.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             hot: None,
             fit: false,
@@ -1219,6 +1262,10 @@ impl Window {
         // Значок программы: тот же скруглённый квадрат, что у неё на столе и в
         // меню. Он и опознаёт окно быстрее заголовка — цвет читается раньше
         // текста.
+        // Вкладки в заголовке (20.11, как Windows Terminal): полоса вкладок и
+        // есть заголовок - ни значка, ни имени программы перед ней (они
+        // читались как лишняя вкладка «Термин…»).
+        let tabs_here = !self.tab_order.is_empty() && !theme::is_mobile();
         let badge_side = ctx.px(16);
         let badge = Rect::new(
             ctx.px(12) as i32,
@@ -1228,7 +1275,9 @@ impl Window {
         );
         // Значок программы, как на панели задач (24.10: был цветной квадрат
         // без знака — «квадратик цветной»).
-        self.icon_art().draw(ctx, &mut self.surface, badge);
+        if !tabs_here {
+            self.icon_art().draw(ctx, &mut self.surface, badge);
+        }
         self.draw_strip(focused);
 
         // Кнопки нарисованы всегда, а не только у активного окна: кнопка,
@@ -1245,20 +1294,20 @@ impl Window {
         // под крестик, читается как ошибка отрисовки.
         let text_x = badge.right() + ctx.px(8) as i32;
         let room = (self.leftmost_button().x - ctx.px(12) as i32 - text_x).max(0) as u32;
-        // Вкладки в заголовке: подпись — только имя программы перед ними.
-        let tabs_here = !self.tab_order.is_empty() && !theme::is_mobile();
-        let room = if tabs_here { ctx.face(Role::Body).width(self.app.caption()).min(room) } else { room };
         let ink = if focused { p.ink } else { p.ink4 };
-        paint::text_clipped(
-            ctx,
-            &mut self.surface,
-            Role::Body,
-            text_x,
-            paint::baseline(ctx, Role::Body, bar),
-            room,
-            &self.title,
-            ink,
-        );
+        if !tabs_here {
+            let label = self.label();
+            paint::text_clipped(
+                ctx,
+                &mut self.surface,
+                Role::Body,
+                text_x,
+                paint::baseline(ctx, Role::Body, bar),
+                room,
+                &label,
+                ink,
+            );
+        }
         // Обводка окна — последней: она ложится поверх и полосы заголовка, и
         // содержимого, и именно она делает из двух прямоугольников один лист.
         self.paint_edge(focused);
@@ -1531,8 +1580,239 @@ impl Window {
         self.tabs.retain(|tab| tab.session != session);
         self.tab_order.remove(at);
         self.tab_titles.retain(|(item, _)| *item != session);
+        self.renamed.retain(|item| *item != session);
+        if self.tab_edit.as_ref().is_some_and(|(item, _)| *item == session) {
+            self.tab_edit = None;
+        }
         self.draw_strip(true);
         true
+    }
+
+    /// Вынуть вкладку `session` из окна (20.11): унести в новое окно или в
+    /// полосу другого. Последнюю не вынуть - окно без вкладок не бывает.
+    pub fn take_tab(&mut self, session: usize) -> Option<LooseTab> {
+        let at = self.tab_order.iter().position(|item| *item == session)?;
+        if self.tab_order.len() < 2 {
+            return None;
+        }
+        // Видимую сначала сменяет соседняя - так её сетка оказывается среди
+        // скрытых, откуда её и берут.
+        if session == self.session {
+            let next = if at + 1 < self.tab_order.len() { self.tab_order[at + 1] } else { self.tab_order[at - 1] };
+            self.switch_tab(next);
+        }
+        let index = self.tabs.iter().position(|tab| tab.session == session)?;
+        let tab = self.tabs.swap_remove(index);
+        let title = self.tab_titles.iter().find(|(item, _)| *item == session).map(|(_, title)| title.clone());
+        let renamed = self.renamed.contains(&session);
+        self.tab_order.retain(|item| *item != session);
+        self.tab_titles.retain(|(item, _)| *item != session);
+        self.renamed.retain(|item| *item != session);
+        if self.tab_edit.as_ref().is_some_and(|(item, _)| *item == session) {
+            self.tab_edit = None;
+        }
+        self.draw_strip(true);
+        Some(LooseTab { session, grid: tab.grid, title, renamed })
+    }
+
+    /// Вынуть единственную вкладку окна (её бросили на полосу другого окна):
+    /// окно остаётся без вкладок и сетки - его закрывают следом.
+    pub fn take_last_tab(&mut self) -> Option<LooseTab> {
+        if self.tab_order.len() != 1 {
+            return None;
+        }
+        let session = self.session;
+        let ctx = self.ctx();
+        let area = grid_area(&self.surface, self.scale, true);
+        let blank = TextGrid::new(area, ctx.face(Role::Mono), mini_ui::text::TERM_FG, mini_ui::text::TERM_BG)?;
+        let Content::Text(current) = &mut self.content else {
+            return None;
+        };
+        let mut grid = core::mem::replace(current, blank);
+        grid.hide();
+        let title = self.tab_titles.iter().find(|(item, _)| *item == session).map(|(_, title)| title.clone());
+        let renamed = self.renamed.contains(&session);
+        self.tab_order.clear();
+        self.tab_titles.clear();
+        self.renamed.clear();
+        self.tab_edit = None;
+        Some(LooseTab { session, grid, title, renamed })
+    }
+
+    /// Принять вынутую вкладку в конец полосы и показать её. Не вышло (не
+    /// терминал, такая уже есть) - вкладка возвращается вызывающему.
+    pub fn put_tab(&mut self, tab: LooseTab) -> Result<(), LooseTab> {
+        if self.tab_order.is_empty() || self.tab_order.contains(&tab.session) {
+            return Err(tab);
+        }
+        let LooseTab { session, mut grid, title, renamed } = tab;
+        grid.hide();
+        // Сетка привязана к точкам прежнего окна: здесь у неё своя область.
+        let area = grid_area(&self.surface, self.scale, true);
+        let _ = grid.rebind(&mut self.surface, area);
+        self.tabs.push(TermTab { session, grid });
+        self.tab_order.push(session);
+        if let Some(title) = title {
+            self.tab_titles.push((session, title));
+        }
+        if renamed {
+            self.renamed.push(session);
+        }
+        self.switch_tab(session);
+        Ok(())
+    }
+
+    /// Сделать только что созданное окно терминала окном одной вкладки
+    /// `tab` (её унесли из полосы). Прежняя единственная вкладка нового окна
+    /// - пустая сетка - выбрасывается.
+    pub fn adopt_only(&mut self, tab: LooseTab) -> Result<(), LooseTab> {
+        if !self.app.is_terminal() || !matches!(self.content, Content::Text(_)) {
+            return Err(tab);
+        }
+        let LooseTab { session, mut grid, title, renamed } = tab;
+        let area = grid_area(&self.surface, self.scale, true);
+        let _ = grid.rebind(&mut self.surface, area);
+        let back = content_area(&self.surface, self.bar());
+        self.surface.fill(back, mini_ui::text::TERM_BG);
+        if let Content::Text(current) = &mut self.content {
+            *current = grid;
+            current.show(&mut self.surface);
+            current.take_damage();
+        }
+        self.tabs.clear();
+        self.tab_order.clear();
+        self.tab_order.push(session);
+        self.session = session;
+        self.tab_titles.clear();
+        self.renamed.clear();
+        self.tab_edit = None;
+        if let Some(title) = title {
+            self.tab_titles.push((session, title));
+        }
+        if renamed {
+            self.renamed.push(session);
+        }
+        self.damage = self.damage.union(&back);
+        self.draw_strip(true);
+        Ok(())
+    }
+
+    /// Переставить вкладку `session` на место `to` в полосе (её тянут вдоль
+    /// полосы мышью).
+    pub fn move_tab(&mut self, session: usize, to: usize) -> bool {
+        let Some(at) = self.tab_order.iter().position(|item| *item == session) else {
+            return false;
+        };
+        let to = to.min(self.tab_order.len() - 1);
+        if at == to {
+            return false;
+        }
+        let item = self.tab_order.remove(at);
+        self.tab_order.insert(to, item);
+        self.draw_strip(true);
+        true
+    }
+
+    /// Место в полосе (номер по порядку) под точкой экрана `x` - по
+    /// горизонтали, высоту не спрашивая: вкладку тянут вдоль полосы, и
+    /// рука уходит немного вверх или вниз.
+    #[must_use]
+    pub fn tab_slot_at(&self, x: i32) -> Option<usize> {
+        if self.tab_order.is_empty() {
+            return None;
+        }
+        let local = x - self.rect.x;
+        let (tabs, _) = self.strip_layout();
+        tabs.iter().position(|(_, tab, _)| local >= tab.x && local < tab.right())
+    }
+
+    /// Лежит ли точка экрана на полосе вкладок этого окна (сюда бросают
+    /// вкладку из другого окна).
+    #[must_use]
+    pub fn strip_contains(&self, x: i32, y: i32) -> bool {
+        if self.tab_order.is_empty() || self.popup || self.frameless || self.minimized || !self.rect.contains(x, y) {
+            return false;
+        }
+        let (lx, ly) = (x - self.rect.x, y - self.rect.y);
+        let top = if theme::is_mobile() { Self::title_height(self.scale) as i32 } else { 0 };
+        let h = if theme::is_mobile() { self.ctx().px(STRIP_H) } else { Self::title_height(self.scale) };
+        ly >= top && ly < top + h as i32 && lx < self.minimize_button().x
+    }
+
+    /// Начать правку имени вкладки прямо в полосе («Переименовать»).
+    pub fn begin_rename(&mut self, session: usize) -> bool {
+        if !self.tab_order.contains(&session) {
+            return false;
+        }
+        self.tab_edit = Some((session, self.tab_title(session)));
+        self.tab_edit_all = true;
+        self.draw_strip(true);
+        true
+    }
+
+    /// Правят ли сейчас имя вкладки.
+    #[must_use]
+    pub const fn renaming(&self) -> bool {
+        self.tab_edit.is_some()
+    }
+
+    /// Клавиша, пока правят имя вкладки: Enter - принять, Esc - отменить,
+    /// Backspace - стереть знак, знак - дописать.
+    pub fn rename_key(&mut self, code: KeyCode, ch: Option<char>) -> RenameStep {
+        let Some((session, text)) = self.tab_edit.as_mut() else {
+            return RenameStep::Cancelled;
+        };
+        let session = *session;
+        let all = core::mem::take(&mut self.tab_edit_all);
+        match code {
+            KeyCode::Enter => {
+                let name = self.commit_rename().map_or_else(String::new, |(_, name)| name);
+                return RenameStep::Done(session, name);
+            }
+            KeyCode::Escape => {
+                self.tab_edit = None;
+                self.draw_strip(true);
+                return RenameStep::Cancelled;
+            }
+            KeyCode::Backspace if all => text.clear(),
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            _ => match ch {
+                Some(ch) if !ch.is_control() && text.chars().count() < 64 => {
+                    if all {
+                        text.clear();
+                    }
+                    text.push(ch);
+                }
+                _ => {
+                    self.draw_strip(true);
+                    return RenameStep::Typing;
+                }
+            },
+        }
+        self.draw_strip(true);
+        RenameStep::Typing
+    }
+
+    /// Принять набранное имя (Enter или щелчок мимо). Пустое имя - вкладку
+    /// снова называет то, что в ней идёт.
+    pub fn commit_rename(&mut self) -> Option<(usize, String)> {
+        let (session, text) = self.tab_edit.take()?;
+        let name = String::from(text.trim());
+        if name.is_empty() {
+            self.renamed.retain(|item| *item != session);
+        } else {
+            match self.tab_titles.iter_mut().find(|(item, _)| *item == session) {
+                Some((_, old)) => *old = name.clone(),
+                None => self.tab_titles.push((session, name.clone())),
+            }
+            if !self.renamed.contains(&session) {
+                self.renamed.push(session);
+            }
+        }
+        self.draw_strip(true);
+        Some((session, name))
     }
 
     /// Выполнить `action` над сеткой сессии `session`, видимой или нет: на
@@ -1558,6 +1838,10 @@ impl Window {
 
     /// Подпись вкладки сессии `session` (что в ней идёт).
     pub fn set_tab_title(&mut self, session: usize, title: &str) {
+        // Имя, данное человеком, программа не перекрывает (20.11).
+        if self.renamed.contains(&session) {
+            return;
+        }
         match self.tab_titles.iter_mut().find(|(item, _)| *item == session) {
             Some((_, old)) if old == title => return,
             Some((_, old)) => *old = String::from(title),
@@ -1585,10 +1869,9 @@ impl Window {
         // до кнопок окна. Телефон — своей полосой под заголовком.
         let in_title = !theme::is_mobile();
         let (top, h, left, right) = if in_title {
+            // С 20.11 полоса и есть заголовок: вкладки от левого края.
             let title = Self::title_height(self.scale);
-            let label = ctx.face(Role::Body).width(self.app.caption());
-            let left = ctx.px(12 + 16 + 8) + label + ctx.px(14);
-            (0, title, left, (self.minimize_button().x - ctx.px(8) as i32).max(0) as u32)
+            (0, title, ctx.px(8), (self.minimize_button().x - ctx.px(8) as i32).max(0) as u32)
         } else {
             (Self::title_height(self.scale) as i32, ctx.px(STRIP_H), ctx.px(6), self.surface.width().saturating_sub(ctx.px(6)))
         };
@@ -1642,8 +1925,10 @@ impl Window {
                     self.surface.fill(Rect::new(tab.x, bottom - ctx.px(2) as i32, tab.w, ctx.px(2)), mini_ui::text::TERM_BG);
                 }
             }
-            let title = self.tab_title(session);
-            let ink = if active { mini_ui::text::TERM_FG } else { p.ink4 };
+            // Имя правят прямо во вкладке: рамка акцентом и курсор в конце.
+            let editing = self.tab_edit.as_ref().filter(|(item, _)| *item == session).map(|(_, text)| text.clone());
+            let title = editing.clone().unwrap_or_else(|| self.tab_title(session));
+            let ink = if active || editing.is_some() { mini_ui::text::TERM_FG } else { p.ink4 };
             let glyph = ctx.px(12);
             glyphicon::draw(
                 &mut self.surface,
@@ -1665,6 +1950,20 @@ impl Window {
                 &title,
                 ink,
             );
+            if editing.is_some() {
+                let field = Rect::new(text_x - ctx.px(4) as i32, tab.y + ctx.px(4) as i32, (close.x - text_x).max(0) as u32, tab.h.saturating_sub(ctx.px(8)));
+                draw::rounded_stroke(&mut self.surface, field, ctx.px(4), p.acc, 255);
+                let room = (close.x - text_x - ctx.px(4) as i32).max(0) as u32;
+                // Только начали - имя выделено целиком: набор его заменит.
+                if self.tab_edit_all {
+                    let width = ctx.face(Role::Body).width(&title).min(room);
+                    let mark = Rect::new(text_x - ctx.px(1) as i32, field.y + ctx.px(3) as i32, width + ctx.px(2), field.h.saturating_sub(ctx.px(6)));
+                    draw::blend_rect(&mut self.surface, mark, p.acc, 110);
+                    paint::text_clipped(ctx, &mut self.surface, Role::Body, text_x, paint::baseline(ctx, Role::Body, tab), room, &title, mini_ui::text::TERM_FG);
+                }
+                let caret = text_x + ctx.face(Role::Body).width(&title).min(room) as i32 + 1;
+                self.surface.fill(Rect::new(caret, field.y + ctx.px(4) as i32, ctx.px(1).max(1), field.h.saturating_sub(ctx.px(8))), mini_ui::text::TERM_FG);
+            }
             let cross = ctx.px(10);
             glyphicon::draw(
                 &mut self.surface,
@@ -1695,7 +1994,7 @@ impl Window {
                     return super::appicon::Art::Image(logo);
                 }
             }
-            let terminal = self.app == App::Terminal;
+            let terminal = self.app.is_terminal();
             super::appicon::Art::Glyph(if terminal { Icon::Terminal } else { self.app.icon() }, self.app.tone(), terminal)
         })
     }
@@ -2385,9 +2684,27 @@ impl Window {
     ///
     /// У окон ядра это [`App::caption`], у окна программы — имя, которое
     /// назвала она сама.
+    ///
+    /// Программа может прислать имя из двух частей через `\x1f` (20.11):
+    /// «Files\x1fЗагрузки». Первая - имя окна для журнала и прицела стенда,
+    /// вторая - что видит человек ([`Self::label`]): папку, файл.
     #[must_use]
     pub fn caption(&self) -> &str {
-        &self.title
+        self.title.split('\x1f').next().unwrap_or(&self.title)
+    }
+
+    /// Подпись окна для человека: заголовок, кнопка панели, миниатюра
+    /// (20.11). У окна с вкладками - имя видимой вкладки, у программы - вторая
+    /// часть её имени (см. [`Self::caption`]), если она есть.
+    #[must_use]
+    pub fn label(&self) -> String {
+        if !self.tab_order.is_empty() {
+            return self.tab_title(self.session);
+        }
+        match self.title.split_once('\x1f') {
+            Some((_, shown)) if !shown.is_empty() => String::from(shown),
+            _ => self.title.clone(),
+        }
     }
 
     /// Сменить имя окна программы (фаза 62c, `user_abi::SYS_WINTITLE`).
