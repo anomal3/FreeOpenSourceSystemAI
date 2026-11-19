@@ -14157,6 +14157,78 @@ info,vmm,gr,chan}.rs`, `gpu info` / `gpu nvktest` в `shell.rs`. Кодиров�
 железе; таблицы и kernel-VA не возвращаются до снятия пространства;
 прерывания (nonstall) — M8.
 
+### G (ночь 19→20.11): CE-жетон, `gpu unload` с перезапуском, `gpu gametest`, TMNF на NVK
+
+Разбор hw-log10 (0.8.970): M1 и канал GR на RTX 3060 — PASS, копия через
+CE2 (runlist 1) стоит с GP_GET 0, `gpu unload` снимает WPR2 чисто, но экран
+остаётся чёрным. Что сделано:
+
+- **Жетон звонка (CE на своём runlist).** `NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN`
+  у nvidia.ko обрабатывает CPU-RM (`kfifoGenerateWorkSubmitTokenHal_GA100`,
+  ветка `!PLATFORM_GSP`: `RUNLIST_ID << 16 | chid`) — этим жетоном звонят
+  CUDA/UVM; мы же спрашиваем сам GSP-RM, и у него ветка `PLATFORM_GSP` —
+  внутренний жетон без runlist (0x8). nouveau r535 звонит `runl->id << 16 |
+  chid`. Теперь канал звонит расчётным; в журнал — регистры runlist
+  (`chcfg`, `DOORBELL_CONFIG`, запись CHRAM канала). `gpu nvktest`, если
+  канал не двинулся за 1,5 с, звонит по очереди расчётным, жетоном RM и
+  `DOORBELL_CONFIG`-жетоном (как nouveau без GSP) и пишет `nvgpu: doorbell
+  runlist N chid C token T (Kind): WORKS|no progress` — один прогон решает;
+  сработавший запоминается для runlist. Руками: `gpu nvktest ce token-rm|
+  token-calc|token-dbcfg`. Сторож канала считает от отправки, а не от
+  создания канала.
+- **`gpu unload`** = выгрузка (как перед перезагрузкой) + сразу перезапуск
+  GSP-RM (FWSEC-FRTS, booter, RM) + режимы мониторов + стол
+  (`nvidia_gsp::restart`, общая с автозапуском часть `after_boot`). Удачный
+  перезапуск заодно доказывает, что тёплая перезагрузка поднимет карту.
+  `gpu unload off` — оставить выгруженным, как раньше. На железе НЕ проверено.
+- **`gpu gametest`** (`display/nvidia_gametest.rs`): одна команда, ход — в окне
+  терминала и строками `gametest:` в журнале (на флешке): GSP-RM (поднять,
+  если лежит) → мониторы → `gpu info` + `gpu nvktest` (CE и GR) → узел
+  `/dev/dri/renderD128` настоящей карты → сценарий пакета Proton
+  `/opt/proton/bin/fossai-gametest` (vkprobe на NVK, vulkaninfo, vkcube 600
+  кадров через dmabuf, Direct3D 9 через DXVK на NVK с замером, TMNF через
+  DXVK на NVK, замер 60 с). Вывод сценария идёт в журнал ядра через канал
+  (`gametest| …`), первые 800 ioctl DRM у vkprobe — трассой (видно, на чём
+  споткнулся NVK). Ступень FAIL канала GR — дальше не идёт (`gpu gametest
+  force` — идти); `gpu gametest soft -- vk|d3d` — то же на SoftGpu (QEMU);
+  `bg` — не ждать; Ctrl+C — перестать ждать.
+- **TMNF выбирает видеокарту сам**: есть узел и `vulkaninfo` на NVK за 60 с
+  называет NVK — DXVK на NVK (`tmnf: the video card answers through NVK`),
+  иначе — процессор (wined3d/llvmpipe). `--nvk` / `--cpu` — без проверки.
+  Узел по-прежнему появляется только после `nvk hw on` или `gpu gametest`.
+- **Показ кадров NVK**: dma-buf `DMA_BUF_IOCTL_IMPORT/EXPORT_SYNC_FILE` —
+  Mesa WSI ставит забор кадра при показе, ядро ждёт его (≤2 с), так что стол
+  не читает недорисованный кадр (неявной синхронизации у нас нет).
+
+Путь игры: TMNF — Direct3D 9 → DXVK d3d9 → Vulkan → NVK (Mesa 25.0.7) →
+наш nouveau uAPI → GSP-RM. wined3d/Zink не берём: Zink над NVK — лишний
+слой, а DXVK на NVK — штатная пара в Linux. Вся «LOCAL»-память NVK у нас в
+памяти машины (домен GART|VRAM → sysmem), только явный VRAM — в видеопамяти:
+медленнее по PCIe, зато кадры WSI читаются столом процессором.
+
+Проверено в QEMU: см. строку ниже (nvk-soft-vk). На железе — утром.
+
+**Утренняя проверка для Романа (одна загрузка):**
+1. Флешка с новым образом, загрузка; подождать, пока стол переедет на
+   2560x1440 (GSP-RM и мониторы поднимаются сами).
+2. Открыть «Терминал», набрать `gpu gametest` и ждать: в окне идут строки
+   `gametest: PASS|FAIL …`; по ходу откроются окна vkcube, d3dprobe и TMNF
+   (первый запуск TMNF ставит игру — пару минут; замер — 60 с, потом игра
+   закроется сама). Всё займёт 5–15 минут. В конце строка
+   `gametest: done in N s: … passed, … failed`.
+3. Если всё PASS — запустить TMNF с рабочего стола и поиграть: он сам
+   возьмёт видеокарту (DXVK, счётчик кадров в углу).
+4. По желанию — `gpu unload`: экран на пару секунд погаснет и должен
+   вернуться (перезапуск GSP-RM); в журнале `restart: GSP-RM running`.
+5. `power off` (журнал допишется на флешку) и прислать `G:\FREEOS\LOG.TXT`.
+Если `gpu gametest` встал на ступени до vkprobe — тоже прислать журнал:
+строки `nvgpu:`, `gametest`, `nvidia-gsp` скажут, что дальше.
+
+Осталось (TODO): подтвердить на железе CE-жетон, M5 (NVK создаёт
+устройство на RTX 3060), M6/M7 (кадры vkcube/DXVK), второе включение после
+`gpu unload`; прерывания вместо опроса заборов (M8), VRAM для «LOCAL» при
+ReBAR.
+
 ## Стенд: `Expect` сразу за ожиданием начала строки
 
 `Step::Expect` смотрит в уже прочитанное, а ожидание перед ним находит
