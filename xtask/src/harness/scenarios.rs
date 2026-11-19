@@ -6996,8 +6996,10 @@ pub const ALL: &[Scenario] = &[
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             // На диске может стоять Proton без NVK (до 18.11): поставить заново
             // из пакета образа и убедиться, что описатель NVK на месте.
+            // `install` с FOSSAI_WITH_PROTON=1 мог и не поставить Proton
+            // (20.11: «is not installed») — тогда сразу ставить.
             Step::Line("pkg remove proton"),
-            Step::Await("pkg: removed proton", 900_000),
+            Step::AwaitOneOf(&["pkg: removed proton", "pkg: proton is not installed"], 900_000),
             Step::Wait(5_000),
             Step::Line("pkg install proton"),
             Step::Await("pkg: installed proton 11, ", 2_400_000),
