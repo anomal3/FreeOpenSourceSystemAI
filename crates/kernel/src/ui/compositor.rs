@@ -2187,7 +2187,7 @@ impl Compositor {
     /// поднимает другое окно, и окно во весь экран перестаёт быть впереди.
     #[must_use]
     pub fn fullscreen_front(&self) -> bool {
-        if self.start.is_some() {
+        if self.start.is_some() || self.menu_open() {
             return false;
         }
         let Some(panel) = self.panel.as_ref() else {
@@ -4148,7 +4148,8 @@ impl Compositor {
         super::statusbar::draw(back, band, dy, self.primary.w, self.scale);
         self.icons.draw(back, band, dy);
         for window in self.windows.iter().filter(|window| !window.minimized && !self.hidden_by_flight(window)) {
-            let r = if window.popup { 0 } else { radius };
+            // Развёрнутое и полноэкранное окно — углами в углы экрана (20.11).
+            let r = if window.popup || window.fullscreen || window.is_maximized() { 0 } else { radius };
             if !window.shaped {
                 self.drop_shadow(back, window.rect, band, dy, r);
             }
@@ -4344,7 +4345,8 @@ impl Compositor {
             let t0 = crate::time::uptime_ns();
             // Углы всплывающего окна не скругляются: меню рисует свою рамку
             // прямоугольником, и срезанный угол вырезал бы её.
-            let r = if window.popup { 0 } else { radius };
+            // Развёрнутое и полноэкранное окно — углами в углы экрана (20.11).
+            let r = if window.popup || window.fullscreen || window.is_maximized() { 0 } else { radius };
             // Диалог поверх всего — под ним стол затемнён на 40 % (макет 18).
             if dims(window.app) {
                 draw::blend_rect(back, Rect::new(band.x, band.y + dy, band.w, band.h), Color::rgb(0, 0, 0), 102);
