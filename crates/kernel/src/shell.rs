@@ -2439,17 +2439,53 @@ fn gpu(argument: &str) {
     if argument == "gametest" || argument.starts_with("gametest ") {
         let rest = argument.trim_start_matches("gametest");
         sprintln!("  gpu: {}", crate::display::nvidia_gametest::start(rest));
-        // Без `bg` — ждать и печатать ход проверки в это окно.
+        // Без `bg` — ждать и печатать ход проверки в это окно. Первая
+        // вкладка разбирает весь ввод стола, поэтому, пока ждём, ввод
+        // раздаётся как в `foreground` (иначе мышь и клавиатура стола
+        // замерли бы на всю проверку); Ctrl+C — перестать ждать (проверка
+        // идёт дальше в фоне).
         if !rest.split_whitespace().any(|w| w == "bg") {
-            loop {
+            let me = sched::session();
+            let primary = me == 0;
+            let mut status_at = 0u64;
+            'wait: loop {
                 for line in crate::display::nvidia_gametest::drain() {
                     sprintln!("  {line}");
                 }
                 if !crate::display::nvidia_gametest::running() {
                     break;
                 }
-                crate::sched::sleep_ms(250);
+                let seen = input_seq(primary, me);
+                if primary && ui::is_active() && ui::hover_pending() {
+                    ui::hover_tick();
+                }
+                let now = time::uptime_ms();
+                if ui::animating() || now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
+                    status_at = now;
+                    if primary {
+                        update_status();
+                    }
+                    ui::shell_status(Some("gpu gametest · идёт"));
+                }
+                while let Some(event) = if primary { next_pointer() } else { None } {
+                    ui::dispatch_pointer(event);
+                }
+                while let Some(event) = next_key(primary, me) {
+                    if tty::is_interrupt(event) {
+                        sprintln!("^C");
+                        sprintln!("  gpu: gametest goes on in the background ('gametest:' lines in the log)");
+                        break 'wait;
+                    }
+                }
+                let period = if ui::animating() { FRAME_PERIOD_MS } else { POLL_PERIOD_MS };
+                let deadline = time::uptime_ms() + period;
+                if primary {
+                    sched::block_on_input(deadline, || input::sequence() != seen);
+                } else {
+                    sched::block_on_input(deadline, || session::seq(me) != seen);
+                }
             }
+            ui::shell_status(None);
             for line in crate::display::nvidia_gametest::drain() {
                 sprintln!("  {line}");
             }
