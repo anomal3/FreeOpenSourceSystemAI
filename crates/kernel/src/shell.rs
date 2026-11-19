@@ -2298,6 +2298,9 @@ fn amd(argument: &str) {
     if argument.trim() == "vbios" {
         for line in crate::display::amd::polaris_vbios() {
             sprintln!("  amd: {line}");
+            // И в журнал ядра: он попадает в `\FREEOS\LOG.TXT` живой флешки, а
+            // вывод оболочки после перезагрузки пропадает (19.11, Роман).
+            crate::kprintln!("  amdgpu      : vbios: {line}");
         }
         return;
     }
@@ -2309,6 +2312,7 @@ fn amd(argument: &str) {
     for line in lines {
         sprintln!("  amd: {line}");
     }
+    crate::kprintln!("  amdgpu      : (amd command run: report shown on screen)");
 }
 
 fn gpu(argument: &str) {
