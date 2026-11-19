@@ -9,8 +9,9 @@
 //! # Что умеет
 //!
 //! * Полоса меню «Файл / Правка / Вид / Синтаксис» с сочетаниями справа.
-//! * Открыть, сохранить, сохранить как (Ctrl+O, Ctrl+S, Ctrl+Shift+S) — окном
-//!   со списком папок и полем имени; создать (Ctrl+N). Несохранённое — вопрос
+//! * Открыть, сохранить, сохранить как (Ctrl+O, Ctrl+S, Ctrl+Shift+S) — общим
+//!   окном «Открыть» / «Сохранить как» (`mini_ui::filedlg`, 20.11: быстрый
+//!   доступ, адрес, таблица, тип файла); создать (Ctrl+N). Несохранённое — вопрос
 //!   «Сохранить изменения?» перед «Создать», «Открыть» и закрытием окна.
 //! * Выделение Shift+стрелками, Shift+Home/End, Ctrl+A; Вырезать, Копировать,
 //!   Вставить через общий буфер обмена стола (`SYS_CLIPBOARD`: тот же, что у
@@ -46,12 +47,13 @@ use mini_ui::paint::{self, Ctx, Weight};
 use mini_ui::syntax::{self, Kind, Lang};
 use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface, theme};
-use user_abi::{Dirent, KIND_DIRECTORY, Stat, WIN_MOD_CTRL, WIN_MOD_SHIFT};
+use user_abi::{Dirent, KIND_DIRECTORY, WIN_MOD_CTRL, WIN_MOD_SHIFT};
 use user_progs::app::{self, App, Spec};
+use user_progs::filedlg::{FileDialog, Filter, Options, Outcome, SysHost};
 use user_progs::{
     Args, SysInfo, WIN_KEY_DELETE, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT, WIN_KEY_PAGE_DOWN,
     WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP, clipboard_get, clipboard_set, close, file_size, open, open_write,
-    println, read, readdir_raw, stat, write,
+    println, read, readdir_raw, write,
 };
 
 const SPEC: Spec = Spec { name: "notepad", title: "Notepad", period_ms: 1_000 };
@@ -76,7 +78,7 @@ const CTRL_S: u32 = 0x13;
 const MENU_H: u32 = 32;
 const STATUS_H: u32 = 28;
 const GUTTER_CHARS: usize = 4;
-/// Строка выпадающего меню и окна выбора файла.
+/// Строка выпадающего меню и окна «Шрифт».
 const ITEM_H: u32 = 30;
 /// Где шрифты системы.
 const FONTS_DIR: &str = "/usr/share/fonts/fossai";
@@ -202,20 +204,6 @@ enum Then {
     Quit,
 }
 
-/// Окно «Открыть» / «Сохранить как»: папка, её содержимое, поле имени.
-struct FileDialog {
-    save: bool,
-    dir: String,
-    /// Имена и «папка ли», папки первыми.
-    entries: Vec<(String, bool)>,
-    selected: usize,
-    top: usize,
-    name: String,
-    error: Option<String>,
-    /// Последний щелчок по строке: её номер — для двойного щелчка.
-    last_click: Option<usize>,
-}
-
 struct Editor {
     /// Строки без перевода строки на конце.
     lines: Vec<String>,
@@ -244,7 +232,11 @@ struct Editor {
     redo: Vec<Snapshot>,
     last_edit: EditKind,
     numbers: bool,
+    /// Окно «Открыть» / «Сохранить как» и что это: сохранение (`true`).
     dialog: Option<FileDialog>,
+    dialog_save: bool,
+    /// Система для окна выбора файла (папки, тома, значки).
+    host: SysHost,
     /// Вопрос «Сохранить изменения?» и что сделать после ответа.
     ask_save: Option<Then>,
     quit: bool,
@@ -296,9 +288,11 @@ impl Editor {
             last_edit: EditKind::None,
             numbers: true,
             dialog: None,
+            dialog_save: false,
+            host: SysHost::new("notepad"),
             ask_save: None,
             quit: false,
-            home: home_dir(),
+            home: user_progs::filedlg::home_dir(),
             font: TextFont { face: None, label: String::from(BUILTIN_FONT), path: None, size: 12 },
             font_dialog: None,
             wrap: false,
@@ -469,95 +463,48 @@ impl Editor {
     // -----------------------------------------------------------------------
 
     fn open_dialog(&mut self, save: bool) {
-        let dir = match self.path.as_deref() {
-            Some(path) => parent_of(path),
-            None => self.home.clone(),
-        };
-        let name = if save { self.path.as_deref().map_or_else(|| String::from("Без имени.txt"), |path| path.rsplit('/').next().unwrap_or(path).to_string()) } else { String::new() };
-        let mut dialog = FileDialog { save, dir, entries: Vec::new(), selected: 0, top: 0, name, error: None, last_click: None };
-        dialog.reload();
-        println(&format!("notepad: {} dialog at {}", if save { "save" } else { "open" }, dialog.dir));
-        self.dialog = Some(dialog);
-    }
-
-    /// Готово в окне выбора файла: войти в папку или открыть / сохранить.
-    fn dialog_accept(&mut self) {
-        let Some(dialog) = self.dialog.as_mut() else {
-            return;
-        };
-        let name = dialog.name.trim().to_string();
-        // Выбрана папка и имя не набрано (или совпадает с ней) — войти в неё.
-        if let Some((entry, true)) = dialog.entries.get(dialog.selected).cloned() {
-            if name.is_empty() || name == entry {
-                dialog.enter(&entry);
-                return;
-            }
-        }
-        if name.is_empty() {
-            dialog.error = Some(String::from("Введите имя файла"));
-            return;
-        }
-        let path = if name.starts_with('/') { name } else { join(&dialog.dir, &name) };
-        let mut info = Stat::default();
-        if stat(&path, &mut info) >= 0 && info.kind == KIND_DIRECTORY {
-            dialog.dir = path;
-            dialog.name.clear();
-            dialog.reload();
-            return;
-        }
-        let save = dialog.save;
-        self.dialog = None;
-        if save {
-            self.set_lang(Lang::detect(&path));
-            self.path = Some(path);
-            self.save();
+        let filters = vec![
+            Filter::new("Текстовые файлы", &["txt"]),
+            Filter::new("Исходный код", &["rs", "c", "h", "py", "sh", "lua", "cs", "js", "json", "toml"]),
+            Filter::all(),
+        ];
+        let ext = self.path.as_deref().map(|path| path.rsplit('/').next().unwrap_or(path)).and_then(|name| name.rsplit_once('.')).map(|(_, ext)| ext.to_ascii_lowercase());
+        // Новый документ или .txt — «Текстовые файлы» (к имени без
+        // расширения допишется .txt); остальное — «Все файлы».
+        let filter = if save && matches!(ext.as_deref(), None | Some("txt")) { 0 } else { 2 };
+        let mut options = if save {
+            Options::save(&self.path.as_deref().map_or_else(|| String::from("Без имени.txt"), |path| path.rsplit('/').next().unwrap_or(path).to_string()))
         } else {
-            self.load(&path);
+            Options::open()
         }
+        .filters(filters)
+        .filter(filter);
+        // Файл уже есть на диске — окно в его папке; иначе — последняя папка
+        // или «Документы» (решает окно).
+        if let Some(path) = &self.path {
+            options = options.dir(&parent_of(path));
+        }
+        let dialog = FileDialog::new(&self.host, options);
+        println(&format!("notepad: {} dialog at {}", if save { "save" } else { "open" }, dialog.dir()));
+        self.dialog = Some(dialog);
+        self.dialog_save = save;
     }
 
-    fn dialog_key(&mut self, code: u32) {
-        let Some(dialog) = self.dialog.as_mut() else {
-            return;
-        };
-        let rows = 8usize;
-        match code {
-            ESCAPE => self.dialog = None,
-            ENTER => self.dialog_accept(),
-            BACKSPACE => {
-                if dialog.name.pop().is_none() {
-                    // Пустое имя — Backspace уводит в папку выше, как в Проводнике.
-                    let up = parent_of(&dialog.dir);
-                    if up != dialog.dir {
-                        dialog.dir = up;
-                        dialog.reload();
-                    }
-                }
-                dialog.error = None;
-            }
-            WIN_KEY_UP | WIN_KEY_DOWN => {
-                let count = dialog.entries.len();
-                if count > 0 {
-                    dialog.selected = if code == WIN_KEY_UP { dialog.selected.saturating_sub(1) } else { (dialog.selected + 1).min(count - 1) };
-                    if dialog.selected < dialog.top {
-                        dialog.top = dialog.selected;
-                    } else if dialog.selected >= dialog.top + rows {
-                        dialog.top = dialog.selected + 1 - rows;
-                    }
-                    if let Some((entry, false)) = dialog.entries.get(dialog.selected).cloned() {
-                        dialog.name = entry;
-                    }
+    /// Ответ окна выбора файла.
+    fn dialog_done(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Pending => {}
+            Outcome::Cancelled => self.dialog = None,
+            Outcome::Chosen(path) => {
+                self.dialog = None;
+                if self.dialog_save {
+                    self.set_lang(Lang::detect(&path));
+                    self.path = Some(path);
+                    self.save();
+                } else {
+                    self.load(&path);
                 }
             }
-            code if code < 0x0100_0000 => {
-                if let Some(ch) = char::from_u32(code).filter(|ch| !ch.is_control()) {
-                    if dialog.name.len() < 200 {
-                        dialog.name.push(ch);
-                    }
-                    dialog.error = None;
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1322,22 +1269,6 @@ impl Editor {
     }
 }
 
-impl FileDialog {
-    fn reload(&mut self) {
-        self.entries = list_dir(&self.dir);
-        self.selected = 0;
-        self.top = 0;
-        self.error = None;
-        self.last_click = None;
-    }
-
-    fn enter(&mut self, name: &str) {
-        self.dir = if name == ".." { parent_of(&self.dir) } else { join(&self.dir, name) };
-        self.name.clear();
-        self.reload();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Раскладка
 // ---------------------------------------------------------------------------
@@ -1400,31 +1331,6 @@ fn dropdown(ctx: Ctx, area: Rect, head: Rect, items: &[Item]) -> (Rect, Vec<Rect
     let dx = x - head.x;
     let rect = Rect::new(x, head.bottom() + ctx.px(2) as i32, w, h);
     (rect, rows.into_iter().map(|row| row.translate(dx, 0)).collect())
-}
-
-/// Окно выбора файла: карточка, список, поле имени, кнопки.
-struct DialogPlan {
-    card: Rect,
-    list: Rect,
-    field: Rect,
-    ok: Rect,
-    cancel: Rect,
-}
-
-fn dialog_plan(ctx: Ctx, area: Rect) -> DialogPlan {
-    let w = ctx.px(560).min(area.w.saturating_sub(ctx.px(24)));
-    let h = ctx.px(430).min(area.h.saturating_sub(ctx.px(24)));
-    let card = Rect::new(area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 2, w, h);
-    let pad = ctx.px(20) as i32;
-    let list_y = card.y + pad + ctx.px(56) as i32;
-    let bottom_h = ctx.px(34 + 14 + 32 + 20);
-    let list = Rect::new(card.x + pad, list_y, w - ctx.px(40), (card.bottom() - bottom_h as i32 - list_y).max(0) as u32);
-    let field = Rect::new(card.x + pad, list.bottom() + ctx.px(12) as i32, w - ctx.px(40), ctx.px(34));
-    let bw = ctx.px(120);
-    let by = card.bottom() - pad - ctx.px(32) as i32;
-    let cancel = Rect::new(card.right() - pad - bw as i32, by, bw, ctx.px(32));
-    let ok = Rect::new(cancel.x - ctx.px(8) as i32 - bw as i32, by, bw, ctx.px(32));
-    DialogPlan { card, list, field, ok, cancel }
 }
 
 /// Карточка вопроса «Сохранить изменения?» и три кнопки.
@@ -1715,41 +1621,9 @@ impl Editor {
     }
 
     fn draw_dialog(&self, s: &mut Surface, ctx: Ctx, area: Rect) {
-        let Some(dialog) = &self.dialog else {
-            return;
-        };
-        let p = ctx.palette;
-        draw::blend_rect(s, area, mini_ui::Color::rgb(0, 0, 0), 90);
-        let plan = dialog_plan(ctx, area);
-        let inner = kit::card(ctx, s, plan.card);
-        let pad = ctx.px(20) as i32;
-        let heading = if dialog.save { "Сохранить как" } else { "Открыть файл" };
-        paint::text(inner, s, Role::Title, plan.card.x + pad, plan.card.y + pad, heading, p.ink);
-        paint::text_clipped(inner, s, Role::Caption, plan.card.x + pad, plan.card.y + pad + ctx.px(28) as i32, plan.card.w - ctx.px(40), &dialog.dir, p.ink3);
-        paint::sunk(inner, s, plan.list, ctx.px(6));
-        let rows = (plan.list.h / ctx.px(ITEM_H)).max(1) as usize;
-        for (offset, (name, folder)) in dialog.entries.iter().skip(dialog.top).take(rows).enumerate() {
-            let index = dialog.top + offset;
-            let row = Rect::new(plan.list.x + ctx.px(4) as i32, plan.list.y + ctx.px(2) as i32 + (offset as u32 * ctx.px(ITEM_H)) as i32, plan.list.w - ctx.px(8), ctx.px(ITEM_H));
-            if index == dialog.selected {
-                draw::rounded(s, row, ctx.px(4), p.acc, 60);
-            }
-            let g = ctx.px(16);
-            let icon = if *folder { Fi::Folder } else { Fi::File };
-            iconset::draw(s, icon, row.x + ctx.px(8) as i32, row.y + (row.h - g) as i32 / 2, g, if *folder { p.warn } else { p.ink3 }, 255);
-            paint::text_clipped(inner, s, Role::Body, row.x + ctx.px(32) as i32, paint::baseline(ctx, Role::Body, row), row.w - ctx.px(40), name, p.ink);
+        if let Some(dialog) = &self.dialog {
+            dialog.draw(&self.host, s, ctx, area);
         }
-        paint::sunk(inner, s, plan.field, ctx.px(6));
-        draw::rounded_stroke(s, plan.field, ctx.px(6), p.acc, 255);
-        let tx = plan.field.x + ctx.px(10) as i32;
-        paint::text_clipped(inner, s, Role::Body, tx, paint::baseline(ctx, Role::Body, plan.field), plan.field.w - ctx.px(20), &dialog.name, p.ink);
-        let tw = ctx.face(Role::Body).width(&dialog.name).min(plan.field.w - ctx.px(20));
-        s.fill(Rect::new(tx + tw as i32 + 1, plan.field.y + ctx.px(8) as i32, ctx.px(2), plan.field.h - ctx.px(16)), p.acc);
-        let hint = dialog.error.clone().unwrap_or_else(|| String::from("Enter — готово · Backspace — папка выше · Esc — отмена"));
-        let hint_ink = if dialog.error.is_some() { p.bad_ink } else { p.ink4 };
-        paint::text_clipped(inner, s, Role::Caption, plan.card.x + pad, plan.ok.y + ctx.px(8) as i32, (plan.ok.x - plan.card.x - pad - ctx.px(8) as i32).max(0) as u32, &hint, hint_ink);
-        paint::button(inner, s, plan.ok, Weight::Primary, if dialog.save { "Сохранить" } else { "Открыть" }, false);
-        paint::button(inner, s, plan.cancel, Weight::Normal, "Отмена", false);
     }
 
     fn draw_ask(&self, s: &mut Surface, ctx: Ctx, area: Rect) {
@@ -1827,8 +1701,9 @@ impl App for Editor {
             self.font_key(code);
             return true;
         }
-        if self.dialog.is_some() {
-            self.dialog_key(code);
+        if let Some(dialog) = self.dialog.as_mut() {
+            let outcome = dialog.key(&self.host, code, mods, latin);
+            self.dialog_done(outcome);
             return true;
         }
         if self.ask_save.is_some() {
@@ -1979,8 +1854,9 @@ impl App for Editor {
             self.font_click(ctx, area, x, y);
             return true;
         }
-        if self.dialog.is_some() {
-            self.dialog_click(ctx, area, x, y);
+        if let Some(dialog) = self.dialog.as_mut() {
+            let outcome = dialog.click(&self.host, ctx, area, x, y);
+            self.dialog_done(outcome);
             return true;
         }
         if self.ask_save.is_some() {
@@ -2044,14 +1920,34 @@ impl App for Editor {
 
     fn wheel(&mut self, clicks: i32) -> bool {
         if let Some(dialog) = self.dialog.as_mut() {
-            let last = dialog.entries.len().saturating_sub(1);
-            dialog.top = if clicks > 0 { dialog.top.saturating_sub(3) } else { (dialog.top + 3).min(last) };
+            dialog.wheel(clicks);
             return true;
         }
         let rows = self.page_rows.get();
         let last = self.lines.len().saturating_sub(rows.max(1));
         self.top = if clicks > 0 { self.top.saturating_sub(3) } else { (self.top + 3).min(last) };
         true
+    }
+
+    /// Имя окна: «Notepad» — для журнала и стенда, после `\x1f` — то, что
+    /// видит человек в заголовке и на панели задач.
+    fn title(&self) -> Option<String> {
+        Some(format!("Notepad\x1f{} — Блокнот", Editor::title(self)))
+    }
+
+    /// Тянут ползунок прокрутки в окне выбора файла.
+    fn drag(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        self.dialog.as_mut().is_some_and(|dialog| dialog.drag(ctx, area, x, y))
+    }
+
+    fn release(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
+        match self.dialog.as_mut() {
+            Some(dialog) => {
+                dialog.release();
+                true
+            }
+            None => false,
+        }
     }
 
     fn tick(&mut self, _info: &SysInfo) -> bool {
@@ -2077,43 +1973,6 @@ impl App for Editor {
 
     fn wants_quit(&self) -> bool {
         self.quit
-    }
-}
-
-impl Editor {
-    fn dialog_click(&mut self, ctx: Ctx, area: Rect, x: i32, y: i32) {
-        let plan = dialog_plan(ctx, area);
-        if plan.ok.contains(x, y) {
-            self.dialog_accept();
-            return;
-        }
-        if plan.cancel.contains(x, y) {
-            self.dialog = None;
-            return;
-        }
-        let Some(dialog) = self.dialog.as_mut() else {
-            return;
-        };
-        if plan.list.contains(x, y) {
-            let offset = ((y - plan.list.y - ctx.px(2) as i32).max(0) as u32 / ctx.px(ITEM_H)) as usize;
-            let index = dialog.top + offset;
-            let Some((name, folder)) = dialog.entries.get(index).cloned() else {
-                return;
-            };
-            let again = dialog.last_click == Some(index);
-            dialog.selected = index;
-            dialog.last_click = Some(index);
-            if folder {
-                // Папка — с одного щелчка, как ссылка: в окне выбора файла
-                // зайти в неё и есть дело щелчка.
-                dialog.enter(&name);
-            } else {
-                dialog.name = name;
-                if again {
-                    self.dialog_accept();
-                }
-            }
-        }
     }
 }
 
@@ -2191,25 +2050,6 @@ fn parent_of(path: &str) -> String {
         Some(0) | None => String::from("/"),
         Some(at) => path[..at].to_string(),
     }
-}
-
-/// Домашняя папка: `/root` у нулевого uid, иначе своя в `/home`.
-fn home_dir() -> String {
-    let me = user_progs::uid();
-    if me == 0 {
-        return String::from("/root");
-    }
-    for (name, folder) in list_dir("/home") {
-        if !folder || name == ".." {
-            continue;
-        }
-        let path = join("/home", &name);
-        let mut info = Stat::default();
-        if stat(&path, &mut info) >= 0 && info.uid == me {
-            return path;
-        }
-    }
-    String::from("/home")
 }
 
 /// Положить растр глифа цветом `color` по его покрытию, не выходя за `clip`.

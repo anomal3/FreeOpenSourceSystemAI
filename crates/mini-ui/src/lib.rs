@@ -42,6 +42,8 @@ extern crate alloc;
 /// Псевдографика по ячейке терминала: рамки и блоки от края до края (фаза С9).
 pub mod boxdraw;
 pub mod draw;
+/// Окно «Открыть» / «Сохранить как» — одно на все программы (20.11).
+pub mod filedlg;
 pub mod font;
 pub mod glyphicon;
 /// Картинки FIMG — значки программ из пакетов.
