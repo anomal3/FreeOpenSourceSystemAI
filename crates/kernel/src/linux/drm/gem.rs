@@ -312,9 +312,49 @@ impl Object for DmaBuf {
 /// (`ENOTTY`: Mesa тогда обходится без неё).
 pub fn dmabuf_ioctl(_object: &Arc<dyn Object>, request: u32, arg: usize) -> i64 {
     const SYNC: u32 = 0x4008_6200;
+    // `struct dma_buf_export_sync_file` / `dma_buf_import_sync_file`:
+    // `{u32 flags; s32 fd}` (Linux 6.0+). Mesa WSI (`wsi_common_drm.c`)
+    // ставит ими забор кадра на dma-buf при показе (NVK неявной синхронизации
+    // ядра не знает) и берёт забор перед записью в кадр.
+    const EXPORT_SYNC_FILE: u32 = 0xc008_6202;
+    const IMPORT_SYNC_FILE: u32 = 0x4008_6203;
     match request {
         SYNC => {
             if get::<u64>(arg).is_err() { -e::EFAULT } else { 0 }
+        }
+        // Наш стол пишет в буферы клиента только процессором и сразу —
+        // забор «уже выполнен».
+        EXPORT_SYNC_FILE => {
+            let Ok(mut args) = get::<[u32; 2]>(arg) else { return -e::EFAULT };
+            if args[0] & !3 != 0 || args[0] == 0 {
+                return -e::EINVAL;
+            }
+            let fd = super::install(Arc::new(super::sync::SyncFile(nvgpu::syncobj::Fence::signaled())), false, true);
+            if fd < 0 {
+                return fd;
+            }
+            args[1] = fd as u32;
+            if put(arg, args).is_err() { -e::EFAULT } else { 0 }
+        }
+        // Неявной синхронизации у стола нет: он читает кадр сразу после
+        // `commit`. Поэтому забор кадра (конец отрисовки на GPU) ждётся
+        // здесь, до показа, — не дольше 2 с (сторож канала — 10 с).
+        IMPORT_SYNC_FILE => {
+            let Ok(args) = get::<[u32; 2]>(arg) else { return -e::EFAULT };
+            if args[0] & !3 != 0 || args[0] == 0 {
+                return -e::EINVAL;
+            }
+            let Some(object) = super::object_of(args[1] as usize) else { return -e::EBADF };
+            let Some(sync) = object.as_any().downcast_ref::<super::sync::SyncFile>() else { return -e::EINVAL };
+            let deadline = crate::time::uptime_ns() + 2_000_000_000;
+            match super::sync::wait_until(Some(deadline), || Ok(super::sync::signaled(&sync.0))) {
+                Ok(()) => 0,
+                Err(err) if err == -super::ETIME => {
+                    crate::kprintln!("nvgpu: dma-buf IMPORT_SYNC_FILE: frame fence not done in 2 s - shown anyway");
+                    0
+                }
+                Err(err) => err,
+            }
         }
         _ => -e::ENOTTY,
     }
