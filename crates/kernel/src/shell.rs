@@ -2437,7 +2437,23 @@ fn gpu(argument: &str) {
     // каналы, узел DRM, vkprobe/vkcube/D3D9/TMNF на NVK) — в фоне, итог —
     // строки `gametest:` в журнале.
     if argument == "gametest" || argument.starts_with("gametest ") {
-        sprintln!("  gpu: {}", crate::display::nvidia_gametest::start(argument.trim_start_matches("gametest")));
+        let rest = argument.trim_start_matches("gametest");
+        sprintln!("  gpu: {}", crate::display::nvidia_gametest::start(rest));
+        // Без `bg` — ждать и печатать ход проверки в это окно.
+        if !rest.split_whitespace().any(|w| w == "bg") {
+            loop {
+                for line in crate::display::nvidia_gametest::drain() {
+                    sprintln!("  {line}");
+                }
+                if !crate::display::nvidia_gametest::running() {
+                    break;
+                }
+                crate::sched::sleep_ms(250);
+            }
+            for line in crate::display::nvidia_gametest::drain() {
+                sprintln!("  {line}");
+            }
+        }
         return;
     }
     if argument == "gsp" || argument.starts_with("gsp ") {

@@ -805,6 +805,7 @@ B=/opt/debian/bin/bash
 X=/opt/proton/share/fossai/d3dprobe.exe
 NVK="--env=FOSSAI_VULKAN=nvk"
 WHAT=${1:-all}
+VKFAIL=
 pass=0; fail=0; names=
 now() { echo $(( ${EPOCHREALTIME/[.,]/} / 1000 )); }
 say() { echo "gametest: $*"; }
@@ -835,7 +836,7 @@ if [ ! -e /dev/dri/renderD128 ]; then
 fi
 case $WHAT in all|vk)
     # 1. Vulkan на NVK: устройство, отправка с забором, заливка и копия 1 МиБ.
-    step vkprobe 300 $B $P $NVK --run=vkprobe NVK
+    step vkprobe 300 $B $P $NVK --run=vkprobe NVK || VKFAIL=1
     # 2. Что видит загрузчик (имя, драйвер, версии) - для журнала.
     step vulkaninfo 120 $B $P $NVK --run=vulkaninfo --summary
     # 3. vkcube: 600 кадров через zwp_linux_dmabuf_v1 (окно на столе).
@@ -844,6 +845,11 @@ case $WHAT in all|vk)
         ms=$(( $(now) - t )); [ $ms -gt 0 ] && say "vkcube: 600 frames in $ms ms = $(( 600000 / ms )) fps (with start-up)"
     fi ;;
 esac
+# Без Vulkan на NVK DXVK и игре на видеокарте не на чем работать.
+if [ -n "$VKFAIL" ] && [ "$WHAT" = all ]; then
+    say "vkprobe failed - skipping d3d9-dxvk-nvk and tmnf-nvk (the log above has the NVK ioctl trace)"
+    WHAT=none
+fi
 case $WHAT in all|d3d)
     # 4. Direct3D 9 (как у TMNF) через DXVK на NVK: 20 с кадров, замер.
     step d3d9-dxvk-nvk 600 $B $P $NVK --bench=20,d3dprobe9-dxvk-nvk --dxvk $X 9 20 ;;
