@@ -79,13 +79,16 @@ static void end(void) { end_fd(-1); }
 
 enum {
     ID_DISPLAY = 1, ID_REGISTRY, ID_SYNC, ID_COMPOSITOR, ID_SHM, ID_WM, ID_SEAT,
-    ID_SURFACE, ID_XDG, ID_TOPLEVEL, ID_POOL, ID_BUFFER, ID_FRAME, ID_POINTER, ID_SYNC2, ID_KEYBOARD, ID_BUFFER2
+    ID_SURFACE, ID_XDG, ID_TOPLEVEL, ID_POOL, ID_BUFFER, ID_FRAME, ID_POINTER, ID_SYNC2, ID_KEYBOARD, ID_BUFFER2,
+    ID_POOL_FULL, ID_BUFFER_FULL, ID_FRAME2, ID_BUFFER_MON
 };
 
 static uint32_t global_compositor, global_shm, global_wm, global_seat;
 static int synced, synced2, formats_argb, configured, configure_serial, released, frame_done, pointer_in;
 static int protocol_error;
-static int keymap_ok, keyboard_in, key_down, key_up;
+static int keymap_ok, keyboard_in, key_down, key_up, key_b;
+/* Последний `xdg_toplevel.configure` (20.11): размер и есть ли FULLSCREEN. */
+static int conf_w, conf_h, full_seen, full_clear, never;
 static int fds[16], nfds;
 
 static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
@@ -126,6 +129,15 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
     } else if (id == ID_KEYBOARD && opcode == 3) {
         if (args[2] == 30 && args[3] == 1) key_down = 1;
         if (args[2] == 30 && args[3] == 0 && key_down) key_up = 1;
+        if (args[2] == 48 && args[3] == 0) key_b = 1;
+    } else if (id == ID_TOPLEVEL && opcode == 0) {
+        int full = 0;
+        conf_w = (int)args[0];
+        conf_h = (int)args[1];
+        for (uint32_t i = 0; i < args[2] / 4; i++)
+            if (args[3 + i] == 2) full = 1; /* XDG_TOPLEVEL_STATE_FULLSCREEN */
+        if (full) full_seen = 1;
+        else full_clear = 1;
     } else if (id == ID_WM && opcode == 0) {
         begin(ID_WM, 3); /* pong */
         put(args[0]);
@@ -325,6 +337,120 @@ int main(void) {
     fflush(stdout);
     wait_for(&key_up, 60000);
     check(keyboard_in && key_down && key_up, "the window has the keyboard; key a goes down and up");
+
+    /* Во весь экран (20.11): `set_fullscreen` даёт `configure` с состоянием
+     * FULLSCREEN и размером монитора; `unset_fullscreen` — прежний размер
+     * без него, и стол не разворачивает окно обратно сам. Окно, которое
+     * само стало размером с монитор (игры Wine), становится полноэкранным. */
+    full_seen = 0;
+    configured = 0;
+    begin(ID_TOPLEVEL, 11); /* set_fullscreen(output = null) */
+    put(0);
+    end();
+    wait_for(&full_seen, 5000);
+    wait_for(&configured, 2000);
+    int mon_w = conf_w, mon_h = conf_h;
+    printf("waylandcheck: fullscreen configure %dx%d\n", mon_w, mon_h);
+    check(full_seen && mon_w > width && mon_h > height, "set_fullscreen gets configure with the fullscreen state and the monitor size");
+    begin(ID_XDG, 4);
+    put((uint32_t)configure_serial);
+    end();
+    int big = mon_w > 0 && mon_h > 0 && mon_w <= 8192 && mon_h <= 8192;
+    size_t full_bytes = big ? (size_t)mon_w * (size_t)mon_h * 4 : 4;
+    int full_fd = memfd_create("waylandcheck-full", MFD_CLOEXEC);
+    uint32_t *full_px = full_fd >= 0 && ftruncate(full_fd, (off_t)full_bytes) == 0
+        ? mmap(NULL, full_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, full_fd, 0) : MAP_FAILED;
+    if (full_px != MAP_FAILED && big)
+        for (int y = 0; y < mon_h; y++)
+            for (int x = 0; x < mon_w; x++) {
+                int edge = x < 8 || y < 8 || x >= mon_w - 8 || y >= mon_h - 8;
+                full_px[(size_t)y * mon_w + x] = edge ? 0xffff4040u : 0xff203050u + (uint32_t)((x * 96 / mon_w) << 8);
+            }
+    begin(ID_SHM, 0);
+    put(ID_POOL_FULL);
+    put((uint32_t)full_bytes);
+    end_fd(full_fd);
+    begin(ID_POOL_FULL, 0);
+    put(ID_BUFFER_FULL);
+    put(0);
+    put((uint32_t)mon_w);
+    put((uint32_t)mon_h);
+    put((uint32_t)mon_w * 4);
+    put(0);
+    end();
+    begin(ID_SURFACE, 1);
+    put(ID_BUFFER_FULL);
+    put(0);
+    put(0);
+    end();
+    begin(ID_SURFACE, 2);
+    put(0);
+    put(0);
+    put((uint32_t)mon_w);
+    put((uint32_t)mon_h);
+    end();
+    frame_done = 0;
+    begin(ID_SURFACE, 3);
+    put(ID_FRAME2);
+    end();
+    begin(ID_SURFACE, 6);
+    end();
+    printf("waylandcheck: fullscreen shown\n");
+    fflush(stdout);
+    wait_for(&key_b, 60000);
+
+    full_clear = 0;
+    configured = 0;
+    begin(ID_TOPLEVEL, 12); /* unset_fullscreen */
+    end();
+    wait_for(&full_clear, 5000);
+    wait_for(&configured, 2000);
+    printf("waylandcheck: unset_fullscreen configure %dx%d\n", conf_w, conf_h);
+    check(full_clear && conf_w == width && conf_h == height, "unset_fullscreen gives back the window size without the fullscreen state");
+    begin(ID_XDG, 4);
+    put((uint32_t)configure_serial);
+    end();
+    begin(ID_SURFACE, 1);
+    put(ID_BUFFER);
+    put(0);
+    put(0);
+    end();
+    begin(ID_SURFACE, 2);
+    put(0);
+    put(0);
+    put(width);
+    put(height);
+    end();
+    begin(ID_SURFACE, 6);
+    end();
+    full_seen = 0;
+    wait_for(&never, 2000);
+    check(!full_seen, "no fullscreen ping-pong after unset_fullscreen");
+
+    /* Сам стал размером с монитор — полноэкранный. */
+    begin(ID_POOL_FULL, 0);
+    put(ID_BUFFER_MON);
+    put(0);
+    put((uint32_t)mon_w);
+    put((uint32_t)mon_h);
+    put((uint32_t)mon_w * 4);
+    put(0);
+    end();
+    begin(ID_SURFACE, 1);
+    put(ID_BUFFER_MON);
+    put(0);
+    put(0);
+    end();
+    begin(ID_SURFACE, 2);
+    put(0);
+    put(0);
+    put((uint32_t)mon_w);
+    put((uint32_t)mon_h);
+    end();
+    begin(ID_SURFACE, 6);
+    end();
+    wait_for(&full_seen, 5000);
+    check(full_seen && conf_w == mon_w && conf_h == mon_h, "a monitor-sized window becomes fullscreen");
 
     struct timespec nap = {2, 0};
     nanosleep(&nap, NULL);

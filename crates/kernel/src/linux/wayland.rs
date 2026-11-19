@@ -320,6 +320,7 @@ const PING_EVERY_MS: u64 = 5_000;
 /// …и столько ждать `pong`: дольше — клиент не разбирает свою очередь.
 const PING_PATIENCE_MS: u64 = 5_000;
 const XDG_TOPLEVEL_MAXIMIZED: u32 = 1;
+const XDG_TOPLEVEL_FULLSCREEN: u32 = 2;
 const XDG_TOPLEVEL_ACTIVATED: u32 = 4;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -545,6 +546,9 @@ struct Win {
     /// Когда стол попросил окно закрыться (мс работы системы); ноль — не
     /// просил или уже спрошено «не отвечает» (P4).
     close_asked: u64,
+    /// `set_fullscreen` пришёл до того, как окно открылось (20.11): исполнить
+    /// при открытии.
+    want_full: bool,
 }
 
 /// Всплывающее окно стола за `xdg_popup`.
@@ -1186,8 +1190,16 @@ impl Client {
                     }
                     // Рамку Chromium рисует сам (окно без рамки стола), и о
                     // перетаскивании, размере и кнопках просит стол он.
-                    // 11/12 — `set_fullscreen`/`unset_fullscreen` (18.11): на
-                    // весь экран — как развернуть, на свой монитор (игры Wine).
+                    // 11/12 — `set_fullscreen`/`unset_fullscreen` (20.11):
+                    // настоящий полноэкранный режим — весь монитор, панель не
+                    // поверх, в `configure` состояние FULLSCREEN (прежде — как
+                    // «развернуть», и Wine, не видя состояния, крутил set/unset).
+                    // До открытия окна — запомнить.
+                    11 | 12 if !self.wins.iter().any(|win| win.toplevel == id && win.open.is_some()) => {
+                        if let Some(win) = self.wins.iter_mut().find(|win| win.toplevel == id) {
+                            win.want_full = opcode == 11;
+                        }
+                    }
                     5 | 6 | 9 | 10 | 11 | 12 | 13 => {
                         // `resize(seat, serial, edges)`: у Wayland верх 1, низ 2,
                         // лево 4, право 8 — у стола свои биты.
@@ -1213,8 +1225,10 @@ impl Client {
                             let _ = match opcode {
                                 5 => crate::ui::begin_move(pid, slot),
                                 6 => crate::ui::begin_resize(pid, slot, edges),
-                                9 | 11 => crate::ui::maximize_window(pid, slot, true),
-                                10 | 12 => crate::ui::maximize_window(pid, slot, false),
+                                9 => crate::ui::maximize_window(pid, slot, true),
+                                10 => crate::ui::maximize_window(pid, slot, false),
+                                11 => crate::ui::fullscreen_window(pid, slot, true),
+                                12 => crate::ui::fullscreen_window(pid, slot, false),
                                 _ => crate::ui::minimize_window(pid, slot),
                             };
                         }
@@ -1395,6 +1409,7 @@ impl Client {
                     active: true,
                     title_due: false,
                     close_asked: 0,
+                    want_full: false,
                 });
             }
             2 => {
@@ -1599,6 +1614,9 @@ impl Client {
         if crate::ui::window_maximized(self.pid, slot) {
             states.extend_from_slice(&XDG_TOPLEVEL_MAXIMIZED.to_ne_bytes());
         }
+        if crate::ui::window_fullscreen(self.pid, slot) {
+            states.extend_from_slice(&XDG_TOPLEVEL_FULLSCREEN.to_ne_bytes());
+        }
         if active {
             states.extend_from_slice(&XDG_TOPLEVEL_ACTIVATED.to_ne_bytes());
         }
@@ -1612,7 +1630,9 @@ impl Client {
     fn current_size(&self, index: usize) -> (i32, i32) {
         let win = &self.wins[index];
         match win.open {
-            Some((w, h)) if crate::ui::window_maximized(self.pid, win.slot) => (w as i32, h as i32),
+            Some((w, h)) if crate::ui::window_maximized(self.pid, win.slot) || crate::ui::window_fullscreen(self.pid, win.slot) => {
+                (w as i32, h as i32)
+            }
             _ => (0, 0),
         }
     }
@@ -1759,6 +1779,9 @@ impl Client {
                 let _ = crate::ui::raw_keys_window(pid, win.slot);
                 kprintln!("  wayland     : #{pid} window '{}' {gw}x{gh}", win.title);
                 win.open = Some((gw, gh));
+                if core::mem::take(&mut win.want_full) {
+                    let _ = crate::ui::fullscreen_window(pid, win.slot, true);
+                }
             }
             Some(size) if size != (gw, gh) => {
                 let Some(pixels) = Surface::new(gw, gh, theme::window_bg()) else {

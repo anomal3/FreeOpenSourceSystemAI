@@ -426,6 +426,95 @@ pub struct Window {
     /// Низ окна поднят над клавиатурой (05.11): когда она уйдёт, стол вернёт
     /// его к полоске жеста (`Compositor::lift_program_windows`).
     pub lifted: bool,
+    /// Что лежит под обводкой окна (20.11), см. [`EdgeBook`].
+    edge: EdgeBook,
+    /// Окно во весь монитор (`xdg_toplevel.set_fullscreen`, 20.11): ни
+    /// рамки, ни панели поверх, пока оно впереди. Не то же, что развёрнутое:
+    /// то занимает рабочую область, это — монитор целиком.
+    pub fullscreen: bool,
+    /// Куда вернуть окно из полноэкранного режима.
+    full_from: Option<Rect>,
+    /// Размер монитора, на который окно открыто во весь экран.
+    full_size: (u32, u32),
+    /// Последний размер программа выбрала сама, а не ответила им на просьбу
+    /// стола (см. [`Self::replace_pixels`]).
+    self_sized: bool,
+}
+
+/// Учёт обводки окна (20.11).
+///
+/// Обводка — полупрозрачная линия поверх того, что уже лежит в поверхности.
+/// Раньше она смешивалась с поверхностью заново при каждой перерисовке
+/// заголовка и при каждом наведении на его кнопки, а содержимое под ней
+/// не перерисовывалось: линия с каждым разом густела, но на экран попадала
+/// только кусками — там, где кадр пересобирался по другой причине (под
+/// курсором, ведомым вдоль верхнего края). Отсюда «кольцо» вокруг окна.
+/// Копия пикселей программы, наоборот, стирала обводку по бокам и снизу.
+///
+/// Теперь для каждой точки, которой может коснуться обводка (две крайние
+/// строки и столбца и дуги углов), помнится, что под ней (`base`) и что в ней
+/// было после обводки (`drawn`). Точка, в которой уже не то, что нарисовали,
+/// перерисована содержимым — её новое значение и есть основа. Обводка
+/// всегда ложится на основу один раз.
+struct EdgeBook {
+    w: u32,
+    h: u32,
+    base: Vec<u32>,
+    drawn: Vec<u32>,
+    focused: bool,
+}
+
+impl EdgeBook {
+    const fn new() -> Self {
+        Self { w: 0, h: 0, base: Vec::new(), drawn: Vec::new(), focused: false }
+    }
+}
+
+/// Точки поверхности `w`×`h`, которых касается обводка радиуса `radius`
+/// ([`draw::rounded_stroke`]): по две крайние строки и столбца и полоса вдоль
+/// дуги каждого угла. Порядок всегда один и тот же — по нему [`EdgeBook`]
+/// хранит значения.
+fn edge_points(w: u32, h: u32, radius: u32, mut f: impl FnMut(u32, u32)) {
+    if w < 4 || h < 4 {
+        return;
+    }
+    let c = (radius + 1).min(w / 2).min(h / 2);
+    // Внутри круга радиуса `radius - 2.5` с центром в центре скругления
+    // обводки нет. Всё в удвоенных координатах, чтобы остаться в целых.
+    let r2 = 2 * i64::from(radius);
+    let inner = (r2 - 5).max(0);
+    let near = |lx: u32, ly: u32| {
+        if lx < 2 || ly < 2 {
+            return true;
+        }
+        let dx = 2 * i64::from(lx) + 1 - r2;
+        let dy = 2 * i64::from(ly) + 1 - r2;
+        dx * dx + dy * dy >= inner * inner
+    };
+    for y in 0..h {
+        let ly = y.min(h - 1 - y);
+        if ly < c {
+            for x in 0..c {
+                if near(x, ly) {
+                    f(x, y);
+                }
+            }
+            if ly < 2 {
+                for x in c..w - c {
+                    f(x, y);
+                }
+            }
+            for x in w - c..w {
+                if near(w - 1 - x, ly) {
+                    f(x, y);
+                }
+            }
+        } else {
+            for x in [0, 1, w - 2, w - 1] {
+                f(x, y);
+            }
+        }
+    }
 }
 
 /// Счётчик для [`Window::born`].
@@ -588,6 +677,11 @@ impl Window {
             fit: false,
             keyboard: false,
             lifted: false,
+            edge: EdgeBook::new(),
+            fullscreen: false,
+            full_from: None,
+            full_size: (0, 0),
+            self_sized: false,
         }
     }
 
@@ -711,10 +805,27 @@ impl Window {
         if asked.is_none() && !self.fit {
             self.restore = None;
         }
+        self.self_sized = asked.is_none() && !self.fit;
+        // Окно во весь экран, ставшее по своей воле другого размера, из
+        // полноэкранного режима вышло (игра переключилась в окно). Ответ на
+        // просьбу стола — нет: он и есть размер монитора, пусть и с опозданием.
+        if self.self_sized && self.fullscreen && answer != self.full_size {
+            self.fullscreen = false;
+            self.full_from = None;
+        }
         self.redraw_content();
         self.draw_decorations(focused);
         self.damage = Rect::new(0, 0, w, h);
         true
+    }
+
+    /// Последний размер программа выбрала сама, а не ответила на просьбу
+    /// стола: только такой размер стол вправе толковать как «хочу во весь
+    /// экран» (`ui::resize_window`), иначе ответ на «вернуть размер» снова
+    /// разворачивал бы окно — и так по кругу.
+    #[must_use]
+    pub const fn self_sized(&self) -> bool {
+        self.self_sized
     }
 
     /// Может ли человек менять окну размер: окну ядра — по его виду
@@ -929,7 +1040,7 @@ impl Window {
         // размер менять можно, и с рамкой, и без (Chromium, Rider: их тень, за
         // которую тянут в Linux, стол срезает). Полоса узкая, а у углов —
         // шире, как у Windows: в угол целиться труднее.
-        if !self.popup && self.resizable() && !self.is_maximized() && !theme::is_mobile() {
+        if !self.popup && self.resizable() && !self.is_maximized() && !self.fullscreen && !theme::is_mobile() {
             let edges = self.edges_at(local.0, local.1);
             if edges != 0 {
                 return Some(Hit::Resize(edges));
@@ -992,7 +1103,7 @@ impl Window {
         // Уголок проверяется после заголовка: у окна ростом с полосу заголовка
         // они пересекаются, и таскать такое окно важнее, чем тянуть его за
         // размер.
-        if self.resizable() && !self.fit && self.resize_grip().contains(local.0, local.1) {
+        if self.resizable() && !self.fit && !self.is_maximized() && !self.fullscreen && self.resize_grip().contains(local.0, local.1) {
             return Some(Hit::Resize(EDGE_RIGHT | EDGE_BOTTOM));
         }
         Some(Hit::Body)
@@ -1038,7 +1149,8 @@ impl Window {
         // Окно без рамки растягивают по просьбе программы, а не за уголок —
         // точки легли бы поверх её рисунка.
         // Рамку стола на телефоне (`fit`) не тянут вовсе: её размер — экран.
-        if !self.resizable() || self.frameless || self.fit {
+        // Развёрнутое окно за уголок не тянут (20.11) — и уголка у него нет.
+        if !self.resizable() || self.frameless || self.fit || self.is_maximized() {
             return;
         }
         let ctx = self.ctx();
@@ -1149,8 +1261,7 @@ impl Window {
         );
         // Обводка окна — последней: она ложится поверх и полосы заголовка, и
         // содержимого, и именно она делает из двух прямоугольников один лист.
-        let edge = if focused { p.line3 } else { p.line2 };
-        draw::rounded_stroke(&mut self.surface, bounds, radius, edge.color, edge.alpha);
+        self.paint_edge(focused);
 
         // Уголок размера: три точки в правом нижнем углу. Без нарисованного
         // признака за него никто не потянет — угадывать, что окно где-то
@@ -1222,13 +1333,88 @@ impl Window {
         }
         self.hot = hot;
         self.paint_title_buttons(focused);
-        let ctx = self.ctx();
-        let p = ctx.palette;
-        let bounds = self.surface.bounds();
-        let edge = if focused { p.line3 } else { p.line2 };
-        draw::rounded_stroke(&mut self.surface, bounds, ctx.px(theme::R_WINDOW), edge.color, edge.alpha);
+        // Обводка — заново, но на основу, а не поверх прежней (см.
+        // [`EdgeBook`]): кнопки только что залиты, остальной периметр
+        // остаётся каким был.
+        self.paint_edge(focused);
         let row = self.leftmost_button().union(&self.close_button());
         self.damage = self.damage.union(&row);
+    }
+
+    /// Положить обводку окна на основу (см. [`EdgeBook`]) цветом активного
+    /// или неактивного окна. Изменившиеся точки попадают в `damage`.
+    fn paint_edge(&mut self, focused: bool) {
+        if self.popup || self.frameless {
+            return;
+        }
+        let ctx = self.ctx();
+        let p = ctx.palette;
+        let radius = ctx.px(theme::R_WINDOW);
+        let ink = if focused { p.line3 } else { p.line2 };
+        let bounds = self.surface.bounds();
+        let (w, h) = (bounds.w, bounds.h);
+        let Self { surface, edge: book, .. } = &mut *self;
+        book.focused = focused;
+        if (book.w, book.h) != (w, h) {
+            let mut count = 0usize;
+            edge_points(w, h, radius, |_, _| count += 1);
+            book.base.clear();
+            book.drawn.clear();
+            if book.base.try_reserve_exact(count).is_err() || book.drawn.try_reserve_exact(count).is_err() {
+                // Памяти на учёт нет — обводка как раньше, просто поверх.
+                book.w = 0;
+                draw::rounded_stroke(surface, bounds, radius, ink.color, ink.alpha);
+                return;
+            }
+            book.w = w;
+            book.h = h;
+        }
+        // Первый проход: основа под каждой точкой — прежняя, если точка
+        // хранит нарисованное обводкой, иначе её нынешнее значение.
+        // `drawn` до второго прохода хранит то, что было в точке до вызова.
+        let mut i = 0usize;
+        edge_points(w, h, radius, |x, y| {
+            let now = surface.get(x, y);
+            if i >= book.base.len() {
+                book.base.push(now);
+                book.drawn.push(now);
+            } else if now != book.drawn[i] {
+                book.base[i] = now;
+            }
+            book.drawn[i] = now;
+            surface.row_mut(y)[x as usize] = book.base[i];
+            i += 1;
+        });
+        draw::rounded_stroke(surface, bounds, radius, ink.color, ink.alpha);
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        let mut i = 0usize;
+        edge_points(w, h, radius, |x, y| {
+            let now = surface.get(x, y);
+            if now != book.drawn[i] {
+                let (x, y) = (x as i32, y as i32);
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+            book.drawn[i] = now;
+            i += 1;
+        });
+        if x0 <= x1 {
+            let changed = Rect::new(x0, y0, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32);
+            self.damage = self.damage.union(&changed);
+        }
+    }
+
+    /// Задевает ли прямоугольник поверхности место обводки (с запасом на
+    /// углы): тогда после копии пикселей её надо положить заново.
+    fn touches_edge(&self, rect: Rect) -> bool {
+        if self.popup || self.frameless || rect.is_empty() {
+            return false;
+        }
+        let c = (self.ctx().px(theme::R_WINDOW) + 1) as i32;
+        let (w, h) = (self.surface.width() as i32, self.surface.height() as i32);
+        rect.x < c || rect.y < c || rect.right() > w - c || rect.bottom() > h - c
     }
 
     /// Перекрасить окно под текущую тему.
@@ -1709,6 +1895,9 @@ impl Window {
             }
         }
         self.damage = self.damage.union(&area);
+        // Заливка стёрла обводку по бокам и снизу.
+        let focused = self.edge.focused;
+        self.paint_edge(focused);
     }
 
     /// Показать в «Параметрах» раздел экрана.
@@ -2104,6 +2293,88 @@ impl Window {
         }
     }
 
+    /// Куда вернётся развёрнутое окно; `None` — оно не развёрнуто.
+    #[must_use]
+    pub const fn restore_rect(&self) -> Option<Rect> {
+        self.restore
+    }
+
+    /// Вернуть развёрнутое окно к прежнему размеру, но поставить его углом в
+    /// `x`, `y` (20.11): развёрнутое окно потащили за заголовок, и оно
+    /// уменьшается под указателем, как в Windows.
+    pub fn unmaximize_at(&mut self, x: i32, y: i32, focused: bool) -> bool {
+        let Some(rect) = self.restore.take() else {
+            return false;
+        };
+        if !self.resize(rect.w, rect.h) {
+            self.restore = Some(rect);
+            return false;
+        }
+        self.rect.x = x;
+        self.rect.y = y;
+        self.draw_decorations(focused);
+        true
+    }
+
+    /// Забыть, что окно развёрнуто, оставив его размер и место (его сдвинули
+    /// клавишами): кнопка снова предлагает «развернуть».
+    pub fn forget_maximized(&mut self, focused: bool) {
+        if self.restore.take().is_some() {
+            self.draw_decorations(focused);
+        }
+    }
+
+    /// Попросить программу ответить на текущий размер окна — даже если он не
+    /// изменился: сервер Wayland отвечает на такую просьбу `configure` с
+    /// состояниями окна (развёрнуто, во весь экран), и клиент узнаёт, что его
+    /// просьба исполнена.
+    pub fn ask_configure(&mut self) {
+        if self.is_program() && self.resizable() {
+            let (w, h) = (self.rect.w, self.rect.h.saturating_sub(self.bar()));
+            self.ask_resize(w, h);
+        }
+    }
+
+    /// Открыть окно во весь монитор `area` (20.11). `true` — состояние
+    /// изменилось.
+    pub fn enter_fullscreen(&mut self, area: Rect) -> bool {
+        if self.fullscreen || area.is_empty() {
+            return false;
+        }
+        let previous = self.rect;
+        // Флаг — до изменения размера: просьба программе уходит из него же,
+        // и сервер Wayland читает состояние, отвечая на неё.
+        self.fullscreen = true;
+        if !self.resize(area.w, area.h) {
+            self.fullscreen = false;
+            return false;
+        }
+        self.rect.x = area.x;
+        self.rect.y = area.y;
+        self.full_from = Some(previous);
+        self.full_size = (area.w, area.h.saturating_sub(self.bar()));
+        self.ask_configure();
+        true
+    }
+
+    /// Выйти из полноэкранного режима туда, где окно стояло до него.
+    pub fn leave_fullscreen(&mut self) -> bool {
+        if !self.fullscreen {
+            return false;
+        }
+        self.fullscreen = false;
+        let back = self.full_from.take().unwrap_or(self.rect);
+        if !self.resize(back.w, back.h) {
+            self.fullscreen = true;
+            self.full_from = Some(back);
+            return false;
+        }
+        self.rect.x = back.x;
+        self.rect.y = back.y;
+        self.ask_configure();
+        true
+    }
+
     /// Поверхность окна — для сборки кадра.
     #[must_use]
     pub const fn surface(&self) -> &Surface {
@@ -2190,6 +2461,12 @@ impl Window {
             self.draw_grip();
         }
         self.damage = self.damage.union(&copied);
+        // Копия легла и на обводку (20.11: раньше её края так и пропадали —
+        // до следующего наведения на кнопки заголовка).
+        if self.touches_edge(copied) {
+            let focused = self.edge.focused;
+            self.paint_edge(focused);
+        }
     }
 
     /// Поверхность программы — чтобы ядро нарисовало в ней само (сервер

@@ -215,6 +215,14 @@ pub struct Compositor {
     /// Что внизу экрана телефона нарисовано последним: `true` — полоска
     /// жеста (на экране программа), `false` — док (см. [`Self::app_in_front`]).
     front_shown: bool,
+    /// Панель спрятана под окном во весь экран (см.
+    /// [`Self::fullscreen_front`]) — так было в прошлом кадре.
+    full_front_shown: bool,
+    /// Где был указатель, когда окно взяли за заголовок: развёрнутое окно
+    /// уменьшается, только когда указатель отошёл от этой точки (20.11).
+    drag_press: (i32, i32),
+    /// Тащимое окно было развёрнутым и уменьшилось под указателем.
+    drag_unmaximized: bool,
     /// Окно, которое сейчас тащат за заголовок.
     ///
     /// Программа, а не индекс: порядок окон меняется при поднятии, и индекс,
@@ -401,6 +409,9 @@ impl Compositor {
             under_dirty: Rect::EMPTY,
             status_text: alloc::string::String::new(),
             front_shown: false,
+            full_front_shown: false,
+            drag_press: (0, 0),
+            drag_unmaximized: false,
             drag: None,
             drag_from: (0, 0),
             drag_resizes: false,
@@ -551,6 +562,15 @@ impl Compositor {
     /// Док или полоска жеста — по тому, есть ли на экране программа.
     /// Сменилось — пометить низ экрана.
     fn sync_front(&mut self) {
+        // Окно во весь экран вышло вперёд или ушло назад — панель под ним
+        // прячется или возвращается (20.11).
+        let full = self.fullscreen_front();
+        if full != self.full_front_shown {
+            self.full_front_shown = full;
+            if let Some(rect) = self.panel.as_ref().map(|panel| panel.rect) {
+                self.mark_layer(rect);
+            }
+        }
         let front = self.app_in_front();
         if front == self.front_shown {
             return;
@@ -1212,11 +1232,17 @@ impl Compositor {
         let Some(window) = self.windows.get_mut(self.focus) else {
             return;
         };
+        if window.fullscreen {
+            return;
+        }
         let before = window.rect;
         window.move_within(dx, dy, &areas[..n]);
         if window.rect == before {
             return;
         }
+        // Сдвинутое развёрнутое окно больше не развёрнуто (20.11): кнопка
+        // снова «развернуть», а не «вернуть».
+        window.forget_maximized(true);
         let after = window.rect;
         // Два прямоугольника, а не один объединяющий: при большом сдвиге
         // объединение — это почти весь экран, тогда как настоящих изменений два
@@ -1671,7 +1697,7 @@ impl Compositor {
     pub fn panel_at(&self, x: i32, y: i32) -> Option<PanelHit> {
         // Под открытой клавиатурой дока нет — он спрятан, и нажимать его нельзя.
         // И под программой на телефоне: вместо дока там полоска жеста (04.11).
-        if self.keyboard_visible() || self.app_in_front() {
+        if self.keyboard_visible() || self.app_in_front() || self.fullscreen_front() {
             return None;
         }
         let panel = self.panel.as_ref()?;
@@ -1685,6 +1711,8 @@ impl Compositor {
     pub fn set_drag(&mut self, app: Option<App>) {
         self.drag = app;
         if let Some(app) = app {
+            self.drag_press = self.pointer.position();
+            self.drag_unmaximized = false;
             self.drag_from = self.rect_of(app).map_or((0, 0), |rect| (rect.x, rect.y));
         } else {
             self.drag_resizes = false;
@@ -1724,6 +1752,12 @@ impl Compositor {
     #[must_use]
     pub const fn dragging(&self) -> Option<App> {
         self.drag
+    }
+
+    /// Развёрнутое окно, взятое за заголовок, уже уменьшилось (20.11).
+    #[must_use]
+    pub const fn drag_unmaximized(&self) -> bool {
+        self.drag_unmaximized
     }
 
     /// Захват меняет размер окна, а не двигает его.
@@ -1771,6 +1805,16 @@ impl Compositor {
             self.pending_size = Some((app, x, y, w, h));
             return;
         }
+        // Развёрнутое окно, которое потащили, возвращается к прежнему
+        // размеру под указателем (20.11, как в Windows), а не едет
+        // развёрнутым. Во весь экран — не тащится вовсе.
+        if self.windows.get(index).is_some_and(|window| window.fullscreen) {
+            return;
+        }
+        if self.windows.get(index).is_some_and(Window::is_maximized) {
+            self.unmaximize_dragged(index, app, &areas[..n]);
+            return;
+        }
         let Some(window) = self.windows.get_mut(index) else {
             return;
         };
@@ -1781,6 +1825,43 @@ impl Compositor {
         }
         let after = window.rect;
         self.note_moved(app, before, after);
+        self.follow_owner(app);
+    }
+
+    /// Развёрнутое окно тащат за заголовок: как только указатель отошёл от
+    /// точки нажатия дальше порога (дрожь руки при щелчке — не перенос),
+    /// окно принимает прежний размер. Указатель остаётся на той же доле
+    /// ширины заголовка и на той же высоте в нём — окно уменьшается «вокруг»
+    /// руки, а не отпрыгивает из-под неё.
+    fn unmaximize_dragged(&mut self, index: usize, app: App, areas: &[Rect]) {
+        let (px, py) = self.pointer.position();
+        let (ax, ay) = self.drag_press;
+        let threshold = 4 * self.scale.max(1) as i32;
+        if (px - ax).abs() < threshold && (py - ay).abs() < threshold {
+            return;
+        }
+        let focused = self.focus == index;
+        let Some(window) = self.windows.get_mut(index) else {
+            return;
+        };
+        let before = window.rect;
+        let Some(back) = window.restore_rect() else {
+            return;
+        };
+        let along = i64::from((ax - before.x).clamp(0, before.w as i32));
+        let x = ax - (along * i64::from(back.w) / i64::from(before.w.max(1))) as i32;
+        let y = before.y;
+        if !window.unmaximize_at(x, y, focused) {
+            return;
+        }
+        // Дальше окно идёт за указателем от этого места: то, на что он
+        // успел отойти от точки нажатия, — уже сдвиг.
+        window.move_within(px - ax, py - ay, areas);
+        crate::kprintln!("  desktop     : restored '{}' from maximized by dragging", window.caption());
+        self.drag_unmaximized = true;
+        let after = window.rect;
+        self.mark_layer(before);
+        self.mark_layer(after);
         self.follow_owner(app);
     }
 
@@ -1866,6 +1947,11 @@ impl Compositor {
         let Some(index) = self.index_of(app) else {
             return false;
         };
+        // Окно во весь экран не разворачивают и не возвращают: его размер —
+        // монитор, пока программа сама не выйдет из этого режима.
+        if self.windows.get(index).is_some_and(|window| window.fullscreen) {
+            return false;
+        }
         let mut area = match self.windows.get(index) {
             Some(window) => self.app_area_for(window.rect),
             None => self.app_area(),
@@ -1888,6 +1974,9 @@ impl Compositor {
         if !window.toggle_maximize(area) {
             return false;
         }
+        // Поверхность пересобрана неактивной (`Window::resize`): заголовок
+        // — по настоящему фокусу.
+        window.draw_decorations(index == self.focus);
         let after = window.rect;
         self.mark_layer(before);
         self.mark_layer(after);
@@ -1900,6 +1989,57 @@ impl Compositor {
             super::set_animating(true);
         }
         true
+    }
+
+    /// Открыть окно во весь монитор, на котором оно стоит, или вернуть
+    /// (20.11, `xdg_toplevel.set_fullscreen` — игры под Wine). `true` —
+    /// состояние изменилось.
+    pub fn set_fullscreen(&mut self, app: App, on: bool) -> bool {
+        let Some(index) = self.index_of(app) else {
+            return false;
+        };
+        let Some(rect) = self.windows.get(index).map(|window| window.rect) else {
+            return false;
+        };
+        let monitor = self.output_near(rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2);
+        let area = self.output_rects().get(monitor).copied().unwrap_or(self.primary);
+        let focused = index == self.focus;
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        let before = window.rect;
+        let changed = if on { window.enter_fullscreen(area) } else { window.leave_fullscreen() };
+        if !changed {
+            return false;
+        }
+        window.draw_decorations(focused);
+        let after = window.rect;
+        self.mark_layer(before);
+        self.mark_layer(after);
+        if let Some(panel) = self.panel.as_ref().map(|panel| panel.rect) {
+            self.mark_layer(panel);
+        }
+        self.follow_owner(app);
+        true
+    }
+
+    /// Впереди всех окон — окно во весь экран, закрывающее панель: панель
+    /// тогда не рисуется и щелчки не ловит (20.11). Открытый «Пуск»
+    /// возвращает её — Win из игры ведёт к панели, как в Windows; Alt+Tab
+    /// поднимает другое окно, и окно во весь экран перестаёт быть впереди.
+    #[must_use]
+    pub fn fullscreen_front(&self) -> bool {
+        if self.start.is_some() {
+            return false;
+        }
+        let Some(panel) = self.panel.as_ref() else {
+            return false;
+        };
+        self.windows
+            .iter()
+            .rev()
+            .find(|window| !window.minimized && !window.popup)
+            .is_some_and(|window| window.fullscreen && !window.rect.intersect(&panel.rect).is_empty())
     }
 
     /// Закрыть окно программы. Возвращает `true`, если оно было.
@@ -3911,7 +4051,9 @@ impl Compositor {
                 draw::rounded(back, pill.translate(0, dy), pill.h / 2, ink, 220);
             }
         }
-        if let Some(panel) = self.panel.as_ref().filter(|_| !keyboard_up && !front) {
+        // Под окном во весь экран, стоящим впереди, панели нет (20.11).
+        let full = self.fullscreen_front();
+        if let Some(panel) = self.panel.as_ref().filter(|_| !keyboard_up && !front && !full) {
             // Полосы, которых док не задевает, отсекаются здесь, до всякой
             // работы. `stack` проверяет то же самое, но уже внутри — а нам
             // нужно знать, сколько раз он вызывается вхолостую: счётчик
@@ -4103,8 +4245,21 @@ impl Compositor {
             return;
         }
         let ink = theme::palette().shadow;
-        let halo = placed.translate(0, drop as i32 + dy);
-        draw::shadow(back, halo, radius, spread, ink.color, ink.alpha);
+        // Фигура тени — сам слой, опущенный на `drop` и обрезанный снизу по
+        // его краю, а с боков сжатый на треть сдвига (20.11). Прежде тенью был
+        // слой, просто сдвинутый вниз, а [`draw::shadow`] под фигурой тени не
+        // кладёт: под нижним краем окна оставалась полоса чистых обоев
+        // высотой в `drop` — та «прозрачная рамка» снизу, с тенью уже под ней.
+        // Теперь тень начинается прямо от нижнего края и гаснет вниз на весь
+        // `spread`, по бокам — чуть мягче, сверху — едва заметна.
+        let side = (drop / 3).min(placed.w / 4);
+        let shape = Rect::new(
+            placed.x + side as i32,
+            placed.y + drop as i32 + dy,
+            placed.w.saturating_sub(side * 2),
+            placed.h.saturating_sub(drop).max(1),
+        );
+        draw::shadow(back, shape, radius, spread, ink.color, ink.alpha);
     }
 
     /// Накрыто ли всё, что в этой полосе, каким-нибудь одним окном.

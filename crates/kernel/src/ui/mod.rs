@@ -448,6 +448,9 @@ const PASTE_LIMIT: usize = 1000;
 
 static LAST_ICON_CLICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static LAST_ICON: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// Последний щелчок по заголовку окна (20.11): окно, время, точка. Второй
+/// щелчок туда же за [`DOUBLE_CLICK_MS`] разворачивает окно или возвращает.
+static LAST_TITLE: SpinLock<Option<(App, u64, i32, i32)>> = SpinLock::new(None);
 
 /// Что делает левая кнопка, нажатая на столе, пока её держат (01.11).
 enum IconGesture {
@@ -2790,6 +2793,11 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                     rect.y
                 );
             }
+            // Развёрнутое окно уменьшилось под указателем (20.11): у него
+            // теперь другой размер, а не только место.
+            if desktop.drag_unmaximized() {
+                log_window(desktop, app, true);
+            }
         }
         // Растяжение за уголок — так же, как разворот: новый прямоугольник в
         // журнал. Без него снаружи не видно, где теперь кнопки окна, и стенд
@@ -3355,6 +3363,33 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         // ни щелчка содержимому (оно досталось бы вопросу, в чужих
         // координатах), ни перетаскивания, ни уголка.
         let popup = app.is_some_and(|app| desktop.is_popup(app));
+        // Двойной щелчок по заголовку (20.11): развернуть или вернуть, как в
+        // Windows. Первый щелчок мог прийтись на неактивное окно — он только
+        // поднял его, но запомнить его надо и тогда.
+        if let Some(app) = app.filter(|_| hit == Hit::Title && !popup) {
+            let now = if at_ms == 0 { crate::time::uptime_ms() } else { at_ms };
+            let slop = 6 * desktop.scale().max(1) as i32;
+            let double = {
+                let mut last = LAST_TITLE.lock();
+                let double = last.is_some_and(|(was, at, lx, ly)| {
+                    was == app && now.saturating_sub(at) <= DOUBLE_CLICK_MS && (x - lx).abs() <= slop && (y - ly).abs() <= slop
+                });
+                // Третий щелчок — снова первый, а не второй двойной.
+                *last = if double { None } else { Some((app, now, x, y)) };
+                double
+            };
+            if double {
+                desktop.set_drag(None);
+                let name = name_of(desktop, app);
+                if desktop.find(app).is_some_and(|window| window.resizable()) && desktop.toggle_maximize(app) {
+                    kprintln!("  desktop     : title double-click on '{name}'");
+                    kprintln!("  desktop     : resized '{name}'");
+                    log_window(desktop, app, true);
+                }
+                desktop.present();
+                return;
+            }
+        }
         if desktop.focused_app() != app && !popup && matches!(hit, Hit::Body | Hit::Title | Hit::Resize(_)) {
             desktop.present();
             return;
@@ -5549,6 +5584,29 @@ pub fn maximize_window(task: u32, slot: u32, on: bool) -> Result<(), WindowError
     .unwrap_or_else(|| Err(unavailable()))
 }
 
+/// Открыть окно программы во весь монитор (`on`) или вернуть
+/// (`xdg_toplevel.set_fullscreen` и `unset_fullscreen`, 20.11). Уже в нужном
+/// состоянии — ничего.
+pub fn fullscreen_window(task: u32, slot: u32, on: bool) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let now = desktop.find(app).ok_or(WindowError::NoWindow)?.fullscreen;
+        if now != on && desktop.set_fullscreen(app, on) {
+            kprintln!("  desktop     : '{}' {} fullscreen", name_of(desktop, app), if on { "entered" } else { "left" });
+            log_window(desktop, app, true);
+            desktop.present();
+        }
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Открыто ли окно программы во весь экран.
+#[must_use]
+pub fn window_fullscreen(task: u32, slot: u32) -> bool {
+    with_desktop(|desktop| desktop.find(App::Program(task, slot)).is_some_and(|window| window.fullscreen)).unwrap_or(false)
+}
+
 /// Развёрнуто ли окно программы.
 #[must_use]
 pub fn window_maximized(task: u32, slot: u32) -> bool {
@@ -5673,9 +5731,24 @@ pub fn resize_window(task: u32, slot: u32, pixels: Surface) -> Result<(), Window
         // экран»: 18.11, Trackmania на ПК Романа стала 2560x1440 там, где
         // стояла, — полосой через два монитора). Такое окно разворачивается
         // на свой монитор, а не висит между ними; «восстановить» вернёт его.
+        //
+        // 20.11: только размер, выбранный самой программой, — ответ на
+        // просьбу стола («вернуть размер») так не толкуется, иначе выходил
+        // круг. Окно без рамки стола (Wayland, игры Wine) становится окном во
+        // весь экран — монитор целиком, без панели поверх; окно с рамкой
+        // стола — развёрнутым, как раньше.
         let monitor_sized = desktop.output_rects().iter().any(|r| (r.w, r.h) == size);
-        if monitor_sized && !desktop.find(app).is_some_and(|w| w.is_maximized()) && desktop.toggle_maximize(app) {
-            kprintln!("  desktop     : '{}' is monitor-sized, maximized on its monitor", name_of(desktop, app));
+        let (chosen, frameless, full, maximized) = desktop
+            .find(app)
+            .map_or((false, false, false, false), |w| (w.self_sized(), w.frameless, w.fullscreen, w.is_maximized()));
+        if monitor_sized && chosen && !full {
+            if frameless {
+                if desktop.set_fullscreen(app, true) {
+                    kprintln!("  desktop     : '{}' is monitor-sized, fullscreen on its monitor", name_of(desktop, app));
+                }
+            } else if !maximized && desktop.toggle_maximize(app) {
+                kprintln!("  desktop     : '{}' is monitor-sized, maximized on its monitor", name_of(desktop, app));
+            }
         }
         log_window(desktop, app, focused);
         // Окно могло сжаться: открывшееся под ним место рисуется заново.
