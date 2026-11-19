@@ -69,10 +69,15 @@ MODE=\n\
 # `bench: tmnf dxvk 1280x720 avg N fps`, игра снимается.\n\
 SIZE=\n\
 BENCH=\n\
+# Видеокарта (20.11): `--nvk` - DXVK на NVK без проверки, `--cpu` - кадры на\n\
+# процессоре всегда; по умолчанию - сам (см. ниже).\n\
+GPU=auto\n\
 while :; do\n\
     case \"$1\" in\n\
         --wined3d) MODE=; shift ;;\n\
         --dxvk) MODE=--dxvk; shift ;;\n\
+        --nvk) GPU=nvk; shift ;;\n\
+        --cpu) GPU=cpu; shift ;;\n\
         --720p) SIZE=1280x720; shift ;;\n\
         --1080p) SIZE=1920x1080; shift ;;\n\
         --desktop=*) SIZE=${1#--desktop=}; shift ;;\n\
@@ -82,12 +87,24 @@ while :; do\n\
         *) break ;;\n\
     esac\n\
 done\n\
+# Есть узел видеокарты (/dev/dri/renderD128: `nvk hw on` или `gpu gametest`)\n\
+# и NVK за 60 с называет себя в vulkaninfo - Direct3D 9 через DXVK на\n\
+# видеокарте (RTX 3060 через GSP-RM). Иначе - как раньше, процессор.\n\
+if [ \"$GPU\" = auto ] && [ -e /dev/dri/renderD128 ] && [ \"$FOSSAI_VULKAN\" != lvp ]; then\n\
+    I=$(/opt/debian/bin/timeout -k 5 60 /opt/debian/bin/bash $P --env=FOSSAI_VULKAN=nvk --run=vulkaninfo --summary 2>&1)\n\
+    case $I in\n\
+        *NVK*) GPU=nvk; echo \"tmnf: the video card answers through NVK - DXVK on the GPU\" ;;\n\
+        *) GPU=cpu; echo \"tmnf: NVK did not answer in 60 s - drawing on the CPU: ${I:0:300}\" ;;\n\
+    esac\n\
+fi\n\
+if [ \"$GPU\" = nvk ]; then MODE=--dxvk; export FOSSAI_VULKAN=nvk; fi\n\
+if [ \"$GPU\" = cpu ] && [ -z \"$MODE\" ]; then export FOSSAI_VULKAN=lvp; fi\n\
 if [ -n \"$MODE\" ]; then export DXVK_HUD=${DXVK_HUD:-fps,frametimes}; else export WINEDEBUG=${WINEDEBUG:-fixme-all,+fps}; fi\n\
 A=()\n\
 [ -n \"$SIZE\" ] && A+=(\"--desktop=$SIZE\")\n\
-R=dxvk; [ -z \"$MODE\" ] && R=wined3d\n\
+R=dxvk; [ -z \"$MODE\" ] && R=wined3d; [ \"$GPU\" = nvk ] && R=dxvk-nvk\n\
 [ -n \"$BENCH\" ] && A+=(\"--bench=$BENCH,tmnf $R ${SIZE:-native}\")\n\
-echo \"tmnf: starting TmForever.exe (${MODE:-wined3d}, ${SIZE:-native size})\"\n\
+echo \"tmnf: starting TmForever.exe ($R, ${SIZE:-native size})\"\n\
 exec /opt/debian/bin/bash $P \"${A[@]}\" \"$@\" $MODE \"$G/TmForever.exe\"\n";
 
 /// Собрать пакет.

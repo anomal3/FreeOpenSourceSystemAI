@@ -6644,22 +6644,36 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(10_000),
             Step::Line("run /opt/debian/bin/ls /opt/proton/share/vulkan/icd.d"),
             Step::Await("nouveau_icd.x86_64.json", 30_000),
-            Step::Line("nvk soft on"),
-            Step::Wait(1_000),
-            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --run=vkprobe NVK"),
-            Step::Await("vkprobe: start", 60_000),
-            Step::Await("vkprobe: ok vkEnumeratePhysicalDevices finds a device", 120_000),
-            Step::Await("vkprobe: ok a device with the requested name is listed", 30_000),
-            Step::Await("vkprobe: ok vkCreateDevice", 300_000),
-            Step::Await("vkprobe: ok vkWaitForFences (5 s)", 60_000),
-            Step::Await("vkprobe: 0 failed", 120_000),
-            // Показ кадров NVK (M7): vkcube только на NVK, кадры - буферами
-            // zwp_linux_dmabuf_v1. SoftGpu шейдеры не выполняет - картинка
-            // не проверяется, только путь буферов.
-            Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=VK_DRIVER_FILES=/opt/proton/share/vulkan/icd.d/nouveau_icd.x86_64.json --run=vkcube --wsi wayland"),
-            Step::Await("dmabuf buffer", 300_000),
-            Step::Wait(20_000),
+            // Утренняя проверка Романа (`gpu gametest`) в режиме SoftGpu
+            // (20.11): та же пользовательская часть (fossai-gametest), её
+            // вывод - через канал в журнал ядра (`gametest| `). vk: vkprobe
+            // на NVK, vulkaninfo, vkcube 600 кадров буферами
+            // zwp_linux_dmabuf_v1 (M7). SoftGpu шейдеры не выполняет -
+            // картинка не проверяется, только путь.
+            Step::Line("power never"),
+            Step::Await("screen off: never", 15_000),
+            Step::Line("gpu gametest soft -- vk"),
+            Step::Await("gametest: PASS soft-node", 30_000),
+            Step::Await("gametest| vkprobe: start", 300_000),
+            Step::Await("gametest| vkprobe: ok vkEnumeratePhysicalDevices finds a device", 300_000),
+            Step::Await("gametest| vkprobe: ok vkCreateDevice", 600_000),
+            Step::Await("gametest| vkprobe: ok vkWaitForFences (5 s)", 300_000),
+            Step::Await("gametest| gametest: PASS vkprobe", 300_000),
+            Step::Await("gametest| gametest: PASS vulkaninfo", 300_000),
+            Step::Await("dmabuf buffer", 600_000),
+            Step::Shot("nvk-vkcube"),
+            Step::Await("gametest| gametest: PASS vkcube", 1_200_000),
+            Step::Await("gametest: done", 120_000),
+            // d3d: Direct3D 9 (как TMNF) через DXVK на NVK, замер 20 с.
+            Step::Line("gpu gametest soft -- d3d"),
+            Step::Await("gametest: PASS soft-node", 30_000),
+            Step::Await("gametest| bench: d3dprobe9-dxvk-nvk", 1_800_000),
+            Step::Shot("nvk-d3d9"),
+            Step::Await("gametest| bench: d3dprobe9-dxvk-nvk avg", 600_000),
+            Step::Await("gametest| gametest: PASS d3d9-dxvk-nvk", 300_000),
+            Step::Await("gametest: done", 120_000),
             Step::Absent("vkprobe: FAILED"),
+            Step::Absent("gametest| gametest: FAIL"),
             Step::Absent("protocol error"),
             Step::Absent("KERNEL PANIC"),
         ],

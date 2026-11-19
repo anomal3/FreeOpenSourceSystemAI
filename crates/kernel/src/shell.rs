@@ -2433,6 +2433,13 @@ fn gpu(argument: &str) {
         crate::usb::stick_log::flush_now();
         return;
     }
+    // 20.11: проверка игры на видеокарте одной командой (GSP, мониторы,
+    // каналы, узел DRM, vkprobe/vkcube/D3D9/TMNF на NVK) — в фоне, итог —
+    // строки `gametest:` в журнале.
+    if argument == "gametest" || argument.starts_with("gametest ") {
+        sprintln!("  gpu: {}", crate::display::nvidia_gametest::start(argument.trim_start_matches("gametest")));
+        return;
+    }
     if argument == "gsp" || argument.starts_with("gsp ") {
         for line in crate::display::nvidia_gsp::boot_gsp(argument.trim_start_matches("gsp")) {
             sprintln!("  gpu: {line}");
@@ -2467,7 +2474,7 @@ fn gpu(argument: &str) {
         return;
     }
     if !argument.is_empty() {
-        sprintln!("  usage: gpu [boot | gsp [heap MiB] | unload | display | info | nvktest [ce|gr] [skip-pdes]]   (boot = FWSEC-FRTS; gsp = start GSP-RM; unload = stop GSP-RM and release WPR2; info/nvktest = NVK self-tests)");
+        sprintln!("  usage: gpu [boot | gsp [heap MiB] | unload [off] | display | info | nvktest [ce|gr] [skip-pdes] [token-rm|token-calc|token-dbcfg] | gametest [force|kernel] [-- script args]]   (boot = FWSEC-FRTS; gsp = start GSP-RM; unload = stop GSP-RM, release WPR2 and start it again; info/nvktest = NVK self-tests; gametest = the whole GPU game check into the log)");
         return;
     }
     let (chip, revision) = crate::display::nvidia::chip_of(card.boot0, card.boot42);

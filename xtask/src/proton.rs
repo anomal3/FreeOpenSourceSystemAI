@@ -755,6 +755,7 @@ $W "$@" 2>&1 | {
 "#);
     files.push((String::from("bin/fossai-proton"), script.as_bytes().to_vec(), 0o755));
     files.push((String::from("bin/proton-bench"), BENCH.as_bytes().to_vec(), 0o755));
+    files.push((String::from("bin/fossai-gametest"), GAMETEST.as_bytes().to_vec(), 0o755));
     // Новый 64-битный процесс (`wineboot`, программа из программы) ntdll GE
     // запускает загрузчиком `i386-unix/wine64`; 32-битной части Linux у нас
     // нет — переходник отдаёт запуск 64-битному загрузчику. Интерпретатор —
@@ -791,6 +792,72 @@ $W "$@" 2>&1 | {
     say!("proton: {} — {} файлов, {} МиБ", out.display(), files.len(), bytes / (1024 * 1024));
     Ok(())
 }
+
+/// `bin/fossai-gametest [vk|d3d|tmnf|all]` (20.11.2026): пользовательская
+/// часть `gpu gametest` — всё на NVK (видеокарта через GSP-RM), по ступени на
+/// строку `gametest: PASS|FAIL имя за N мс`, в конце `gametest: summary`.
+/// Ядро запускает её с выводом в канал и переписывает строки в свой журнал
+/// (на флешку). Руками: `run -b /opt/debian/bin/bash /opt/proton/bin/fossai-gametest`.
+const GAMETEST: &str = r#"#!/bin/bash
+exec 2>&1
+P=/opt/proton/bin/fossai-proton
+B=/opt/debian/bin/bash
+X=/opt/proton/share/fossai/d3dprobe.exe
+NVK="--env=FOSSAI_VULKAN=nvk"
+WHAT=${1:-all}
+pass=0; fail=0; names=
+now() { echo $(( ${EPOCHREALTIME/[.,]/} / 1000 )); }
+say() { echo "gametest: $*"; }
+# Предел времени: `timeout` coreutils Debian, если есть.
+T=; [ -x /opt/debian/bin/timeout ] && T="/opt/debian/bin/timeout -k 10"
+# step ИМЯ СЕКУНДЫ КОМАНДА... - вывод команды идёт как есть, затем PASS/FAIL.
+step() {
+    local name=$1 secs=$2; shift 2
+    local t=$(now) rc
+    say "run $name (limit ${secs} s)"
+    if [ -n "$T" ]; then $T $secs "$@"; else "$@"; fi
+    rc=$?
+    local ms=$(( $(now) - t ))
+    if [ $rc = 0 ]; then
+        pass=$((pass + 1)); say "PASS $name in $ms ms"
+    else
+        fail=$((fail + 1)); names="$names $name"
+        local why=; [ $rc = 124 ] && why=", time limit"
+        say "FAIL $name (exit $rc$why) after $ms ms"
+    fi
+    return $rc
+}
+say "start: $(date '+%F %T'), what=$WHAT, node $( [ -e /dev/dri/renderD128 ] && echo present || echo ABSENT)"
+if [ ! -e /dev/dri/renderD128 ]; then
+    say "FAIL no /dev/dri/renderD128 - run 'nvk hw on' (or 'gpu gametest') first"
+    say "summary: 0 passed, 1 failed (node)"
+    exit 1
+fi
+case $WHAT in all|vk)
+    # 1. Vulkan на NVK: устройство, отправка с забором, заливка и копия 1 МиБ.
+    step vkprobe 300 $B $P $NVK --run=vkprobe NVK
+    # 2. Что видит загрузчик (имя, драйвер, версии) - для журнала.
+    step vulkaninfo 120 $B $P $NVK --run=vulkaninfo --summary
+    # 3. vkcube: 600 кадров через zwp_linux_dmabuf_v1 (окно на столе).
+    t=$(now)
+    if step vkcube 180 $B $P $NVK --run=vkcube --wsi wayland --c 600; then
+        ms=$(( $(now) - t )); [ $ms -gt 0 ] && say "vkcube: 600 frames in $ms ms = $(( 600000 / ms )) fps (with start-up)"
+    fi ;;
+esac
+case $WHAT in all|d3d)
+    # 4. Direct3D 9 (как у TMNF) через DXVK на NVK: 20 с кадров, замер.
+    step d3d9-dxvk-nvk 600 $B $P $NVK --bench=20,d3dprobe9-dxvk-nvk --dxvk $X 9 20 ;;
+esac
+case $WHAT in all|tmnf)
+    # 5. TMNF через DXVK на NVK: замер 60 с (`bench:` - к/с), игра снимается.
+    if [ -x /opt/tmnf/bin/tmnf ] || [ -f /opt/tmnf/bin/tmnf ]; then
+        step tmnf-nvk 1800 $B /opt/tmnf/bin/tmnf --nvk --bench=60
+    else
+        say "tmnf: package not installed - skipped"
+    fi ;;
+esac
+say "summary: $pass passed, $fail failed${names:+ ($names )}"
+"#;
 
 /// `bin/proton-bench [СЕКУНДЫ] [all|cache|size|threads]` (P1/P2/P3, 18.11):
 /// матрица замеров одной командой — на стенде и на живой флешке Романа

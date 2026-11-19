@@ -32,6 +32,8 @@ mod bochs;
 pub mod intel;
 pub mod nvidia;
 pub mod nvidia_disp;
+// `gpu gametest` (20.11): утренняя проверка игры на видеокарте одной командой.
+pub mod nvidia_gametest;
 pub mod nvidia_gsp;
 // NVK поверх GSP-RM (18.11, WP-A): видеопамять, адресные пространства GPU,
 // golden context GR, каналы и бэкенд `nvgpu::GpuBackend` для слоя DRM.
