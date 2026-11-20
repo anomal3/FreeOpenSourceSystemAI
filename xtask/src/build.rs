@@ -175,7 +175,9 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
         // системы он не по карману — он едет только на установочный носитель.
         if !programs.is_empty() {
             for package in crate::package::build_samples(opts.arch, opts.release)? {
-                if crate::package::GAMES.contains(&package.file_name.as_str()) {
+                // Приложения Craft (десятки мегабайт) — тоже только носитель
+                // установки; на живую флешку они едут файлами ESP (image.rs).
+                if crate::package::GAMES.contains(&package.file_name.as_str()) || crate::craft::is_package_file(&package.file_name) {
                     continue;
                 }
                 extra.push((format!("media/{}", package.file_name), package.path));
@@ -337,12 +339,14 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 46] = [
+pub const USER_PROGRAMS: [&str; 53] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sockfd", "sshd",
     "cat", "sysupdate", "fetch", "memtest", "filemap", "posix", "winshow", "sysmon", "files",
     "taskmgr", "devmgr", "dotnet", "sftp-server", "big", "smash", "httpd", "threads", "drvd",
-    "notepad", "calc", "stuck", "bigfile", "phone",
+    "notepad", "calc", "stuck", "bigfile", "phone", "png2fimg",
+    // Системные инструменты (фаза П1/П2, 20.11).
+    "run", "charmap", "sysinfo", "eventlog", "services", "cleanmgr",
 ];
 
 /// Программы, которые в `/bin` **не** едут.
@@ -833,6 +837,9 @@ mod tests {
             .chain(crate::cbuild::C_PROGRAMS.iter().map(|program| program.name))
             .chain(crate::cbuild::FOREIGN_PROGRAMS)
             .chain([crate::cbuild::LINUX_VDSO])
+            // Проба std Rust: из трёх программ `ruststd::PROGRAMS` на носитель
+            // едет одна `rstd` (сценарий `rust-std` на установленной системе).
+            .chain(crate::ruststd::PROGRAMS.iter().copied().filter(|name| *name == "rstd"))
             .collect();
 
         let missing: Vec<&&str> = expected

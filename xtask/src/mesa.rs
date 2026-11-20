@@ -72,11 +72,19 @@ pub const PACKAGES: [(&str, &str); 52] = [
 const DIR: &str = "usr/lib/x86_64-linux-gnu/";
 
 /// Чего из этих пакетов не класть: X11 и GLX (Wine на Wayland рисует через
-/// EGL) и драйверы Vulkan видеокарт (нужен только lavapipe).
+/// EGL) и драйверы Vulkan видеокарт, кроме lavapipe и NVK (18.11.2026:
+/// `libvulkan_nouveau.so` поверх узла DRM nouveau ядра, nvk-spec.md; его
+/// зависимости — libdrm/zlib/zstd/xcb/wayland/expat/stdc++ — уже в PACKAGES).
 fn skipped(name: &str) -> bool {
     name.starts_with("libGLX")
         || name.starts_with("libGL.so")
-        || (name.starts_with("libvulkan_") && !name.starts_with("libvulkan_lvp"))
+        || (name.starts_with("libvulkan_") && !name.starts_with("libvulkan_lvp") && !name.starts_with("libvulkan_nouveau"))
+}
+
+/// Описатель ICD Vulkan (формат загрузчика 1.0.0, api_version — как у
+/// описателей Mesa 25.0.7 в mesa-vulkan-drivers).
+fn icd(library: &str) -> String {
+    format!("{{\"file_format_version\" : \"1.0.0\", \"ICD\" : {{ \"library_path\" : \"/opt/proton/lib/{library}\", \"api_version\" : \"1.4.305\" }}}}\n")
 }
 
 /// Пробы: из usr/bin пакетов в bin/ с загрузчиком своей glibc.
@@ -136,9 +144,27 @@ pub fn add(cache: &Path, files: &mut Vec<(String, Vec<u8>, u32)>, patch: fn(&mut
     // Вендор EGL (glvnd) - Mesa по имени библиотеки: она в LD_LIBRARY_PATH.
     let egl = "{\"file_format_version\" : \"1.0.0\", \"ICD\" : { \"library_path\" : \"libEGL_mesa.so.0\" }}\n";
     put(files, String::from("share/glvnd/egl_vendor.d/50_mesa.json"), egl.as_bytes().to_vec(), 0o644);
-    // Драйвер Vulkan - lavapipe.
-    let vk = "{\"file_format_version\" : \"1.0.0\", \"ICD\" : { \"library_path\" : \"/opt/proton/lib/libvulkan_lvp.so\", \"api_version\" : \"1.4.305\" }}\n";
-    put(files, String::from("share/vulkan/icd.d/lvp_icd.x86_64.json"), vk.as_bytes().to_vec(), 0o644);
+    // Драйверы Vulkan - lavapipe (всегда) и NVK (видеокарта NVIDIA через
+    // /dev/dri/renderD128; без узла NVK устройств не отдаёт). Какие из них
+    // видит загрузчик - решает fossai-proton (`VK_DRIVER_FILES`).
+    put(files, String::from("share/vulkan/icd.d/lvp_icd.x86_64.json"), icd("libvulkan_lvp.so").into_bytes(), 0o644);
+    if files.iter().any(|(path, _, _)| path == "lib/libvulkan_nouveau.so") {
+        put(files, String::from("share/vulkan/icd.d/nouveau_icd.x86_64.json"), icd("libvulkan_nouveau.so").into_bytes(), 0o644);
+    } else {
+        say!("mesa: в пакетах нет libvulkan_nouveau.so - NVK не будет");
+    }
+    // Проба Vulkan (веха M6 NVK): своя программа на glibc Debian, загрузчик -
+    // как у проб Mesa ниже. Без sysroot/clang пакет собирается и без неё.
+    match crate::debian::build_glibc_probe("vkprobe.c") {
+        Ok(mut data) => {
+            if patch(&mut data) {
+                put(files, String::from("bin/vkprobe"), data, 0o755);
+            } else {
+                say!("mesa: у vkprobe нет загрузчика Debian");
+            }
+        }
+        Err(e) => say!("mesa: vkprobe не собрался: {e:#}"),
+    }
     for name in PROGRAMS {
         // mesa-utils-bin кладёт их с суффиксом архитектуры.
         let found = follow(&mesa, &format!("usr/bin/{name}"), 0).or_else(|| follow(&mesa, &format!("usr/bin/{name}.x86_64-linux-gnu"), 0));

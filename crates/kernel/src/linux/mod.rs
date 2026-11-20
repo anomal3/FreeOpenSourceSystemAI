@@ -28,8 +28,8 @@ use core::mem::size_of;
 
 use user_abi::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, SYS_CLOCK, SYS_CLOSE, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_GETGID,
-    SYS_GETPID, SYS_GETUID, SYS_ISATTY, SYS_MPROTECT, SYS_MUNMAP, SYS_NANOSLEEP, SYS_RANDOM, SYS_READ, SYS_SEEK,
-    SYS_SET_TLS, SYS_WRITE, SYS_YIELD,
+    SYS_GETPID, SYS_GETUID, SYS_ISATTY, SYS_MUNMAP, SYS_NANOSLEEP, SYS_RANDOM, SYS_READ, SYS_SEEK,
+    SYS_WRITE, SYS_YIELD,
 };
 
 mod poll;
@@ -40,7 +40,10 @@ pub mod recent;
 mod net;
 mod netdev;
 mod netlink;
+// Узел DRM nouveau для Mesa NVK (18.11.2026, `nvk-spec.md`).
+pub mod drm;
 pub mod ntsync;
+pub mod perfdiag;
 mod process;
 pub mod profile;
 pub mod signal;
@@ -56,6 +59,7 @@ use crate::kprintln;
 use crate::mm::PageFlags;
 use crate::user::files::FdKind;
 use crate::user::space;
+use crate::user::Place;
 use crate::vfs::NodeKind;
 use crate::vfs::perm::Access;
 
@@ -207,6 +211,7 @@ mod nr {
     pub const MSYNC: usize = 26;
     pub const MREMAP: usize = 25;
     pub const SENDFILE: usize = 40;
+    pub const COPY_FILE_RANGE: usize = 326;
     pub const MINCORE: usize = 27;
     pub const FCHDIR: usize = 81;
     pub const INOTIFY_INIT: usize = 253;
@@ -347,6 +352,7 @@ pub unsafe fn syscall(frame: &mut crate::arch::TrapFrame) {
     }
     let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9].map(|value| value as usize);
     let started = crate::time::uptime_ns();
+    perfdiag::ensure_started();
     recent::begin(number, &args);
     // SAFETY: контракт функции.
     let result = unsafe { dispatch(number, args, frame) };
@@ -542,7 +548,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::FSTAT => fstat(a0, a1),
             nr::LSEEK => errno(native(SYS_SEEK, a0, a1, a2)),
             nr::MMAP => mmap(a0, a1, a2, a3, a4, args[5]),
-            nr::MPROTECT => errno(native(SYS_MPROTECT, a0, a1, a2)),
+            nr::MPROTECT => mprotect(a0, a1, a2),
             // Снять то, чего нет, у Linux не ошибка (12.11: Wine снимает
             // `KUSER_SHARED_DATA` на всякий случай и проверяет ответ).
             nr::MUNMAP => match errno(native(SYS_MUNMAP, a0, a1, 0)) {
@@ -588,6 +594,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::MADVISE => madvise(a0, a1, a2),
             nr::MREMAP => mremap(a0, a1, a2, a3),
             nr::SENDFILE => sendfile(a0, a1, a2, a3),
+            nr::COPY_FILE_RANGE => copy_file_range(a0, a1, a2, a3, a4, a5),
             nr::INOTIFY_INIT => ipc::inotify_init(0),
             nr::INOTIFY_INIT1 => ipc::inotify_init(a0),
             nr::INOTIFY_ADD_WATCH => ipc::inotify_add_watch(a0),
@@ -826,6 +833,10 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     // Объекты синхронизации Windows для Wine (16.11.2026); выключенное
     // устройство отсюда не открывается — и дальше по цепочке его нет.
     if let Some(answer) = ntsync::open(&linux, flags) {
+        return answer;
+    }
+    // `/dev/dri/renderD128` (NVK, 18.11.2026): есть, только пока стоит бэкенд.
+    if let Some(answer) = drm::open(&linux, flags) {
         return answer;
     }
     if let Some((node, writable)) = special::node(&linux) {
@@ -1071,6 +1082,10 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
     if ntsync::exists(&linux) {
         return put_stat(out, S_IFCHR, 0o666, 0, 0, 0, 0, ino_of(&linux));
     }
+    // Узел DRM: `st_rdev` = 226:128 — по нему libdrm узнаёт устройство.
+    if let Some(rdev) = drm::rdev(&linux) {
+        return put_stat(out, S_IFCHR, 0o666, 0, 0, 0, 0, rdev);
+    }
     if special::exists(&linux) {
         let kind = if linux.starts_with("/dev/") { S_IFCHR } else { S_IFREG };
         // Настоящие номера Linux у известных устройств (`makedev(1, 3)` …).
@@ -1115,6 +1130,8 @@ fn fstat(fd: usize, out: usize) -> i64 {
     // Объект слоя Linux (фаза 71e): сокет или «анонимный узел».
     if let Some(Some((object, _))) = crate::user::with_current(|program| program.files.object(fd)) {
         let ino = alloc::sync::Arc::as_ptr(&object) as *const () as usize as u64;
+        // Узел DRM — со своим `st_rdev` (`drmGetDevice2` libdrm).
+        let ino = drm::object_rdev(&*object).unwrap_or(ino);
         return put_stat(out, object.mode(), 0o600, 0, 0, 0, 0, ino);
     }
     // Стандартный поток — на каком бы номере он ни стоял (фаза 71d): канал
@@ -1333,6 +1350,10 @@ fn readlink(dir: usize, ptr: usize, buf: usize, size: usize) -> i64 {
     if let Some(answer) = links::read(&path, buf, size) {
         return answer;
     }
+    // Ссылки sysfs узла DRM (`…/device/subsystem` → `…/bus/pci`).
+    if let Some(answer) = drm::readlink(&path, buf, size) {
+        return answer;
+    }
     if path == "/proc/self/exe" {
         let exe = crate::user::with_current(|program| String::from(crate::linux_path::shown(&program.path)))
             .unwrap_or_default();
@@ -1534,7 +1555,7 @@ unsafe fn fcntl_lock(fd: usize, cmd: usize, arg: usize) -> i64 {
         if !wait {
             return -e::EAGAIN;
         }
-        if signal::pending() {
+        if signal::pending() || crate::user::kill_pending() {
             return -e::EINTR;
         }
         crate::io_events::wait(seen, Some(crate::time::uptime_ms() + 250));
@@ -1565,7 +1586,7 @@ fn flock(fd: usize, operation: usize) -> i64 {
             Some(Ok(Some(_))) if !wait => return -e::EWOULDBLOCK,
             Some(Ok(Some(_))) => {}
         }
-        if signal::pending() {
+        if signal::pending() || crate::user::kill_pending() {
             return -e::EINTR;
         }
         crate::io_events::wait(seen, Some(crate::time::uptime_ms() + 250));
@@ -1665,6 +1686,53 @@ unsafe fn writev(fd: usize, iov: usize, count: usize) -> i64 {
     total
 }
 
+/// Строки журнала об отказах `mprotect`/`mmap(MAP_FIXED)` — не больше стольких
+/// на систему: TrackMania и Chromium делают их тысячами, а отказ, ради которого
+/// журнал заведён, обычно один из первых.
+const VM_LOG_LIMIT: usize = 64;
+/// Отказы по диапазонам меньше этого не пишутся: «большой диапазон» — резерв
+/// кучи glibc (64 МиБ), стек потока (8 МиБ), куча Wine; страница-другая —
+/// обычные пробы Wine, которые и должны отказывать.
+const VM_LOG_MIN_BYTES: usize = 64 * 1024;
+
+/// Строка журнала об отказе работы с памятью (17.11.2026, разбор сбоя
+/// TrackMania: был ли отказ у `mprotect`, растящего кучу glibc).
+fn vm_log(line: core::fmt::Arguments<'_>) {
+    static SHOWN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if SHOWN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < VM_LOG_LIMIT {
+        kprintln!("  linux       : {} {line}", crate::sched::current());
+    }
+}
+
+/// Область программы по адресу — строкой для журнала.
+fn describe(addr: usize) -> String {
+    crate::user::with_current(|program| program.describe_range(addr, 1)).unwrap_or_default()
+}
+
+/// `mprotect`. Дыра в диапазоне — `ENOMEM`, как у Linux (17.11.2026; родной
+/// ответ «плохой адрес» переводился в `EFAULT`, которого Linux здесь не даёт
+/// никогда). Отказ по большому диапазону — в журнал.
+fn mprotect(addr: usize, len: usize, prot: usize) -> i64 {
+    // Число областей — под тем же замком, строка журнала — уже без него.
+    let result = crate::user::with_current_shared(|program, shared| {
+        let result = program.linux_mprotect(addr, len, prot, shared);
+        // Вид отказавшей памяти (P5) — строка собирается только при отказе.
+        let what = if result.is_err() && len >= VM_LOG_MIN_BYTES { program.describe_range(addr, len) } else { String::new() };
+        (result, program.region_count(), what)
+    });
+    if let Some((Err(err), regions, what)) = &result {
+        if len >= VM_LOG_MIN_BYTES {
+            vm_log(format_args!("mprotect {addr:#x}+{len:#x} prot {prot:#x} -> {err:?} (regions {regions}: {what})"));
+        }
+    }
+    match result.map(|(result, _, _)| result) {
+        Some(Ok(())) => 0,
+        Some(Err(crate::user::MmapError::Unmapped)) => -e::ENOMEM,
+        Some(Err(err)) => errno(crate::user::syscall::mmap_errno(err)),
+        None => -e::ESRCH,
+    }
+}
+
 /// `mmap`: безымянная память или кусок файла с любыми правами, кроме записи
 /// и исполнения сразу; `MAP_FIXED` — ровно по адресу (фаза 71b). Общая
 /// запись в файл (`MAP_SHARED` с `PROT_WRITE`) — отказ: в файл отображение не
@@ -1679,24 +1747,24 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
     const MAP_FIXED: usize = 0x10;
     const MAP_ANONYMOUS: usize = 0x20;
     const MAP_FIXED_NOREPLACE: usize = 0x10_0000;
-    let mut fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
     // Нижняя половина адресов — программам (ядро наверху, 31.10.2026):
     // `MAP_FIXED_NOREPLACE` на занятое — `EEXIST`, как у Linux; подсказка без
-    // `MAP_FIXED` в нижней области исполняется, если место свободно (Wine и Go
-    // просят адреса так).
+    // `MAP_FIXED` исполняется, если место свободно (Wine, Go и `new_heap`
+    // glibc просят адреса так). Свободно ли — решает `linux_mmap` под замком
+    // программы, в одном заходе с отображением (17.11.2026: проверка
+    // отдельным заходом пускала между ними чужой `mmap`, и подсказка
+    // становилась `MAP_FIXED` поверх него — см. [`crate::user::Place`]).
     let bytes = len.div_ceil(4096).saturating_mul(4096);
-    if flags & MAP_FIXED == 0 && addr != 0 && len != 0 {
-        let free = crate::user::with_current(|program| program.range_free(addr, bytes)).unwrap_or(false);
-        if flags & MAP_FIXED_NOREPLACE != 0 {
-            // Занято или не наше место — `EEXIST`, кроме адресов выше окна:
-            // там `ENOMEM` (ниже), как у Linux за концом пространства.
-            if !free && addr.checked_add(bytes).is_some_and(|end| end <= crate::user::WINDOW_BASE + (1 << 39)) {
-                return -e::EEXIST;
-            }
-        } else if free {
-            fixed = true;
-        }
-    }
+    let place = if flags & MAP_FIXED != 0 {
+        Place::Fixed
+    } else if flags & MAP_FIXED_NOREPLACE != 0 {
+        Place::NoReplace
+    } else if addr != 0 && len != 0 {
+        Place::Hint
+    } else {
+        Place::Anywhere
+    };
+    let fixed = matches!(place, Place::Fixed | Place::NoReplace);
     let shared_flag = flags & MAP_SHARED != 0;
     let mut shared = None;
     let file = if flags & MAP_ANONYMOUS != 0 {
@@ -1705,6 +1773,15 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
             shared = Some((crate::user::shm::SharedMem::new(len as u64), 0));
         }
         None
+    } else if let Some(found) = drm::mmap_object(fd, offset as u64, len) {
+        // Буфер DRM или dma-buf (NVK, 18.11.2026): кадры буфера.
+        match found {
+            Ok(mem) => {
+                shared = Some(mem);
+                None
+            }
+            Err(err) => return err,
+        }
     } else {
         let node = match crate::user::with_current(|program| program.files.node(fd)) {
             Some(Ok(node)) => node,
@@ -1799,7 +1876,18 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
     if fixed && addr.checked_add(bytes).is_none_or(|end| end > crate::user::WINDOW_BASE + (1 << 39)) {
         return -e::ENOMEM;
     }
-    match crate::user::with_current(|program| program.linux_mmap(addr, len, prot, fixed, file, shared)) {
+    let result = crate::user::with_current(|program| {
+        (program.linux_mmap(addr, len, prot, place, file, shared), program.region_count())
+    });
+    // `MAP_FIXED` по большому диапазону, которое не прошло, — в журнал
+    // (17.11.2026, разбор сбоя TrackMania): без этого не видно, кто и почему
+    // не получил своё место. Не больше [`VM_LOG_LIMIT`] строк.
+    if let Some((Err(err), regions)) = &result {
+        if place == Place::Fixed && bytes >= VM_LOG_MIN_BYTES {
+            vm_log(format_args!("mmap(MAP_FIXED) {addr:#x}+{bytes:#x} prot {prot:#x} -> {err:?} (regions {regions})"));
+        }
+    }
+    match result.map(|(result, _)| result) {
         Some(Ok(base)) => base as i64,
         Some(Err(err)) => errno(crate::user::syscall::mmap_errno(err)),
         None => -e::ESRCH,
@@ -1839,7 +1927,7 @@ fn mremap(old: usize, old_size: usize, new_size: usize, flags: usize) -> i64 {
         const PROT_READ: usize = 1;
         const PROT_WRITE: usize = 2;
         let prot = if writable { PROT_READ | PROT_WRITE } else { PROT_READ };
-        let mapped = crate::user::with_current(|program| program.linux_mmap(0, new_size, prot, false, None, Some((mem, offset))));
+        let mapped = crate::user::with_current(|program| program.linux_mmap(0, new_size, prot, Place::Anywhere, None, Some((mem, offset))));
         let new = match mapped {
             Some(Ok(base)) => base,
             Some(Err(err)) => return errno(crate::user::syscall::mmap_errno(err)),
@@ -1874,34 +1962,78 @@ fn mremap(old: usize, old_size: usize, new_size: usize, flags: usize) -> i64 {
 /// копирует так файлы профиля). Не файл с обеих сторон — `EINVAL`: так
 /// программа узнаёт, что пора копировать чтением и записью.
 fn sendfile(out: usize, input: usize, offset_ptr: usize, count: usize) -> i64 {
+    copy_range(input, offset_ptr, out, 0, count)
+}
+
+/// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)` (P10,
+/// 18.11.2026): копия куска файла ядром. Без него `cp` coreutils получал
+/// `ENOSYS` на каждом файле (1316 раз в журнале TrackMania — копия шаблона
+/// префикса Wine в 630 МиБ) и уходил на запасной путь чтением и записью
+/// через память программы. Флаги — только ноль; не файл с какой-либо
+/// стороны — `EINVAL` (запасной путь `cp` его понимает); один и тот же файл
+/// с перекрытием — `EINVAL`, как у Linux.
+fn copy_file_range(input: usize, in_ptr: usize, out: usize, out_ptr: usize, count: usize, flags: usize) -> i64 {
+    if !COPY_FILE_RANGE_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        return -e::ENOSYS;
+    }
+    if flags != 0 {
+        return -e::EINVAL;
+    }
+    copy_range(input, in_ptr, out, out_ptr, count)
+}
+
+/// `copy_file_range` включён (`lxcfr off` — прежний `ENOSYS`, для
+/// сравнения).
+pub static COPY_FILE_RANGE_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Скопировать до `count` байт из файла `input` в файл `out`. Смещения —
+/// указатели на `loff_t` программы (ноль — позиция файла, которая
+/// сдвигается). Ответ — сколько скопировано.
+fn copy_range(input: usize, in_ptr: usize, out: usize, out_ptr: usize, count: usize) -> i64 {
     const SEEK_SET: usize = 0;
     const SEEK_CUR: usize = 1;
+    /// Кусок копии: крупнее, чем у `read`, — копия идёт целиком в ядре.
+    const CHUNK: usize = 256 * 1024;
     let nodes = crate::user::with_current(|program| (program.files.node(input), program.files.node(out)));
     let (from, to) = match nodes {
         Some((Ok(from), Ok(to))) => (from, to),
         Some(_) => return -e::EINVAL,
         None => return -e::ESRCH,
     };
-    let start = if offset_ptr == 0 {
-        // SAFETY: контракт `syscall`.
-        let at = errno(unsafe { native(SYS_SEEK, input, 0, SEEK_CUR) });
-        if at < 0 {
-            return at;
-        }
-        at as u64
-    } else {
-        if !space::user_can(offset_ptr, 8, PageFlags::WRITE) {
-            return -e::EFAULT;
-        }
-        // SAFETY: проверено строкой выше.
-        unsafe { core::ptr::read_unaligned(offset_ptr as *const u64) }
-    };
-    // SAFETY: контракт `syscall`.
-    let out_at = errno(unsafe { native(SYS_SEEK, out, 0, SEEK_CUR) });
-    if out_at < 0 {
+    if from.metadata().kind != NodeKind::File || to.metadata().kind != NodeKind::File {
         return -e::EINVAL;
     }
-    let mut buf = alloc::vec![0u8; 64 * 1024];
+    // Смещение — из памяти программы или позиция дескриптора.
+    let offset = |fd: usize, ptr: usize| -> Result<u64, i64> {
+        if ptr == 0 {
+            // SAFETY: контракт `syscall`.
+            let at = errno(unsafe { native(SYS_SEEK, fd, 0, SEEK_CUR) });
+            return if at < 0 { Err(-e::EINVAL) } else { Ok(at as u64) };
+        }
+        if !space::user_can(ptr, 8, PageFlags::WRITE) {
+            return Err(-e::EFAULT);
+        }
+        // SAFETY: проверено строкой выше.
+        Ok(unsafe { core::ptr::read_unaligned(ptr as *const u64) })
+    };
+    let start = match offset(input, in_ptr) {
+        Ok(at) => at,
+        Err(err) => return err,
+    };
+    let out_at = match offset(out, out_ptr) {
+        Ok(at) => at,
+        Err(err) => return err,
+    };
+    // Тот же файл и куски перекрываются — у Linux `EINVAL`.
+    let same = core::ptr::addr_eq(alloc::sync::Arc::as_ptr(&from), alloc::sync::Arc::as_ptr(&to));
+    if same && start < out_at.saturating_add(count as u64) && out_at < start.saturating_add(count as u64) {
+        return -e::EINVAL;
+    }
+    let mut buf = Vec::new();
+    if buf.try_reserve_exact(CHUNK.min(count.max(1))).is_err() {
+        return -e::ENOMEM;
+    }
+    buf.resize(CHUNK.min(count.max(1)), 0u8);
     let mut done = 0usize;
     while done < count {
         let want = (count - done).min(buf.len());
@@ -1911,20 +2043,35 @@ fn sendfile(out: usize, input: usize, offset_ptr: usize, count: usize) -> i64 {
             Err(err) if done == 0 => return vfs_errno(err),
             Err(_) => break,
         };
-        match to.write_at(out_at as u64 + done as u64, &buf[..got]) {
-            Ok(_) => done += got,
+        match to.write_at(out_at + done as u64, &buf[..got]) {
+            Ok(0) => break,
+            Ok(wrote) => {
+                done += wrote;
+                if wrote < got {
+                    break;
+                }
+            }
             Err(err) if done == 0 => return vfs_errno(err),
             Err(_) => break,
         }
+        // Долгая копия не держит снятие процесса.
+        if crate::user::kill_pending() {
+            break;
+        }
     }
-    // SAFETY: контракт `syscall`.
-    unsafe { native(SYS_SEEK, out, out_at as usize + done, SEEK_SET) };
-    if offset_ptr == 0 {
+    if out_ptr == 0 {
+        // SAFETY: контракт `syscall`.
+        unsafe { native(SYS_SEEK, out, out_at as usize + done, SEEK_SET) };
+    } else {
+        // SAFETY: проверено в `offset`.
+        unsafe { core::ptr::write_unaligned(out_ptr as *mut u64, out_at + done as u64) };
+    }
+    if in_ptr == 0 {
         // SAFETY: контракт `syscall`.
         unsafe { native(SYS_SEEK, input, start as usize + done, SEEK_SET) };
     } else {
-        // SAFETY: проверено выше.
-        unsafe { core::ptr::write_unaligned(offset_ptr as *mut u64, start + done as u64) };
+        // SAFETY: проверено в `offset`.
+        unsafe { core::ptr::write_unaligned(in_ptr as *mut u64, start + done as u64) };
     }
     done as i64
 }
@@ -1951,6 +2098,10 @@ unsafe fn ioctl(fd: usize, request: usize, arg: usize) -> i64 {
     const FIONBIO: usize = 0x5421;
     // `/dev/ntsync` — первым: `WAIT_ANY` Wine — самый частый ioctl игры.
     if let Some(answer) = ntsync::ioctl(fd, request, arg) {
+        return answer;
+    }
+    // DRM nouveau, dma-buf, syncobj (NVK, 18.11.2026).
+    if let Some(answer) = drm::ioctl(fd, request, arg) {
         return answer;
     }
     // Звук ALSA (`/dev/snd`, шаг 7 Proton).
@@ -2103,7 +2254,20 @@ unsafe fn arch_prctl(code: usize, addr: usize) -> i64 {
     const ARCH_GET_GS: usize = 0x1004;
     match code {
         // SAFETY: контракт `syscall`.
-        ARCH_SET_FS => errno(unsafe { native(SYS_SET_TLS, addr, 0, 0) }),
+        // Как у Linux: только проверка диапазона, без замка планировщика
+        // (20.11, Wine без FSGSBASE — сотни тысяч вызовов в секунду).
+        ARCH_SET_FS => {
+            if addr >= 1 << 47 {
+                return -e::EPERM;
+            }
+            // `fsgsbase off` — и путь по-старому, под замком (A/B на стенде).
+            if crate::arch::fsgsbase_advertised(None) {
+                crate::sched::set_current_tls_fast(addr as u64);
+            } else {
+                crate::sched::set_current_tls(addr as u64);
+            }
+            0
+        }
         ARCH_GET_FS => {
             if !space::user_can(addr, 8, PageFlags::WRITE) {
                 return -e::EFAULT;
@@ -2119,7 +2283,11 @@ unsafe fn arch_prctl(code: usize, addr: usize) -> i64 {
             if addr >= 1 << 47 {
                 return -e::EPERM;
             }
-            crate::sched::set_current_gs(addr as u64);
+            if crate::arch::fsgsbase_advertised(None) {
+                crate::sched::set_current_gs_fast(addr as u64);
+            } else {
+                crate::sched::set_current_gs(addr as u64);
+            }
             0
         }
         ARCH_GET_GS => {
@@ -2174,7 +2342,7 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usi
                 let uptime = u128::from(crate::time::uptime_ns());
                 Some(if command == FUTEX_WAIT_BITSET {
                     if op & FUTEX_CLOCK_REALTIME != 0 {
-                        let now = u128::from(crate::time::now_unix().unwrap_or(0)) * 1_000_000_000 + uptime % 1_000_000_000;
+                        let now = u128::from(crate::time::realtime_ns().unwrap_or(0));
                         uptime + wanted.saturating_sub(now)
                     } else {
                         wanted
@@ -2183,11 +2351,13 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usi
                     uptime + wanted
                 })
             };
+            perfdiag::FUTEX_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             loop {
                 // Сигнал, пришедший, пока поток был вне ядра, доставляется на
                 // выходе из вызова — а ожидание без срока до выхода не дойдёт
                 // никогда (фаза 74: `SIGCHLD` .NET). Как у Linux — `EINTR`.
-                if signal::pending() {
+                // Снятие процесса (P4) — тоже: снимет его выход из вызова.
+                if signal::pending() || crate::user::kill_pending() {
                     return -e::EINTR;
                 }
                 let ms = match deadline {
@@ -2213,7 +2383,13 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usi
             }
         }
         // SAFETY: контракт `syscall`.
-        FUTEX_WAKE | FUTEX_WAKE_BITSET => errno(unsafe { native(SYS_FUTEX_WAKE, addr, value, 0) }),
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            // SAFETY: контракт `syscall`.
+            let woken = errno(unsafe { native(SYS_FUTEX_WAKE, addr, value, 0) });
+            perfdiag::FUTEX_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            perfdiag::FUTEX_WOKEN.fetch_add(woken.max(0) as u64, core::sync::atomic::Ordering::Relaxed);
+            woken
+        }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             if command == FUTEX_CMP_REQUEUE {
                 if !space::user_can(addr, 4, PageFlags::READ) {
@@ -2428,6 +2604,7 @@ unsafe fn futex_waitv(waiters: usize, count: usize, flags: usize, timeout: usize
         return -e::EINVAL;
     }
     if waiters == 0 || !space::user_can(waiters, count * 24, PageFlags::READ) {
+        vm_log(format_args!("futex_waitv: array {waiters:#x} is not readable: {}", describe(waiters)));
         return -e::EFAULT;
     }
     let mut entries = alloc::vec::Vec::new();
@@ -2462,14 +2639,18 @@ unsafe fn futex_waitv(waiters: usize, count: usize, flags: usize, timeout: usize
         let wanted = u128::from(seconds) * 1_000_000_000 + u128::from(nanos);
         let uptime = u128::from(crate::time::uptime_ns());
         Some(if clock == CLOCK_REALTIME {
-            let now = u128::from(crate::time::now_unix().unwrap_or(0)) * 1_000_000_000 + uptime % 1_000_000_000;
+            let now = u128::from(crate::time::realtime_ns().unwrap_or(0));
             uptime + wanted.saturating_sub(now)
         } else {
             wanted
         })
     };
+    perfdiag::FUTEXV_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     loop {
-        if signal::pending() {
+        // Снятие процесса будит поток «просто так» (`sched::wake`), и ответ
+        // `Other` вёл на новый виток сна: поток fsync Wine не выходил из
+        // вызова никогда, и снять зависшую игру было нельзя (P4, 18.11.2026).
+        if signal::pending() || crate::user::kill_pending() {
             return -e::EINTR;
         }
         let until = match deadline {
@@ -2486,7 +2667,11 @@ unsafe fn futex_waitv(waiters: usize, count: usize, flags: usize, timeout: usize
         match crate::user::syscall::futex_wait_many(&entries, until) {
             crate::user::syscall::FutexMany::Woken(index) => return index as i64,
             crate::user::syscall::FutexMany::Changed => return -e::EAGAIN,
-            crate::user::syscall::FutexMany::BadAddress => return -e::EFAULT,
+            crate::user::syscall::FutexMany::BadAddress => {
+                let first = entries.first().map_or(0, |entry| entry.0);
+                vm_log(format_args!("futex_waitv: word {first:#x} has no futex key: {}", describe(first)));
+                return -e::EFAULT;
+            }
             // Срок (проверит начало цикла), сигнал (тоже) или лишнее
             // пробуждение — заново.
             crate::user::syscall::FutexMany::Other => {}
@@ -2571,8 +2756,14 @@ fn membarrier(cmd: usize) -> i64 {
     const REGISTER_PRIVATE_EXPEDITED: usize = 16;
     match cmd {
         QUERY => (GLOBAL | PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED) as i64,
-        GLOBAL | PRIVATE_EXPEDITED => {
-            crate::arch::flush_user_translations();
+        // Глобальный — всем процессорам; частный — только тем, где сейчас
+        // идут потоки этого процесса (19.11: адресный сброс).
+        GLOBAL => {
+            crate::arch::flush_user_translations(None);
+            0
+        }
+        PRIVATE_EXPEDITED => {
+            crate::arch::flush_user_translations(crate::user::current_space_root());
             0
         }
         REGISTER_PRIVATE_EXPEDITED => 0,

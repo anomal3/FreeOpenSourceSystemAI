@@ -545,9 +545,9 @@ fn sqrt(value: f64) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
-    // Калькулятор — узкий и высокий, как в Windows, а не две трети экрана.
-    let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), info.screen_w.max(1), info.screen_h.max(1));
-    let width = (340 * scale).min(info.screen_w);
-    let height = (520 * scale).min(info.screen_h.saturating_sub(80 * scale)).max(360);
-    app::run(&SPEC, &info, (width, height), |_, _| Calc::new())
+    // Калькулятор — узкий и невысокий, как «Обычный» у Windows. До 20.11 он
+    // просил 340×520 сам и на экране 1280×720 занимал почти всю высоту
+    // (Роман: «полэкрана»); размер теперь — по общему правилу каркаса.
+    let size = app::window_size(&info, app::size::CALC);
+    app::run(&SPEC, &info, size, |_, _| Calc::new())
 }

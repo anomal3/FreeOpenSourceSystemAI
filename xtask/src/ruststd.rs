@@ -197,7 +197,7 @@ fn warn_stale_libfreeos(lib: &Path) {
 }
 
 /// Подготовить `build/rust-std/src/{library,libc}` и вернуть путь к `library`.
-fn prepare() -> Result<PathBuf> {
+pub fn prepare() -> Result<PathBuf> {
     let src = root().join("src");
     let library = src.join("library");
     let stamp = root().join("src.stamp");

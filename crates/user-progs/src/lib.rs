@@ -30,6 +30,8 @@ extern crate alloc;
 pub mod http;
 /// Каркас программы с окном: окно, цикл событий, тема (фаза С8).
 pub mod app;
+/// Окно «Открыть» / «Сохранить как»: системная сторона (20.11).
+pub mod filedlg;
 /// Стартовый код позиционно-независимой программы: перемещения до `_start`.
 mod start;
 
@@ -244,6 +246,30 @@ impl Window {
         let flags = if resizable { user_abi::WIN_STYLE_RESIZABLE as usize } else { 0 };
         // SAFETY: аргументы — числа.
         insist(|| unsafe { syscall(user_abi::SYS_WINSTYLE, self.id as usize, flags, 0) })
+    }
+
+    /// Сказать столу всё о виде окна разом ([`user_abi::SYS_WINSTYLE`]):
+    /// флаги `WIN_STYLE_*` (диалог, место у «Пуска»).
+    pub fn set_style(&self, flags: u32) -> i64 {
+        // SAFETY: аргументы — числа.
+        insist(|| unsafe { syscall(user_abi::SYS_WINSTYLE, self.id as usize, flags as usize, 0) })
+    }
+
+    /// Сменить имя окна ([`user_abi::SYS_WINTITLE`]): кнопка на панели задач
+    /// и миниатюра меняются вместе с ним. Имя длиннее
+    /// [`user_abi::MAX_TITLE`] байт обрезается по границе знака — ядро такое
+    /// отвергло бы целиком.
+    pub fn set_title(&self, title: &str) -> i64 {
+        let mut end = title.len().min(user_abi::MAX_TITLE);
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        let title = &title[..end];
+        if title.is_empty() {
+            return user_abi::ERR_LIMIT;
+        }
+        // SAFETY: строка живёт в памяти программы, длина — её собственная.
+        insist(|| unsafe { syscall(user_abi::SYS_WINTITLE, self.id as usize, title.as_ptr() as usize, title.len()) })
     }
 
     /// Сменить размер окна (фаза N7d). После успеха прежние пиксели

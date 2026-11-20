@@ -133,29 +133,7 @@ pub fn build(arch: Arch) -> Result<()> {
     fs::create_dir_all(&cache)?;
     let mut root: BTreeMap<String, Node> = BTreeMap::new();
     unpack(&cache, &PACKAGES, &mut root)?;
-
-    // Sysroot для сборки: корень плюс пакеты разработчика — на диск, ссылки
-    // копиями (lld читает `libc.so` — сценарий с абсолютными путями внутри
-    // sysroot).
-    let mut dev: BTreeMap<String, Node> = BTreeMap::new();
-    unpack(&cache, &PACKAGES, &mut dev)?;
-    unpack(&cache, &DEV_PACKAGES, &mut dev)?;
-    let sysroot = sdk::root().join("debian-sysroot");
-    let _ = fs::remove_dir_all(&sysroot);
-    for (path, node) in &dev {
-        let data = match node {
-            Node::Dir => continue,
-            Node::File { data, .. } => data,
-            Node::Link(_) => match follow(&dev, path, 0) {
-                Some((data, _)) => data,
-                None => continue,
-            },
-        };
-        let target = sysroot.join(path);
-        fs::create_dir_all(target.parent().unwrap())?;
-        fs::write(&target, data)?;
-    }
-    say!("debian: sysroot для сборки — {}", sysroot.display());
+    let sysroot = make_sysroot(&cache)?;
     for (source, place) in CHECKS {
         let program = build_check(&sysroot, source)?;
         root.insert(String::from(place), Node::File { data: fs::read(&program)?, mode: 0o755 });
@@ -172,6 +150,49 @@ pub fn build(arch: Arch) -> Result<()> {
     root.entry(String::from("bin/sh")).or_insert_with(|| Node::Link(String::from("bash")));
 
     pack(&root)
+}
+
+/// Sysroot для сборки: корень плюс пакеты разработчика — на диск, ссылки
+/// копиями (lld читает `libc.so` — сценарий с абсолютными путями внутри
+/// sysroot). Собирается заново.
+fn make_sysroot(cache: &std::path::Path) -> Result<PathBuf> {
+    let mut dev: BTreeMap<String, Node> = BTreeMap::new();
+    unpack(cache, &PACKAGES, &mut dev)?;
+    unpack(cache, &DEV_PACKAGES, &mut dev)?;
+    let sysroot = sdk::root().join("debian-sysroot");
+    let _ = fs::remove_dir_all(&sysroot);
+    for (path, node) in &dev {
+        let data = match node {
+            Node::Dir => continue,
+            Node::File { data, .. } => data,
+            Node::Link(_) => match follow(&dev, path, 0) {
+                Some((data, _)) => data,
+                None => continue,
+            },
+        };
+        let target = sysroot.join(path);
+        fs::create_dir_all(target.parent().unwrap())?;
+        fs::write(&target, data)?;
+    }
+    say!("debian: sysroot для сборки — {}", sysroot.display());
+    Ok(sysroot)
+}
+
+/// Собрать программу на glibc Debian 12 из `libc/linux/<source>` для чужого
+/// пакета (18.11.2026: `vkprobe` в пакете Proton, NVK). Sysroot берётся
+/// готовый, если `debian::build` его уже разложил, иначе раскладывается.
+/// Загрузчик в программе — `/lib64/ld-linux-x86-64.so.2`; пакет при желании
+/// переписывает его на свой.
+pub(crate) fn build_glibc_probe(source: &str) -> Result<Vec<u8>> {
+    let sysroot = sdk::root().join("debian-sysroot");
+    let sysroot = if sysroot.join("usr/lib/x86_64-linux-gnu/Scrt1.o").is_file() {
+        sysroot
+    } else {
+        let cache = sdk::root().join("thirdparty/debian");
+        fs::create_dir_all(&cache)?;
+        make_sysroot(&cache)?
+    };
+    Ok(fs::read(build_check(&sysroot, source)?)?)
 }
 
 /// Скачать (или взять из кеша) пакеты, сверить хеши и разложить в `root`.

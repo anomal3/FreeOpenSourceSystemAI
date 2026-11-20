@@ -601,6 +601,26 @@ pub enum MmapError {
     /// Отдельно от [`MmapError::BadRequest`]: просьба осмысленна, просто
     /// система такого не даёт, и программе полезно знать разницу.
     WriteExecute,
+    /// В диапазоне `mprotect` есть дыра — адреса, за которыми ничего нет.
+    /// Родной программе это тот же [`MmapError::BadRequest`]; Linux отвечает
+    /// на такое `ENOMEM`, и слой Linux отличает его (17.11.2026).
+    Unmapped,
+    /// `MAP_FIXED_NOREPLACE` на занятое место (`EEXIST` у Linux).
+    Exists,
+}
+
+/// Куда класть отображение программы Linux ([`Program::linux_mmap`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Place {
+    /// Куда угодно — ядро ищет место само.
+    Anywhere,
+    /// Подсказка без `MAP_FIXED`: по адресу, если место свободно, иначе куда
+    /// угодно. Занятое подсказка не снимает никогда (как у Linux).
+    Hint,
+    /// `MAP_FIXED`: ровно по адресу, сняв всё, что там лежало.
+    Fixed,
+    /// `MAP_FIXED_NOREPLACE`: ровно по адресу, но только на свободное.
+    NoReplace,
 }
 
 /// Сколько байт файла программы ядро читает при запуске.
@@ -855,6 +875,13 @@ pub struct Program {
     /// Номер родителя (`getppid`, фаза 71d): кто сделал `fork`; ноль —
     /// запущен системой.
     pub linux_ppid: u32,
+    /// Задание (P4, 18.11.2026): номер процесса, с которого начался запуск
+    /// из системы (меню, ярлык, `run`), — у всех его потомков один, и
+    /// `setsid`/`setpgid` его не меняют (как область `systemd` у Linux).
+    /// Ноль — задание этого процесса начинается с него самого. По нему
+    /// «Завершить» в «Программа не отвечает» снимает игру под Wine вместе с
+    /// `wineserver` и служебными процессами префикса.
+    pub linux_job: u32,
     /// Процесс снят сигналом (фаза 71d): `wait4` родителя узнаёт номер
     /// сигнала, а не код выхода.
     pub linux_signal: Option<u8>,
@@ -1085,12 +1112,23 @@ impl Program {
     /// частная копия программы, в файл не уходит (`MAP_PRIVATE`). Так `ld.so`
     /// раскладывает библиотеки: резервирует место под всю библиотеку первым
     /// `mmap`, кладёт сегменты поверх `MAP_FIXED` и `.bss` — безымянной памятью.
+    ///
+    /// Куда класть — [`Place`], и решается это здесь, под замком программы,
+    /// вместе с самим отображением (17.11.2026). Раньше «свободно ли место
+    /// под подсказку» спрашивалось отдельным заходом под замок, а
+    /// отображалось следующим, уже как `MAP_FIXED`, — и между ними другой
+    /// поток успевал положить туда своё: `clear_range` молча снимал это. Так
+    /// TrackMania под Proton теряла стек нового потока llvmpipe: главный поток
+    /// отобразил его и открыл на запись, поток-соседка в те же микросекунды
+    /// заводил кучу glibc с подсказкой `aligned_heap_area` в то же место —
+    /// куча легла поверх стека, и запись в `struct pthread` нового потока
+    /// (база + 8 МиБ + 0xd58) пришла в закрытый хвост кучи (SIGSEGV).
     pub(crate) fn linux_mmap(
         &mut self,
         addr: usize,
         len: usize,
         prot: usize,
-        fixed: bool,
+        place: Place,
         file: Option<(Arc<dyn Node>, u64)>,
         shared: Option<(Arc<shm::SharedMem>, u64)>,
     ) -> Result<usize, MmapError> {
@@ -1104,7 +1142,10 @@ impl Program {
         let jit = prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0;
         // Частное отображение файла «на запись и исполнение» — у программы
         // Linux с правом `jit` сразу RWX (12.11, секции PE под Wine).
-        let file_rwx = jit && self.rwx_code() && file.is_some() && shared.is_none();
+        // Разделяемая память — так же (P5, 18.11.2026: секция Wine без
+        // файла — `memfd` под `MAP_SHARED`).
+        let file_rwx =
+            jit && self.rwx_code() && (file.is_some() || (shared.is_some() && SHARED_RWX.load(Ordering::Relaxed)));
         if jit && !file_rwx && (!self.jit_allowed || file.is_some() || shared.is_some()) {
             return Err(MmapError::WriteExecute);
         }
@@ -1126,6 +1167,20 @@ impl Program {
         };
         let pages = len.div_ceil(PAGE_SIZE);
         let bytes = pages.checked_mul(PAGE_SIZE).ok_or(MmapError::BadRequest)?;
+        // Подсказка исполняется, только если место свободно, а «не заменяя»
+        // на занятое — отказ; оба вопроса — под тем же замком, что и
+        // отображение, иначе ответ устаревает раньше, чем им воспользуются.
+        let fixed = match place {
+            Place::Anywhere => false,
+            Place::Fixed => true,
+            Place::Hint => addr != 0 && self.range_free(addr, bytes),
+            Place::NoReplace => {
+                if !self.range_free(addr, bytes) {
+                    return Err(MmapError::Exists);
+                }
+                true
+            }
+        };
         let base = if fixed {
             // Только там, где программе вообще положена память: окно образа
             // и области памяти по запросу ([`owns`]).
@@ -1666,21 +1721,36 @@ impl Program {
             // с правом [`Rights::JIT`]: JIT Linux сам решает, где у него код, и
             // отдаёт память то в «запись и исполнение», то обратно.
             let code = matches!(region.source, Source::Anonymous(Anon { jit: true, .. }));
-            if region.base > covered || !self.divisible(region) || (code && !self.jit_allowed) {
+            // Дыра — свой ответ: Linux даёт на неё `ENOMEM` (см.
+            // [`MmapError::Unmapped`]), родной программе это всё тот же
+            // «плохой адрес».
+            if region.base > covered {
+                return Err(MmapError::Unmapped);
+            }
+            if !self.divisible(region) || (code && !self.jit_allowed) {
                 return Err(MmapError::BadRequest);
             }
             // Памятью кода становится только безымянная память — и сегмент
             // образа у программы Linux с правом `jit` (12.11: Wine делает
             // секции PE «на запись и исполнение» — упакованный установщик
             // Trackmania распаковывает себя поверх своего кода).
-            let image_rwx = self.rwx_code() && matches!(region.source, Source::Image(_));
+            //
+            // И разделяемая память (P5, 18.11.2026): в журнале TrackMania 64
+            // отказа `mprotect … prot 0x7` на 32-битных адресах — Wine делает
+            // RWX вид секции (`NtMapViewOfSection` с PAGE_EXECUTE_READWRITE),
+            // а секция без файла у него — `memfd`, отображённый `MAP_SHARED`.
+            // Переключения «по обращению» у программы с `rwx_code` нет —
+            // страницы сразу RWX у этого владельца, права второго не меняются.
+            let image_rwx = self.rwx_code()
+                && (matches!(region.source, Source::Image(_))
+                    || (matches!(region.source, Source::Shared(_)) && SHARED_RWX.load(Ordering::Relaxed)));
             if jit && !matches!(region.source, Source::Anonymous(_)) && !image_rwx {
                 return Err(MmapError::WriteExecute);
             }
             covered = region.end();
         }
         if covered < end {
-            return Err(MmapError::BadRequest);
+            return Err(MmapError::Unmapped);
         }
         if self.mappings.len() + self.cuts_needed(addr, end) > MAX_MAPPINGS {
             return Err(MmapError::Limit);
@@ -1720,6 +1790,9 @@ impl Program {
                     if flags.contains(PageFlags::USER) { flags } else { PageFlags::READ }
                 }
                 Source::Shared(memory) => {
+                    // «Запись и исполнение» — сразу RWX с пометкой JIT, как у
+                    // сегмента образа выше.
+                    let flags = if jit { RWX_CODE } else { flags };
                     memory.flags = flags;
                     if flags.contains(PageFlags::USER) { flags } else { PageFlags::READ }
                 }
@@ -1753,7 +1826,7 @@ impl Program {
             }
         }
         if shared {
-            arch::flush_user_translations();
+            arch::flush_user_translations(Some(self.space.root()));
         }
         // Отказ построителя здесь возможен только на исчерпании кадров под
         // промежуточные таблицы — а они у присутствующей страницы уже есть.
@@ -1764,6 +1837,40 @@ impl Program {
         }
         self.merge_around(addr, end);
         Ok(())
+    }
+
+    /// [`Program::mprotect`] для слоя Linux: тот переводит ответ сам
+    /// (дыра — `ENOMEM`) и пишет отказы в журнал.
+    pub(crate) fn linux_mprotect(&mut self, addr: usize, len: usize, prot: usize, shared: bool) -> Result<(), MmapError> {
+        self.mprotect(addr, len, prot, shared)
+    }
+
+    /// Сколько областей у программы — для журнала сбоев.
+    pub(crate) fn region_count(&self) -> usize {
+        self.mappings.len()
+    }
+
+    /// Задание процесса ([`Program::linux_job`]): его собственный номер,
+    /// если запуск начался с него.
+    #[must_use]
+    pub fn job(&self) -> u32 {
+        if self.linux_job != 0 { self.linux_job } else { self.linux_pid }
+    }
+
+    /// Области, задетые `[addr, addr + len)`, — строкой для журнала отказа
+    /// `mprotect` (P5): «WriteExecute» без вида области не говорил, какая
+    /// память его не приняла. Не больше трёх.
+    pub(crate) fn describe_range(&self, addr: usize, len: usize) -> alloc::string::String {
+        let end = addr.saturating_add(len);
+        let first = self.mappings.partition_point(|region| region.end() <= addr);
+        let mut text = alloc::string::String::new();
+        for region in self.mappings[first..].iter().take_while(|region| region.base < end).take(3) {
+            if !text.is_empty() {
+                text.push_str("; ");
+            }
+            text.push_str(&Self::region_line(region));
+        }
+        text
     }
 
     /// Снять область `index` целиком — просьба совпала с ней адрес в адрес и
@@ -2092,7 +2199,7 @@ impl Program {
         // SAFETY: страница принадлежит области этой программы.
         unsafe { self.space.unmap_range_keep(virt, 1) };
         if shared {
-            arch::flush_user_translations();
+            arch::flush_user_translations(Some(self.space.root()));
         }
         // SAFETY: адрес свободен (снят строкой выше), кадр наш.
         if unsafe { self.space.remap(virt, fresh, flags) }.is_err() {
@@ -2146,8 +2253,13 @@ impl Program {
     /// Вторая половина отказа в разделяемой памяти (фаза 71e): кадр — объекта,
     /// отображается чужим (без счёта своих страниц и без возврата при снятии).
     fn fault_commit_shared(&mut self, page_addr: usize, frame: PhysAddr, flags: PageFlags) -> Commit {
-        if self.region_at(page_addr).is_none() {
+        let Some(index) = self.region_at(page_addr) else {
             return Commit::Failed;
+        };
+        // Права области сменились, пока кадр брался у объекта (см.
+        // [`Program::fault_commit`]) — повтор составит план заново.
+        if !matches!(&self.mappings[index].source, Source::Shared(memory) if memory.flags == flags) {
+            return Commit::Raced;
         }
         if arch::translate(self.space.root(), VirtAddr::new(page_addr)).is_some() {
             return Commit::Raced;
@@ -2157,6 +2269,30 @@ impl Program {
         match unsafe { self.space.map_frames(VirtAddr::new(page_addr), frame, 1, flags) } {
             Ok(()) => Commit::Mapped,
             Err(_) => Commit::Failed,
+        }
+    }
+
+    /// Годится ли ещё план отказа [`Program::fault_plan`] для страницы `page`
+    /// области `index`: та же область по смыслу (безымянная, тот же файл с
+    /// того же места) и те же права.
+    ///
+    /// Сверяется ровно то, из чего план составлен, поэтому для неизменной
+    /// области ответ всегда «да» — повтор отказа не зациклится.
+    fn plan_holds(&self, index: usize, page: usize, plan: &FaultPlan) -> bool {
+        let same_node = |node: &Arc<dyn Node>| {
+            plan.node.as_ref().is_some_and(|ours| core::ptr::addr_eq(Arc::as_ptr(ours), Arc::as_ptr(node)))
+        };
+        let at = (page * PAGE_SIZE) as u64;
+        match &self.mappings[index].source {
+            // Память кода: права первой страницы зависят от обращения, а не
+            // только от области, — сверять нечего, кроме того, что это она.
+            Source::Anonymous(anon) if anon.jit => plan.node.is_none() && plan.shared.is_none(),
+            Source::Anonymous(anon) if anon.lazy => {
+                plan.node.is_none() && plan.shared.is_none() && plan.flags == anon.page_flags()
+            }
+            Source::Image(image) => same_node(&image.node) && plan.offset == image.offset + at && plan.flags == image.flags,
+            Source::File(file) => same_node(&file.node) && plan.offset == file.offset + at,
+            _ => false,
         }
     }
 
@@ -2179,6 +2315,16 @@ impl Program {
         if arch::translate(self.space.root(), VirtAddr::new(page_addr)).is_some() {
             return Commit::Raced;
         }
+        // План составлен под прежним заходом под замок, а между заходами
+        // другой поток мог сменить области: `mprotect` (в «никак» или только
+        // на чтение), `munmap` с новым `mmap` на том же месте, `MAP_FIXED`
+        // другого файла. Положить кадр со старыми правами значило бы открыть
+        // запись туда, где её уже нет, или показать содержимое не того файла
+        // (17.11.2026, разбор сбоя TrackMania). Устаревший план — не отказ:
+        // кадр возвращается, инструкция повторится и спросит заново.
+        if !self.plan_holds(index, page, plan) {
+            return Commit::Raced;
+        }
         // Страница, которую будут исполнять, наполнялась через кеш данных:
         // чтением с носителя (сегмент кода) или обнулением (память кода).
         // На AArch64 кеш инструкций этого не видит, пока кадр не вычищен, — и
@@ -2190,7 +2336,14 @@ impl Program {
         }
         // SAFETY: кадр наш, адрес лежит в области этой программы, и страницы
         // под ним сейчас нет — проверено строкой выше под тем же замком.
-        if unsafe { self.space.map(VirtAddr::new(page_addr), frame, plan.flags) }.is_err() {
+        if let Err(err) = unsafe { self.space.map(VirtAddr::new(page_addr), frame, plan.flags) } {
+            // Не должно быть никогда (страницы нет, область наша) — поэтому
+            // и в журнал, с ошибкой построителя: нет кадра под таблицу,
+            // крупная страница на пути или запись+исполнение без JIT.
+            static SHOWN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+            if SHOWN.fetch_add(1, Ordering::Relaxed) < 16 {
+                kprintln!("  user        : WARNING: fault at {page_addr:#x} could not map a page ({:?}): {err:?}", plan.flags);
+            }
             return Commit::Failed;
         }
 
@@ -2291,7 +2444,7 @@ impl Program {
                 return Flip::Refused;
             }
             if shared {
-                arch::flush_user_translations();
+                arch::flush_user_translations(Some(self.space.root()));
             }
             arch::sync_instructions(phys);
             self.jit.to_execute += 1;
@@ -2339,7 +2492,7 @@ impl Program {
             return Flip::Refused;
         }
         if shared {
-            arch::flush_user_translations();
+            arch::flush_user_translations(Some(self.space.root()));
         }
         if flags.contains(PageFlags::EXEC) {
             arch::sync_instructions(phys);
@@ -2589,6 +2742,14 @@ pub fn with_current<R>(f: impl FnOnce(&mut Program) -> R) -> Option<R> {
 /// Считаются ссылки на процесс: по одной у каждого потока в таблице
 /// программ и одна наша. Лишняя ссылка, которую держит кто-то мимоходом
 /// (диспетчер задач), даёт лишний сброс — это дорого, но не неверно.
+///
+/// Перепроверено 17.11.2026 (разбор сбоя TrackMania, где подозревался
+/// пропущенный сброс): планировщик пишет `CR3` на **каждом** переключении,
+/// PCID не включён, страницы программ не глобальные — значит, на процессоре,
+/// откуда однопоточный процесс ушёл, его трансляций не остаётся, и сбрасывать
+/// «на всякий случай» нечего. Счёт ссылок, прочитанный до замка, не может
+/// занизить число потоков: новый поток заводит только поток того же
+/// процесса, а единственный сейчас занят этим вызовом.
 #[track_caller]
 pub fn with_current_shared<R>(f: impl FnOnce(&mut Program, bool) -> R) -> Option<R> {
     let process = current_process()?;
@@ -2940,7 +3101,38 @@ fn package_rights(path: &str) -> Option<Rights> {
 /// бывает чужой файл (`start=` у Chromium — это `bash` корня Debian, пакета
 /// без прав). Файл не из пакета права не получает никогда.
 fn jit_of_path(path: &str) -> bool {
-    package_rights(path).is_some_and(|rights| rights.contains(Rights::JIT))
+    probe_jit_path(path) || package_rights(path).is_some_and(|rights| rights.contains(Rights::JIT))
+}
+
+/// Право `jit` проверочным программам Linux (`lxjit on`, консоль ядра):
+/// у `/compat/linux/bin` нет манифеста, а проба памяти «на запись и
+/// исполнение» без права проверяла бы только отказ (P5, 18.11.2026).
+static PROBE_JIT: AtomicBool = AtomicBool::new(false);
+
+/// RWX поверх разделяемой памяти (P5) — `lxshrwx on|off`.
+static SHARED_RWX: AtomicBool = AtomicBool::new(true);
+
+pub fn set_shared_rwx(on: bool) {
+    SHARED_RWX.store(on, Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn shared_rwx() -> bool {
+    SHARED_RWX.load(Ordering::Relaxed)
+}
+
+pub fn set_probe_jit(on: bool) {
+    PROBE_JIT.store(on, Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn probe_jit() -> bool {
+    PROBE_JIT.load(Ordering::Relaxed)
+}
+
+/// Файл проверочной программы Linux при включённом `lxjit`.
+fn probe_jit_path(path: &str) -> bool {
+    PROBE_JIT.load(Ordering::Relaxed) && path.starts_with("/compat/linux/bin/") && !path[18..].contains('/')
 }
 
 /// Что разрешено программе, исполняющейся сейчас.
@@ -3221,7 +3413,8 @@ fn place_linux_args(
         (AT_CLKTCK, 100),
         (AT_SECURE, 0),
         (AT_RANDOM, random_at),
-        (AT_HWCAP2, 0),
+        // Бит 1 — HWCAP2_FSGSBASE (20.11): Wine меняет базы FS/GS сам.
+        (AT_HWCAP2, crate::arch::hwcap2()),
         (AT_EXECFN, execfn),
         // vDSO (01.11.2026): нет — ключ с нулём, glibc его так и понимает.
         (AT_SYSINFO_EHDR, start.vdso),
@@ -3910,6 +4103,7 @@ fn run(
             linux_cwd: alloc::string::String::from("/"),
             linux_pid: sched::current().as_u32(),
             linux_ppid: 0,
+            linux_job: 0,
             linux_signal: None,
             linux_dirs: Vec::new(),
             linux_actions: [LinuxAction::default(); 65],
@@ -4248,6 +4442,12 @@ pub fn futex_key(addr: usize) -> Option<usize> {
     if addr % 4 != 0 {
         return None;
     }
+    // Слово на странице, ещё не тронутой или разделённой `fork` (копия при
+    // записи, только чтение): у Linux ожидание её доводит само, а здесь
+    // ответом был `EFAULT` — и поток `futex_waitv` ребёнка после `fork`
+    // крутился на нём без сна (18.11.2026, проба `hangprobe`). Довести как
+    // запись из программы.
+    prepare_write(addr, 4);
     if !space::user_can(addr, 4, PageFlags::READ | PageFlags::WRITE | PageFlags::USER) {
         return None;
     }
@@ -4589,7 +4789,7 @@ impl Program {
         // Страницы родителя стали только на чтение — его потоки на других
         // процессорах не должны писать по старым трансляциям.
         if downgraded {
-            arch::flush_user_translations();
+            arch::flush_user_translations(Some(self.space.root()));
         }
         Ok(Self {
             space,
@@ -4612,6 +4812,7 @@ impl Program {
             linux_cwd: self.linux_cwd.clone(),
             linux_pid: 0,
             linux_ppid: self.linux_pid,
+            linux_job: self.job(),
             linux_signal: None,
             linux_dirs: self.linux_dirs.clone(),
             linux_actions: self.linux_actions,
@@ -4794,7 +4995,7 @@ pub fn exec(frame: &mut arch::TrapFrame, path: &str, args: &[&str], env: &[&str]
     // своему манифесту, как раньше.
     let jit_allowed = match package_rights(path) {
         Some(rights) => rights.contains(Rights::JIT),
-        None => process.lock().jit_allowed,
+        None => probe_jit_path(path) || process.lock().jit_allowed,
     };
 
     // Дальше пути назад нет — но сначала остальные потоки: их задачи стоят
@@ -4936,21 +5137,92 @@ impl Program {
         }
     }
 
-    /// Что за область по адресу `addr` (журнал сбоев, фаза 71j).
+    /// Что за область по адресу `addr` (журнал сбоев, фаза 71j): вид, границы,
+    /// права и ленивость области, есть ли страница, и соседи с их правами
+    /// (17.11.2026: строка «anonymous X..Y, page None» не отвечала, закрыта
+    /// ли область программой или ядро не смогло её дать).
     pub fn describe_region(&self, addr: usize) -> alloc::string::String {
-        let Some(region) = self.mappings.iter().find(|region| region.base <= addr && addr < region.end()) else {
-            return alloc::string::String::from("no region");
+        use core::fmt::Write;
+        let index = self.mappings.partition_point(|region| region.end() <= addr);
+        let inside = self.mappings.get(index).is_some_and(|region| region.base <= addr);
+        let mut out = alloc::string::String::new();
+        if inside {
+            let region = &self.mappings[index];
+            let present =
+                arch::translate(self.space.root(), VirtAddr::new(addr & !(PAGE_SIZE - 1))).map(|(_, flags)| flags);
+            let _ = write!(out, "{}, page {present:?}", Self::region_line(region));
+        } else {
+            out.push_str("no region");
+        }
+        // Соседи: слева — последняя область до адреса, справа — первая после
+        // той, в которую он попал (или после дыры).
+        if let Some(prev) = index.checked_sub(1).and_then(|at| self.mappings.get(at)) {
+            let _ = write!(out, "; prev {}", Self::region_line(prev));
+        }
+        if let Some(next) = self.mappings.get(if inside { index + 1 } else { index }) {
+            let _ = write!(out, "; next {}", Self::region_line(next));
+        }
+        out
+    }
+
+    /// Одна область для журнала: вид, границы, права `rwx` (`-` — нет,
+    /// `k` — страница только ядру, то есть `PROT_NONE`) и пометки.
+    fn region_line(region: &Mapping) -> alloc::string::String {
+        let rights = |flags: PageFlags| {
+            let user = flags.contains(PageFlags::USER);
+            let mut text = alloc::string::String::new();
+            text.push(if user { 'r' } else { '-' });
+            text.push(if user && flags.contains(PageFlags::WRITE) { 'w' } else { '-' });
+            text.push(if user && flags.contains(PageFlags::EXEC) { 'x' } else { '-' });
+            text
         };
-        let kind = match &region.source {
-            Source::Anonymous(_) => "anonymous",
-            Source::ThreadStack => "thread stack",
-            Source::Image(_) => "file (private)",
-            Source::Shared(_) => "shared",
-            Source::File(_) => "file",
-            _ => "other",
+        let (kind, prot, notes) = match &region.source {
+            Source::Anonymous(anon) => (
+                "anonymous",
+                rights(anon.flags),
+                alloc::format!("{}{}", if anon.lazy { " lazy" } else { " eager" }, if anon.jit { " jit" } else { "" }),
+            ),
+            Source::ThreadStack => ("thread stack", alloc::string::String::from("rw-"), alloc::string::String::new()),
+            Source::Image(image) => (
+                "file (private)",
+                rights(image.flags),
+                alloc::format!(" off {:#x}{}", image.offset, if image.pinned { " pinned" } else { "" }),
+            ),
+            Source::Shared(shared) => ("shared", rights(shared.flags), alloc::string::String::new()),
+            Source::File(file) => ("file", alloc::string::String::from("r--"), alloc::format!(" off {:#x}", file.offset)),
+            _ => ("other", alloc::string::String::from("???"), alloc::string::String::new()),
         };
-        let present = arch::translate(self.space.root(), VirtAddr::new(addr & !(PAGE_SIZE - 1))).map(|(_, flags)| flags);
-        alloc::format!("{kind} {:#x}..{:#x}, page {present:?}", region.base, region.end())
+        let blocks = if region.blocks > 0 { alloc::format!(" blocks {}", region.blocks) } else { alloc::string::String::new() };
+        alloc::format!("{kind} {:#x}..{:#x} {prot}{notes}{blocks}", region.base, region.end())
+    }
+
+    /// Почему план отказа не составился ([`Program::fault_plan`] вернул
+    /// `None`) — тот же разбор, но с причиной, для журнала (17.11.2026).
+    fn refusal(&self, page_addr: usize, access: Touch) -> FaultWhy {
+        let Some(index) = self.region_at(page_addr) else {
+            return FaultWhy::NoRegion;
+        };
+        let write = access == Touch::Write;
+        let rights = |flags: PageFlags| {
+            if !flags.contains(PageFlags::USER) {
+                FaultWhy::ProtNone
+            } else if write && !flags.contains(PageFlags::WRITE) {
+                FaultWhy::ReadOnly
+            } else if access == Touch::Execute && !flags.contains(PageFlags::EXEC) {
+                FaultWhy::NoExec
+            } else {
+                FaultWhy::Other
+            }
+        };
+        match &self.mappings[index].source {
+            Source::Anonymous(anon) if anon.lazy => rights(anon.flags),
+            Source::Image(image) => rights(image.flags),
+            Source::Shared(memory) => rights(memory.flags),
+            Source::File(_) if write => FaultWhy::ReadOnly,
+            Source::Anonymous(_) => FaultWhy::Eager,
+            Source::ThreadStack => FaultWhy::Guard,
+            _ => FaultWhy::Other,
+        }
     }
 
     pub fn linux_maps(&self) -> alloc::string::String {
@@ -5477,6 +5749,32 @@ pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
     done
 }
 
+/// Отказ страницы **ядра** по адресу программы (20.11.2026, сбой TrackMania:
+/// ядро проверило массив `poll`, соседний поток сделал `fork`, и запись ядра
+/// пришла в разделённую страницу «только на чтение»). Разбирается тем же
+/// [`fault_in`], что отказ самой программы, — копия при записи, подкачка,
+/// ленивая страница, — если разбору не нужен лок, который задача уже держит:
+/// таблица программ или замок своего процесса (под ним ядро, например,
+/// копирует прочитанное из файла; второй захват был бы сном навсегда).
+/// `Err` — почему не разобран (для журнала).
+pub fn kernel_fault_in(addr: usize, access: Touch, present: bool) -> Result<(), &'static str> {
+    if PROGRAMS.held_by_current() {
+        return Err("the program table lock is held by this task");
+    }
+    let Some(process) = current_process() else {
+        return Err("no program");
+    };
+    if process.held_by_current() {
+        return Err("the process lock is held by this task");
+    }
+    drop(process);
+    if fault_in(addr, access, present) {
+        Ok(())
+    } else {
+        Err(last_fault_why().name())
+    }
+}
+
 /// Вид последнего отказа «страницы не было» у потока слота — для `lxstat`:
 /// 503 общая память, 504 из кэша страниц, 505 пустая (без файла), 506 чтение
 /// файла; 500 — не дошёл до решения.
@@ -5487,8 +5785,110 @@ fn note_fault_kind(kind: u16) {
     FAULT_KIND[sched::current_slot()].store(kind, Ordering::Relaxed);
 }
 
+/// Почему последний отказ потока не разрешился (17.11.2026) — для строки
+/// журнала о SIGSEGV: «права области не пускают» и «ядро не смогло дать
+/// страницу» снаружи выглядят одинаково.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FaultWhy {
+    /// Отказ разрешился (или до решения не дошёл).
+    Resolved = 0,
+    /// По адресу нет области.
+    NoRegion,
+    /// Область закрыта (`PROT_NONE`).
+    ProtNone,
+    /// Запись в область только на чтение.
+    ReadOnly,
+    /// Исполнение в области без права исполнения.
+    NoExec,
+    /// Нет страницы в жадной области — таблицы разошлись с записью.
+    Eager,
+    /// Сторожевая страница стека потока.
+    Guard,
+    /// Кадров нет — и кэш страниц отдать нечего.
+    NoFrame,
+    /// Чтение файла не удалось.
+    ReadError,
+    /// Построитель таблиц отказал отобразить кадр.
+    MapFailed,
+    /// Страница есть, а права не пускают (не копирование при записи, не
+    /// память кода).
+    PresentDenied,
+    /// Иное — разбор не узнал случай.
+    Other,
+}
+
+impl FaultWhy {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::NoRegion,
+            2 => Self::ProtNone,
+            3 => Self::ReadOnly,
+            4 => Self::NoExec,
+            5 => Self::Eager,
+            6 => Self::Guard,
+            7 => Self::NoFrame,
+            8 => Self::ReadError,
+            9 => Self::MapFailed,
+            10 => Self::PresentDenied,
+            11 => Self::Other,
+            _ => Self::Resolved,
+        }
+    }
+
+    /// Имя для журнала.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::NoRegion => "no region",
+            Self::ProtNone => "prot none",
+            Self::ReadOnly => "read-only",
+            Self::NoExec => "no exec",
+            Self::Eager => "eager region lost a page",
+            Self::Guard => "stack guard",
+            Self::NoFrame => "no frame",
+            Self::ReadError => "read error",
+            Self::MapFailed => "map failed",
+            Self::PresentDenied => "present, denied",
+            Self::Other => "other",
+        }
+    }
+}
+
+static FAULT_WHY: [core::sync::atomic::AtomicU8; sched::MAX_TASKS] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; sched::MAX_TASKS];
+
+fn note_why(why: FaultWhy) {
+    FAULT_WHY[sched::current_slot()].store(why as u8, Ordering::Relaxed);
+}
+
+/// Причина последнего неразрешённого отказа текущего потока.
+#[must_use]
+pub fn last_fault_why() -> FaultWhy {
+    FaultWhy::from_u8(FAULT_WHY[sched::current_slot()].load(Ordering::Relaxed))
+}
+
+/// Строка журнала о неразрешённом отказе текущей программы: область и соседи
+/// ([`Program::describe_region`]), причина ([`last_fault_why`]), свободные
+/// кадры, число областей и ссылок на процесс (≈ потоки + 1).
+#[must_use]
+pub fn describe_fault(addr: usize) -> alloc::string::String {
+    let Some(process) = current_process() else {
+        return alloc::string::String::from("no program");
+    };
+    let refs = Arc::strong_count(&process).saturating_sub(1);
+    let (what, regions) = {
+        let program = process.lock();
+        (program.describe_region(addr), program.mappings.len())
+    };
+    let free = crate::mm::frame::stats().free;
+    alloc::format!("{what}; why {}; free frames {free}, regions {regions}, process refs {refs}", last_fault_why().name())
+}
+
 fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
     let page_addr = addr & !(PAGE_SIZE - 1);
+    note_why(FaultWhy::Resolved);
     // Страница на месте, а обращение не прошло — это нарушение прав, и
     // подкачка тут ни при чём. Кроме памяти кода (фаза 59): у неё «не те
     // права» — обычное состояние, и отказ означает «переключи».
@@ -5509,24 +5909,41 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
                 sched::sleep_ms(JIT_WAIT_MS);
                 true
             }
-            Some(Flip::Refused) | None => false,
+            Some(Flip::Refused) | None => {
+                note_why(FaultWhy::PresentDenied);
+                false
+            }
         };
     }
 
-    // Шаг первый, под замком: что читать.
-    let Some(plan) = with_current(|program| program.fault_plan(page_addr, access)).flatten() else {
-        return false;
+    // Шаг первый, под замком: что читать. Нет плана — причина в журнал
+    // отказа (тем же заходом под замок, пока область та же).
+    let plan = match with_current(|program| program.fault_plan(page_addr, access).ok_or_else(|| program.refusal(page_addr, access))) {
+        Some(Ok(plan)) => plan,
+        Some(Err(why)) => {
+            note_why(why);
+            return false;
+        }
+        None => {
+            note_why(FaultWhy::NoRegion);
+            return false;
+        }
     };
     if let Some((memory, page)) = &plan.shared {
         note_fault_kind(503);
         let Some(frame) = memory.frame(*page) else {
+            note_why(FaultWhy::NoFrame);
             return false;
         };
         let flags = plan.flags;
-        return !matches!(
+        let failed = matches!(
             with_current(|program| program.fault_commit_shared(page_addr, frame, flags)),
             None | Some(Commit::Failed)
         );
+        if failed {
+            note_why(FaultWhy::MapFailed);
+        }
+        return !failed;
     }
 
     // Шаг второй, без замка: кадр и чтение. Замок пула отпускается до чтения:
@@ -5564,6 +5981,9 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
                 if !matches!(commit, Commit::Mapped) {
                     return_frame(frame);
                 }
+                if matches!(commit, Commit::Failed) {
+                    note_why(FaultWhy::MapFailed);
+                }
                 return !matches!(commit, Commit::Failed);
             }
         }
@@ -5577,6 +5997,9 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
                 // Снимаем своего владельца; кадр остаётся кэшу.
                 return_frame(frame);
             }
+            if matches!(commit, Commit::Failed) {
+                note_why(FaultWhy::MapFailed);
+            }
             return !matches!(commit, Commit::Failed);
         }
     }
@@ -5586,9 +6009,15 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
         // только он.
         None if crate::mm::pagecache::shrink(256) > 0 => match take_frame_reserved() {
             Some(frame) => frame,
-            None => return false,
+            None => {
+                note_why(FaultWhy::NoFrame);
+                return false;
+            }
         },
-        None => return false,
+        None => {
+            note_why(FaultWhy::NoFrame);
+            return false;
+        }
     };
     // SAFETY: кадр только что выдан аллокатором, принадлежит нам одним и
     // виден через прямое отображение. Читаем в него **мимо** адресов
@@ -5608,6 +6037,7 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
                 Some(read) => read,
                 None => {
                     return_frame(frame);
+                    note_why(FaultWhy::ReadError);
                     return false;
                 }
             }
@@ -5616,6 +6046,7 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
             Ok(read) => read,
             Err(_) => {
                 return_frame(frame);
+                note_why(FaultWhy::ReadError);
                 return false;
             }
         },
@@ -5650,6 +6081,7 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
         }
         Commit::Failed => {
             return_frame(frame);
+            note_why(FaultWhy::MapFailed);
             false
         }
     }
@@ -5781,6 +6213,96 @@ pub fn request_kill(id: sched::TaskId) -> Result<(), KillError> {
         }
         None => Err(KillError::NotAProgram),
     }
+}
+
+/// Снять программу задачи `id` вместе с её группой (P4, 18.11.2026):
+/// «Завершить» в «Программа не отвечает».
+///
+/// Окно игры под Wine принадлежит одному процессу, но игра — это ещё
+/// `wineserver`, `explorer.exe`, `services.exe`, `winedevice.exe`: снять
+/// только окно значило оставить их (в журнале 9c пришлось снимать три
+/// задачи из Диспетчера, и у главной оставалось 86 потоков). Группа — все
+/// процессы Linux того же задания ([`Program::linux_job`]), кроме предков
+/// окна, которые не Wine: скрипт запуска (`tmnf`) или `bash` терминала,
+/// из которого игру запустили, живут дальше — первый закончится сам, когда
+/// закончится Wine. Каждый процесс получает просьбу о снятии, и будятся все
+/// его потоки — спящий без срока иначе не дошёл бы до выхода.
+///
+/// Программа не Linux — как [`request_kill`]. Ответ — сколько процессов
+/// получили просьбу.
+pub fn end_program_group(id: sched::TaskId) -> Result<usize, KillError> {
+    if sched::is_idle(id) {
+        return Err(KillError::NotAProgram);
+    }
+    let (slot, _) = sched::lookup(id).ok_or(KillError::NoSuchTask)?;
+    let process_of = |slot: usize| PROGRAMS.lock().get(slot).and_then(Option::as_ref).cloned();
+    let target = process_of(slot).ok_or(KillError::NotAProgram)?;
+    let (linux, job, mut parent) = {
+        let program = target.lock();
+        (program.linux, program.job(), program.linux_ppid)
+    };
+    if !linux {
+        request_kill(id)?;
+        return Ok(1);
+    }
+    // Предки окна: номер процесса и путь программы.
+    let mut ancestors: Vec<u32> = Vec::new();
+    for _ in 0..32 {
+        if parent == 0 || ancestors.contains(&parent) {
+            break;
+        }
+        ancestors.push(parent);
+        let Some((pslot, _)) = sched::lookup(sched::TaskId::new(parent)) else {
+            break;
+        };
+        parent = match process_of(pslot) {
+            Some(process) => process.lock().linux_ppid,
+            None => break,
+        };
+    }
+    // Процессы задания — по одному на `Arc`, со всеми слотами потоков.
+    let table: Vec<(usize, Arc<Mutex<Program>>)> = {
+        let table = PROGRAMS.lock();
+        table.iter().enumerate().filter_map(|(slot, entry)| entry.as_ref().map(|p| (slot, Arc::clone(p)))).collect()
+    };
+    let mut groups: Vec<(Arc<Mutex<Program>>, Vec<usize>)> = Vec::new();
+    for (slot, process) in table {
+        match groups.iter_mut().find(|(known, _)| Arc::ptr_eq(known, &process)) {
+            Some((_, slots)) => slots.push(slot),
+            None => groups.push((process, alloc::vec![slot])),
+        }
+    }
+    let mut ended = 0usize;
+    let mut names = alloc::string::String::new();
+    for (process, slots) in groups {
+        let chosen = {
+            let mut program = process.lock();
+            let same_job = program.linux && program.job() == job;
+            // Предок, который не Wine (скрипт, оболочка), остаётся.
+            let keep = ancestors.contains(&program.linux_pid) && !program.path.contains("wine");
+            if Arc::ptr_eq(&process, &target) || (same_job && !keep) {
+                program.kill_requested = true;
+                if names.len() < 400 {
+                    let short = program.path.rsplit('/').next().unwrap_or("");
+                    let _ = core::fmt::Write::write_fmt(&mut names, format_args!(" #{} {short}", program.linux_pid));
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if chosen {
+            ended += 1;
+            for slot in slots {
+                if let Some(task) = sched::id_of_slot(slot) {
+                    sched::wake(task);
+                }
+            }
+        }
+    }
+    sched::wake_input();
+    kprintln!("  user        : ending job #{job} of {id}: {ended} process(es):{names}");
+    Ok(ended)
 }
 
 /// Снять остальные потоки процесса, чей главный поток в слоте `slot` только
@@ -5927,7 +6449,7 @@ fn release_region(space: &mut Space, region: &Mapping, shared: bool) -> usize {
         // держит эта же запись; в пул они не уходят.
         let removed = unsafe { space.unmap_range_keep(VirtAddr::new(region.base), region.pages) };
         if shared && removed > 0 {
-            arch::flush_user_translations();
+            arch::flush_user_translations(Some(space.root()));
         }
         return removed;
     }

@@ -159,6 +159,14 @@ pub fn offer(device: &Shared, first_lba: u64) {
             }
         }
     }
+    // Режим экрана для загрузчика (17.11): `\FREEOS\DISPLAY.CFG` лежит на
+    // загрузочном разделе флешки заранее нужного размера — загрузчик читает
+    // его до ядра, а ядро переписывает на месте, как журнал.
+    if DISPLAY.lock().is_none() {
+        if let Some((runs, size)) = file_runs(&fat, &mut device, dir, b"DISPLAY CFG") {
+            *DISPLAY.lock() = Some(Target { device: device.clone(), runs, size, flushed: 0, fresh: false, failures: 0 });
+        }
+    }
     if TARGET.lock().is_some() {
         return;
     }
@@ -192,6 +200,21 @@ fn file_runs(fat: &Fat, device: &mut Shared, dir: u32, name: &[u8; 11]) -> Optio
         cluster = next;
     }
     Some((runs, (covered.min(wanted) as usize * SECTOR).min(size as usize)))
+}
+
+/// Файл режима экрана для загрузчика на флешке, если он есть.
+static DISPLAY: SpinLock<Option<Target>> = SpinLock::new(None);
+
+/// Записать режим экрана для загрузчика на живую флешку (`WxH`). `false` —
+/// файла нет или запись не удалась.
+pub fn store_display(width: u32, height: u32) -> bool {
+    let Some(mut target) = DISPLAY.lock().take() else { return false };
+    let text = alloc::format!("{width}x{height}\n");
+    let size = target.size;
+    let ok = target.write_range(text.as_bytes(), 0, size);
+    let _ = target.device.flush();
+    *DISPLAY.lock() = Some(target);
+    ok
 }
 
 /// Файл раскладки мониторов на флешке, если он есть.

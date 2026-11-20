@@ -468,6 +468,12 @@ pub fn request_screen_mode(width: u32, height: u32) -> Result<(), alloc::string:
     let _ = writeln!(text, "{width}x{height}");
     let bytes = text.as_bytes();
 
+    // Живая флешка: ESP не разобран как раздел системы, но на нём лежит
+    // заранее выделенный `DISPLAY.CFG` — его переписывает `stick_log`.
+    if crate::usb::stick_log::store_display(width, height) {
+        crate::kprintln!("  settings    : {width}x{height} saved for the loader on the stick (\\FREEOS\\DISPLAY.CFG)");
+        return Ok(());
+    }
     let mut guard = LAYOUT.lock();
     let layout = guard.as_mut().ok_or_else(|| alloc::string::String::from("no ESP on this machine"))?;
     let (device, first_lba) = layout

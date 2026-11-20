@@ -59,6 +59,10 @@ use crate::sync::Mutex;
 use crate::user::files::Handle;
 use crate::user::shm::SharedMem;
 
+/// `zwp_linux_dmabuf_v1` (NVK, веха M7) — отдельным файлом.
+#[path = "wayland_dmabuf.rs"]
+mod dmabuf;
+
 /// Имя сокета: `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` у программ Linux
 /// (`XDG_RUNTIME_DIR=/run/user/0`, `WAYLAND_DISPLAY=wayland-0`).
 pub const SOCKET: &[u8] = b"/run/user/0/wayland-0";
@@ -103,6 +107,29 @@ static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 
 /// Печатать запросы клиентов и события сервера (`kernel wltrace on`).
 static TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Темп ответов на `frame` (P8) и `ping` клиентам (P4) — включаемы
+/// командами `wlpace`/`wlping`: сравнить с прежним поведением на железе.
+static PACE: AtomicBool = AtomicBool::new(true);
+static PING: AtomicBool = AtomicBool::new(true);
+/// Непрозрачные строки смешиваемых слоёв — копией (19.11.2026);
+/// `wlopaque off` — через `over` по точкам, как раньше.
+pub static OPAQUE_ROWS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_pace(on: bool) {
+    PACE.store(on, Ordering::Relaxed);
+}
+#[must_use]
+pub fn pace() -> bool {
+    PACE.load(Ordering::Relaxed)
+}
+pub fn set_ping(on: bool) {
+    PING.store(on, Ordering::Relaxed);
+}
+#[must_use]
+pub fn ping() -> bool {
+    PING.load(Ordering::Relaxed)
+}
 
 /// Включить или выключить трассировку протокола.
 pub fn set_trace(on: bool) {
@@ -149,8 +176,10 @@ fn run() {
             }
             alive
         });
-        // События окон приходят без уведомления — опрос раз в кадр.
-        crate::io_events::wait(seen, Some(now + 16));
+        // События окон приходят без уведомления — опрос раз в кадр; раньше —
+        // если у клиента отложен ответ на `frame` (темп экрана, P8).
+        let due = clients.iter().filter_map(Client::frames_due_at).min().unwrap_or(u64::MAX);
+        crate::io_events::wait(seen, Some(due.clamp(now + 1, now + 16)));
     }
 }
 
@@ -233,7 +262,7 @@ impl Args<'_> {
 // ---- объекты --------------------------------------------------------------------
 
 /// Глобальные объекты: номер в реестре, интерфейс, версия.
-const GLOBALS: [(u32, &str, u32); 8] = [
+const GLOBALS: [(u32, &str, u32); 9] = [
     (1, "wl_compositor", 4),
     (2, "wl_subcompositor", 1),
     (3, "wl_shm", 1),
@@ -256,6 +285,9 @@ const GLOBALS: [(u32, &str, u32); 8] = [
     // to the … interface» в `libawt_wlawt.so`). Масштаба экрана у нас нет —
     // окно приходит в размер буфера, и `set_destination` его не меняет.
     (8, "wp_viewporter", 1),
+    // Буферы dma-buf (18.11.2026): аппаратный Vulkan (Mesa NVK) показывает
+    // кадры только так (`wayland_dmabuf.rs`).
+    (9, dmabuf::INTERFACE, dmabuf::VERSION),
 ];
 
 const SHM_ARGB8888: u32 = 0;
@@ -274,10 +306,35 @@ const MOD_CONTROL: u32 = 4;
 const MOD_ALT: u32 = 8;
 const MOD_NUM: u32 = 16;
 const MOD_SUPER: u32 = 64;
+/// Темп ответов на `wl_surface.frame` — кадр экрана 60 Гц (P8): клиент в
+/// режиме FIFO (DXVK, Mesa WSI) рисует не чаще, чем стол показывает.
+const FRAME_MS: u64 = 16;
+/// Дольше этого ответ на `frame` не откладывается, даже если окно ещё не
+/// показано (стол занят): клиент не должен стоять.
+const FRAME_HOLD_MAX_MS: u64 = 100;
+/// Окно не закрылось за столько после просьбы — стол спросит «Программа не
+/// отвечает» (P4, 18.11.2026; как `HUNG_AFTER_MS` у родных окон).
+const CLOSE_GRACE_MS: u64 = 10_000;
+/// `xdg_wm_base.ping` — раз в столько, пока у клиента есть окна…
+const PING_EVERY_MS: u64 = 5_000;
+/// …и столько ждать `pong`: дольше — клиент не разбирает свою очередь.
+const PING_PATIENCE_MS: u64 = 5_000;
 const XDG_TOPLEVEL_MAXIMIZED: u32 = 1;
+const XDG_TOPLEVEL_FULLSCREEN: u32 = 2;
 const XDG_TOPLEVEL_ACTIVATED: u32 = 4;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
+
+/// Кнопка evdev по коду кнопки в событии окна: 1 левая, 2 правая, 4 средняя
+/// (средняя приходит с 20.11).
+const fn evdev_button(code: u32) -> u32 {
+    match code {
+        2 => BTN_RIGHT,
+        4 => BTN_MIDDLE,
+        _ => BTN_LEFT,
+    }
+}
 
 #[derive(Clone)]
 struct Buffer {
@@ -497,6 +554,12 @@ struct Win {
     active: bool,
     /// Заголовок не дошёл до стола (он был занят) — повторить.
     title_due: bool,
+    /// Когда стол попросил окно закрыться (мс работы системы); ноль — не
+    /// просил или уже спрошено «не отвечает» (P4).
+    close_asked: u64,
+    /// `set_fullscreen` пришёл до того, как окно открылось (20.11): исполнить
+    /// при открытии.
+    want_full: bool,
 }
 
 /// Всплывающее окно стола за `xdg_popup`.
@@ -549,6 +612,8 @@ enum Obj {
     DataOffer,
     Viewporter,
     Viewport,
+    Dmabuf,
+    DmabufParams(dmabuf::Params),
 }
 
 impl Obj {
@@ -581,6 +646,8 @@ impl Obj {
             Self::DataOffer => "wl_data_offer",
             Self::Viewporter => "wp_viewporter",
             Self::Viewport => "wp_viewport",
+            Self::Dmabuf => "zwp_linux_dmabuf_v1",
+            Self::DmabufParams(_) => "zwp_linux_buffer_params_v1",
         }
     }
 }
@@ -632,6 +699,18 @@ struct Client {
     keys_down: Vec<u32>,
     seat_version: u32,
     broken: bool,
+    /// `xdg_wm_base` клиента — ему идут `ping` (P4).
+    wm_base: Option<u32>,
+    /// Посланный и ещё не отвеченный `ping`: номер и когда послан.
+    ping: Option<(u32, u64)>,
+    /// Когда послан последний `ping`.
+    ping_sent: u64,
+    /// О молчании на `ping` уже сказано в журнале.
+    ping_silence_told: bool,
+    /// Когда клиенту последний раз ответили на `frame` (темп, P8) и с какого
+    /// мига ответ отложен.
+    frame_answered: u64,
+    frames_held_since: u64,
 }
 
 impl Client {
@@ -666,6 +745,12 @@ impl Client {
             keys_down: Vec::new(),
             seat_version: 1,
             broken: false,
+            wm_base: None,
+            ping: None,
+            ping_sent: 0,
+            ping_silence_told: false,
+            frame_answered: 0,
+            frames_held_since: 0,
         }
     }
 
@@ -702,7 +787,7 @@ impl Client {
     /// Один виток: прочитать, разобрать, отправить. `false` — соединения нет.
     fn step(&mut self, now: u64) -> bool {
         let time = now as u32;
-        self.answer_frames(time);
+        self.answer_frames(now);
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             match self.conn.recv(&mut buf) {
@@ -755,8 +840,10 @@ impl Client {
                     self.present_popup(index);
                 }
             }
-            // Кадры этого витка показаны — ответить сразу.
-            self.answer_frames(time);
+            self.watch_answers(now);
+            // Кадры этого витка показаны — ответить, но не чаще кадра
+            // экрана (P8).
+            self.answer_frames(now);
         }
         self.flush();
         !self.broken || !self.out.is_empty()
@@ -944,6 +1031,71 @@ impl Client {
                     _ => {}
                 }
             }
+            // `destroy`, `create_params(id)`.
+            Obj::Dmabuf => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let new = args.u32()?;
+                    self.objects.insert(new, Obj::DmabufParams(dmabuf::Params::default()));
+                }
+                _ => {}
+            },
+            // `destroy`, `add(fd, plane, offset, stride, mod_hi, mod_lo)`,
+            // `create(w, h, format, flags)`, `create_immed(id, w, h, format, flags)`.
+            Obj::DmabufParams(_) => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let Some(fd) = self.fds.pop_front() else {
+                        self.fail(id, dmabuf::ERR_INCOMPLETE, "add without a descriptor");
+                        return Ok(());
+                    };
+                    let (plane, offset, stride) = (args.u32()?, args.u32()?, args.u32()?);
+                    let modifier = (u64::from(args.u32()?) << 32) | u64::from(args.u32()?);
+                    let added = match self.objects.get_mut(&id) {
+                        Some(Obj::DmabufParams(params)) => params.add(&fd, plane, offset, stride, modifier),
+                        _ => Ok(()),
+                    };
+                    if let Err(dmabuf::Fail(code, text)) = added {
+                        self.fail(id, code, text);
+                    }
+                }
+                2 | 3 => {
+                    let new = if opcode == 3 { Some(args.u32()?) } else { None };
+                    let (width, height, format, flags) = (args.i32()?, args.i32()?, args.u32()?, args.u32()?);
+                    let made = match self.objects.get_mut(&id) {
+                        Some(Obj::DmabufParams(params)) => params.create(width, height, format, flags),
+                        _ => return Ok(()),
+                    };
+                    if let Ok(buffer) = &made {
+                        kprintln!(
+                            "  wayland     : client #{} dmabuf buffer {}x{} stride {} format {:#x}",
+                            self.pid,
+                            buffer.width,
+                            buffer.height,
+                            buffer.stride,
+                            format
+                        );
+                    }
+                    match (made, new) {
+                        (Ok(buffer), Some(new)) => {
+                            self.objects.insert(new, Obj::Buffer(buffer));
+                        }
+                        // `create`: буфер с номером сервера и событие `created`.
+                        (Ok(buffer), None) => {
+                            let server = self.next_server_id;
+                            self.next_server_id = self.next_server_id.wrapping_add(1).max(0xff00_0000);
+                            self.objects.insert(server, Obj::Buffer(buffer));
+                            self.send(Msg::new(id, 0).u32(server));
+                        }
+                        (Err(dmabuf::Fail(code, text)), None) if dmabuf::soft_failure(code) => {
+                            kprintln!("  wayland     : client #{} dmabuf import failed: {text}", self.pid);
+                            self.send(Msg::new(id, 1));
+                        }
+                        (Err(dmabuf::Fail(code, text)), _) => self.fail(id, code, text),
+                    }
+                }
+                _ => {}
+            },
             Obj::Shm => {
                 if opcode == 0 {
                     let new = args.u32()?;
@@ -996,6 +1148,17 @@ impl Client {
                     let surface = args.u32()?;
                     self.objects.insert(new, Obj::XdgSurface(surface));
                 }
+                // `pong(serial)` (P4).
+                3 => {
+                    let serial = args.u32()?;
+                    if self.ping.is_some_and(|(sent, _)| sent == serial) {
+                        if self.ping_silence_told {
+                            kprintln!("  wayland     : client #{} answers ping again", self.pid);
+                        }
+                        self.ping = None;
+                        self.ping_silence_told = false;
+                    }
+                }
                 _ => {}
             },
             Obj::Positioner(old) => {
@@ -1038,7 +1201,17 @@ impl Client {
                     }
                     // Рамку Chromium рисует сам (окно без рамки стола), и о
                     // перетаскивании, размере и кнопках просит стол он.
-                    5 | 6 | 9 | 10 | 13 => {
+                    // 11/12 — `set_fullscreen`/`unset_fullscreen` (20.11):
+                    // настоящий полноэкранный режим — весь монитор, панель не
+                    // поверх, в `configure` состояние FULLSCREEN (прежде — как
+                    // «развернуть», и Wine, не видя состояния, крутил set/unset).
+                    // До открытия окна — запомнить.
+                    11 | 12 if !self.wins.iter().any(|win| win.toplevel == id && win.open.is_some()) => {
+                        if let Some(win) = self.wins.iter_mut().find(|win| win.toplevel == id) {
+                            win.want_full = opcode == 11;
+                        }
+                    }
+                    5 | 6 | 9 | 10 | 11 | 12 | 13 => {
                         // `resize(seat, serial, edges)`: у Wayland верх 1, низ 2,
                         // лево 4, право 8 — у стола свои биты.
                         let edges = if opcode == 6 {
@@ -1065,6 +1238,8 @@ impl Client {
                                 6 => crate::ui::begin_resize(pid, slot, edges),
                                 9 => crate::ui::maximize_window(pid, slot, true),
                                 10 => crate::ui::maximize_window(pid, slot, false),
+                                11 => crate::ui::fullscreen_window(pid, slot, true),
+                                12 => crate::ui::fullscreen_window(pid, slot, false),
                                 _ => crate::ui::minimize_window(pid, slot),
                             };
                         }
@@ -1126,13 +1301,28 @@ impl Client {
             5 => Obj::Seat,
             7 => Obj::DataDeviceManager,
             8 => Obj::Viewporter,
+            9 => Obj::Dmabuf,
             _ => Obj::Output,
         };
         self.objects.insert(new, object);
+        if name == 4 {
+            self.wm_base = Some(new);
+        }
         match name {
             3 => {
                 self.send(Msg::new(new, 0).u32(SHM_ARGB8888));
                 self.send(Msg::new(new, 0).u32(SHM_XRGB8888));
+            }
+            // Версия 3: `format` (устаревшее, но его ждут старые клиенты) и
+            // `modifier` — только LINEAR.
+            9 => {
+                for (format, _) in dmabuf::FORMATS {
+                    self.send(Msg::new(new, 0).u32(format));
+                    if version >= 3 {
+                        let linear = dmabuf::MOD_LINEAR;
+                        self.send(Msg::new(new, 1).u32(format).u32((linear >> 32) as u32).u32(linear as u32));
+                    }
+                }
             }
             5 => {
                 self.seat_version = version;
@@ -1229,6 +1419,8 @@ impl Client {
                     see_through: false,
                     active: true,
                     title_due: false,
+                    close_asked: 0,
+                    want_full: false,
                 });
             }
             2 => {
@@ -1361,6 +1553,7 @@ impl Client {
     }
 
     fn commit(&mut self, id: u32) {
+        super::perfdiag::WL_COMMITS.fetch_add(1, Ordering::Relaxed);
         let (pending, frames) = match self.objects.get_mut(&id) {
             Some(Obj::Surface(state)) => (state.pending.take(), core::mem::take(&mut state.frames)),
             _ => return,
@@ -1432,6 +1625,9 @@ impl Client {
         if crate::ui::window_maximized(self.pid, slot) {
             states.extend_from_slice(&XDG_TOPLEVEL_MAXIMIZED.to_ne_bytes());
         }
+        if crate::ui::window_fullscreen(self.pid, slot) {
+            states.extend_from_slice(&XDG_TOPLEVEL_FULLSCREEN.to_ne_bytes());
+        }
         if active {
             states.extend_from_slice(&XDG_TOPLEVEL_ACTIVATED.to_ne_bytes());
         }
@@ -1445,7 +1641,9 @@ impl Client {
     fn current_size(&self, index: usize) -> (i32, i32) {
         let win = &self.wins[index];
         match win.open {
-            Some((w, h)) if crate::ui::window_maximized(self.pid, win.slot) => (w as i32, h as i32),
+            Some((w, h)) if crate::ui::window_maximized(self.pid, win.slot) || crate::ui::window_fullscreen(self.pid, win.slot) => {
+                (w as i32, h as i32)
+            }
             _ => (0, 0),
         }
     }
@@ -1464,11 +1662,92 @@ impl Client {
     /// Ответить на `wl_surface.frame` всех показанных кадров — сразу, а не на
     /// следующем витке (13.11): клиент в режиме FIFO (DXVK, Mesa WSI) ждал
     /// на каждом кадре сон сервера в 16 мс.
-    fn answer_frames(&mut self, time: u32) {
+    ///
+    /// Темп (P8, 18.11.2026): не чаще кадра экрана ([`FRAME_MS`]) и только
+    /// когда окно действительно показано (перерисовка не отложена занятым
+    /// столом), но не дольше [`FRAME_HOLD_MAX_MS`]. Раньше ответ уходил на
+    /// каждом витке: игра в меню рисовала сотни кадров в секунду, и каждый
+    /// копировался и собирался столом, а показывались из них шестьдесят.
+    fn answer_frames(&mut self, now: u64) {
+        if self.frames_due.is_empty() {
+            self.frames_held_since = 0;
+            return;
+        }
+        if self.frames_held_since == 0 {
+            self.frames_held_since = now;
+        }
+        let held = now.saturating_sub(self.frames_held_since);
+        let unshown = self.wins.iter().any(|win| win.dirty) || self.pops.iter().any(|pop| pop.dirty);
+        let early = now < self.frame_answered.saturating_add(FRAME_MS);
+        if PACE.load(Ordering::Relaxed) && held < FRAME_HOLD_MAX_MS && (unshown || early) {
+            return;
+        }
+        let time = now as u32;
         for callback in core::mem::take(&mut self.frames_due) {
             if self.objects.contains_key(&callback) {
                 self.send(Msg::new(callback, 0).u32(time));
                 self.delete(callback);
+                super::perfdiag::WL_FRAMES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.frame_answered = now;
+        self.frames_held_since = 0;
+    }
+
+    /// Когда этому клиенту пора ответить на отложенные `frame` — чтобы
+    /// задача сервера проснулась к сроку, а не на следующем опросе.
+    fn frames_due_at(&self) -> Option<u64> {
+        (!self.frames_due.is_empty()).then(|| self.frame_answered.saturating_add(FRAME_MS))
+    }
+
+    /// `ping` клиенту и «не отвечает» столу (P4, 18.11.2026).
+    ///
+    /// Просьба закрыть окно (крестик, Alt+F4, меню панели) уходит клиенту
+    /// событием `xdg_toplevel.close` — а дальше решает программа. TrackMania
+    /// на ПК Романа просьбу трижды пропустила, и снять игру можно было только
+    /// из Диспетчера задач, по процессу. Теперь: окно не закрылось за
+    /// [`CLOSE_GRACE_MS`] — или клиент молчит на `ping` дольше
+    /// [`PING_PATIENCE_MS`] после просьбы — стол спрашивает «Программа не
+    /// отвечает — Завершить / Подождать». Молчание на `ping` без просьбы
+    /// закрыть только пишется в журнал: игра, компилирующая шейдеры, —
+    /// не повод для вопроса.
+    fn watch_answers(&mut self, now: u64) {
+        let Some(base) = self.wm_base.filter(|_| PING.load(Ordering::Relaxed)) else {
+            return;
+        };
+        if self.wins.is_empty() {
+            return;
+        }
+        let asked_since_ping = self.wins.iter().any(|win| win.close_asked > self.ping_sent);
+        if self.ping.is_none() && (now.saturating_sub(self.ping_sent) >= PING_EVERY_MS || asked_since_ping) {
+            let serial = self.next_serial();
+            self.send(Msg::new(base, 0).u32(serial));
+            self.ping = Some((serial, now));
+            self.ping_sent = now;
+        }
+        let silent = self.ping.map_or(0, |(_, sent)| now.saturating_sub(sent));
+        if silent >= PING_PATIENCE_MS && !self.ping_silence_told {
+            self.ping_silence_told = true;
+            kprintln!("  wayland     : client #{} does not answer ping for {} s", self.pid, silent / 1000);
+        }
+        for index in 0..self.wins.len() {
+            let win = &self.wins[index];
+            if win.close_asked == 0 || win.open.is_none() {
+                continue;
+            }
+            let waited = now.saturating_sub(win.close_asked);
+            if waited >= CLOSE_GRACE_MS || (silent >= PING_PATIENCE_MS && waited >= PING_PATIENCE_MS) {
+                kprintln!(
+                    "  wayland     : #{} window '{}' still open {} s after close was asked{}",
+                    self.pid,
+                    win.title,
+                    waited / 1000,
+                    if silent > 0 { alloc::format!(", ping unanswered for {} s", silent / 1000) } else { String::new() },
+                );
+                crate::ui::report_unresponsive(self.pid, win.slot, waited / 1000);
+                // Следующий вопрос — не раньше чем через столько же
+                // («Подождать» в диалоге).
+                self.wins[index].close_asked = now;
             }
         }
     }
@@ -1511,6 +1790,9 @@ impl Client {
                 let _ = crate::ui::raw_keys_window(pid, win.slot);
                 kprintln!("  wayland     : #{pid} window '{}' {gw}x{gh}", win.title);
                 win.open = Some((gw, gh));
+                if core::mem::take(&mut win.want_full) {
+                    let _ = crate::ui::fullscreen_window(pid, win.slot, true);
+                }
             }
             Some(size) if size != (gw, gh) => {
                 let Some(pixels) = Surface::new(gw, gh, theme::window_bg()) else {
@@ -1540,7 +1822,27 @@ impl Client {
         let alpha = has_alpha(&layers);
         let single = layers.len() == 1;
         let mut clear = false;
-        let painted = crate::ui::paint_window(pid, win.slot, area, |target| clear = paint(target, &layers, swap, area, alpha));
+        // Копия буфера клиента в окно стола — отдельно от сборки и вывода,
+        // которые `paint_window` делает тут же (P1: `perf-diag`).
+        let mut copy_ns = 0u64;
+        let painted = crate::ui::paint_window(pid, win.slot, area, |target| {
+            let started = crate::time::uptime_ns();
+            clear = paint(target, &layers, swap, area, alpha);
+            copy_ns = crate::time::uptime_ns().saturating_sub(started);
+        });
+        if painted.is_ok() {
+            super::perfdiag::WL_PAINTS.fetch_add(1, Ordering::Relaxed);
+            super::perfdiag::WL_PAINT_NS.fetch_add(copy_ns, Ordering::Relaxed);
+            let px = u64::from(area.w) * u64::from(area.h);
+            super::perfdiag::WL_PAINT_PX.fetch_add(px, Ordering::Relaxed);
+            // Лучшая копия — только по крупным (от 0,1 Мточки): у мелких
+            // кусков цена вызова больше цены точек.
+            if px >= 100_000 {
+                super::perfdiag::WL_PAINT_BEST.fetch_min(copy_ns * 1_000_000 / px, Ordering::Relaxed);
+            }
+        } else {
+            super::perfdiag::WL_BUSY.fetch_add(1, Ordering::Relaxed);
+        }
         win.dirty = painted.is_err();
         if painted.is_ok() {
             // Прозрачность помнится до перерисовки целиком: частичная видит
@@ -1889,7 +2191,7 @@ impl Client {
                     user_abi::WIN_RELEASE if self.swallow_release => self.swallow_release = false,
                     user_abi::WIN_POINTER | user_abi::WIN_RELEASE => {
                         let target = self.pointer_motion_at(surface, x, y, time);
-                        let button = if event.code == 2 { BTN_RIGHT } else { BTN_LEFT };
+                        let button = evdev_button(event.code);
                         let state = u32::from(event.kind == user_abi::WIN_POINTER);
                         // Нажатие — в журнал: «щелчок не доходит до программы»
                         // иначе снаружи не разобрать (крестик диалога Java,
@@ -1959,6 +2261,11 @@ impl Client {
                     user_abi::WIN_CLOSE => {
                         let toplevel = self.wins[index].toplevel;
                         self.send(Msg::new(toplevel, 1));
+                        // Отсчёт «не отвечает» — с первой просьбы (P4).
+                        if self.wins[index].close_asked == 0 {
+                            self.wins[index].close_asked = crate::time::uptime_ms().max(1);
+                            kprintln!("  wayland     : #{} asked to close '{}'", self.pid, self.wins[index].title);
+                        }
                     }
                     _ => {}
                 }
@@ -1989,7 +2296,7 @@ impl Client {
                     }
                     user_abi::WIN_POINTER | user_abi::WIN_RELEASE => {
                         let target = self.pointer_motion_at(surface, x, y, time);
-                        let button = if event.code == 2 { BTN_RIGHT } else { BTN_LEFT };
+                        let button = evdev_button(event.code);
                         let state = u32::from(event.kind == user_abi::WIN_POINTER);
                         // Нажатие — в журнал: «щелчок не доходит до программы»
                         // иначе снаружи не разобрать (крестик диалога Java,
@@ -2257,11 +2564,15 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
             target.row_mut(y as u32)[ax0 as usize..ax1 as usize].fill(fill);
         }
     }
-    let mut row = Vec::new();
-    if row.try_reserve_exact(area.w as usize * 4).is_err() {
+    // Точки, а не байты: строку смешиваемого слоя проверяем на прозрачность
+    // словами (см. ниже), и ей нужно выравнивание `u32`.
+    let mut row: Vec<u32> = Vec::new();
+    if row.try_reserve_exact(area.w as usize).is_err() {
         return false;
     }
-    row.resize(area.w as usize * 4, 0u8);
+    // Строк, ушедших одной копией (P8, `perf-diag`).
+    let mut direct = 0u64;
+    row.resize(area.w as usize, 0u32);
     for layer in layers {
         let buf = &layer.buf;
         let x0 = layer.x.max(ax0);
@@ -2292,23 +2603,41 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
                     return false;
                 }
                 let or = if buf.format == SHM_XRGB8888 { 0xff00_0000 } else { 0 };
-                if swap {
-                    for pixel in out.iter_mut() {
-                        *pixel = to_screen(u32::from_le(*pixel) | or) & keep;
-                    }
-                } else if or != 0 || keep != u32::MAX {
-                    for pixel in out.iter_mut() {
-                        *pixel = (u32::from_le(*pixel) | or) & keep;
-                    }
+                if !swap && !alpha {
+                    // Непрозрачное окно без перестановки каналов (P8,
+                    // 18.11.2026): старший байт стол у такого окна не читает
+                    // (`stack` копирует, `over` красит только цвет), и
+                    // проход по точкам ради него — второй проход по кадру
+                    // (14,7 МБ на 2560x1440). Строка — одной копией.
+                    direct += 1;
+                    continue;
+                }
+                if swap || or != 0 || keep != u32::MAX {
+                    fix_row(out, swap, or, keep);
                 }
                 continue;
             }
-            if !buf.mem.read(at, &mut row[..count * 4]) {
+            let src_row = &mut row[..count];
+            // SAFETY: байты тех же `count` точек.
+            let bytes = unsafe { core::slice::from_raw_parts_mut(src_row.as_mut_ptr().cast::<u8>(), count * 4) };
+            if !buf.mem.read(at, bytes) {
                 return false;
             }
             let out = &mut target.row_mut(ty as u32)[x0 as usize..x1 as usize];
-            for (pixel, bytes) in out.iter_mut().zip(row.chunks_exact(4)) {
-                let mut src = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            // Строка смешиваемого слоя целиком непрозрачна — `over` вернул бы
+            // её саму: копия и тот же проход, что у нижнего слоя (19.11.2026).
+            // Так winewayland кладёт кадр OpenGL (wined3d) — подповерхностью
+            // ARGB над окном, — и по точкам через `over` шёл каждый кадр:
+            // 12,5 мс на 0,9 Мточки даже в лучшем случае.
+            if OPAQUE_ROWS.load(Ordering::Relaxed) && row_opaque(src_row) {
+                out.copy_from_slice(src_row);
+                if swap || keep != u32::MAX {
+                    fix_row(out, swap, 0, keep);
+                }
+                continue;
+            }
+            for (pixel, &src) in out.iter_mut().zip(src_row.iter()) {
+                let mut src = u32::from_le(src);
                 if buf.format == SHM_XRGB8888 {
                     src |= 0xff00_0000;
                 }
@@ -2317,6 +2646,47 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
             }
         }
     }
-    alpha && (ay0..ay1).any(|y| target.row(y as u32)[ax0 as usize..ax1 as usize].iter().any(|pixel| pixel >> 24 != 0xff))
+    if direct > 0 {
+        super::perfdiag::WL_DIRECT.fetch_add(1, Ordering::Relaxed);
+    }
+    alpha && (ay0..ay1).any(|y| !row_opaque(&target.row(y as u32)[ax0 as usize..ax1 as usize]))
+}
+
+/// Привести строку клиента к виду стола: старший байт (`or`, `keep`) и, при
+/// `swap`, красный с синим местами.
+///
+/// Точки — по две за раз (19.11.2026): ядро без векторов, и проход по одной
+/// точке — вдвое больше шагов; в QEMU без ускорения каждый шаг дорог.
+fn fix_row(row: &mut [u32], swap: bool, or: u32, keep: u32) {
+    let or2 = u64::from(or) * 0x1_0000_0001;
+    let keep2 = u64::from(keep) * 0x1_0000_0001;
+    let swap2 = |p: u64| (p & 0xff00_ff00_ff00_ff00) | ((p >> 16) & 0x0000_00ff_0000_00ff) | ((p & 0x0000_00ff_0000_00ff) << 16);
+    let swap1 = |p: u32| (p & 0xff00_ff00) | ((p >> 16) & 0xff) | ((p & 0xff) << 16);
+    // SAFETY: `u64` — две точки `u32` подряд; `align_to_mut` берёт только
+    // выровненную середину, края (по точке, не больше) остаются точками.
+    let (head, middle, tail) = unsafe { row.align_to_mut::<u64>() };
+    if swap {
+        for pair in middle.iter_mut() {
+            *pair = swap2(*pair | or2) & keep2;
+        }
+        for pixel in head.iter_mut().chain(tail.iter_mut()) {
+            *pixel = swap1(*pixel | or) & keep;
+        }
+    } else {
+        for pair in middle.iter_mut() {
+            *pair = (*pair | or2) & keep2;
+        }
+        for pixel in head.iter_mut().chain(tail.iter_mut()) {
+            *pixel = (*pixel | or) & keep;
+        }
+    }
+}
+
+/// Все ли точки строки непрозрачны (альфа 0xff) — по две за раз.
+fn row_opaque(row: &[u32]) -> bool {
+    // SAFETY: см. [`fix_row`].
+    let (head, middle, tail) = unsafe { row.align_to::<u64>() };
+    const ALPHA2: u64 = 0xff00_0000_ff00_0000;
+    head.iter().chain(tail).all(|pixel| pixel >> 24 == 0xff) && middle.iter().all(|pair| pair & ALPHA2 == ALPHA2)
 }
 

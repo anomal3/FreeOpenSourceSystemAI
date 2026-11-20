@@ -163,6 +163,14 @@ pub enum Action {
     Compress,
     Cut,
     Copy,
+    /// Меню вкладки терминала (20.11): переименовать её прямо в полосе.
+    TabRename,
+    /// Закрыть вкладку.
+    TabClose,
+    /// Закрыть все вкладки окна, кроме этой.
+    TabCloseOthers,
+    /// Унести вкладку в новое окно терминала.
+    TabDetach,
 }
 
 /// Какое подменю открывает пункт.
@@ -176,7 +184,11 @@ pub enum Sub {
 
 impl Action {
     /// Все пункты, какие бывают, — по ним считается размер поверхности.
-    const ALL: [Action; 36] = [
+    const ALL: [Action; 40] = [
+        Action::TabRename,
+        Action::TabClose,
+        Action::TabCloseOthers,
+        Action::TabDetach,
         Action::Open,
         Action::Rename,
         Action::Delete,
@@ -277,6 +289,9 @@ impl Action {
     /// Меню кнопки панели задач (макет 11).
     pub const ON_BUTTON: [Action; 3] = [Action::PinTaskbar, Action::CloseOne, Action::CloseAll];
 
+    /// Меню вкладки терминала (20.11, как в Windows Terminal).
+    pub const ON_TAB: [Action; 4] = [Action::TabRename, Action::TabDetach, Action::TabClose, Action::TabCloseOthers];
+
     /// Меню ярлыка программы из пакета: открыть, где лежит, убрать ярлык.
     /// «Обновить» на значке программы не нужен (Роман, 24.10).
     /// Макет 08.
@@ -368,6 +383,10 @@ impl Action {
             Action::Compress => "Сжать в архив",
             Action::Cut => "Вырезать",
             Action::Copy => "Копировать",
+            Action::TabRename => "Переименовать",
+            Action::TabClose => "Закрыть",
+            Action::TabCloseOthers => "Закрыть другие",
+            Action::TabDetach => "Переместить в новое окно",
         }
     }
 
@@ -403,6 +422,8 @@ impl Action {
             Action::SwitchLayout => 3,
             Action::NetworkSettings | Action::ClockSettings => 2,
             Action::TaskManager => 4,
+            Action::TabRename | Action::TabDetach => 14,
+            Action::TabClose | Action::TabCloseOthers => 15,
         }
     }
 
@@ -449,6 +470,9 @@ impl Action {
             Action::PinTaskbar | Action::PinStart | Action::PinQuick => None,
             Action::Compress => Some(Icon::Package),
             Action::Cut | Action::Copy => None,
+            Action::TabRename => None,
+            Action::TabDetach => Some(Icon::Maximize),
+            Action::TabClose | Action::TabCloseOthers => Some(Icon::Close),
         }
     }
 
@@ -458,7 +482,7 @@ impl Action {
         match self {
             Action::Cut => Some(Fi::Cut),
             Action::Copy => Some(Fi::Copy),
-            Action::Rename => Some(Fi::Rename),
+            Action::Rename | Action::TabRename => Some(Fi::Rename),
             Action::Delete | Action::EmptyTrash | Action::DeleteShortcut => Some(Fi::Trash),
             Action::PinTaskbar | Action::PinStart | Action::PinQuick => Some(Fi::Pin),
             Action::Submenu(Sub::Sort) => Some(Fi::Sort),
@@ -496,7 +520,6 @@ impl Action {
                 | Action::SortType
                 | Action::SortDate
                 | Action::RunAsAdmin
-                | Action::PinTaskbar
                 | Action::PinStart
                 | Action::PinQuick
                 | Action::Compress
@@ -506,6 +529,10 @@ impl Action {
         )
     }
 }
+
+/// Пункт «Закрепить на панели задач» открытого меню открепляет: кнопка уже
+/// закреплена (ставит стол перед открытием меню кнопки, 20.11).
+pub static UNPIN_TASKBAR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Чем меню занято прямо сейчас.
 enum Mode {
@@ -760,6 +787,8 @@ impl ContextMenu {
     /// Подпись пункта: у «Открыть с помощью» — с именем программы.
     fn label(&self, action: Action) -> String {
         match action {
+            // Кнопка уже закреплена — пункт открепляет (20.11).
+            Action::PinTaskbar if UNPIN_TASKBAR.load(core::sync::atomic::Ordering::Relaxed) => String::from("Открепить от панели задач"),
             Action::OpenWith(index) | Action::Window(index) | Action::Recent(index) => match self.handlers.get(usize::from(index)) {
                 Some((name, _)) => name.clone(),
                 None => String::from(action.title()),

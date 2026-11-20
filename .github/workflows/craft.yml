@@ -1,0 +1,240 @@
+# Приложения Craft (GridCraft, WordCraft, PdfCraft, MailCraft) для FossAi —
+# нативные пакеты .fpk без форка: каждую ночь (и вручную) берётся последний
+# выпуск каждого приложения с GitHub, на него накладываются правки
+# ports/craft/<app>, сборка идёт в том же контейнере fossai-builder, что и
+# на ПК (ports/servo/builder/Dockerfile), пакеты подписываются ключом выпуска
+# и выкладываются в выпуск `craft-packages` вместе с подписанным индексом
+# `<арх>-craft-index.json(.sig)`. Система обновляет их программой `craftupd`.
+#
+# Не собралось новое (правки не легли) — xtask пробует закреплённый тег из
+# ports/craft/versions.toml; не собралось и оно — пакет этого приложения в
+# выпуске остаётся прежним (assets заменяются только собранными).
+#
+# Секрет UPDATE_ENTROPY — base64 файла build/keys/update-entropy с машины
+# выпуска (из него xtask выводит ключ подписи, см. xtask/src/keys.rs). Без
+# секрета пакеты подписались бы случайным ключом и система их отвергла бы —
+# поэтому без него работа останавливается.
+#
+# Что на ПК лежит готовым, а здесь приносится (версии — как на ПК, 18.11.2026):
+#   * picolibc — git, ревизия PICOLIBC_REV (build/toolchain/picolibc);
+#   * llvm-project — тег LLVM_TAG, только compiler-rt/cmake/llvm/cmake
+#     (вспомогательные подпрограммы компилятора, tools/build-builtins.sh);
+#   * libc++/libc++abi/libunwind — `xtask thirdparty --only libcxx` сам качает
+#     llvm-project-22.1.8.src.tar.xz (с проверкой SHA-256);
+#   * clang/lld 22 (apt.llvm.org), meson MESON_VERSION, ninja, cmake;
+#   * Rust RUST_NIGHTLY + rust-src (правки std привязаны к нему);
+#   * build/rust-std/src — `cargo xtask rust-std-src`.
+# Готовый набор (sysroot + исходники std) кешируется целиком по точному ключу.
+#
+# СОСТОЯНИЕ (18.11.2026): работает — прогон 44275478841 за 26 мин (набор с
+# нуля ~4 мин, четыре приложения ~19 мин), в выпуске 5 пакетов и индекс.
+#
+# Пути: проект смонтирован ещё и в /work — тот же путь, что внутри контейнера,
+# поэтому абсолютные пути в build/rust-std/src/patches.toml верны и там, и тут.
+
+name: craft
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Одно приложение (пусто — все)"
+        required: false
+        default: ""
+      latest:
+        description: "Брать последний выпуск с GitHub (иначе — теги из versions.toml)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: craft
+  cancel-in-progress: false
+
+env:
+  ARCH: x86_64
+  PICOLIBC_REV: 2964dc6b9faf697c5fadaf6a86ca499390f9e7b5
+  LLVM_TAG: llvmorg-22.1.8
+  RUST_NIGHTLY: nightly-2026-08-11
+  MESON_VERSION: 1.12.0
+  # rust-toolchain.toml просит просто «nightly» — берётся закреплённый.
+  RUSTUP_TOOLCHAIN: nightly-2026-08-11
+  # Кеш контейнера (клоны выпусков, крейты с правками, Cargo.lock, реестр
+  # crates.io) — каталоги раннера вместо томов Docker: их сохраняет actions/cache.
+  FOSSAI_CRAFT_CACHE: /home/runner/craft-cache
+  FOSSAI_CARGO_REGISTRY: /home/runner/cargo-registry
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    defaults:
+      run:
+        working-directory: /work
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Проект в /work, место на диске
+        working-directory: ${{ github.workspace }}
+        run: |
+          sudo mkdir -p /work
+          sudo mount --bind "$GITHUB_WORKSPACE" /work
+          # Сборка всех четырёх занимает ~10 ГБ; у раннера свободно ~100 ГБ.
+          mkdir -p "$FOSSAI_CRAFT_CACHE" "$FOSSAI_CARGO_REGISTRY"
+          df -h /
+
+      - name: Ключ подписи выпуска
+        env:
+          UPDATE_ENTROPY: ${{ secrets.UPDATE_ENTROPY }}
+        run: |
+          if [ -z "$UPDATE_ENTROPY" ]; then
+            echo "::error::нет секрета UPDATE_ENTROPY — пакеты нечем подписать"
+            exit 1
+          fi
+          mkdir -p build/keys
+          echo "$UPDATE_ENTROPY" | base64 -d > build/keys/update-entropy
+
+      - name: LLVM 22, meson, Rust (тот же ночной, что на ПК)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y clang-22 lld-22 llvm-22 llvm-22-dev libclang-22-dev ninja-build cmake python3
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
+          pipx install "meson==$MESON_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src
+
+      - name: Версии инструментов
+        run: |
+          clang --version
+          ld.lld --version
+          meson --version
+          rustc -vV
+
+      - name: Кеш набора FreeOS и исходников std
+        id: sdk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/toolchain/sysroot
+            build/toolchain/compiler-rt
+            build/toolchain/bin
+            build/toolchain/cross
+            build/toolchain/*.cmake
+            build/rust-std/src
+            build/rust-std/src.stamp
+          key: freeos-sdk-v1-${{ env.PICOLIBC_REV }}-${{ env.LLVM_TAG }}-${{ env.RUST_NIGHTLY }}-${{ hashFiles('libc/**', 'crates/freeos-cc/**', 'crates/user-progs/user.ld', 'ports/rust-std/**', 'xtask/src/cbuild.rs', 'xtask/src/sdk.rs', 'xtask/src/ruststd.rs', 'xtask/src/thirdparty.rs', 'tools/build-builtins.sh') }}
+
+      - name: Исходники picolibc и compiler-rt (закреплённые ревизии)
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p build/toolchain
+          git init -q build/toolchain/picolibc
+          git -C build/toolchain/picolibc fetch -q --depth 1 https://github.com/picolibc/picolibc "$PICOLIBC_REV"
+          git -C build/toolchain/picolibc checkout -q FETCH_HEAD
+          git clone -q --depth 1 --branch "$LLVM_TAG" --filter=blob:none --sparse \
+            https://github.com/llvm/llvm-project build/toolchain/llvm-project
+          git -C build/toolchain/llvm-project sparse-checkout set compiler-rt cmake llvm/cmake third-party
+
+      - name: Набор FreeOS (builtins, picolibc, sysroot, libc++)
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          sh tools/build-builtins.sh x86_64
+          sh tools/build-builtins.sh aarch64
+          cargo xtask sdk
+          cargo xtask thirdparty --only libcxx --arch "$ARCH"
+
+      - name: Исходники std для freeos (build/rust-std/src, patches.toml)
+        run: |
+          cargo xtask rust-std-src
+          cat build/rust-std/src/patches.toml
+          ls build/toolchain/sysroot/$ARCH/lib
+
+      - name: Сохранить кеш набора
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/toolchain/sysroot
+            build/toolchain/compiler-rt
+            build/toolchain/bin
+            build/toolchain/cross
+            build/toolchain/*.cmake
+            build/rust-std/src
+            build/rust-std/src.stamp
+          key: ${{ steps.sdk-cache.outputs.cache-primary-key }}
+
+      - name: Освободить место (исходники набора больше не нужны)
+        run: |
+          rm -rf build/toolchain/llvm-project build/toolchain/thirdparty build/toolchain/picolibc \
+                 build/toolchain/pico-* build/toolchain/build-*-none-elf build/toolchain/sdk
+          df -h /
+
+      - name: Кеш контейнера (клоны, крейты, реестр)
+        id: craft-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /home/runner/craft-cache
+            !/home/runner/craft-cache/target-craft/**
+            !/home/runner/craft-cache/target-craftupd/**
+            /home/runner/cargo-registry
+          key: craft-cache-v1-${{ github.run_id }}
+          restore-keys: craft-cache-v1-
+
+      - name: Контейнер сборки
+        run: docker build -t fossai-builder ports/servo/builder
+
+      - name: craftupd (обновление приложений в системе)
+        run: |
+          docker run --rm -v /work:/work -v "$FOSSAI_CRAFT_CACHE:/cache" \
+            -v "$FOSSAI_CARGO_REGISTRY:/opt/cargo/registry" \
+            fossai-builder sh /work/ports/craft/builder/build-craftupd.sh "$ARCH" \
+            || echo "::warning::craftupd не собрался"
+
+      - name: Сборка приложений Craft
+        run: |
+          ARGS="--arch $ARCH --out dist"
+          if [ -n "${{ github.event.inputs.app }}" ]; then ARGS="$ARGS --app ${{ github.event.inputs.app }}"; fi
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.latest }}" = "true" ]; then ARGS="$ARGS --latest"; fi
+          cargo xtask craft $ARGS || echo "::warning::не все приложения собрались — выкладывается то, что есть"
+          ls -la dist
+          df -h /
+
+      # Контейнер пишет от root (крейты в реестре — с правами 600): tar кеша
+      # работает от runner и без этого их не читает.
+      - name: Права на кеш контейнера
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$FOSSAI_CRAFT_CACHE" "$FOSSAI_CARGO_REGISTRY"
+
+      - name: Сохранить кеш контейнера
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /home/runner/craft-cache
+            !/home/runner/craft-cache/target-craft/**
+            !/home/runner/craft-cache/target-craftupd/**
+            /home/runner/cargo-registry
+          key: craft-cache-v1-${{ github.run_id }}
+
+      - name: Имена файлов выпуска (<арх>-…)
+        run: |
+          ls dist/*.fpk >/dev/null 2>&1 || { echo "::error::ни одного пакета"; exit 1; }
+          mkdir -p upload
+          for f in dist/*; do cp "$f" "upload/$ARCH-$(basename "$f")"; done
+          ls -la upload
+
+      - name: Выложить в выпуск craft-packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view craft-packages >/dev/null 2>&1 || \
+            gh release create craft-packages --title "Craft packages for FossAi" \
+              --notes "Нативные пакеты GridCraft, WordCraft, PdfCraft, MailCraft для FossAi (собираются ночью). Обновление в системе: craftupd." --prerelease
+          gh release upload craft-packages upload/* --clobber

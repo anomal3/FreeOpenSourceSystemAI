@@ -330,7 +330,7 @@ fn isb() {
 /// исполнили `tlbi vaae1is` ([`invalidate_page`]) — «Inner Shareable» и
 /// значит «на всех процессорах домена», и `dsb ish` после него ждёт, пока
 /// сбросят все. На x86-64 того же добиваются межпроцессорным прерыванием.
-pub fn flush_user_translations() {}
+pub fn flush_user_translations(_root: Option<PhysAddr>) {}
 
 /// Подготовить кадр к исполнению после записи в него (фаза 56).
 ///

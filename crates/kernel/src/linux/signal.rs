@@ -610,11 +610,23 @@ pub fn deliver_fault(frame: &mut crate::arch::TrapFrame, vector: u8, addr: usize
             );
         }
     }
-    // Отказ страницы с адресом в программе (фаза 71j) — что за область там.
+    // Отказ страницы с адресом в программе (фаза 71j) — что за область там,
+    // её права, соседи и почему ядро не дало страницу.
+    //
+    // Счёт строк — по видам (17.11.2026), а не один на систему: двадцать
+    // строк съедали ранние обычные сбои Wine (переход по адресу ядра,
+    // `0xffff80dfff6b8fce`, — Wine так проверяет, ловя SIGSEGV сам), и сбой
+    // игры, ради которого журнал и заведён, уже не печатался. Теперь адреса
+    // выше половины пространства (ядро) — свой маленький счёт, остальные —
+    // по причине отказа ([`crate::user::FaultWhy`]).
     if vector == 14 && frame.rip >= 0x1_0000 {
-        static SHOWN_PF: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-        if SHOWN_PF.fetch_add(1, Ordering::Relaxed) < 20 {
-            let what = crate::user::with_current(|program| program.describe_region(addr)).unwrap_or_default();
+        const KINDS: usize = 13;
+        static SHOWN_PF: [core::sync::atomic::AtomicUsize; KINDS] =
+            [const { core::sync::atomic::AtomicUsize::new(0) }; KINDS];
+        let why = crate::user::last_fault_why();
+        let (kind, limit) = if addr >= 1 << 47 { (KINDS - 1, 4) } else { (why as usize % (KINDS - 1), 16) };
+        if SHOWN_PF[kind].fetch_add(1, Ordering::Relaxed) < limit {
+            let what = crate::user::describe_fault(addr);
             crate::kprintln!(
                 "  linux       : {} page fault at {addr:#x} (error {:#x}) from {:#x}: {what}",
                 sched::current(),

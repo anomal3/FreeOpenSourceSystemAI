@@ -53,6 +53,8 @@
 // скрывал по-настоящему новые.
 #![allow(dead_code)]
 
+/// Быстрая копия больших кусков (кадры Wayland, стол) — способ выбран замером.
+pub mod copy;
 pub mod dma;
 pub mod frame;
 pub mod heap;

@@ -1,0 +1,46 @@
+[package]
+name = "eframe"
+# Та же версия, что у eframe приложений Craft (0.37): подставляется вместо него
+# через `[patch.crates-io]` в `--config` сборки (ports/craft/builder/build-craft.sh).
+version = "0.37.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "FossAi (FreeOS) host for eframe 0.37 apps: native FreeOS window, egui drawn by the CPU"
+publish = false
+
+# Имена возможностей — как у настоящего eframe, чтобы `features = [...]`
+# приложений разрешались. Графических бэкендов здесь нет: всё рисует
+# процессор (egui_software_backend), окно — `freeos_window_*` из libfreeos.
+[features]
+default = ["default_fonts"]
+accesskit = []
+android-game-activity = []
+android-native-activity = []
+clipboard = []
+default_fonts = ["egui/default_fonts"]
+experimental = []
+glow = []
+inspection = []
+links = []
+# Как у eframe: память egui (окна, раскрытые заголовки) — в хранилище приложения.
+persistence = ["egui/persistence"]
+system_fonts = []
+wayland = []
+web_screen_reader = []
+wgpu = []
+wgpu_no_default_features = []
+x11 = []
+__screenshot = []
+
+[dependencies]
+egui = { version = "0.37", default-features = false }
+egui_software_backend = { path = "../egui-software-backend", default-features = false, features = ["std"] }
+log = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+ron = "0.12"
+serde = { version = "1", features = ["derive"] }
+# Только типы для `Frame::winit_window()` (всегда `None`): заглушка ../winit.
+winit = { path = "../winit" }
+# Как у eframe: Frame и CreationContext — «окна» для rfd::set_parent (у нас без
+# дескриптора: родителя у диалога FreeOS нет).
+raw-window-handle = "0.6"

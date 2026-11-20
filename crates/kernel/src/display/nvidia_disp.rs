@@ -23,7 +23,6 @@ use core::sync::atomic::{Ordering, fence};
 
 use super::nvidia::Bar0;
 use super::nvidia_gsp::{H_CLIENT, H_DEVICE, Log, Mem, Res, Rm, SESSION, le32};
-use crate::mm::PageFlags;
 
 // --- раскладка видеопамяти (область 2 RM: свободная, с 0x5150000) ----------
 
@@ -100,6 +99,14 @@ struct Disp {
 unsafe impl Send for Disp {}
 
 static DISP: crate::sync::SpinLock<Option<Disp>> = crate::sync::SpinLock::new(None);
+
+/// Забыть каналы и головки: GSP-RM выгружается (`nvidia_gsp::unload`), и
+/// всё, что создано на карте, разбирает он сам вместе с нашим клиентом.
+pub(crate) fn forget() {
+    if let Some(mut disp) = DISP.try_lock() {
+        *disp = None;
+    }
+}
 
 /// Канал дисплея: буфер команд в памяти машины и его регистры в BAR0.
 #[derive(Clone, Copy)]
@@ -306,7 +313,25 @@ fn light(rm: &mut Rm, log: &mut Log, disp: &mut Disp, wanted: &[(u32, u32, u32, 
         edid.resize(16 + 2048, 0);
         let r = rm.disp(0x0073_0245, &edid)?;
         let size = le32(&r, 8)? as usize;
-        let monitor = edid::parse(r.get(16..16 + size.min(2048)).unwrap_or(&[])).map_err(|e| format!("EDID of {id:#x}: {e:?}"))?;
+        let mut monitor = edid::parse(r.get(16..16 + size.min(2048)).unwrap_or(&[])).map_err(|e| format!("EDID of {id:#x}: {e:?}"))?;
+        // Только режимы, которые пролезают в линию DisplayPort (24 бита на
+        // точку, 8b/10b: полезных 8 бит из 10 на каждый символ линии). 17.11:
+        // LHC P2410R предлагает 180 Гц (720 МГц), а его DP 1.2 — 4×5,4 Гбит/с,
+        // 17,28 Гбит/с полезных: тренировка линии не проходила ни на одной
+        // скорости, и монитор гас. Такие режимы «Параметры» больше не видят.
+        if let Ok(caps) = dpcd_caps(rm, id) {
+            let rate = (u32::from(caps[1]) * 27_000).min(disp.gpu_max_rate);
+            let lanes = u64::from(caps[2] & 0x1f).min(4);
+            let budget = u64::from(rate) * 8 * lanes;
+            let before = monitor.modes.len();
+            monitor.modes.retain(|m| u64::from(m.clock_khz) * 24 <= budget);
+            if monitor.modes.len() != before {
+                log.push(format!(
+                    "output {id:#x}: {} mode(s) above the DP link ({rate} kHz x{lanes}) hidden",
+                    before - monitor.modes.len()
+                ));
+            }
+        }
         // Без явного выбора — режим, сохранённый «Параметрами» для этого
         // монитора (по паспорту), а если монитор его больше не предлагает или
         // сохранённого нет — родной.
@@ -348,19 +373,10 @@ fn bring_up(rm: &mut Rm, log: &mut Log, internal: (u32, u32), device: crate::pci
     let bar = rm.bar;
     // BAR1 (физический режим) → видеопамять для процессора.
     let bar1 = device.memory_bar(1).ok_or("no BAR1")?.as_u64();
-    let phys = crate::mm::PhysAddr::new(bar1 + VRAM_MAP_START);
-    let virt = phys.to_direct_map();
-    // SAFETY: окно видеопамяти карты; запись с объединением (WC).
-    unsafe {
-        crate::arch::map_active(
-            virt,
-            phys,
-            (VRAM_MAP_END - VRAM_MAP_START) as usize,
-            PageFlags::READ | PageFlags::WRITE | PageFlags::WRITE_COMBINE,
-        )
-    }
-    .map_err(|_| "could not map BAR1")?;
-    let vram = Vram { base: virt.as_usize() };
+    // Окно общее с NVK (`nvidia_rm_vram`) и отображается один раз: второе
+    // `map_active` того же куска отвечает AlreadyMapped (18.11).
+    const _: () = assert!(VRAM_MAP_START == super::nvidia_gsp::BAR1_WINDOW_START && VRAM_MAP_END == super::nvidia_gsp::BAR1_WINDOW_END);
+    let vram = Vram { base: super::nvidia_gsp::bar1_window(device)? };
     vram.zero(INST, 0x10000);
     vram.zero(SYNC, 0x1000);
     vram.w32(INST + 0x8000, 0x1234_5678);
@@ -472,6 +488,25 @@ fn new_channel(rm: &mut Rm, internal: (u32, u32), class: u32, instance: u32, use
     put(&mut a, 0x20, 1);
     rm.alloc(H_ROOT, (class << 16) | instance, class, &a)?;
     Ok(Channel { pb, user, cur: 0, chn })
+}
+
+/// Возможности приёмника DisplayPort: первые 15 байт DPCD, а если приёмник
+/// объявил расширенный блок (бит 7 байта `0x000E`), — они же из `0x2200`.
+///
+/// 17.11, LHC P2410R: в старом поле монитор пишет «DP 1.2, 5,4 Гбит/с», а
+/// настоящие возможности (DP 1.4, 8,1 Гбит/с на линию) — только в `0x2200`;
+/// так делают мониторы DP 1.4 ради старых источников. Без этого 180 Гц при
+/// 2560x1440 (720 МГц) не помещались в линию, хотя в Windows работают.
+fn dpcd_caps(rm: &mut Rm, id: u32) -> Res<Vec<u8>> {
+    let base = aux(rm, id, 9, 0, &[], 15)?;
+    if base.get(0x0e).is_some_and(|b| b & 0x80 != 0) {
+        if let Ok(ext) = aux(rm, id, 9, 0x2200, &[], 15) {
+            if ext.len() >= 4 && ext[0] >= base[0] {
+                return Ok(ext);
+            }
+        }
+    }
+    Ok(base)
 }
 
 /// AUX DisplayPort: прочитать (`cmd` 9) или записать (8) до 16 байт DPCD.
@@ -599,8 +634,8 @@ fn set_head(rm: &mut Rm, log: &mut Log, disp: &mut Disp, head: u32, id: u32, lin
         return Err(format!("no window channel {w} for head {head}"));
     }
 
-    // DPCD: возможности приёмника.
-    let dpcd = aux(rm, id, 9, 0, &[], 15)?;
+    // DPCD: возможности приёмника (с расширенным блоком DP 1.4).
+    let dpcd = dpcd_caps(rm, id)?;
     let (max_rate, max_lanes, ef) = (u32::from(dpcd[1]) * 27_000, u32::from(dpcd[2] & 0x1f).min(4), dpcd[2] & 0x80 != 0);
     log.push(format!("DPCD rev {:#x}, max {} kHz x{}, enhanced framing {ef}", dpcd[0], max_rate, max_lanes));
 

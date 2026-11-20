@@ -21,8 +21,11 @@
 //!
 //! # Цена ошибки
 //!
-//! Прошивка карты (VBIOS) не меняется. Неудача оставляет карту в состоянии,
-//! из которого её выводит только выключение питания: WPR2 уже задан.
+//! Прошивка карты (VBIOS) не меняется. Неудача оставляет карту с поднятым
+//! WPR2; с 18.11 его снимает выгрузка (`unload`: при перезагрузке, при
+//! выключении и командой `gpu unload`) и попытка восстановления на загрузке
+//! (`recover_stale_wpr2`) — booter_unload на SEC2. Не вышло — только
+//! выключение питания.
 
 use alloc::format;
 use alloc::string::String;
@@ -349,6 +352,119 @@ fn checksum(bytes: &[u8]) -> u32 {
     ((x >> 32) as u32) ^ (x as u32)
 }
 
+// --- booter (load и unload) на процессоре SEC2 --------------------------------
+
+/// Booter из linux-firmware (`booter_load` или `booter_unload`), готовый к
+/// запуску на SEC2: образ с вписанной по фьюзу подписью — в памяти машины.
+/// Заголовки у обоих одинаковые (nouveau `nvkm_falcon_fw_ctor_hs_v2`, nova
+/// `firmware/booter.rs`).
+pub(crate) struct Booter {
+    buf: Mem,
+    size: usize,
+    app_off: usize,
+    app_size: usize,
+    os_data_off: usize,
+    os_data_size: usize,
+    pkc: usize,
+    engine_id: u32,
+    ucode_id: u32,
+    fuse: u32,
+    sig_index: usize,
+}
+
+impl Booter {
+    /// Разобрать файл `name` и вписать подпись под фьюз карты (без карты —
+    /// последнюю: сухой прогон).
+    fn parse(name: &str, booter: &[u8], bar: Option<Bar0>) -> Res<Self> {
+        if le32(booter, 0)? != 0x10de {
+            return Err(format!("{name}: not an NVIDIA firmware header"));
+        }
+        let (b_hdr, b_data, b_size) = (le32(booter, 0x0c)? as usize, le32(booter, 0x10)? as usize, le32(booter, 0x14)? as usize);
+        let sig_offset = le32(booter, b_hdr)? as usize;
+        let sig_size = le32(booter, b_hdr + 4)? as usize;
+        let patch_loc = le32(booter, le32(booter, b_hdr + 8)? as usize)? as usize;
+        let patch_sig = le32(booter, le32(booter, b_hdr + 12)? as usize)? as usize;
+        let meta_at = le32(booter, b_hdr + 16)? as usize;
+        let (fuse_ver, engine_id, ucode_id) = (le32(booter, meta_at)?, le32(booter, meta_at + 4)?, le32(booter, meta_at + 8)?);
+        let num_sig = le32(booter, le32(booter, b_hdr + 24)? as usize)? as usize;
+        let load = le32(booter, b_hdr + 28)? as usize;
+        let (os_data_off, os_data_size) = (le32(booter, load + 8)? as usize, le32(booter, load + 12)? as usize);
+        let (app_off, app_size) = (le32(booter, load + 20)? as usize, le32(booter, load + 24)? as usize);
+        if num_sig == 0 || sig_size / num_sig != 384 || engine_id & 1 == 0 || !(1..=16).contains(&ucode_id) {
+            return Err(format!("{name}: unexpected header (sigs {num_sig}, size {sig_size}, engine {engine_id}, ucode {ucode_id})"));
+        }
+        if patch_loc < os_data_off || patch_loc + 384 > b_size {
+            return Err(format!("{name}: signature place {patch_loc:#x} outside the data section"));
+        }
+        let fuse = bar.map_or(0, |bar| bar.rd(0x0082_4140 + (ucode_id as usize - 1) * 4) & 0xffff);
+        let fuse_bits = fls(fuse);
+        let sig_index = if fuse_bits == 0 {
+            num_sig - 1
+        } else {
+            fuse_ver.checked_sub(fuse_bits).ok_or(format!("{name}: no signature for fuse {fuse:#x}"))? as usize
+        };
+        if sig_index >= num_sig {
+            return Err(format!("{name}: signature index {sig_index} out of {num_sig}"));
+        }
+        let buf = Mem::new(b_size.div_ceil(PAGE_SIZE))?;
+        buf.bytes()[..b_size].copy_from_slice(booter.get(b_data..b_data + b_size).ok_or(format!("{name} truncated"))?);
+        let sig_from = sig_offset + patch_sig + sig_index * 384;
+        buf.bytes()[patch_loc..patch_loc + 384]
+            .copy_from_slice(booter.get(sig_from..sig_from + 384).ok_or(format!("{name}: signature truncated"))?);
+        Ok(Self {
+            buf,
+            size: b_size,
+            app_off,
+            app_size,
+            os_data_off,
+            os_data_size,
+            pkc: patch_loc - os_data_off,
+            engine_id,
+            ucode_id,
+            fuse,
+            sig_index,
+        })
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "{} B, IMEM {:#x} from {:#x}, DMEM {:#x} from {:#x}, fuse {:#x} -> signature {}, PARAADDR {:#x}",
+            self.size, self.app_size, self.app_off, self.os_data_size, self.os_data_off, self.fuse, self.sig_index, self.pkc
+        )
+    }
+
+    /// Сбросить SEC2, загрузить booter, положить `mbox0`/`mbox1` в почтовые
+    /// ящики и запустить (nouveau `nvkm_falcon_fw_boot` для `booter.load` /
+    /// `booter.unload`). Ждёт остановки до 2 с: (остановился, MAILBOX0, MAILBOX1).
+    fn run(&self, bar: Bar0, mbox0: u32, mbox1: u32) -> Res<(bool, u32, u32)> {
+        bar.wr(SEC2 + 0x14, u32::MAX);
+        falcon_reset(bar, SEC2)?;
+        if bar.rd(SEC2_2 + 0x668) & 0x10 != 0 {
+            bar.wr(SEC2_2 + 0x668, 0);
+            if !bar.wait(10_000, |b| b.rd(SEC2_2 + 0x668) & 1 != 0) {
+                return Err("SEC2 did not switch to the Falcon core".into());
+            }
+        }
+        bar.wr(SEC2 + 0x84, bar.rd(0));
+        bar.wr(SEC2 + 0x624, bar.rd(SEC2 + 0x624) | 0x80);
+        bar.wr(SEC2 + 0x10c, 0);
+        bar.wr(SEC2 + 0x600, (bar.rd(SEC2 + 0x600) & !7) | 5);
+        fence(Ordering::SeqCst);
+        falcon_dma(bar, SEC2, self.buf.phys, self.app_off, 0, self.app_size, 0x614)?;
+        falcon_dma(bar, SEC2, self.buf.phys + self.os_data_off as u64, 0, 0, self.os_data_size, 0x600)?;
+        bar.wr(SEC2_2 + 0x210, self.pkc as u32);
+        bar.wr(SEC2_2 + 0x19c, self.engine_id);
+        bar.wr(SEC2_2 + 0x198, self.ucode_id);
+        bar.wr(SEC2_2 + 0x180, 1);
+        bar.wr(SEC2 + 0x104, self.app_off as u32);
+        bar.wr(SEC2 + 0x40, mbox0);
+        bar.wr(SEC2 + 0x44, mbox1);
+        falcon_start(bar, SEC2);
+        let halted = bar.wait(2_000_000, |b| b.rd(SEC2 + 0x100) & 0x10 != 0);
+        Ok((halted, bar.rd(SEC2 + 0x40), bar.rd(SEC2 + 0x44)))
+    }
+}
+
 // --- главное -----------------------------------------------------------------
 
 /// Этап 5: запустить GSP-RM. Возвращает строки отчёта (они же — в журнал).
@@ -391,41 +507,16 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
     log.push(format!("firmware: booter {} B, bootloader {} B, gsp {} B", booter.len(), loader.len(), gsp.metadata().size));
 
     // 2a. booter_load.
-    if le32(&booter, 0)? != 0x10de {
-        return Err("BOOTER.BIN: not an NVIDIA firmware header".into());
+    let booter = Booter::parse("BOOTER.BIN", &booter, card.map(|(_, bar)| bar))?;
+    log.push(format!("booter_load: {}", booter.describe()));
+
+    // 2a'. Для выгрузки (`unload`): booter_unload с флешки и FWSEC-SB из VBIOS
+    // — заранее, пока флешка есть и окно PROM читается (nouveau готовит оба в
+    // `tu102_gsp_oneinit`/`r535_gsp_rm_boot_ctor`). Нет их — GSP-RM всё равно
+    // запускается, но выгрузить его можно будет только выключением питания.
+    if !dry {
+        prepare_unload_kit(log);
     }
-    let (b_hdr, b_data, b_size) = (le32(&booter, 0x0c)? as usize, le32(&booter, 0x10)? as usize, le32(&booter, 0x14)? as usize);
-    let sig_offset = le32(&booter, b_hdr)? as usize;
-    let sig_size = le32(&booter, b_hdr + 4)? as usize;
-    let patch_loc = le32(&booter, le32(&booter, b_hdr + 8)? as usize)? as usize;
-    let patch_sig = le32(&booter, le32(&booter, b_hdr + 12)? as usize)? as usize;
-    let meta_at = le32(&booter, b_hdr + 16)? as usize;
-    let (fuse_ver, engine_id, ucode_id) = (le32(&booter, meta_at)?, le32(&booter, meta_at + 4)?, le32(&booter, meta_at + 8)?);
-    let num_sig = le32(&booter, le32(&booter, b_hdr + 24)? as usize)? as usize;
-    let load = le32(&booter, b_hdr + 28)? as usize;
-    let (os_data_off, os_data_size) = (le32(&booter, load + 8)? as usize, le32(&booter, load + 12)? as usize);
-    let (app_off, app_size) = (le32(&booter, load + 20)? as usize, le32(&booter, load + 24)? as usize);
-    if num_sig == 0 || sig_size / num_sig != 384 || engine_id & 1 == 0 || !(1..=16).contains(&ucode_id) {
-        return Err(format!("BOOTER.BIN: unexpected header (sigs {num_sig}, size {sig_size}, engine {engine_id}, ucode {ucode_id})"));
-    }
-    let fuse = card.map_or(0, |(_, bar)| bar.rd(0x0082_4140 + (ucode_id as usize - 1) * 4) & 0xffff);
-    let fuse_bits = fls(fuse);
-    let sig_index = if fuse_bits == 0 {
-        num_sig - 1
-    } else {
-        fuse_ver.checked_sub(fuse_bits).ok_or(format!("booter has no signature for fuse {fuse:#x}"))? as usize
-    };
-    if sig_index >= num_sig {
-        return Err(format!("booter signature index {sig_index} out of {num_sig}"));
-    }
-    let booter_buf = Mem::new(b_size.div_ceil(PAGE_SIZE))?;
-    booter_buf.bytes()[..b_size].copy_from_slice(booter.get(b_data..b_data + b_size).ok_or("BOOTER.BIN truncated")?);
-    let sig_from = sig_offset + patch_sig + sig_index * 384;
-    booter_buf.bytes()[patch_loc..patch_loc + 384].copy_from_slice(booter.get(sig_from..sig_from + 384).ok_or("booter signature truncated")?);
-    let pkc = patch_loc - os_data_off;
-    log.push(format!(
-        "booter: IMEM {app_size:#x} from {app_off:#x}, DMEM {os_data_size:#x} from {os_data_off:#x}, fuse {fuse:#x} -> signature {sig_index}, PARAADDR {pkc:#x}"
-    ));
 
     // 2b. Загрузчик GSP (RISC-V).
     let (l_hdr, l_data, l_size) = (le32(&loader, 0x0c)? as usize, le32(&loader, 0x10)? as usize, le32(&loader, 0x14)? as usize);
@@ -620,32 +711,8 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
     bar.wr(GSP + 0x44, (libos.phys >> 32) as u32);
     bar.wr(GSP + 0x84, bar.rd(0));
 
-    // 8. booter_load на SEC2.
-    bar.wr(SEC2 + 0x14, u32::MAX);
-    falcon_reset(bar, SEC2)?;
-    if bar.rd(SEC2_2 + 0x668) & 0x10 != 0 {
-        bar.wr(SEC2_2 + 0x668, 0);
-        if !bar.wait(10_000, |b| b.rd(SEC2_2 + 0x668) & 1 != 0) {
-            return Err("SEC2 did not switch to the Falcon core".into());
-        }
-    }
-    bar.wr(SEC2 + 0x84, bar.rd(0));
-    bar.wr(SEC2 + 0x624, bar.rd(SEC2 + 0x624) | 0x80);
-    bar.wr(SEC2 + 0x10c, 0);
-    bar.wr(SEC2 + 0x600, (bar.rd(SEC2 + 0x600) & !7) | 5);
-    fence(Ordering::SeqCst);
-    falcon_dma(bar, SEC2, booter_buf.phys, app_off, 0, app_size, 0x614)?;
-    falcon_dma(bar, SEC2, booter_buf.phys + os_data_off as u64, 0, 0, os_data_size, 0x600)?;
-    bar.wr(SEC2_2 + 0x210, pkc as u32);
-    bar.wr(SEC2_2 + 0x19c, engine_id);
-    bar.wr(SEC2_2 + 0x198, ucode_id);
-    bar.wr(SEC2_2 + 0x180, 1);
-    bar.wr(SEC2 + 0x104, app_off as u32);
-    bar.wr(SEC2 + 0x40, meta.phys as u32);
-    bar.wr(SEC2 + 0x44, (meta.phys >> 32) as u32);
-    falcon_start(bar, SEC2);
-    let halted = bar.wait(2_000_000, |b| b.rd(SEC2 + 0x100) & 0x10 != 0);
-    let (m0, m1) = (bar.rd(SEC2 + 0x40), bar.rd(SEC2 + 0x44));
+    // 8. booter_load на SEC2: в почтовых ящиках — адрес GspFwWprMeta.
+    let (halted, m0, m1) = booter.run(bar, meta.phys as u32, (meta.phys >> 32) as u32)?;
     log.push(format!(
         "booter {}: MAILBOX0 {m0:#x}, MAILBOX1 {m1:#x}, CPUCTL {:#x}, WPR2 {:#010x}..{:#010x}, meta verified {:#x}",
         if halted { "halted" } else { "did NOT halt" },
@@ -751,7 +818,7 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
                     le32(&payload, 0x644).unwrap_or(0),
                     le32(&payload, 0x648).unwrap_or(0)
                 ));
-                break (le32(&payload, 0x640).unwrap_or(0), le32(&payload, 0x648).unwrap_or(0));
+                break (le32(&payload, 0x640).unwrap_or(0), le32(&payload, 0x648).unwrap_or(0), StaticInfo::parse(&payload));
             }
             Some((function, _, _)) => log.push(format!("event {function:#x} while waiting for static info")),
             None if crate::time::uptime_ms() > deadline => return Err("no GET_GSP_STATIC_INFO reply in 5 s".into()),
@@ -776,7 +843,8 @@ fn run(log: &mut Log, heap_mib: u64, dry: bool) -> Res<()> {
 
     // Сеанс живёт дальше: дисплей (`nvidia_disp`) продолжает разговор с RM.
     // Память GSP (журналы, очереди, образ) не возвращается никогда.
-    *SESSION.lock() = Some(Session { queues, bar, internal_client: internal.0, internal_subdevice: internal.1 });
+    *SESSION.lock() =
+        Some(Session { queues, bar, internal_client: internal.0, internal_subdevice: internal.1, info: internal.2 });
     Ok(())
 }
 
@@ -786,17 +854,211 @@ pub(crate) struct Session {
     pub(crate) bar: Bar0,
     pub(crate) internal_client: u32,
     pub(crate) internal_subdevice: u32,
+    /// Разобранный ответ GET_GSP_STATIC_INFO (NVK, 18.11).
+    pub(crate) info: StaticInfo,
 }
 
 // SAFETY: очереди — память машины, отданная GSP; ходит один владелец под замком.
 unsafe impl Send for Session {}
 
-pub(crate) static SESSION: crate::sync::SpinLock<Option<Session>> = crate::sync::SpinLock::new(None);
+/// Область видеопамяти, как её описал RM (`fbRegion[]` статических сведений).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FbRegion {
+    pub(crate) base: u64,
+    /// Последний байт включительно.
+    pub(crate) limit: u64,
+    pub(crate) reserved: u64,
+    pub(crate) perf: u32,
+    pub(crate) compr: u8,
+    pub(crate) iso: u8,
+    pub(crate) protected: u8,
+}
+
+/// Что из статических сведений нужно NVK (`nvidia_rm_*`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StaticInfo {
+    pub(crate) name: String,
+    pub(crate) fb_length: u64,
+    pub(crate) regions: Vec<FbRegion>,
+    pub(crate) bar1_pde: u64,
+    pub(crate) bar2_pde: u64,
+}
+
+impl StaticInfo {
+    fn parse(payload: &[u8]) -> Self {
+        let name = payload.get(0x4ec..0x52c).unwrap_or(&[]);
+        let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+        let count = le32(payload, 0x158).unwrap_or(0).min(16) as usize;
+        let regions = (0..count)
+            .map(|i| {
+                let at = 0x160 + i * 48;
+                FbRegion {
+                    base: le64(payload, at).unwrap_or(0),
+                    limit: le64(payload, at + 8).unwrap_or(0),
+                    reserved: le64(payload, at + 16).unwrap_or(0),
+                    perf: le32(payload, at + 24).unwrap_or(0),
+                    compr: payload.get(at + 28).copied().unwrap_or(0),
+                    iso: payload.get(at + 29).copied().unwrap_or(0),
+                    protected: payload.get(at + 30).copied().unwrap_or(0),
+                }
+            })
+            .collect();
+        Self {
+            name: String::from_utf8_lossy(&name[..end]).into_owned(),
+            fb_length: le64(payload, 0x4c8).unwrap_or(0),
+            regions,
+            bar1_pde: le64(payload, 0x600).unwrap_or(0),
+            bar2_pde: le64(payload, 0x608).unwrap_or(0),
+        }
+    }
+}
+
+/// Замок сеанса GSP-RM (NVK, 18.11; спецификация, риск 9).
+///
+/// Раньше сеанс лежал под `SpinLock`, и ожидание ответа RM (до 5 с) шло с
+/// запрещёнными прерываниями. Теперь это флаг занятости: ждущая задача
+/// засыпает по миллисекунде, а держатель работает с разрешёнными
+/// прерываниями. Если звать из места, где спать нельзя (держится спин-лок или
+/// прерывания запрещены), ожидание крутится, как раньше. API тот же
+/// (`lock`/`try_lock`), чтобы дисплей (`nvidia_disp`) и выгрузка не менялись.
+pub(crate) struct SessionLock {
+    busy: core::sync::atomic::AtomicBool,
+    value: core::cell::UnsafeCell<Option<Session>>,
+}
+
+// SAFETY: доступ к `value` — только через `SessionGuard`, который выдаётся
+// после захвата флага `busy` и существует в единственном экземпляре.
+unsafe impl Sync for SessionLock {}
+
+impl SessionLock {
+    const fn new() -> Self {
+        Self { busy: core::sync::atomic::AtomicBool::new(false), value: core::cell::UnsafeCell::new(None) }
+    }
+
+    /// Захватить, если свободен.
+    pub(crate) fn try_lock(&self) -> Option<SessionGuard<'_>> {
+        self.busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+            .then_some(SessionGuard { lock: self })
+    }
+
+    /// Захватить, дождавшись освобождения.
+    pub(crate) fn lock(&self) -> SessionGuard<'_> {
+        loop {
+            if let Some(guard) = self.lock_within(60_000) {
+                return guard;
+            }
+            crate::kprintln!("  nvidia-gsp  : GSP-RM session busy for 60 s - still waiting");
+        }
+    }
+
+    /// Захватить, ожидая не дольше `ms` миллисекунд.
+    pub(crate) fn lock_within(&self, ms: u64) -> Option<SessionGuard<'_>> {
+        let deadline = crate::time::uptime_ms() + ms;
+        loop {
+            if let Some(guard) = self.try_lock() {
+                return Some(guard);
+            }
+            if crate::time::uptime_ms() > deadline {
+                return None;
+            }
+            pause_briefly();
+        }
+    }
+}
+
+/// Доступ к сеансу на время удержания [`SessionLock`].
+pub(crate) struct SessionGuard<'a> {
+    lock: &'a SessionLock,
+}
+
+impl core::ops::Deref for SessionGuard<'_> {
+    type Target = Option<Session>;
+    fn deref(&self) -> &Option<Session> {
+        // SAFETY: охранник существует только при захваченном флаге.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl core::ops::DerefMut for SessionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Option<Session> {
+        // SAFETY: см. `Deref`.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: охранник ещё держит флаг — сеанс читается без гонки.
+        let alive = unsafe { (*self.lock.value.get()).is_some() };
+        RUNNING.store(alive, Ordering::Release);
+        self.lock.busy.store(false, Ordering::Release);
+    }
+}
+
+/// Можно ли здесь уснуть: прерывания разрешены, спин-локов не держим,
+/// планировщик идёт.
+fn may_sleep() -> bool {
+    crate::arch::interrupts::enabled() && !crate::sync::spin_held() && crate::sched::is_running()
+}
+
+/// Короткая пауза ожидания: миллисекунда сна, если можно спать, иначе 100 мкс
+/// активного ожидания.
+pub(crate) fn pause_briefly() {
+    if may_sleep() {
+        crate::sched::sleep_ms(1);
+    } else {
+        spin_us(100);
+    }
+}
+
+pub(crate) static SESSION: SessionLock = SessionLock::new();
+/// Есть ли сеанс — без захвата замка (его спрашивают из композитора).
+static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Работает ли GSP-RM.
 #[must_use]
 pub fn running() -> bool {
-    SESSION.lock().is_some()
+    RUNNING.load(Ordering::Acquire)
+}
+
+/// Окно BAR1 (физический режим: смещение окна == адрес видеопамяти) для
+/// процессора: `[BAR1_WINDOW_START, BAR1_WINDOW_END)` с объединением записи.
+/// Отображается один раз на всю жизнь ядра и общее для дисплея
+/// (`nvidia_disp`) и NVK (`nvidia_rm_vram`): повторное `map_active` того же
+/// куска отвечает `AlreadyMapped` (2-МиБ страницы), и второй потребитель
+/// раньше падал.
+pub(crate) const BAR1_WINDOW_START: u64 = 0x0600_0000;
+pub(crate) const BAR1_WINDOW_END: u64 = 0x1000_0000;
+static BAR1_VIRT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Виртуальный адрес, под которым процессор видит видеопамять
+/// `BAR1_WINDOW_START`; отображает окно при первом вызове.
+pub(crate) fn bar1_window(device: crate::pci::Device) -> Res<usize> {
+    let known = BAR1_VIRT.load(Ordering::Acquire);
+    if known != 0 {
+        return Ok(known);
+    }
+    let bar1 = device.memory_bar(1).ok_or("no BAR1")?.as_u64();
+    let phys = PhysAddr::new(bar1 + BAR1_WINDOW_START);
+    let virt = phys.to_direct_map();
+    // SAFETY: окно видеопамяти карты; запись с объединением (WC), как у дисплея.
+    let mapped = unsafe {
+        crate::arch::map_active(
+            virt,
+            phys,
+            (BAR1_WINDOW_END - BAR1_WINDOW_START) as usize,
+            crate::mm::PageFlags::READ | crate::mm::PageFlags::WRITE | crate::mm::PageFlags::WRITE_COMBINE,
+        )
+    };
+    match mapped {
+        // Уже отображено (прошлый сеанс GSP после `gpu unload`): то же окно.
+        Ok(()) | Err(crate::mm::MapError::AlreadyMapped) => {}
+        Err(why) => return Err(format!("could not map BAR1: {why}")),
+    }
+    BAR1_VIRT.store(virt.as_usize(), Ordering::Release);
+    Ok(virt.as_usize())
 }
 
 /// Состояние BAR1 и дисплейных головок — для журнала.
@@ -817,6 +1079,81 @@ fn snapshot(bar: Bar0) -> String {
         out.push_str(&format!(" | head{head} raster {raster:#x} line {line0}->{line1}"));
     }
     out
+}
+
+// --- события GSP (NVK, 18.11) ----------------------------------------------
+//
+// Номера — r570.144 (`rm/r570/nvrm/msgfn.h` в Linux): у r535 часть
+// номеров после 0x101a сдвинута, поэтому только эти.
+
+const EV_POST_EVENT: u32 = 0x1003;
+const EV_RC_TRIGGERED: u32 = 0x1004;
+const EV_MMU_FAULT_QUEUED: u32 = 0x1005;
+const EV_OS_ERROR_LOG: u32 = 0x1006;
+const EV_UCODE_LIBOS_PRINT: u32 = 0x100c;
+const EV_GSP_LOCKDOWN_NOTICE: u32 = 0x101c;
+const EV_GSP_POST_NOCAT_RECORD: u32 = 0x1020;
+const EV_FECS_ERROR: u32 = 0x1021;
+
+/// Каналы, которые RM объявил убитыми (RC_TRIGGERED): (chid, тип исключения).
+/// Читает и очищает `nvidia_rm_chan`.
+pub(crate) static RC_CHIDS: crate::sync::SpinLock<Vec<(u32, u32)>> = crate::sync::SpinLock::new(Vec::new());
+static EVENTS_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Первые `n` байт в шестнадцатеричном виде — для журнала.
+pub(crate) fn hex_head(bytes: &[u8], n: usize) -> String {
+    let mut out = String::new();
+    for (i, b) in bytes.iter().take(n).enumerate() {
+        if i > 0 && i % 4 == 0 {
+            out.push(' ');
+        }
+        out.push_str(&format!("{b:02x}"));
+    }
+    if bytes.len() > n {
+        out.push_str("..");
+    }
+    out
+}
+
+/// Печатный текст из байтов (строки ошибок RM).
+fn printable(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    bytes[..end].iter().map(|b| if (0x20..0x7f).contains(b) { char::from(*b) } else { '.' }).collect()
+}
+
+/// Разобрать событие GSP, пришедшее без запроса. Строка — для журнала
+/// (`nvgpu: gsp event ...`); `None` — событие нам неизвестно. RC_TRIGGERED
+/// запоминается в [`RC_CHIDS`] (канал убит — `chan_seq_done` вернёт ENODEV).
+pub(crate) fn gsp_event(function: u32, result: u32, p: &[u8]) -> Option<String> {
+    let w = |at: usize| le32(p, at).unwrap_or(0);
+    let line = match function {
+        EV_RC_TRIGGERED => {
+            let (engine, chid, level, kind) = (w(0), w(4), w(12), w(16));
+            RC_CHIDS.lock().push((chid, kind));
+            format!(
+                "RC_TRIGGERED chid {chid} engine {engine} exceptLevel {level} exceptType {kind:#x} scope {} mmu fault {:#x} type {} (head {})",
+                w(20),
+                u64::from(w(28)) | (u64::from(w(32)) << 32),
+                w(36),
+                hex_head(p, 0x30)
+            )
+        }
+        EV_MMU_FAULT_QUEUED => format!("MMU_FAULT_QUEUED ({} B: {})", p.len(), hex_head(p, 0x40)),
+        EV_OS_ERROR_LOG => format!("OS_ERROR_LOG exceptType {:#x} '{}'", w(0), printable(p.get(8..).unwrap_or(&[]))),
+        EV_POST_EVENT => format!("POST_EVENT ({} B: {})", p.len(), hex_head(p, 0x20)),
+        EV_UCODE_LIBOS_PRINT => format!("UCODE_LIBOS_PRINT engine {:#x} ({} B: {})", w(0), p.len(), hex_head(p, 0x20)),
+        EV_GSP_LOCKDOWN_NOTICE => format!("GSP_LOCKDOWN_NOTICE {:#x}", w(0)),
+        EV_GSP_POST_NOCAT_RECORD => format!("GSP_POST_NOCAT_RECORD ({} B)", p.len()),
+        EV_FECS_ERROR => format!("FECS_ERROR ({} B: {})", p.len(), hex_head(p, 0x20)),
+        _ => return None,
+    };
+    let line = format!("nvgpu: gsp event {function:#x} (result {result:#x}) {line}");
+    // Журнал не топится: первые 64 события и каждое RC — сразу на флешку.
+    let n = EVENTS_LOGGED.fetch_add(1, Ordering::Relaxed);
+    if n < 64 || function == EV_RC_TRIGGERED {
+        crate::kprintln!("  {line}");
+    }
+    Some(line)
 }
 
 // --- RM: объекты и управление (этап 6) --------------------------------------
@@ -840,8 +1177,18 @@ pub(crate) struct Rm<'a> {
 impl Rm<'_> {
     /// Послать RPC и дождаться ответа с той же функцией (события — мимо).
     pub(crate) fn call(&mut self, function: u32, payload: &[u8]) -> Res<Vec<u8>> {
+        self.call_within(function, payload, 5000)
+    }
+
+    /// То же, но ждать ответа не дольше `ms` миллисекунд.
+    ///
+    /// Ждёт сначала 2 мс активно (ответы RM обычно быстрее), потом засыпает
+    /// по миллисекунде, если здесь можно спать (замок сеанса — не спин-лок).
+    /// События GSP, пришедшие по дороге, разбирает [`gsp_event`].
+    pub(crate) fn call_within(&mut self, function: u32, payload: &[u8], ms: u64) -> Res<Vec<u8>> {
         self.queues.send(Some(self.bar), function, payload)?;
-        let deadline = crate::time::uptime_ms() + 5000;
+        let start = crate::time::uptime_ms();
+        let deadline = start + ms;
         loop {
             match self.queues.receive()? {
                 Some((f, result, reply)) if f == function => {
@@ -850,24 +1197,67 @@ impl Rm<'_> {
                     }
                     return Ok(reply);
                 }
-                Some((f, _, _)) => self.log.push(format!("event {f:#x} during RPC {function}")),
-                None if crate::time::uptime_ms() > deadline => return Err(format!("no reply to RPC {function} in 5 s")),
-                None => spin_us(200),
+                Some((f, result, payload)) => {
+                    if let Some(line) = gsp_event(f, result, &payload) {
+                        self.log.push(line);
+                    } else {
+                        self.log.push(format!("event {f:#x} during RPC {function}"));
+                    }
+                }
+                None if crate::time::uptime_ms() > deadline => return Err(format!("no reply to RPC {function} in {ms} ms")),
+                None if crate::time::uptime_ms() < start + 2 => spin_us(50),
+                None => pause_briefly(),
             }
         }
     }
 
-    /// GSP_RM_ALLOC: объект `class` с хэндлом `object` под `parent`.
+    /// Разобрать пришедшие без запроса события (NVK: перед каждым витком
+    /// ожидания забора). Ничего не ждёт.
+    pub(crate) fn pump(&mut self) -> Res<usize> {
+        let mut seen = 0;
+        while let Some((f, result, payload)) = self.queues.receive()? {
+            seen += 1;
+            if let Some(line) = gsp_event(f, result, &payload) {
+                self.log.push(line);
+            } else {
+                self.log.push(format!("unsolicited message {f:#x} (result {result:#x}, {} B)", payload.len()));
+            }
+        }
+        Ok(seen)
+    }
+
+    /// GSP_RM_ALLOC: объект `class` с хэндлом `object` под `parent` нашего
+    /// клиента дисплея.
     pub(crate) fn alloc(&mut self, parent: u32, object: u32, class: u32, params: &[u8]) -> Res<()> {
+        self.alloc_in(H_CLIENT, parent, object, class, params).map(|_| ())
+    }
+
+    /// GSP_RM_ALLOC от имени клиента `client` (NVK: у каждого адресного
+    /// пространства свой клиент). Возвращает ответные параметры (RM пишет в
+    /// них, например, выбранные значения). При ошибке — статус и начало
+    /// сырого ответа (раскладки 570 против 535 сверяются по ним).
+    pub(crate) fn alloc_in(&mut self, client: u32, parent: u32, object: u32, class: u32, params: &[u8]) -> Res<Vec<u8>> {
         let mut p = alloc::vec![0u8; 0x20 + params.len()];
-        for (at, v) in [(0, H_CLIENT), (4, parent), (8, object), (12, class), (0x14, params.len() as u32)] {
+        for (at, v) in [(0, client), (4, parent), (8, object), (12, class), (0x14, params.len() as u32)] {
             p[at..at + 4].copy_from_slice(&v.to_le_bytes());
         }
         p[0x20..].copy_from_slice(params);
         let reply = self.call(FN_RM_ALLOC, &p)?;
         let status = le32(&reply, 0x10)?;
         if status != 0 {
-            return Err(format!("alloc class {class:#x} status {status:#x}"));
+            return Err(format!("alloc class {class:#x} handle {object:#x} status {status:#x} (reply head {})", hex_head(&reply, 0x40)));
+        }
+        Ok(reply.get(0x20..).unwrap_or(&[]).to_vec())
+    }
+
+    /// RPC FREE: снять объект `object` (с потомками) у клиента `client`.
+    /// Клиент снимается так: `client, 0, client`.
+    pub(crate) fn free_in(&mut self, client: u32, parent: u32, object: u32) -> Res<()> {
+        let free = [client, parent, object, 0].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let reply = self.call_within(FN_FREE, &free, 2000)?;
+        let status = le32(&reply, 12).unwrap_or(u32::MAX);
+        if status != 0 {
+            return Err(format!("free {object:#x} status {status:#x}"));
         }
         Ok(())
     }
@@ -882,7 +1272,7 @@ impl Rm<'_> {
         let reply = self.call(FN_RM_CONTROL, &p)?;
         let status = le32(&reply, 0x0c)?;
         if status != 0 {
-            return Err(format!("control {cmd:#x} status {status:#x}"));
+            return Err(format!("control {cmd:#x} status {status:#x} (reply head {})", hex_head(&reply, 0x40)));
         }
         Ok(reply.get(0x18..).unwrap_or(&[]).to_vec())
     }
@@ -1151,14 +1541,266 @@ fn run_sequencer(bar: Bar0, payload: &[u8], libos: u64, app_version: u32) -> Res
     Ok(format!("sequencer: {} op(s) [{}]", ops.len(), ops.join(" ")))
 }
 
+// --- выгрузка GSP-RM: WPR2 снимается без выключения питания -----------------
+//
+// 18.11: после GSP-RM область WPR2 держалась до выключения питания, и после
+// горячей перезагрузки драйвер не запускался. Порядок — как у nouveau при
+// выгрузке (`tu102_gsp_fini` → `r535_gsp_fini`, `nvkm_gsp_fwsec_sb`,
+// `tu102_gsp_booter_unload`) и nova-core (`Gsp::unload`, `shutdown_gsp`,
+// `Sec2UnloadBundle::run` в `gsp/hal/tu102.rs`):
+//
+// 1. RPC FREE нашего клиента RM (`r535_gsp_rpc_rm_free`) — RM сам разбирает
+//    всё под ним, в том числе каналы дисплея;
+// 2. RPC UNLOADING_GUEST_DRIVER (47) c `bInPMTransition = 0`, `newLevel = 0`
+//    (`r535_gsp_rpc_unloading_guest_driver`), ждать ответа;
+// 3. ждать бит 31 в MAILBOX0 процессора GSP (LIBOS «processor suspended»:
+//    nouveau ждёт 2 с, nova — 5 с);
+// 4. FWSEC-SB на процессоре GSP (сброс GSP в состояние «до LIBOS»);
+// 5. booter_unload на SEC2 с 0xff/0xff в почтовых ящиках; MAILBOX0 должен
+//    стать 0, WPR2 (0x1fa828) — исчезнуть.
+//
+// Каждый шаг ограничен по времени; неудача пишется в журнал и не мешает
+// следующим шагам и перезагрузке.
+
+const FN_UNLOADING_GUEST_DRIVER: u32 = 47;
+
+/// Что нужно для выгрузки и чего при выключении может уже не быть: флешки
+/// (booter_unload) и, на всякий случай, окна PROM (FWSEC-SB). Готовится при
+/// запуске GSP-RM и при восстановлении на загрузке.
+struct UnloadKit {
+    booter: Option<Booter>,
+    sb: Option<super::nvidia::FwsecImage>,
+}
+
+static UNLOAD_KIT: crate::sync::SpinLock<UnloadKit> = crate::sync::SpinLock::new(UnloadKit { booter: None, sb: None });
+
+/// Приготовить booter_unload (`BOOTUNLD.BIN`) и FWSEC-SB, если ещё нет.
+fn prepare_unload_kit(log: &mut Log) {
+    let bar = super::nvidia::card().map(|(_, bar)| bar);
+    let (have_booter, have_sb) = {
+        let kit = UNLOAD_KIT.lock();
+        (kit.booter.is_some(), kit.sb.is_some())
+    };
+    if !have_booter {
+        match read_whole("BOOTUNLD.BIN").and_then(|bytes| Booter::parse("BOOTUNLD.BIN", &bytes, bar)) {
+            Ok(booter) => {
+                log.push(format!("booter_unload cached for unload: {}", booter.describe()));
+                UNLOAD_KIT.lock().booter = Some(booter);
+            }
+            Err(why) => log.push(format!("booter_unload NOT cached - {why}; WPR2 will stay until power-off")),
+        }
+    }
+    if !have_sb && bar.is_some() {
+        let mut lines = Log::new();
+        match super::nvidia::prepare_fwsec_sb(&mut lines) {
+            Ok(image) => {
+                log.push("FWSEC-SB prepared for unload".into());
+                UNLOAD_KIT.lock().sb = Some(image);
+            }
+            Err(why) => {
+                log.extend(lines.into_iter().map(|l| format!("FWSEC-SB prepare: {l}")));
+                log.push(format!("FWSEC-SB NOT prepared - {why}"));
+            }
+        }
+    }
+}
+
+/// Поднят ли WPR2 (как его проверяет весь драйвер: HI >> 4).
+fn wpr2_set(bar: Bar0) -> bool {
+    bar.rd(0x001f_a828) >> 4 != 0
+}
+
+fn wpr2_text(bar: Bar0) -> String {
+    let (lo, hi) = (bar.rd(0x001f_a824), bar.rd(0x001f_a828));
+    if hi >> 4 == 0 {
+        format!("WPR2 {lo:#010x}..{hi:#010x} (not set)")
+    } else {
+        format!("WPR2 {lo:#010x}..{hi:#010x} (SET: {:#x}..{:#x})", u64::from(lo >> 4) << 12, (u64::from(hi >> 4) << 12) + 0x1000)
+    }
+}
+
+fn gsp_state(bar: Bar0) -> String {
+    format!(
+        "GSP RISCV_CPUCTL {:#x} CPUCTL {:#x} MAILBOX0 {:#x} MAILBOX1 {:#x} BCR {:#x}; SEC2 CPUCTL {:#x} MAILBOX0 {:#x}",
+        bar.rd(GSP2 + 0x388),
+        bar.rd(GSP + 0x100),
+        bar.rd(GSP + 0x40),
+        bar.rd(GSP + 0x44),
+        bar.rd(GSP2 + 0x668),
+        bar.rd(SEC2 + 0x100),
+        bar.rd(SEC2 + 0x40)
+    )
+}
+
+/// Журнал выгрузки: каждая строка — сразу в `kprintln` (если что-то
+/// повиснет, на флешке останется, на каком шаге), и в отчёт.
+struct Steps {
+    log: Log,
+    printed: usize,
+}
+
+impl Steps {
+    fn push(&mut self, line: String) {
+        self.log.push(line);
+        self.flush();
+    }
+    fn flush(&mut self) {
+        for line in &self.log[self.printed..] {
+            crate::kprintln!("  nvidia-gsp  : unload: {line}");
+        }
+        self.printed = self.log.len();
+    }
+}
+
+/// Шаги 4–5: FWSEC-SB и booter_unload, проверка WPR2. Истина — WPR2 снят.
+fn release_wpr2(steps: &mut Steps, bar: Bar0) -> bool {
+    if !wpr2_set(bar) {
+        steps.push(format!("{} - nothing to release", wpr2_text(bar)));
+        return true;
+    }
+    // Шина: память и управление шиной — booter и FWSEC читают себя из памяти
+    // машины (на загрузке после горячей перезагрузки FRTS ещё не включал их).
+    if let Some((device, _)) = super::nvidia::card() {
+        // SAFETY: регистр команд конфигурационного пространства этой карты.
+        unsafe { device.write_config8(0x04, device.config8(0x04) | 0x06) };
+    }
+    let Some(kit) = UNLOAD_KIT.try_lock() else {
+        steps.push("unload kit is busy - skipped".into());
+        return false;
+    };
+    match kit.sb.as_ref() {
+        Some(sb) => {
+            let mut lines = Log::new();
+            let outcome = super::nvidia::run_fwsec_sb(&mut lines, sb);
+            for line in lines {
+                steps.push(format!("FWSEC-SB: {line}"));
+            }
+            match outcome {
+                Ok(()) => steps.push(format!("FWSEC-SB done; {}", gsp_state(bar))),
+                // nouveau и nova: ошибка SB — в журнал, booter_unload всё равно.
+                Err(why) => steps.push(format!("FWSEC-SB failed - {why}; trying booter_unload anyway")),
+            }
+        }
+        None => steps.push("FWSEC-SB not prepared - going straight to booter_unload".into()),
+    }
+    let Some(booter) = kit.booter.as_ref() else {
+        steps.push("booter_unload not cached (BOOTUNLD.BIN was missing at GSP start) - WPR2 stays".into());
+        return false;
+    };
+    steps.push(format!("booter_unload on SEC2, mailboxes 0xff/0xff ({})", booter.describe()));
+    let started = crate::time::uptime_ms();
+    match booter.run(bar, 0xff, 0xff) {
+        Ok((halted, m0, m1)) => steps.push(format!(
+            "booter_unload {} after {} ms: MAILBOX0 {m0:#x} (0 = ok, 0xff = did not run), MAILBOX1 {m1:#x}, SEC2 CPUCTL {:#x}",
+            if halted { "halted" } else { "did NOT halt" },
+            crate::time::uptime_ms() - started,
+            bar.rd(SEC2 + 0x100)
+        )),
+        Err(why) => steps.push(format!("booter_unload failed to start - {why}")),
+    }
+    let released = !wpr2_set(bar);
+    steps.push(format!("{} - {}", wpr2_text(bar), if released { "RELEASED" } else { "still set" }));
+    released
+}
+
+/// Выгрузить GSP-RM и снять WPR2: при перезагрузке и выключении
+/// (`power::shut_down`) и командой `gpu unload`. Без карты — ничего и молча.
+/// Худший случай по времени — около 15 с (каждое ожидание ограничено).
+pub fn unload(reason: &str) -> Log {
+    let Some((_, bar)) = super::nvidia::card() else { return Log::new() };
+    let mut steps = Steps { log: Log::new(), printed: 0 };
+    let started = crate::time::uptime_ms();
+
+    // Сеанс забирается насовсем: после выгрузки с RM никто не говорит.
+    let mut session = None;
+    let deadline = started + 2000;
+    loop {
+        if let Some(mut guard) = SESSION.try_lock() {
+            session = guard.take();
+            break;
+        }
+        if crate::time::uptime_ms() > deadline {
+            steps.push("GSP-RM session is busy for 2 s - skipping the RM steps".into());
+            break;
+        }
+        spin_us(1000);
+    }
+    if session.is_none() && !wpr2_set(bar) {
+        steps.push(format!("({reason}) GSP-RM not running, {} - nothing to do", wpr2_text(bar)));
+        return steps.log;
+    }
+    steps.push(format!("({reason}) start: {}; {}", wpr2_text(bar), gsp_state(bar)));
+
+    if let Some(mut session) = session {
+        super::nvidia_disp::forget();
+        let mut rm = Rm { queues: &mut session.queues, bar, log: Vec::new() };
+        // 0. NVK: бэкенд больше не принимает вызовов, клиенты RM адресных
+        // пространств (с каналами под ними) снимаются первыми.
+        for line in super::nvidia_rm_chan::shutdown(&mut rm) {
+            steps.push(line);
+        }
+        // 1. Наш клиент RM (с устройством, дисплеем и каналами под ним).
+        let free = [H_CLIENT, 0, H_CLIENT, 0].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        match rm.call_within(FN_FREE, &free, 1000) {
+            Ok(r) => steps.push(format!("RPC FREE client {H_CLIENT:#x}: status {:#x}", le32(&r, 12).unwrap_or(u32::MAX))),
+            Err(why) => steps.push(format!("RPC FREE client {H_CLIENT:#x} - {why} (going on)")),
+        }
+        // 2. UNLOADING_GUEST_DRIVER: bInPMTransition 0, bGc6Entering 0, newLevel 0.
+        let t = crate::time::uptime_ms();
+        match rm.call_within(FN_UNLOADING_GUEST_DRIVER, &[0u8; 8], 3000) {
+            Ok(_) => steps.push(format!("RPC UNLOADING_GUEST_DRIVER: replied after {} ms", crate::time::uptime_ms() - t)),
+            Err(why) => steps.push(format!("RPC UNLOADING_GUEST_DRIVER - {why} (going on)")),
+        }
+        for line in core::mem::take(&mut rm.log) {
+            steps.push(format!("RM: {line}"));
+        }
+        // 3. GSP сообщает «остановился» битом 31 в MAILBOX0.
+        let t = crate::time::uptime_ms();
+        let suspended = bar.wait(3_000_000, |b| b.rd(GSP + 0x40) & 0x8000_0000 != 0);
+        steps.push(format!(
+            "GSP {} after {} ms; {}",
+            if suspended { "suspended (MAILBOX0 bit 31)" } else { "did NOT report suspend in 3 s" },
+            crate::time::uptime_ms() - t,
+            gsp_state(bar)
+        ));
+    }
+
+    // 4–5. FWSEC-SB и booter_unload.
+    let released = release_wpr2(&mut steps, bar);
+    steps.push(format!(
+        "({reason}) {} in {} ms",
+        if released { "done: WPR2 released, the next boot can start GSP-RM" } else { "FAILED: WPR2 stays until power-off" },
+        crate::time::uptime_ms() - started
+    ));
+    steps.log
+}
+
+/// Восстановление на загрузке: WPR2 уже поднят (наш прошлый сеанс без
+/// выгрузки или другая система при горячей перезагрузке). Ни nouveau, ни
+/// nova этого не делают (nova: «GPU needs to be reset»), поэтому это опыт:
+/// старого RM не спросить (его очередей нет), так что сразу шаги 4–5 —
+/// FWSEC-SB сбрасывает процессор GSP, booter_unload снимает WPR2.
+fn recover_stale_wpr2(bar: Bar0) -> bool {
+    let mut steps = Steps { log: Log::new(), printed: 0 };
+    steps.push(format!("(boot recovery) {} left from before this boot; {}", wpr2_text(bar), gsp_state(bar)));
+    let mut log = Log::new();
+    prepare_unload_kit(&mut log);
+    for line in log {
+        steps.push(line);
+    }
+    let released = release_wpr2(&mut steps, bar);
+    steps.push(format!("(boot recovery) {}", if released { "WPR2 released - starting GSP-RM normally" } else { "FAILED" }));
+    released
+}
+
 /// Автозапуск при загрузке (16.11, Роман: «система после запуска проверяет
 /// драйвера и устройства и сама применяет драйвер»): дождаться флешки или
 /// диска с прошивкой, запустить GSP-RM, зажечь мониторы и перевести стол на
 /// основной.
 ///
 /// Не запускается, если в меню загрузки выбран «экран прошивки», если карта
-/// не из поддержанных (GA102–GA107) или если WPR2 уже задан (горячая
-/// перезагрузка без снятия питания: повторный запуск GSP невозможен).
+/// не из поддержанных (GA102–GA107) или если WPR2 уже задан и снять его
+/// booter_unload не вышло (горячая перезагрузка без выгрузки GSP-RM).
 /// Ставить ли режим сразу после автозапуска GSP-RM (см. `auto_task`).
 /// Снова да с 16.11: после флагов ctxdma 0x45 `gpu display` на ПК Романа
 /// зажёг оба монитора 2560x1440.
@@ -1175,10 +1817,6 @@ pub fn auto_task() {
         crate::kprintln!("  nvidia-gsp  : auto start: chip {chip:#x} is not done yet, staying on the firmware display");
         return;
     }
-    if bar.rd(0x001f_a828) >> 4 != 0 {
-        crate::kprintln!("  nvidia-gsp  : auto start skipped - WPR2 already set (warm reboot); power the machine off to use the driver");
-        return;
-    }
     // Прошивку даёт флешка (Live) — она монтируется задачей USB чуть позже.
     let deadline = crate::time::uptime_ms() + 90_000;
     while open("GSP.BIN").is_err() {
@@ -1188,10 +1826,34 @@ pub fn auto_task() {
         }
         crate::sched::sleep_ms(1000);
     }
+    // WPR2 уже поднят (горячая перезагрузка): попробовать снять его
+    // booter_unload — нужен BOOTUNLD.BIN с той же флешки.
+    if wpr2_set(bar) {
+        if !recover_stale_wpr2(bar) {
+            crate::kprintln!("  nvidia-gsp  : auto start skipped - WPR2 already set (warm reboot); power the machine off to use the driver");
+            return;
+        }
+    }
     crate::kprintln!("  nvidia-gsp  : auto start: firmware found, starting GSP-RM");
     let log = boot_gsp("");
     if !log.iter().any(|l| l == "GSP-RM: running") {
         return;
+    }
+    for line in after_boot() {
+        crate::kprintln!("  nvidia-gsp  : auto start: {line}");
+    }
+}
+
+/// Что делается после подъёма GSP-RM (автозапуск и перезапуск после `gpu
+/// unload`): бэкенд NVK, режимы мониторов, стол на основной монитор.
+fn after_boot() -> Log {
+    let mut log = Log::new();
+    // NVK (18.11): бэкенд GPU для слоя DRM — только сведения и арены, на
+    // карте ничего не создаётся; узел /dev/dri включается отдельно.
+    let mut nvk = Log::new();
+    match super::nvidia_rm_chan::attach(&mut nvk) {
+        Ok(_) => log.push("NVK backend attached".into()),
+        Err(why) => log.push(format!("NVK backend not attached - {why}")),
     }
     // Режимы мониторов — сохранённые «Параметрами» (modeset берёт их сам по
     // паспорту монитора, а не предложенный — родной). Места, основной и
@@ -1203,15 +1865,68 @@ pub fn auto_task() {
     // железе, сам он не запускается — картинка остаётся от прошивки, а
     // проверка — командой `gpu display` (на ней и смотрим журнал).
     if !AUTO_MODESET {
-        crate::kprintln!("  nvidia-gsp  : auto start: GSP-RM up; modeset is manual for now ('gpu display')");
-        return;
+        log.push("GSP-RM up; modeset is manual for now ('gpu display')".into());
+        return log;
     }
-    let _ = super::nvidia_disp::modeset(&[]);
+    let modeset = super::nvidia_disp::modeset(&[]);
+    if let Some(stop) = modeset.iter().find(|l| l.starts_with("display: stopped")) {
+        log.push(format!("modeset: {stop}"));
+    }
     if let Some(plan) = crate::ui::saved_layout() {
-        crate::kprintln!("  nvidia-gsp  : auto start: saved monitor layout ({} output(s))", plan.len());
+        log.push(format!("saved monitor layout ({} output(s))", plan.len()));
         crate::ui::apply_layout(plan);
     } else if let Some((w, h)) = super::nvidia_disp::primary_size() {
         crate::ui::request_mode(w, h);
-        crate::kprintln!("  nvidia-gsp  : auto start: desktop moves to {w}x{h}");
+        log.push(format!("desktop moves to {w}x{h}"));
+    } else {
+        log.push("no monitor lit - the desktop stays where it was".into());
     }
+    log
+}
+
+/// Перезапуск GSP-RM после выгрузки (`gpu unload`, 19.11): цель выгрузки —
+/// тёплая перезагрузка без снятия питания, а проверка без перезагрузки
+/// оставляла чёрный экран (hw-log10: головы разобрал RM вместе с клиентом,
+/// GOP-кадра больше нет — он жил в видеопамяти). Здесь — то же, что на
+/// загрузке после снятого WPR2: FWSEC-FRTS, booter, GSP-RM, затем режимы и
+/// стол (кадры стола лежат в тех же местах видеопамяти — картинка
+/// возвращается как была). Удачный перезапуск заодно доказывает, что
+/// следующая тёплая перезагрузка поднимет карту.
+pub fn restart(reason: &str) -> Log {
+    let mut log = Log::new();
+    let Some((_, bar)) = super::nvidia::card() else { return log };
+    let started = crate::time::uptime_ms();
+    if running() {
+        log.push(format!("({reason}) restart: GSP-RM is already running"));
+        return log;
+    }
+    if wpr2_set(bar) {
+        log.push(format!("({reason}) restart: {} - GSP-RM cannot start until power-off", wpr2_text(bar)));
+        return log;
+    }
+    if open("GSP.BIN").is_err() {
+        log.push(format!("({reason}) restart: no NVIDIA firmware (FREEOS/NVIDIA) - stays off"));
+        return log;
+    }
+    log.push(format!("({reason}) restart: starting GSP-RM again ({})", wpr2_text(bar)));
+    let boot = boot_gsp("");
+    let up = boot.iter().any(|l| l == "GSP-RM: running");
+    log.push(format!(
+        "({reason}) restart: GSP-RM {} after {} ms{}",
+        if up { "running" } else { "did NOT start" },
+        crate::time::uptime_ms() - started,
+        if up { String::new() } else { format!(" - last: {}", boot.iter().rev().take(3).cloned().collect::<Vec<_>>().join(" | ")) }
+    ));
+    if up {
+        log.extend(after_boot());
+        log.push(format!(
+            "({reason}) restart: display {} in {} ms total",
+            super::nvidia_disp::describe(),
+            crate::time::uptime_ms() - started
+        ));
+    }
+    for line in &log {
+        crate::kprintln!("  nvidia-gsp  : {line}");
+    }
+    log
 }

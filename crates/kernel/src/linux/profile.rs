@@ -53,6 +53,17 @@ pub fn report(reset: bool) -> Vec<(usize, u64, u64)> {
     rows
 }
 
+/// Число слотов счёта (номера вызовов и виды отказов страниц).
+pub const COUNT: usize = SLOTS;
+
+/// Снимок счёта без сброса — `(раз, наносекунд)` на слот (`perf-diag`
+/// считает разность с прошлым снимком и `lxstat` не трогает).
+pub fn snapshot(out: &mut [(u64, u64)]) {
+    for (number, cell) in out.iter_mut().enumerate().take(SLOTS) {
+        *cell = (CALLS[number].load(Ordering::Relaxed), NANOS[number].load(Ordering::Relaxed));
+    }
+}
+
 /// Имя вызова для таблицы — самые частые; остальные — номером.
 #[must_use]
 pub fn name(number: usize) -> &'static str {
@@ -124,7 +135,15 @@ pub fn name(number: usize) -> &'static str {
         290 => "eventfd2",
         293 => "pipe2",
         318 => "getrandom",
+        326 => "copy_file_range",
         332 => "statx",
+        40 => "sendfile",
+        233 => "epoll_ctl",
+        234 => "tgkill",
+        299 => "recvmmsg",
+        435 => "clone3",
+        441 => "epoll_pwait2",
+        449 => "futex_waitv",
         // Не вызовы — отказы страниц (`user::fault_in`).
         500 => "#pf missing",
         501 => "#pf write (cow/jit)",

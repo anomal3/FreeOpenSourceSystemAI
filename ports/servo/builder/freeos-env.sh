@@ -50,6 +50,8 @@ eval "export CC_$KEY=$ARCH-freeos-cc CXX_$KEY=$ARCH-freeos-c++ AR_$KEY=llvm-ar"
 PC=/tmp/pkgconfig-$ARCH
 mkdir -p $PC
 for f in $SR/pkgconfig/*.pc; do
+    # В CI библиотек с .pc в sysroot может не быть (собран только libc++).
+    [ -f "$f" ] || continue
     sed 's#[A-Za-z]:/BlueGit/FreeOpenSourseSystemAI#/work#g' "$f" > $PC/$(basename "$f")
 done
 export PKG_CONFIG_ALLOW_CROSS=1

@@ -165,6 +165,13 @@ pub struct BitmapFrameAllocator {
     /// `free` возвращает его в пул; больше нуля — `free` только уменьшает
     /// счёт.
     shares: Option<PhysAddr>,
+    /// Номер кадра за концом последнего Usable-региона (20.11.2026) — длина
+    /// таблицы [`Self::shares`]. Не [`Self::frames`]: тот считается по
+    /// **всем** регионам, а QEMU q35 описывает зарезервированную дыру у
+    /// 1 ТиБ — таблица на 2^28 кадров просила 512 МиБ подряд, и на машине с
+    /// 512 МиБ её не было никогда: `fork` копировал каждую страницу вместо
+    /// копирования при записи, а на 8 ГиБ таблица съедала 512 МиБ.
+    usable_frames: usize,
 }
 
 /// Верхняя граница кадра под код запуска: 640 КиБ.
@@ -203,6 +210,7 @@ impl BitmapFrameAllocator {
         // usable: карта должна описывать и дыры тоже, иначе кадр, случайно
         // выданный из неописанной области, не с чем будет сверить.
         let mut top: u64 = 0;
+        let mut usable_top: u64 = 0;
         let mut host_start: u64 = 0;
         let mut host_len: u64 = 0;
         for index in 0..count {
@@ -218,6 +226,9 @@ impl BitmapFrameAllocator {
                 continue;
             };
             top = top.max(end.min(MAX_TRACKED_PHYS));
+            if region.kind == KIND_USABLE {
+                usable_top = usable_top.max(end.min(MAX_TRACKED_PHYS));
+            }
             if region.kind == KIND_USABLE && region.len > host_len {
                 host_start = region.start;
                 host_len = region.len;
@@ -258,6 +269,7 @@ impl BitmapFrameAllocator {
             low_frame: None,
             low_root: None,
             shares: None,
+            usable_frames: ((usable_top >> PAGE_SHIFT) as usize).min(frames),
         };
 
         // Всё занято, пока карта памяти не докажет обратное.
@@ -327,13 +339,14 @@ impl BitmapFrameAllocator {
     /// копирует страницу.
     pub fn share(&mut self, frame: PhysAddr) -> bool {
         let index = (frame.as_u64() >> PAGE_SHIFT) as usize;
-        if index >= self.frames || !self.is_used(index) {
+        // Кадры выше последнего Usable-региона пул не выдаёт — делить нечего.
+        if index >= self.usable_frames || !self.is_used(index) {
             return false;
         }
         let table = match self.shares {
             Some(table) => table,
             None => {
-                let pages = (self.frames * 2).div_ceil(PAGE_SIZE);
+                let pages = (self.usable_frames * 2).div_ceil(PAGE_SIZE);
                 let Some(table) = self.allocate_contiguous(pages) else {
                     return false;
                 };
@@ -359,7 +372,7 @@ impl BitmapFrameAllocator {
         let index = (frame.as_u64() >> PAGE_SHIFT) as usize;
         match self.shares {
             // SAFETY: см. `share`.
-            Some(table) if index < self.frames => unsafe { *self.share_slot(table, index) > 0 },
+            Some(table) if index < self.usable_frames => unsafe { *self.share_slot(table, index) > 0 },
             _ => false,
         }
     }
@@ -691,7 +704,7 @@ impl FrameAllocator for BitmapFrameAllocator {
         }
         // Разделённый кадр (фаза 71g): уходит один владелец, кадр остаётся
         // остальным.
-        if let Some(table) = self.shares {
+        if let Some(table) = self.shares.filter(|_| index < self.usable_frames) {
             let slot = self.share_slot(table, index);
             // SAFETY: см. `share`.
             unsafe {

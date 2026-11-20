@@ -592,6 +592,10 @@ pub fn boot_fwsec() -> alloc::vec::Vec<alloc::string::String> {
     log
 }
 
+/// Команды FWSEC — `init_cmd` приложения DMEMMAPPER (nouveau `nvfw/fw.h`).
+const FWSEC_CMD_FRTS: u32 = 0x15;
+const FWSEC_CMD_SB: u32 = 0x19;
+
 #[allow(clippy::too_many_lines)]
 fn run_fwsec(log: &mut alloc::vec::Vec<alloc::string::String>) -> Result<(), alloc::string::String> {
     use alloc::format;
@@ -606,13 +610,7 @@ fn run_fwsec(log: &mut alloc::vec::Vec<alloc::string::String>) -> Result<(), all
     }
 
     // 1. Прошивка карты закончила свой запуск (GFW boot).
-    if !bar.wait(4_000_000, |b| b.rd(0x0011_8128) & 1 != 0 && b.rd(0x0011_8234) & 0xff == 0xff) {
-        return Err(format!(
-            "GFW boot not complete (0x118128 {:#x}, 0x118234 {:#x})",
-            bar.rd(0x0011_8128),
-            bar.rd(0x0011_8234)
-        ));
-    }
+    wait_gfw_boot(bar)?;
     let (lo, hi) = (bar.rd(NV_PFB_WPR2_ADDR_LO), bar.rd(NV_PFB_WPR2_ADDR_HI));
     if hi >> 4 != 0 {
         return Err(format!("WPR2 already set ({lo:#010x}..{hi:#010x}) - needs a GPU reset (power off)"));
@@ -645,7 +643,81 @@ fn run_fwsec(log: &mut alloc::vec::Vec<alloc::string::String>) -> Result<(), all
         return Err("FRTS address does not fit the command".into());
     }
 
-    // 3. Микрокод FWSEC из прошивки карты.
+    // 3–4. Микрокод FWSEC из прошивки карты: копия, подпись и команда FRTS.
+    let image = prepare_fwsec(log, bar, FWSEC_CMD_FRTS, frts_base, frts_size)?;
+
+    // Шина: память и управление шиной (DMA с карты в память машины).
+    // SAFETY: регистр команд конфигурационного пространства этой карты.
+    unsafe { device.write_config8(0x04, device.config8(0x04) | 0x06) };
+
+    // Страница сброса кешей системной памяти — до сброса Falcon.
+    let flush = crate::mm::dma::alloc(4096).map_err(|_| "no DMA memory for the flush page")?;
+    let flush_phys = flush.phys().as_u64();
+    bar.wr(0x0010_0c40, ((flush_phys >> 40) & 0xff_ffff) as u32);
+    bar.wr(0x0010_0c10, (flush_phys >> 8) as u32);
+
+    let outcome = start_fwsec(log, bar, &image).and_then(|(halted, mbox0, _)| {
+        let scratch = bar.rd(0x0000_1438);
+        let (lo, hi) = (bar.rd(NV_PFB_WPR2_ADDR_LO), bar.rd(NV_PFB_WPR2_ADDR_HI));
+        log.push(format!("FRTS error {:#x}, WPR2 {lo:#010x}..{hi:#010x}", scratch >> 16));
+        if !halted {
+            return Err("FWSEC did not finish (signature refused or hang)".into());
+        }
+        if mbox0 != 0 {
+            return Err(format!("FWSEC returned {mbox0:#x}"));
+        }
+        if scratch >> 16 != 0 {
+            return Err(format!("FRTS error {:#x}", scratch >> 16));
+        }
+        if hi >> 4 == 0 {
+            return Err("WPR2 still not set".into());
+        }
+        let lower = u64::from(lo >> 4) << 12;
+        if lower != frts_base {
+            return Err(format!("WPR2 starts at {lower:#x}, expected {frts_base:#x}"));
+        }
+        Ok(())
+    });
+    // SAFETY: Falcon остановлен (или не стартовал), буфер больше не читается.
+    unsafe { crate::mm::dma::free(&image.buffer) };
+    outcome
+}
+
+/// Прошивка карты закончила свой запуск (GFW boot) — до 4 с.
+fn wait_gfw_boot(bar: Bar0) -> Result<(), alloc::string::String> {
+    if !bar.wait(4_000_000, |b| b.rd(0x0011_8128) & 1 != 0 && b.rd(0x0011_8234) & 0xff == 0xff) {
+        return Err(alloc::format!(
+            "GFW boot not complete (0x118128 {:#x}, 0x118234 {:#x})",
+            bar.rd(0x0011_8128),
+            bar.rd(0x0011_8234)
+        ));
+    }
+    Ok(())
+}
+
+/// FWSEC, готовый к запуску: копия микрокода из VBIOS в памяти DMA с уже
+/// вписанными подписью и командой. Для FWSEC-SB его готовят заранее — при
+/// запуске GSP-RM, — а запускают при выгрузке (как nouveau: `fwsec_sb.ctor`
+/// в `r535_gsp_rm_boot_ctor`, запуск в `tu102_gsp_fini`).
+pub(crate) struct FwsecImage {
+    buffer: crate::mm::dma::DmaBuffer,
+    f: Fwsec,
+    command: u32,
+}
+
+// SAFETY: буфер DMA — память машины, принадлежащая драйверу; владелец один.
+unsafe impl Send for FwsecImage {}
+
+/// Прочитать FWSEC из прошивки карты и вписать подпись и команду `command`
+/// (FRTS — с областью `frts_base`/`frts_size`; SB — только `read_vbios`).
+fn prepare_fwsec(
+    log: &mut alloc::vec::Vec<alloc::string::String>,
+    bar: Bar0,
+    command: u32,
+    frts_base: u64,
+    frts_size: u64,
+) -> Result<FwsecImage, alloc::string::String> {
+    use alloc::format;
     let mut rom = Rom::new(bar.0);
     let _ = rom.parse();
     let desc = rom.fwsec_ucode.ok_or("no FWSEC (prod) ucode in the VBIOS")?;
@@ -668,7 +740,7 @@ fn run_fwsec(log: &mut alloc::vec::Vec<alloc::string::String>) -> Result<(), all
     let blob_at = desc + (hdr >> 16) as usize;
     let blob_len = imem_len + dmem_len;
     log.push(format!(
-        "FWSEC v3: IMEM {imem_len:#x} at {imem_base:#x}, DMEM {dmem_len:#x} at {dmem_base:#x}, \
+        "FWSEC v3 (cmd {command:#x}): IMEM {imem_len:#x} at {imem_base:#x}, DMEM {dmem_len:#x} at {dmem_base:#x}, \
          engines {engine_mask:#x}, ucode {ucode_id}, {signature_count} signatures (versions {signature_versions:#x})"
     ));
     if imem_len % DMA_CHUNK != 0 || blob_len == 0 || blob_len > 0x8_0000 {
@@ -677,14 +749,12 @@ fn run_fwsec(log: &mut alloc::vec::Vec<alloc::string::String>) -> Result<(), all
     if !rom.ensure(blob_at + blob_len) || !rom.ensure(desc + 0x2c + signature_count * SIGNATURE) {
         return Err("FWSEC image runs past the PROM window".into());
     }
-
-    // 4. Образ в памяти для DMA: копия, подпись и команда FRTS.
     let padded = blob_len.div_ceil(DMA_CHUNK) * DMA_CHUNK;
     let buffer = crate::mm::dma::alloc(padded).map_err(|_| "no DMA memory for the ucode")?;
     // SAFETY: буфер только что выделен, `padded` байт, наш до `free`.
     let image = unsafe { core::slice::from_raw_parts_mut(buffer.as_ptr::<u8>(), padded) };
     image[..blob_len].copy_from_slice(&rom.data[blob_at..blob_at + blob_len]);
-    let outcome = patch_and_run(log, bar, device, image, &buffer, &rom.data, desc, Fwsec {
+    let f = Fwsec {
         pkc_offset,
         interface_offset,
         imem_base,
@@ -695,15 +765,17 @@ fn run_fwsec(log: &mut alloc::vec::Vec<alloc::string::String>) -> Result<(), all
         ucode_id,
         signature_count,
         signature_versions,
-        frts_base,
-        frts_size,
-    });
-    // SAFETY: Falcon остановлен (или не стартовал), буфер больше не читается.
-    unsafe { crate::mm::dma::free(&buffer) };
-    outcome
+    };
+    if let Err(why) = patch(log, bar, image, &rom.data, desc, &f, command, frts_base, frts_size) {
+        // SAFETY: карта этот буфер ещё не видела.
+        unsafe { crate::mm::dma::free(&buffer) };
+        return Err(why);
+    }
+    Ok(FwsecImage { buffer, f, command })
 }
 
-/// Поля дескриптора и раскладка, нужные загрузке.
+/// Поля дескриптора, нужные загрузке.
+#[derive(Clone, Copy)]
 struct Fwsec {
     pkc_offset: usize,
     interface_offset: usize,
@@ -715,20 +787,21 @@ struct Fwsec {
     ucode_id: u32,
     signature_count: usize,
     signature_versions: u32,
-    frts_base: u64,
-    frts_size: u64,
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn patch_and_run(
+/// Вписать подпись по фьюзу и команду в DMEMMAPPER (nouveau
+/// `nvkm_gsp_fwsec_patch`: `read_vbios` всегда, область FRTS — только для FRTS).
+#[allow(clippy::too_many_arguments)]
+fn patch(
     log: &mut alloc::vec::Vec<alloc::string::String>,
     bar: Bar0,
-    device: crate::pci::Device,
     image: &mut [u8],
-    buffer: &crate::mm::dma::DmaBuffer,
     rom: &[u8],
     desc: usize,
-    f: Fwsec,
+    f: &Fwsec,
+    init_cmd: u32,
+    frts_base: u64,
+    frts_size: u64,
 ) -> Result<(), alloc::string::String> {
     use alloc::format;
     let dmem = f.imem_len;
@@ -776,38 +849,32 @@ fn patch_and_run(
     let mapper = mapper.ok_or("no DMEMMAPPER in the app interface table")?;
     let command = dmem + get32(image, mapper + 0x08).ok_or("DMEMMAPPER is outside DMEM")? as usize;
     let command_len = get32(image, mapper + 0x0c).unwrap_or(0);
-    if command_len < 44 {
-        return Err(format!("FRTS command buffer too small ({command_len})"));
+    // read_vbios: ver, hdr, addr (u64), size, flags.
+    let mut words: alloc::vec::Vec<u32> = alloc::vec![1, 24, 0, 0, 0, 2];
+    if init_cmd == FWSEC_CMD_FRTS {
+        // frts_region: ver, hdr, addr, size (4 KiB), type FB.
+        words.extend_from_slice(&[1, 20, (frts_base >> 12) as u32, (frts_size >> 12) as u32, 2]);
     }
-    let frts = [
-        1u32,
-        24,
-        0,
-        0,
-        0,
-        2, // read_vbios: ver, hdr, addr (u64), size, flags
-        1,
-        20,
-        (f.frts_base >> 12) as u32,
-        (f.frts_size >> 12) as u32,
-        2, // frts_region: ver, hdr, addr, size (4 KiB), type FB
-    ];
-    for (index, value) in frts.iter().enumerate() {
-        put32(image, command + index * 4, *value).ok_or("FRTS command is outside DMEM")?;
+    if (command_len as usize) < words.len() * 4 {
+        return Err(format!("FWSEC command buffer too small ({command_len})"));
     }
-    put32(image, mapper + 0x2c, 0x15).ok_or("DMEMMAPPER is outside DMEM")?; // init_cmd = FRTS
-    log.push(format!("DMEMMAPPER at DMEM {:#x}, command at {:#x}", mapper - dmem, command - dmem));
+    for (index, value) in words.iter().enumerate() {
+        put32(image, command + index * 4, *value).ok_or("FWSEC command is outside DMEM")?;
+    }
+    put32(image, mapper + 0x2c, init_cmd).ok_or("DMEMMAPPER is outside DMEM")?;
+    log.push(format!("DMEMMAPPER at DMEM {:#x}, command at {:#x}, init_cmd {init_cmd:#x}", mapper - dmem, command - dmem));
+    Ok(())
+}
 
-    // Шина: память и управление шиной (DMA с карты в память машины).
-    // SAFETY: регистр команд конфигурационного пространства этой карты.
-    unsafe { device.write_config8(0x04, device.config8(0x04) | 0x06) };
-
-    // Страница сброса кешей системной памяти — до сброса Falcon.
-    let flush = crate::mm::dma::alloc(4096).map_err(|_| "no DMA memory for the flush page")?;
-    let flush_phys = flush.phys().as_u64();
-    bar.wr(0x0010_0c40, ((flush_phys >> 40) & 0xff_ffff) as u32);
-    bar.wr(0x0010_0c10, (flush_phys >> 8) as u32);
-
+/// Сбросить GSP Falcon, загрузить в него FWSEC и запустить; ждать остановки
+/// до 2 с. Возвращает (остановился, MAILBOX0, MAILBOX1).
+fn start_fwsec(
+    log: &mut alloc::vec::Vec<alloc::string::String>,
+    bar: Bar0,
+    fw: &FwsecImage,
+) -> Result<(bool, u32, u32), alloc::string::String> {
+    use alloc::format;
+    let f = fw.f;
     // Сброс GSP Falcon.
     let _ = bar.rd(GSP + 0xf4);
     let _ = bar.wait(150, |b| b.rd(GSP + 0xf4) & 0x8000_0000 != 0);
@@ -833,7 +900,7 @@ fn patch_and_run(
     bar.wr(GSP + 0x10c, 0);
     bar.wr(GSP + 0x600, (bar.rd(GSP + 0x600) & !7) | 5);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    let phys = buffer.phys().as_u64();
+    let phys = fw.buffer.phys().as_u64();
     let section = |base: u64, offset: usize, target: u32, len: usize, command: u32| -> Result<(), alloc::string::String> {
         bar.wr(GSP + 0x110, (base >> 8) as u32);
         bar.wr(GSP + 0x128, ((base >> 40) & 0x1ff) as u32);
@@ -851,7 +918,7 @@ fn patch_and_run(
     };
     section(phys, 0, f.imem_base, f.imem_len, 0x614)?;
     section(phys + f.imem_len as u64, 0, f.dmem_base, f.dmem_len, 0x600)?;
-    log.push(format!("loaded by DMA from {phys:#x}"));
+    log.push(format!("FWSEC cmd {:#x} loaded by DMA from {phys:#x}", fw.command));
 
     // Загрузчик в ПЗУ (BROM) проверит подпись и запустит микрокод.
     bar.wr(GSP2 + 0x210, f.pkc_offset as u32);
@@ -867,29 +934,47 @@ fn patch_and_run(
     }
     let halted = bar.wait(2_000_000, |b| b.rd(GSP + 0x100) & 0x10 != 0);
     let (mbox0, mbox1) = (bar.rd(GSP + 0x40), bar.rd(GSP + 0x44));
-    let scratch = bar.rd(0x0000_1438);
-    let (lo, hi) = (bar.rd(NV_PFB_WPR2_ADDR_LO), bar.rd(NV_PFB_WPR2_ADDR_HI));
     log.push(format!(
-        "{}: CPUCTL {:#x}, MAILBOX0 {mbox0:#x}, MAILBOX1 {mbox1:#x}, FRTS error {:#x}, WPR2 {lo:#010x}..{hi:#010x}",
+        "FWSEC cmd {:#x} {}: CPUCTL {:#x}, MAILBOX0 {mbox0:#x}, MAILBOX1 {mbox1:#x}",
+        fw.command,
         if halted { "halted" } else { "did NOT halt in 2 s" },
-        bar.rd(GSP + 0x100),
-        scratch >> 16
+        bar.rd(GSP + 0x100)
     ));
+    Ok((halted, mbox0, mbox1))
+}
+
+/// Приготовить FWSEC-SB заранее (пока окно PROM читается и память есть).
+pub(crate) fn prepare_fwsec_sb(log: &mut alloc::vec::Vec<alloc::string::String>) -> Result<FwsecImage, alloc::string::String> {
+    let bar = card().ok_or("no NVIDIA card")?.1;
+    prepare_fwsec(log, bar, FWSEC_CMD_SB, 0, 0)
+}
+
+/// FWSEC-SB: вернуть процессор GSP в состояние «до LIBOS» перед
+/// `booter_unload` (nouveau `nvkm_gsp_fwsec_sb`, nova `Sec2UnloadBundle::run`).
+/// Ошибка SB — в младших 16 битах 0x1454 (`0x001400 + 0x15 * 4`).
+pub(crate) fn run_fwsec_sb(log: &mut alloc::vec::Vec<alloc::string::String>, fw: &FwsecImage) -> Result<(), alloc::string::String> {
+    use alloc::format;
+    let (device, bar) = card().ok_or("no NVIDIA card")?;
+    // SAFETY: регистр команд конфигурационного пространства этой карты:
+    // память и управление шиной (DMA микрокода из памяти машины).
+    unsafe { device.write_config8(0x04, device.config8(0x04) | 0x06) };
+    let (halted, mbox0, _) = start_fwsec(log, bar, fw)?;
+    let error = bar.rd(0x0000_1454) & 0xffff;
+    log.push(format!("FWSEC-SB: SB error {error:#x} (0x1454 {:#x})", bar.rd(0x0000_1454)));
     if !halted {
-        return Err("FWSEC did not finish (signature refused or hang)".into());
+        return Err("FWSEC-SB did not finish".into());
     }
     if mbox0 != 0 {
-        return Err(format!("FWSEC returned {mbox0:#x}"));
+        return Err(format!("FWSEC-SB returned {mbox0:#x}"));
     }
-    if scratch >> 16 != 0 {
-        return Err(format!("FRTS error {:#x}", scratch >> 16));
-    }
-    if hi >> 4 == 0 {
-        return Err("WPR2 still not set".into());
-    }
-    let lower = u64::from(lo >> 4) << 12;
-    if lower != f.frts_base {
-        return Err(format!("WPR2 starts at {lower:#x}, expected {:#x}", f.frts_base));
+    if error != 0 {
+        return Err(format!("FWSEC-SB error {error:#x}"));
     }
     Ok(())
+}
+
+/// Границы WPR2 сейчас: (LO, HI) — регистры 0x1fa824/0x1fa828.
+#[must_use]
+pub fn wpr2_now() -> Option<(u32, u32)> {
+    card().map(|(_, bar)| (bar.rd(NV_PFB_WPR2_ADDR_LO), bar.rd(NV_PFB_WPR2_ADDR_HI)))
 }

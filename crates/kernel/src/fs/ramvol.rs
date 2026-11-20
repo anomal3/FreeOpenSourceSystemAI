@@ -184,6 +184,23 @@ pub fn mount_live_branches() {
     LIVE.store(opt && var, core::sync::atomic::Ordering::Release);
 }
 
+/// Записываемые `/tmp` и `/root` там, где их нет (20.11): корень — образ
+/// RAM-диска только для чтения (живая флешка, запуск стендом без установки,
+/// телефон). «Сведения о системе», «Журнал событий», «Очистка диска» и
+/// «Файлы» пишут туда так же, как на установленной системе, а `mkdir /tmp`
+/// отвечал «operation not supported». Есть каталог — его не трогают: у
+/// установленной системы свои. Права — как всюду: `/tmp` пишут все, а
+/// удаляет владелец, `/root` — только root.
+pub fn mount_missing_scratch() {
+    let missing = |path: &str| !matches!(super::list(path), Some(Ok(_)));
+    if missing("/tmp") && mount("/tmp", 2048, "scratch-tmp", *b"fossai-scratch-t") {
+        let _ = super::chmod_as(crate::vfs::perm::Credentials::ROOT, "/tmp", 0o1777);
+    }
+    if missing("/root") && mount("/root", 4096, "scratch-root", *b"fossai-scratch-r") {
+        let _ = super::chmod_as(crate::vfs::perm::Credentials::ROOT, "/root", 0o700);
+    }
+}
+
 /// Есть ли у живой системы `/opt` и `/var` для пакетов.
 pub fn live() -> bool {
     LIVE.load(core::sync::atomic::Ordering::Acquire)

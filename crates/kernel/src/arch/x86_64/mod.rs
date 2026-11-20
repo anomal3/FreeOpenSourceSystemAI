@@ -286,19 +286,161 @@ const IA32_FS_BASE: u32 = 0xC000_0100;
 /// Нужно, чтобы не писать MSR на каждом переключении: запись в него стоит на
 /// порядок дороже сравнения, а у подавляющего большинства задач база нулевая и
 /// не меняется. Кеш по процессору, а не по задаче: регистр принадлежит железу.
+///
+/// `u64::MAX` — «неизвестно» (20.11): первая запись идёт в MSR всегда, а не
+/// сравнивается с нулём, которого в регистре после прошивки может и не быть.
 static FS_BASE_NOW: [core::sync::atomic::AtomicU64; crate::smp::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::smp::MAX_CPUS];
+
+/// CR4.FSGSBASE включён (20.11). Тогда программа меняет базы `FS` и `GS`
+/// сама — `wrfsbase`/`wrgsbase`, без `arch_prctl` (Wine — на каждом переходе
+/// PE <-> unix, до 900 тыс. вызовов в секунду на игре). Кеши `*_BASE_NOW`
+/// при этом не истина: база читается из процессора, а при переключении
+/// задачи сохраняется в задачу ([`live_user_bases`]). Ядро `GS` не адресует
+/// (заглушка `syscall` меняет базы `swapgs` лишь на две команды и возвращает),
+/// так что база, записанная программой, ядру ничего не портит.
+static FSGSBASE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Сообщать ли программам `HWCAP2_FSGSBASE` в `AT_HWCAP2` (`fsgsbase on|off`
+/// в оболочке — сравнить с путём через `arch_prctl` в одной загрузке).
+static FSGSBASE_ADVERTISED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+const CR4_FSGSBASE: u64 = 1 << 16;
+
+/// Включить FSGSBASE на этом процессоре, если он её знает
+/// (CPUID.(EAX=7,ECX=0):EBX[0]). Загрузочный решает за всех; проснувшиеся
+/// получают `CR4` от трамплина и подтверждают бит [`fsgsbase_secondary`].
+pub fn enable_fsgsbase() -> bool {
+    if cpuid(0, 0).eax < 7 || cpuid(7, 0).ebx & 1 == 0 {
+        return false;
+    }
+    set_cr4_bits(CR4_FSGSBASE);
+    FSGSBASE.store(true, core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// То же на проснувшемся процессоре: бит обязан быть на всех, иначе задача,
+/// переехавшая на процессор без него, получит `#UD` на `wrfsbase`.
+pub fn fsgsbase_secondary() {
+    if fsgsbase() {
+        set_cr4_bits(CR4_FSGSBASE);
+    }
+}
+
+fn set_cr4_bits(bits: u64) {
+    // SAFETY: кольцо ноль; бит объявлен процессором (проверено CPUID), прочие
+    // биты `CR4` остаются как были.
+    unsafe {
+        let mut cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+        cr4 |= bits;
+        asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
+    }
+}
+
+/// Включён ли FSGSBASE.
+#[must_use]
+pub fn fsgsbase() -> bool {
+    FSGSBASE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// `AT_HWCAP2` для вспомогательного вектора программы Linux: бит 1 —
+/// `HWCAP2_FSGSBASE` (Wine по нему выбирает `wrfsbase` вместо `arch_prctl`).
+#[must_use]
+pub fn hwcap2() -> usize {
+    if fsgsbase() && FSGSBASE_ADVERTISED.load(core::sync::atomic::Ordering::Relaxed) { 2 } else { 0 }
+}
+
+/// Объявлять ли `HWCAP2_FSGSBASE` новым программам; `None` — только узнать.
+pub fn fsgsbase_advertised(set: Option<bool>) -> bool {
+    if let Some(on) = set {
+        FSGSBASE_ADVERTISED.store(on, core::sync::atomic::Ordering::Relaxed);
+    }
+    FSGSBASE_ADVERTISED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// Команды FSGSBASE байтами: ассемблер LLVM без `target-feature=+fsgsbase` их
+// не принимает. Регистр — всегда RAX (ModRM 0xc0 | (номер << 3)).
+fn rdfsbase() -> u64 {
+    let value: u64;
+    // SAFETY: зовётся только при включённом CR4.FSGSBASE; читает базу `FS`.
+    unsafe { asm!(".byte 0xf3, 0x48, 0x0f, 0xae, 0xc0", out("rax") value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+fn rdgsbase() -> u64 {
+    let value: u64;
+    // SAFETY: как у `rdfsbase`; в ядре в `IA32_GS_BASE` — база программы.
+    unsafe { asm!(".byte 0xf3, 0x48, 0x0f, 0xae, 0xc8", out("rax") value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+fn wrfsbase(value: u64) {
+    // SAFETY: CR4.FSGSBASE включён; база `FS` ядром не используется.
+    unsafe { asm!(".byte 0xf3, 0x48, 0x0f, 0xae, 0xd0", in("rax") value, options(nomem, nostack, preserves_flags)) };
+}
+
+fn wrgsbase(value: u64) {
+    // SAFETY: CR4.FSGSBASE включён; ядро `GS` не адресует (см. `IA32_GS_BASE`).
+    unsafe { asm!(".byte 0xf3, 0x48, 0x0f, 0xae, 0xd8", in("rax") value, options(nomem, nostack, preserves_flags)) };
+}
+
+/// Базы `FS` и `GS` программы на этом процессоре прямо сейчас — их
+/// переключение задачи кладёт в уходящую задачу, а `ARCH_GET_*` и `clone`
+/// читают для текущей (20.11). `None` — база не из MSR (селектор TLS у
+/// 32-битного кода Wine) или неизвестна.
+#[must_use]
+pub fn live_user_bases() -> (Option<u64>, Option<u64>) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let cpu = crate::smp::cpu();
+    let known = |value: u64| (value != u64::MAX).then_some(value);
+    // С FSGSBASE база FS — своё состояние, независимое от селектора, как у
+    // Linux (`x86_fsgsbase_load`): Wine в WoW64 входит в unix-часть с
+    // селектором TEB32 в FS и ставит базу pthread `wrfsbase`. Сохранять её
+    // надо и при ненулевом селекторе, иначе после переключения селектор
+    // вернул бы базу TEB32, и glibc читал бы мимо (TMNF setup, 20.11:
+    // page fault at 0x308).
+    let fs = if fsgsbase() {
+        Some(rdfsbase())
+    } else if user_fs_selector() != 0 {
+        None
+    } else {
+        known(FS_BASE_NOW[cpu].load(Relaxed))
+    };
+    let gs_selector: u16;
+    // SAFETY: чтение сегментного регистра — ни памяти, ни флагов.
+    unsafe { asm!("mov {0:x}, gs", out(reg) gs_selector, options(nomem, nostack, preserves_flags)) };
+    let gs = if gs_selector != 0 {
+        None
+    } else if fsgsbase() {
+        Some(rdgsbase())
+    } else {
+        known(GS_BASE_NOW[cpu].load(Relaxed))
+    };
+    (fs, gs)
+}
 
 /// База хранилища потока программы, которая сейчас на этом процессоре
 /// (`arch_prctl(ARCH_GET_FS)` программы Linux, фаза 71a).
 #[must_use]
 pub fn user_tls() -> u64 {
+    if fsgsbase() {
+        return rdfsbase();
+    }
     FS_BASE_NOW[crate::smp::cpu()].load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Поставить базу хранилища потока, если она отличается от нынешней.
 pub fn set_user_tls(base: u64) {
     let cpu = crate::smp::cpu();
+    if fsgsbase() {
+        // Сравнение — с регистром: программа могла сменить базу сама.
+        FS_BASE_NOW[cpu].store(base, core::sync::atomic::Ordering::Relaxed);
+        if rdfsbase() != base {
+            wrfsbase(base);
+        }
+        return;
+    }
     if FS_BASE_NOW[cpu].swap(base, core::sync::atomic::Ordering::Relaxed) == base {
         return;
     }
@@ -337,6 +479,12 @@ pub fn enter_user_segments(tls: u64, fs_selector: u16, tls_entries: &[u64; 3]) {
     }
     if fs_selector != 0 {
         load_fs_selector(fs_selector);
+        // База — та, что была при уходе (см. `live_user_bases`): загрузка
+        // селектора поставила базу дескриптора.
+        if fsgsbase() {
+            wrfsbase(tls);
+            FS_BASE_NOW[crate::smp::cpu()].store(tls, core::sync::atomic::Ordering::Relaxed);
+        }
         return;
     }
     if user_fs_selector() != 0 {
@@ -370,11 +518,14 @@ const IA32_GS_BASE: u32 = 0xC000_0101;
 
 /// Что записано в `IA32_GS_BASE` на каждом процессоре (как [`FS_BASE_NOW`]).
 static GS_BASE_NOW: [core::sync::atomic::AtomicU64; crate::smp::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::smp::MAX_CPUS];
 
 /// База `GS` программы, которая сейчас на этом процессоре.
 #[must_use]
 pub fn user_gs() -> u64 {
+    if fsgsbase() {
+        return rdgsbase();
+    }
     GS_BASE_NOW[crate::smp::cpu()].load(core::sync::atomic::Ordering::Relaxed)
 }
 
@@ -394,6 +545,13 @@ pub fn set_user_gs(base: u64) {
         GS_BASE_NOW[crate::smp::cpu()].store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
     }
     let cpu = crate::smp::cpu();
+    if fsgsbase() {
+        GS_BASE_NOW[cpu].store(base, core::sync::atomic::Ordering::Relaxed);
+        if rdgsbase() != base {
+            wrgsbase(base);
+        }
+        return;
+    }
     if GS_BASE_NOW[cpu].swap(base, core::sync::atomic::Ordering::Relaxed) == base {
         return;
     }
@@ -748,6 +906,23 @@ pub fn drain_serial_rx(out: &mut [u8]) -> usize {
 ///
 /// Единственный вызывающий — холостая задача планировщика, которой нечего
 /// исполнять до ближайшего события.
+pub fn wait_for_interrupt_unless(flag: &core::sync::atomic::AtomicBool) {
+    // `cli` до проверки, `sti; hlt` одной парой (20.11): прерывание,
+    // пришедшее после проверки, ждёт `sti` и будит `hlt` — пинок не теряется
+    // до следующего тика. Без `nomem`: обе вставки — барьер для компилятора.
+    // SAFETY: зовёт холостой цикл с разрешёнными прерываниями; на выходе они
+    // разрешены снова.
+    unsafe { asm!("cli", options(nostack, preserves_flags)) };
+    if flag.load(core::sync::atomic::Ordering::SeqCst) {
+        // SAFETY: см. выше.
+        unsafe { asm!("sti", options(nostack, preserves_flags)) };
+        return;
+    }
+    // SAFETY: см. выше.
+    unsafe { asm!("sti", "hlt", options(nostack, preserves_flags)) };
+}
+
+/// Остановка до прерывания (см. [`wait_for_interrupt_unless`]).
 pub fn wait_for_interrupt() {
     // SAFETY: `hlt` не трогает ни память, ни стек. При разрешённых прерываниях
     // процессор просыпается на первом же из них; при запрещённых остановился бы

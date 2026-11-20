@@ -26,6 +26,10 @@ pub enum Art {
     Glyph(Icon, Tone, bool),
     /// Картинка программы.
     Image(Arc<Image>),
+    /// Залитая цветом плитка со знаком набора — всегда, без замены картинкой
+    /// макета (20.11, системные утилиты: у `Icon::Log` картинка макета —
+    /// редактор кода, а журналу нужен свой значок).
+    Tile(Icon, Tone),
 }
 
 impl Art {
@@ -44,6 +48,7 @@ impl Art {
                 None => paint::icon_tile(ctx, surface, rect, *icon, *tone, *filled),
             },
             Self::Image(image) => image.draw(surface, rect),
+            Self::Tile(icon, tone) => paint::icon_tile(ctx, surface, rect, *icon, *tone, true),
         }
     }
 
@@ -53,8 +58,25 @@ impl Art {
         match self {
             Self::Image(_) => true,
             Self::Glyph(icon, ..) => design_for(*icon).is_some(),
+            Self::Tile(..) => false,
         }
     }
+}
+
+/// Значок системной утилиты (20.11) по имени программы в `/bin`: один и тот
+/// же в «Пуске», на панели задач и в заголовке окна. `None` — не утилита.
+#[must_use]
+pub fn tool_art(program: &str) -> Option<Art> {
+    let (icon, tone) = match program {
+        "run" => (Icon::Prompt, Tone::Accent),
+        "charmap" => (Icon::Keyboard, Tone::Ok),
+        "sysinfo" => (Icon::Computer, Tone::Accent),
+        "eventlog" => (Icon::Log, Tone::Warn),
+        "services" => (Icon::Service, Tone::Ok),
+        "cleanmgr" => (Icon::Disk, Tone::Bad),
+        _ => return None,
+    };
+    Some(Art::Tile(icon, tone))
 }
 
 /// Прочитанные картинки: путь и то, что вышло (`None` — файла нет или он не
@@ -124,6 +146,10 @@ pub fn of_manifest(icon: &str) -> Art {
         }
         return Art::glyph(Icon::Package);
     }
+    // Значок макета по имени (`windows-apps` — программы Windows, 18.11).
+    if let Some(image) = design(icon) {
+        return Art::Image(image);
+    }
     Art::glyph(named(icon))
 }
 
@@ -170,6 +196,9 @@ pub fn of_program(path: &str, title: &str) -> (Art, String) {
         }
     }
     let program = path.rsplit('/').next().unwrap_or(path);
+    if let Some(art) = tool_art(program) {
+        return (art, group);
+    }
     let art = match program {
         // «Файлы» на столе залиты акцентом — и на панели так же.
         "files" | "mc" => Art::Glyph(Icon::Folder, Tone::Accent, true),

@@ -52,6 +52,15 @@ pub struct SharedMem {
     size: AtomicU64,
     /// Файл, кусок которого отображён на запись: куда возвращать записанное.
     file: Option<FileBack>,
+    /// Чужие кадры (буфер DRM, [`SharedMem::from_frames`]).
+    borrowed: Option<Borrowed>,
+}
+
+/// Кадры страниц `0..pages` принадлежат не объекту, а владельцу `keep`
+/// (буфер GPU): объект их не возвращает в пул, а держит владельца живым.
+struct Borrowed {
+    pages: usize,
+    _keep: Arc<dyn core::any::Any + Send + Sync>,
 }
 
 /// Кусок файла `[start, end)` за объектом.
@@ -97,7 +106,22 @@ const MAX_FILE_MAP: usize = 64 << 20;
 impl SharedMem {
     #[must_use]
     pub fn new(size: u64) -> Arc<Self> {
-        Arc::new(Self { frames: Mutex::new(BTreeMap::new()), size: AtomicU64::new(size), file: None })
+        Arc::new(Self { frames: Mutex::new(BTreeMap::new()), size: AtomicU64::new(size), file: None, borrowed: None })
+    }
+
+    /// Память над готовыми кадрами чужого владельца (буфер DRM, NVK,
+    /// 18.11.2026, `nvk-spec.md` 3.3): страница `i` — кадр `frames[i]`.
+    /// Кадры в пул не возвращаются — их вернёт владелец `keep`, которого
+    /// объект держит живым, пока жив сам (то есть пока буфер отображён).
+    /// Страниц за `frames` у такого объекта не бывает: `mmap` проверяет длину.
+    pub fn from_frames(frames: &[PhysAddr], size: u64, keep: Arc<dyn core::any::Any + Send + Sync>) -> Arc<Self> {
+        let map: BTreeMap<usize, PhysAddr> = frames.iter().copied().enumerate().collect();
+        Arc::new(Self {
+            frames: Mutex::new(map),
+            size: AtomicU64::new(size),
+            file: None,
+            borrowed: Some(Borrowed { pages: frames.len(), _keep: keep }),
+        })
     }
 
     /// Кусок файла `[offset, offset + len)` для `MAP_SHARED` на запись:
@@ -113,6 +137,7 @@ impl SharedMem {
             frames: Mutex::new(BTreeMap::new()),
             size: AtomicU64::new(size),
             file: Some(FileBack { node: Arc::clone(&node), start: offset, end: AtomicU64::new(end), clean: Mutex::new(BTreeMap::new()) }),
+            borrowed: None,
         });
         // Кусками по [`FILE_RUN`]: одно чтение файловой системы вместо
         // шестидесяти четырёх.
@@ -160,6 +185,7 @@ impl SharedMem {
                     frames: Mutex::new(BTreeMap::new()),
                     size: AtomicU64::new(node.metadata().size),
                     file: Some(FileBack { node: Arc::clone(&node), start: 0, end: AtomicU64::new(0), clean: Mutex::new(BTreeMap::new()) }),
+                    borrowed: None,
                 });
                 files.push((id, Arc::downgrade(&mem)));
                 mem
@@ -273,7 +299,11 @@ impl SharedMem {
     /// Кадр страницы `page`: есть — его, нет — новый, с нулями. `None` —
     /// кадров не осталось (с учётом запаса ядра).
     pub fn frame(&self, page: usize) -> Option<PhysAddr> {
-        let mut frames = self.frames.lock();
+        Self::frame_in(&mut self.frames.lock(), page)
+    }
+
+    /// [`Self::frame`] под уже взятым замком.
+    fn frame_in(frames: &mut BTreeMap<usize, PhysAddr>, page: usize) -> Option<PhysAddr> {
         if let Some(frame) = frames.get(&page) {
             return Some(*frame);
         }
@@ -291,23 +321,28 @@ impl SharedMem {
     /// Прочитать `buf.len()` байт с `offset` — без оглядки на длину файла
     /// (сервер Wayland читает буфер в пределах пула, который ему объявили).
     /// `false` — кадров не осталось.
+    ///
+    /// Так сервер Wayland читает строки буфера клиента (19.11.2026): замок
+    /// кадров — один на вызов, а не на страницу, и копия — [`crate::mm::copy`]
+    /// (`memcpy` ядра в TCG давала ~450 МБ/с).
     pub fn read(&self, offset: u64, buf: &mut [u8]) -> bool {
         let out = buf.as_mut_ptr();
         self.copy(offset, buf.len(), |frame, done, take| {
             // SAFETY: `done + take <= buf.len()`; кадр — см. `copy`.
-            unsafe { core::ptr::copy_nonoverlapping(frame, out.add(done), take) };
+            unsafe { crate::mm::copy::copy(out.add(done), frame, take) };
         })
         .is_ok()
     }
 
     fn copy(&self, offset: u64, len: usize, mut each: impl FnMut(*mut u8, usize, usize)) -> VfsResult<()> {
         let mut done = 0;
+        let mut frames = self.frames.lock();
         while done < len {
             let at = offset as usize + done;
             let page = at / PAGE_SIZE;
             let inside = at % PAGE_SIZE;
             let take = (PAGE_SIZE - inside).min(len - done);
-            let frame = self.frame(page).ok_or(VfsError::NoSpace)?;
+            let frame = Self::frame_in(&mut frames, page).ok_or(VfsError::NoSpace)?;
             // SAFETY: кадр принадлежит объекту и жив, пока жив он; виден через
             // прямое отображение, смещение и длина — внутри страницы.
             each(unsafe { super::frame_bytes(frame).add(inside) }, done, take);
@@ -317,10 +352,61 @@ impl SharedMem {
     }
 }
 
+/// Замер `copybench` (19.11.2026): кадр 1280x720 (3,6 МБ) строками из
+/// разделяемой памяти — как его читает сервер Wayland — и тот же объём одной
+/// копией из кучи в кучу. МБ/с в журнал.
+pub fn bench_frame() {
+    const STRIDE: usize = 1280 * 4;
+    const ROWS: usize = 720;
+    const LEN: usize = STRIDE * ROWS;
+    let mem = SharedMem::new(LEN as u64);
+    let mut src = Vec::new();
+    let mut dst = Vec::new();
+    if src.try_reserve_exact(LEN).is_err() || dst.try_reserve_exact(LEN).is_err() {
+        return;
+    }
+    src.resize(LEN, 0x5au8);
+    dst.resize(LEN, 0u8);
+    // Кадры объекта — касанием, как у клиента, нарисовавшего кадр.
+    if ShmNode(Arc::clone(&mem)).write_at(0, &src).is_err() {
+        return;
+    }
+    let mb_s = |ns: u64| LEN as u64 * 1000 / ns.max(1);
+    let mut line = String::new();
+    for method in crate::mm::copy::methods() {
+        let (rows_ns, flat_ns) = crate::mm::copy::with_copy(method, || {
+            let mut rows_ns = u64::MAX;
+            let mut flat_ns = u64::MAX;
+            for _ in 0..3 {
+                let started = crate::time::uptime_ns();
+                for row in 0..ROWS {
+                    if !mem.read((row * STRIDE) as u64, &mut dst[row * STRIDE..(row + 1) * STRIDE]) {
+                        return (0, 0);
+                    }
+                }
+                rows_ns = rows_ns.min(crate::time::uptime_ns().saturating_sub(started));
+                let started = crate::time::uptime_ns();
+                dst.copy_from_slice(&src);
+                flat_ns = flat_ns.min(crate::time::uptime_ns().saturating_sub(started));
+            }
+            (rows_ns, flat_ns)
+        });
+        let _ = core::fmt::Write::write_fmt(
+            &mut line,
+            format_args!(" {} {}/{}", method.name(), mb_s(rows_ns), mb_s(flat_ns)),
+        );
+    }
+    crate::kprintln!("  copybench   : 1280x720 frame MB/s shm rows/heap flat:{line}");
+}
+
 impl Drop for SharedMem {
     fn drop(&mut self) {
         self.flush();
-        let frames = core::mem::take(&mut *self.frames.lock());
+        let mut frames = core::mem::take(&mut *self.frames.lock());
+        // Чужие кадры остаются владельцу (буфер GPU).
+        if let Some(borrowed) = &self.borrowed {
+            frames.retain(|page, _| *page >= borrowed.pages);
+        }
         crate::mm::frame::with(|pool| {
             for frame in frames.into_values() {
                 // SAFETY: кадры выданы этим же пулом под этот объект; ссылок на
@@ -348,14 +434,14 @@ impl Node for ShmNode {
         let out = buf.as_mut_ptr();
         self.0.copy(offset, len, |frame, done, take| {
             // SAFETY: `done + take <= len <= buf.len()`; кадр — см. `copy`.
-            unsafe { core::ptr::copy_nonoverlapping(frame, out.add(done), take) };
+            unsafe { crate::mm::copy::copy(out.add(done), frame, take) };
         })?;
         Ok(len)
     }
     fn write_at(&self, offset: u64, data: &[u8]) -> VfsResult<usize> {
         self.0.copy(offset, data.len(), |frame, done, take| {
             // SAFETY: см. `read_at`.
-            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(done), frame, take) };
+            unsafe { crate::mm::copy::copy(frame, data.as_ptr().add(done), take) };
         })?;
         let end = offset + data.len() as u64;
         self.0.size.fetch_max(end, Ordering::Relaxed);

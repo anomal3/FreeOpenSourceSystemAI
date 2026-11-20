@@ -96,6 +96,11 @@ pub fn init() {
         asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
     }
 
+    // FSGSBASE (20.11): базы FS/GS программа ставит сама, без `arch_prctl`.
+    if super::enable_fsgsbase() {
+        crate::kprintln!("  cpu         : FSGSBASE on (user wrfsbase/wrgsbase, AT_HWCAP2 bit 1)");
+    }
+
     let (_, _, ecx, _) = cpuid(1, 0);
     let have_xsave = ecx & (1 << 26) != 0;
     if !have_xsave {
@@ -156,6 +161,7 @@ static XCR0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(
 /// размер, а задача, переехавшая на процессор с другим `XCR0`, записала бы
 /// `xsave` за конец своей области.
 pub fn init_secondary() {
+    super::fsgsbase_secondary();
     if !HAVE_XSAVE.load(Ordering::Relaxed) {
         return;
     }

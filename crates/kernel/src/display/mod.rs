@@ -33,7 +33,16 @@ pub mod intel;
 pub mod amd;
 pub mod nvidia;
 pub mod nvidia_disp;
+// `gpu gametest` (20.11): утренняя проверка игры на видеокарте одной командой.
+pub mod nvidia_gametest;
 pub mod nvidia_gsp;
+// NVK поверх GSP-RM (18.11, WP-A): видеопамять, адресные пространства GPU,
+// golden context GR, каналы и бэкенд `nvgpu::GpuBackend` для слоя DRM.
+pub mod nvidia_rm_chan;
+pub mod nvidia_rm_gr;
+pub mod nvidia_rm_info;
+pub mod nvidia_rm_vmm;
+pub mod nvidia_rm_vram;
 pub mod outputs;
 #[cfg(target_arch = "x86_64")]
 mod vmsvga;

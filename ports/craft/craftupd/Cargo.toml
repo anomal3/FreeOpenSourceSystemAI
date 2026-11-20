@@ -1,0 +1,24 @@
+[package]
+name = "craftupd"
+version = "0.1.0"
+edition = "2024"
+description = "FossAi: обновление приложений Craft (GridCraft, WordCraft, PdfCraft, MailCraft) по подписанному индексу craft-index.json"
+publish = false
+
+# Отдельное рабочее пространство: собирается в контейнере fossai-builder
+# (ports/craft/builder/build-craftupd.sh <арх>) целью <арх>-unknown-freeos.
+[workspace]
+
+[dependencies]
+# Подпись индекса и разбор пакетов — те же крейты, что у ядра, `pkg` и xtask.
+osupdate = { path = "../../../crates/osupdate" }
+fpk = { path = "../../../crates/fpk" }
+# HTTPS: rustls на ring (как rtls в N3) и корни Mozilla — системного
+# хранилища сертификатов у FreeOS нет.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+webpki-roots = "1"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+strip = true

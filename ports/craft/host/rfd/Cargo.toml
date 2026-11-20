@@ -1,0 +1,22 @@
+[package]
+name = "rfd"
+# Вместо rfd 0.17 у приложений Craft (`[patch.crates-io]` в --config сборки).
+version = "0.17.2"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "FossAi (FreeOS) file and message dialogs with the rfd 0.17 API: a separate FreeOS window with an egui file browser"
+publish = false
+
+# Имена возможностей — как у rfd, чтобы `features = [...]` приложений разрешались.
+[features]
+default = ["xdg-portal"]
+common-controls-v6 = []
+file-handle-inner = []
+gtk3 = []
+wayland = []
+xdg-portal = []
+
+[dependencies]
+eframe = { path = "../eframe", default-features = false }
+egui = { version = "0.37", default-features = false }
+raw-window-handle = "0.6"

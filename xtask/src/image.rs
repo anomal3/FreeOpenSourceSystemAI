@@ -160,6 +160,7 @@ pub fn build_with_key(built: &Built, kind: Kind, live_key: Option<&Path>) -> Res
     payload.push(build_file(build.number));
     if kind == Kind::System {
         payload.push(live_file());
+        payload.push(display_file());
     }
     let bytes = assemble(&payload, kind)?;
 
@@ -203,6 +204,21 @@ fn build_file(number: u32) -> Payload {
         path: String::from("FREEOS/BUILD"),
         data: format!("{number}\n").into_bytes(),
         source: PathBuf::from("(номер сборки)"),
+    }
+}
+
+/// Режим экрана для загрузчика на живой флешке `\FREEOS\DISPLAY.CFG`
+/// (17.11): заранее на один сектор, из пробелов после «none» — загрузчик
+/// читает первую строку, «none» для него — «ничего не просили». Ядро
+/// переписывает его на месте (`usb::stick_log::store_display`), когда в
+/// «Параметрах» выбирают разрешение: создавать файлы на FAT оно не умеет.
+fn display_file() -> Payload {
+    let mut data = vec![b' '; 512];
+    data[..5].copy_from_slice(b"none\n");
+    Payload {
+        path: String::from("FREEOS/DISPLAY.CFG"),
+        data,
+        source: PathBuf::from("(режим экрана для загрузчика)"),
     }
 }
 
@@ -273,6 +289,8 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                 ("booter_load-570.144.bin", "FREEOS/NVIDIA/BOOTER.BIN"),
                 ("bootloader-570.144.bin", "FREEOS/NVIDIA/BOOTLDR.BIN"),
                 ("gsp-570.144.bin", "FREEOS/NVIDIA/GSP.BIN"),
+                // 18.11: снимает WPR2 при перезагрузке (`gpu unload`).
+                ("booter_unload-570.144.bin", "FREEOS/NVIDIA/BOOTUNLD.BIN"),
             ] {
                 let source = firmware.join(name);
                 if source.is_file() {
@@ -283,12 +301,37 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // хочу на ПК проверить на живом»). Корень живой системы только на
             // чтение, поэтому пакет едет файлом `\FREEOS\PKG\OBSOS.FPK`, а ядро,
             // увидев флешку, ставит его в `/opt` в памяти (`usb::storage`).
-            if built.release {
+            // `FOSSAI_LIVE_APPS=0` (18.11, Роман: «редакторы и OBSOS пока на
+            // флешку не грузить, проверяем только Proton и игры») — без OBSOS
+            // и Craft: флешка меньше, пакеты ставятся быстрее.
+            let live_apps = std::env::var("FOSSAI_LIVE_APPS").map_or(true, |v| v != "0");
+            if built.release && live_apps {
                 if let Some(bytes) = crate::package::servo(arch)? {
                     payload.push(Payload {
                         path: format!("{}/OBSOS.FPK", arch::PAYLOAD_PKG_DIR),
                         data: bytes,
                         source: PathBuf::from("(пакет OBSOS)"),
+                    });
+                }
+            }
+            // Приложения Craft (17.11): GridCraft, WordCraft, PdfCraft,
+            // MailCraft — так же файлами `\FREEOS\PKG\<8 знаков>.FPK`, ядро
+            // ставит их после OBSOS (`LIVE_ORDER` в usb/storage.rs).
+            if built.release && live_apps {
+                for app in crate::craft::apps()? {
+                    if let Some((file, bytes)) = crate::craft::package(&app, arch)? {
+                        payload.push(Payload {
+                            path: format!("{}/{}", arch::PAYLOAD_PKG_DIR, crate::craft::esp_name(&app.name)),
+                            data: bytes,
+                            source: PathBuf::from(format!("(пакет {file})")),
+                        });
+                    }
+                }
+                if let Some((file, bytes)) = crate::craft::updater_package(arch)? {
+                    payload.push(Payload {
+                        path: format!("{}/CRAFTUPD.FPK", arch::PAYLOAD_PKG_DIR),
+                        data: bytes,
+                        source: PathBuf::from(format!("(пакет {file})")),
                     });
                 }
             }
@@ -406,6 +449,13 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     .collect::<String>()
                     .to_uppercase();
                 if short.len() > 8 {
+                    // Приложения Craft (19.11): установщик их не знает
+                    // (`payload.rs` PACKAGES), ставятся они живой флешкой и
+                    // `craftupd` — на установочный носитель не кладутся.
+                    if crate::craft::apps()?.iter().any(|app| package.file_name.starts_with(&format!("{}-", app.name))) {
+                        say!("{}: приложение Craft, на установочный носитель не кладётся", package.file_name);
+                        continue;
+                    }
                     bail!("имя пакета {} не помещается в 8.3 на FAT: {short}", package.file_name);
                 }
                 let target = format!("{}/{short}.FPK", arch::PAYLOAD_PKG_DIR);

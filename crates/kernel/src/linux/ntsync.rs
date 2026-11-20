@@ -673,6 +673,12 @@ fn wait(dev: &Arc<Device>, arg: usize, all: bool) -> i64 {
 /// Абсолютный срок в нс по монотонным часам ядра (`uptime_ns`); `None` —
 /// без срока (`U64_MAX`). `REALTIME` переводится один раз, как у
 /// `futex_waitv`.
+///
+/// «Сейчас» — `time::realtime_ns`, те же часы, что у `clock_gettime`
+/// (19.11.2026). Раньше доли секунды брались от `uptime_ns`, а у часов суток
+/// они сдвинуты на миг, когда приняли время прошивки: срок ошибался до
+/// секунды — и проба ntsync падала, стоило загрузке сдвинуться на
+/// миллисекунды (замер `memcpy` перед `adopt_boot_clock`).
 fn deadline(timeout: u64, realtime: bool) -> Option<u128> {
     if timeout == u64::MAX {
         return None;
@@ -682,6 +688,6 @@ fn deadline(timeout: u64, realtime: bool) -> Option<u128> {
         return Some(wanted);
     }
     let uptime = u128::from(crate::time::uptime_ns());
-    let now = u128::from(crate::time::now_unix().unwrap_or(0)) * 1_000_000_000 + uptime % 1_000_000_000;
+    let now = u128::from(crate::time::realtime_ns().unwrap_or(0));
     Some(uptime + wanted.saturating_sub(now))
 }

@@ -45,6 +45,7 @@
 pub mod appicon;
 pub mod compositor;
 pub mod context;
+pub mod deskcfg;
 pub mod dialog;
 pub mod icons;
 pub mod lock;
@@ -59,6 +60,7 @@ pub mod home;
 pub mod keyboard;
 pub mod shade;
 pub mod start;
+pub mod startapps;
 pub mod tray;
 pub mod statusbar;
 pub mod term;
@@ -89,7 +91,7 @@ use panel::{NetState, PanelHit, Status, TrayItem};
 use settings::Section;
 pub use window::App;
 use dialog::{AboutFacts, Answer, Dialog};
-use window::{Hit, Window};
+use window::{Hit, RenameStep, Window};
 
 /// Насколько сдвигается окно за одно нажатие Ctrl+стрелка.
 ///
@@ -345,9 +347,22 @@ fn open_close_menu(desktop: &mut Compositor, app: App, status: &Status) {
     items.extend_from_slice(&context::Action::ON_BUTTON);
     desktop.context_handlers(recent.iter().map(|(_, path)| (String::from(context::base_name(path)), path.clone())).collect());
     *RECENT_MENU.lock() = recent;
+    // «Закрепить на панели задач» (20.11): ключ программы окна; без ключа
+    // (окно .NET, задача без пути) пункт серый.
+    let key = pin_key_of_group(&group);
+    context::UNPIN_TASKBAR.store(key.as_deref().is_some_and(deskcfg::task_pinned), Ordering::Relaxed);
+    let unkeyed = key.is_none();
+    *PIN_KEY.lock() = key;
     desktop.open_context(button.x, button.y, &items);
+    let mut off = alloc::vec::Vec::new();
     if single {
-        desktop.context_set_off(alloc::vec![context::Action::CloseAll]);
+        off.push(context::Action::CloseAll);
+    }
+    if unkeyed {
+        off.push(context::Action::PinTaskbar);
+    }
+    if !off.is_empty() {
+        desktop.context_set_off(off);
     }
     desktop.context_select_none();
     if let Some(rect) = desktop.context_rect() {
@@ -356,8 +371,44 @@ fn open_close_menu(desktop: &mut Compositor, app: App, status: &Status) {
     desktop.refresh_panel(status);
 }
 
+/// Ключ закрепления программы, чьи окна собираются в группу `group`
+/// (`deskcfg`, 20.11): строка манифеста «Пуска» или пакет из `/opt`.
+fn pin_key_of_group(group: &str) -> Option<String> {
+    if group.is_empty() {
+        return None;
+    }
+    if let Some(entry) = startapps::ENTRIES.iter().find(|entry| entry.group == group) {
+        return Some(String::from(entry.key));
+    }
+    let name = group.strip_prefix("/opt/")?.split('/').next()?;
+    Some(alloc::format!("pkg:{name}"))
+}
+
+/// Ключ программы, для которой открыто меню кнопки панели.
+static PIN_KEY: SpinLock<Option<String>> = SpinLock::new(None);
+
+/// Меню закреплённой кнопки без окон: только «Открепить».
+fn open_pin_menu(desktop: &mut Compositor, index: usize, x: i32, y: i32, status: &Status) {
+    let Some(key) = desktop.panel_pin_key(index) else {
+        return;
+    };
+    context::UNPIN_TASKBAR.store(true, Ordering::Relaxed);
+    *PIN_KEY.lock() = Some(key);
+    desktop.open_context(x, y, &[context::Action::PinTaskbar]);
+    desktop.context_select_none();
+    if let Some(rect) = desktop.context_rect() {
+        kprintln!("  desktop     : context menu at {},{} {}x{} for pinned button", rect.x, rect.y, rect.w, rect.h);
+    }
+    desktop.refresh_panel(status);
+}
+
 /// Файлы, открытые столом (команда программы и путь), — новые первыми.
 static RECENT: SpinLock<alloc::vec::Vec<(String, String)>> = SpinLock::new(alloc::vec::Vec::new());
+/// Недавние файлы для «Пуска» (команда и путь), новые первыми.
+pub(crate) fn recent_files() -> alloc::vec::Vec<(String, String)> {
+    RECENT.lock().iter().take(8).cloned().collect()
+}
+
 /// «Недавние» открытого меню кнопки.
 static RECENT_MENU: SpinLock<alloc::vec::Vec<(String, String)>> = SpinLock::new(alloc::vec::Vec::new());
 
@@ -448,6 +499,9 @@ const PASTE_LIMIT: usize = 1000;
 
 static LAST_ICON_CLICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static LAST_ICON: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// Последний щелчок по заголовку окна (20.11): окно, время, точка. Второй
+/// щелчок туда же за [`DOUBLE_CLICK_MS`] разворачивает окно или возвращает.
+static LAST_TITLE: SpinLock<Option<(App, u64, i32, i32)>> = SpinLock::new(None);
 
 /// Что делает левая кнопка, нажатая на столе, пока её держат (01.11).
 enum IconGesture {
@@ -726,7 +780,7 @@ pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
     // Размер сетки хранится отдельно от стола: спрашивают его программы — в том
     // числе тогда, когда стол занят перерисовкой. Обновляется он при каждом
     // возврате стола (см. `remember_shell_size`): окно можно растянуть.
-    let cells = match desktop.find(App::Terminal) {
+    let cells = match desktop.front_terminal().and_then(|app| desktop.find(app)) {
         Some(window) => window.size_in_cells(),
         None => (0, 0),
     };
@@ -958,7 +1012,7 @@ fn take_deferred() -> Option<(usize, String)> {
 
 /// Вывод вкладки `session` — в её сетку (видимую или нет).
 fn feed_session(desktop: &mut Compositor, session: usize, text: &str) {
-    match desktop.find(App::Terminal) {
+    match desktop.terminal_of(session) {
         Some(window) => window.with_session(session, |window| term::feed(session, Some(window), text)),
         None => term::feed(session, None, text),
     }
@@ -981,6 +1035,19 @@ static TAB_REQUESTS: SpinLock<alloc::vec::Vec<TabRequest>> = SpinLock::new(alloc
 fn request_tab(request: TabRequest) {
     TAB_REQUESTS.lock().push(request);
     crate::sched::wake_input();
+}
+
+/// В какое окно терминала встанет новая вкладка (20.11: окон бывает
+/// несколько - «+» нажимают в одном из них). `None` - в ближайшее.
+static NEW_TAB_IN: SpinLock<Option<App>> = SpinLock::new(None);
+
+/// Номер следующего окна, в которое уносят вкладку ([`App::TermWin`]).
+static NEXT_TERM_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// Новая вкладка в окне `app`.
+fn request_new_tab(app: Option<App>) {
+    *NEW_TAB_IN.lock() = app;
+    request_tab(TabRequest::New);
 }
 
 /// Забрать просьбы о вкладках (их исполняет оболочка).
@@ -1012,7 +1079,7 @@ static DROPPED_OUTPUT: AtomicU64 = AtomicU64::new(0);
 /// [`shell_size`] продолжал отдавать размер от загрузки — `mc`, открытый в
 /// развёрнутом терминале, рисовал панели в его левой трети.
 fn remember_shell_size(desktop: &mut Compositor) {
-    let cells = desktop.find(App::Terminal).map_or((0, 0), |window| window.size_in_cells());
+    let cells = desktop.front_terminal().and_then(|app| desktop.find(app)).map_or((0, 0), |window| window.size_in_cells());
     let packed = (u64::from(cells.0) << 32) | u64::from(cells.1);
     let before = SHELL_CELLS.swap(packed, Ordering::Relaxed);
     if before != packed && before != 0 && packed != 0 {
@@ -1053,7 +1120,8 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
     if theme::is_mobile() {
         return desktop.mobile_rect();
     }
-    let p = desktop.primary_rect();
+    // От угла рабочей области: панель может стоять сверху или слева (20.11).
+    let p = desktop.primary_work();
     layout_local(desktop, app).translate(p.x, p.y)
 }
 
@@ -1062,8 +1130,8 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
     // Раскладка считается от размера экрана, а не задана числами: прошивка
     // вправе дать и 800×600, и 1920×1080, и окно, не помещающееся на экран,
     // выглядело бы как испорченная графика.
-    let width = desktop.screen_width();
-    let work = (desktop.work_bottom() - desktop.primary_rect().y).max(1) as u32;
+    let width = desktop.primary_work().w;
+    let work = desktop.primary_work().h.max(1);
     let margin = width / 24;
 
     // На телефоне окно занимает экран целиком — от строки состояния до
@@ -1079,7 +1147,7 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
     }
 
     match app {
-        App::Terminal => Rect::new(
+        App::Terminal | App::TermWin(_) => Rect::new(
             margin as i32,
             (work / 16) as i32,
             width * 5 / 8,
@@ -1192,13 +1260,18 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
         // панели задач, а там окно программы к этому времени уже существует —
         // кнопка на панели без окна не рисуется.
         App::Program(..) => None,
+        // Унесённое окно терминала заново не строится: его вкладка живёт
+        // только в нём, и пустое такое окно повторило бы первую вкладку.
+        App::TermWin(_) => None,
         other => {
             // Терминал открывается заново — с одной вкладкой; оболочки
-            // прежних вкладок закрываются (их сеток больше нет).
+            // прежних вкладок закрываются (их сеток больше нет). Вкладки,
+            // унесённые в свои окна (20.11), живут дальше.
             if other == App::Terminal {
                 ACTIVE_SESSION.store(0, Ordering::Relaxed);
+                let held = desktop.terminal_sessions();
                 for session in 1..crate::sched::MAX_SESSIONS {
-                    if crate::shell::session::alive(session) {
+                    if crate::shell::session::alive(session) && !held.contains(&session) {
                         request_tab(TabRequest::Close(session));
                     }
                 }
@@ -1367,25 +1440,39 @@ pub fn write(text: &str) {
 /// Очистить окно оболочки.
 pub fn clear_shell() {
     let session = crate::sched::session();
-    with_window(App::Terminal, |window| window.with_session(session, Window::clear));
+    with_session_window(session, |window| window.with_session(session, Window::clear));
 }
 
 /// Показывать ли курсор в окне оболочки.
 pub fn set_cursor(visible: bool) {
     let session = crate::sched::session();
-    with_window(App::Terminal, |window| window.with_session(session, |window| window.set_cursor(visible)));
+    with_session_window(session, |window| window.with_session(session, |window| window.set_cursor(visible)));
 }
 
-/// Открыть во окне терминала вкладку сессии `session` и показать её.
-pub fn add_tab(session: usize) -> bool {
+/// Сделать что-нибудь с окном терминала, в котором вкладка `session`.
+fn with_session_window(session: usize, action: impl FnOnce(&mut Window)) {
     with_desktop(|desktop| {
-        let Some(window) = desktop.find(App::Terminal) else {
+        if let Some(window) = desktop.terminal_of(session) {
+            action(window);
+        }
+        desktop.present();
+    });
+}
+
+/// Открыть в окне терминала вкладку сессии `session` и показать её: в том
+/// окне, где нажали «+» (Ctrl+Shift+T), иначе в ближайшем.
+pub fn add_tab(session: usize) -> bool {
+    let wanted = NEW_TAB_IN.lock().take();
+    with_desktop(|desktop| {
+        let target = wanted.filter(|app| desktop.index_of(*app).is_some()).or_else(|| desktop.front_terminal());
+        let Some(window) = target.and_then(|app| desktop.find(app)) else {
             return false;
         };
         let added = window.add_tab(session);
         if added {
             ACTIVE_SESSION.store(session, Ordering::Relaxed);
             kprintln!("  terminal    : tab {} opened", session + 1);
+            desktop.refresh_panel(&status_now());
             desktop.present();
         }
         added
@@ -1393,33 +1480,49 @@ pub fn add_tab(session: usize) -> bool {
     .unwrap_or(false)
 }
 
-/// Убрать вкладку сессии `session` (её оболочка закончилась).
+/// Убрать вкладку сессии `session` (её оболочка закончилась). Окно, в
+/// котором она была последней, уходит вместе с ней (20.11: так кончается
+/// унесённое окно, когда в нём набрали `exit`).
 pub fn remove_tab(session: usize) {
     with_desktop(|desktop| {
-        if let Some(window) = desktop.find(App::Terminal) {
+        let app = desktop.terminal_app_of(session);
+        if let Some(window) = desktop.terminal_of(session) {
             if window.remove_tab(session) {
-                ACTIVE_SESSION.store(window.active_session(), Ordering::Relaxed);
+                let focused = desktop.front_terminal() == app;
+                if focused {
+                    if let Some(window) = app.and_then(|app| desktop.find(app)) {
+                        ACTIVE_SESSION.store(window.active_session(), Ordering::Relaxed);
+                    }
+                }
                 kprintln!("  terminal    : tab {} closed", session + 1);
+            } else if window.tab_sessions().len() == 1 && session != 0 {
+                if let Some(app) = app {
+                    desktop.close(app);
+                    kprintln!("  terminal    : tab {} closed with its window", session + 1);
+                    log_focus(desktop);
+                }
             }
         }
+        desktop.refresh_panel(&status_now());
         desktop.present();
     });
 }
 
-/// Показать вкладку сессии `session`.
+/// Показать вкладку сессии `session` в её окне.
 fn switch_tab(desktop: &mut Compositor, session: usize) {
-    if let Some(window) = desktop.find(App::Terminal) {
+    if let Some(window) = desktop.terminal_of(session) {
         if window.switch_tab(session) {
             ACTIVE_SESSION.store(session, Ordering::Relaxed);
             kprintln!("  terminal    : tab {} active", session + 1);
         }
     }
+    desktop.refresh_panel(&status_now());
     desktop.present();
 }
 
-/// Соседняя вкладка (`forward` — правее, по кругу).
+/// Соседняя вкладка активного окна терминала (`forward` - правее, по кругу).
 fn cycle_tab(desktop: &mut Compositor, forward: bool) {
-    let next = desktop.find(App::Terminal).and_then(|window| {
+    let next = desktop.front_terminal().and_then(|app| desktop.find(app)).and_then(|window| {
         let order = window.tab_sessions();
         let at = order.iter().position(|item| *item == window.active_session())?;
         let count = order.len();
@@ -1430,17 +1533,243 @@ fn cycle_tab(desktop: &mut Compositor, forward: bool) {
     }
 }
 
-/// Сделать что-нибудь с окном программы и вывести изменения на экран.
-///
-/// Окна может не быть: пользователь вправе его закрыть. Тогда вывод оболочки
-/// уходит только в серийную линию — это не отказ, а последствие закрытия окна.
-fn with_window(app: App, action: impl FnOnce(&mut Window)) {
-    with_desktop(|desktop| {
-        if let Some(window) = desktop.find(app) {
-            action(window);
+/// Вкладку тянут мышью (20.11): из какого окна, какую и откуда начали.
+#[derive(Clone, Copy)]
+struct TabDrag {
+    app: App,
+    session: usize,
+    y0: i32,
+}
+
+static TAB_DRAG: SpinLock<Option<TabDrag>> = SpinLock::new(None);
+
+/// Насколько (точек до масштаба) вкладку надо увести от полосы по
+/// вертикали, чтобы она оторвалась в своё окно - как в Windows Terminal.
+const TEAR_OFF: i32 = 40;
+
+/// Окно терминала несут за вкладку (а не за заголовок): отпущенное над
+/// полосой другого окна, оно отдаёт туда свою вкладку.
+static CARRY_TAB: AtomicBool = AtomicBool::new(false);
+
+/// Вкладка, над которой открыто меню вкладки: окно и сессия.
+static TAB_MENU: SpinLock<Option<(App, usize)>> = SpinLock::new(None);
+
+/// Нажали на вкладку: показать её и начать слежку за перетаскиванием. У
+/// окна с одной вкладкой вкладку тянут вместе с окном - так её бросают на
+/// полосу другого окна (см. [`drop_on_strip`]).
+fn press_tab(desktop: &mut Compositor, app: Option<App>, session: usize, y: i32) {
+    switch_tab(desktop, session);
+    let Some(app) = app else {
+        return;
+    };
+    let single = desktop.find(app).is_some_and(|window| window.tab_sessions().len() < 2);
+    if single || theme::is_mobile() {
+        if !theme::is_mobile() {
+            desktop.set_drag(Some(app));
+            CARRY_TAB.store(true, Ordering::Relaxed);
         }
-        desktop.present();
-    });
+        return;
+    }
+    *TAB_DRAG.lock() = Some(TabDrag { app, session, y0: y });
+}
+
+/// Указатель с зажатой кнопкой, пока тянут вкладку: вдоль полосы - она
+/// меняется местами с соседними, далеко вверх или вниз - отрывается в
+/// новое окно, которое дальше едет за указателем.
+fn drag_tab(desktop: &mut Compositor, x: i32, y: i32) {
+    let Some(drag) = *TAB_DRAG.lock() else {
+        return;
+    };
+    let scale = desktop.scale() as i32;
+    let Some(window) = desktop.find(drag.app) else {
+        *TAB_DRAG.lock() = None;
+        return;
+    };
+    let top = window.rect.y;
+    let bottom = top + Window::title_height(scale as u32) as i32;
+    let away = if y < top { top - y } else if y >= bottom { y - bottom + 1 } else { 0 };
+    if away > TEAR_OFF * scale && (y - drag.y0).abs() > TEAR_OFF * scale {
+        *TAB_DRAG.lock() = None;
+        tear_off(desktop, drag.app, drag.session, x, y, true);
+        return;
+    }
+    if let Some(slot) = window.tab_slot_at(x) {
+        if window.move_tab(drag.session, slot) {
+            desktop.present();
+        }
+    }
+}
+
+/// Отпустили кнопку: слежка за вкладкой кончилась.
+fn end_tab_drag() {
+    *TAB_DRAG.lock() = None;
+}
+
+/// Унести вкладку `session` окна `from` в новое окно терминала (20.11).
+/// Новое окно встаёт так, чтобы точка `(x, y)` пришлась на его вкладку;
+/// `carry` - оно дальше едет за указателем (вкладку тянут мышью). Оболочка
+/// сессии не замечает переезда: её вывод находит окно по номеру вкладки.
+fn tear_off(desktop: &mut Compositor, from: App, session: usize, x: i32, y: i32, carry: bool) -> Option<App> {
+    let scale = desktop.scale();
+    let ctx = mini_ui::paint::Ctx::scaled(scale);
+    let source = desktop.find(from)?;
+    if source.tab_sessions().len() < 2 {
+        return None;
+    }
+    let size = layout(desktop, App::TermWin(0));
+    let source = desktop.find(from)?;
+    // Размер - как у окна, из которого унесли, если оно не развёрнуто.
+    let (w, h) = if source.is_maximized() { (size.w, size.h) } else { (source.rect.w, source.rect.h) };
+    let tab = source.take_tab(session)?;
+    let title_h = Window::title_height(scale) as i32;
+    let union = desktop.union_rect();
+    let rx = (x - ctx.px(60) as i32).clamp(union.x, (union.right() - w as i32).max(union.x));
+    let ry = (y - title_h / 2).clamp(union.y, (desktop.work_bottom() - title_h).max(union.y));
+    let app = App::TermWin(NEXT_TERM_WIN.fetch_add(1, Ordering::Relaxed));
+    let Some(mut window) = Window::text(app, Rect::new(rx, ry, w, h), scale) else {
+        if let Some(source) = desktop.find(from) {
+            let _ = source.put_tab(tab);
+        }
+        kprintln!("  terminal    : not enough memory for a new window");
+        return None;
+    };
+    // Одна кнопка на панели с первым окном терминала.
+    window.group = String::from(App::Terminal.title());
+    if let Err(tab) = window.adopt_only(tab) {
+        if let Some(source) = desktop.find(from) {
+            let _ = source.put_tab(tab);
+        }
+        return None;
+    }
+    window.draw_decorations(true);
+    desktop.push(window);
+    ACTIVE_SESSION.store(session, Ordering::Relaxed);
+    kprintln!("  terminal    : tab {} moved to a new window", session + 1);
+    log_window(desktop, app, true);
+    log_window(desktop, from, false);
+    log_focus(desktop);
+    if carry {
+        desktop.set_drag(Some(app));
+        CARRY_TAB.store(true, Ordering::Relaxed);
+    }
+    desktop.refresh_panel(&status_now());
+    // Где кнопка нового окна на панели: стенд наводит на неё указатель,
+    // чтобы открыть миниатюры.
+    if let Some(button) = desktop.button_of(app) {
+        kprintln!("  desktop     : button of '{}' at {},{} {}x{}", app.title(), button.x, button.y, button.w, button.h);
+    }
+    desktop.present();
+    Some(app)
+}
+
+/// Окно терминала с одной вкладкой отпустили над полосой вкладок другого:
+/// вкладка переезжает туда, окно уходит (20.11). `true` - переехала.
+fn drop_on_strip(desktop: &mut Compositor, dragged: App, x: i32, y: i32) -> bool {
+    if !dragged.is_terminal() || theme::is_mobile() {
+        return false;
+    }
+    let Some(target) = desktop.terminal_strip_at(x, y, dragged) else {
+        return false;
+    };
+    let Some(window) = desktop.find(dragged) else {
+        return false;
+    };
+    if window.tab_sessions().len() != 1 {
+        return false;
+    }
+    let session = window.active_session();
+    let Some(tab) = window.take_last_tab() else {
+        return false;
+    };
+    let Some(into) = desktop.find(target) else {
+        if let Some(window) = desktop.find(dragged) {
+            let _ = window.adopt_only(tab);
+        }
+        return false;
+    };
+    if let Err(tab) = into.put_tab(tab) {
+        if let Some(window) = desktop.find(dragged) {
+            let _ = window.adopt_only(tab);
+        }
+        return false;
+    }
+    desktop.set_drag(None);
+    desktop.close(dragged);
+    if let Some(index) = desktop.index_of(target) {
+        desktop.raise(index);
+    }
+    ACTIVE_SESSION.store(session, Ordering::Relaxed);
+    kprintln!("  terminal    : tab {} merged into '{}'", session + 1, target.title());
+    log_window(desktop, target, true);
+    log_focus(desktop);
+    desktop.refresh_panel(&status_now());
+    desktop.present();
+    true
+}
+
+/// Меню вкладки по правой кнопке (20.11): «Переименовать», «Закрыть»,
+/// «Закрыть другие», «Переместить в новое окно».
+fn open_tab_menu(desktop: &mut Compositor, app: App, session: usize, x: i32, y: i32) {
+    switch_tab(desktop, session);
+    let count = desktop.find(app).map_or(0, |window| window.tab_sessions().len());
+    *TAB_MENU.lock() = Some((app, session));
+    desktop.open_context(x, y, &context::Action::ON_TAB);
+    let mut off = alloc::vec::Vec::new();
+    // Первую вкладку (оболочку сеанса) не закрывают: она живёт всегда.
+    if session == 0 {
+        off.push(context::Action::TabClose);
+    }
+    if count < 2 {
+        off.extend([context::Action::TabCloseOthers, context::Action::TabDetach]);
+    }
+    if !off.is_empty() {
+        desktop.context_set_off(off);
+    }
+    if let Some(rect) = desktop.context_rect() {
+        kprintln!("  desktop     : context menu at {},{} {}x{} for tab", rect.x, rect.y, rect.w, rect.h);
+    }
+}
+
+/// Пункт меню вкладки.
+fn tab_action(desktop: &mut Compositor, action: context::Action) {
+    desktop.close_context();
+    let Some((app, session)) = TAB_MENU.lock().take() else {
+        return;
+    };
+    match action {
+        context::Action::TabRename => {
+            if desktop.find(app).is_some_and(|window| window.begin_rename(session)) {
+                kprintln!("  terminal    : renaming tab {}", session + 1);
+            }
+        }
+        context::Action::TabClose => request_tab(TabRequest::Close(session)),
+        context::Action::TabCloseOthers => {
+            let others: alloc::vec::Vec<usize> =
+                desktop.find(app).map(|window| window.tab_sessions().iter().copied().filter(|item| *item != session).collect()).unwrap_or_default();
+            for other in others {
+                request_tab(TabRequest::Close(other));
+            }
+        }
+        context::Action::TabDetach => {
+            let rect = desktop.rect_of(app).unwrap_or(Rect::new(0, 0, 1, 1));
+            let scale = desktop.scale() as i32;
+            let (x, y) = (rect.x + 96 * scale, rect.y + 48 * scale);
+            tear_off(desktop, app, session, x, y, false);
+        }
+        _ => {}
+    }
+    desktop.present();
+}
+
+/// Принять имя вкладки, которое правили, если щёлкнули мимо него.
+fn commit_tab_rename(desktop: &mut Compositor) {
+    let Some(app) = desktop.front_terminal() else {
+        return;
+    };
+    if let Some((session, name)) = desktop.find(app).filter(|window| window.renaming()).and_then(Window::commit_rename) {
+        kprintln!("  terminal    : tab {} named '{}'", session + 1, name);
+        desktop.refresh_panel(&status_now());
+    }
 }
 
 /// Размер окна оболочки в символах. Нули — графики нет.
@@ -1490,6 +1819,44 @@ static FLUSH_NS: AtomicU64 = AtomicU64::new(0);
 /// Записать, во что обошёлся перенос прямоугольника к хосту.
 pub fn note_flush(ns: u64) {
     FLUSH_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// Перенос к хосту, наносекунды с загрузки (`perf-diag`).
+#[must_use]
+pub fn flush_ns() -> u64 {
+    FLUSH_NS.load(Ordering::Relaxed)
+}
+
+/// Мониторов, о которых ведётся счёт вывода порознь.
+pub const OUTPUT_STATS: usize = 4;
+/// Вывод полос на каждый монитор: наносекунды и точки (P1, 18.11.2026) —
+/// на ПК Романа два монитора 2560x1440, и общий `blit` не говорил, какой
+/// из них дорог (сканаут во VRAM через BAR1 против обычной памяти).
+static OUTPUT_BLIT_NS: [AtomicU64; OUTPUT_STATS] = [const { AtomicU64::new(0) }; OUTPUT_STATS];
+static OUTPUT_POINTS: [AtomicU64; OUTPUT_STATS] = [const { AtomicU64::new(0) }; OUTPUT_STATS];
+
+/// Записать вывод куска полосы на монитор `index`.
+pub fn note_output_blit(index: usize, ns: u64, points: u64) {
+    if let (Some(time), Some(count)) = (OUTPUT_BLIT_NS.get(index), OUTPUT_POINTS.get(index)) {
+        time.fetch_add(ns, Ordering::Relaxed);
+        count.fetch_add(points, Ordering::Relaxed);
+    }
+}
+
+/// Вывод на монитор `index`: наносекунды и точки с загрузки.
+#[must_use]
+pub fn output_blit(index: usize) -> (u64, u64) {
+    match (OUTPUT_BLIT_NS.get(index), OUTPUT_POINTS.get(index)) {
+        (Some(time), Some(count)) => (time.load(Ordering::Relaxed), count.load(Ordering::Relaxed)),
+        _ => (0, 0),
+    }
+}
+
+/// Худший кадр с прошлого вопроса — и забыть его (`perf-diag` спрашивает раз
+/// в полминуты и хочет худший именно за них).
+#[must_use]
+pub fn take_worst_frame_ns() -> u64 {
+    WORST_FRAME_NS.swap(0, Ordering::Relaxed)
 }
 
 /// Записать, во что обошлась одна полоса кадра. Зовётся из композитора.
@@ -1871,8 +2238,10 @@ pub fn tick() {
     // «Завершить программу» — вне замка стола: снятие задачи берёт свои.
     let task = HUNG_KILL.swap(0, Ordering::Relaxed);
     if task != 0 {
-        match crate::user::request_kill(crate::sched::TaskId::new(task)) {
-            Ok(()) => kprintln!("  desktop     : killed #{task}, it did not respond"),
+        // Вместе с группой (P4): у игры под Wine это ещё `wineserver` и
+        // служебные процессы префикса.
+        match crate::user::end_program_group(crate::sched::TaskId::new(task)) {
+            Ok(count) => kprintln!("  desktop     : killed #{task} ({count} process(es)), it did not respond"),
             Err(_) => kprintln!("  desktop     : #{task} could not be ended"),
         }
     }
@@ -2073,6 +2442,15 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
         }
     }
 
+    // Ctrl+Shift+Esc - диспетчер задач откуда угодно, как в Windows (20.11):
+    // открытый поднимается, а не открывается второй.
+    if event.code == KeyCode::Escape && event.mods.contains(Modifiers::CTRL) && event.mods.contains(Modifiers::SHIFT) {
+        open_task_manager(desktop);
+        desktop.refresh_panel(status);
+        desktop.present();
+        return None;
+    }
+
     // Win+Пробел — второе сочетание раскладки, то, к которому привыкли в
     // Windows 8 и позже. Alt+Shift выше — то, к которому привыкли раньше.
     if event.code == KeyCode::Space && event.mods.contains(Modifiers::META) {
@@ -2102,6 +2480,18 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
         // не через каждый эмулятор, а стол без меню — это набор окон.
         KeyCode::F1 => {
             toggle_menu(desktop, status);
+            return None;
+        }
+        // Ctrl+Shift+Esc — диспетчер задач, как в Windows (20.11).
+        KeyCode::Escape if event.mods.contains(Modifiers::CTRL) && event.mods.contains(Modifiers::SHIFT) => {
+            run_choice(desktop, panel::Choice::Program("taskmgr", ""));
+            desktop.refresh_panel(status);
+            return None;
+        }
+        // Win+R — «Выполнить», как в Windows (фаза П1, 20.11): /bin/run.
+        KeyCode::R if event.mods.contains(Modifiers::META) => {
+            run_choice(desktop, panel::Choice::Program("run", ""));
+            desktop.refresh_panel(status);
             return None;
         }
         // Win+L — заблокировать, как в Windows (72h-4).
@@ -2207,7 +2597,30 @@ pub fn dispatch_pointer(event: PointerEvent) {
     }
 }
 
-/// Кнопку `button` (1 левая, 2 правая) отпустили в точке `x, y` экрана.
+/// Код средней кнопки в [`WIN_POINTER`] и [`WIN_RELEASE`] (20.11) — третий
+/// бит маски кнопок, как у [`WIN_MOVE`]: 1 левая, 2 правая, 4 средняя.
+const MIDDLE_BUTTON: u32 = 4;
+
+/// Среднюю кнопку нажали (20.11): окну программы под указателем — нажатие с
+/// кодом [`MIDDLE_BUTTON`] и захват до отпускания. Окно не поднимается и
+/// фокус не меняется: вкладка, открытая средней кнопкой, открывается фоном.
+/// Над окнами стола, панелью и меню средняя кнопка ничего не делает.
+fn press_middle(desktop: &mut Compositor, x: i32, y: i32) {
+    if desktop.menu_open() || desktop.context_open() || desktop.dragging().is_some() || desktop.captured().is_some() {
+        return;
+    }
+    let Some((app, local_x, local_y)) = desktop.program_under(x, y) else {
+        return;
+    };
+    let Some(window) = desktop.find(app) else {
+        return;
+    };
+    window.push_event(WinEvent { kind: WIN_POINTER, code: MIDDLE_BUTTON, x: local_x, y: local_y });
+    desktop.capture(app, MIDDLE_BUTTON);
+    kprintln!("  desktop     : middle click at {local_x},{local_y} of '{}'", name_of(desktop, app));
+}
+
+/// Кнопку `button` (1 левая, 2 правая, 4 средняя) отпустили в точке `x, y` экрана.
 ///
 /// Отпускание достаётся окну, над которым кнопку **нажали** (фаза 62b), и точка
 /// тогда бывает за краем его поверхности. Когда отпущены все кнопки, захват
@@ -2256,6 +2669,13 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
         }
         return;
     }
+    // Автоскрытие панели: край экрана выдвигает её, уход — прячет (20.11).
+    desktop.taskbar_pointer(x, y);
+    if desktop.menu_open() && !desktop.context_open() {
+        if desktop.menu_mut().is_some_and(|menu| menu.hover(x, y)) {
+            desktop.present();
+        }
+    }
     if desktop.context_open() {
         hover_context(desktop, x, y, status);
     } else if desktop.thumbs_open() {
@@ -2279,7 +2699,7 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
     } else {
         match desktop.window_at(x, y) {
             Some((_, Hit::Resize(edges))) => resize_shape(edges),
-            Some((index, Hit::Body)) if desktop.app_at(index) == Some(App::Terminal) => pointer::Shape::Text,
+            Some((index, Hit::Body)) if desktop.app_at(index).is_some_and(App::is_terminal) => pointer::Shape::Text,
             // Окно программы выбирает форму само (SYS_WINCURSOR): рука над
             // ссылкой браузера, текст над полем.
             Some((index, Hit::Body)) => match desktop.app_at(index) {
@@ -2324,6 +2744,13 @@ fn resize_shape(edges: u8) -> pointer::Shape {
 /// окном, держится, — ему (фаза 68c, `user_abi::WIN_WHEEL`). Окнам стола
 /// колесо пока ничего не делает.
 fn wheel(desktop: &mut Compositor, x: i32, y: i32, clicks: i32) {
+    // Открытый «Пуск» прокручивает колонку под указателем (20.11).
+    if desktop.menu_open() && !desktop.context_open() {
+        if desktop.menu_mut().is_some_and(|menu| menu.wheel(x, y, clicks)) {
+            desktop.present();
+        }
+        return;
+    }
     let target = if let Some((app, _)) = desktop.captured() {
         Some(app)
     } else if desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open() {
@@ -2339,7 +2766,7 @@ fn wheel(desktop: &mut Compositor, x: i32, y: i32, clicks: i32) {
     if target.is_none() && desktop.dragging().is_none() && !desktop.menu_open() && !desktop.context_open() {
         let moved = desktop.window_under(x, y).and_then(|app| desktop.find(app)).is_some_and(|window| {
             let moved = window.wheel(clicks);
-            if moved && window.app == App::Terminal {
+            if moved && window.app.is_terminal() {
                 log_terminal_view(window);
             }
             moved
@@ -2520,9 +2947,12 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     if dx != 0 || dy != 0 {
         hover(desktop, x, y, event.buttons, status);
         if event.buttons.contains(Buttons::LEFT) && SELECTING.load(Ordering::Relaxed) {
-            if let Some(window) = desktop.find(App::Terminal) {
+            if let Some(window) = desktop.front_terminal().and_then(|app| desktop.find(app)) {
                 window.term_select_to(x, y);
             }
+        }
+        if event.buttons.contains(Buttons::LEFT) {
+            drag_tab(desktop, x, y);
         }
     }
     if event.wheel != 0 {
@@ -2541,7 +2971,12 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         // в окно или в кнопку панели: у них своего меню пока нет.
         // «Открыть с помощью ›» у каждого файла свой — программы приходят
         // меню перед открытием (`context_handlers`).
-        let target: Option<(&[context::Action], &str)> = if desktop.context_open() {
+        let in_start = desktop.menu_open() && desktop.menu_mut().is_some_and(|menu| menu.context(x, y));
+        let target: Option<(&[context::Action], &str)> = if in_start {
+            // Правая кнопка над «Пуском» — его собственное меню программы.
+            desktop.present();
+            None
+        } else if desktop.context_open() {
             desktop.close_context();
             None
         } else if let Some(hit) = desktop.panel_at(x, y) {
@@ -2556,6 +2991,10 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                         desktop.close_thumbs();
                     }
                     open_close_menu(desktop, app, status);
+                    None
+                }
+                PanelHit::Pin(index) => {
+                    open_pin_menu(desktop, index, x, y, status);
                     None
                 }
                 PanelHit::Menu
@@ -2580,7 +3019,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 if let Some(window) = target.filter(|_| !redirected) {
                     // Терминал: правая кнопка копирует выделенное, а без
                     // выделения вставляет — как в Windows Terminal и PuTTY.
-                    if window.app == App::Terminal {
+                    if window.app.is_terminal() {
                         let selection = window.term_selection();
                         if selection.is_empty() {
                             paste_clipboard();
@@ -2604,6 +3043,15 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 }
                 desktop.refresh_panel(status);
                 desktop.present();
+            }
+            // Правая кнопка по вкладке терминала - её меню (20.11).
+            if let Hit::Tab(session) | Hit::TabClose(session) = hit {
+                if let Some(app) = desktop.app_at(index) {
+                    desktop.raise(index);
+                    log_focus(desktop);
+                    open_tab_menu(desktop, app, session, x, y);
+                    desktop.present();
+                }
             }
             None
         } else {
@@ -2653,6 +3101,11 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 desktop.refresh_panel(status);
             }
             desktop.open_context(x, y, items);
+            // Ярлык программы на столе на панель пока не закрепляется — из
+            // «Пуска» (20.11).
+            if items.contains(&context::Action::PinTaskbar) {
+                desktop.context_set_off(alloc::vec![context::Action::PinTaskbar]);
+            }
             // Печатается **место, куда меню встало**, а не точка щелчка: у
             // края экрана оно сдвигается, чтобы не выехать, и стенд, целящийся
             // по точке щелчка, попадал бы мимо пунктов.
@@ -2669,6 +3122,15 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
     if event.released(Buttons::RIGHT) {
         release_pointer(desktop, x, y, 2, status);
+    }
+    // Средняя кнопка (20.11) — окну программы под указателем, кодом 4
+    // ([`MIDDLE_BUTTON`]): «Файлы» открывают по ней папку в новой вкладке и
+    // закрывают вкладку, как Проводник.
+    if event.pressed(Buttons::MIDDLE) {
+        press_middle(desktop, x, y);
+    }
+    if event.released(Buttons::MIDDLE) {
+        release_pointer(desktop, x, y, MIDDLE_BUTTON, status);
     }
     if event.released(Buttons::LEFT) {
         // Жест по полоске и карточка переключателя — раньше прочего: нажатие,
@@ -2713,8 +3175,9 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
             kprintln!("  desktop     : volume {value} (dragged)");
         }
         release_pointer(desktop, x, y, 1, status);
+        end_tab_drag();
         if SELECTING.swap(false, Ordering::Relaxed) {
-            if let Some(text) = desktop.find(App::Terminal).and_then(Window::term_select_end) {
+            if let Some(text) = desktop.front_terminal().and_then(|app| desktop.find(app)).and_then(Window::term_select_end) {
                 kprintln!("  terminal    : selected {} chars", text.chars().count());
             }
         }
@@ -2732,6 +3195,22 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         // Размер, отложенный до кадра, применяется до того, как спросят, где и
         // какого размера окно: иначе отпускание описывало бы окно на шаг назад.
         desktop.settle_drag();
+        // Окно терминала с одной вкладкой бросили на полосу другого -
+        // вкладка переезжает туда (20.11).
+        let carried = CARRY_TAB.swap(false, Ordering::Relaxed);
+        if let Some(app) = desktop.dragging().filter(|_| carried && !desktop.drag_resizes()) {
+            if drop_on_strip(desktop, app, x, y) {
+                desktop.set_drag(None);
+            }
+        }
+        // Окно бросили у края экрана — прилипает к половине монитора или
+        // разворачивается (20.11, как Snap в Windows).
+        if let Some(app) = desktop.dragging().filter(|_| !desktop.drag_resizes()) {
+            if let Some(zone) = desktop.drop_snap(app) {
+                kprintln!("  desktop     : snapped '{}' {}", name_of(desktop, app), zone.name());
+                log_window(desktop, app, true);
+            }
+        }
         // Где окно оказалось — в журнал: это единственное видимое снаружи
         // последствие перетаскивания, и без него проверить его можно было бы
         // только глазами по снимку экрана.
@@ -2749,6 +3228,11 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                     rect.x,
                     rect.y
                 );
+            }
+            // Развёрнутое окно уменьшилось под указателем (20.11): у него
+            // теперь другой размер, а не только место.
+            if desktop.drag_unmaximized() {
+                log_window(desktop, app, true);
             }
         }
         // Растяжение за уголок — так же, как разворот: новый прямоугольник в
@@ -3147,13 +3631,13 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         }
     }
 
-    // 1. Открытое меню.
+    // 1. Открытое меню. Щелчок внутри может и не запускать: раскрыть
+    // папку, открыть меню пользователя, закрепить (20.11).
     if desktop.menu_open() {
-        let choice = desktop.menu_mut().and_then(|menu| menu.choice_at(x, y));
-        match choice {
-            Some(choice) => {
+        let click = desktop.menu_mut().map_or(panel::MenuClick::Close, |menu| menu.click(x, y));
+        match click {
+            panel::MenuClick::Launch(choice) => {
                 if let Some(menu) = desktop.menu_mut() {
-                    menu.select_at(x, y);
                     menu.close();
                 }
                 kprintln!("  desktop     : menu closed");
@@ -3162,10 +3646,15 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                 desktop.refresh_panel(status);
                 return;
             }
+            panel::MenuClick::Stay => {
+                desktop.refresh_panel(status);
+                desktop.present();
+                return;
+            }
             // Щелчок мимо меню закрывает его и на этом заканчивается: это то,
             // чего человек ждёт от щелчка вне открытого меню, и заодно
             // единственный способ закрыть его мышью.
-            None => {
+            panel::MenuClick::Close => {
                 if let Some(menu) = desktop.menu_mut() {
                     menu.close();
                 }
@@ -3236,6 +3725,14 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
             PanelHit::Missing(what) => {
                 kprintln!("  desktop     : {what} -- no program for it on this machine yet");
             }
+            // Закреплённая программа без окна — запустить (20.11).
+            PanelHit::Pin(index) => {
+                if let Some(choice) = desktop.panel_pin_choice(index) {
+                    kprintln!("  desktop     : taskbar pin '{}' launched", desktop.panel_pin_caption(index));
+                    run_choice(desktop, choice);
+                }
+                desktop.refresh_panel(status);
+            }
             PanelHit::Empty => {}
         }
         return;
@@ -3305,7 +3802,8 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         *ICON_GESTURE.lock() = Some(IconGesture::Band { x0: x, y0: y, keep });
     }
 
-    // 4. Окна.
+    // 4. Окна. Имя вкладки, которое правили, принимается щелчком мимо.
+    commit_tab_rename(desktop);
     if let Some((index, hit)) = desktop.window_at(x, y) {
         let app = desktop.app_at(index);
         desktop.raise(index);
@@ -3315,6 +3813,33 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         // ни щелчка содержимому (оно досталось бы вопросу, в чужих
         // координатах), ни перетаскивания, ни уголка.
         let popup = app.is_some_and(|app| desktop.is_popup(app));
+        // Двойной щелчок по заголовку (20.11): развернуть или вернуть, как в
+        // Windows. Первый щелчок мог прийтись на неактивное окно — он только
+        // поднял его, но запомнить его надо и тогда.
+        if let Some(app) = app.filter(|_| hit == Hit::Title && !popup) {
+            let now = if at_ms == 0 { crate::time::uptime_ms() } else { at_ms };
+            let slop = 6 * desktop.scale().max(1) as i32;
+            let double = {
+                let mut last = LAST_TITLE.lock();
+                let double = last.is_some_and(|(was, at, lx, ly)| {
+                    was == app && now.saturating_sub(at) <= DOUBLE_CLICK_MS && (x - lx).abs() <= slop && (y - ly).abs() <= slop
+                });
+                // Третий щелчок — снова первый, а не второй двойной.
+                *last = if double { None } else { Some((app, now, x, y)) };
+                double
+            };
+            if double {
+                desktop.set_drag(None);
+                let name = name_of(desktop, app);
+                if desktop.find(app).is_some_and(|window| window.resizable()) && desktop.toggle_maximize(app) {
+                    kprintln!("  desktop     : title double-click on '{name}'");
+                    kprintln!("  desktop     : resized '{name}'");
+                    log_window(desktop, app, true);
+                }
+                desktop.present();
+                return;
+            }
+        }
         if desktop.focused_app() != app && !popup && matches!(hit, Hit::Body | Hit::Title | Hit::Resize(_)) {
             desktop.present();
             return;
@@ -3370,9 +3895,11 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                 }
             }
             // Полоса вкладок терминала.
-            Hit::Tab(session) => switch_tab(desktop, session),
+            // Нажатая вкладка - видимой; дальше её можно тянуть: вдоль
+            // полосы, прочь из неё (новое окно) или на полосу другого окна.
+            Hit::Tab(session) => press_tab(desktop, app, session, y),
             Hit::TabClose(session) => request_tab(TabRequest::Close(session)),
-            Hit::TabNew => request_tab(TabRequest::New),
+            Hit::TabNew => request_new_tab(app),
             Hit::Title => {
                 desktop.set_drag(app);
                 if let Some(app) = app {
@@ -3425,7 +3952,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                         false
                     }
                     Some(window) => {
-                        if window.app == App::Terminal && window.term_select_start(x, y) {
+                        if window.app.is_terminal() && window.term_select_start(x, y) {
                             SELECTING.store(true, Ordering::Relaxed);
                         }
                         window.handle_click(x, y);
@@ -3515,6 +4042,9 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
             }
         }
         *HUNG.lock() = None;
+        // Пока вопрос был открыт, сервер Wayland мог сказать о том же окне
+        // снова — ответ уже дан.
+        *UNANSWERED.lock() = None;
         return;
     }
     let choice = if app == App::OpenWith && answer == Answer::Open {
@@ -3585,13 +4115,29 @@ fn choose_program(desktop: &mut Compositor, path: &str) {
 fn terminal_key(desktop: &mut Compositor, event: KeyEvent) -> bool {
     let shift = event.mods.contains(Modifiers::SHIFT);
     let ctrl = event.mods.contains(Modifiers::CTRL);
-    let Some(window) = desktop.find(App::Terminal) else {
+    let Some(app) = desktop.front_terminal() else {
         return false;
     };
+    let Some(window) = desktop.find(app) else {
+        return false;
+    };
+    // Имя вкладки правят в полосе (20.11): клавиатура - полю.
+    if window.renaming() {
+        match window.rename_key(event.code, keymap::char_for(event)) {
+            RenameStep::Done(session, name) => {
+                kprintln!("  terminal    : tab {} named '{}'", session + 1, name);
+                desktop.refresh_panel(&status_now());
+            }
+            RenameStep::Cancelled => kprintln!("  terminal    : tab rename cancelled"),
+            RenameStep::Typing => {}
+        }
+        desktop.present();
+        return true;
+    }
     // Вкладки, как в Windows Terminal: Ctrl+Shift+T — новая, Ctrl+Shift+W —
     // закрыть, Ctrl+Tab и Ctrl+Shift+Tab — соседняя.
     if ctrl && shift && event.code == KeyCode::T {
-        request_tab(TabRequest::New);
+        request_new_tab(Some(app));
         return true;
     }
     if ctrl && shift && event.code == KeyCode::W {
@@ -3809,7 +4355,11 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
         // Окна оболочки может не быть вовсе (его закрыли) — тогда ввод всё
         // равно уходит ей: иначе система осталась бы без единственного места,
         // где можно набрать команду.
-        Some(App::Terminal) | None => {
+        Some(App::Terminal | App::TermWin(_)) | None => {
+            // Клавиши - видимой вкладке активного окна терминала (20.11: окон
+            // терминала может быть несколько).
+            let session = desktop.front_terminal().filter(|_| desktop.focused_app().is_some()).and_then(|app| desktop.find(app)).map_or(0, |window| window.active_session());
+            ACTIVE_SESSION.store(session, Ordering::Relaxed);
             if event.pressed && terminal_key(desktop, event) {
                 return None;
             }
@@ -4063,7 +4613,7 @@ fn adopt_plan(
 /// Размеры, которые спрашивают без захвата стола: окно оболочки в знаках,
 /// основной монитор, весь стол.
 fn remember_sizes(desktop: &mut Compositor) {
-    let cells = match desktop.find(App::Terminal) {
+    let cells = match desktop.front_terminal().and_then(|app| desktop.find(app)) {
         Some(window) => window.size_in_cells(),
         None => (0, 0),
     };
@@ -4288,6 +4838,39 @@ fn apply_look_change(desktop: &mut Compositor, look: bool, title: bool, status: 
     }
 }
 
+/// `ui taskbar …` и `ui start …` оболочки (20.11): сменить вид панели и
+/// «Пуска» без «Параметров» — так их меняет стенд.
+pub fn taskbar_command(words: &str) {
+    let status = status_now();
+    if words.trim() == "settings" {
+        with_desktop(|desktop| {
+            open_settings(desktop, Section::Dock, &status);
+            desktop.present();
+        });
+        return;
+    }
+    deskcfg::command(words);
+    with_desktop(|desktop| {
+        desktop.refresh_panel(&status);
+        desktop.present();
+    });
+}
+
+pub fn start_command(words: &str) {
+    let status = status_now();
+    if words.trim() == "settings" {
+        with_desktop(|desktop| {
+            open_settings(desktop, Section::Start, &status);
+            desktop.present();
+        });
+        return;
+    }
+    deskcfg::start_command(words);
+    with_desktop(|desktop| {
+        desktop.reload_menu();
+    });
+}
+
 /// Открыть или закрыть меню запуска.
 fn toggle_menu(desktop: &mut Compositor, status: &Status) {
     // Открывается — значит пересобирается (фаза N8): пакет, поставленный после
@@ -4307,6 +4890,14 @@ fn toggle_menu(desktop: &mut Compositor, status: &Status) {
     );
     if !packages.is_empty() {
         kprintln!("  desktop     : start menu offers packages: {packages}");
+    }
+    // Где что стоит — для стенда (`Aim::Spot`).
+    if opened {
+        if let Some(menu) = desktop.menu_mut() {
+            for spot in menu.spots() {
+                kprintln!("  desktop     : start spot {spot}");
+            }
+        }
     }
     if !opened {
         // Закрытое меню надо стереть: под ним фон и окна, которые никто не
@@ -4340,6 +4931,8 @@ fn handle_menu(desktop: &mut Compositor, event: KeyEvent, status: &Status) {
             menu.close();
             closed = true;
         }
+        // Escape сперва закрывает всплывшее над «Пуском» меню (20.11).
+        KeyCode::Escape if menu.dismiss_popup() => {}
         KeyCode::Escape | KeyCode::LeftMeta | KeyCode::RightMeta | KeyCode::F1 => {
             menu.close();
             closed = true;
@@ -4375,6 +4968,22 @@ fn handle_menu(desktop: &mut Compositor, event: KeyEvent, status: &Status) {
 fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
     match choice {
         panel::Choice::App(app) => launch(desktop, app),
+        // Меню пользователя в «Пуске» (20.11).
+        panel::Choice::Settings(section) => {
+            launch(desktop, App::Settings);
+            if let Some(window) = desktop.find(App::Settings) {
+                window.show_settings(section);
+            }
+            kprintln!("  desktop     : settings opened on {section:?}");
+        }
+        panel::Choice::Lock => {
+            desktop.lock_screen();
+            kprintln!("  desktop     : locked");
+        }
+        panel::Choice::Recent(command, path) => {
+            kprintln!("  desktop     : opening recent '{path}'");
+            open_file(desktop, &command, &path);
+        }
         panel::Choice::Program(name, args) => {
             let path = if args.is_empty() {
                 alloc::format!("/bin/{name}")
@@ -4408,8 +5017,30 @@ fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
     }
 }
 
+/// Диспетчер задач: поднять его окно, если оно есть, иначе запустить
+/// `/bin/taskmgr` (Ctrl+Shift+Esc).
+fn open_task_manager(desktop: &mut Compositor) {
+    let open = desktop.buttons().into_iter().find(|entry| entry.group.rsplit('/').next() == Some("taskmgr")).map(|entry| entry.app);
+    match open {
+        Some(app) => {
+            kprintln!("  desktop     : task manager raised");
+            launch(desktop, app);
+        }
+        None => run_choice(desktop, panel::Choice::Program("taskmgr", "")),
+    }
+}
+
 /// Запустить программу: поднять её окно или создать новое.
 fn launch(desktop: &mut Compositor, app: App) {
+    // Первую вкладку унесли в своё окно (20.11) - «Терминал» поднимает его,
+    // а не открывает её второй раз.
+    if app == App::Terminal && desktop.index_of(app).is_none() {
+        if let Some(index) = desktop.terminal_app_of(0).and_then(|holder| desktop.index_of(holder)) {
+            desktop.raise(index);
+            log_focus(desktop);
+            return;
+        }
+    }
     if let Some(index) = desktop.index_of(app) {
         // Свёрнутое окно возвращается на экран, а не просто поднимается: иначе
         // кнопка в панели задач у свёрнутого окна не делала бы ничего видимого.
@@ -4562,6 +5193,11 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         return;
     }
     match action {
+        // Меню вкладки терминала (20.11).
+        context::Action::TabRename | context::Action::TabClose | context::Action::TabCloseOthers | context::Action::TabDetach => {
+            tab_action(desktop, action);
+            desktop.refresh_panel(status);
+        }
         // Пункт с подменю ничего не делает сам: подменю открыл указатель.
         context::Action::Submenu(_) | context::Action::RecentHeader => {}
         context::Action::Recent(number) => {
@@ -4580,7 +5216,6 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         | context::Action::SortType
         | context::Action::SortDate
         | context::Action::RunAsAdmin
-        | context::Action::PinTaskbar
         | context::Action::PinStart
         | context::Action::PinQuick
         | context::Action::Compress
@@ -4766,6 +5401,15 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             members.retain(|member| desktop.index_of(*member).is_some());
             if let Some(anchor) = members.first().copied() {
                 open_list_of(desktop, anchor, members, status, hovered, false);
+            }
+            desktop.refresh_panel(status);
+        }
+        // Закрепить или открепить программу кнопки (20.11).
+        context::Action::PinTaskbar => {
+            desktop.close_context();
+            if let Some(key) = PIN_KEY.lock().take() {
+                let pinned = deskcfg::toggle_task_pin(&key);
+                kprintln!("  desktop     : taskbar {} '{key}'", if pinned { "pinned" } else { "unpinned" });
             }
             desktop.refresh_panel(status);
         }
@@ -5227,6 +5871,19 @@ static HUNG: SpinLock<Option<App>> = SpinLock::new(None);
 /// Задача, которую велено снять, — снимает [`tick`] вне замка стола.
 static HUNG_KILL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Окно, о котором сервер Wayland сказал «не отвечает» (P4): задача, номер
+/// окна, сколько секунд. Просьбу закрыться он читает сразу и передаёт
+/// клиенту — непрочитанной в очереди окна она не лежит, и [`watch_hung`]
+/// по очереди её бы не увидел никогда.
+static UNANSWERED: SpinLock<Option<(u32, u32, u64)>> = SpinLock::new(None);
+
+/// Сервер Wayland: окно `slot` задачи `task` не закрылось на просьбу за
+/// `seconds` секунд или клиент не отвечает на `ping`. Стол спросит
+/// «Программа не отвечает — Завершить / Подождать».
+pub fn report_unresponsive(task: u32, slot: u32, seconds: u64) {
+    *UNANSWERED.lock() = Some((task, slot, seconds));
+}
+
 /// Найти окно, не прочитавшее просьбу закрыться за [`HUNG_AFTER_MS`], и
 /// спросить о нём (макет 18).
 fn watch_hung(desktop: &mut Compositor) {
@@ -5243,7 +5900,14 @@ fn watch_hung(desktop: &mut Compositor) {
     }
     let now = crate::time::uptime_ms();
     let mut found = None;
-    for app in desktop.program_apps() {
+    if let Some((task, slot, seconds)) = UNANSWERED.lock().take() {
+        let app = App::Program(task, slot);
+        if desktop.find(app).is_some() {
+            found = Some((app, seconds));
+        }
+    }
+    let apps = if found.is_none() { desktop.program_apps() } else { Vec::new() };
+    for app in apps {
         let Some(window) = desktop.find(app) else {
             continue;
         };
@@ -5303,9 +5967,9 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         let full_h = if framed { h.saturating_add(Window::title_height(scale)) } else { h };
         // Окно программы открывается на основном мониторе, по центру его
         // рабочей области.
-        let p = desktop.primary_rect();
-        let screen = desktop.screen_width();
-        let work = (desktop.app_bottom() - p.y).max(1) as u32;
+        let p = desktop.primary_work();
+        let screen = p.w;
+        let work = p.h.max(1);
         // На телефоне окно программы открывается во весь экран, как у Android
         // (05.11): рамку держит стол, пиксели лежат в ней по центру или
         // срезаны (NetSurf просит 800×600 на экране шириной 720), а умеющей
@@ -5486,6 +6150,29 @@ pub fn maximize_window(task: u32, slot: u32, on: bool) -> Result<(), WindowError
     .unwrap_or_else(|| Err(unavailable()))
 }
 
+/// Открыть окно программы во весь монитор (`on`) или вернуть
+/// (`xdg_toplevel.set_fullscreen` и `unset_fullscreen`, 20.11). Уже в нужном
+/// состоянии — ничего.
+pub fn fullscreen_window(task: u32, slot: u32, on: bool) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let now = desktop.find(app).ok_or(WindowError::NoWindow)?.fullscreen;
+        if now != on && desktop.set_fullscreen(app, on) {
+            kprintln!("  desktop     : '{}' {} fullscreen", name_of(desktop, app), if on { "entered" } else { "left" });
+            log_window(desktop, app, true);
+            desktop.present();
+        }
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Открыто ли окно программы во весь экран.
+#[must_use]
+pub fn window_fullscreen(task: u32, slot: u32) -> bool {
+    with_desktop(|desktop| desktop.find(App::Program(task, slot)).is_some_and(|window| window.fullscreen)).unwrap_or(false)
+}
+
 /// Развёрнуто ли окно программы.
 #[must_use]
 pub fn window_maximized(task: u32, slot: u32) -> bool {
@@ -5518,22 +6205,30 @@ pub fn minimize_window(task: u32, slot: u32) -> Result<(), WindowError> {
 pub fn shell_status(status: Option<&str>) {
     let session = crate::sched::session();
     with_desktop(|desktop| {
-        if let Some(window) = desktop.find(App::Terminal) {
+        // Окно, в котором вкладка этой оболочки (20.11: их бывает несколько).
+        let app = desktop.terminal_app_of(session);
+        let mut visible = false;
+        if let Some(window) = desktop.terminal_of(session) {
             if window.has_tabs() {
                 let title = status.map_or_else(|| alloc::format!("Терминал {}", session + 1), String::from);
                 window.set_tab_title(session, &title);
             }
+            visible = window.active_session() == session;
         }
-        if session != active_session() {
+        if !visible {
             desktop.present();
             return;
         }
-        let focused = desktop.focused_app() == Some(App::Terminal);
+        let Some(app) = app else {
+            desktop.present();
+            return;
+        };
+        let focused = desktop.focused_app() == Some(app);
         let caption = match status {
             Some(status) => alloc::format!("{} — {status}", App::Terminal.caption()),
             None => String::from(App::Terminal.caption()),
         };
-        let changed = desktop.find(App::Terminal).is_some_and(|window| window.set_caption(&caption, focused));
+        let changed = desktop.find(app).is_some_and(|window| window.set_caption(&caption, focused));
         if changed {
             desktop.refresh_panel(&status_now());
             desktop.present();
@@ -5602,8 +6297,32 @@ pub fn resize_window(task: u32, slot: u32, pixels: Surface) -> Result<(), Window
         let Some(window) = desktop.find(app) else {
             return Err(WindowError::NoWindow);
         };
+        let size = (pixels.width(), pixels.height());
         if !window.replace_pixels(pixels, focused) {
             return Err(WindowError::NoMemory);
+        }
+        // Программа сама стала размером с монитор (игра под Wine «на весь
+        // экран»: 18.11, Trackmania на ПК Романа стала 2560x1440 там, где
+        // стояла, — полосой через два монитора). Такое окно разворачивается
+        // на свой монитор, а не висит между ними; «восстановить» вернёт его.
+        //
+        // 20.11: только размер, выбранный самой программой, — ответ на
+        // просьбу стола («вернуть размер») так не толкуется, иначе выходил
+        // круг. Окно без рамки стола (Wayland, игры Wine) становится окном во
+        // весь экран — монитор целиком, без панели поверх; окно с рамкой
+        // стола — развёрнутым, как раньше.
+        let monitor_sized = desktop.output_rects().iter().any(|r| (r.w, r.h) == size);
+        let (chosen, frameless, full, maximized) = desktop
+            .find(app)
+            .map_or((false, false, false, false), |w| (w.self_sized(), w.frameless, w.fullscreen, w.is_maximized()));
+        if monitor_sized && chosen && !full {
+            if frameless {
+                if desktop.set_fullscreen(app, true) {
+                    kprintln!("  desktop     : '{}' is monitor-sized, fullscreen on its monitor", name_of(desktop, app));
+                }
+            } else if !maximized && desktop.toggle_maximize(app) {
+                kprintln!("  desktop     : '{}' is monitor-sized, maximized on its monitor", name_of(desktop, app));
+            }
         }
         log_window(desktop, app, focused);
         // Окно могло сжаться: открывшееся под ним место рисуется заново.
@@ -5622,10 +6341,42 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
         let Some(window) = desktop.find(app) else {
             return Err(WindowError::NoWindow);
         };
-        let resizable = flags & user_abi::WIN_STYLE_RESIZABLE != 0;
+        // Диалог (20.11) размера не меняет, что бы ни просили вместе с ним.
+        let dialog = flags & user_abi::WIN_STYLE_DIALOG != 0;
+        let resizable = flags & user_abi::WIN_STYLE_RESIZABLE != 0 && !dialog;
+        if window.dialog != dialog {
+            window.dialog = dialog;
+            window.draw_decorations(focused);
+        }
         window.set_resizable(resizable, focused);
         if resizable {
             kprintln!("  desktop     : '{}' is resizable", name_of(desktop, app));
+        }
+        if dialog {
+            kprintln!("  desktop     : '{}' is a dialog", name_of(desktop, app));
+        }
+        // У кнопки «Пуск» (20.11, «Выполнить»): в угол рабочей области,
+        // ближайший к кнопке, — у нижней панели это левый нижний.
+        if flags & user_abi::WIN_STYLE_AT_START != 0 && !theme::is_mobile() {
+            let work = desktop.primary_work();
+            let home = desktop.start_button_rect();
+            let margin = (12 * desktop.scale()) as i32;
+            let placed = desktop.find(app).map(|window| {
+                let (w, h) = (window.rect.w as i32, window.rect.h as i32);
+                let (cx, cy) = if home.is_empty() { (work.x, work.bottom()) } else { (home.x + home.w as i32 / 2, home.y + home.h as i32 / 2) };
+                let left = cx - work.x <= work.right() - cx;
+                let top = cy - work.y < work.bottom() - cy;
+                let x = if left { work.x + margin } else { work.right() - margin - w };
+                let y = if top { work.y + margin } else { work.bottom() - margin - h };
+                window.rect.x = x.max(work.x);
+                window.rect.y = y.max(work.y);
+                (window.rect.x, window.rect.y)
+            });
+            if let Some((x, y)) = placed {
+                kprintln!("  desktop     : '{}' placed at the Start button {x},{y}", name_of(desktop, app));
+                log_window(desktop, app, focused);
+            }
+            desktop.repaint_all();
         }
         desktop.present();
         Ok(())
@@ -5659,7 +6410,7 @@ pub fn title_window(task: u32, slot: u32, title: &str) -> Result<(), WindowError
             return Err(WindowError::NoWindow);
         };
         if window.set_title(title, focused) {
-            kprintln!("  desktop     : #{task} window is now called '{title}'");
+            kprintln!("  desktop     : #{task} window is now called '{}'", title.replace('\x1f', " | "));
             // И место под новым именем: стенд наводит мышь по имени, а первое
             // имя у окна бывает разным (Chromium с zygote открывает окно уже
             // с адресом страницы, а не «Untitled»).

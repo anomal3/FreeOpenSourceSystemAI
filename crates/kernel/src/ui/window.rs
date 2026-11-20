@@ -55,6 +55,10 @@ use crate::input::KeyCode;
 pub enum App {
     /// Оболочка.
     Terminal,
+    /// Ещё одно окно терминала (20.11): в него унесли вкладку из полосы
+    /// (как в Windows Terminal). Номер - порядковый, окна ищут по [`App`], и
+    /// второму окну терминала нужно своё имя.
+    TermWin(u32),
     /// Что это за система.
     About,
     /// Параметры: сведения о системе, экран, программы, обновление.
@@ -124,6 +128,12 @@ impl App {
         }
     }
 
+    /// Окно терминала - первое или унесённое из полосы вкладок.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, App::Terminal | App::TermWin(_))
+    }
+
     /// Как окно называется для человека.
     ///
     /// Отдельно от [`App::title`], а не вместо него: `title` попадает в журнал,
@@ -133,7 +143,7 @@ impl App {
     #[must_use]
     pub const fn caption(self) -> &'static str {
         match self {
-            App::Terminal => "Терминал",
+            App::Terminal | App::TermWin(_) => "Терминал",
             App::About => "О системе",
             App::Settings => "Параметры",
             App::Shutdown => "Выключение",
@@ -156,7 +166,7 @@ impl App {
     #[must_use]
     pub const fn tone(self) -> mini_ui::paint::Tone {
         match self {
-            App::Terminal => mini_ui::paint::Tone::Ok,
+            App::Terminal | App::TermWin(_) => mini_ui::paint::Tone::Ok,
             App::Shutdown | App::Restart => mini_ui::paint::Tone::Bad,
             _ => mini_ui::paint::Tone::Accent,
         }
@@ -171,14 +181,14 @@ impl App {
     /// у такого окна не рисуется: нарисованный, он обещал бы то, чего нет.
     #[must_use]
     pub const fn resizable(self) -> bool {
-        matches!(self, App::Terminal | App::Settings)
+        matches!(self, App::Terminal | App::TermWin(_) | App::Settings)
     }
 
     /// Значок программы: на столе, в меню запуска и в заголовке окна.
     #[must_use]
     pub const fn icon(self) -> Icon {
         match self {
-            App::Terminal => Icon::Terminal,
+            App::Terminal | App::TermWin(_) => Icon::Terminal,
             App::About => Icon::Info,
             App::Settings => Icon::Settings,
             App::Shutdown | App::Restart => Icon::Power,
@@ -194,6 +204,8 @@ impl App {
     pub const fn title(self) -> &'static str {
         match self {
             App::Terminal => "Terminal",
+            // Стенд целится в унесённое окно по этому имени.
+            App::TermWin(_) => "Terminal window",
             App::About => "About",
             App::Settings => "Settings",
             App::Shutdown => "Shut down",
@@ -211,7 +223,7 @@ impl App {
     #[must_use]
     pub const fn about(self) -> &'static str {
         match self {
-            App::Terminal => "оболочка и команды ядра",
+            App::Terminal | App::TermWin(_) => "оболочка и команды ядра",
             App::About => "что это за система",
             App::Settings => "экран, программы, обновление",
             App::Shutdown => "закрыть том и выключить",
@@ -268,6 +280,26 @@ pub enum Hit {
 pub struct TermTab {
     pub session: usize,
     pub grid: TextGrid,
+}
+
+/// Вкладка, вынутая из окна (20.11): её сетка и имя едут в другое окно
+/// терминала, а оболочка сессии живёт дальше - о переезде она не знает, её
+/// вывод находит окно по номеру сессии.
+pub struct LooseTab {
+    pub session: usize,
+    grid: TextGrid,
+    title: Option<String>,
+    renamed: bool,
+}
+
+/// Что сделала клавиша с именем вкладки, которое правят в полосе.
+pub enum RenameStep {
+    /// Набор продолжается (или клавиша проглочена).
+    Typing,
+    /// Enter: сессия и новое имя (пустое - имя снова даёт программа).
+    Done(usize, String),
+    /// Esc: имя прежнее.
+    Cancelled,
 }
 
 /// Высота полосы вкладок терминала (как у Windows Terminal — под
@@ -356,6 +388,10 @@ pub struct Window {
     pub minimized_at_ms: u64,
     /// Куда вернуть окно, если оно развёрнуто. `None` — окно обычного размера.
     restore: Option<Rect>,
+    /// Окно прилеплено к половине монитора (брошено у края, 20.11, как Snap
+    /// в Windows): его прежний прямоугольник. Потащили — окно возвращает
+    /// прежний размер под указателем, как развёрнутое.
+    snap_from: Option<Rect>,
     /// Окно-владелец той же программы (фаза 62d, `user_abi::SYS_WINOWNER`):
     /// это окно всегда стоит над ним, и поднять владельца — поднять и его.
     pub owner: Option<App>,
@@ -403,6 +439,14 @@ pub struct Window {
     session: usize,
     /// Подписи вкладок: сессия и что в ней идёт.
     tab_titles: Vec<(usize, String)>,
+    /// Вкладки, которым человек дал имя сам (20.11): подпись от программы
+    /// его больше не перекрывает.
+    renamed: Vec<usize>,
+    /// Вкладка, имя которой правят прямо в полосе: сессия и набранное.
+    tab_edit: Option<(usize, String)>,
+    /// Имя выделено целиком (правку только начали): первый знак заменяет
+    /// его, как в Windows Terminal.
+    tab_edit_all: bool,
     /// По чему окна складываются в одну кнопку панели задач: путь программы.
     /// Пусто — окно ядра, группа по [`App`].
     pub group: String,
@@ -426,6 +470,99 @@ pub struct Window {
     /// Низ окна поднят над клавиатурой (05.11): когда она уйдёт, стол вернёт
     /// его к полоске жеста (`Compositor::lift_program_windows`).
     pub lifted: bool,
+    /// Что лежит под обводкой окна (20.11), см. [`EdgeBook`].
+    edge: EdgeBook,
+    /// Окно во весь монитор (`xdg_toplevel.set_fullscreen`, 20.11): ни
+    /// рамки, ни панели поверх, пока оно впереди. Не то же, что развёрнутое:
+    /// то занимает рабочую область, это — монитор целиком.
+    pub fullscreen: bool,
+    /// Куда вернуть окно из полноэкранного режима.
+    full_from: Option<Rect>,
+    /// Размер монитора, на который окно открыто во весь экран.
+    full_size: (u32, u32),
+    /// Последний размер программа выбрала сама, а не ответила им на просьбу
+    /// стола (см. [`Self::replace_pixels`]).
+    self_sized: bool,
+    /// Маленький диалог программы (20.11, `user_abi::WIN_STYLE_DIALOG`,
+    /// «Выполнить»): в заголовке только крестик.
+    pub dialog: bool,
+}
+
+/// Учёт обводки окна (20.11).
+///
+/// Обводка — полупрозрачная линия поверх того, что уже лежит в поверхности.
+/// Раньше она смешивалась с поверхностью заново при каждой перерисовке
+/// заголовка и при каждом наведении на его кнопки, а содержимое под ней
+/// не перерисовывалось: линия с каждым разом густела, но на экран попадала
+/// только кусками — там, где кадр пересобирался по другой причине (под
+/// курсором, ведомым вдоль верхнего края). Отсюда «кольцо» вокруг окна.
+/// Копия пикселей программы, наоборот, стирала обводку по бокам и снизу.
+///
+/// Теперь для каждой точки, которой может коснуться обводка (две крайние
+/// строки и столбца и дуги углов), помнится, что под ней (`base`) и что в ней
+/// было после обводки (`drawn`). Точка, в которой уже не то, что нарисовали,
+/// перерисована содержимым — её новое значение и есть основа. Обводка
+/// всегда ложится на основу один раз.
+struct EdgeBook {
+    w: u32,
+    h: u32,
+    radius: u32,
+    base: Vec<u32>,
+    drawn: Vec<u32>,
+    focused: bool,
+}
+
+impl EdgeBook {
+    const fn new() -> Self {
+        Self { w: 0, h: 0, radius: 0, base: Vec::new(), drawn: Vec::new(), focused: false }
+    }
+}
+
+/// Точки поверхности `w`×`h`, которых касается обводка радиуса `radius`
+/// ([`draw::rounded_stroke`]): по две крайние строки и столбца и полоса вдоль
+/// дуги каждого угла. Порядок всегда один и тот же — по нему [`EdgeBook`]
+/// хранит значения.
+fn edge_points(w: u32, h: u32, radius: u32, mut f: impl FnMut(u32, u32)) {
+    if w < 4 || h < 4 {
+        return;
+    }
+    let c = (radius + 1).min(w / 2).min(h / 2);
+    // Внутри круга радиуса `radius - 2.5` с центром в центре скругления
+    // обводки нет. Всё в удвоенных координатах, чтобы остаться в целых.
+    let r2 = 2 * i64::from(radius);
+    let inner = (r2 - 5).max(0);
+    let near = |lx: u32, ly: u32| {
+        if lx < 2 || ly < 2 {
+            return true;
+        }
+        let dx = 2 * i64::from(lx) + 1 - r2;
+        let dy = 2 * i64::from(ly) + 1 - r2;
+        dx * dx + dy * dy >= inner * inner
+    };
+    for y in 0..h {
+        let ly = y.min(h - 1 - y);
+        if ly < c {
+            for x in 0..c {
+                if near(x, ly) {
+                    f(x, y);
+                }
+            }
+            if ly < 2 {
+                for x in c..w - c {
+                    f(x, y);
+                }
+            }
+            for x in w - c..w {
+                if near(w - 1 - x, ly) {
+                    f(x, y);
+                }
+            }
+        } else {
+            for x in [0, 1, w - 2, w - 1] {
+                f(x, y);
+            }
+        }
+    }
 }
 
 /// Счётчик для [`Window::born`].
@@ -458,7 +595,7 @@ impl Window {
         // Windows Terminal (T5); заливка окна остаётся под заголовком.
         let back = mini_ui::text::TERM_BG;
         let mut surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
-        let strip = app == App::Terminal && !theme::is_mobile();
+        let strip = app.is_terminal() && !theme::is_mobile();
         surface.fill(content_area(&surface, Window::title_height(scale)), back);
         let grid = TextGrid::new(
             grid_area(&surface, scale, strip),
@@ -566,6 +703,7 @@ impl Window {
             minimized: false,
             minimized_at_ms: 0,
             restore: None,
+            snap_from: None,
             owner: None,
             modal: false,
             popup: false,
@@ -583,11 +721,20 @@ impl Window {
             tabs: Vec::new(),
             session: 0,
             tab_titles: Vec::new(),
+            renamed: Vec::new(),
+            tab_edit: None,
+            tab_edit_all: false,
             born: BORN.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             hot: None,
             fit: false,
             keyboard: false,
             lifted: false,
+            edge: EdgeBook::new(),
+            fullscreen: false,
+            full_from: None,
+            full_size: (0, 0),
+            self_sized: false,
+            dialog: false,
         }
     }
 
@@ -711,10 +858,27 @@ impl Window {
         if asked.is_none() && !self.fit {
             self.restore = None;
         }
+        self.self_sized = asked.is_none() && !self.fit;
+        // Окно во весь экран, ставшее по своей воле другого размера, из
+        // полноэкранного режима вышло (игра переключилась в окно). Ответ на
+        // просьбу стола — нет: он и есть размер монитора, пусть и с опозданием.
+        if self.self_sized && self.fullscreen && answer != self.full_size {
+            self.fullscreen = false;
+            self.full_from = None;
+        }
         self.redraw_content();
         self.draw_decorations(focused);
         self.damage = Rect::new(0, 0, w, h);
         true
+    }
+
+    /// Последний размер программа выбрала сама, а не ответила на просьбу
+    /// стола: только такой размер стол вправе толковать как «хочу во весь
+    /// экран» (`ui::resize_window`), иначе ответ на «вернуть размер» снова
+    /// разворачивал бы окно — и так по кругу.
+    #[must_use]
+    pub const fn self_sized(&self) -> bool {
+        self.self_sized
     }
 
     /// Может ли человек менять окну размер: окну ядра — по его виду
@@ -884,7 +1048,13 @@ impl Window {
 
     /// Самая левая кнопка заголовка: до неё доходит подпись.
     fn leftmost_button(&self) -> Rect {
-        if self.has_keyboard_button() { self.keyboard_button() } else { self.minimize_button() }
+        if self.has_keyboard_button() {
+            self.keyboard_button()
+        } else if self.dialog {
+            self.close_button()
+        } else {
+            self.minimize_button()
+        }
     }
 
     /// Нажать или отжать кнопку клавиатуры: перерисовать кнопки.
@@ -929,7 +1099,7 @@ impl Window {
         // размер менять можно, и с рамкой, и без (Chromium, Rider: их тень, за
         // которую тянут в Linux, стол срезает). Полоса узкая, а у углов —
         // шире, как у Windows: в угол целиться труднее.
-        if !self.popup && self.resizable() && !self.is_maximized() && !theme::is_mobile() {
+        if !self.popup && self.resizable() && !self.is_maximized() && !self.fullscreen && !theme::is_mobile() {
             let edges = self.edges_at(local.0, local.1);
             if edges != 0 {
                 return Some(Hit::Resize(edges));
@@ -959,11 +1129,12 @@ impl Window {
             }
         }
         // На телефоне это «на весь экран» (05.11): окно встаёт от края до края,
-        // окно программы получает просьбу заполнить его.
-        if self.maximize_button().contains(local.0, local.1) {
+        // окно программы получает просьбу заполнить его. У диалога этих
+        // кнопок нет (20.11): там просто заголовок.
+        if !self.dialog && self.maximize_button().contains(local.0, local.1) {
             return Some(Hit::Maximize);
         }
-        if self.minimize_button().contains(local.0, local.1) {
+        if !self.dialog && self.minimize_button().contains(local.0, local.1) {
             return Some(Hit::Minimize);
         }
         if self.has_keyboard_button() && self.keyboard_button().contains(local.0, local.1) {
@@ -992,7 +1163,7 @@ impl Window {
         // Уголок проверяется после заголовка: у окна ростом с полосу заголовка
         // они пересекаются, и таскать такое окно важнее, чем тянуть его за
         // размер.
-        if self.resizable() && !self.fit && self.resize_grip().contains(local.0, local.1) {
+        if self.resizable() && !self.fit && !self.is_maximized() && !self.fullscreen && self.resize_grip().contains(local.0, local.1) {
             return Some(Hit::Resize(EDGE_RIGHT | EDGE_BOTTOM));
         }
         Some(Hit::Body)
@@ -1038,7 +1209,8 @@ impl Window {
         // Окно без рамки растягивают по просьбе программы, а не за уголок —
         // точки легли бы поверх её рисунка.
         // Рамку стола на телефоне (`fit`) не тянут вовсе: её размер — экран.
-        if !self.resizable() || self.frameless || self.fit {
+        // Развёрнутое окно за уголок не тянут (20.11) — и уголка у него нет.
+        if !self.resizable() || self.frameless || self.fit || self.is_maximized() {
             return;
         }
         let ctx = self.ctx();
@@ -1076,7 +1248,7 @@ impl Window {
         let scale = self.scale;
         let title_h = Self::title_height(scale);
         let bounds = self.surface.bounds();
-        let radius = ctx.px(theme::R_WINDOW);
+        let radius = self.corner_radius();
         let bar = Rect::new(0, 0, bounds.w, title_h);
 
         // Полоса — прямоугольник без скругления, и это не упущение: верхние
@@ -1107,6 +1279,10 @@ impl Window {
         // Значок программы: тот же скруглённый квадрат, что у неё на столе и в
         // меню. Он и опознаёт окно быстрее заголовка — цвет читается раньше
         // текста.
+        // Вкладки в заголовке (20.11, как Windows Terminal): полоса вкладок и
+        // есть заголовок - ни значка, ни имени программы перед ней (они
+        // читались как лишняя вкладка «Термин…»).
+        let tabs_here = !self.tab_order.is_empty() && !theme::is_mobile();
         let badge_side = ctx.px(16);
         let badge = Rect::new(
             ctx.px(12) as i32,
@@ -1116,7 +1292,9 @@ impl Window {
         );
         // Значок программы, как на панели задач (24.10: был цветной квадрат
         // без знака — «квадратик цветной»).
-        self.icon_art().draw(ctx, &mut self.surface, badge);
+        if !tabs_here {
+            self.icon_art().draw(ctx, &mut self.surface, badge);
+        }
         self.draw_strip(focused);
 
         // Кнопки нарисованы всегда, а не только у активного окна: кнопка,
@@ -1133,24 +1311,23 @@ impl Window {
         // под крестик, читается как ошибка отрисовки.
         let text_x = badge.right() + ctx.px(8) as i32;
         let room = (self.leftmost_button().x - ctx.px(12) as i32 - text_x).max(0) as u32;
-        // Вкладки в заголовке: подпись — только имя программы перед ними.
-        let tabs_here = !self.tab_order.is_empty() && !theme::is_mobile();
-        let room = if tabs_here { ctx.face(Role::Body).width(self.app.caption()).min(room) } else { room };
         let ink = if focused { p.ink } else { p.ink4 };
-        paint::text_clipped(
-            ctx,
-            &mut self.surface,
-            Role::Body,
-            text_x,
-            paint::baseline(ctx, Role::Body, bar),
-            room,
-            &self.title,
-            ink,
-        );
+        if !tabs_here {
+            let label = self.label();
+            paint::text_clipped(
+                ctx,
+                &mut self.surface,
+                Role::Body,
+                text_x,
+                paint::baseline(ctx, Role::Body, bar),
+                room,
+                &label,
+                ink,
+            );
+        }
         // Обводка окна — последней: она ложится поверх и полосы заголовка, и
         // содержимого, и именно она делает из двух прямоугольников один лист.
-        let edge = if focused { p.line3 } else { p.line2 };
-        draw::rounded_stroke(&mut self.surface, bounds, radius, edge.color, edge.alpha);
+        self.paint_edge(focused);
 
         // Уголок размера: три точки в правом нижнем углу. Без нарисованного
         // признака за него никто не потянет — угадывать, что окно где-то
@@ -1186,11 +1363,14 @@ impl Window {
         let restore_icon = if self.restore.is_some() { Icon::Restore } else { Icon::Maximize };
         let glyph = ctx.px(10);
         let keyboard = self.has_keyboard_button().then(|| (self.keyboard_button(), Icon::Keyboard, Hit::Keyboard));
-        for (button, icon, hit) in keyboard.into_iter().chain([
-            (self.minimize_button(), Icon::Minimize, Hit::Minimize),
-            (self.maximize_button(), restore_icon, Hit::Maximize),
-            (self.close_button(), Icon::Close, Hit::Close),
-        ]) {
+        // Диалог (20.11) — один крестик, как «Выполнить» в Windows.
+        let sizing = (!self.dialog).then(|| {
+            [
+                (self.minimize_button(), Icon::Minimize, Hit::Minimize),
+                (self.maximize_button(), restore_icon, Hit::Maximize),
+            ]
+        });
+        for (button, icon, hit) in keyboard.into_iter().chain(sizing.into_iter().flatten()).chain([(self.close_button(), Icon::Close, Hit::Close)]) {
             let hot = self.hot == Some(hit);
             // Нажатая кнопка клавиатуры — цветом акцента: видно, что
             // клавиатура открыта для этого окна.
@@ -1222,13 +1402,96 @@ impl Window {
         }
         self.hot = hot;
         self.paint_title_buttons(focused);
-        let ctx = self.ctx();
-        let p = ctx.palette;
-        let bounds = self.surface.bounds();
-        let edge = if focused { p.line3 } else { p.line2 };
-        draw::rounded_stroke(&mut self.surface, bounds, ctx.px(theme::R_WINDOW), edge.color, edge.alpha);
+        // Обводка — заново, но на основу, а не поверх прежней (см.
+        // [`EdgeBook`]): кнопки только что залиты, остальной периметр
+        // остаётся каким был.
+        self.paint_edge(focused);
         let row = self.leftmost_button().union(&self.close_button());
         self.damage = self.damage.union(&row);
+    }
+
+    /// Положить обводку окна на основу (см. [`EdgeBook`]) цветом активного
+    /// или неактивного окна. Изменившиеся точки попадают в `damage`.
+    fn paint_edge(&mut self, focused: bool) {
+        if self.popup || self.frameless {
+            return;
+        }
+        let ctx = self.ctx();
+        let p = ctx.palette;
+        let radius = self.corner_radius();
+        let ink = if focused { p.line3 } else { p.line2 };
+        let bounds = self.surface.bounds();
+        let (w, h) = (bounds.w, bounds.h);
+        let Self { surface, edge: book, .. } = &mut *self;
+        book.focused = focused;
+        if (book.w, book.h, book.radius) != (w, h, radius) {
+            let mut count = 0usize;
+            edge_points(w, h, radius, |_, _| count += 1);
+            book.base.clear();
+            book.drawn.clear();
+            if book.base.try_reserve_exact(count).is_err() || book.drawn.try_reserve_exact(count).is_err() {
+                // Памяти на учёт нет — обводка как раньше, просто поверх.
+                book.w = 0;
+                draw::rounded_stroke(surface, bounds, radius, ink.color, ink.alpha);
+                return;
+            }
+            book.w = w;
+            book.h = h;
+            book.radius = radius;
+        }
+        // Первый проход: основа под каждой точкой — прежняя, если точка
+        // хранит нарисованное обводкой, иначе её нынешнее значение.
+        // `drawn` до второго прохода хранит то, что было в точке до вызова.
+        let mut i = 0usize;
+        edge_points(w, h, radius, |x, y| {
+            let now = surface.get(x, y);
+            if i >= book.base.len() {
+                book.base.push(now);
+                book.drawn.push(now);
+            } else if now != book.drawn[i] {
+                book.base[i] = now;
+            }
+            book.drawn[i] = now;
+            surface.row_mut(y)[x as usize] = book.base[i];
+            i += 1;
+        });
+        draw::rounded_stroke(surface, bounds, radius, ink.color, ink.alpha);
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        let mut i = 0usize;
+        edge_points(w, h, radius, |x, y| {
+            let now = surface.get(x, y);
+            if now != book.drawn[i] {
+                let (x, y) = (x as i32, y as i32);
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+            book.drawn[i] = now;
+            i += 1;
+        });
+        if x0 <= x1 {
+            let changed = Rect::new(x0, y0, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32);
+            self.damage = self.damage.union(&changed);
+        }
+    }
+
+    /// Радиус углов окна: развёрнутое и полноэкранное стоят углами в углы
+    /// экрана, и скругления у них нет — ни в обводке, ни в кромке (20.11).
+    fn corner_radius(&self) -> u32 {
+        // Телефон — как был: там окна всегда во весь экран и со скруглением.
+        if self.fullscreen || (self.is_maximized() && !theme::is_mobile()) { 0 } else { self.ctx().px(theme::R_WINDOW) }
+    }
+
+    /// Задевает ли прямоугольник поверхности место обводки (с запасом на
+    /// углы): тогда после копии пикселей её надо положить заново.
+    fn touches_edge(&self, rect: Rect) -> bool {
+        if self.popup || self.frameless || rect.is_empty() {
+            return false;
+        }
+        let c = (self.corner_radius() + 1) as i32;
+        let (w, h) = (self.surface.width() as i32, self.surface.height() as i32);
+        rect.x < c || rect.y < c || rect.right() > w - c || rect.bottom() > h - c
     }
 
     /// Перекрасить окно под текущую тему.
@@ -1345,8 +1608,239 @@ impl Window {
         self.tabs.retain(|tab| tab.session != session);
         self.tab_order.remove(at);
         self.tab_titles.retain(|(item, _)| *item != session);
+        self.renamed.retain(|item| *item != session);
+        if self.tab_edit.as_ref().is_some_and(|(item, _)| *item == session) {
+            self.tab_edit = None;
+        }
         self.draw_strip(true);
         true
+    }
+
+    /// Вынуть вкладку `session` из окна (20.11): унести в новое окно или в
+    /// полосу другого. Последнюю не вынуть - окно без вкладок не бывает.
+    pub fn take_tab(&mut self, session: usize) -> Option<LooseTab> {
+        let at = self.tab_order.iter().position(|item| *item == session)?;
+        if self.tab_order.len() < 2 {
+            return None;
+        }
+        // Видимую сначала сменяет соседняя - так её сетка оказывается среди
+        // скрытых, откуда её и берут.
+        if session == self.session {
+            let next = if at + 1 < self.tab_order.len() { self.tab_order[at + 1] } else { self.tab_order[at - 1] };
+            self.switch_tab(next);
+        }
+        let index = self.tabs.iter().position(|tab| tab.session == session)?;
+        let tab = self.tabs.swap_remove(index);
+        let title = self.tab_titles.iter().find(|(item, _)| *item == session).map(|(_, title)| title.clone());
+        let renamed = self.renamed.contains(&session);
+        self.tab_order.retain(|item| *item != session);
+        self.tab_titles.retain(|(item, _)| *item != session);
+        self.renamed.retain(|item| *item != session);
+        if self.tab_edit.as_ref().is_some_and(|(item, _)| *item == session) {
+            self.tab_edit = None;
+        }
+        self.draw_strip(true);
+        Some(LooseTab { session, grid: tab.grid, title, renamed })
+    }
+
+    /// Вынуть единственную вкладку окна (её бросили на полосу другого окна):
+    /// окно остаётся без вкладок и сетки - его закрывают следом.
+    pub fn take_last_tab(&mut self) -> Option<LooseTab> {
+        if self.tab_order.len() != 1 {
+            return None;
+        }
+        let session = self.session;
+        let ctx = self.ctx();
+        let area = grid_area(&self.surface, self.scale, true);
+        let blank = TextGrid::new(area, ctx.face(Role::Mono), mini_ui::text::TERM_FG, mini_ui::text::TERM_BG)?;
+        let Content::Text(current) = &mut self.content else {
+            return None;
+        };
+        let mut grid = core::mem::replace(current, blank);
+        grid.hide();
+        let title = self.tab_titles.iter().find(|(item, _)| *item == session).map(|(_, title)| title.clone());
+        let renamed = self.renamed.contains(&session);
+        self.tab_order.clear();
+        self.tab_titles.clear();
+        self.renamed.clear();
+        self.tab_edit = None;
+        Some(LooseTab { session, grid, title, renamed })
+    }
+
+    /// Принять вынутую вкладку в конец полосы и показать её. Не вышло (не
+    /// терминал, такая уже есть) - вкладка возвращается вызывающему.
+    pub fn put_tab(&mut self, tab: LooseTab) -> Result<(), LooseTab> {
+        if self.tab_order.is_empty() || self.tab_order.contains(&tab.session) {
+            return Err(tab);
+        }
+        let LooseTab { session, mut grid, title, renamed } = tab;
+        grid.hide();
+        // Сетка привязана к точкам прежнего окна: здесь у неё своя область.
+        let area = grid_area(&self.surface, self.scale, true);
+        let _ = grid.rebind(&mut self.surface, area);
+        self.tabs.push(TermTab { session, grid });
+        self.tab_order.push(session);
+        if let Some(title) = title {
+            self.tab_titles.push((session, title));
+        }
+        if renamed {
+            self.renamed.push(session);
+        }
+        self.switch_tab(session);
+        Ok(())
+    }
+
+    /// Сделать только что созданное окно терминала окном одной вкладки
+    /// `tab` (её унесли из полосы). Прежняя единственная вкладка нового окна
+    /// - пустая сетка - выбрасывается.
+    pub fn adopt_only(&mut self, tab: LooseTab) -> Result<(), LooseTab> {
+        if !self.app.is_terminal() || !matches!(self.content, Content::Text(_)) {
+            return Err(tab);
+        }
+        let LooseTab { session, mut grid, title, renamed } = tab;
+        let area = grid_area(&self.surface, self.scale, true);
+        let _ = grid.rebind(&mut self.surface, area);
+        let back = content_area(&self.surface, self.bar());
+        self.surface.fill(back, mini_ui::text::TERM_BG);
+        if let Content::Text(current) = &mut self.content {
+            *current = grid;
+            current.show(&mut self.surface);
+            current.take_damage();
+        }
+        self.tabs.clear();
+        self.tab_order.clear();
+        self.tab_order.push(session);
+        self.session = session;
+        self.tab_titles.clear();
+        self.renamed.clear();
+        self.tab_edit = None;
+        if let Some(title) = title {
+            self.tab_titles.push((session, title));
+        }
+        if renamed {
+            self.renamed.push(session);
+        }
+        self.damage = self.damage.union(&back);
+        self.draw_strip(true);
+        Ok(())
+    }
+
+    /// Переставить вкладку `session` на место `to` в полосе (её тянут вдоль
+    /// полосы мышью).
+    pub fn move_tab(&mut self, session: usize, to: usize) -> bool {
+        let Some(at) = self.tab_order.iter().position(|item| *item == session) else {
+            return false;
+        };
+        let to = to.min(self.tab_order.len() - 1);
+        if at == to {
+            return false;
+        }
+        let item = self.tab_order.remove(at);
+        self.tab_order.insert(to, item);
+        self.draw_strip(true);
+        true
+    }
+
+    /// Место в полосе (номер по порядку) под точкой экрана `x` - по
+    /// горизонтали, высоту не спрашивая: вкладку тянут вдоль полосы, и
+    /// рука уходит немного вверх или вниз.
+    #[must_use]
+    pub fn tab_slot_at(&self, x: i32) -> Option<usize> {
+        if self.tab_order.is_empty() {
+            return None;
+        }
+        let local = x - self.rect.x;
+        let (tabs, _) = self.strip_layout();
+        tabs.iter().position(|(_, tab, _)| local >= tab.x && local < tab.right())
+    }
+
+    /// Лежит ли точка экрана на полосе вкладок этого окна (сюда бросают
+    /// вкладку из другого окна).
+    #[must_use]
+    pub fn strip_contains(&self, x: i32, y: i32) -> bool {
+        if self.tab_order.is_empty() || self.popup || self.frameless || self.minimized || !self.rect.contains(x, y) {
+            return false;
+        }
+        let (lx, ly) = (x - self.rect.x, y - self.rect.y);
+        let top = if theme::is_mobile() { Self::title_height(self.scale) as i32 } else { 0 };
+        let h = if theme::is_mobile() { self.ctx().px(STRIP_H) } else { Self::title_height(self.scale) };
+        ly >= top && ly < top + h as i32 && lx < self.minimize_button().x
+    }
+
+    /// Начать правку имени вкладки прямо в полосе («Переименовать»).
+    pub fn begin_rename(&mut self, session: usize) -> bool {
+        if !self.tab_order.contains(&session) {
+            return false;
+        }
+        self.tab_edit = Some((session, self.tab_title(session)));
+        self.tab_edit_all = true;
+        self.draw_strip(true);
+        true
+    }
+
+    /// Правят ли сейчас имя вкладки.
+    #[must_use]
+    pub const fn renaming(&self) -> bool {
+        self.tab_edit.is_some()
+    }
+
+    /// Клавиша, пока правят имя вкладки: Enter - принять, Esc - отменить,
+    /// Backspace - стереть знак, знак - дописать.
+    pub fn rename_key(&mut self, code: KeyCode, ch: Option<char>) -> RenameStep {
+        let Some((session, text)) = self.tab_edit.as_mut() else {
+            return RenameStep::Cancelled;
+        };
+        let session = *session;
+        let all = core::mem::take(&mut self.tab_edit_all);
+        match code {
+            KeyCode::Enter => {
+                let name = self.commit_rename().map_or_else(String::new, |(_, name)| name);
+                return RenameStep::Done(session, name);
+            }
+            KeyCode::Escape => {
+                self.tab_edit = None;
+                self.draw_strip(true);
+                return RenameStep::Cancelled;
+            }
+            KeyCode::Backspace if all => text.clear(),
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            _ => match ch {
+                Some(ch) if !ch.is_control() && text.chars().count() < 64 => {
+                    if all {
+                        text.clear();
+                    }
+                    text.push(ch);
+                }
+                _ => {
+                    self.draw_strip(true);
+                    return RenameStep::Typing;
+                }
+            },
+        }
+        self.draw_strip(true);
+        RenameStep::Typing
+    }
+
+    /// Принять набранное имя (Enter или щелчок мимо). Пустое имя - вкладку
+    /// снова называет то, что в ней идёт.
+    pub fn commit_rename(&mut self) -> Option<(usize, String)> {
+        let (session, text) = self.tab_edit.take()?;
+        let name = String::from(text.trim());
+        if name.is_empty() {
+            self.renamed.retain(|item| *item != session);
+        } else {
+            match self.tab_titles.iter_mut().find(|(item, _)| *item == session) {
+                Some((_, old)) => *old = name.clone(),
+                None => self.tab_titles.push((session, name.clone())),
+            }
+            if !self.renamed.contains(&session) {
+                self.renamed.push(session);
+            }
+        }
+        self.draw_strip(true);
+        Some((session, name))
     }
 
     /// Выполнить `action` над сеткой сессии `session`, видимой или нет: на
@@ -1372,6 +1866,10 @@ impl Window {
 
     /// Подпись вкладки сессии `session` (что в ней идёт).
     pub fn set_tab_title(&mut self, session: usize, title: &str) {
+        // Имя, данное человеком, программа не перекрывает (20.11).
+        if self.renamed.contains(&session) {
+            return;
+        }
         match self.tab_titles.iter_mut().find(|(item, _)| *item == session) {
             Some((_, old)) if old == title => return,
             Some((_, old)) => *old = String::from(title),
@@ -1399,10 +1897,9 @@ impl Window {
         // до кнопок окна. Телефон — своей полосой под заголовком.
         let in_title = !theme::is_mobile();
         let (top, h, left, right) = if in_title {
+            // С 20.11 полоса и есть заголовок: вкладки от левого края.
             let title = Self::title_height(self.scale);
-            let label = ctx.face(Role::Body).width(self.app.caption());
-            let left = ctx.px(12 + 16 + 8) + label + ctx.px(14);
-            (0, title, left, (self.minimize_button().x - ctx.px(8) as i32).max(0) as u32)
+            (0, title, ctx.px(8), (self.minimize_button().x - ctx.px(8) as i32).max(0) as u32)
         } else {
             (Self::title_height(self.scale) as i32, ctx.px(STRIP_H), ctx.px(6), self.surface.width().saturating_sub(ctx.px(6)))
         };
@@ -1456,8 +1953,10 @@ impl Window {
                     self.surface.fill(Rect::new(tab.x, bottom - ctx.px(2) as i32, tab.w, ctx.px(2)), mini_ui::text::TERM_BG);
                 }
             }
-            let title = self.tab_title(session);
-            let ink = if active { mini_ui::text::TERM_FG } else { p.ink4 };
+            // Имя правят прямо во вкладке: рамка акцентом и курсор в конце.
+            let editing = self.tab_edit.as_ref().filter(|(item, _)| *item == session).map(|(_, text)| text.clone());
+            let title = editing.clone().unwrap_or_else(|| self.tab_title(session));
+            let ink = if active || editing.is_some() { mini_ui::text::TERM_FG } else { p.ink4 };
             let glyph = ctx.px(12);
             glyphicon::draw(
                 &mut self.surface,
@@ -1479,6 +1978,20 @@ impl Window {
                 &title,
                 ink,
             );
+            if editing.is_some() {
+                let field = Rect::new(text_x - ctx.px(4) as i32, tab.y + ctx.px(4) as i32, (close.x - text_x).max(0) as u32, tab.h.saturating_sub(ctx.px(8)));
+                draw::rounded_stroke(&mut self.surface, field, ctx.px(4), p.acc, 255);
+                let room = (close.x - text_x - ctx.px(4) as i32).max(0) as u32;
+                // Только начали - имя выделено целиком: набор его заменит.
+                if self.tab_edit_all {
+                    let width = ctx.face(Role::Body).width(&title).min(room);
+                    let mark = Rect::new(text_x - ctx.px(1) as i32, field.y + ctx.px(3) as i32, width + ctx.px(2), field.h.saturating_sub(ctx.px(6)));
+                    draw::blend_rect(&mut self.surface, mark, p.acc, 110);
+                    paint::text_clipped(ctx, &mut self.surface, Role::Body, text_x, paint::baseline(ctx, Role::Body, tab), room, &title, mini_ui::text::TERM_FG);
+                }
+                let caret = text_x + ctx.face(Role::Body).width(&title).min(room) as i32 + 1;
+                self.surface.fill(Rect::new(caret, field.y + ctx.px(4) as i32, ctx.px(1).max(1), field.h.saturating_sub(ctx.px(8))), mini_ui::text::TERM_FG);
+            }
             let cross = ctx.px(10);
             glyphicon::draw(
                 &mut self.surface,
@@ -1509,7 +2022,7 @@ impl Window {
                     return super::appicon::Art::Image(logo);
                 }
             }
-            let terminal = self.app == App::Terminal;
+            let terminal = self.app.is_terminal();
             super::appicon::Art::Glyph(if terminal { Icon::Terminal } else { self.app.icon() }, self.app.tone(), terminal)
         })
     }
@@ -1709,6 +2222,9 @@ impl Window {
             }
         }
         self.damage = self.damage.union(&area);
+        // Заливка стёрла обводку по бокам и снизу.
+        let focused = self.edge.focused;
+        self.paint_edge(focused);
     }
 
     /// Показать в «Параметрах» раздел экрана.
@@ -2093,15 +2609,145 @@ impl Window {
             }
             None => {
                 let previous = self.rect;
+                // «Развёрнуто» — до пересборки поверхности: она рисует
+                // украшения уже развёрнутого окна (углы без скругления).
+                self.restore = Some(previous);
                 if !self.resize(area.w, area.h) {
+                    self.restore = None;
                     return false;
                 }
                 self.rect.x = area.x;
                 self.rect.y = area.y;
-                self.restore = Some(previous);
                 true
             }
         }
+    }
+
+    /// Вернуть развёрнутое окно к прежнему размеру, но поставить его углом в
+    /// `x`, `y` (20.11): развёрнутое окно потащили за заголовок, и оно
+    /// уменьшается под указателем, как в Windows.
+    ///
+    /// Так же возвращается окно, прилепленное к половине монитора (20.11): к
+    /// размеру, который был до прилипания, — даже если его потом ещё и
+    /// развернули.
+    pub fn unmaximize_at(&mut self, x: i32, y: i32, focused: bool) -> bool {
+        let Some(rect) = self.drag_restore_rect() else {
+            return false;
+        };
+        let (restore, snap) = (self.restore.take(), self.snap_from.take());
+        if !self.resize(rect.w, rect.h) {
+            self.restore = restore;
+            self.snap_from = snap;
+            return false;
+        }
+        self.rect.x = x;
+        self.rect.y = y;
+        self.draw_decorations(focused);
+        true
+    }
+
+    /// Каким окно станет, если его потащить за заголовок: прилепленное — тем,
+    /// что было до прилипания, развёрнутое — прежним. `None` — окно обычное.
+    #[must_use]
+    pub const fn drag_restore_rect(&self) -> Option<Rect> {
+        match self.snap_from {
+            Some(rect) => Some(rect),
+            None => self.restore,
+        }
+    }
+
+    /// Прилеплено ли окно к половине монитора.
+    #[must_use]
+    pub const fn is_snapped(&self) -> bool {
+        self.snap_from.is_some()
+    }
+
+    /// Окно бросили у края экрана (20.11, как Snap в Windows): занять
+    /// `area` — половину рабочей области монитора, или развернуться на неё
+    /// (`maximize`, край сверху). `previous` — прямоугольник, к которому
+    /// окно вернётся, когда его потащат или «восстановят»: окно, уже
+    /// прилепленное, помнит самый первый. `false` — размер окну не меняется
+    /// (калькулятор).
+    pub fn snap_to(&mut self, area: Rect, previous: Rect, maximize: bool) -> bool {
+        if area.is_empty() || self.fullscreen {
+            return false;
+        }
+        let (snap, restore) = (self.snap_from.take(), self.restore.take());
+        let previous = snap.unwrap_or(previous);
+        if maximize {
+            // «Развёрнуто» — до пересборки: углы без скругления.
+            self.restore = Some(previous);
+        }
+        if !self.resize(area.w, area.h) {
+            self.restore = restore;
+            self.snap_from = snap;
+            return false;
+        }
+        if !maximize {
+            self.snap_from = Some(previous);
+        }
+        self.rect.x = area.x;
+        self.rect.y = area.y;
+        true
+    }
+
+    /// Забыть, что окно развёрнуто, оставив его размер и место (его сдвинули
+    /// клавишами): кнопка снова предлагает «развернуть».
+    pub fn forget_maximized(&mut self, focused: bool) {
+        if self.restore.take().is_some() {
+            self.draw_decorations(focused);
+        }
+    }
+
+    /// Попросить программу ответить на текущий размер окна — даже если он не
+    /// изменился: сервер Wayland отвечает на такую просьбу `configure` с
+    /// состояниями окна (развёрнуто, во весь экран), и клиент узнаёт, что его
+    /// просьба исполнена.
+    pub fn ask_configure(&mut self) {
+        if self.is_program() && self.resizable() {
+            let (w, h) = (self.rect.w, self.rect.h.saturating_sub(self.bar()));
+            self.ask_resize(w, h);
+        }
+    }
+
+    /// Открыть окно во весь монитор `area` (20.11). `true` — состояние
+    /// изменилось.
+    pub fn enter_fullscreen(&mut self, area: Rect) -> bool {
+        if self.fullscreen || area.is_empty() {
+            return false;
+        }
+        let previous = self.rect;
+        // Флаг — до изменения размера: просьба программе уходит из него же,
+        // и сервер Wayland читает состояние, отвечая на неё.
+        self.fullscreen = true;
+        if !self.resize(area.w, area.h) {
+            self.fullscreen = false;
+            return false;
+        }
+        self.rect.x = area.x;
+        self.rect.y = area.y;
+        self.full_from = Some(previous);
+        self.full_size = (area.w, area.h.saturating_sub(self.bar()));
+        self.ask_configure();
+        true
+    }
+
+    /// Выйти из полноэкранного режима туда, где окно стояло до него.
+    pub fn leave_fullscreen(&mut self) -> bool {
+        if !self.fullscreen {
+            return false;
+        }
+        self.fullscreen = false;
+        let back = self.full_from.take().unwrap_or(self.rect);
+        if !self.resize(back.w, back.h) {
+            self.fullscreen = true;
+            self.full_from = Some(back);
+            return false;
+        }
+        self.rect.x = back.x;
+        self.rect.y = back.y;
+        self.ask_configure();
+        true
     }
 
     /// Поверхность окна — для сборки кадра.
@@ -2114,9 +2760,27 @@ impl Window {
     ///
     /// У окон ядра это [`App::caption`], у окна программы — имя, которое
     /// назвала она сама.
+    ///
+    /// Программа может прислать имя из двух частей через `\x1f` (20.11):
+    /// «Files\x1fЗагрузки». Первая - имя окна для журнала и прицела стенда,
+    /// вторая - что видит человек ([`Self::label`]): папку, файл.
     #[must_use]
     pub fn caption(&self) -> &str {
-        &self.title
+        self.title.split('\x1f').next().unwrap_or(&self.title)
+    }
+
+    /// Подпись окна для человека: заголовок, кнопка панели, миниатюра
+    /// (20.11). У окна с вкладками - имя видимой вкладки, у программы - вторая
+    /// часть её имени (см. [`Self::caption`]), если она есть.
+    #[must_use]
+    pub fn label(&self) -> String {
+        if !self.tab_order.is_empty() {
+            return self.tab_title(self.session);
+        }
+        match self.title.split_once('\x1f') {
+            Some((_, shown)) if !shown.is_empty() => String::from(shown),
+            _ => self.title.clone(),
+        }
     }
 
     /// Сменить имя окна программы (фаза 62c, `user_abi::SYS_WINTITLE`).
@@ -2190,6 +2854,12 @@ impl Window {
             self.draw_grip();
         }
         self.damage = self.damage.union(&copied);
+        // Копия легла и на обводку (20.11: раньше её края так и пропадали —
+        // до следующего наведения на кнопки заголовка).
+        if self.touches_edge(copied) {
+            let focused = self.edge.focused;
+            self.paint_edge(focused);
+        }
     }
 
     /// Поверхность программы — чтобы ядро нарисовало в ней само (сервер
@@ -2287,8 +2957,20 @@ fn grid_area(surface: &Surface, scale: u32, strip: bool) -> Rect {
     // С 72h вкладки ПК — в заголовке (макет 15), своя полоса только у
     // телефона.
     let top = Window::title_height(scale) + if strip && theme::is_mobile() { ctx.px(STRIP_H) } else { 0 };
-    content_area(surface, top).shrink(ctx.px(4))
+    let mut area = content_area(surface, top).shrink(ctx.px(4));
+    // Справа — поле под уголок размера (20.11). Сетка прокручивается
+    // сдвигом пикселей (`Surface::scroll_up`), и точки уголка, лежавшие в
+    // её прямоугольнике, уезжали вверх с каждой строкой вывода — вдоль
+    // правого края терминала оставался столбик серых точек.
+    if !theme::is_mobile() {
+        area.w = area.w.saturating_sub(ctx.px(GRIP_GUTTER));
+    }
+    area
 }
+
+/// Ширина поля справа от сетки терминала, где лежит уголок размера: точки
+/// уголка — не дальше 13 точек от края окна, сетка кончается в 4.
+const GRIP_GUTTER: u32 = 10;
 
 /// Сделать точки прямоугольника непрозрачными (старший байт — 0xFF).
 ///

@@ -1,0 +1,10 @@
+[package]
+name = "nvgpu"
+description = "NVK on FossAi: pure logic for emulating the nouveau DRM uAPI over GSP-RM - GpuBackend contract, uAPI structs, VRAM/VA allocators, GMMU (GP100+) page tables, GPFIFO/semaphore encoders, syncobj timelines and SoftGpu (a software GPU for QEMU/host tests)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

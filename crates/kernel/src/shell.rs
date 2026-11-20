@@ -1089,6 +1089,9 @@ fn run_builtin(line: &str) -> bool {
         "history" => show_history(),
         "help" => help(),
         "uptime" => sprintln!("  {} ms, {} timer ticks", time::uptime_ms(), irq::ticks()),
+        // Версия и номер сборки (20.11): «Сведения о системе» спрашивают её
+        // через SYS_KERNEL_COMMAND — эта команда разрешена и не root.
+        "version" => sprintln!("FossAi {} {}", crate::version_text(), crate::arch::ARCH_NAME),
         "date" => date(),
         // `free` — привычное имя из Unix, и под ним команда стоит на быстрой
         // кнопке экранной клавиатуры телефона.
@@ -1197,6 +1200,158 @@ fn run_builtin(line: &str) -> bool {
                 if crate::linux::ntsync::enabled() { "on" } else { "off" },
                 if crate::linux::ntsync::DEFAULT_ENABLED { "on" } else { "off" }
             );
+        }
+        // Узел DRM для Mesa NVK (18.11.2026): `nvk soft on` — программная
+        // видеокарта SoftGpu (QEMU, пробы), `nvk hw on` — показать узел
+        // настоящей карты (по умолчанию скрыт, пока NVK на ней не работает),
+        // `nvk trace on` — каждый ioctl в журнал.
+        #[cfg(target_arch = "x86_64")]
+        "nvk" => {
+            let mut words = argument.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("soft"), Some(on @ ("on" | "off"))) => {
+                    if !crate::linux::drm::set_soft(on == "on") {
+                        sprintln!("  nvk: SoftGpu is not available");
+                    }
+                }
+                (Some("hw"), Some(on @ ("on" | "off"))) => crate::linux::drm::set_hw(on == "on"),
+                (Some("trace"), Some(on @ ("on" | "off"))) => crate::linux::drm::set_trace(on == "on"),
+                (None, None) => {}
+                _ => sprintln!("  nvk: usage `nvk [soft|hw|trace on|off]`"),
+            }
+            let (real, soft) = crate::linux::drm::backend_state();
+            sprintln!(
+                "  nvk: /dev/dri/renderD128 {} (real backend {}, hw {}, soft {}, trace {})",
+                if crate::linux::drm::node_visible() { "present" } else { "absent" },
+                if real { "registered" } else { "none" },
+                if crate::linux::drm::hw() { "on" } else { "off" },
+                if soft { "on" } else { "off" },
+                if crate::linux::drm::trace() { "on" } else { "off" }
+            );
+        }
+        // Способ `memcpy`/`memset` ядра (19.11.2026): без аргумента — замер
+        // всех и выбор лучшего, с именем — задать руками для сравнения.
+        "copybench" => match argument.trim() {
+            "" | "auto" => {
+                crate::mm::copy::force(None);
+                crate::user::shm::bench_frame();
+            }
+            name => match crate::mm::copy::parse(name) {
+                Some(method) => crate::mm::copy::force(Some(method)),
+                None => sprintln!("  copybench: usage `copybench [auto|rep-q|rep-b|words|sse]`"),
+            },
+        },
+        // Отчёт `perf-diag` в журнал раз в 30 с, пока работают программы
+        // Linux (P1, 18.11.2026); `now` — напечатать накопленное сразу.
+        #[cfg(target_arch = "x86_64")]
+        "perfdiag" => {
+            match argument.trim() {
+                "on" => crate::linux::perfdiag::set_enabled(true),
+                "off" => crate::linux::perfdiag::set_enabled(false),
+                "now" => crate::linux::perfdiag::request_now(),
+                "" => {}
+                _ => sprintln!("  perfdiag: usage `perfdiag [on|off|now]`"),
+            }
+            sprintln!("  perfdiag: {}", crate::linux::perfdiag::status());
+        }
+        // Темп ответов на `wl_surface.frame` (P8) и `ping` клиентам Wayland
+        // (P4), RWX поверх разделяемой памяти (P5) — включаемы для сравнения.
+        #[cfg(target_arch = "x86_64")]
+        // Адресный сброс TLB и непрозрачные строки подповерхностей (19.11) —
+        // тоже: `off` — как до них, для сравнения на одном образе.
+        "wlpace" | "wlping" | "lxshrwx" | "lxcfr" | "tlbtarget" | "wlopaque" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            let on = match argument.trim() {
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => None,
+            };
+            if let Some(on) = on {
+                match command {
+                    "wlpace" => crate::linux::wayland::set_pace(on),
+                    "wlping" => crate::linux::wayland::set_ping(on),
+                    "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.store(on, Relaxed),
+                    "tlbtarget" => crate::arch::smp::FLUSH_TARGETED.store(on, Relaxed),
+                    "wlopaque" => crate::linux::wayland::OPAQUE_ROWS.store(on, Relaxed),
+                    _ => crate::user::set_shared_rwx(on),
+                }
+            }
+            let now = match command {
+                "wlpace" => crate::linux::wayland::pace(),
+                "wlping" => crate::linux::wayland::ping(),
+                "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.load(Relaxed),
+                "tlbtarget" => crate::arch::smp::FLUSH_TARGETED.load(Relaxed),
+                "wlopaque" => crate::linux::wayland::OPAQUE_ROWS.load(Relaxed),
+                _ => crate::user::shared_rwx(),
+            };
+            sprintln!("  {command}: {}", if now { "on" } else { "off" });
+        }
+        // HWCAP2_FSGSBASE новым программам (20.11): `off` — Wine снова ставит
+        // базы FS/GS через `arch_prctl` (сравнение в одной загрузке).
+        "fsgsbase" => {
+            match argument.trim() {
+                "on" => _ = crate::arch::fsgsbase_advertised(Some(true)),
+                "off" => _ = crate::arch::fsgsbase_advertised(Some(false)),
+                "" => {}
+                _ => sprintln!("  fsgsbase: usage `fsgsbase [on|off]`"),
+            }
+            sprintln!(
+                "  fsgsbase: cpu {}, advertised to new programs {}",
+                if crate::arch::fsgsbase() { "on" } else { "off (no CPUID.7 EBX bit 0)" },
+                if crate::arch::hwcap2() & 2 != 0 { "yes" } else { "no" }
+            );
+        }
+        // Ожидание пинка холостым процессором до `hlt` (20.11), мкс.
+        "idlepoll" => {
+            match argument.trim() {
+                "" => {}
+                "off" => crate::sched::set_idle_poll_us(0),
+                value => match value.parse::<u64>() {
+                    Ok(us) => crate::sched::set_idle_poll_us(us),
+                    Err(_) => sprintln!("  idlepoll: usage `idlepoll [MICROSECONDS|off]`"),
+                },
+            }
+            sprintln!("  idlepoll: {} us", crate::sched::idle_poll_us());
+        }
+        // Ожидание занятого мьютекса ядра в цикле до сна (20.11), мкс.
+        "mutexspin" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "off" => crate::sync::MUTEX_SPIN_NS.store(0, Relaxed),
+                value => match value.parse::<u64>() {
+                    Ok(us) => crate::sync::MUTEX_SPIN_NS.store(us.min(1000) * 1000, Relaxed),
+                    Err(_) => sprintln!("  mutexspin: usage `mutexspin [MICROSECONDS|off]`"),
+                },
+            }
+            sprintln!(
+                "  mutexspin: {} us, {} lock(s) taken while spinning",
+                crate::sync::MUTEX_SPIN_NS.load(Relaxed) / 1000,
+                crate::sync::MUTEX_SPIN_WINS.load(Relaxed)
+            );
+        }
+        // Пинок простаивающих процессоров при пробуждении (P9, 18.11.2026).
+        "schedkick" => {
+            match argument.trim() {
+                "on" => crate::sched::set_kicks(true),
+                "off" => crate::sched::set_kicks(false),
+                "" => {}
+                _ => sprintln!("  schedkick: usage `schedkick [on|off]`"),
+            }
+            sprintln!("  schedkick: {}", if crate::sched::kicks() { "on" } else { "off" });
+        }
+        // Право `jit` проверочным программам Linux из `/compat/linux/bin`
+        // (P5, 18.11.2026): там нет пакета, который назвал бы его, а проба
+        // `rwxprobe` проверяет именно память «на запись и исполнение».
+        #[cfg(target_arch = "x86_64")]
+        "lxjit" => {
+            match argument.trim() {
+                "on" => crate::user::set_probe_jit(true),
+                "off" => crate::user::set_probe_jit(false),
+                "" => {}
+                _ => sprintln!("  lxjit: usage `lxjit [on|off]`"),
+            }
+            sprintln!("  lxjit: /compat/linux/bin programs {} the jit right", if crate::user::probe_jit() { "have" } else { "do not have" });
         }
         "irq" => interrupt_wakes(argument),
         "beep" => beep(argument),
@@ -2096,6 +2251,16 @@ fn ui_status(argument: &str) {
         sprintln!("  ui       no framebuffer; the shell runs on the serial console");
         return;
     }
+    // Вид панели и «Пуска» (20.11): `ui taskbar dock left autohide`,
+    // `ui start wide`.
+    if let Some(words) = argument.trim().strip_prefix("taskbar") {
+        ui::taskbar_command(words);
+        return;
+    }
+    if let Some(words) = argument.trim().strip_prefix("start") {
+        ui::start_command(words);
+        return;
+    }
     if argument.trim() == "reset" {
         ui::reset_timing();
         sprintln!("  ui       frame counters reset");
@@ -2339,10 +2504,107 @@ fn gpu(argument: &str) {
         }
         return;
     }
+    // 18.11: выгрузить GSP-RM и снять WPR2 — то же, что делает перезагрузка
+    // (проверка без перезагрузки). 19.11: следом GSP-RM поднимается снова
+    // и мониторы зажигаются (иначе экран чёрный — головы разобрал RM);
+    // `gpu unload off` — оставить выгруженным (дальше `gpu gsp`, `gpu display`).
+    if argument == "unload" || argument == "unload off" {
+        if let Some((lo, hi)) = crate::display::nvidia::wpr2_now() {
+            sprintln!("  gpu: before: WPR2 {lo:#010x}..{hi:#010x}, GSP-RM {}", if crate::display::nvidia_gsp::running() { "running" } else { "not running" });
+        }
+        for line in crate::display::nvidia_gsp::unload("gpu unload") {
+            sprintln!("  gpu: {line}");
+        }
+        if let Some((lo, hi)) = crate::display::nvidia::wpr2_now() {
+            sprintln!("  gpu: after: WPR2 {lo:#010x}..{hi:#010x} ({})", if hi >> 4 == 0 { "not set" } else { "SET" });
+        }
+        if argument == "unload" {
+            for line in crate::display::nvidia_gsp::restart("gpu unload") {
+                sprintln!("  gpu: {line}");
+            }
+        }
+        crate::usb::stick_log::flush_now();
+        return;
+    }
+    // 20.11: проверка игры на видеокарте одной командой (GSP, мониторы,
+    // каналы, узел DRM, vkprobe/vkcube/D3D9/TMNF на NVK) — в фоне, итог —
+    // строки `gametest:` в журнале.
+    if argument == "gametest" || argument.starts_with("gametest ") {
+        let rest = argument.trim_start_matches("gametest");
+        sprintln!("  gpu: {}", crate::display::nvidia_gametest::start(rest));
+        // Без `bg` — ждать и печатать ход проверки в это окно. Первая
+        // вкладка разбирает весь ввод стола, поэтому, пока ждём, ввод
+        // раздаётся как в `foreground` (иначе мышь и клавиатура стола
+        // замерли бы на всю проверку); Ctrl+C — перестать ждать (проверка
+        // идёт дальше в фоне).
+        if !rest.split_whitespace().any(|w| w == "bg") {
+            let me = sched::session();
+            let primary = me == 0;
+            let mut status_at = 0u64;
+            'wait: loop {
+                for line in crate::display::nvidia_gametest::drain() {
+                    sprintln!("  {line}");
+                }
+                if !crate::display::nvidia_gametest::running() {
+                    break;
+                }
+                let seen = input_seq(primary, me);
+                if primary && ui::is_active() && ui::hover_pending() {
+                    ui::hover_tick();
+                }
+                let now = time::uptime_ms();
+                if ui::animating() || now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
+                    status_at = now;
+                    if primary {
+                        update_status();
+                    }
+                    ui::shell_status(Some("gpu gametest · идёт"));
+                }
+                while let Some(event) = if primary { next_pointer() } else { None } {
+                    ui::dispatch_pointer(event);
+                }
+                while let Some(event) = next_key(primary, me) {
+                    if tty::is_interrupt(event) {
+                        sprintln!("^C");
+                        sprintln!("  gpu: gametest goes on in the background ('gametest:' lines in the log)");
+                        break 'wait;
+                    }
+                }
+                let period = if ui::animating() { FRAME_PERIOD_MS } else { POLL_PERIOD_MS };
+                let deadline = time::uptime_ms() + period;
+                if primary {
+                    sched::block_on_input(deadline, || input::sequence() != seen);
+                } else {
+                    sched::block_on_input(deadline, || session::seq(me) != seen);
+                }
+            }
+            ui::shell_status(None);
+            for line in crate::display::nvidia_gametest::drain() {
+                sprintln!("  {line}");
+            }
+        }
+        return;
+    }
     if argument == "gsp" || argument.starts_with("gsp ") {
         for line in crate::display::nvidia_gsp::boot_gsp(argument.trim_start_matches("gsp")) {
             sprintln!("  gpu: {line}");
         }
+        return;
+    }
+    // NVK поверх GSP-RM (18.11, WP-A): `gpu info` — веха M1 (арены
+    // видеопамяти, движки, GPC/TPC, PTIMER); `gpu nvktest [ce|gr]
+    // [skip-pdes]` — веха M2 (канал, объект копирования, копия 1 МиБ через
+    // GPU). Строки `nvgpu:` идут и в журнал на флешке.
+    if argument == "info" || argument == "nvktest" || argument.starts_with("nvktest ") {
+        let log = if argument == "info" {
+            crate::display::nvidia_rm_chan::info_report()
+        } else {
+            crate::display::nvidia_rm_chan::nvktest(argument.trim_start_matches("nvktest"))
+        };
+        for line in log {
+            sprintln!("  gpu: {line}");
+        }
+        crate::usb::stick_log::flush_now();
         return;
     }
     let Some(card) = crate::display::nvidia::found() else {
@@ -2357,7 +2619,7 @@ fn gpu(argument: &str) {
         return;
     }
     if !argument.is_empty() {
-        sprintln!("  usage: gpu [boot | gsp [heap MiB]]   (boot = FWSEC-FRTS, stage 4; gsp = start GSP-RM, stage 5)");
+        sprintln!("  usage: gpu [boot | gsp [heap MiB] | unload [off] | display | info | nvktest [ce|gr] [skip-pdes] [token-rm|token-calc|token-dbcfg] | gametest [force|kernel] [-- script args]]   (boot = FWSEC-FRTS; gsp = start GSP-RM; unload = stop GSP-RM, release WPR2 and start it again; info/nvktest = NVK self-tests; gametest = the whole GPU game check into the log)");
         return;
     }
     let (chip, revision) = crate::display::nvidia::chip_of(card.boot0, card.boot42);

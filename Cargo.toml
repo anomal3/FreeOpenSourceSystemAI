@@ -23,6 +23,7 @@ members = [
     "crates/installer",
     "crates/kernel",
     "crates/mini-ui",
+    "crates/nvgpu",
     "crates/osupdate",
     "crates/raster",
     "crates/slots",

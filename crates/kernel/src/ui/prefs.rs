@@ -116,6 +116,8 @@ pub fn adopt() {
         }
         crate::kprintln!("  desktop     : {key} {} from {}", sysconf::value(text, key).unwrap_or(""), path);
     }
+    // Панель задач и «Пуск» одним набором (20.11, см. `deskcfg`).
+    super::deskcfg::adopt(text, &path);
     if let Some(height) = sysconf::title_bar(text) {
         if mini_ui::theme::set_title_h(height) {
             crate::kprintln!("  desktop     : title bar {height} px from {path}");
@@ -215,6 +217,11 @@ pub fn store_panel(pref: super::settings::PanelPref, on: bool) -> Result<(), cra
         super::settings::PanelPref::Animations => "animations",
     };
     store_key(key, if on { "on" } else { "off" })
+}
+
+/// Записать строку `key=value` (для `deskcfg`: панель и «Пуск»).
+pub fn store_line(key: &str, value: &str) -> Result<(), crate::vfs::VfsError> {
+    store_key(key, value)
 }
 
 /// Правится одна строка файла, остальные остаются как были.

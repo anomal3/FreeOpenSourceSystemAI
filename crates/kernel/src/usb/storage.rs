@@ -175,7 +175,8 @@ fn live_packages(mount: &str) {
 }
 
 /// Порядок установки пакетов живой флешки (кого нет в списке — в конце).
-const LIVE_ORDER: [&str; 4] = ["obsos", "debian", "proton", "tmnf"];
+/// Приложения Craft — по 8 знаков имени файла 8.3 (`GRIDCRAF.FPK`).
+const LIVE_ORDER: [&str; 8] = ["obsos", "gridcraf", "wordcraf", "pdfcraft", "mailcraf", "debian", "proton", "tmnf"];
 
 static LIVE_QUEUE: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
 static LIVE_RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

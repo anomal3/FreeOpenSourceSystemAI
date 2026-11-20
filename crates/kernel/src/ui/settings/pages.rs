@@ -55,6 +55,7 @@ impl SettingsView {
             Section::Wallpaper => wallpaper(pass, x, y, w),
             Section::Colors => colors(pass, x, y, w),
             Section::Dock => dock(pass, x, y, w),
+            Section::Start => start_page(pass, x, y, w),
             Section::Explorer => explorer(pass, x, y, w),
             Section::Apps => self.apps(pass, x, y, w),
             Section::Packages => self.packages_page(pass, x, y, w),
@@ -484,6 +485,31 @@ impl SettingsView {
         next
     }
 
+    // ── Программы Windows (P12, 18.11) ──────────────────────────────────────
+
+    /// Программы, поставленные в префиксы Proton: ярлыки удаления, которые
+    /// записал их установщик («Uninstall …»), и для каждого префикса —
+    /// «Установка и удаление программ» Wine (`uninstaller`: всё, что есть в
+    /// реестре префикса, в том числе MSI без ярлыков). Без пакета `proton` и
+    /// префиксов — раздела нет.
+    fn windows_programs(&self, pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
+        use super::super::panel::{pct, proton_line, windows_prefixes, windows_shortcuts};
+        let prefixes = windows_prefixes();
+        if prefixes.is_empty() {
+            return y;
+        }
+        let mut y = pass.group(x, y, w, "Программы Windows");
+        for shortcut in windows_shortcuts().into_iter().filter(|shortcut| shortcut.uninstall) {
+            let line = proton_line(&format!("--shortcut={}", pct(&shortcut.file)));
+            y = row(pass, x, y, w, Some(Fi::Package), &shortcut.caption, &shortcut.prefix, Ctl::Button("Удалить", Weight::Normal), Some(Deed::Run(line)));
+        }
+        for prefix in prefixes {
+            let line = proton_line(&format!("--env=WINEPREFIX={prefix} uninstaller"));
+            y = row(pass, x, y, w, Some(Fi::Folder), "Установка и удаление программ", &prefix, Ctl::Button("Открыть", Weight::Normal), Some(Deed::Run(line)));
+        }
+        y
+    }
+
     // ── Приложения ───────────────────────────────────────────────────────────
 
     fn apps(&self, pass: &mut Pass, x: i32, y: i32, w: u32) {
@@ -521,6 +547,7 @@ impl SettingsView {
                         y = row(pass, x, y, w, Some(Fi::Warning), "Реестр пакетов", &err, Ctl::Chip("ОШИБКА", Tone::Bad), None);
                     }
                 }
+                y = self.windows_programs(pass, x, y, w);
                 y = pass.group(x, y, w, "Установка");
                 y = row(pass, x, y, w, Some(Fi::Download), "Установить пакет из файла", "Файлы .fpk с носителя, из домашнего каталога и со стола", Ctl::Button("Обзор…", Weight::Primary), Some(Deed::ChooseFile));
                 y = pass.group(x, y, w, "Источник");
@@ -765,18 +792,206 @@ fn colors(pass: &mut Pass, x: i32, y: i32, w: u32) {
 }
 
 fn dock(pass: &mut Pass, x: i32, y: i32, w: u32) {
-    let mut y = pass.group(x, y, w, "Часы");
-    let uptime = super::super::panel::shows(PanelPref::Uptime);
-    y = row(pass, x, y, w, Some(Fi::Clock), "Показывать аптайм", "Время и время работы отвечают на разные вопросы", Ctl::Toggle(uptime), Some(Deed::Panel(PanelPref::Uptime, !uptime)));
-    let date = super::super::panel::shows(PanelPref::Date);
-    y = row(pass, x, y, w, Some(Fi::Calendar), "Показывать дату", "", Ctl::Toggle(date), Some(Deed::Panel(PanelPref::Date, !date)));
+    use super::super::deskcfg::{self, Edge, Mode, TaskbarDeed};
+    let ctx = pass.ctx;
+    let p = ctx.palette;
+    let cfg = deskcfg::taskbar();
+
+    // Вид: две карточки с картинкой, как выбор темы (макет, 20.11).
+    let gap = ctx.px(12);
+    let card_w = (w.saturating_sub(gap)) / 2;
+    let card_h = ctx.px(196).min(card_w * 3 / 4 + ctx.px(60));
+    for (index, (mode, title, desc)) in [
+        (Mode::Panel, "Панель", "Во всю сторону экрана: «Пуск», окна, трей"),
+        (Mode::Dock, "Dock", "Значки по центру, полоска под открытыми"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rect = Rect::new(x + (index as u32 * (card_w + gap)) as i32, y, card_w, card_h);
+        let focused = pass.deed(rect, Deed::Taskbar(TaskbarDeed::Mode(mode)));
+        if pass.visible(rect) {
+            mode_card(pass, rect, mode, cfg.edge, title, desc, cfg.mode == mode, focused);
+        }
+    }
+    let mut y = y + (card_h + ctx.px(6)) as i32;
+
+    y = pass.group(x, y, w, "Поведение");
+    let edges: Vec<(&str, Deed, bool)> = Edge::ALL.iter().map(|edge| (edge.title(), Deed::Taskbar(TaskbarDeed::Edge(*edge)), cfg.edge == *edge)).collect();
+    y = seg_row(pass, x, y, w, Fi::Layers, "Расположение", "Сторона экрана, у которой стоит панель", &edges);
+    y = row(pass, x, y, w, Some(Fi::Eye), "Автоматически скрывать", "Панель выезжает при наведении на край экрана, окна занимают весь экран", Ctl::Toggle(cfg.autohide), Some(Deed::Taskbar(TaskbarDeed::Autohide(!cfg.autohide))));
+    let labels: Vec<(String, Deed, bool)> = deskcfg::ICON_SIZES.iter().map(|size| (format!("{size}"), Deed::Taskbar(TaskbarDeed::Icon(*size)), cfg.icon == *size)).collect();
+    let sizes: Vec<(&str, Deed, bool)> = labels.iter().map(|(label, deed, on)| (label.as_str(), deed.clone(), *on)).collect();
+    y = seg_row(pass, x, y, w, Fi::Sliders, "Размер значков Dock", "Точки; только в режиме Dock", &sizes);
+
     // Как «Объединять кнопки панели задач» в Windows 11: значок на программу
     // (окна стопкой) или кнопка с подписью на каждое окно.
     y = pass.group(x, y, w, "Кнопки окон");
     let labels = super::super::panel::shows(PanelPref::Labels);
     y = row(pass, x, y, w, Some(Fi::Dock), "Только значки", "Окна одной программы — в одной кнопке, как в Windows 11", Ctl::Radio(!labels), Some(Deed::Panel(PanelPref::Labels, false)));
-    y = row(pass, x, y, w, Some(Fi::Dock), "Значки и подписи", "Кнопка с названием на каждое окно", Ctl::Radio(labels), Some(Deed::Panel(PanelPref::Labels, true)));
-    row(pass, x, y, w, Some(Fi::Keyboard), "Раскладка в трее", "Щелчок переключает, как Alt+Shift", Ctl::Value("Показывается"), None);
+    y = row(pass, x, y, w, Some(Fi::Dock), "Значки и подписи", "Кнопка с названием на каждое окно; у панели снизу и сверху", Ctl::Radio(labels), Some(Deed::Panel(PanelPref::Labels, true)));
+    let pins = deskcfg::task_pins_for(cfg.mode).len();
+    let pins_text = format!("{pins}");
+    y = row(pass, x, y, w, Some(Fi::Pin), "Закреплённые программы", "Закрепляются правой кнопкой в «Пуске»", Ctl::Value(&pins_text), None);
+    if pins > 0 {
+        y = row(pass, x, y, w, None, "Открепить все", "Останутся только кнопки открытых окон", Ctl::Button("Открепить", Weight::Normal), Some(Deed::Taskbar(TaskbarDeed::ClearPins)));
+    }
+
+    y = pass.group(x, y, w, "Часы");
+    let uptime = super::super::panel::shows(PanelPref::Uptime);
+    y = row(pass, x, y, w, Some(Fi::Clock), "Показывать аптайм", "Время и время работы отвечают на разные вопросы", Ctl::Toggle(uptime), Some(Deed::Panel(PanelPref::Uptime, !uptime)));
+    let date = super::super::panel::shows(PanelPref::Date);
+    y = row(pass, x, y, w, Some(Fi::Calendar), "Показывать дату", "", Ctl::Toggle(date), Some(Deed::Panel(PanelPref::Date, !date)));
+    y = row(pass, x, y, w, Some(Fi::Keyboard), "Раскладка в трее", "Щелчок переключает, как Alt+Shift", Ctl::Value("Показывается"), None);
+    y = pass.group(x, y, w, "Меню «Пуск»");
+    nav_row(pass, x, y, w, Section::Start);
+    let _ = p;
+}
+
+/// «Пуск»: ширина, что показывать, закреплённые (20.11).
+fn start_page(pass: &mut Pass, x: i32, y: i32, w: u32) {
+    use super::super::deskcfg::{self, StartDeed};
+    let cfg = deskcfg::start();
+    let mut y = pass.group(x, y, w, "Размер");
+    let widths = [("Обычный", Deed::Start(StartDeed::Wide(false)), !cfg.wide), ("Широкий", Deed::Start(StartDeed::Wide(true)), cfg.wide)];
+    y = seg_row(pass, x, y, w, Fi::Apps, "Ширина меню", "Широкое — больше столбцов закреплённых и шире список", &widths);
+    y = pass.group(x, y, w, "Что показывать");
+    y = row(pass, x, y, w, Some(Fi::Pin), "Закреплённые", "Плитки программ и папок, порядок задаёте вы", Ctl::Toggle(cfg.pinned), Some(Deed::Start(StartDeed::Pinned(!cfg.pinned))));
+    y = row(pass, x, y, w, Some(Fi::List), "Все программы", "Список по алфавиту с папками", Ctl::Toggle(cfg.all), Some(Deed::Start(StartDeed::All(!cfg.all))));
+    y = row(pass, x, y, w, Some(Fi::History), "Недавние файлы", "Файлы, открытые со стола и из «Пуска»", Ctl::Toggle(cfg.recent), Some(Deed::Start(StartDeed::Recent(!cfg.recent))));
+    y = pass.group(x, y, w, "Закреплённые");
+    let count = format!("{}", deskcfg::start_pins().len());
+    y = row(pass, x, y, w, Some(Fi::Apps), "Закреплено", "Правая кнопка на программе в «Пуске» — закрепить, открепить, в начало", Ctl::Value(&count), None);
+    y = row(pass, x, y, w, Some(Fi::Undo), "Вернуть как было", "Терминал, Параметры, Файлы, папки «Системные утилиты» и «SDK C#»", Ctl::Button("Вернуть", Weight::Normal), Some(Deed::Start(StartDeed::ResetPins)));
+    pass.note(x, y, w, "Win или F1 — открыть «Пуск»; набор текста сразу ищет; Ctrl+Shift+Esc — диспетчер задач.");
+}
+
+/// Строка-карточка с переключателем из нескольких кнопок справа.
+fn seg_row(pass: &mut Pass, x: i32, y: i32, w: u32, icon: Fi, title: &str, desc: &str, options: &[(&str, Deed, bool)]) -> i32 {
+    let ctx = pass.ctx;
+    let p = ctx.palette;
+    let h = ctx.px(60);
+    let rect = Rect::new(x, y, w, h);
+    let next = y + (h + ctx.px(4)) as i32;
+    let pad = ctx.px(18) as i32;
+    let face = ctx.face(Role::Body);
+    let seg_h = ctx.px(32);
+    let widths: Vec<u32> = options.iter().map(|(label, _, _)| face.width(label) + ctx.px(24)).collect();
+    let total: u32 = widths.iter().sum::<u32>() + ctx.px(4);
+    let seg = Rect::new(rect.right() - pad - total as i32, rect.y + (h as i32 - seg_h as i32) / 2, total, seg_h);
+    let mut buttons = Vec::new();
+    let mut bx = seg.x + ctx.px(2) as i32;
+    for ((_, deed, _), bw) in options.iter().zip(&widths) {
+        let button = Rect::new(bx, seg.y + ctx.px(2) as i32, *bw, seg_h - ctx.px(4));
+        let focused = pass.deed_in(button, rect, deed.clone());
+        buttons.push((button, focused));
+        bx += *bw as i32;
+    }
+    if !pass.visible(rect) {
+        return next;
+    }
+    let card = ctx.flat(p.card);
+    let inner = ctx.on(card);
+    let radius = ctx.px(8);
+    pass.on(|s| {
+        draw::rounded(s, rect, radius, card, 255);
+        draw::rounded_stroke(s, rect, radius, p.line2.color, p.line2.alpha);
+        draw::rounded(s, seg, ctx.px(6), p.sunk.over(card), 255);
+        draw::rounded_stroke(s, seg, ctx.px(6), p.line2.color, p.line2.alpha);
+    });
+    for ((label, _, on), (button, focused)) in options.iter().zip(&buttons) {
+        let (button, focused, on) = (*button, *focused, *on);
+        pass.on(|s| {
+            if on {
+                draw::rounded_gradient(s, button, ctx.px(5), p.acc, p.acc2, 255);
+            }
+            if focused {
+                draw::rounded_stroke(s, button, ctx.px(5), p.acc, 255);
+            }
+            let ink = if on { Color::rgb(0xFF, 0xFF, 0xFF) } else { p.ink2 };
+            paint::text_centered(inner.on(if on { p.acc } else { p.sunk.over(card) }), s, Role::Body, button, label, ink);
+        });
+    }
+    let size = ctx.px(22);
+    pass.icon(icon, rect.x + pad, rect.y + (h as i32 - size as i32) / 2, size, p.ink2);
+    let text_x = rect.x + pad + (size + ctx.px(16)) as i32;
+    let room = (seg.x - ctx.px(14) as i32 - text_x).max(0) as u32;
+    let both = line_h(ctx, Role::Body) + ctx.px(3) as i32 + line_h(ctx, Role::Caption);
+    let top = rect.y + (h as i32 - both) / 2;
+    pass.text(Role::Body, text_x, top, room, title, p.ink);
+    pass.text(Role::Caption, text_x, top + line_h(ctx, Role::Body) + ctx.px(3) as i32, room, desc, p.ink4);
+    next
+}
+
+/// Карточка вида панели с картинкой стола.
+fn mode_card(pass: &mut Pass, rect: Rect, mode: super::super::deskcfg::Mode, edge: super::super::deskcfg::Edge, title: &str, desc: &str, current: bool, focused: bool) {
+    use super::super::deskcfg::{Edge, Mode};
+    let ctx = pass.ctx;
+    let p = ctx.palette;
+    let radius = ctx.px(8);
+    let pad = ctx.px(14);
+    let shot = Rect::new(rect.x + pad as i32, rect.y + pad as i32, rect.w - pad * 2, (rect.h - pad * 2).saturating_sub(ctx.px(52)));
+    pass.on(|s| {
+        let card = ctx.flat(p.card);
+        draw::rounded(s, rect, radius, card, 255);
+        let (line, alpha) = if current { (p.acc, 255) } else { (p.line2.color, p.line2.alpha) };
+        draw::rounded_stroke(s, rect, radius, line, alpha);
+        if current {
+            let ring = Rect::new(rect.x - 1, rect.y - 1, rect.w + 2, rect.h + 2);
+            draw::rounded_stroke(s, ring, radius + 1, p.acctint.color, p.acctint.alpha);
+        }
+        if focused {
+            draw::rounded_stroke(s, rect.shrink(2), radius, p.acc, 255);
+        }
+        let (top, bottom) = theme::wallpaper_colors(theme::wallpaper());
+        draw::rounded_gradient(s, shot, ctx.px(4), top, bottom, 255);
+        let bar = Color::rgb(0x12, 0x15, 0x1B);
+        let unit = ctx.px(8);
+        let vertical = matches!(edge, Edge::Left | Edge::Right);
+        let tiles = [p.acc, Color::rgb(0xE0, 0x9A, 0x2B), Color::rgb(0x1F, 0x9E, 0x8F), Color::rgb(0x3C, 0xA0, 0x55)];
+        match mode {
+            Mode::Panel => {
+                let strip = match edge {
+                    Edge::Bottom => Rect::new(shot.x, shot.bottom() - unit as i32 - 4, shot.w, unit + 4),
+                    Edge::Top => Rect::new(shot.x, shot.y, shot.w, unit + 4),
+                    Edge::Left => Rect::new(shot.x, shot.y, unit + 4, shot.h),
+                    Edge::Right => Rect::new(shot.right() - unit as i32 - 4, shot.y, unit + 4, shot.h),
+                };
+                s.fill(strip, bar);
+                for n in 0..3u32 {
+                    let at = if vertical {
+                        Rect::new(strip.x + 2, strip.y + 4 + (n * (unit + 4)) as i32, unit, unit)
+                    } else {
+                        Rect::new(strip.x + 4 + (n * (unit * 3 + 4)) as i32, strip.y + 2, if n == 0 { unit } else { unit * 3 }, unit)
+                    };
+                    draw::rounded(s, at, 2, if n == 0 { p.acc } else { p.ink5 }, 255);
+                }
+            }
+            Mode::Dock => {
+                let count = 5u32;
+                let len = count * (unit + 3) + 6;
+                let plate = match edge {
+                    Edge::Bottom => Rect::new(shot.x + (shot.w as i32 - len as i32) / 2, shot.bottom() - unit as i32 - 10, len, unit + 6),
+                    Edge::Top => Rect::new(shot.x + (shot.w as i32 - len as i32) / 2, shot.y + 4, len, unit + 6),
+                    Edge::Left => Rect::new(shot.x + 4, shot.y + (shot.h as i32 - len as i32) / 2, unit + 6, len),
+                    Edge::Right => Rect::new(shot.right() - unit as i32 - 10, shot.y + (shot.h as i32 - len as i32) / 2, unit + 6, len),
+                };
+                draw::rounded(s, plate, 4, bar, 255);
+                for n in 0..count {
+                    let at = if vertical {
+                        Rect::new(plate.x + 3, plate.y + 3 + (n * (unit + 3)) as i32, unit, unit)
+                    } else {
+                        Rect::new(plate.x + 3 + (n * (unit + 3)) as i32, plate.y + 3, unit, unit)
+                    };
+                    let color = if n == 0 { p.ink5 } else { tiles[(n as usize - 1) % tiles.len()] };
+                    draw::rounded(s, at, 2, color, 255);
+                }
+            }
+        }
+    });
+    let ty = shot.bottom() + ctx.px(10) as i32;
+    pass.text(Role::Strong, rect.x + pad as i32, ty, rect.w - pad * 2, title, p.ink);
+    pass.text(Role::Caption, rect.x + pad as i32, ty + line_h(ctx, Role::Strong) + ctx.px(2) as i32, rect.w - pad * 2, desc, p.ink3);
 }
 
 fn explorer(pass: &mut Pass, x: i32, y: i32, w: u32) {

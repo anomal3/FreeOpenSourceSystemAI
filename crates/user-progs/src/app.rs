@@ -23,6 +23,7 @@
 //!   палитра меняется вместе с темой.
 
 use alloc::format;
+use alloc::string::String;
 
 use mini_ui::paint::Ctx;
 use mini_ui::{Rect, Surface, theme};
@@ -51,6 +52,9 @@ const QUIT: u32 = 'q' as u32;
 
 /// Код правой кнопки в событии `WIN_POINTER`.
 pub const RIGHT_BUTTON: u32 = 2;
+
+/// Код средней кнопки в событии `WIN_POINTER` (ядро присылает её с 20.11).
+pub const MIDDLE_BUTTON: u32 = 4;
 
 /// Что программа с окном умеет сама.
 ///
@@ -125,6 +129,42 @@ pub trait App {
         false
     }
 
+    /// Колесо вместе с раскладкой окна (20.11): колесо двигает **вид**, а не
+    /// выделение, и чтобы не уехать за конец, надо знать высоту вида. По
+    /// умолчанию — [`App::wheel`].
+    fn wheel_at(&mut self, _area: Rect, _ctx: Ctx, clicks: i32) -> bool {
+        self.wheel(clicks)
+    }
+
+    /// Указатель движется без нажатых кнопок — подсветить полосу прокрутки,
+    /// вкладку под ним.
+    fn hover(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
+        false
+    }
+
+    /// Указатель ушёл с окна: погасить подсветку.
+    fn leave(&mut self) -> bool {
+        false
+    }
+
+    /// Щелчок средней кнопкой ([`MIDDLE_BUTTON`]).
+    fn click_middle(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
+        false
+    }
+
+    /// Имя окна сейчас. `None` — то, что в паспорте ([`Spec::title`]).
+    ///
+    /// Форма — `"Имя\x1fПодпись"`: имя остаётся именем окна для журнала и
+    /// стенда (`focus 'Files'`), подпись стол показывает в заголовке, на
+    /// панели задач и в миниатюрах. Без `\x1f` строка — и то и другое.
+    ///
+    /// «Файлы» зовут окно открытой папкой (20.11): два окна «Files» на
+    /// панели задач и в миниатюрах не различить. Каркас сверяет имя после
+    /// каждого кадра и меняет его только когда оно сменилось.
+    fn title(&self) -> Option<String> {
+        None
+    }
+
     /// После всякого разобранного ввода — «Файлы» печатают здесь, куда ушло
     /// выделение.
     fn after_input(&mut self) {}
@@ -141,6 +181,14 @@ pub trait App {
     /// рассчитана на один размер (калькулятор).
     fn resizable(&self) -> bool {
         true
+    }
+
+    /// Особый вид окна — флаги `user_abi::WIN_STYLE_*` сверх
+    /// [`App::resizable`] (20.11): `WIN_STYLE_DIALOG` — маленький диалог с
+    /// одним крестиком, `WIN_STYLE_AT_START` — открыть у кнопки «Пуск», как
+    /// «Выполнить» в Windows.
+    fn window_style(&self) -> u32 {
+        0
     }
 }
 
@@ -186,7 +234,56 @@ pub fn start(spec: &Spec) -> SysInfo {
     info
 }
 
-/// Окно в две трети экрана — размер диспетчеров.
+/// Желаемые размеры окон системных программ в точках макета (множитель 1).
+///
+/// # Почему числом, а не долей экрана
+///
+/// До 20.11 диспетчеры и «Файлы» брали две трети экрана, калькулятор —
+/// своё число, а каждая следующая программа — что придумала. Роман: на 1280×720
+/// и на 2560×1440 калькулятор занимал полэкрана, а окна разных программ
+/// открывались совсем разными. Доля экрана растёт вместе с экраном, а
+/// содержимое — нет: на мониторе 2560 таблица в две трети ширины — это пустое
+/// поле справа. Число же, умноженное на множитель геометрии, даёт **один и тот
+/// же вид** на обоих экранах: на 2560 при 200 % окно вдвое больше в точках и
+/// такое же на глаз. Маленький экран окно не переполнит — [`window_size`]
+/// ограничивает его долей рабочей области.
+pub mod size {
+    /// «Файлы».
+    pub const FILES: (u32, u32) = (1000, 640);
+    /// Блокнот.
+    pub const NOTEPAD: (u32, u32) = (900, 600);
+    /// Диспетчер задач.
+    pub const TASKMGR: (u32, u32) = (900, 620);
+    /// Диспетчер устройств.
+    pub const DEVMGR: (u32, u32) = (760, 560);
+    /// Калькулятор — узкий и невысокий, как «Обычный» у Windows.
+    pub const CALC: (u32, u32) = (320, 460);
+}
+
+/// Больше какой доли рабочей области окно при открытии не бывает, проценты.
+const MAX_SHARE: u32 = 85;
+
+/// Размер окна при открытии: желаемый размер в точках макета `logical`
+/// (см. [`size`]), умноженный на множитель геометрии (тот же, что у рамки
+/// стола и шрифта), но не больше [`MAX_SHARE`] процентов рабочей области —
+/// экрана без панели задач и заголовка окна — и не меньше самого маленького
+/// окна каркаса.
+#[must_use]
+pub fn window_size(info: &SysInfo, logical: (u32, u32)) -> (u32, u32) {
+    let (screen_w, screen_h) = (info.screen_w.max(1), info.screen_h.max(1));
+    let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), screen_w, screen_h);
+    let work_h = screen_h.saturating_sub((theme::PANEL_H + theme::TITLE_H) * scale);
+    let max_w = (screen_w * MAX_SHARE / 100).max(MIN_W.min(screen_w));
+    let max_h = (work_h * MAX_SHARE / 100).max(MIN_H.min(screen_h));
+    let width = (logical.0 * scale).clamp(MIN_W.min(max_w), max_w);
+    let height = (logical.1 * scale).clamp(MIN_H.min(max_h), max_h);
+    (width, height)
+}
+
+/// Окно в две трети экрана — прежний размер диспетчеров.
+///
+/// Устарело (20.11): размер зависел от экрана, а не от содержимого, и на
+/// 2560×1440 окно выходило вдвое больше нужного. Новое — [`window_size`].
 #[must_use]
 pub fn two_thirds(info: &SysInfo) -> (u32, u32) {
     let width = (info.screen_w * 2 / 3).clamp(320, info.screen_w.max(320));
@@ -225,7 +322,11 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
     let mut app = make(Ctx::scaled(scale), area);
     // Тянуть за край и разворачивать — как всякое окно (Роман, 27.10:
     // «Файлы» нельзя было растянуть, а терминал можно).
-    if app.resizable() {
+    let style = app.window_style();
+    if style != 0 {
+        let resizable = if app.resizable() { user_abi::WIN_STYLE_RESIZABLE } else { 0 };
+        let _ = window.set_style(style | resizable);
+    } else if app.resizable() {
         let _ = window.set_resizable(true);
     }
 
@@ -235,6 +336,8 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
     let mut frames = 0u64;
     // Модификаторы последнего нажатия кнопки мыши (`WIN_MODS` перед ним).
     let mut pointer_mods = 0i32;
+    // Имя, которое окно носит сейчас: сначала — из паспорта.
+    let mut shown_title: Option<String> = None;
     let reason;
 
     'live: loop {
@@ -255,13 +358,19 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
                     pointer_mods = 0;
                     app.click_right(area, ctx, event.x, event.y)
                 }
+                WIN_POINTER if event.code == MIDDLE_BUTTON => {
+                    pointer_mods = 0;
+                    app.click_middle(area, ctx, event.x, event.y)
+                }
                 user_abi::WIN_MODS => {
                     pointer_mods = event.code as i32;
                     false
                 }
                 WIN_POINTER => app.click_with(area, ctx, event.x, event.y, core::mem::take(&mut pointer_mods)),
-                WIN_WHEEL => app.wheel(event.x),
+                WIN_WHEEL => app.wheel_at(area, ctx, event.x),
                 user_abi::WIN_MOVE if event.code & 1 != 0 => app.drag(area, ctx, event.x, event.y),
+                user_abi::WIN_MOVE if event.code == 0 => app.hover(area, ctx, event.x, event.y),
+                user_abi::WIN_LEAVE => app.leave(),
                 user_abi::WIN_RELEASE if event.code == 1 => app.release(area, ctx, event.x, event.y),
                 // Новый размер от стола: поверхность выдаётся заново, прежние
                 // пиксели после ответа недействительны.
@@ -320,6 +429,13 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
             if window.commit() >= 0 {
                 dirty = false;
                 frames += 1;
+            }
+            if let Some(title) = app.title() {
+                if shown_title.as_deref() != Some(title.as_str()) && window.set_title(&title) >= 0 {
+                    // «Имя\x1fПодпись» (договор K2, 20.11): в журнал — читаемо.
+                    println(&format!("{}: window title '{}'", spec.name, title.replace('\x1f', " | ")));
+                    shown_title = Some(title);
+                }
             }
         }
         nanosleep(0, POLL_NS);
