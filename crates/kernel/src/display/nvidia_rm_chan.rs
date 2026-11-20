@@ -346,8 +346,13 @@ pub fn attach(log: &mut Log) -> Res<Arc<RmBackend>> {
     // Слою DRM (WP-C): регистрация — узел /dev/dri/renderD128 настоящей
     // карты появляется сразу (D4, 20.11: `drm::DEFAULT_HW`), `nvk hw off`
     // прячет.
-    let gpu: Arc<dyn GpuBackend> = backend.clone();
-    crate::linux::drm::set_backend(Some(gpu));
+    // Слой Linux (`crate::linux`) есть только на x86_64.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let gpu: Arc<dyn GpuBackend> = backend.clone();
+        crate::linux::drm::set_backend(Some(gpu));
+    }
+    #[cfg(target_arch = "x86_64")]
     say(
         log,
         alloc::format!("nvgpu: backend attached, DRM node {}", if crate::linux::drm::hw() { "/dev/dri/renderD128 present" } else { "hidden ('nvk hw on')" }),
@@ -364,6 +369,7 @@ pub(crate) fn shutdown(rm: &mut Rm) -> Log {
         *b = None;
     }
     // Новые open узла DRM больше не увидят карту; открытые получают ENODEV.
+    #[cfg(target_arch = "x86_64")]
     crate::linux::drm::set_backend(None);
     let clients: Vec<u32> = core::mem::take(&mut *super::nvidia_rm_vmm::LIVE_CLIENTS.lock());
     for client in clients {
