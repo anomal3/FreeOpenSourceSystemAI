@@ -1025,6 +1025,8 @@ case $WHAT in present)
     # VSync к/с выше частоты монитора (сколько успевает рисовать), с ней -
     # около частоты (60 в QEMU). IMMEDIATE есть только при
     # wp_tearing_control_v1 сервера - не выбрался - FAIL ступени.
+    # Прогрев (первый запуск lavapipe компилирует шейдеры в кеш Mesa) - не в замер.
+    step vkcube-warmup 120 $B $P --lvp --run=vkcube --wsi wayland --c 30
     for drv in lvp nvk; do
         for m in 0 1 2; do
             t=$(now)

@@ -128,6 +128,14 @@ static PACE_CHECKED_MS: AtomicU64 = AtomicU64::new(0);
 /// 144 Гц — 144, у GOP и virtio — 60), `<Гц>` — своя, `off`/`unlimited` — без
 /// темпа (замеры: кадры столько, сколько стол успевает показать). Ответ —
 /// строка для терминала.
+///
+/// Темп держит только того, кто его просит (D7, 21.11.2026): `frame` ждёт
+/// клиент с VSync (Vulkan FIFO, DXVK `SyncInterval 1`, GL swap interval 1).
+/// С выключенной VSync Mesa WSI (`MAILBOX`, `IMMEDIATE` через
+/// `wp_tearing_control_v1`) `frame` не просит и ждёт только
+/// `wl_buffer.release` — сервер возвращает сменённый буфер сразу и
+/// показывает последний кадр с частотой монитора, так что игра рисует
+/// столько, сколько успевает GPU. `off` — принудительно без темпа и для FIFO.
 pub fn pace_command(argument: &str) -> String {
     match argument.trim() {
         "on" | "auto" => {
@@ -150,7 +158,12 @@ pub fn pace_command(argument: &str) -> String {
     }
     let mhz = pace_mhz();
     let forced = PACE_FORCED_MHZ.load(Ordering::Relaxed) != 0;
-    alloc::format!("  wlpace: on, {}.{:03} Hz ({})", mhz / 1000, mhz % 1000, if forced { "forced" } else { "fastest monitor" })
+    alloc::format!(
+        "  wlpace: on, {}.{:03} Hz ({}) for vsync clients (FIFO); vsync-off clients (MAILBOX/IMMEDIATE) are not paced",
+        mhz / 1000,
+        mhz % 1000,
+        if forced { "forced" } else { "fastest monitor" }
+    )
 }
 
 /// Частота темпа в мГц: заданная руками или самого быстрого включённого
@@ -319,7 +332,7 @@ impl Args<'_> {
 // ---- объекты --------------------------------------------------------------------
 
 /// Глобальные объекты: номер в реестре, интерфейс, версия.
-const GLOBALS: [(u32, &str, u32); 9] = [
+const GLOBALS: [(u32, &str, u32); 11] = [
     (1, "wl_compositor", 4),
     (2, "wl_subcompositor", 1),
     (3, "wl_shm", 1),
@@ -345,7 +358,22 @@ const GLOBALS: [(u32, &str, u32); 9] = [
     // Буферы dma-buf (18.11.2026): аппаратный Vulkan (Mesa NVK) показывает
     // кадры только так (`wayland_dmabuf.rs`).
     (9, dmabuf::INTERFACE, dmabuf::VERSION),
+    // Вертикальная синхронизация — решение игры (D7, 21.11.2026). Mesa WSI
+    // на Wayland даёт `VK_PRESENT_MODE_IMMEDIATE_KHR` только при этом
+    // глобале (MAILBOX и FIFO — всегда): DXVK/vkd3d с выключенной VSync
+    // выбирают IMMEDIATE (подсказка `async`), иначе MAILBOX.
+    (10, "wp_tearing_control_manager_v1", 1),
+    // Время показа кадра (`wp_presentation_feedback`): Mesa отвечает по нему
+    // на `vkWaitForPresentKHR` (DXVK ждёт им кадр в полёте) — без него ждать
+    // было нечем, кроме `frame`.
+    (11, "wp_presentation", 1),
 ];
+
+/// `wp_tearing_control_v1.presentation_hint`: `async` — можно с разрывом.
+const TEARING_ASYNC: u32 = 1;
+/// `wp_presentation.clock_id`: время в `presented` — `CLOCK_MONOTONIC`
+/// (`time::uptime_ns`, его же отдаёт `clock_gettime`).
+const PRESENTATION_CLOCK: u32 = 1;
 
 const SHM_ARGB8888: u32 = 0;
 const SHM_XRGB8888: u32 = 1;
@@ -578,6 +606,18 @@ struct SurfaceState {
     /// `wp_viewport` поверхности: действующий и ждущий `commit`.
     view: View,
     view_next: Option<View>,
+    /// `wp_tearing_control_v1` поверхности (одна на поверхность) и подсказка
+    /// `async`: действующая и ждущая `commit` (D7).
+    tearing: Option<u32>,
+    tearing_async: bool,
+    tearing_next: Option<bool>,
+    /// `wp_presentation_feedback`, ждущие `commit`.
+    feedback: Vec<u32>,
+    /// Как клиент показывает кадры — уже сказано в журнал (0 — нет, 1 — с
+    /// темпом `frame`, 2 — без него); сколько кадров подряд так же.
+    told: u8,
+    run: u8,
+    run_unpaced: bool,
 }
 
 /// Кусок буфера и размер поверхности (`wp_viewport`, D4 20.11.2026): Wine
@@ -630,6 +670,13 @@ impl SurfaceState {
             full: true,
             view: View::default(),
             view_next: None,
+            tearing: None,
+            tearing_async: false,
+            tearing_next: None,
+            feedback: Vec::new(),
+            told: 0,
+            run: 0,
+            run_unpaced: false,
         }
     }
 
@@ -671,6 +718,11 @@ struct Win {
     adopted: Option<(u32, Buffer)>,
     /// Собственные пиксели окна, отложенные на время показа без копии.
     stash: Option<Surface>,
+    /// Когда окно последний раз показано (мкс) и до какого мига отложен
+    /// показ кадра, пришедшего без темпа (`MAILBOX`/`IMMEDIATE`, D7): такие
+    /// кадры показываются с частотой монитора, последний побеждает.
+    presented_us: u64,
+    hold_until_us: u64,
 }
 
 /// Всплывающее окно стола за `xdg_popup`.
@@ -726,6 +778,11 @@ enum Obj {
     Viewport(u32),
     Dmabuf,
     DmabufParams(dmabuf::Params),
+    TearingManager,
+    /// `wp_tearing_control_v1` поверхности с этим номером.
+    Tearing(u32),
+    Presentation,
+    Feedback,
 }
 
 impl Obj {
@@ -760,6 +817,10 @@ impl Obj {
             Self::Viewport(_) => "wp_viewport",
             Self::Dmabuf => "zwp_linux_dmabuf_v1",
             Self::DmabufParams(_) => "zwp_linux_buffer_params_v1",
+            Self::TearingManager => "wp_tearing_control_manager_v1",
+            Self::Tearing(_) => "wp_tearing_control_v1",
+            Self::Presentation => "wp_presentation",
+            Self::Feedback => "wp_presentation_feedback",
         }
     }
 }
@@ -823,6 +884,12 @@ struct Client {
     /// какого мига ответ отложен (мс).
     frame_answered_us: u64,
     frames_held_since: u64,
+    /// `wp_presentation_feedback` после `commit`: (объект, поверхность,
+    /// поверхность окна) — `presented`, когда окно показано, `discarded`, если
+    /// кадр сменили раньше (D7).
+    feedbacks: Vec<(u32, u32, u32)>,
+    /// Счётчик показов для `presented` (`seq`).
+    present_seq: u64,
 }
 
 impl Client {
@@ -863,6 +930,8 @@ impl Client {
             ping_silence_told: false,
             frame_answered_us: 0,
             frames_held_since: 0,
+            feedbacks: Vec::new(),
+            present_seq: 0,
         }
     }
 
@@ -938,8 +1007,10 @@ impl Client {
             self.serve_owner();
             self.window_events(time);
             self.popup_events(time);
+            let now_us = crate::time::uptime_ns() / 1000;
             for index in 0..self.wins.len() {
-                if self.wins[index].dirty {
+                // Отложенный кадр без темпа (D7) — к своему сроку.
+                if self.wins[index].dirty && now_us >= self.wins[index].hold_until_us {
                     self.present(index);
                 }
                 let win = &mut self.wins[index];
@@ -1014,6 +1085,59 @@ impl Client {
                     self.bind(name, &interface, version, new);
                 }
             }
+            // `destroy`, `get_tearing_control(id, surface)` (D7).
+            Obj::TearingManager => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let new = args.u32()?;
+                    let surface = args.u32()?;
+                    match self.objects.get_mut(&surface) {
+                        Some(Obj::Surface(state)) if state.tearing.is_some_and(|other| other != new) => {
+                            self.fail(id, 0, "the surface already has a tearing control");
+                            return Ok(());
+                        }
+                        Some(Obj::Surface(state)) => state.tearing = Some(new),
+                        _ => {}
+                    }
+                    self.objects.insert(new, Obj::Tearing(surface));
+                }
+                _ => {}
+            },
+            // `set_presentation_hint(hint)` (с `commit`), `destroy` — снова
+            // `vsync`.
+            Obj::Tearing(surface) => {
+                let surface = *surface;
+                let hint = match opcode {
+                    0 => args.u32()? == TEARING_ASYNC,
+                    1 => {
+                        self.delete(id);
+                        if let Some(Obj::Surface(state)) = self.objects.get_mut(&surface) {
+                            state.tearing = None;
+                        }
+                        false
+                    }
+                    _ => return Ok(()),
+                };
+                if let Some(Obj::Surface(state)) = self.objects.get_mut(&surface) {
+                    state.tearing_next = Some(hint);
+                }
+            }
+            // `destroy`, `feedback(surface, callback)`: ответ — после показа
+            // кадра следующего `commit` этой поверхности.
+            Obj::Presentation => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let surface = args.u32()?;
+                    let callback = args.u32()?;
+                    self.objects.insert(callback, Obj::Feedback);
+                    match self.objects.get_mut(&surface) {
+                        Some(Obj::Surface(state)) => state.feedback.push(callback),
+                        _ => self.feedback_end(callback, None),
+                    }
+                }
+                _ => {}
+            },
+            Obj::Feedback => {}
             Obj::Callback | Obj::Region | Obj::Output | Obj::Keyboard => {
                 // `destroy`/`release` у тех, у кого он есть, — нулевой.
                 let destroys = match object {
@@ -1452,6 +1576,8 @@ impl Client {
             7 => Obj::DataDeviceManager,
             8 => Obj::Viewporter,
             9 => Obj::Dmabuf,
+            10 => Obj::TearingManager,
+            11 => Obj::Presentation,
             _ => Obj::Output,
         };
         self.objects.insert(new, object);
@@ -1459,6 +1585,7 @@ impl Client {
             self.wm_base = Some(new);
         }
         match name {
+            11 => self.send(Msg::new(new, 0).u32(PRESENTATION_CLOCK)),
             3 => {
                 self.send(Msg::new(new, 0).u32(SHM_ARGB8888));
                 self.send(Msg::new(new, 0).u32(SHM_XRGB8888));
@@ -1514,6 +1641,15 @@ impl Client {
                     let buffer = *buffer;
                     self.release(buffer);
                 }
+                // Кадры поверхности уже не покажутся.
+                let unsent = match self.objects.get_mut(&id) {
+                    Some(Obj::Surface(state)) => core::mem::take(&mut state.feedback),
+                    _ => Vec::new(),
+                };
+                for feedback in unsent {
+                    self.feedback_end(feedback, None);
+                }
+                self.feedback_discard(|surface, _| surface == id);
                 self.delete(id);
             }
             1 => {
@@ -1577,6 +1713,8 @@ impl Client {
                     want_full: false,
                     adopted: None,
                     stash: None,
+                    presented_us: 0,
+                    hold_until_us: 0,
                 });
             }
             2 => {
@@ -1710,12 +1848,42 @@ impl Client {
 
     fn commit(&mut self, id: u32) {
         super::perfdiag::WL_COMMITS.fetch_add(1, Ordering::Relaxed);
-        let (pending, frames) = match self.objects.get_mut(&id) {
-            Some(Obj::Surface(state)) => (state.pending.take(), core::mem::take(&mut state.frames)),
+        let (pending, frames, feedback) = match self.objects.get_mut(&id) {
+            Some(Obj::Surface(state)) => (state.pending.take(), core::mem::take(&mut state.frames), core::mem::take(&mut state.feedback)),
             _ => return,
         };
+        let paced = !frames.is_empty();
         self.frames_due.extend(frames);
         let attached = pending.is_some();
+        // Кадр без `frame` с новым буфером — клиент не ждёт темпа экрана
+        // (Mesa WSI в `MAILBOX`/`IMMEDIATE`: VSync в игре выключена) — или
+        // прямо разрешил разрыв (`async`). Такой кадр не тормозится, а
+        // показывается не чаще монитора; последний побеждает (D7).
+        let mut unpaced = false;
+        if let Some(Obj::Surface(state)) = self.objects.get_mut(&id) {
+            if let Some(hint) = state.tearing_next.take() {
+                state.tearing_async = hint;
+            }
+            if attached && pending != Some(None) {
+                unpaced = state.tearing_async || !paced;
+                // В журнал — когда видно, что это поток кадров (30 подряд), а
+                // не редкая перерисовка обычной программы.
+                state.run = if unpaced == state.run_unpaced { state.run.saturating_add(1) } else { 1 };
+                state.run_unpaced = unpaced;
+                let mode = if unpaced { 2 } else { 1 };
+                if state.run == 30 && state.told != mode {
+                    state.told = mode;
+                    let how = match (unpaced, state.tearing_async) {
+                        (true, true) => "without vsync (tearing allowed, IMMEDIATE): frames are not paced",
+                        (true, false) => "without frame callbacks (MAILBOX): frames are not paced",
+                        _ => "with frame callbacks (FIFO, vsync): paced by the monitor",
+                    };
+                    kprintln!("  wayland     : #{} surface {id} presents {how}", self.pid);
+                }
+            }
+        }
+        // Прежний кадр этой поверхности, так и не показанный, сменён этим.
+        self.feedback_discard(|surface, _| surface == id);
         if let Some(Obj::Surface(state)) = self.objects.get_mut(&id) {
             let damage = core::mem::replace(&mut state.damage, Rect::EMPTY);
             state.ready = state.ready.union(&damage);
@@ -1768,9 +1936,17 @@ impl Client {
                 _ => break,
             }
         }
+        self.feedbacks.extend(feedback.into_iter().map(|callback| (callback, id, root)));
         let Some(index) = self.wins.iter().position(|win| win.surface == root) else {
             if let Some(index) = self.pops.iter().position(|pop| pop.surface == root) {
                 self.present_popup(index);
+            }
+            // Меню показывается сразу; поверхность без окна не покажется.
+            let shown = self.pops.iter().any(|pop| pop.surface == root && pop.open.is_some() && !pop.dirty);
+            if shown {
+                self.feedback_presented(root, 0);
+            } else {
+                self.feedback_discard(|_, of| of == root);
             }
             return;
         };
@@ -1780,7 +1956,74 @@ impl Client {
             self.wins[index].configured = true;
             self.configure(index, 0, 0);
         }
+        // Кадр без темпа пришёл раньше кадра монитора после прошлого показа
+        // — показать его (или более новый) к сроку; прежний буфер уже
+        // вернулся клиенту выше, и рисовать ему есть во что (D7).
+        if unpaced && PACE.load(Ordering::Relaxed) && self.wins[index].open.is_some() {
+            let now_us = crate::time::uptime_ns() / 1000;
+            let due = self.wins[index].presented_us.saturating_add(frame_us());
+            if now_us < due {
+                let win = &mut self.wins[index];
+                win.dirty = true;
+                win.hold_until_us = due;
+                super::perfdiag::WL_COALESCED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
         self.present(index);
+    }
+
+    /// Ответ на `wp_presentation_feedback`: `presented` (с временем
+    /// показа) или `discarded`; объект уничтожается сервером.
+    fn feedback_end(&mut self, callback: u32, presented: Option<(u64, u32)>) {
+        if !matches!(self.objects.get(&callback), Some(Obj::Feedback)) {
+            return;
+        }
+        match presented {
+            Some((ns, flags)) => {
+                let secs = ns / 1_000_000_000;
+                let refresh = (frame_us() * 1000).min(u64::from(u32::MAX)) as u32;
+                let seq = self.present_seq;
+                self.send(
+                    Msg::new(callback, 1)
+                        .u32((secs >> 32) as u32)
+                        .u32(secs as u32)
+                        .u32((ns % 1_000_000_000) as u32)
+                        .u32(refresh)
+                        .u32((seq >> 32) as u32)
+                        .u32(seq as u32)
+                        .u32(flags),
+                );
+            }
+            None => self.send(Msg::new(callback, 2)),
+        }
+        self.delete(callback);
+    }
+
+    /// `discarded` ждущим показа кадрам, отобранным `which(поверхность, окно)`.
+    fn feedback_discard(&mut self, which: impl Fn(u32, u32) -> bool) {
+        if !self.feedbacks.iter().any(|&(_, surface, root)| which(surface, root)) {
+            return;
+        }
+        let (gone, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.feedbacks).into_iter().partition(|&(_, surface, root)| which(surface, root));
+        self.feedbacks = kept;
+        for (callback, _, _) in gone {
+            self.feedback_end(callback, None);
+        }
+    }
+
+    /// Окно с поверхностью `root` показано — `presented` его кадрам.
+    fn feedback_presented(&mut self, root: u32, flags: u32) {
+        if !self.feedbacks.iter().any(|&(_, _, of)| of == root) {
+            return;
+        }
+        self.present_seq += 1;
+        let now = crate::time::uptime_ns();
+        let (done, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.feedbacks).into_iter().partition(|&(_, _, of)| of == root);
+        self.feedbacks = kept;
+        for (callback, _, _) in done {
+            self.feedback_end(callback, Some((now, flags)));
+        }
     }
 
     /// `xdg_toplevel.configure` с размером (0 — «выбери сам») и состояниями
@@ -1871,14 +2114,25 @@ impl Client {
                 super::perfdiag::WL_FRAMES.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.frame_answered_us = now_us;
+        // Сетка кадров, а не «от последнего ответа» (D7): опоздание задачи
+        // сервера (очередь готовых в QEMU) не копится, и FIFO держит частоту
+        // монитора, а не 52-56 к/с при 60 Гц. Опоздание больше кадра —
+        // сетка заново от «сейчас».
+        let ideal = self.frame_answered_us.saturating_add(frame_us());
+        self.frame_answered_us = if now_us >= ideal && now_us - ideal < frame_us() { ideal } else { now_us };
         self.frames_held_since = 0;
     }
 
     /// Когда этому клиенту пора ответить на отложенные `frame` (мс, вверх) —
     /// чтобы задача сервера проснулась к сроку, а не на следующем опросе.
     fn frames_due_at(&self) -> Option<u64> {
-        (!self.frames_due.is_empty()).then(|| self.frame_answered_us.saturating_add(frame_us()).div_ceil(1000))
+        let frames = (!self.frames_due.is_empty()).then(|| self.frame_answered_us.saturating_add(frame_us()).div_ceil(1000));
+        // И к сроку отложенного показа кадра без темпа (D7).
+        let held = self.wins.iter().filter(|win| win.dirty && win.hold_until_us != 0).map(|win| win.hold_until_us.div_ceil(1000)).min();
+        match (frames, held) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// `ping` клиенту и «не отвечает» столу (P4, 18.11.2026).
@@ -1933,8 +2187,28 @@ impl Client {
         }
     }
 
-    /// Свести поверхность окна с подповерхностями и показать на столе.
+    /// Показать окно ([`Self::present_now`]); показано — запомнить когда и
+    /// ответить `presented` его кадрам (D7).
     fn present(&mut self, index: usize) {
+        self.present_now(index);
+        let Some(win) = self.wins.get_mut(index) else {
+            return;
+        };
+        if win.dirty || win.open.is_none() {
+            return;
+        }
+        // Отложенный показ — по сетке кадров (опоздание задачи не копится).
+        let now_us = crate::time::uptime_ns() / 1000;
+        let due = win.hold_until_us;
+        win.presented_us = if due != 0 && now_us >= due && now_us - due < frame_us() { due } else { now_us };
+        win.hold_until_us = 0;
+        // `ZERO_COPY` (8): окно показывает буфер клиента без копии.
+        let (root, flags) = (win.surface, if win.adopted.is_some() { 8 } else { 0 });
+        self.feedback_presented(root, flags);
+    }
+
+    /// Свести поверхность окна с подповерхностями и показать на столе.
+    fn present_now(&mut self, index: usize) {
         let surface = self.wins[index].surface;
         let (width, height) = match self.objects.get(&surface) {
             Some(Obj::Surface(state)) => state.size().unwrap_or((0, 0)),
@@ -2306,6 +2580,10 @@ impl Client {
         if win.open.take().is_some() {
             close_slot(self.pid, win.slot);
         }
+        win.hold_until_us = 0;
+        let root = win.surface;
+        self.feedback_discard(|_, of| of == root);
+        let win = &mut self.wins[index];
         // Окна больше нет — и пикселей из буфера клиента тоже.
         win.stash = None;
         if let Some((buffer, _)) = win.adopted.take() {

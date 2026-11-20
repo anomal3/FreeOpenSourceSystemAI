@@ -14880,6 +14880,76 @@ VRAM для «LOCAL» в QEMU не проверить (SoftGpu не исполн
 готовых задач по процессору вместо одного замка планировщика (оставшиеся
 сайты `:1278` futex и `:1652` schedule).
 
+### D7 (ночь 20→21.11): VSync решает игра — FIFO с темпом, MAILBOX/IMMEDIATE без
+
+Требование Романа: частота кадров игры не привязана к монитору, если в игре
+VSync выключена (как в Windows: рисует столько, сколько успевает GPU, разрыв
+допустим). До D7 FIFO-темп D4 держал всех, а IMMEDIATE Mesa на нашем сервере
+не предлагала вовсе. Что сделано (`linux/wayland.rs`):
+
+- **Семантика Wayland.** FIFO (Vulkan FIFO, DXVK `SyncInterval 1`, GL swap
+  interval 1) просит `wl_surface.frame` — ответы по-прежнему с частотой
+  монитора (D4), теперь **по сетке кадров**: опоздание задачи сервера не
+  копится (d3dprobe с VSync в QEMU — ровно 60,0 к/с вместо 52–56).
+  Кадр с новым буфером **без** `frame` (Mesa WSI в MAILBOX/IMMEDIATE) или с
+  подсказкой `async` — «без темпа»: сменённый буфер возвращается клиенту
+  (`wl_buffer.release`) сразу при новом `commit`, а показ окна — не чаще кадра
+  монитора, последний кадр побеждает (отложенный показ — к сроку по сетке,
+  задача сервера просыпается к нему). `perf-diag`: `N unpaced held`.
+- **`wp_tearing_control_manager_v1`** (глобал 10): Mesa 25.0.7 даёт
+  `VK_PRESENT_MODE_IMMEDIATE_KHR` только при нём (MAILBOX и FIFO — всегда;
+  `wp_fifo_v1`/`wp_commit_timing_v1` не объявлены — FIFO Mesa идёт через
+  `frame`). `set_presentation_hint` — двойная буферизация с `commit`.
+- **`wp_presentation`** (глобал 11, часы `CLOCK_MONOTONIC`): `feedback` →
+  `presented` (время показа, шаг кадра, `seq`, флаг `ZERO_COPY` у показа без
+  копии) или `discarded`, если кадр сменили до показа / поверхность ушла.
+  По нему Mesa отвечает на `vkWaitForPresentKHR` (DXVK держит им кадры в
+  полёте).
+- В журнал — как клиент показывает (после 30 кадров подряд): `wayland :
+  #N surface S presents without vsync (tearing allowed, IMMEDIATE)` / `without
+  frame callbacks (MAILBOX)` / `with frame callbacks (FIFO, vsync)`. DXVK
+  пишет своё: `Present mode: VK_PRESENT_MODE_…`.
+- **`wlpace`** по умолчанию (`auto`) так и работает — руками ничего не
+  выключать; `wlpace off` — принудительно без темпа и для FIFO (замеры).
+- **Запуск без навязанной VSync**: `fossai-proton` и `tmnf` VSync не трогают —
+  решает настройка игры. Только по просьбе: `--vsync on|off` (первым ключом
+  после `--nvk/--lvp/--env`; у `tmnf` — где угодно) → `DXVK_CONFIG`
+  `dxgi.syncInterval`/`d3d9.presentInterval` (D3D9–12, d3d12 vkd3d — через dxgi
+  DXVK), `MESA_VK_WSI_PRESENT_MODE` (Vulkan), `vblank_mode` (OpenGL/EGL).
+- `gpu gametest -- present` (не входит в `all`): vkcube `--present_mode`
+  0/1/2 на lavapipe и NVK, затем d3dprobe D3D9 через DXVK на NVK с `--vsync
+  off` и `on`.
+
+Проверено в QEMU (21.11, живая флешка с Proton, `-smp 8`, монитор 60 Гц,
+`work\d7\d7-live.ps1`, `gpu gametest soft -- present`): vkcube на lavapipe —
+IMMEDIATE 81 к/с, MAILBOX 83, FIFO 57 (600 кадров вместе с запуском);
+d3dprobe на NVK SoftGpu с VSync off — DXVK `Present mode: IMMEDIATE`,
+**271,6 к/с** (было 61 при любой настройке); с VSync on — FIFO, **60,0 к/с**.
+vkcube на NVK SoftGpu падает в `demo_draw` (assert, `NOUVEAU_EXEC` → ENODEV)
+во всех трёх режимах — так же было и до D7 (журнал D4), к режимам показа не
+относится (DXVK на том же NVK работает).
+
+**Проверка на ПК (RTX 3060, монитор 144 Гц):**
+1. Терминал: `wlpace` — `on, 144.000 Hz … vsync-off clients (MAILBOX/IMMEDIATE)
+   are not paced`.
+2. `gpu gametest -- present` → в `LOG.TXT`: `bench: d3dprobe9-vsync-off avg …`
+   заметно выше 144, `d3dprobe9-vsync-on avg` около 144; строки `Present mode:
+   VK_PRESENT_MODE_IMMEDIATE_KHR` и `…FIFO_KHR`.
+3. TMNF из «Пуска»: в настройках графики игры (если есть) выключить вертикальную
+   синхронизацию — счётчик выше 144 (сколько тянет видеокарта); включить —
+   около 144. В журнале строка `presents without vsync` или `with frame
+   callbacks`.
+4. Если игра свою настройку не слушает: `tmnf --vsync off` (или `on`) из
+   терминала — `fossai-proton: vsync off (DXVK_CONFIG=…)`.
+5. `perfdiag now` при VSync off: `unpaced held` растёт, `paints` около
+   частоты монитора — стол не копирует лишних кадров.
+
+Осталось (TODO): `wp_fifo_v1`/`wp_commit_timing_v1` (FIFO без `frame` у
+Mesa 25.1+ и `FIFO_LATEST_READY`), настоящий разрыв (IMMEDIATE сейчас
+показывается со сборкой стола по сетке монитора, как MAILBOX), темп по
+монитору, на котором окно; задача сервера Wayland без приоритета — при
+полной загрузке ЦП в QEMU показ окна 40–50 раз/с вместо 60.
+
 ## Стенд: `Expect` сразу за ожиданием начала строки
 
 `Step::Expect` смотрит в уже прочитанное, а ожидание перед ним находит

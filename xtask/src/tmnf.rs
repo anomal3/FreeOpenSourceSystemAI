@@ -72,6 +72,10 @@ BENCH=\n\
 # Видеокарта (20.11): `--nvk` - DXVK на NVK без проверки, `--cpu` - кадры на\n\
 # процессоре всегда; по умолчанию - сам (см. ниже).\n\
 GPU=auto\n\
+# VSync (D7, 21.11): по умолчанию - как в настройках графики самой игры;\n\
+# `--vsync on|off` - навязать (DXVK_CONFIG, см. fossai-proton). Без VSync\n\
+# игра рисует быстрее монитора.\n\
+VS=()\n\
 while :; do\n\
     case \"$1\" in\n\
         --wined3d) MODE=; shift ;;\n\
@@ -84,6 +88,8 @@ while :; do\n\
         --native) SIZE=; shift ;;\n\
         --bench) BENCH=60; shift ;;\n\
         --bench=*) BENCH=${1#--bench=}; shift ;;\n\
+        --vsync) VS=(--vsync \"$2\"); shift 2 ;;\n\
+        --vsync=*) VS=(--vsync \"${1#--vsync=}\"); shift ;;\n\
         *) break ;;\n\
     esac\n\
 done\n\
@@ -108,7 +114,7 @@ A=()\n\
 R=dxvk; [ -z \"$MODE\" ] && R=wined3d; [ \"$GPU\" = nvk ] && R=dxvk-nvk\n\
 [ -n \"$BENCH\" ] && A+=(\"--bench=$BENCH,tmnf $R ${SIZE:-native}\")\n\
 echo \"tmnf: starting TmForever.exe ($R, ${SIZE:-native size})\"\n\
-exec /opt/debian/bin/bash $P \"${A[@]}\" \"$@\" $MODE \"$G/TmForever.exe\"\n";
+exec /opt/debian/bin/bash $P \"${VS[@]}\" \"${A[@]}\" \"$@\" $MODE \"$G/TmForever.exe\"\n";
 
 /// Собрать пакет.
 pub fn build() -> Result<()> {
