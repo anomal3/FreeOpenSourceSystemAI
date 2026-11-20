@@ -4149,7 +4149,7 @@ impl Compositor {
         self.icons.draw(back, band, dy);
         for window in self.windows.iter().filter(|window| !window.minimized && !self.hidden_by_flight(window)) {
             // Развёрнутое и полноэкранное окно — углами в углы экрана (20.11).
-            let r = if window.popup || window.fullscreen || window.is_maximized() { 0 } else { radius };
+            let r = if window.popup || window.fullscreen || (window.is_maximized() && !theme::is_mobile()) { 0 } else { radius };
             if !window.shaped {
                 self.drop_shadow(back, window.rect, band, dy, r);
             }
@@ -4346,7 +4346,7 @@ impl Compositor {
             // Углы всплывающего окна не скругляются: меню рисует свою рамку
             // прямоугольником, и срезанный угол вырезал бы её.
             // Развёрнутое и полноэкранное окно — углами в углы экрана (20.11).
-            let r = if window.popup || window.fullscreen || window.is_maximized() { 0 } else { radius };
+            let r = if window.popup || window.fullscreen || (window.is_maximized() && !theme::is_mobile()) { 0 } else { radius };
             // Диалог поверх всего — под ним стол затемнён на 40 % (макет 18).
             if dims(window.app) {
                 draw::blend_rect(back, Rect::new(band.x, band.y + dy, band.w, band.h), Color::rgb(0, 0, 0), 102);

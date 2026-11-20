@@ -499,6 +499,7 @@ pub struct Window {
 struct EdgeBook {
     w: u32,
     h: u32,
+    radius: u32,
     base: Vec<u32>,
     drawn: Vec<u32>,
     focused: bool,
@@ -506,7 +507,7 @@ struct EdgeBook {
 
 impl EdgeBook {
     const fn new() -> Self {
-        Self { w: 0, h: 0, base: Vec::new(), drawn: Vec::new(), focused: false }
+        Self { w: 0, h: 0, radius: 0, base: Vec::new(), drawn: Vec::new(), focused: false }
     }
 }
 
@@ -1231,7 +1232,7 @@ impl Window {
         let scale = self.scale;
         let title_h = Self::title_height(scale);
         let bounds = self.surface.bounds();
-        let radius = ctx.px(theme::R_WINDOW);
+        let radius = self.corner_radius();
         let bar = Rect::new(0, 0, bounds.w, title_h);
 
         // Полоса — прямоугольник без скругления, и это не упущение: верхние
@@ -1398,13 +1399,13 @@ impl Window {
         }
         let ctx = self.ctx();
         let p = ctx.palette;
-        let radius = ctx.px(theme::R_WINDOW);
+        let radius = self.corner_radius();
         let ink = if focused { p.line3 } else { p.line2 };
         let bounds = self.surface.bounds();
         let (w, h) = (bounds.w, bounds.h);
         let Self { surface, edge: book, .. } = &mut *self;
         book.focused = focused;
-        if (book.w, book.h) != (w, h) {
+        if (book.w, book.h, book.radius) != (w, h, radius) {
             let mut count = 0usize;
             edge_points(w, h, radius, |_, _| count += 1);
             book.base.clear();
@@ -1417,6 +1418,7 @@ impl Window {
             }
             book.w = w;
             book.h = h;
+            book.radius = radius;
         }
         // Первый проход: основа под каждой точкой — прежняя, если точка
         // хранит нарисованное обводкой, иначе её нынешнее значение.
@@ -1455,13 +1457,20 @@ impl Window {
         }
     }
 
+    /// Радиус углов окна: развёрнутое и полноэкранное стоят углами в углы
+    /// экрана, и скругления у них нет — ни в обводке, ни в кромке (20.11).
+    fn corner_radius(&self) -> u32 {
+        // Телефон — как был: там окна всегда во весь экран и со скруглением.
+        if self.fullscreen || (self.is_maximized() && !theme::is_mobile()) { 0 } else { self.ctx().px(theme::R_WINDOW) }
+    }
+
     /// Задевает ли прямоугольник поверхности место обводки (с запасом на
     /// углы): тогда после копии пикселей её надо положить заново.
     fn touches_edge(&self, rect: Rect) -> bool {
         if self.popup || self.frameless || rect.is_empty() {
             return false;
         }
-        let c = (self.ctx().px(theme::R_WINDOW) + 1) as i32;
+        let c = (self.corner_radius() + 1) as i32;
         let (w, h) = (self.surface.width() as i32, self.surface.height() as i32);
         rect.x < c || rect.y < c || rect.right() > w - c || rect.bottom() > h - c
     }
@@ -2581,12 +2590,15 @@ impl Window {
             }
             None => {
                 let previous = self.rect;
+                // «Развёрнуто» — до пересборки поверхности: она рисует
+                // украшения уже развёрнутого окна (углы без скругления).
+                self.restore = Some(previous);
                 if !self.resize(area.w, area.h) {
+                    self.restore = None;
                     return false;
                 }
                 self.rect.x = area.x;
                 self.rect.y = area.y;
-                self.restore = Some(previous);
                 true
             }
         }
