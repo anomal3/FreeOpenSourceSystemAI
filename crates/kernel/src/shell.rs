@@ -1912,7 +1912,7 @@ fn help() {
     sprintln!("  panic now     stop this machine with a kernel panic (to test the snapshot)");
     sprintln!("  pci           every device on the bus, with its identifiers");
     sprintln!("  acpidump SIG  an ACPI table (DSDT, FACP, APIC...) in hex to the kernel log");
-    sprintln!("  amd [vbios]   AMD graphics card: PCI, IP discovery or Polaris registers; vbios reads the ROM");
+    sprintln!("  amd [vbios|smc]  AMD graphics card: PCI, IP discovery or Polaris registers; vbios reads the ROM, smc the power controller");
     sprintln!("  ui [reset]    compositor state and frame timing; reset zeroes it");
     sprintln!("  tasks         scheduler state");
     sprintln!("  ls [path]     list a directory of the mounted filesystem");
@@ -2295,6 +2295,15 @@ fn outputs(argument: &str) {
 fn amd(argument: &str) {
     // `amd vbios` — прочитать VBIOS Polaris из ПЗУ карты (пишет индексные
     // регистры SMC, поэтому не на загрузке, а по команде).
+    // `amd smc` — состояние микроконтроллера питания Polaris (только чтение;
+    // пишет лишь индекс косвенного доступа).
+    if argument.trim() == "smc" {
+        for line in crate::display::amd::polaris_smc() {
+            sprintln!("  amd: {line}");
+            crate::kprintln!("  amdgpu      : smc: {line}");
+        }
+        return;
+    }
     if argument.trim() == "vbios" {
         for line in crate::display::amd::polaris_vbios() {
             sprintln!("  amd: {line}");

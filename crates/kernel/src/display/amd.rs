@@ -738,3 +738,97 @@ pub fn polaris_vbios() -> Vec<String> {
     lines.extend(atom_summary(&bios));
     lines
 }
+
+// --- SMC (микроконтроллер управления питанием), только чтение ---------------
+//
+// Этап P2, шаг 1. Источники — `smu7_smumgr.c` (`smu7_is_smc_ram_running`,
+// `smu7_send_msg_to_smc`), `polaris10_smumgr.c` (`polaris10_start_smu`),
+// `smu_7_1_3_d.h`/`smu_7_1_3_sh_mask.h`, `smu7_ppsmc.h` (Linux 6.12).
+//
+// Драйвер Linux запускает SMC (заливает образ в её SRAM) только если она ещё
+// **не** работает: ck_disable == 0 и счётчик команд >= 0x20100. После POST
+// прошивкой видеокарты (VBIOS `ASIC_Init`) она обычно уже запущена, и тогда
+// остаётся лишь слать ей сообщения (`LoadUcodes` и т.д.). Этот шаг как раз
+// выясняет, так ли это на живой карте, и ничего не пишет, кроме индекса
+// косвенного доступа `SMC_IND_INDEX_11`.
+
+const MM_SMC_MESSAGE_0: usize = 0x94;
+const MM_SMC_RESP_0: usize = 0x95;
+const MM_SMC_MSG_ARG_0: usize = 0xa4;
+const IX_SMC_SYSCON_RESET_CNTL: u32 = 0x8000_0000;
+const IX_SMC_SYSCON_CLOCK_CNTL_0: u32 = 0x8000_0004;
+const IX_SMC_SYSCON_MISC_CNTL: u32 = 0x8000_0010;
+const IX_SMC_SYSCON_MSG_ARG_0: u32 = 0x8000_0068;
+const IX_SMC_PC_C: u32 = 0x8000_0370;
+const IX_RCU_UC_EVENTS: u32 = 0xc000_0004;
+const IX_SMU_STATUS: u32 = 0xe000_3088;
+const IX_SMU_FIRMWARE: u32 = 0xe000_30a4;
+/// Слово в SRAM SMC, которое Linux ждёт после старта (`FIRMWARE_FLAGS`, бит 0
+/// `INTERRUPTS_ENABLED`).
+const IX_FIRMWARE_FLAGS: u32 = 0x3f000;
+/// Порог счётчика команд, с которого драйвер считает SMC запущенной.
+const SMC_PC_RUNNING: u32 = 0x20100;
+
+impl Window {
+    /// Прочитать регистр SMC по косвенному адресу `ix` — как
+    /// `cgs_read_ind_register(CGS_IND_REG__SMC, ix)`.
+    fn smc_read(&self, ix: u32) -> u32 {
+        self.wr(MM_SMC_IND_INDEX_11 * 4, ix);
+        self.rd(MM_SMC_IND_DATA_11 * 4)
+    }
+}
+
+/// `amd smc`: состояние SMC (микроконтроллера питания) Polaris. Только чтение.
+#[must_use]
+pub fn polaris_smc() -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some((base, _, _)) = *POLARIS_MMIO.lock() else {
+        lines.push(String::from("no Polaris card was probed"));
+        return lines;
+    };
+    let window = Window(base);
+    let reset = window.smc_read(IX_SMC_SYSCON_RESET_CNTL);
+    let clock = window.smc_read(IX_SMC_SYSCON_CLOCK_CNTL_0);
+    let misc = window.smc_read(IX_SMC_SYSCON_MISC_CNTL);
+    let pc = window.smc_read(IX_SMC_PC_C);
+    let events = window.smc_read(IX_RCU_UC_EVENTS);
+    let status = window.smc_read(IX_SMU_STATUS);
+    let firmware = window.smc_read(IX_SMU_FIRMWARE);
+    let flags = window.smc_read(IX_FIRMWARE_FLAGS);
+    let msg_arg = window.smc_read(IX_SMC_SYSCON_MSG_ARG_0);
+    lines.push(format!(
+        "SMC_SYSCON_RESET_CNTL {reset:#010x} (rst_reg {}), CLOCK_CNTL_0 {clock:#010x} (ck_disable {}), MISC_CNTL {misc:#010x}",
+        reset & 1,
+        clock & 1
+    ));
+    lines.push(format!("SMC_PC_C {pc:#010x} (running threshold {SMC_PC_RUNNING:#x})"));
+    // `smu7_is_smc_ram_running`.
+    let running = clock & 1 == 0 && pc >= SMC_PC_RUNNING;
+    lines.push(format!(
+        "SMC {}: Linux would {} the SMC firmware image",
+        if running { "is RUNNING" } else { "is NOT running" },
+        if running { "NOT upload" } else { "upload" }
+    ));
+    lines.push(format!(
+        "RCU_UC_EVENTS {events:#010x} (boot_seq_done {}, interrupts_enabled {}), SMU_STATUS {status:#010x} (done {}, pass {})",
+        (events >> 7) & 1,
+        (events >> 16) & 1,
+        status & 1,
+        (status >> 1) & 1
+    ));
+    lines.push(format!(
+        "SMU_FIRMWARE {firmware:#010x} (smu_mode {} = {}, smu_sel {}), FIRMWARE_FLAGS(SRAM 0x3f000) {flags:#010x} (interrupts_enabled {})",
+        (firmware >> 16) & 1,
+        if (firmware >> 16) & 1 == 0 { "non-protected" } else { "protected" },
+        (firmware >> 17) & 1,
+        flags & 1
+    ));
+    // Почтовый ящик: ответ 1 = OK, 0xFE = неизвестная команда, 0xFF = сбой.
+    lines.push(format!(
+        "mailbox: SMC_MESSAGE_0 {:#x}, SMC_RESP_0 {:#x}, SMC_MSG_ARG_0 {:#x}, SMC_SYSCON_MSG_ARG_0 {msg_arg:#x}",
+        window.rd(MM_SMC_MESSAGE_0 * 4),
+        window.rd(MM_SMC_RESP_0 * 4),
+        window.rd(MM_SMC_MSG_ARG_0 * 4)
+    ));
+    lines
+}
