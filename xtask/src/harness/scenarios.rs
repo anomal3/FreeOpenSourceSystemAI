@@ -15034,7 +15034,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("window      : 'Files' at 640,", 15_000),
             Step::Wait(1_500),
             // В нём — корень (с «Этого компьютера» — первый том).
-            Step::Key("ret"),
+            Step::Key("backspace"),
             Step::Await("files: / has ", 15_000),
             Step::Wait(1_000),
             // Наведение подсвечивает строку (ядро присылает движения без
