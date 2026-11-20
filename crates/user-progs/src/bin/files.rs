@@ -5245,6 +5245,16 @@ fn starting_dir(argument: Option<&str>) -> String {
 fn window_size(info: &SysInfo) -> (u32, u32) {
     // С 20.11 — общее правило каркаса: желаемый размер в точках макета,
     // умноженный на масштаб и ограниченный рабочей областью.
-    app::window_size(info, app::size::FILES)
+    // Но не уже, чем нужно, чтобы таблица со всеми столбцами встала рядом с
+    // боковой колонкой (240 + TABLE_MIN_W + поля, 850 точек макета): на 2560
+    // при 200 % доля в 56 % (20.11) прятала «Размер» за прокруткой вбок.
+    let (w, h) = app::window_size(info, app::size::FILES);
+    let scale = mini_ui::theme::geometry_scale_for(
+        user_abi::sysinfo_scale_choice(info.flags),
+        info.screen_w.max(1),
+        info.screen_h.max(1),
+    );
+    let fit = (850 * scale).min(info.screen_w * 85 / 100);
+    (w.max(fit), h)
 }
 

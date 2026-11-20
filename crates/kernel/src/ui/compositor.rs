@@ -1160,6 +1160,32 @@ impl Compositor {
             .map(|window| window.rect)
     }
 
+    /// Каскад (20.11): новое окно, чей угол пришёлся на угол уже открытого,
+    /// сдвигается вниз-вправо на высоту заголовка — как у Windows, чтобы
+    /// второе окно не легло ровно поверх первого. Сдвиг, выводящий окно за
+    /// рабочую область, не делается.
+    #[must_use]
+    pub fn cascade(&self, rect: Rect) -> Rect {
+        let step = Window::title_height(self.scale) as i32;
+        let work = self.primary_work();
+        let mut out = rect;
+        for _ in 0..16 {
+            let taken = self
+                .windows
+                .iter()
+                .any(|window| (window.rect.x - out.x).abs() < step / 2 && (window.rect.y - out.y).abs() < step / 2);
+            if !taken {
+                break;
+            }
+            let next = Rect::new(out.x + step, out.y + step, out.w, out.h);
+            if next.right() > work.right() || next.bottom() > work.bottom() {
+                break;
+            }
+            out = next;
+        }
+        out
+    }
+
     /// Как называется окно этой программы.
     ///
     /// Нужно журналу: у окна программы имя своё, и [`App::title`] о нём не

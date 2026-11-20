@@ -1771,7 +1771,12 @@ impl SettingsView {
         pass.limit = main.bottom() - bottom_h as i32;
 
         // ── Страница ─────────────────────────────────────────────────────────
-        let w = main.w.min(ctx.px(900));
+        // Карточки тянутся на всю колонку страницы, как у «Параметров»
+        // Windows 11, но не шире 1100 точек макета: на окне во весь
+        // развёрнутый экран 2560 строка в две тысячи точек отрывала бы
+        // значение справа от подписи слева (20.11: было 900, и на развёрнутом
+        // окне страница занимала левую треть).
+        let w = main.w.min(ctx.px(1100));
         let start = top - self.scroll;
         if self.search.is_empty() {
             self.page_body(pass, main.x, start, w);
@@ -1794,7 +1799,9 @@ impl SettingsView {
         let limit = pass.limit;
         pass.top = area.y;
         pass.limit = main.bottom();
-        self.draw_footer(pass, Rect::new(main.x, limit, main.w, bottom_h), &buttons);
+        // Кнопки — у правого края карточек, а не окна: на широком окне
+        // «Применить» иначе уезжала далеко от того, что применяет.
+        self.draw_footer(pass, Rect::new(main.x, limit, w, bottom_h), &buttons);
         pass.extent = extent;
         pass.limit = limit;
         top

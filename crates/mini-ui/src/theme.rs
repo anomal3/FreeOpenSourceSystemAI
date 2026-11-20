@@ -803,6 +803,38 @@ pub const fn geometry_scale_for(choice: u32, width: u32, height: u32) -> u32 {
     }
 }
 
+/// Какую долю рабочей области окно может занять при открытии, проценты
+/// `(ширина, высота)`.
+///
+/// Роман, 20.11, монитор 2560×1440: «Файлы» открывались на четыре пятых
+/// экрана, «Параметры» — почти во весь. Доля падает с ростом экрана, как у
+/// Windows: на 1280 окну нужно почти всё место (82 × 86 %), на 2560 и больше
+/// — чуть больше половины ширины и две трети высоты (56 × 66 %); между ними —
+/// по прямой.
+#[must_use]
+pub const fn window_share(screen_w: u32) -> (u32, u32) {
+    let s = if screen_w < 1280 {
+        1280
+    } else if screen_w > 2560 {
+        2560
+    } else {
+        screen_w
+    };
+    let t = s - 1280;
+    (82 - t * 26 / 1280, 86 - t * 20 / 1280)
+}
+
+/// Размер нового окна: желаемый в точках макета `logical`, умноженный на
+/// `scale`, но не больше [`window_share`] рабочей области `work` экрана
+/// шириной `screen_w`.
+#[must_use]
+pub const fn default_window(logical: (u32, u32), scale: u32, work: (u32, u32), screen_w: u32) -> (u32, u32) {
+    let (sw, sh) = window_share(screen_w);
+    let (max_w, max_h) = (work.0 * sw / 100, work.1 * sh / 100);
+    let (w, h) = (logical.0 * scale, logical.1 * scale);
+    (if w < max_w { w } else { max_w }, if h < max_h { h } else { max_h })
+}
+
 /// Выбор масштаба, запомненный в настройках (0 — авто, 1, 2). Действует он
 /// с запуска стола: стол перестраивать на ходу дорого и рискованно.
 static SCALE_CHOICE: AtomicU8 = AtomicU8::new(0);

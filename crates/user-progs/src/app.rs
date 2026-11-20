@@ -260,23 +260,20 @@ pub mod size {
     pub const CALC: (u32, u32) = (320, 460);
 }
 
-/// Больше какой доли рабочей области окно при открытии не бывает, проценты.
-const MAX_SHARE: u32 = 85;
-
 /// Размер окна при открытии: желаемый размер в точках макета `logical`
 /// (см. [`size`]), умноженный на множитель геометрии (тот же, что у рамки
-/// стола и шрифта), но не больше [`MAX_SHARE`] процентов рабочей области —
-/// экрана без панели задач и заголовка окна — и не меньше самого маленького
-/// окна каркаса.
+/// стола и шрифта), но не больше доли рабочей области — экрана без панели
+/// задач и заголовка окна — из [`theme::window_share`] (20.11: на 2560 было
+/// 85 %, и «Файлы» занимали почти весь экран; теперь 56 × 66 %, на 1280 —
+/// 82 × 86 %) и не меньше самого маленького окна каркаса.
 #[must_use]
 pub fn window_size(info: &SysInfo, logical: (u32, u32)) -> (u32, u32) {
     let (screen_w, screen_h) = (info.screen_w.max(1), info.screen_h.max(1));
     let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), screen_w, screen_h);
     let work_h = screen_h.saturating_sub((theme::PANEL_H + theme::TITLE_H) * scale);
-    let max_w = (screen_w * MAX_SHARE / 100).max(MIN_W.min(screen_w));
-    let max_h = (work_h * MAX_SHARE / 100).max(MIN_H.min(screen_h));
-    let width = (logical.0 * scale).clamp(MIN_W.min(max_w), max_w);
-    let height = (logical.1 * scale).clamp(MIN_H.min(max_h), max_h);
+    let (width, height) = theme::default_window(logical, scale, (screen_w, work_h), screen_w);
+    let width = width.max(MIN_W.min(screen_w));
+    let height = height.max(MIN_H.min(work_h.max(1)));
     (width, height)
 }
 

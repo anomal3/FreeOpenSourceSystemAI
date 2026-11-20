@@ -1122,7 +1122,12 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
     }
     // От угла рабочей области: панель может стоять сверху или слева (20.11).
     let p = desktop.primary_work();
-    layout_local(desktop, app).translate(p.x, p.y)
+    let rect = layout_local(desktop, app).translate(p.x, p.y);
+    // Окна-программы встают каскадом; диалоги — строго по центру.
+    match app {
+        App::Terminal | App::Settings => desktop.cascade(rect),
+        _ => rect,
+    }
 }
 
 /// [`layout`] в координатах основного монитора.
@@ -1132,7 +1137,6 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
     // выглядело бы как испорченная графика.
     let width = desktop.primary_work().w;
     let work = desktop.primary_work().h.max(1);
-    let margin = width / 24;
 
     // На телефоне окно занимает экран целиком — от строки состояния до
     // полоски жеста у низа (04.11, как у iPhone): дока под программой нет,
@@ -1146,34 +1150,29 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
         return desktop.mobile_rect();
     }
 
+    // Терминал и «Параметры» (20.11): размер в точках макета, умноженный на
+    // множитель, но не больше доли рабочей области ([`theme::window_share`]) —
+    // как окна программ ([`open_window`] берёт размер у программы, а та — у
+    // `app::window_size`). Прежние 5/8 × 3/4 и 7/8 × 9/10 экрана на
+    // 2560×1440 давали окна почти во весь экран. Окно — по центру.
+    let centered = |w: u32, h: u32| {
+        Rect::new(((width.saturating_sub(w)) / 2) as i32, ((work.saturating_sub(h)) / 2) as i32, w, h)
+    };
+    let screen_w = desktop.screen_width();
     match app {
-        App::Terminal | App::TermWin(_) => Rect::new(
-            margin as i32,
-            (work / 16) as i32,
-            width * 5 / 8,
-            work * 3 / 4,
-        ),
-        // «Параметры» — окно из двух колонок: разделы слева и настройки
-        // справа. Ширина считается от них, а не долей экрана: боковая колонка
-        // 240, содержимому нужно место под подпись, пояснение и элемент
-        // справа, а предпросмотр стола — ещё 340. Окно уже этой суммы
-        // показывало бы содержимое в щели между колонкой и краем.
+        App::Terminal | App::TermWin(_) => {
+            let (w, h) = theme::default_window((900, 560), desktop.scale(), (width, work), screen_w);
+            centered(w.max(320.min(width)), h.max(200.min(work)))
+        }
+        // «Параметры» — окно из двух колонок: разделы слева, страница справа.
+        // Высота — не меньше, чем нужно боковой колонке: прокрутки у неё нет,
+        // и все тринадцать разделов обязаны поместиться (520 точек макета).
         App::Settings => {
-            let w = (width * 7 / 8).clamp(560, width.saturating_sub(margin).max(560));
-            // Девять десятых рабочей области, а не четыре пятых, и это не вкус.
-            // С фазы 48 разделов восемь, и у трёх из них содержимое высокое:
-            // список часовых поясов, два поля сети с подписями, перечень томов.
-            // На прежней высоте нижняя строка каждого из них уезжала за край —
-            // клавиатурой она достижима (попадания считаются независимо от
-            // видимости), а мышью нет вовсе. Раздел, которым нельзя
-            // воспользоваться мышью, — это раздел, о котором никто не узнает.
-            let h = (work * 9 / 10).max(360);
-            Rect::new(
-                ((width.saturating_sub(w)) / 2) as i32,
-                (work / 24) as i32,
-                w,
-                h,
-            )
+            let scale = desktop.scale();
+            let (w, h) = theme::default_window((1100, 760), scale, (width, work), screen_w);
+            let w = w.max(560.min(width));
+            let h = h.max((520 * scale).min(work * 9 / 10)).max(360.min(work));
+            centered(w, h)
         }
         // Размер диалога — от его содержимого, а не доля экрана: текст и
         // кнопки те же на любом мониторе, и на 1920 окно в половину ширины
@@ -5979,12 +5978,13 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         let rect = if mobile {
             desktop.app_area()
         } else {
-            Rect::new(
+            // По центру; второе окно на том же месте — каскадом (20.11).
+            desktop.cascade(Rect::new(
                 p.x + ((screen.saturating_sub(w)) / 2) as i32,
                 p.y + ((work.saturating_sub(full_h)) / 2) as i32,
                 w,
                 full_h,
-            )
+            ))
         };
         let mut window =
             Window::program(app, rect, scale, title, pixels).ok_or(WindowError::NoMemory)?;

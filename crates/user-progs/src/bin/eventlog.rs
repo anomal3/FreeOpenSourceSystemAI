@@ -1001,6 +1001,6 @@ fn home_dir() -> String {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
-    let size = app::two_thirds(&info);
+    let size = app::window_size(&info, (960, 620));
     app::run(&SPEC, &info, size, |_, _| EventLog::new())
 }
