@@ -323,6 +323,28 @@ impl BtrfsFs {
         // Часов нет — ноль, а не выдуманная дата.
         let time = crate::time::now_unix().unwrap_or(0);
         let outcome = action(disk, active, time);
+        if let Err(err) = &outcome {
+            // Отказы тома (место, память, носитель, сорванная транзакция) - в
+            // журнал, чтобы они не терялись за кодом ошибки программы (20.11).
+            // «Имя занято» и «нет такого» - обычное дело (`mkdir -p`, `rm -f`).
+            static TOLD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+            let volume = matches!(
+                err,
+                btrfs::Error::NoSpace
+                    | btrfs::Error::NoMemory
+                    | btrfs::Error::Io
+                    | btrfs::Error::Corrupt
+                    | btrfs::Error::BadChecksum
+                    | btrfs::Error::Aborted
+            );
+            if volume && TOLD.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 20 {
+                let what = touched.iter().find_map(|item| match item {
+                    Touched::Entry(dir, name) => Some((*dir, *name)),
+                    _ => None,
+                });
+                crate::kprintln!("  btrfs       : change failed ({err}), entry {:?}, pending {}", what, guard.pending);
+            }
+        }
         // Замер 31.10: долгая правка держит замок тома для всех.
         let held = crate::time::uptime_ms().saturating_sub(got);
         let waited = got.saturating_sub(asked);
@@ -418,6 +440,18 @@ impl Inner {
             crate::kprintln!("  btrfs       : commit latency {took} ms, {ops} op(s)");
         }
         let generation = active.generation();
+        if let Err(err) = committed {
+            // Отказ фиксации раньше был молчаливым (20.11): пачка пропадала
+            // без следа, и тот, кто писал в созданный в ней каталог, получал
+            // `NotFound` (похоже, так оборвалась установка Proton у G).
+            let heap = crate::mm::heap::stats();
+            crate::kprintln!(
+                "  btrfs       : commit FAILED ({err}) after {ops} op(s): uncommitted changes dropped, writer reopened; heap {}/{} KiB used, {} dirty block(s)",
+                heap.used / 1024,
+                heap.size / 1024,
+                disk.dirty_blocks()
+            );
+        }
         if committed.is_err() {
             // Страницы, прочитанные из памяти писателя, могли описывать
             // незафиксированное — его больше нет.
@@ -425,6 +459,7 @@ impl Inner {
             match btrfs::Writer::open(disk, *first_lba) {
                 Ok(fresh) => *writer = Some(fresh),
                 Err(err) => {
+                    crate::kprintln!("  btrfs       : writer cannot reopen ({err}): the volume is read-only now");
                     *writer = None;
                     *refused = Some(convert(err));
                 }
@@ -445,6 +480,7 @@ impl Inner {
                     // Прежний читатель верен ровно до следующей фиксации:
                     // только она может положить новый узел или данные на место
                     // тех, что видит он. Значит, следующей не будет.
+                    crate::kprintln!("  btrfs       : reader cannot reopen after a commit ({err}): the volume is read-only now");
                     *writer = None;
                     *refused = Some(convert(err));
                     return Err(convert(err));
@@ -466,8 +502,18 @@ impl Inner {
                 Ok(())
             }
             Err(err) => {
-                self.writer = None;
-                self.refused = Some(convert(err));
+                // Читатель с писателем нужен только для чисел и проверки:
+                // читают и пишут через писателя. Бросить писателя здесь значило
+                // бы молча потерять всю незафиксированную пачку - и созданные
+                // в ней каталоги стали бы `NotFound` для того, кто в них пишет.
+                // Читатель остаётся отставшим; следующий вызов попробует снова.
+                static TOLD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+                if TOLD.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 5 {
+                    crate::kprintln!("  btrfs       : stale reader cannot reopen ({err}), {} uncommitted op(s)", self.pending);
+                }
+                if self.writer.is_none() {
+                    self.refused = Some(convert(err));
+                }
                 Err(convert(err))
             }
         }

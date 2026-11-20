@@ -73,9 +73,16 @@ fn budget(total: usize) -> usize {
 pub const HEAP_RESERVE: usize = 16 * 1024 * 1024;
 
 /// Хватает ли кучи ядра, чтобы кэшам расти.
+///
+/// Считается и то, до чего куча ещё может дорасти (`heap::grow`, 11.11): она
+/// стартует с 32 МиБ, и прежняя проверка одного свободного внутри текущей кучи
+/// (20.11) не давала кэшу блоков расти, как только в куче занято больше
+/// половины: куча так и не росла, а запись, не легшая в кэш, шла на носитель
+/// сразу 4-КиБ кусками.
 #[must_use]
 pub fn heap_roomy() -> bool {
-    crate::mm::heap::stats().free > HEAP_RESERVE
+    let headroom = crate::mm::heap_limit().saturating_sub(crate::mm::heap_size());
+    crate::mm::heap::stats().free.saturating_add(headroom) > HEAP_RESERVE
 }
 
 /// Сколько кадров держат кэши блоков (для диагностики).
