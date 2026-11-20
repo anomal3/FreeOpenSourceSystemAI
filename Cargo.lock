@@ -390,6 +390,7 @@ name = "disk"
 version = "0.8.0"
 dependencies = [
  "fatfs",
+ "flate2",
 ]
 
 [[package]]

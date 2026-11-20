@@ -49,3 +49,17 @@ pub fn build(path: &Path) -> Result<()> {
     bytes[511] = 0xAA;
     std::fs::write(path, bytes).map_err(|err| anyhow!("{}: {err}", path.display()))
 }
+
+/// Образ внешнего диска exFAT для сценария `exfat` (20.11): как SSD Романа —
+/// GPT, один раздел «Basic data» с сектора 2048, exFAT с меткой `Z7S`.
+/// Собран чужими `mkfs.exfat` и `exfat-fuse` (см. `disk::exfat::tests`), а не
+/// нашим писателем: читать надо то, что пишут другие.
+pub fn build_exfat(path: &Path) -> Result<()> {
+    use std::io::Read as _;
+    const IMAGE: &[u8] = include_bytes!("../../../crates/disk/testdata/exfat-z7s.img.gz");
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(IMAGE)
+        .read_to_end(&mut bytes)
+        .map_err(|err| anyhow!("образ exFAT не распаковывается: {err}"))?;
+    std::fs::write(path, bytes).map_err(|err| anyhow!("{}: {err}", path.display()))
+}

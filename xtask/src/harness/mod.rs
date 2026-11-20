@@ -783,12 +783,18 @@ fn execute(
     } else {
         String::new()
     };
-    extra.extend(
-        scenario
-            .extra
-            .iter()
-            .map(|s| s.replace("{wav}", &wav_arg).replace("{stick}", &stick_arg)),
-    );
+    // `{exfat}` — внешний диск exFAT (20.11), распакованный заново: гость в
+    // него пишет, а стенд потом проверяет его чужим `fsck.exfat`.
+    let exfat_arg = if scenario.extra.iter().any(|s| s.contains("{exfat}")) {
+        let image = paths::test_dir().join(format!("{prefix}-exfat.img"));
+        stick::build_exfat(&image)?;
+        crate::util::qemu_path(&image)?
+    } else {
+        String::new()
+    };
+    extra.extend(scenario.extra.iter().map(|s| {
+        s.replace("{wav}", &wav_arg).replace("{stick}", &stick_arg).replace("{exfat}", &exfat_arg)
+    }));
     // Лишние аргументы QEMU для всех сценариев разом, например `-accel whpx`:
     // гостевой код тогда исполняет настоящий процессор, а не эмулятор. Нужно
     // затем, что эмулятор прощает то, чего не прощает железо, — бит Accessed

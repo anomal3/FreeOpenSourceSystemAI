@@ -28,6 +28,7 @@
 //! [`crate::vfs::perm`].
 
 pub mod btrfsfs;
+pub mod exfatfs;
 pub mod ext2fs;
 pub mod fat;
 // Блокировки файлов (08.11.2026): fcntl F_*LK и flock для всех программ.
@@ -35,6 +36,7 @@ pub mod locks;
 pub mod ramvol;
 
 pub use btrfsfs::BtrfsFs;
+pub use exfatfs::ExfatFs;
 pub use ext2fs::Ext2Fs;
 pub use fat::Fat32;
 
@@ -228,11 +230,11 @@ pub fn mounted() -> Vec<(&'static str, &'static str)> {
 
 /// Точки монтирования с файловой системой и местом (всего, свободно; `None` —
 /// том о месте не знает): для «Этого компьютера» в «Файлах» (`SYS_MOUNTS`).
-pub fn mounted_space() -> Vec<(&'static str, &'static str, Option<(u64, u64)>)> {
+pub fn mounted_space() -> Vec<(&'static str, &'static str, Option<(u64, u64)>, Option<alloc::string::String>)> {
     // Спрашивать тома — после замка таблицы, как у [`space`].
     let volumes: Vec<(&'static str, Arc<dyn FileSystem>)> =
         MOUNTS.lock().iter().rev().map(|mount| (mount.prefix, Arc::clone(&mount.fs))).collect();
-    volumes.into_iter().map(|(prefix, fs)| (prefix, fs.name(), fs.space())).collect()
+    volumes.into_iter().map(|(prefix, fs)| (prefix, fs.name(), fs.space(), fs.label())).collect()
 }
 
 /// Место на томах, куда пишут: первая точка монтирования тома, всего и

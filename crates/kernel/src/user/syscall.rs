@@ -2182,11 +2182,13 @@ fn mounts(ptr: usize, len: usize) -> i64 {
     let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
     let mut written = 0usize;
     // Место — третьим и четвёртым полем (02.11), `-` — том о нём не знает.
-    for (point, kind, space) in crate::fs::mounted_space() {
+    // Метка тома — пятым (20.11, `Z7S` у exFAT-диска), если есть.
+    for (point, kind, space, label) in crate::fs::mounted_space() {
         let point = if point.is_empty() { "/" } else { point };
+        let label = label.map(|l| alloc::format!("\t{}", l.replace(['\t', '\n'], " "))).unwrap_or_default();
         let line = match space {
-            Some((total, free)) => alloc::format!("{point}\t{kind}\t{total}\t{free}\n"),
-            None => alloc::format!("{point}\t{kind}\t-\t-\n"),
+            Some((total, free)) => alloc::format!("{point}\t{kind}\t{total}\t{free}{label}\n"),
+            None => alloc::format!("{point}\t{kind}\t-\t-{label}\n"),
         };
         let bytes = line.as_bytes();
         if written + bytes.len() > len {

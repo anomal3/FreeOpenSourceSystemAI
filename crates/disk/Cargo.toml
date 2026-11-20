@@ -13,6 +13,9 @@ rust-version.workspace = true
 # посторонней реализацией FAT. Проверять свой писатель своим же читателем
 # бессмысленно — общая ошибка в понимании формата осталась бы незамеченной.
 fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
+# Образ exFAT для тестов (`testdata/exfat-z7s.img.gz`, собран `mkfs.exfat` и
+# `exfat-fuse`) хранится сжатым.
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 
 [lints]
 workspace = true

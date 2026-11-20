@@ -151,6 +151,8 @@ struct Row {
     volume: String,
     /// У тома — свободно, байт (`size` — всего); ноль у `size` — неизвестно.
     free: u64,
+    /// У тома — метка (`Z7S` у exFAT-диска, 20.11); пусто — нет.
+    label: String,
 }
 
 impl Row {
@@ -167,6 +169,7 @@ impl Row {
             mtime: entry.mtime,
             volume: String::new(),
             free: 0,
+            label: String::new(),
         }
     }
 
@@ -183,6 +186,7 @@ impl Row {
             mtime: 0,
             volume: kind.to_string(),
             free,
+            label: String::new(),
         }
     }
 
@@ -2578,7 +2582,7 @@ impl Files {
             let tx = icon.right() + ctx.px(14) as i32;
             let room = (card.right() - tx - ctx.px(14) as i32).max(0) as u32;
             let mut ty = card.y + ctx.px(14) as i32;
-            paint::text_clipped(ctx, s, Role::Body, tx, ty, room, &volume_title(&row.name), p.ink);
+            paint::text_clipped(ctx, s, Role::Body, tx, ty, room, &volume_title(&row.name, &row.label), p.ink);
             ty += ctx.px(24) as i32;
             if row.size > 0 {
                 let used = row.size.saturating_sub(row.free);
@@ -2866,7 +2870,7 @@ impl Files {
     /// Подпись плитки.
     fn tile_name(&self, row: &Row) -> String {
         if row.is_volume() {
-            return volume_title(&row.name);
+            return volume_title(&row.name, &row.label);
         }
         self.shown_name(row).to_string()
     }
@@ -3244,7 +3248,7 @@ impl Files {
             let room = (right - name_x).max(0) as u32;
             let ink = if selected { p.ink } else { p.ink2 };
             let shown = if row.is_volume() {
-                volume_title(&row.name)
+                volume_title(&row.name, &row.label)
             } else {
                 self.shown_name(row).to_string()
             };
@@ -3730,7 +3734,7 @@ fn places(home: &str) -> Vec<(Option<&'static str>, String)> {
     }
     out.push((Some("—"), String::from(COMPUTER)));
     out.push((None, String::from("/")));
-    for disk in ["/data", "/usb"] {
+    for disk in USB_PLACES {
         let mut info = Stat::default();
         if stat(disk, &mut info) >= 0 && info.kind == KIND_DIRECTORY {
             out.push((None, String::from(disk)));
@@ -3739,6 +3743,10 @@ fn places(home: &str) -> Vec<(Option<&'static str>, String)> {
     out.push((None, format!("{home}/.local/share/Trash/files")));
     out
 }
+
+/// Диски в боковой колонке под «Этим компьютером»: данные и съёмные
+/// (`/usb`, `/usb1`… — второй накопитель, например exFAT-диск, 20.11).
+const USB_PLACES: [&str; 5] = ["/data", "/usb", "/usb1", "/usb2", "/usb3"];
 
 /// Подпись места в боковой колонке (72g).
 fn place_title<'a>(path: &'a str, home: &str) -> &'a str {
@@ -3749,6 +3757,9 @@ fn place_title<'a>(path: &'a str, home: &str) -> &'a str {
         _ if path == COMPUTER => "Этот компьютер",
         _ if path == "/" => "Системный диск",
         _ if path == "/usb" => "USB-накопитель",
+        _ if path == "/usb1" => "USB-накопитель 2",
+        _ if path == "/usb2" => "USB-накопитель 3",
+        _ if path == "/usb3" => "USB-накопитель 4",
         _ if path == "/data" => "Данные",
         _ if path.ends_with("/.local/share/Trash/files") => "Корзина",
         "Desktop" => "Рабочий стол",
@@ -3769,7 +3780,7 @@ fn place_icon(path: &str, home: &str) -> &'static str {
     match path {
         COMPUTER => "place-this-pc",
         "/" => "place-system-disk",
-        "/usb" => "place-usb-stick",
+        "/usb" | "/usb1" | "/usb2" | "/usb3" => "place-usb-stick",
         "/data" => "place-local-disk",
         _ if path.ends_with("/.local/share/Trash/files") => {
             if dir_has_entries(path) { "place-trash-full" } else { "place-trash-empty" }
@@ -3778,11 +3789,14 @@ fn place_icon(path: &str, home: &str) -> &'static str {
     }
 }
 
-/// Имя тома на странице «Этот компьютер».
-fn volume_title(point: &str) -> String {
+/// Имя тома на странице «Этот компьютер»: у съёмного с меткой — как в
+/// Проводнике, «Z7S (/usb1)».
+fn volume_title(point: &str, label: &str) -> String {
     match point {
         "/" => String::from("Системный диск"),
         "/data" => String::from("Данные (/data)"),
+        other if !label.is_empty() => format!("{label} ({other})"),
+        other if other.starts_with("/usb") => format!("USB-накопитель ({other})"),
         other => other.to_string(),
     }
 }
@@ -3807,7 +3821,10 @@ fn list_volumes() -> Vec<Row> {
             let kind = fields.next()?;
             let total = fields.next().and_then(|value| value.parse().ok()).unwrap_or(0);
             let free = fields.next().and_then(|value| value.parse().ok()).unwrap_or(0);
-            Some(Row::volume(point, kind, total, free))
+            let mut row = Row::volume(point, kind, total, free);
+            // Пятое поле — метка тома (20.11).
+            row.label = fields.next().unwrap_or("").to_string();
+            Some(row)
         })
         .collect()
 }
@@ -3854,7 +3871,7 @@ fn place_slots(ctx: Ctx, side: Rect, home: &str) -> Vec<PlaceSlot> {
             0
         };
         // Диски — под «Этим компьютером», с отступом.
-        let indent = if matches!(path.as_str(), "/" | "/data" | "/usb") { ctx.px(16) } else { 0 };
+        let indent = if matches!(path.as_str(), "/" | "/data" | "/usb" | "/usb1" | "/usb2" | "/usb3") { ctx.px(16) } else { 0 };
         let rect = Rect::new(
             side.x + (padx + indent) as i32,
             y,

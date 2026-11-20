@@ -1373,6 +1373,23 @@ fn run_builtin(line: &str) -> bool {
                 stat(&path);
             }
         }
+        // `sum <путь>` — длина и CRC-32 файла (20.11: сверка файлов exFAT-диска
+        // со стендом); `cp <откуда> <куда>` — копия файла (пути без пробелов).
+        "sum" => {
+            if argument.is_empty() {
+                sprintln!("  usage: sum <path>");
+            } else if let Some(path) = human_path(argument) {
+                checksum(&path);
+            }
+        }
+        "cp" => match argument.split_once(' ') {
+            Some((from, to)) if !to.trim().is_empty() => {
+                if let (Some(from), Some(to)) = (human_path(from.trim()), human_path(to.trim())) {
+                    copy(&from, &to);
+                }
+            }
+            _ => sprintln!("  usage: cp <from> <to>"),
+        },
         "cat" => {
             if argument.is_empty() {
                 sprintln!("  usage: cat <path>");
@@ -3230,6 +3247,67 @@ fn stat(path: &str) {
             sprintln!("  age    {} s", now.saturating_sub(u64::from(meta.mtime)));
         }
     }
+}
+
+/// `sum`: длина файла и его CRC-32 (IEEE, как у `crc32` и zlib).
+fn checksum(path: &str) {
+    let node = match fs::resolve_as(user::session::credentials(), path, Access::READ) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return sprintln!("  {path}: {err}"),
+        None => return sprintln!("  no filesystem is mounted"),
+    };
+    let mut buf = alloc::vec![0u8; 1 << 20];
+    let mut crc = disk::crc32::Crc32::new();
+    let mut offset = 0u64;
+    loop {
+        match node.read_at(offset, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                crc.update(&buf[..n]);
+                offset += n as u64;
+            }
+            Err(err) => return sprintln!("  {path}: {err} at byte {offset}"),
+        }
+    }
+    sprintln!("  sum: {path} {offset} bytes crc32 {:08x}", crc.finish());
+}
+
+/// `cp`: копия файла кусками по мегабайту; цель создаётся или обрезается.
+fn copy(from: &str, to: &str) {
+    let cred = user::session::credentials();
+    let source = match fs::resolve_as(cred, from, Access::READ) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return sprintln!("  {from}: {err}"),
+        None => return sprintln!("  no filesystem is mounted"),
+    };
+    let target = match fs::resolve_as(cred, to, Access::WRITE) {
+        Some(Ok(node)) => node.truncate(0).map(|()| node),
+        Some(Err(VfsError::NotFound)) => match fs::create_as(cred, to, 0o644) {
+            Some(result) => result,
+            None => return sprintln!("  no filesystem is mounted"),
+        },
+        Some(Err(err)) => Err(err),
+        None => return sprintln!("  no filesystem is mounted"),
+    };
+    let target = match target {
+        Ok(node) => node,
+        Err(err) => return sprintln!("  {to}: {err}"),
+    };
+    let mut buf = alloc::vec![0u8; 1 << 20];
+    let mut offset = 0u64;
+    loop {
+        let n = match source.read_at(offset, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) => return sprintln!("  {from}: {err} at byte {offset}"),
+        };
+        if let Err(err) = target.write_at(offset, &buf[..n]) {
+            return sprintln!("  {to}: {err} at byte {offset}");
+        }
+        offset += n as u64;
+    }
+    fs::writeback_all();
+    sprintln!("  cp: {offset} bytes copied to {to}");
 }
 
 fn show(path: &str) {
