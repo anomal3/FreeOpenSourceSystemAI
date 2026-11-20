@@ -2438,6 +2438,10 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run -b /bin/run"),
             Step::Await("window      : 'Run' at", 30_000),
             Step::Await("run: ready", 15_000),
+            // Маленький диалог у кнопки «Пуск», только крестик (20.11).
+            Step::Await("desktop     : 'Run' is a dialog", 15_000),
+            Step::Await("desktop     : 'Run' placed at the Start button", 15_000),
+            Step::Await("run: window title 'Run | Выполнить'", 15_000),
             Step::Wait(800),
             Step::Shot("01-run"),
             Step::Repeat("backspace", 20),
@@ -2470,12 +2474,27 @@ pub const ALL: &[Scenario] = &[
             Step::Await("charmap: copied", 15_000),
             Step::Wait(800),
             Step::Shot("04-charmap-copied"),
+            // Знак не из растра интерфейса (→) в строке состояния — шрифтом
+            // TTF, а не «?» (20.11).
+            // Esc — очистить строку копирования; «/», Esc — очистить поиск.
+            Step::Key("esc"),
+            Step::Type("/"),
+            Step::Key("esc"),
+            Step::Type("/2192"),
+            Step::Await("charmap: search '2192' -> 1 match(es)", 15_000),
+            Step::Key("ret"),
+            Step::Await("charmap: added '→'", 15_000),
+            Step::Key("ctrl-c"),
+            Step::Await("charmap: copied '→'", 15_000),
+            Step::Wait(800),
+            Step::Shot("04b-charmap-arrow"),
             Step::Key("alt-f4"),
             Step::Await("charmap: closing on request", 15_000),
             Step::Wait(1_000),
             // ── «Сведения о системе»: раздел «Устройства», экспорт
             Step::Line("run -b /bin/sysinfo"),
             Step::Await("window      : 'System Information' at", 30_000),
+            Step::Await("sysinfo: window title 'System Information | Сведения о системе'", 15_000),
             Step::Wait(1_500),
             Step::Shot("05-sysinfo"),
             Step::Key("3"),
@@ -2483,7 +2502,8 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(800),
             Step::Shot("06-sysinfo-devices"),
             Step::Key("e"),
-            Step::Await("sysinfo: export to", 15_000),
+            // Записываемый /tmp или /root есть и без установки (20.11).
+            Step::Await("sysinfo.txt: ok", 15_000),
             Step::Key("alt-f4"),
             Step::Await("sysinfo: closing on request", 15_000),
             Step::Wait(1_000),
@@ -2498,6 +2518,7 @@ pub const ALL: &[Scenario] = &[
             Step::Shot("08-eventlog-warnings"),
             Step::Key("ctrl-s"),
             Step::Await("eventlog: report to", 15_000),
+            Step::Absent("(no writable folder?)"),
             Step::Key("alt-f4"),
             Step::Await("eventlog: closing on request", 15_000),
             Step::Wait(1_000),
@@ -2509,9 +2530,9 @@ pub const ALL: &[Scenario] = &[
             Step::Key("alt-f4"),
             Step::Await("services: closing on request", 15_000),
             Step::Wait(1_000),
-            // ── «Очистка диска»: файл в /tmp, очистить, файла нет
-            Step::Line("mkdir /tmp"),
-            Step::Wait(300),
+            // ── «Очистка диска»: файл в /tmp, очистить, файла нет. /tmp без
+            // установки — том в памяти (20.11), заводить его не нужно.
+            Step::Expect("ramvol      : 2048 MiB RAM volume at /tmp"),
             Step::Line("echo junk for the cleanup test > /tmp/junk.txt"),
             Step::Wait(500),
             Step::Line("run -b /bin/cleanmgr"),

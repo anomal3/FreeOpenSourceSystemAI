@@ -525,6 +525,13 @@ impl Compositor {
         }
     }
 
+    /// Кнопка «Пуск» на экране (20.11: у неё открывается «Выполнить»);
+    /// пусто — панели нет.
+    #[must_use]
+    pub fn start_button_rect(&self) -> Rect {
+        self.panel.as_ref().map_or(Rect::EMPTY, |panel| panel.home())
+    }
+
     /// «Пуск» под нынешнюю панель.
     fn new_menu(&self) -> Option<Menu> {
         let (home, cfg) = self.panel.as_ref().map_or((Rect::EMPTY, super::deskcfg::taskbar()), |panel| (panel.home(), panel.config()));

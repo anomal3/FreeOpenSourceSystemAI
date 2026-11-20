@@ -158,6 +158,22 @@ impl TtfFace {
         let x = cell.x + (cell.w as i32 - bitmap.width as i32) / 2;
         blit(s, bitmap, x, base + bitmap.top, ink, cell);
     }
+
+    /// Знак на базовой линии `baseline` от пера `x`; ответ — шаг пера.
+    fn draw_at(&self, s: &mut Surface, x: i32, baseline: i32, ch: char, px: u32, ink: Color, clip: Rect) -> i32 {
+        let mut cache = self.cache.borrow_mut();
+        if cache.len() > 1500 {
+            cache.clear();
+        }
+        let bitmap = cache.entry((u32::from(ch), px)).or_insert_with(|| self.font.rasterize(ch, px as f32));
+        blit(s, bitmap, x + bitmap.left, baseline + bitmap.top, ink, clip);
+        (bitmap.advance + 0.5) as i32
+    }
+}
+
+/// Есть ли знак в начертании интерфейса `face`.
+fn ui_has(face: &mini_ui::typeface::Face, ch: char) -> bool {
+    u16::try_from(u32::from(ch)).is_ok_and(|code| face.glyphs.iter().any(|glyph| glyph.code == code))
 }
 
 /// Положить растр по его покрытию, не выходя за `clip`.
@@ -425,6 +441,44 @@ impl CharMap {
         }
     }
 
+    /// Строка шрифтом интерфейса, а знаки, которых во вшитом растре нет
+    /// («ā», «→», «€»), — выбранным шрифтом TrueType (20.11: строка
+    /// состояния и имя знака показывали «?» вместо самого знака). `y` — верх
+    /// строки, как у [`paint::text`]. Ответ — ширина.
+    #[allow(clippy::too_many_arguments)]
+    fn text_mixed(&self, ctx: Ctx, s: &mut Surface, role: Role, x: i32, y: i32, room: u32, text: &str, ink: Color) -> u32 {
+        let Some(ttf) = &self.face else {
+            return paint::text_clipped(ctx, s, role, x, y, room, text, ink);
+        };
+        let face = ctx.face(role);
+        let baseline = y + i32::from(face.ascent);
+        // Кегль TTF — по высоте строчных букв интерфейса: ascent ≈ 0.8 em.
+        let px = (u32::from(face.ascent) * 5 / 4).max(8);
+        let clip = Rect::new(x, y, room, u32::from(face.line));
+        let end = x + room as i32;
+        let mut pen = x;
+        let mut run = String::new();
+        let flush = |run: &mut String, pen: &mut i32, s: &mut Surface| {
+            if !run.is_empty() && *pen < end {
+                *pen += paint::text_clipped(ctx, s, role, *pen, y, (end - *pen) as u32, run, ink) as i32;
+            }
+            run.clear();
+        };
+        for ch in text.chars() {
+            if ui_has(face, ch) || !ttf.has(ch) {
+                run.push(ch);
+            } else {
+                flush(&mut run, &mut pen, s);
+                if pen >= end {
+                    break;
+                }
+                pen += ttf.draw_at(s, pen, baseline, ch, px, ink, clip);
+            }
+        }
+        flush(&mut run, &mut pen, s);
+        (pen - x).max(0) as u32
+    }
+
     fn draw_toolbar(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
         let p = ctx.palette;
         let bar = kit::toolbar(ctx, s, plan.toolbar);
@@ -534,7 +588,7 @@ impl CharMap {
         let w = card.w;
         let line = i32::from(ctx.face(Role::Body).line);
         let name = name_of(ch);
-        y += draw_wrapped(ctx, s, card.x, y, w, &name, Role::Strong, p.ink);
+        y += self.draw_wrapped(ctx, s, card.x, y, w, &name, Role::Strong, p.ink);
         y += ctx.px(8) as i32;
         let code = u32::from(ch);
         let mut utf8 = [0u8; 4];
@@ -744,7 +798,19 @@ impl App for CharMap {
             (None, Some(ch)) => format!("{} · знаков: {} · U+{:04X} {}", self.font_name(), self.chars.len(), u32::from(*ch), name_of(*ch)),
             (None, None) => format!("{} · знаков: 0", self.font_name()),
         };
-        kit::status_bar(ctx, s, plan.status, &status);
+        // Полоса — общая, а фраза — своим путём: в ней сам знак, которого во
+        // вшитом растре может не быть.
+        kit::status_bar(ctx, s, plan.status, "");
+        if !plan.status.is_empty() {
+            let bar = ctx.on(theme::panel_bg());
+            let pad = ctx.px(14);
+            let y = paint::baseline(bar, Role::MonoSmall, plan.status);
+            self.text_mixed(bar, s, Role::MonoSmall, plan.status.x + pad as i32, y, plan.status.w.saturating_sub(pad * 2), &status, ctx.palette.ink4);
+        }
+    }
+
+    fn title(&self) -> Option<String> {
+        Some(String::from("Character Map\x1fТаблица символов"))
     }
 }
 
@@ -817,27 +883,31 @@ fn pretty_font(file: &str) -> String {
     out.replace("Deja Vu", "DejaVu").replace("I B M", "IBM")
 }
 
-/// Перенос по словам: сколько точек по высоте заняло.
-fn draw_wrapped(ctx: Ctx, s: &mut Surface, x: i32, y: i32, w: u32, text: &str, role: Role, ink: Color) -> i32 {
-    let face = ctx.face(role);
-    let line_h = i32::from(face.line);
-    let mut line = String::new();
-    let mut lines = 0;
-    for word in text.split(' ') {
-        let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-        if face.width(&candidate) > w && !line.is_empty() {
-            paint::text_clipped(ctx, s, role, x, y + lines * line_h, w, &line, ink);
-            lines += 1;
-            line = word.to_string();
-        } else {
-            line = candidate;
+impl CharMap {
+    /// Перенос по словам: сколько точек по высоте заняло. Знаки не из растра
+    /// интерфейса — шрифтом TrueType ([`CharMap::text_mixed`]).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_wrapped(&self, ctx: Ctx, s: &mut Surface, x: i32, y: i32, w: u32, text: &str, role: Role, ink: Color) -> i32 {
+        let face = ctx.face(role);
+        let line_h = i32::from(face.line);
+        let mut line = String::new();
+        let mut lines = 0;
+        for word in text.split(' ') {
+            let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+            if face.width(&candidate) > w && !line.is_empty() {
+                self.text_mixed(ctx, s, role, x, y + lines * line_h, w, &line, ink);
+                lines += 1;
+                line = word.to_string();
+            } else {
+                line = candidate;
+            }
         }
+        if !line.is_empty() {
+            self.text_mixed(ctx, s, role, x, y + lines * line_h, w, &line, ink);
+            lines += 1;
+        }
+        lines * line_h
     }
-    if !line.is_empty() {
-        paint::text_clipped(ctx, s, role, x, y + lines * line_h, w, &line, ink);
-        lines += 1;
-    }
-    lines * line_h
 }
 
 // ---------------------------------------------------------------------------

@@ -182,6 +182,14 @@ pub trait App {
     fn resizable(&self) -> bool {
         true
     }
+
+    /// Особый вид окна — флаги `user_abi::WIN_STYLE_*` сверх
+    /// [`App::resizable`] (20.11): `WIN_STYLE_DIALOG` — маленький диалог с
+    /// одним крестиком, `WIN_STYLE_AT_START` — открыть у кнопки «Пуск», как
+    /// «Выполнить» в Windows.
+    fn window_style(&self) -> u32 {
+        0
+    }
 }
 
 /// Самое маленькое окно, до которого программу каркаса можно сжать.
@@ -314,7 +322,11 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
     let mut app = make(Ctx::scaled(scale), area);
     // Тянуть за край и разворачивать — как всякое окно (Роман, 27.10:
     // «Файлы» нельзя было растянуть, а терминал можно).
-    if app.resizable() {
+    let style = app.window_style();
+    if style != 0 {
+        let resizable = if app.resizable() { user_abi::WIN_STYLE_RESIZABLE } else { 0 };
+        let _ = window.set_style(style | resizable);
+    } else if app.resizable() {
         let _ = window.set_resizable(true);
     }
 

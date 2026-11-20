@@ -1375,9 +1375,6 @@ fn clipboard(action: usize, ptr: usize, len: usize) -> i64 {
 
 /// `SYS_KERNEL_COMMAND`: исполнить команду оболочки ядра и отдать вывод.
 fn kernel_command(line: usize, len: usize, out: usize) -> i64 {
-    if !super::credentials().is_root() {
-        return ERR_PERMISSION;
-    }
     if len > 512 || !space::user_can(line, len, PageFlags::READ) {
         return ERR_BAD_ADDRESS;
     }
@@ -1389,6 +1386,11 @@ fn kernel_command(line: usize, len: usize, out: usize) -> i64 {
     let Ok(text) = core::str::from_utf8(bytes) else {
         return ERR_BAD_PATH;
     };
+    // Только root — кроме безвредного «version» (20.11): версию системы
+    // показывают «Сведения о системе» и обычному пользователю.
+    if !super::credentials().is_root() && text.trim() != "version" {
+        return ERR_PERMISSION;
+    }
     let text = alloc::string::String::from(text);
     let Some(output) = crate::shell::run_captured(&text) else {
         return ERR_AGAIN;
@@ -2324,7 +2326,8 @@ fn winstyle(id: i64, flags: usize) -> i64 {
     // Незнакомый флаг — отказ целиком, а не выполненная знакомая часть:
     // программа, попросившая больше, чем ядро умеет, должна узнать об этом
     // сразу, а не по окну, которое ведёт себя не так, как она рассчитывала.
-    if flags & !(user_abi::WIN_STYLE_RESIZABLE as usize) != 0 {
+    let known = user_abi::WIN_STYLE_RESIZABLE | user_abi::WIN_STYLE_DIALOG | user_abi::WIN_STYLE_AT_START;
+    if flags & !(known as usize) != 0 {
         return ERR_UNSUPPORTED;
     }
     match super::style_window(slot, flags as u32) {

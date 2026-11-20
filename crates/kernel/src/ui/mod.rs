@@ -6341,10 +6341,42 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
         let Some(window) = desktop.find(app) else {
             return Err(WindowError::NoWindow);
         };
-        let resizable = flags & user_abi::WIN_STYLE_RESIZABLE != 0;
+        // Диалог (20.11) размера не меняет, что бы ни просили вместе с ним.
+        let dialog = flags & user_abi::WIN_STYLE_DIALOG != 0;
+        let resizable = flags & user_abi::WIN_STYLE_RESIZABLE != 0 && !dialog;
+        if window.dialog != dialog {
+            window.dialog = dialog;
+            window.draw_decorations(focused);
+        }
         window.set_resizable(resizable, focused);
         if resizable {
             kprintln!("  desktop     : '{}' is resizable", name_of(desktop, app));
+        }
+        if dialog {
+            kprintln!("  desktop     : '{}' is a dialog", name_of(desktop, app));
+        }
+        // У кнопки «Пуск» (20.11, «Выполнить»): в угол рабочей области,
+        // ближайший к кнопке, — у нижней панели это левый нижний.
+        if flags & user_abi::WIN_STYLE_AT_START != 0 && !theme::is_mobile() {
+            let work = desktop.primary_work();
+            let home = desktop.start_button_rect();
+            let margin = (12 * desktop.scale()) as i32;
+            let placed = desktop.find(app).map(|window| {
+                let (w, h) = (window.rect.w as i32, window.rect.h as i32);
+                let (cx, cy) = if home.is_empty() { (work.x, work.bottom()) } else { (home.x + home.w as i32 / 2, home.y + home.h as i32 / 2) };
+                let left = cx - work.x <= work.right() - cx;
+                let top = cy - work.y < work.bottom() - cy;
+                let x = if left { work.x + margin } else { work.right() - margin - w };
+                let y = if top { work.y + margin } else { work.bottom() - margin - h };
+                window.rect.x = x.max(work.x);
+                window.rect.y = y.max(work.y);
+                (window.rect.x, window.rect.y)
+            });
+            if let Some((x, y)) = placed {
+                kprintln!("  desktop     : '{}' placed at the Start button {x},{y}", name_of(desktop, app));
+                log_window(desktop, app, focused);
+            }
+            desktop.repaint_all();
         }
         desktop.present();
         Ok(())

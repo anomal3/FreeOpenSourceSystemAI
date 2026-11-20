@@ -664,6 +664,10 @@ enum LeftRow {
 }
 
 impl App for EventLog {
+    fn title(&self) -> Option<String> {
+        Some(String::from("Event Log\x1fЖурнал событий"))
+    }
+
     fn key_with(&mut self, code: u32, mods: i32, latin: u32) -> bool {
         let ctrl = mods & user_abi::WIN_MOD_CTRL != 0;
         if code == CTRL_C || ctrl && (latin == 'c' as u32 || latin == 'C' as u32) {

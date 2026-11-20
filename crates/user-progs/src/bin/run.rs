@@ -54,7 +54,7 @@ const CTRL_U: u32 = 0x15;
 /// Сколько строк истории хранить.
 const HISTORY_MAX: usize = 20;
 /// Сколько подсказок показывать под полем.
-const SUGGEST_MAX: usize = 5;
+const SUGGEST_MAX: usize = 4;
 const MAX_INPUT: usize = 200;
 
 /// Имена Windows и короткие имена → команда FossAi.
@@ -98,6 +98,8 @@ struct Plan {
     ok: Rect,
     cancel: Rect,
     browse: Rect,
+    /// Сколько подсказок помещается в окне.
+    shown: usize,
 }
 
 impl Plan {
@@ -108,7 +110,11 @@ impl Plan {
         let fy = icon.bottom() + ctx.px(18) as i32;
         let field = Rect::new(area.x + pad + label_w as i32, fy, area.w.saturating_sub(pad as u32 * 2 + label_w), ctx.px(34));
         let row = ctx.px(28);
-        let suggest = Rect::new(field.x, field.bottom() + ctx.px(2) as i32, field.w, row * suggestions as u32 + if suggestions > 0 { ctx.px(8) } else { 0 });
+        // Подсказки ложатся поверх кнопок, но не за край окна (20.11: окно
+        // стало ниже, как «Выполнить» в Windows).
+        let room = (area.bottom() - ctx.px(8) as i32 - field.bottom() - ctx.px(2) as i32).max(0) as u32;
+        let shown = suggestions.min((room.saturating_sub(ctx.px(8)) / row) as usize);
+        let suggest = Rect::new(field.x, field.bottom() + ctx.px(2) as i32, field.w, row * shown as u32 + if shown > 0 { ctx.px(8) } else { 0 });
         let bh = ctx.px(34);
         let by = area.bottom() - pad - bh as i32;
         let bw = ctx.px(108);
@@ -117,7 +123,7 @@ impl Plan {
         let cancel = Rect::new(browse.x - gap - bw as i32, by, bw, bh);
         let ok = Rect::new(cancel.x - gap - bw as i32, by, bw, bh);
         let message = Rect::new(area.x + pad, field.bottom() + ctx.px(8) as i32, area.w.saturating_sub(pad as u32 * 2), ctx.px(24));
-        Self { icon, field, suggest, message, ok, cancel, browse }
+        Self { icon, field, suggest, message, ok, cancel, browse, shown }
     }
 }
 
@@ -314,9 +320,9 @@ impl App for Runner {
     fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let suggestions = self.suggestions();
         let plan = Plan::new(ctx, area, suggestions.len());
-        if !suggestions.is_empty() && plan.suggest.contains(x, y) {
+        if plan.shown > 0 && plan.suggest.contains(x, y) {
             let row = ((y - plan.suggest.y - ctx.px(4) as i32).max(0) as u32 / ctx.px(28)) as usize;
-            if let Some((name, _)) = suggestions.get(row) {
+            if let Some((name, _)) = suggestions.get(row).filter(|_| row < plan.shown) {
                 let name = name.clone();
                 self.set_input(&name);
                 self.open = false;
@@ -351,6 +357,15 @@ impl App for Runner {
 
     fn resizable(&self) -> bool {
         false
+    }
+
+    /// Маленький диалог у кнопки «Пуск», как в Windows: только крестик.
+    fn window_style(&self) -> u32 {
+        user_abi::WIN_STYLE_DIALOG | user_abi::WIN_STYLE_AT_START
+    }
+
+    fn title(&self) -> Option<String> {
+        Some(String::from("Run\x1fВыполнить"))
     }
 
     fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
@@ -406,10 +421,10 @@ impl App for Runner {
         paint::button(ctx, s, plan.browse, Weight::Normal, "Обзор…", false);
 
         // Подсказки — поверх всего.
-        if !suggestions.is_empty() {
+        if plan.shown > 0 {
             let card = mini_ui::kit::card(ctx, s, plan.suggest);
             let row_h = ctx.px(28);
-            for (index, (name, hint)) in suggestions.iter().enumerate() {
+            for (index, (name, hint)) in suggestions.iter().enumerate().take(plan.shown) {
                 let row = Rect::new(plan.suggest.x + ctx.px(4) as i32, plan.suggest.y + ctx.px(4) as i32 + (index as u32 * row_h) as i32, plan.suggest.w.saturating_sub(ctx.px(8)), row_h);
                 let on = self.chosen == Some(index);
                 paint::row(card, s, row, if on { paint::RowState::Selected } else { paint::RowState::Idle });
@@ -612,7 +627,9 @@ fn byte_at(text: &str, index: usize) -> usize {
 pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
     let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), info.screen_w.max(1), info.screen_h.max(1));
-    let width = (520 * scale).min(info.screen_w);
-    let height = (300 * scale).min(info.screen_h);
+    // Компактный диалог, как «Выполнить» в Windows (20.11: был 520×300 с
+    // пустым полем посередине); подсказки ложатся поверх кнопок.
+    let width = (480 * scale).min(info.screen_w);
+    let height = (250 * scale).min(info.screen_h);
     app::run(&SPEC, &info, (width, height), |_, _| Runner::new())
 }

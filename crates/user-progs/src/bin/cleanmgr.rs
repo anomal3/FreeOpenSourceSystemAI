@@ -157,6 +157,10 @@ impl Cleaner {
 }
 
 impl App for Cleaner {
+    fn title(&self) -> Option<String> {
+        Some(String::from("Disk Cleanup\x1fОчистка диска"))
+    }
+
     fn key(&mut self, code: u32) -> bool {
         match code {
             WIN_KEY_UP => self.selected = self.selected.saturating_sub(1),
@@ -323,9 +327,9 @@ fn size_text(bytes: u64) -> String {
     const MIB: u64 = KIB * 1024;
     const GIB: u64 = MIB * 1024;
     if bytes >= GIB {
-        format!("{}.{} ГБ", bytes / GIB, bytes % GIB * 10 / GIB)
+        format!("{},{} ГБ", bytes / GIB, bytes % GIB * 10 / GIB)
     } else if bytes >= MIB {
-        format!("{}.{} МБ", bytes / MIB, bytes % MIB * 10 / MIB)
+        format!("{},{} МБ", bytes / MIB, bytes % MIB * 10 / MIB)
     } else if bytes >= KIB {
         format!("{} КБ", bytes / KIB)
     } else {

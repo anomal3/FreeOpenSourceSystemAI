@@ -1089,6 +1089,9 @@ fn run_builtin(line: &str) -> bool {
         "history" => show_history(),
         "help" => help(),
         "uptime" => sprintln!("  {} ms, {} timer ticks", time::uptime_ms(), irq::ticks()),
+        // Версия и номер сборки (20.11): «Сведения о системе» спрашивают её
+        // через SYS_KERNEL_COMMAND — эта команда разрешена и не root.
+        "version" => sprintln!("FossAi {} {}", crate::version_text(), crate::arch::ARCH_NAME),
         "date" => date(),
         // `free` — привычное имя из Unix, и под ним команда стоит на быстрой
         // кнопке экранной клавиатуры телефона.

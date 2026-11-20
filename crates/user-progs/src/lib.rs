@@ -248,6 +248,13 @@ impl Window {
         insist(|| unsafe { syscall(user_abi::SYS_WINSTYLE, self.id as usize, flags, 0) })
     }
 
+    /// Сказать столу всё о виде окна разом ([`user_abi::SYS_WINSTYLE`]):
+    /// флаги `WIN_STYLE_*` (диалог, место у «Пуска»).
+    pub fn set_style(&self, flags: u32) -> i64 {
+        // SAFETY: аргументы — числа.
+        insist(|| unsafe { syscall(user_abi::SYS_WINSTYLE, self.id as usize, flags as usize, 0) })
+    }
+
     /// Сменить имя окна ([`user_abi::SYS_WINTITLE`]): кнопка на панели задач
     /// и миниатюра меняются вместе с ним. Имя длиннее
     /// [`user_abi::MAX_TITLE`] байт обрезается по границе знака — ядро такое

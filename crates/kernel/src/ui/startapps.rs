@@ -212,7 +212,7 @@ pub static ENTRIES: [Entry; 19] = [
         about: "знаки шрифтов системы, копирование",
         folder: "folder:utils",
         art: "",
-        icon: Icon::File,
+        icon: Icon::Keyboard,
         launch: Launch::Program("charmap", ""),
         needs: "",
         group: "/bin/charmap",
@@ -223,7 +223,7 @@ pub static ENTRIES: [Entry; 19] = [
         about: "процессор, память, устройства, диски, сеть",
         folder: "folder:utils",
         art: "",
-        icon: Icon::Info,
+        icon: Icon::Computer,
         launch: Launch::Program("sysinfo", ""),
         needs: "",
         group: "/bin/sysinfo",
@@ -307,6 +307,12 @@ pub fn folder(key: &str) -> Option<&'static Folder> {
 /// Значок строки: картинка макета, если есть, иначе знак набора на плитке.
 #[must_use]
 pub fn art(entry: &Entry) -> super::appicon::Art {
+    // Системные утилиты (20.11) — тем же значком, что их окна на панели.
+    if let Launch::Program(program, "") = entry.launch {
+        if let Some(art) = super::appicon::tool_art(program) {
+            return art;
+        }
+    }
     match super::appicon::design(entry.art) {
         Some(image) => super::appicon::Art::Image(image),
         None => super::appicon::Art::glyph(entry.icon),

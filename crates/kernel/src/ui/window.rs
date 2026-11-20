@@ -483,6 +483,9 @@ pub struct Window {
     /// Последний размер программа выбрала сама, а не ответила им на просьбу
     /// стола (см. [`Self::replace_pixels`]).
     self_sized: bool,
+    /// Маленький диалог программы (20.11, `user_abi::WIN_STYLE_DIALOG`,
+    /// «Выполнить»): в заголовке только крестик.
+    pub dialog: bool,
 }
 
 /// Учёт обводки окна (20.11).
@@ -731,6 +734,7 @@ impl Window {
             full_from: None,
             full_size: (0, 0),
             self_sized: false,
+            dialog: false,
         }
     }
 
@@ -1044,7 +1048,13 @@ impl Window {
 
     /// Самая левая кнопка заголовка: до неё доходит подпись.
     fn leftmost_button(&self) -> Rect {
-        if self.has_keyboard_button() { self.keyboard_button() } else { self.minimize_button() }
+        if self.has_keyboard_button() {
+            self.keyboard_button()
+        } else if self.dialog {
+            self.close_button()
+        } else {
+            self.minimize_button()
+        }
     }
 
     /// Нажать или отжать кнопку клавиатуры: перерисовать кнопки.
@@ -1119,11 +1129,12 @@ impl Window {
             }
         }
         // На телефоне это «на весь экран» (05.11): окно встаёт от края до края,
-        // окно программы получает просьбу заполнить его.
-        if self.maximize_button().contains(local.0, local.1) {
+        // окно программы получает просьбу заполнить его. У диалога этих
+        // кнопок нет (20.11): там просто заголовок.
+        if !self.dialog && self.maximize_button().contains(local.0, local.1) {
             return Some(Hit::Maximize);
         }
-        if self.minimize_button().contains(local.0, local.1) {
+        if !self.dialog && self.minimize_button().contains(local.0, local.1) {
             return Some(Hit::Minimize);
         }
         if self.has_keyboard_button() && self.keyboard_button().contains(local.0, local.1) {
@@ -1352,11 +1363,14 @@ impl Window {
         let restore_icon = if self.restore.is_some() { Icon::Restore } else { Icon::Maximize };
         let glyph = ctx.px(10);
         let keyboard = self.has_keyboard_button().then(|| (self.keyboard_button(), Icon::Keyboard, Hit::Keyboard));
-        for (button, icon, hit) in keyboard.into_iter().chain([
-            (self.minimize_button(), Icon::Minimize, Hit::Minimize),
-            (self.maximize_button(), restore_icon, Hit::Maximize),
-            (self.close_button(), Icon::Close, Hit::Close),
-        ]) {
+        // Диалог (20.11) — один крестик, как «Выполнить» в Windows.
+        let sizing = (!self.dialog).then(|| {
+            [
+                (self.minimize_button(), Icon::Minimize, Hit::Minimize),
+                (self.maximize_button(), restore_icon, Hit::Maximize),
+            ]
+        });
+        for (button, icon, hit) in keyboard.into_iter().chain(sizing.into_iter().flatten()).chain([(self.close_button(), Icon::Close, Hit::Close)]) {
             let hot = self.hot == Some(hit);
             // Нажатая кнопка клавиатуры — цветом акцента: видно, что
             // клавиатура открыта для этого окна.

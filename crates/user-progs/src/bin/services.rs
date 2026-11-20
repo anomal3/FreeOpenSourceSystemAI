@@ -114,7 +114,9 @@ impl Plan {
         let start = button("Запустить");
         let stop = button("Остановить");
         let refresh = button("Обновить");
-        let log_h = ctx.px(LOG_H).min(frame.body.h / 2);
+        // Журнал — не больше трети: список служб важнее (20.11: в окне
+        // 1280×720 при журнале в половину четвёртая служба не помещалась).
+        let log_h = ctx.px(LOG_H).min(frame.body.h / 3);
         let log = Rect::new(frame.body.x, frame.body.bottom() - log_h as i32, frame.body.w, log_h);
         let header_h = u32::from(ctx.face(Role::MonoCaps).line) + ctx.px(14);
         let header = Rect::new(frame.body.x, frame.body.y, frame.body.w, header_h);
@@ -148,11 +150,23 @@ struct Services {
     note: Option<String>,
     root: bool,
     log_error: Option<String>,
+    /// Первая видимая строка списка: служб бывает больше, чем строк в окне.
+    top: core::cell::Cell<usize>,
+    /// Сколько строк помещалось при последней отрисовке.
+    visible: core::cell::Cell<usize>,
 }
 
 impl Services {
     fn new() -> Self {
-        let mut window = Self { services: Vec::new(), selected: 0, note: None, root: user_progs::uid() == 0, log_error: None };
+        let mut window = Self {
+            services: Vec::new(),
+            selected: 0,
+            note: None,
+            root: user_progs::uid() == 0,
+            log_error: None,
+            top: core::cell::Cell::new(0),
+            visible: core::cell::Cell::new(1),
+        };
         window.refresh();
         let running = window.services.iter().filter(|service| service.state == State::Running).count();
         println(&format!("services: {} described, {running} running", window.services.len()));
@@ -199,6 +213,20 @@ impl Services {
         }
         self.services = out;
         self.selected = self.selected.min(self.services.len().saturating_sub(1));
+    }
+
+    /// Первая видимая строка так, чтобы выбранная была видна, при `visible`
+    /// строках в окне.
+    fn view_top(&self, visible: usize) -> usize {
+        let visible = visible.max(1);
+        let max_top = self.services.len().saturating_sub(visible);
+        let mut top = self.top.get().min(max_top);
+        if self.selected < top {
+            top = self.selected;
+        } else if self.selected >= top + visible {
+            top = self.selected + 1 - visible;
+        }
+        top
     }
 
     fn restart(&mut self) {
@@ -273,7 +301,7 @@ impl App for Services {
         } else if plan.refresh.contains(x, y) {
             self.refresh();
         } else if plan.list.contains(x, y) {
-            let index = ((y - plan.list.y) as u32 / ctx.px(ROW_H)) as usize;
+            let index = self.top.get() + ((y - plan.list.y) as u32 / ctx.px(ROW_H)) as usize;
             if index < self.services.len() {
                 self.selected = index;
             }
@@ -281,6 +309,20 @@ impl App for Services {
             return false;
         }
         true
+    }
+
+    fn wheel(&mut self, clicks: i32) -> bool {
+        let visible = self.visible.get().max(1);
+        let max_top = self.services.len().saturating_sub(visible);
+        let top = if clicks > 0 { self.top.get().saturating_sub(1) } else { (self.top.get() + 1).min(max_top) };
+        self.top.set(top);
+        // Выбор остаётся в видимой части, как в списке Windows.
+        self.selected = self.selected.clamp(top, (top + visible - 1).min(self.services.len().saturating_sub(1)).max(top));
+        true
+    }
+
+    fn title(&self) -> Option<String> {
+        Some(String::from("Services\x1fСлужбы"))
     }
 
     fn tick(&mut self, _info: &SysInfo) -> bool {
@@ -308,8 +350,13 @@ impl App for Services {
         draw::hline(s, plan.header.x + ctx.px(12) as i32, plan.header.bottom() - 1, plan.header.w.saturating_sub(ctx.px(24)), p.line.color, p.line.alpha);
         let row_h = ctx.px(ROW_H);
         let g = ctx.px(16);
-        for (index, service) in self.services.iter().enumerate().take((plan.list.h / row_h) as usize) {
-            let row = Rect::new(plan.list.x + ctx.px(8) as i32, plan.list.y + (index as u32 * row_h) as i32, plan.list.w.saturating_sub(ctx.px(16)), row_h.saturating_sub(ctx.px(2)));
+        let visible = ((plan.list.h / row_h) as usize).max(1);
+        let top = self.view_top(visible);
+        self.visible.set(visible);
+        self.top.set(top);
+        for (index, service) in self.services.iter().enumerate().skip(top).take(visible) {
+            let at = (index - top) as u32;
+            let row = Rect::new(plan.list.x + ctx.px(8) as i32, plan.list.y + (at * row_h) as i32, plan.list.w.saturating_sub(ctx.px(16)), row_h.saturating_sub(ctx.px(2)));
             let on = index == self.selected;
             if on {
                 paint::row(ctx, s, row, paint::RowState::Selected);
@@ -327,6 +374,15 @@ impl App for Services {
         }
         if self.services.is_empty() {
             paint::text(ctx, s, Role::Body, columns[0].x, plan.list.y + ctx.px(12) as i32, "/etc/services пуст или не найден", p.ink4);
+        }
+        // Полоса прокрутки — когда служб больше, чем строк.
+        if self.services.len() > visible {
+            let track = Rect::new(plan.list.right() - ctx.px(8) as i32, plan.list.y, ctx.px(4), (visible as u32 * row_h).min(plan.list.h));
+            draw::rounded(s, track, ctx.px(2), ctx.flat(p.sunk), 255);
+            let thumb_h = ((track.h as usize * visible / self.services.len()) as u32).max(ctx.px(20)).min(track.h);
+            let max_top = self.services.len() - visible;
+            let thumb_y = track.y + ((track.h - thumb_h) as usize * top.min(max_top) / max_top.max(1)) as i32;
+            draw::rounded(s, Rect::new(track.x, thumb_y, track.w, thumb_h), ctx.px(2), p.ink4, 255);
         }
 
         // Журнал выбранной службы.
@@ -424,6 +480,6 @@ fn read_text(path: &str) -> Option<String> {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
-    let (w, h) = app::two_thirds(&info);
-    app::run(&SPEC, &info, (w, h * 4 / 5), |_, _| Services::new())
+    let size = app::window_size(&info, (900, 560));
+    app::run(&SPEC, &info, size, |_, _| Services::new())
 }

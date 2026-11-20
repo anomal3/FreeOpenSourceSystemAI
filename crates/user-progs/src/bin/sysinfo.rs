@@ -228,6 +228,10 @@ impl App for Info {
         true
     }
 
+    fn title(&self) -> Option<String> {
+        Some(String::from("System Information\x1fСведения о системе"))
+    }
+
     fn tick(&mut self, _info: &SysInfo) -> bool {
         if matches!(self.section, Section::Summary | Section::Hardware | Section::Services) {
             self.reload();
@@ -309,14 +313,15 @@ fn collect(section: Section) -> Vec<Row> {
     match section {
         Section::Summary => {
             rows.push(item("Имя ОС", "FossAi"));
-            rows.push(item("Версия", version().unwrap_or_else(|| String::from("нет в журнале (root: dmesg build)"))));
+            rows.push(item("Версия", version().unwrap_or_else(|| String::from("неизвестна"))));
             rows.push(item("Архитектура", if cfg!(target_arch = "aarch64") { "AArch64" } else { "x86-64" }));
             rows.push(item("Имя компьютера", read_text("/etc/hostname", 256).map_or_else(|| String::from("freeos"), |text| text.trim().to_string())));
             rows.push(item("Пользователь", user_name()));
             if let Some(info) = &info {
                 rows.push(item("Процессоры", format!("{}", info.cpus)));
-                rows.push(item("Оперативная память", format!("{} МиБ", info.frames_total * 4 / 1024)));
-                rows.push(item("Свободно памяти", format!("{} МиБ", info.frames_free * 4 / 1024)));
+                // SysInfo — в байтах (договор user_abi), а не в кадрах.
+                rows.push(item("Оперативная память", size_text(info.frames_total)));
+                rows.push(item("Свободно памяти", size_text(info.frames_free)));
                 rows.push(item("Экран", format!("{} × {}", info.screen_w, info.screen_h)));
                 rows.push(item("Время работы", uptime_text(info.uptime_ms)));
             }
@@ -333,8 +338,8 @@ fn collect(section: Section) -> Vec<Row> {
                 rows.push(item("Логических процессоров", format!("{}", info.cpus)));
                 rows.push(item("Тиков таймера", format!("{}", info.ticks)));
                 rows.push(group("Память"));
-                rows.push(item("Всего", format!("{} МиБ ({} кадров)", info.frames_total * 4 / 1024, info.frames_total)));
-                rows.push(item("Свободно", format!("{} МиБ", info.frames_free * 4 / 1024)));
+                rows.push(item("Всего", format!("{} ({} кадров по 4 КиБ)", size_text(info.frames_total), info.frames_total / 4096)));
+                rows.push(item("Свободно", size_text(info.frames_free)));
                 rows.push(item("Куча ядра", format!("{} КиБ, свободно {} КиБ", info.heap_size / 1024, info.heap_free / 1024)));
                 rows.push(item("Окно DMA", format!("{} КиБ, занято {} КиБ", info.dma_total / 1024, info.dma_used / 1024)));
                 rows.push(group("Графика и ввод"));
@@ -494,8 +499,17 @@ fn section_text(section: Section, rows: &[Row]) -> String {
     out
 }
 
+/// Версия системы: `0.8.970 x86_64` (20.11 — команда ядра `version`, она
+/// открыта и не root; раньше — строка `build` из журнала, которой в кольце
+/// журнала к этому времени уже не было). Запас — `/os-release` образа.
 fn version() -> Option<String> {
-    kernel_lines("dmesg build").iter().rev().find_map(|line| line.split_once("FossAi ").map(|(_, rest)| rest.trim().to_string()))
+    // Архитектура — своей строкой ниже, здесь только номер.
+    let from_kernel = kernel_lines("version")
+        .into_iter()
+        .find_map(|line| line.strip_prefix("FossAi ").and_then(|rest| rest.split_whitespace().next()).map(String::from));
+    from_kernel.or_else(|| {
+        read_text("/os-release", 4096)?.lines().find_map(|line| line.trim().strip_prefix("version=").map(|value| value.trim().to_string()))
+    })
 }
 
 /// Строки команды оболочки ядра; пусто, если она недоступна (не root).
@@ -559,7 +573,7 @@ fn uptime_text(ms: u64) -> String {
 fn size_text(bytes: u64) -> String {
     const GIB: u64 = 1024 * 1024 * 1024;
     if bytes >= GIB {
-        format!("{}.{} ГиБ", bytes / GIB, bytes % GIB * 10 / GIB)
+        format!("{},{} ГиБ", bytes / GIB, bytes % GIB * 10 / GIB)
     } else {
         format!("{} МиБ", bytes / (1024 * 1024))
     }
