@@ -63,6 +63,8 @@ pub trait SoftHost: Send + Sync {
     fn write_phys(&self, phys: u64, data: &[u8]);
     /// Монотонное время, нс (PTIMER).
     fn now_ns(&self) -> u64;
+    /// Строка в журнал хозяина (ядро — `kprintln`): почему убит канал и т. п.
+    fn log(&self, _line: &str) {}
 }
 
 /// Хозяин из кучи — для тестов на хосте (и тестов WP-C/WP-D).
@@ -1112,7 +1114,9 @@ impl SoftGpu {
             };
             if let Err(why) = res {
                 ex.stats.kills += 1;
-                c.killed = Some(format!("chid {} GP_GET {}: {}", c.chid, get, why));
+                let reason = format!("chid {} GP_GET {}: {}", c.chid, get, why);
+                self.host.log(&format!("softgpu: channel killed - {reason}"));
+                c.killed = Some(reason);
                 return;
             }
             ex.vram.w32(c.userd + gpfifo::USERD_GP_GET, (get + 1) & gpfifo::IB_MAX);

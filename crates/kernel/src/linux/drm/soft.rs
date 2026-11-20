@@ -63,6 +63,10 @@ impl SoftHost for KernelHost {
     fn now_ns(&self) -> u64 {
         crate::time::uptime_ns()
     }
+
+    fn log(&self, line: &str) {
+        crate::kprintln!("nvgpu: {line}");
+    }
 }
 
 /// Новый `SoftGpu` (RTX 3060 по `GpuInfo::ga106`, 256 МиБ «видеопамяти»).
