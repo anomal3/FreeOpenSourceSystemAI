@@ -264,6 +264,92 @@ struct Scheduler {
 
 static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 
+/// Ближайший срок среди ждущих со сроком, мс (`Scheduler::wake_expired`).
+/// Пишется только под замком `SCHED`: при постановке срока — минимум, при
+/// обходе — заново. Ноль — «обойти при первом же переключении».
+static NEXT_DUE: AtomicU64 = AtomicU64::new(0);
+
+/// Задача встала в ожидание со сроком `at` (мс); звать под замком `SCHED`.
+fn note_deadline(at: u64) {
+    NEXT_DUE.fetch_min(at, Ordering::Relaxed);
+}
+
+/// Ожидание замка планировщика (20.11, `perf-diag`): сколько раз замок
+/// оказался занят и сколько наносекунд ждали. На игре с 16 процессорами
+/// через него идут все переключения, futex и пробуждения.
+static SCHED_WAITS: AtomicU64 = AtomicU64::new(0);
+static SCHED_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// `SCHED.lock()` со счётом ожидания: свободный замок — без часов.
+#[track_caller]
+fn sched_lock() -> crate::sync::SpinGuard<'static, Scheduler> {
+    if !SCHED.is_locked() {
+        return SCHED.lock();
+    }
+    let since = crate::time::uptime_ns();
+    let guard = SCHED.lock();
+    let waited = crate::time::uptime_ns().saturating_sub(since);
+    SCHED_WAITS.fetch_add(1, Ordering::Relaxed);
+    SCHED_WAIT_NS.fetch_add(waited, Ordering::Relaxed);
+    note_wait_site(core::panic::Location::caller(), waited);
+    guard
+}
+
+/// Кто ждал замок планировщика дольше всех (место вызова, раз, нс) — для
+/// `perf-diag`: 16 ячеек, место ищется линейно; не нашлось ячейки — в счёт
+/// не идёт. Пишется под замком (вызывающий его уже взял).
+static WAIT_SITES: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+static WAIT_SITE_COUNT: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+static WAIT_SITE_NS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+fn note_wait_site(site: &'static core::panic::Location<'static>, waited: u64) {
+    let key = core::ptr::from_ref(site).addr();
+    for (index, cell) in WAIT_SITES.iter().enumerate() {
+        let now = cell.load(Ordering::Relaxed);
+        if now == 0 {
+            cell.store(key, Ordering::Relaxed);
+        } else if now != key {
+            continue;
+        }
+        WAIT_SITE_COUNT[index].fetch_add(1, Ordering::Relaxed);
+        WAIT_SITE_NS[index].fetch_add(waited, Ordering::Relaxed);
+        return;
+    }
+}
+
+/// Три места, ждавшие замок дольше всех с прошлого вызова: `(файл:строка,
+/// раз, нс)`; счёт обнуляется.
+pub fn take_lock_wait_sites() -> alloc::vec::Vec<(alloc::string::String, u64, u64)> {
+    let mut rows = alloc::vec::Vec::new();
+    {
+        // Под замком: `note_wait_site` пишет ячейки тоже под ним.
+        let _sched = SCHED.lock();
+        for index in 0..WAIT_SITES.len() {
+            let key = WAIT_SITES[index].swap(0, Ordering::Relaxed);
+            let count = WAIT_SITE_COUNT[index].swap(0, Ordering::Relaxed);
+            let ns = WAIT_SITE_NS[index].swap(0, Ordering::Relaxed);
+            if key != 0 && count != 0 {
+                rows.push((key, count, ns));
+            }
+        }
+    }
+    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows.truncate(3);
+    rows.into_iter()
+        .map(|(key, count, ns)| {
+            // SAFETY: ключ — адрес `&'static Location`, записанный выше.
+            let site: &'static core::panic::Location<'static> = unsafe { &*(key as *const core::panic::Location<'static>) };
+            (alloc::format!("{}:{}", site.file().rsplit(['/', '\\']).next().unwrap_or(""), site.line()), count, ns)
+        })
+        .collect()
+}
+
+/// Ожидания замка планировщика: `(раз, нс)`.
+#[must_use]
+pub fn lock_wait_stats() -> (u64, u64) {
+    (SCHED_WAITS.load(Ordering::Relaxed), SCHED_WAIT_NS.load(Ordering::Relaxed))
+}
+
 /// Слот задачи, исполняющейся на процессоре, — без замка планировщика
 /// (владелец мьютекса для сторожа замков).
 static RUNNING_SLOT: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
@@ -289,7 +375,7 @@ pub fn lock_watch_task() {
         let mut found: alloc::vec::Vec<(usize, &'static str, usize, u64, usize, &'static str, Option<(&'static str, u64)>, usize)> =
             alloc::vec::Vec::new();
         {
-            let sched = SCHED.lock();
+            let sched = sched_lock();
             for (slot, entry) in sched.slots().iter().enumerate() {
                 let Some(task) = entry else { continue };
                 let TaskState::Blocked(Wait::Lock(address)) = task.state else { continue };
@@ -492,23 +578,33 @@ impl Scheduler {
     ///
     /// Возвращает `true`, если кто-то проснулся.
     fn wake_expired(&mut self, now: u64) -> bool {
+        // Ближайший срок известен (20.11): до него таблицу не обходить. На
+        // игре это ~30 тыс. переключений в секунду по 100-200 задач Wine под
+        // общим замком.
+        if now < NEXT_DUE.load(Ordering::Relaxed) {
+            return false;
+        }
         let mut woke = false;
+        let mut next = u64::MAX;
         for task in self.slots_mut().iter_mut().flatten() {
-            let due = match task.state {
+            let tick = match task.state {
                 TaskState::Blocked(
                     Wait::Until(tick)
                     | Wait::Input(tick)
                     | Wait::IrqUntil(_, tick)
                     | Wait::FutexUntil(_, tick)
                     | Wait::FutexMany(tick),
-                ) => now >= tick,
-                _ => false,
+                ) => tick,
+                _ => continue,
             };
-            if due {
+            if now >= tick {
                 task.state = TaskState::Ready;
                 woke = true;
+            } else {
+                next = next.min(tick);
             }
         }
+        NEXT_DUE.store(next, Ordering::Relaxed);
         woke
     }
 
@@ -615,7 +711,7 @@ pub fn spawn_daemon(name: &'static str, entry: fn()) -> Result<TaskId, SpawnErro
 
 /// Объявить уже созданную задачу служебной.
 pub fn mark_daemon(id: TaskId) {
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     if let Some(task) = sched.slots_mut().iter_mut().flatten().find(|task| task.id == id) {
         task.daemon = true;
     }
@@ -627,7 +723,7 @@ pub fn mark_daemon(id: TaskId) {
 /// супервизора обязан унаследовать это свойство.
 #[must_use]
 pub fn is_daemon() -> bool {
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     let current = sched.current();
     sched.tasks[current].as_ref().is_some_and(|task| task.daemon)
 }
@@ -653,7 +749,7 @@ pub fn spawn_raw(
     // значит растягивать критическую секцию на скорость UART.
     let stack = Stack::allocate(stack_size).ok_or(SpawnError::OutOfMemory)?;
 
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     let Some(slot) = sched.free_slot() else {
         // `stack` уничтожается после охранника (обратный порядок объявления
         // локальных), то есть куча трогается уже без лока.
@@ -708,7 +804,7 @@ pub fn set_current_tls(base: u64) {
     // Всё — под локом (прерывания запрещены, 13.11): вытеснение между записью
     // в задачу и сбросом селектора возвращало в задачу старый селектор `FS`
     // (переключение сохраняет живой), и поток бежал с чужой базой.
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     let current = sched.current();
     if let Some(task) = sched.tasks[current].as_mut() {
         task.tls = base;
@@ -726,15 +822,20 @@ pub fn set_current_tls(base: u64) {
 /// переносом между ними давало ребёнку `clone` базы чужой задачи.
 #[must_use]
 pub fn current_bases() -> (u64, u64) {
-    let sched = SCHED.lock();
-    sched.tasks[sched.current()].as_ref().map_or((0, 0), |task| (task.tls, task.gs))
+    let sched = sched_lock();
+    let (tls, gs) = sched.tasks[sched.current()].as_ref().map_or((0, 0), |task| (task.tls, task.gs));
+    // Истина — в процессоре (20.11): задача пишет в себя базы только на
+    // переключении, а между ними программа меняет их `wrfsbase` или быстрым
+    // `arch_prctl`.
+    let (fs_now, gs_now) = arch::live_user_bases();
+    (fs_now.unwrap_or(tls), gs_now.unwrap_or(gs))
 }
 
 /// Дескрипторы TLS исполняющейся задачи (`get_thread_area`, поиск свободной
 /// записи `set_thread_area`).
 #[must_use]
 pub fn current_tls_entries() -> [u64; 3] {
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     sched.tasks[sched.current()].as_ref().map_or([0; 3], |task| task.tls_entries)
 }
 
@@ -746,7 +847,7 @@ pub fn set_current_tls_entry(slot: usize, descriptor: u64) {
     }
     // Под локом планировщика прерывания запрещены: задачу не перенесут на
     // другой процессор между записью в неё и в GDT этого.
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     let current = sched.current();
     if let Some(task) = sched.tasks[current].as_mut() {
         task.tls_entries[slot] = descriptor;
@@ -758,13 +859,39 @@ pub fn set_current_tls_entry(slot: usize, descriptor: u64) {
 /// Задать базу `GS` исполняющейся задачи (программы Linux на x86-64,
 /// `arch_prctl(ARCH_SET_GS)`; Wine держит там TEB) — как [`set_current_tls`].
 pub fn set_current_gs(base: u64) {
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     let current = sched.current();
     if let Some(task) = sched.tasks[current].as_mut() {
         task.gs = base;
     }
     arch::set_user_gs(base);
     drop(sched);
+}
+
+/// `arch_prctl(ARCH_SET_FS)` без замка планировщика (20.11). Wine без
+/// FSGSBASE зовёт его на каждом переходе PE <-> unix — до 900 тыс. раз в
+/// секунду, и каждый вызов брал общий замок `SCHED` со всех 16 процессоров.
+/// В задачу база попадает на переключении ([`arch::live_user_bases`]), а
+/// текущую [`current_bases`] читает из процессора. Прерывания закрыты, чтобы
+/// задача не переехала между записью регистра и кеша.
+pub fn set_current_tls_fast(base: u64) {
+    if !cfg!(target_arch = "x86_64") {
+        set_current_tls(base);
+        return;
+    }
+    arch::interrupts::without_interrupts(|| {
+        arch::clear_fs_selector();
+        arch::set_user_tls(base);
+    });
+}
+
+/// `arch_prctl(ARCH_SET_GS)` без замка — как [`set_current_tls_fast`].
+pub fn set_current_gs_fast(base: u64) {
+    if !cfg!(target_arch = "x86_64") {
+        set_current_gs(base);
+        return;
+    }
+    arch::interrupts::without_interrupts(|| arch::set_user_gs(base));
 }
 
 /// Номер слота исполняющейся задачи.
@@ -775,7 +902,11 @@ pub fn set_current_gs(base: u64) {
 /// процессор, поэтому ответ остаётся верным и после вытеснения.
 #[must_use]
 pub fn current_slot() -> usize {
-    SCHED.lock().current()
+    // Без замка (20.11): его брал почти каждый системный вызов программы
+    // (`user::current_process`), а это — общий замок всех процессоров. При
+    // закрытых прерываниях задача не уедет с процессора, и `RUNNING_SLOT`
+    // этого процессора — её слот (пишется вместе с `cpus[].current`).
+    arch::interrupts::without_interrupts(running_slot)
 }
 
 /// Приписать исполняющейся задаче `bytes` байт обмена с носителем.
@@ -783,7 +914,7 @@ pub fn current_slot() -> usize {
 /// Вызывать без замка планировщика на руках: он берётся здесь. Обмен с
 /// носителем длится миллисекунды, взятие замка рядом с ним незаметно.
 pub fn charge_disk(bytes: usize) {
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     let current = sched.current();
     if let Some(task) = sched.tasks[current].as_mut() {
         task.disk_bytes = task.disk_bytes.saturating_add(bytes as u64);
@@ -796,7 +927,7 @@ pub fn charge_net(bytes: usize) {
     if bytes == 0 {
         return;
     }
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     let current = sched.current();
     if let Some(task) = sched.tasks[current].as_mut() {
         task.net_bytes = task.net_bytes.saturating_add(bytes as u64);
@@ -812,7 +943,7 @@ pub fn charge_net(bytes: usize) {
 /// человек, увидев «не существует», ищет ошибку в номере, а её там нет.
 #[must_use]
 pub fn is_idle(id: TaskId) -> bool {
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     sched
         .tasks
         .iter()
@@ -831,7 +962,7 @@ pub fn is_idle(id: TaskId) -> bool {
 /// помогает [`is_idle`].
 #[must_use]
 pub fn lookup(id: TaskId) -> Option<(usize, TaskState)> {
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     sched
         .tasks
         .iter()
@@ -851,7 +982,7 @@ pub fn id_of_slot(slot: usize) -> Option<TaskId> {
     if is_idle_slot(slot) {
         return None;
     }
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     sched.tasks.get(slot).and_then(Option::as_ref).map(|task| task.id)
 }
 
@@ -861,7 +992,7 @@ pub fn id_of_slot(slot: usize) -> Option<TaskId> {
 /// здесь, а на ближайшем переключении задач; сам переход выполняет вызывающий,
 /// потому что он же и знает, в какой момент это безопасно.
 pub fn set_current_space(root: Option<crate::mm::PhysAddr>) {
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     let current = sched.current();
     if let Some(task) = sched.tasks[current].as_mut() {
         task.user.space_root = root;
@@ -880,7 +1011,7 @@ pub fn set_current_space(root: Option<crate::mm::PhysAddr>) {
 /// перенесут на другой раньше, чем она дойдёт до третьего кольца, стек ловушки
 /// там поставит [`schedule`] — из того же поля.
 pub extern "C" fn remember_return_stack(stack: usize) {
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     let current = sched.current();
     if let Some(task) = sched.tasks[current].as_mut() {
         task.user.return_stack = stack;
@@ -891,7 +1022,7 @@ pub extern "C" fn remember_return_stack(stack: usize) {
 /// Стек, на который текущая задача возвращается из третьего кольца. Ноль —
 /// задача программ не запускала.
 pub extern "C" fn return_stack() -> usize {
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     let current = sched.current();
     sched.tasks[current].as_ref().map_or(0, |task| task.user.return_stack)
 }
@@ -901,7 +1032,7 @@ pub extern "C" fn return_stack() -> usize {
 /// `None` — задача ещё жива либо её слот уже переиспользован под другую.
 #[must_use]
 pub fn result_of(id: TaskId) -> Option<i64> {
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     sched
         .tasks
         .iter()
@@ -922,7 +1053,7 @@ pub fn wait(id: TaskId) -> Option<i64> {
         // делает это под тем же локом, так что на соседнем процессоре он
         // дождётся, пока мы уснём.
         {
-            let mut sched = SCHED.lock();
+            let mut sched = sched_lock();
             let found = sched
                 .tasks
                 .iter()
@@ -957,7 +1088,7 @@ pub fn sleep_ms(ms: u64) {
 /// Уснуть до этой отметки времени работы системы (миллисекунды).
 pub fn sleep_until(at_ms: u64) {
     {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         if !sched.running {
             // До запуска планирования спать не на чем и некому.
             return;
@@ -965,6 +1096,7 @@ pub fn sleep_until(at_ms: u64) {
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
             task.state = TaskState::Blocked(Wait::Until(at_ms));
+            note_deadline(at_ms);
         }
     }
     schedule();
@@ -981,13 +1113,14 @@ pub fn sleep_until(at_ms: u64) {
 /// закрывает только порядок «отметить, затем разбудить под локом».
 pub fn block_on_input(until: u64, changed: impl FnOnce() -> bool) {
     {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         if !sched.running || changed() {
             return;
         }
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
             task.state = TaskState::Blocked(Wait::Input(until));
+            note_deadline(until);
         }
     }
     schedule();
@@ -1003,7 +1136,7 @@ pub fn block_on_input(until: u64, changed: impl FnOnce() -> bool) {
 /// Срока у ожидания нет намеренно — см. [`Wait::Lock`].
 pub fn block_on_lock(address: usize, free: impl FnOnce() -> bool) {
     {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         if !sched.running || free() {
             return;
         }
@@ -1037,13 +1170,14 @@ pub fn block_on_lock(address: usize, free: impl FnOnce() -> bool) {
 pub fn block_on_irq_until(source: u32, ms: u64, ready: impl FnOnce() -> bool) {
     let until = crate::time::uptime_ms().saturating_add(ms.max(1));
     {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         if !sched.running || ready() {
             return;
         }
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
             task.state = TaskState::Blocked(Wait::IrqUntil(source, until));
+            note_deadline(until);
         }
     }
     schedule();
@@ -1057,7 +1191,7 @@ pub fn block_on_irq_until(source: u32, ms: u64, ready: impl FnOnce() -> bool) {
 /// процессоре, ни на соседнем.
 pub fn block_on_irq(source: u32, ready: impl FnOnce() -> bool) {
     {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         if !sched.running || ready() {
             return;
         }
@@ -1075,7 +1209,7 @@ pub fn block_on_irq(source: u32, ready: impl FnOnce() -> bool) {
 /// ждущих в готовые. Разбор события — работа задачи, а не обработчика.
 pub fn wake_irq(source: u32) {
     let mut woken = 0usize;
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     for task in sched.slots_mut().iter_mut().flatten() {
         // Оба вида ожидания прерывания, и это не перечисление ради полноты:
         // обработчик не знает и не должен знать, поставил ли ждущий себе
@@ -1110,11 +1244,19 @@ pub fn wake_irq(source: u32) {
 /// Будятся **все** ждущие, а не один: проснувшиеся попробуют захватить лок по
 /// очереди, и не сумевшие уснут снова.
 pub fn wake_lock(address: usize) {
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
+    let mut woke = false;
     for task in sched.slots_mut().iter_mut().flatten() {
         if task.state == TaskState::Blocked(Wait::Lock(address)) {
             task.state = TaskState::Ready;
+            woke = true;
         }
+    }
+    drop(sched);
+    // Пинок одному простаивающему (20.11): лок возьмёт один, остальные
+    // уснут снова; без пинка разбуженный ждал тика (10 мс) на холостом ЦП.
+    if woke {
+        kick_idle(1);
     }
 }
 
@@ -1133,14 +1275,17 @@ pub fn wake_lock(address: usize) {
 /// прийти в один и тот же миг, и перепроверка условия всё равно на нём.
 pub fn block_on_futex(key: usize, until: Option<u64>, ready: impl FnOnce() -> bool) {
     {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         if !sched.running || ready() {
             return;
         }
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
             task.state = TaskState::Blocked(match until {
-                Some(at) => Wait::FutexUntil(key, at),
+                Some(at) => {
+                    note_deadline(at);
+                    Wait::FutexUntil(key, at)
+                }
                 None => Wait::Futex(key),
             });
         }
@@ -1154,7 +1299,7 @@ pub fn block_on_futex(key: usize, until: Option<u64>, ready: impl FnOnce() -> bo
 /// не ждал» от «разбудил» — без этого отпускающий замок не может сказать,
 /// стоило ли вообще звать ядро.
 pub fn wake_futex(key: usize, count: usize) -> usize {
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     let mut woken = 0usize;
     for task in sched.slots_mut().iter_mut().flatten() {
         if count != 0 && woken >= count {
@@ -1221,18 +1366,71 @@ fn kick_idle(count: usize) {
         if cpu == me || !smp::is_online(cpu) || !ON_IDLE[cpu].load(Ordering::Relaxed) {
             continue;
         }
-        if !KICKED[cpu].swap(true, Ordering::AcqRel) {
-            arch::smp::kick(cpu);
+        if !KICKED[cpu].swap(true, Ordering::SeqCst) {
+            // Крутящемуся в `idle_wait` пинок — сам флаг (20.11): IPI ему не
+            // нужен. Порядок SeqCst — пара с `idle_wait`: либо он увидит флаг,
+            // либо мы — что он уже не крутится и идёт в `hlt`.
+            if POLLING[cpu].load(Ordering::SeqCst) {
+                POLL_KICKS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                arch::smp::kick(cpu);
+            }
             left -= 1;
         }
     }
+}
+
+/// Сколько микросекунд холостой процессор ждёт пинка в цикле, прежде чем
+/// уйти в `hlt` (20.11, `idlepoll N`; 0 — сразу `hlt`, как раньше). На игре
+/// Wine/llvmpipe будит потоки ~12 тыс. раз в секунду (perf-diag hw-log10:
+/// 373 тыс. IPI за 30 с), и каждый раз — IPI, выход из `hlt` и обработчик.
+/// Процессор, только что оставшийся без работы, почти всегда получает её
+/// снова через десятки микросекунд: тогда хватает флага.
+static IDLE_POLL_US: AtomicU64 = AtomicU64::new(50);
+/// Процессор крутится в [`idle_wait`].
+static POLLING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+/// Пинков, отданных флагом без IPI (`perf-diag`).
+static POLL_KICKS: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_idle_poll_us(us: u64) {
+    IDLE_POLL_US.store(us.min(10_000), Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn idle_poll_us() -> u64 {
+    IDLE_POLL_US.load(Ordering::Relaxed)
+}
+
+#[must_use]
+pub fn poll_kicks() -> u64 {
+    POLL_KICKS.load(Ordering::Relaxed)
+}
+
+/// Холостой процессор между заходами в планировщик (20.11): короткое
+/// ожидание пинка в цикле, затем `hlt` — без окна между проверкой флага и
+/// остановкой (`arch::wait_for_interrupt_unless`): раньше IPI, пришедший до
+/// `hlt`, оставлял процессор спать до тика (10 мс).
+pub fn idle_wait() {
+    let cpu = smp::cpu();
+    let budget = IDLE_POLL_US.load(Ordering::Relaxed);
+    if budget != 0 && KICKS.load(Ordering::Relaxed) && RUNNING.load(Ordering::Relaxed) && smp::online() > 1 {
+        POLLING[cpu].store(true, Ordering::SeqCst);
+        let deadline = crate::time::uptime_ns().saturating_add(budget * 1000);
+        while !KICKED[cpu].load(Ordering::SeqCst) && crate::time::uptime_ns() < deadline {
+            for _ in 0..64 {
+                core::hint::spin_loop();
+            }
+        }
+        POLLING[cpu].store(false, Ordering::SeqCst);
+    }
+    arch::wait_for_interrupt_unless(&KICKED[cpu]);
 }
 
 /// Снимок очереди для `perf-diag` (P1): сколько задач готово и ждёт
 /// процессора и сколько исполняется прямо сейчас (холостые не в счёт).
 #[must_use]
 pub fn queue_facts() -> (usize, usize) {
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     let (mut ready, mut running) = (0, 0);
     for (slot, task) in sched.tasks.iter().enumerate() {
         if is_idle_slot(slot) {
@@ -1275,7 +1473,7 @@ pub fn block_on_futexes(
 ) -> Option<usize> {
     let mut keys = Some(keys);
     {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         if !sched.running || ready() {
             drop(sched);
             drop(keys);
@@ -1286,13 +1484,14 @@ pub fn block_on_futexes(
             task.futex_keys = keys.take();
             task.futex_woken = None;
             task.state = TaskState::Blocked(Wait::FutexMany(until.unwrap_or(u64::MAX)));
+            note_deadline(until.unwrap_or(u64::MAX));
         }
     }
     schedule();
     // Коробку — из-под лока и освободить уже без него: куча под локом
     // планировщика — лишний порядок захвата.
     let (keys, woken) = {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         let current = sched.current();
         match sched.tasks[current].as_mut() {
             Some(task) => (task.futex_keys.take(), task.futex_woken.take()),
@@ -1448,7 +1647,7 @@ fn schedule_with(cause: Cause) {
     let mut to_tls_entries: [u64; 3] = [0; 3];
 
     {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         // Номер процессора стабилен до конца блока: прерывания запрещены, и
         // перенести эту задачу на другой процессор нечем.
         let cpu = smp::cpu();
@@ -1605,6 +1804,16 @@ fn schedule_with(cause: Cause) {
                             // Селектор `FS` уходящей — у потока Wine в
                             // 32-битном коде он не нулевой (12.11).
                             task.fs_selector = arch::user_fs_selector();
+                            // Базы FS/GS — из процессора (20.11): с FSGSBASE
+                            // программа меняет их сама, а `arch_prctl` больше не
+                            // пишет в задачу под этим замком.
+                            let (fs, gs) = arch::live_user_bases();
+                            if let Some(fs) = fs {
+                                task.tls = fs;
+                            }
+                            if let Some(gs) = gs {
+                                task.gs = gs;
+                            }
                         }
                         if let Some(task) = sched.tasks[next].as_mut() {
                             task.state = TaskState::Running;
@@ -1666,7 +1875,7 @@ fn schedule_with(cause: Cause) {
 /// Снять метку процессора с задачи, только что уступившей его. См. заголовок
 /// модуля.
 fn finish_switch() {
-    SCHED.lock().finish_switch();
+    sched_lock().finish_switch();
 }
 
 /// Батут, с которого начинает любая задача, созданная [`spawn_raw`].
@@ -1678,7 +1887,7 @@ fn finish_switch() {
 /// завершившуюся — не убрал бы уборщик.
 extern "C" fn task_start(slot: usize) -> ! {
     let start = {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         sched.finish_switch();
         sched.tasks[slot]
             .as_ref()
@@ -1973,7 +2182,7 @@ pub fn prepare_cpu(index: usize) -> Option<usize> {
     idle.stack = Some(stack);
     let boxed = box_task(idle)?;
 
-    let mut sched = SCHED.lock();
+    let mut sched = sched_lock();
     sched.tasks[index] = Some(boxed);
     sched.cpus[index].current = index;
     RUNNING_SLOT[index].store(index, Ordering::Relaxed);
@@ -1990,7 +2199,7 @@ pub fn forget_cpu(index: usize) {
     }
     // Задача уничтожается после охранника: `Drop` стека трогает кучу, и делать
     // это под локом планировщика незачем.
-    let task = SCHED.lock().tasks[index].take();
+    let task = sched_lock().tasks[index].take();
     drop(task);
 }
 
@@ -2005,7 +2214,7 @@ pub fn run() -> ! {
     };
 
     {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         if sched.running {
             kprintln!("sched: FATAL: run() called twice");
             arch::halt();
@@ -2024,7 +2233,7 @@ pub fn run() -> ! {
     // Отличие одно: только этот цикл решает, что работа кончилась.
     loop {
         let alive = {
-            let sched = SCHED.lock();
+            let sched = sched_lock();
             sched.alive()
         };
         if alive == 0 {
@@ -2032,11 +2241,8 @@ pub fn run() -> ! {
         }
         schedule();
 
-        // Гонка между этой проверкой и остановкой безобидна: прерывание,
-        // пришедшее в промежутке, разбудит задачу, но `wfi`/`hlt` уже начнётся —
-        // и закончится на ближайшем тике таймера, то есть не позже чем через
-        // 10 мс.
-        arch::wait_for_interrupt();
+        // Ожидание пинка, затем `hlt` (см. `idle_wait`).
+        idle_wait();
     }
 
     // Остальные процессоры останавливаются до сводки: иначе служебные задачи на
@@ -2045,7 +2251,7 @@ pub fn run() -> ! {
     let stopped = smp::stop_others();
 
     let (freed, switches) = {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         (sched.reap(), sched.switches())
     };
 
@@ -2063,21 +2269,21 @@ pub fn run() -> ! {
 /// Идентификатор исполняющейся задачи.
 #[must_use]
 pub fn current() -> TaskId {
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     sched.tasks[sched.current()].as_ref().map_or(TaskId::IDLE, |task| task.id)
 }
 
 /// Имя исполняющейся задачи.
 #[must_use]
 pub fn current_name() -> &'static str {
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     sched.tasks[sched.current()].as_ref().map_or("none", |task| task.name)
 }
 
 /// Сколько всего было переключений контекста.
 #[must_use]
 pub fn switch_count() -> u64 {
-    SCHED.lock().switches()
+    sched_lock().switches()
 }
 
 /// Сколько миллисекунд задача занимала процессор — включая незакрытый отрезок.
@@ -2090,7 +2296,7 @@ pub fn switch_count() -> u64 {
 /// своего предыдущего захода — то есть ноль, пока она не переключится хоть раз.
 #[must_use]
 pub fn cpu_ms(id: TaskId) -> Option<u64> {
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     let task = sched.slots().iter().flatten().find(|task| task.id == id)?;
     let running = if task.ran_since_ms == 0 {
         0
@@ -2103,13 +2309,13 @@ pub fn cpu_ms(id: TaskId) -> Option<u64> {
 /// Запущено ли планирование.
 #[must_use]
 pub fn is_running() -> bool {
-    SCHED.lock().running
+    sched_lock().running
 }
 
 /// Сколько задач ещё не завершились, не считая холостых.
 #[must_use]
 pub fn alive() -> usize {
-    SCHED.lock().alive()
+    sched_lock().alive()
 }
 
 /// Компактный список задач с состояниями.
@@ -2137,7 +2343,7 @@ pub struct TaskFacts {
 /// Снимок всех задач — для `SYS_TASKS`.
 #[must_use]
 pub fn snapshot() -> alloc::vec::Vec<TaskFacts> {
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     let now = crate::time::uptime_ms();
     let mut out = alloc::vec::Vec::new();
     for (slot, entry) in sched.slots().iter().enumerate() {
@@ -2193,7 +2399,7 @@ pub fn dump() {
     // планировщика нельзя (то же правило соблюдает `SYS_TASKS`, см.
     // `user::syscall::tasks`). Значит лок отпускается раньше печати.
     let rows = {
-        let sched = SCHED.lock();
+        let sched = sched_lock();
         let mut rows: alloc::vec::Vec<Row> = alloc::vec::Vec::new();
         for (slot, entry) in sched.slots().iter().enumerate() {
             let Some(entry) = entry else { continue };
@@ -2290,7 +2496,7 @@ pub fn dump() {
     }
     // Итоги берутся под локом заново, и печатать под ним тут можно: в отличие
     // от строк задач, ничего из таблицы программ здесь не спрашивается.
-    let sched = SCHED.lock();
+    let sched = sched_lock();
     kprintln!(
         "  preemption : {}, {} ms slice, {} forced switch(es)",
         if PREEMPTION.load(Ordering::Relaxed) { "on" } else { "off" },
@@ -2424,7 +2630,7 @@ extern "C" fn trampoline(arg: usize) -> ! {
 /// стек заберёт уборщик, когда с неё снимут метку процессора.
 pub fn exit_current_with(result: i64) -> ! {
     {
-        let mut sched = SCHED.lock();
+        let mut sched = sched_lock();
         let current = sched.current();
         let mut id = TaskId::IDLE;
         if let Some(task) = sched.tasks[current].as_mut() {

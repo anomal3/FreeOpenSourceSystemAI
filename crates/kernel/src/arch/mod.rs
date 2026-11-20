@@ -25,11 +25,21 @@ mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
     ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, drain_serial_rx, halt,
-    set_user_gs, set_user_tls, user_gs, user_tls,
+    set_user_gs, set_user_tls, user_gs, user_tls, live_user_bases, fsgsbase, fsgsbase_advertised, hwcap2,
     pci_config_read32, pci_config_write32, poll_boot_devices, power_off, reboot, reboot_on_key,
     remember_serial, report_boot_devices, serial_fallback, spawn_input_services, wait_for_interrupt,
     hypervisor_log, enter_user_segments, clear_fs_selector, set_tls_entry, user_fs_selector, TLS_ENTRY_MIN,
+    wait_for_interrupt_unless,
 };
+
+/// `wfi`, если `flag` не поднят. `wfi` просыпается и на замаскированном
+/// прерывании, так что окна между проверкой и остановкой тут нет.
+#[cfg(target_arch = "aarch64")]
+pub fn wait_for_interrupt_unless(flag: &core::sync::atomic::AtomicBool) {
+    if !flag.load(core::sync::atomic::Ordering::SeqCst) {
+        wait_for_interrupt();
+    }
+}
 
 /// Строка в журнал гипервизора — на AArch64 такого канала нет.
 #[cfg(target_arch = "aarch64")]
@@ -52,6 +62,27 @@ pub fn user_fs_selector() -> u16 {
 }
 #[cfg(target_arch = "aarch64")]
 pub const TLS_ENTRY_MIN: usize = 12;
+// FSGSBASE (20.11) — только x86-64: базы задачи у AArch64 — лишь `TPIDR_EL0`,
+// и пишет её ядро.
+#[cfg(target_arch = "aarch64")]
+#[must_use]
+pub fn live_user_bases() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+#[cfg(target_arch = "aarch64")]
+#[must_use]
+pub fn fsgsbase() -> bool {
+    false
+}
+#[cfg(target_arch = "aarch64")]
+pub fn fsgsbase_advertised(_set: Option<bool>) -> bool {
+    false
+}
+#[cfg(target_arch = "aarch64")]
+#[must_use]
+pub fn hwcap2() -> usize {
+    0
+}
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;

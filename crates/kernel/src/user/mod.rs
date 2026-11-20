@@ -3413,7 +3413,8 @@ fn place_linux_args(
         (AT_CLKTCK, 100),
         (AT_SECURE, 0),
         (AT_RANDOM, random_at),
-        (AT_HWCAP2, 0),
+        // Бит 1 — HWCAP2_FSGSBASE (20.11): Wine меняет базы FS/GS сам.
+        (AT_HWCAP2, crate::arch::hwcap2()),
         (AT_EXECFN, execfn),
         // vDSO (01.11.2026): нет — ключ с нулём, glibc его так и понимает.
         (AT_SYSINFO_EHDR, start.vdso),

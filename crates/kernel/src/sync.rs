@@ -32,7 +32,7 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Сколько [`SpinLock`] держит каждый процессор (фаза 71h). Отказ страницы в
 /// ядре разбирается как отказ программы (копия разделённой страницы) только
@@ -104,6 +104,12 @@ unsafe impl<T: Send> Send for SpinLock<T> {}
 impl<T> SpinLock<T> {
     pub const fn new(value: T) -> Self {
         Self { owner: AtomicUsize::new(FREE), value: UnsafeCell::new(value) }
+    }
+
+    /// Занят ли лок сейчас (для счёта ожиданий, 20.11) — ответ устаревает
+    /// сразу же, полагаться на него для захвата нельзя.
+    pub fn is_locked(&self) -> bool {
+        self.owner.load(Ordering::Relaxed) != FREE
     }
 
     /// Захватить лок, дождавшись освобождения.
@@ -291,6 +297,12 @@ pub struct Mutex<T> {
 unsafe impl<T: Send> Sync for Mutex<T> {}
 unsafe impl<T: Send> Send for Mutex<T> {}
 
+/// Сколько наносекунд [`Mutex::lock`] ждёт занятый лок в цикле, прежде чем
+/// уснуть (20.11; `mutexspin МКС` в оболочке, 0 — сразу спать, как раньше).
+pub static MUTEX_SPIN_NS: AtomicU64 = AtomicU64::new(20_000);
+/// Сколько раз лок достался в цикле, без сна (`perf-diag`).
+pub static MUTEX_SPIN_WINS: AtomicU64 = AtomicU64::new(0);
+
 impl<T> Mutex<T> {
     pub const fn new(value: T) -> Self {
         Self { owner: core::sync::atomic::AtomicUsize::new(0), site: core::sync::atomic::AtomicUsize::new(0), waiters: core::sync::atomic::AtomicUsize::new(0), locked: AtomicBool::new(false), value: UnsafeCell::new(value) }
@@ -312,6 +324,16 @@ impl<T> Mutex<T> {
                 return MutexGuard { lock: self };
             }
 
+            // Лок занят. Сначала — короткое ожидание в цикле (20.11): замок
+            // программы держат микросекунды, а сон и пробуждение через
+            // планировщик стоят его общего замка дважды и переключения. На
+            // игре под Wine (16 потоков на один процесс) `wake_lock` был самым
+            // частым ждущим замка планировщика (perf-diag `sched lock waited`).
+            if self.spin_until_free() {
+                self.owner.store(crate::sched::running_slot() + 1, Ordering::Relaxed);
+                self.site.store(site, Ordering::Relaxed);
+                return MutexGuard { lock: self };
+            }
             // Лок занят. Засыпаем — но проверку «а не освободился ли он»
             // выполняет планировщик под своим локом, и это закрывает гонку
             // целиком. Держатель мьютекса может отпустить его в любой миг — на
@@ -328,6 +350,31 @@ impl<T> Mutex<T> {
                 !self.locked.load(Ordering::SeqCst)
             });
             self.waiters.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Подождать в цикле до [`MUTEX_SPIN_NS`], пока лок освободится, и
+    /// занять его. `false` — не дождались (или процессор один: держатель не
+    /// отпустит, пока мы крутимся).
+    fn spin_until_free(&self) -> bool {
+        let budget = MUTEX_SPIN_NS.load(Ordering::Relaxed);
+        if budget == 0 || crate::smp::online() <= 1 {
+            return false;
+        }
+        let deadline = crate::time::uptime_ns().saturating_add(budget);
+        loop {
+            if !self.locked.load(Ordering::Relaxed)
+                && self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+            {
+                MUTEX_SPIN_WINS.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            if crate::time::uptime_ns() >= deadline {
+                return false;
+            }
+            for _ in 0..32 {
+                core::hint::spin_loop();
+            }
         }
     }
 

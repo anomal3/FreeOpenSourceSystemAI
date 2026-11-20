@@ -269,7 +269,7 @@ pub fn secondary_main(index: usize) -> ! {
     // проверки «все ли закончились»: останавливать машину решает загрузочный.
     loop {
         sched::schedule();
-        arch::wait_for_interrupt();
+        sched::idle_wait();
     }
 }
 

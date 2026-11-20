@@ -29,7 +29,7 @@ use core::mem::size_of;
 use user_abi::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, SYS_CLOCK, SYS_CLOSE, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_GETGID,
     SYS_GETPID, SYS_GETUID, SYS_ISATTY, SYS_MUNMAP, SYS_NANOSLEEP, SYS_RANDOM, SYS_READ, SYS_SEEK,
-    SYS_SET_TLS, SYS_WRITE, SYS_YIELD,
+    SYS_WRITE, SYS_YIELD,
 };
 
 mod poll;
@@ -2254,7 +2254,20 @@ unsafe fn arch_prctl(code: usize, addr: usize) -> i64 {
     const ARCH_GET_GS: usize = 0x1004;
     match code {
         // SAFETY: контракт `syscall`.
-        ARCH_SET_FS => errno(unsafe { native(SYS_SET_TLS, addr, 0, 0) }),
+        // Как у Linux: только проверка диапазона, без замка планировщика
+        // (20.11, Wine без FSGSBASE — сотни тысяч вызовов в секунду).
+        ARCH_SET_FS => {
+            if addr >= 1 << 47 {
+                return -e::EPERM;
+            }
+            // `fsgsbase off` — и путь по-старому, под замком (A/B на стенде).
+            if crate::arch::fsgsbase_advertised(None) {
+                crate::sched::set_current_tls_fast(addr as u64);
+            } else {
+                crate::sched::set_current_tls(addr as u64);
+            }
+            0
+        }
         ARCH_GET_FS => {
             if !space::user_can(addr, 8, PageFlags::WRITE) {
                 return -e::EFAULT;
@@ -2270,7 +2283,11 @@ unsafe fn arch_prctl(code: usize, addr: usize) -> i64 {
             if addr >= 1 << 47 {
                 return -e::EPERM;
             }
-            crate::sched::set_current_gs(addr as u64);
+            if crate::arch::fsgsbase_advertised(None) {
+                crate::sched::set_current_gs_fast(addr as u64);
+            } else {
+                crate::sched::set_current_gs(addr as u64);
+            }
             0
         }
         ARCH_GET_GS => {

@@ -93,7 +93,9 @@ struct Mark {
     calls: Vec<(u64, u64)>,
     /// `(просьб, ожидание нс, худшее нс, без адресатов, адресатов)`.
     shootdowns: (u64, u64, u64, u64, u64),
-    kicks: (u64, u64),
+    kicks: (u64, u64, u64),
+    sched_lock: (u64, u64),
+    mutex_spins: u64,
     futex: [u64; 4],
     deferred: (u64, u64),
     switches: u64,
@@ -113,7 +115,12 @@ impl Mark {
             at_ms: crate::time::uptime_ms(),
             calls,
             shootdowns: crate::arch::smp::shootdown_stats(),
-            kicks: crate::arch::smp::kick_stats(),
+            sched_lock: crate::sched::lock_wait_stats(),
+            mutex_spins: crate::sync::MUTEX_SPIN_WINS.load(Ordering::Relaxed),
+            kicks: {
+                let (sent, taken) = crate::arch::smp::kick_stats();
+                (sent, taken, crate::sched::poll_kicks())
+            },
             futex: [load(&FUTEX_WAITS), load(&FUTEX_WAKES), load(&FUTEX_WOKEN), load(&FUTEXV_WAITS)],
             deferred: crate::sched::deferred_wake_stats(),
             switches: crate::sched::switch_count(),
@@ -242,24 +249,36 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     let shoot_worst = new.shootdowns.2;
     let shoot_local = new.shootdowns.3.saturating_sub(old.shootdowns.3);
     let shoot_cpus = new.shootdowns.4.saturating_sub(old.shootdowns.4);
-    let kicks = (new.kicks.0.saturating_sub(old.kicks.0), new.kicks.1.saturating_sub(old.kicks.1));
+    let kicks = (
+        new.kicks.0.saturating_sub(old.kicks.0),
+        new.kicks.1.saturating_sub(old.kicks.1),
+        new.kicks.2.saturating_sub(old.kicks.2),
+    );
     let futex: [u64; 4] = core::array::from_fn(|i| new.futex[i].saturating_sub(old.futex[i]));
     let deferred = (new.deferred.0.saturating_sub(old.deferred.0), new.deferred.1.saturating_sub(old.deferred.1));
     let _ = write!(
         line,
-        " tlb shootdowns {shoot} to {shoot_cpus} cpus (wait {} ms, {} us each, worst {} us), {shoot_local} needed no IPI; kick IPIs {} sent {} taken; futex wait {} wake {} woke {} waitv {}; deferred wakes {} (overflow {})",
+        " tlb shootdowns {shoot} to {shoot_cpus} cpus (wait {} ms, {} us each, worst {} us), {shoot_local} needed no IPI; kick IPIs {} sent {} taken, {} by idle poll; futex wait {} wake {} woke {} waitv {}; deferred wakes {} (overflow {}); sched lock waited {}x {} ms; mutex taken spinning {}",
         ms(shoot_ns),
         shoot_ns / shoot.max(1) / 1000,
         shoot_worst / 1000,
         kicks.0,
         kicks.1,
+        kicks.2,
         futex[0],
         futex[1],
         futex[2],
         futex[3],
         deferred.0,
         deferred.1,
+        new.sched_lock.0.saturating_sub(old.sched_lock.0),
+        ms(new.sched_lock.1.saturating_sub(old.sched_lock.1)),
+        new.mutex_spins.saturating_sub(old.mutex_spins),
     );
+    // Кто ждал замок планировщика дольше всех (20.11).
+    for (site, count, ns) in crate::sched::take_lock_wait_sites() {
+        let _ = write!(line, "; {site} {count}x {} ms", ms(ns));
+    }
     kprintln!("  perf-diag   : {line}");
 
     // 3. Процессоры и очередь.

@@ -1282,6 +1282,50 @@ fn run_builtin(line: &str) -> bool {
             };
             sprintln!("  {command}: {}", if now { "on" } else { "off" });
         }
+        // HWCAP2_FSGSBASE новым программам (20.11): `off` — Wine снова ставит
+        // базы FS/GS через `arch_prctl` (сравнение в одной загрузке).
+        "fsgsbase" => {
+            match argument.trim() {
+                "on" => _ = crate::arch::fsgsbase_advertised(Some(true)),
+                "off" => _ = crate::arch::fsgsbase_advertised(Some(false)),
+                "" => {}
+                _ => sprintln!("  fsgsbase: usage `fsgsbase [on|off]`"),
+            }
+            sprintln!(
+                "  fsgsbase: cpu {}, advertised to new programs {}",
+                if crate::arch::fsgsbase() { "on" } else { "off (no CPUID.7 EBX bit 0)" },
+                if crate::arch::hwcap2() & 2 != 0 { "yes" } else { "no" }
+            );
+        }
+        // Ожидание пинка холостым процессором до `hlt` (20.11), мкс.
+        "idlepoll" => {
+            match argument.trim() {
+                "" => {}
+                "off" => crate::sched::set_idle_poll_us(0),
+                value => match value.parse::<u64>() {
+                    Ok(us) => crate::sched::set_idle_poll_us(us),
+                    Err(_) => sprintln!("  idlepoll: usage `idlepoll [MICROSECONDS|off]`"),
+                },
+            }
+            sprintln!("  idlepoll: {} us", crate::sched::idle_poll_us());
+        }
+        // Ожидание занятого мьютекса ядра в цикле до сна (20.11), мкс.
+        "mutexspin" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "off" => crate::sync::MUTEX_SPIN_NS.store(0, Relaxed),
+                value => match value.parse::<u64>() {
+                    Ok(us) => crate::sync::MUTEX_SPIN_NS.store(us.min(1000) * 1000, Relaxed),
+                    Err(_) => sprintln!("  mutexspin: usage `mutexspin [MICROSECONDS|off]`"),
+                },
+            }
+            sprintln!(
+                "  mutexspin: {} us, {} lock(s) taken while spinning",
+                crate::sync::MUTEX_SPIN_NS.load(Relaxed) / 1000,
+                crate::sync::MUTEX_SPIN_WINS.load(Relaxed)
+            );
+        }
         // Пинок простаивающих процессоров при пробуждении (P9, 18.11.2026).
         "schedkick" => {
             match argument.trim() {
