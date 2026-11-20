@@ -1538,8 +1538,10 @@ pub const ALL: &[Scenario] = &[
             Step::Expect("usb-storage : exFAT volume 'Z7S' (GPT, LBA 2048) mounted read-write at /usb"),
             Step::Line("ls /usb/D2RLAN"),
             Step::Await("Длинное имя файла с кириллицей и пробелами — проверка exFAT.txt", 15_000),
-            Step::Line("cat /usb/d2rlan/длинное имя файла с кириллицей и пробелами — проверка exfat.txt"),
-            Step::Await("Привет из exFAT!", 15_000),
+            // Кириллицу стенд по серийной линии не набирает: длинное имя
+            // проверено списком выше, а регистр — латиницей.
+            Step::Line("cat /usb/d2rlan/d2r.EXE"),
+            Step::Await("fake D2R executable", 15_000),
             // Непрерывный файл (NoFatChain) и файл цепочкой FAT вперемешку с
             // соседом — суммы те же, что у создателя образа.
             Step::Line("sum /usb/D2RLAN/Data/data.bin"),
@@ -1548,16 +1550,16 @@ pub const ALL: &[Scenario] = &[
             Step::Await("640000 bytes crc32 1e2addfe", 15_000),
             Step::Line("ls /usb/many"),
             Step::Await("file399.txt", 15_000),
-            // Запись: каталог, файл с кириллицей, копия 9 МиБ, удаление.
+            // Запись: каталог, файл, копия 9 МиБ, удаление.
             Step::Line("mkdir /usb/FossAi"),
             Step::Await("created /usb/FossAi", 15_000),
-            Step::Line("echo written by FossAi > /usb/FossAi/привет.txt"),
-            Step::Await("wrote 18 bytes to /usb/FossAi/привет.txt", 15_000),
+            Step::Line("echo written by FossAi > /usb/FossAi/hello.txt"),
+            Step::Await("wrote 18 bytes to /usb/FossAi/hello.txt", 15_000),
             Step::Line("cp /usb/D2RLAN/Data/data.bin /usb/FossAi/copy.bin"),
             Step::Await("cp: 9437307 bytes copied to /usb/FossAi/copy.bin", 120_000),
             Step::Line("sum /usb/FossAi/copy.bin"),
             Step::Await("9437307 bytes crc32 5fb2b681", 30_000),
-            Step::Line("cat /usb/FossAi/ПРИВЕТ.TXT"),
+            Step::Line("cat /usb/FOSSAI/HELLO.TXT"),
             Step::Await("written by FossAi", 15_000),
             Step::Line("rm /usb/frag_b.bin"),
             Step::Await("removed /usb/frag_b.bin", 15_000),
