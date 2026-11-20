@@ -33,6 +33,8 @@ pub mod ext2fs;
 pub mod fat;
 // Блокировки файлов (08.11.2026): fcntl F_*LK и flock для всех программ.
 pub mod locks;
+// Наблюдение за каталогами (20.11): события создания, удаления, записи.
+pub mod notify;
 pub mod ramvol;
 
 pub use btrfsfs::BtrfsFs;
@@ -330,7 +332,11 @@ pub fn create_as(cred: Credentials, path: &str, mode: u16) -> Option<VfsResult<B
         Ok(dir) => dir,
         Err(err) => return Some(Err(err)),
     };
-    Some(dir.create(name, mode, cred.uid, cred.gid))
+    let created = dir.create(name, mode, cred.uid, cred.gid);
+    if created.is_ok() {
+        notify::emit(path, notify::CREATE);
+    }
+    Some(created)
 }
 
 /// Создать каталог по пути от имени `cred`.
@@ -372,7 +378,11 @@ pub fn mkdir_as(cred: Credentials, path: &str, mode: u16) -> Option<VfsResult<()
         }
         Err(err) => return Some(Err(err)),
     };
-    Some(dir.mkdir(name, mode, cred.uid, cred.gid).map(|_| ()))
+    let made = dir.mkdir(name, mode, cred.uid, cred.gid).map(|_| ());
+    if made.is_ok() {
+        notify::emit(path, notify::CREATE | notify::ISDIR);
+    }
+    Some(made)
 }
 
 /// Удалить файл или пустой каталог по пути от имени `cred`.
@@ -393,10 +403,14 @@ pub fn remove_as(cred: Credentials, path: &str) -> Option<VfsResult<()>> {
         Ok(node) => node.metadata().kind,
         Err(err) => return Some(Err(err)),
     };
-    Some(match kind {
+    let removed = match kind {
         NodeKind::Directory => dir.rmdir(name),
         NodeKind::File => dir.unlink(name),
-    })
+    };
+    if removed.is_ok() {
+        notify::emit(path, notify::DELETE | if kind == NodeKind::Directory { notify::ISDIR } else { 0 });
+    }
+    Some(removed)
 }
 
 /// Переименовать файл или каталог от имени `cred`.
@@ -441,7 +455,12 @@ pub fn rename_as(cred: Credentials, old: &str, new: &str) -> Option<VfsResult<()
     if !Arc::ptr_eq(&source, &target) || strip != other {
         return Some(Err(VfsError::Unsupported));
     }
-    Some(source.rename(inside(strip, old), inside(strip, new)))
+    let renamed = source.rename(inside(strip, old), inside(strip, new));
+    if renamed.is_ok() {
+        let dir = resolve_as(cred, new, Access::NONE).and_then(Result::ok).is_some_and(|node| node.metadata().kind == NodeKind::Directory);
+        notify::emit_rename(old, new, dir);
+    }
+    Some(renamed)
 }
 
 /// Перечислить каталог корневой ФС.

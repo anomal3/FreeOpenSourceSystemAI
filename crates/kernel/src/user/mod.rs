@@ -2933,8 +2933,18 @@ pub fn title_window(slot: u32, title: &str) -> Result<(), WindowError> {
 
 /// Назначить окну `slot` текущей программы владельца — её окно `owner`
 /// (фаза 62d).
-pub fn owner_window(slot: u32, owner: Option<u32>, modal: bool) -> Result<(), WindowError> {
-    crate::ui::owner_window(sched::current().as_u32(), slot, owner, modal).map_err(WindowError::Desktop)
+/// Владелец — `(задача, место)`: с 20.11 и окно другой программы.
+pub fn owner_window(slot: u32, owner: Option<(u32, u32)>, modal: bool, center: bool) -> Result<(), WindowError> {
+    crate::ui::owner_window(sched::current().as_u32(), slot, owner, modal, center).map_err(WindowError::Desktop)
+}
+
+/// Чей процесс у задачи `task` (uid). `None` — такой программы нет.
+#[must_use]
+pub fn uid_of_task(task: u32) -> Option<u32> {
+    let (slot, _) = sched::lookup(sched::TaskId::new(task))?;
+    let process = PROGRAMS.lock().get(slot).and_then(Option::as_ref).cloned()?;
+    let uid = process.lock().cred.uid;
+    Some(uid)
 }
 
 /// Забрать событие окна `slot` текущей программы.

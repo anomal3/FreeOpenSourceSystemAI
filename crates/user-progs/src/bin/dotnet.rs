@@ -96,6 +96,8 @@ struct Console {
     scale_checked: u64,
     /// Имя программы без `.dll` — заголовок окна, которому C# не дал своего.
     program: String,
+    /// Окна выбора файла (20.11, `/bin/filedlg`) по номерам, которые видит C#.
+    dialogs: Vec<Option<user_progs::filedlg::Dialog>>,
     /// Начатая, но не законченная строка вывода.
     ///
     /// `Console.Write` за `Console.Write` уходили ядру отдельными `write`, и
@@ -461,6 +463,43 @@ impl Host for Console {
         Some(WindowPixels { pixels: target.window.pixels(), width, height, red_low })
     }
 
+    // Окно выбора файла (20.11): отдельная программа `/bin/filedlg`, модальная
+    // к окну формы. Запрос C# уже собрал строками договора.
+    fn file_dialog_start(&mut self, request: &str, owner: Option<u32>) -> Option<u32> {
+        let owner_id = owner.and_then(|window| self.window_mut(window)).map_or(0, |target| target.window.id());
+        let (mut options, _, _) = user_progs::filedlg::parse_request(request);
+        // Пустой фильтр C# — «все файлы».
+        if options.filters.is_empty() {
+            options.filters = alloc::vec![user_progs::filedlg::Filter::all()];
+        }
+        self.flush_out();
+        match user_progs::filedlg::Dialog::start_owned(&options, owner_id, "dotnet") {
+            Ok(dialog) => {
+                let index = self.dialogs.iter().position(Option::is_none).unwrap_or(self.dialogs.len());
+                if index == self.dialogs.len() {
+                    self.dialogs.push(None);
+                }
+                self.dialogs[index] = Some(dialog);
+                Some(index as u32)
+            }
+            Err(why) => {
+                error(&format!("dotnet: file dialog failed: {why}\n"));
+                None
+            }
+        }
+    }
+
+    fn file_dialog_poll(&mut self, dialog: u32) -> Option<Option<String>> {
+        let Some(slot) = self.dialogs.get_mut(dialog as usize) else { return Some(None) };
+        let Some(active) = slot.as_mut() else { return Some(None) };
+        let outcome = active.poll()?;
+        *slot = None;
+        Some(match outcome {
+            user_progs::filedlg::Outcome::Chosen(path) => Some(path),
+            _ => None,
+        })
+    }
+
     fn window_resize(&mut self, window: u32, width: u32, height: u32) -> bool {
         let Some(target) = self.window_mut(window) else { return false };
         if target.width == width && target.height == height {
@@ -590,6 +629,7 @@ extern "C" fn run(start: usize) -> ! {
         home: home_directory(&settings),
         offset_minutes: sysconf::timezone_minutes(&settings).unwrap_or(0),
         windows: Vec::new(),
+        dialogs: Vec::new(),
         face: None,
         scale: mini_ui::Scale::ONE,
         scale_checked: 0,

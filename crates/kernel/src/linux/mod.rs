@@ -597,8 +597,11 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::COPY_FILE_RANGE => copy_file_range(a0, a1, a2, a3, a4, a5),
             nr::INOTIFY_INIT => ipc::inotify_init(0),
             nr::INOTIFY_INIT1 => ipc::inotify_init(a0),
-            nr::INOTIFY_ADD_WATCH => ipc::inotify_add_watch(a0),
-            nr::INOTIFY_RM_WATCH => 0,
+            nr::INOTIFY_ADD_WATCH => match linux_path(AT_FDCWD, a1) {
+                Ok(linux) => ipc::inotify_add_watch(a0, &fsops::place(&linux), a2 as u32),
+                Err(err) => err,
+            },
+            nr::INOTIFY_RM_WATCH => ipc::inotify_rm_watch(a0, a1),
             // Какие страницы в памяти: все — подкачки нет, а ленивая
             // страница придёт по первому касанию так же быстро.
             nr::MINCORE => {

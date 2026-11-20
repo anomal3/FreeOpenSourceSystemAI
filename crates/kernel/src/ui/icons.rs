@@ -32,8 +32,13 @@
 //! с сам рабочий стол ради каталога, в котором десяток записей. Список
 //! перечитывается там, где стол и так знает, что что-то произошло, и по пункту
 //! «Обновить» — как в любом обозревателе файлов.
+//!
+//! С 20.11 оповещение есть ([`crate::fs::notify`]): каталог стола
+//! перечитывается и тогда, когда его поменял кто угодно другой — см.
+//! [`desktop_folder_changed`].
 
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use mini_ui::draw;
@@ -240,6 +245,48 @@ pub fn hide(label: &str) -> String {
 
 fn is_hidden(label: &str) -> bool {
     HIDDEN.lock().split('|').any(|item| !item.is_empty() && item == label)
+}
+
+/// Наблюдение за каталогом стола (20.11, [`crate::fs::notify`]): каталог и
+/// очередь событий; `true` — событие пришло, а перечитать ещё не удалось.
+static DESK_WATCH: crate::sync::SpinLock<Option<(String, Arc<crate::fs::notify::Queue>, bool)>> = crate::sync::SpinLock::new(None);
+
+/// Сменилось ли что-то в каталоге стола с прошлого раза (Роман, 20.11: файл,
+/// сохранённый на Рабочий стол Блокнотом, появлялся только после «Обновить»).
+/// Спрашивает [`crate::ui::tick`] раз в полсекунды — заодно и пауза, за
+/// которую пачка событий (запись кусками, копирование папки) сливается в одно
+/// перечитывание. `can` — можно ли перечитать сейчас (не идёт правка
+/// подписи): нельзя — перемена ждёт следующего раза.
+pub fn desktop_folder_changed(can: bool) -> bool {
+    let dir = super::context::desktop_dir();
+    let mut watch = DESK_WATCH.lock();
+    // Вошёл другой человек — другой каталог.
+    if watch.as_ref().is_none_or(|(known, ..)| *known != dir) {
+        let Some(queue) = crate::fs::notify::Queue::new() else {
+            return false;
+        };
+        let mask = crate::fs::notify::CREATE | crate::fs::notify::DELETE | crate::fs::notify::MOVED_FROM | crate::fs::notify::MOVED_TO | crate::fs::notify::CLOSE_WRITE;
+        let _ = queue.add(&dir, mask);
+        // Сам стол и его родитель: каталог стола создают и удаляют целиком.
+        let _ = queue.add(&super::context::home_dir(), crate::fs::notify::CREATE | crate::fs::notify::DELETE | crate::fs::notify::MOVED_TO);
+        *watch = Some((dir, queue, false));
+        return false;
+    }
+    let Some((dir, queue, pending)) = watch.as_mut() else {
+        return false;
+    };
+    let events = queue.drain();
+    let leaf = dir.rsplit('/').next().unwrap_or("");
+    // Каталог стола наблюдается первым (номер 1); у родителя — только
+    // события о самом каталоге стола.
+    if events.iter().any(|event| event.wd == 1 || event.name == leaf || event.mask & crate::fs::notify::OVERFLOW != 0) {
+        *pending = true;
+    }
+    if *pending && can {
+        *pending = false;
+        return true;
+    }
+    false
 }
 
 /// Имена и длины записей реестра пакетов одной строкой — дешёвая подпись

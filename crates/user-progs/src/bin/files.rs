@@ -594,6 +594,12 @@ struct Files {
     /// Указатель вошёл в окно над полосой вкладок: до этого времени
     /// проверять, не бросили ли сюда вкладку другого окна.
     drop_watch: Option<u64>,
+    /// Наблюдение за открытой папкой (20.11, `SYS_FSWATCH`): очередь, что
+    /// наблюдается (путь, номер) и пришло ли событие, которое ещё не
+    /// показано (меню или копирование — подождут).
+    watch: i64,
+    watched: Option<(String, i64)>,
+    changed: bool,
 }
 
 /// Что под указателем подсвечено.
@@ -804,9 +810,58 @@ impl Files {
             query: String::new(),
             searching: false,
             offset: local_offset(),
+            watch: user_progs::fswatch_open(),
+            watched: None,
+            changed: false,
         };
         view.reload();
         view
+    }
+
+    /// Папку открытой вкладки поменял кто-то другой (20.11: терминал создал
+    /// файл, Блокнот сохранил) — перечитать, сохранив выделение и прокрутку.
+    /// Зовётся на каждом витке цикла; события за виток сливаются в одно
+    /// перечитывание.
+    fn watch_step(&mut self) -> bool {
+        let want = (!self.on_computer()).then(|| self.path.clone());
+        if want.as_deref() != self.watched.as_ref().map(|(path, _)| path.as_str()) {
+            if let Some((_, wd)) = self.watched.take() {
+                user_progs::fswatch_remove(self.watch, wd);
+            }
+            if let Some(path) = want {
+                let wd = user_progs::fswatch_add(self.watch, &path, 0);
+                if wd >= 0 {
+                    self.watched = Some((path, wd));
+                }
+            }
+            // Только что перешли — список и так свежий.
+            let _ = user_progs::fswatch_read(self.watch);
+            self.changed = false;
+            return false;
+        }
+        if !user_progs::fswatch_read(self.watch).is_empty() {
+            self.changed = true;
+        }
+        let idle = self.menu.is_none() && self.drag.is_none() && self.props.is_none() && self.job.is_none() && self.pop.is_none();
+        if !self.changed || !idle {
+            return false;
+        }
+        self.changed = false;
+        let keep = self.rows.get(self.selected).map(|row| row.name.clone());
+        let marked: Vec<String> = self.picked.iter().filter_map(|index| self.rows.get(*index)).map(|row| row.name.clone()).collect();
+        let offset = self.scroll.offset();
+        self.reload();
+        if let Some(at) = keep.and_then(|name| self.rows.iter().position(|row| row.name == name)) {
+            self.selected = at;
+        }
+        for name in marked {
+            if let Some(at) = self.rows.iter().position(|row| row.name == name) {
+                self.picked.insert(at);
+            }
+        }
+        self.scroll.set(offset);
+        println(&format!("files: folder changed, {} item(s) in {}", self.rows.len(), self.path));
+        true
     }
 
     /// На странице «Этот компьютер»?
@@ -4574,7 +4629,7 @@ impl App for Files {
     /// Копирование кусками — на каждом витке цикла окна; перенос вкладки
     /// между окнами.
     fn step(&mut self) -> bool {
-        self.copy_step() | self.offer_step() | self.watch_drop()
+        self.copy_step() | self.offer_step() | self.watch_drop() | self.watch_step()
     }
 
     fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {

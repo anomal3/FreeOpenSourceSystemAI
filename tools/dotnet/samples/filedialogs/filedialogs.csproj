@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец 20.11: OpenFileDialog, SaveFileDialog, FolderBrowserDialog.
+       На FossAi окна — системное окно выбора файла /bin/filedlg, модальное к
+       форме. Кнопки открывают их, ответ печатается и пишется в подпись;
+       «Сохранить» записывает файл по выбранному пути. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

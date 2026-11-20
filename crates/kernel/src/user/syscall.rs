@@ -214,6 +214,8 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_FDCTL => fdctl(a0, a1, a2),
         // 08.11.2026: блокировки файлов (fcntl F_*LK, flock).
         user_abi::SYS_FLOCK => flock(a0, a1, a2),
+        // 20.11: наблюдение за каталогами (стол, «Файлы», окно выбора файла).
+        user_abi::SYS_FSWATCH => fswatch(a0, a1, a2),
         user_abi::SYS_SOUND => sound(a0, a1, a2),
         // Фаза 68o: вход по SSH в живую систему и команды ядра по сети.
         user_abi::SYS_LIVE_KEYS => live_keys(a0, a1),
@@ -1846,6 +1848,24 @@ fn own_window(id: i64) -> Result<u32, i64> {
     Ok(slot)
 }
 
+/// Номер окна **другой** программы (20.11, владелец окна выбора файла):
+/// `(задача, место)`. Чужое окно можно назвать владельцем, только если
+/// программа запущена тем же пользователем — иначе любая программа могла бы
+/// «заблокировать» окно чужого сеанса своим модальным.
+fn foreign_window(id: i64) -> Result<(u32, u32), i64> {
+    let task = (id as u64 & 0xffff_ffff) as u32;
+    let slot = (id as u64 >> 32) as u32;
+    if id <= 0 || slot >= user_abi::MAX_WINDOWS {
+        return Err(user_abi::ERR_NOT_FOUND);
+    }
+    let mine = super::credentials().uid;
+    match super::uid_of_task(task) {
+        Some(uid) if uid == mine || mine == 0 => Ok((task, slot)),
+        Some(_) => Err(user_abi::ERR_PERMISSION),
+        None => Err(user_abi::ERR_NOT_FOUND),
+    }
+}
+
 /// Чем ответить программе, которой не дали окна.
 fn window_errno(err: super::WindowError) -> i64 {
     use crate::ui::WindowError as Desk;
@@ -2369,19 +2389,25 @@ fn winowner(id: i64, owner: i64, flags: usize) -> i64 {
         Ok(slot) => slot,
         Err(err) => return err,
     };
+    // Владелец — окно этой же программы или (20.11) окно другой программы
+    // того же пользователя: окно выбора файла `/bin/filedlg` над Блокнотом.
     let owner = if owner == 0 {
         None
     } else {
         match own_window(owner) {
-            Ok(owner) => Some(owner),
-            Err(err) => return err,
+            Ok(owner) => Some((sched::current().as_u32(), owner)),
+            Err(_) => match foreign_window(owner) {
+                Ok(pair) => Some(pair),
+                Err(err) => return err,
+            },
         }
     };
-    if flags & !(user_abi::WIN_OWNER_MODAL as usize) != 0 {
+    if flags & !((user_abi::WIN_OWNER_MODAL | user_abi::WIN_OWNER_CENTER) as usize) != 0 {
         return ERR_UNSUPPORTED;
     }
     let modal = flags & user_abi::WIN_OWNER_MODAL as usize != 0;
-    match super::owner_window(slot, owner, modal) {
+    let center = flags & user_abi::WIN_OWNER_CENTER as usize != 0;
+    match super::owner_window(slot, owner, modal, center) {
         Ok(()) => 0,
         Err(err) => window_errno(err),
     }
@@ -2821,6 +2847,83 @@ fn fdctl(fd: usize, op: usize, arg: usize) -> i64 {
         Some(Ok(answer)) => answer,
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `SYS_FSWATCH` (20.11): наблюдение за каталогами — см. договор. Действие —
+/// в старших 32 битах `a0`, дескриптор — в младших.
+fn fswatch(a0: usize, a1: usize, a2: usize) -> i64 {
+    use crate::fs::notify::{Queue, Watcher};
+    let (op, fd) = (a0 >> 32, a0 & 0xffff_ffff);
+    // Очередь за дескриптором — ссылкой, чтобы работать вне замка программы.
+    let queue_of = |fd: usize| -> Result<alloc::sync::Arc<Queue>, i64> {
+        let object = super::with_current(|program| program.files.object(fd)).ok_or(ERR_NO_PROGRAM)?;
+        let (object, _) = object.ok_or(user_abi::ERR_BAD_FD)?;
+        object.as_any().downcast_ref::<Watcher>().map(|watcher| alloc::sync::Arc::clone(&watcher.queue)).ok_or(user_abi::ERR_BAD_FD)
+    };
+    match op {
+        user_abi::FSWATCH_OPEN => {
+            let Some(queue) = Queue::new() else {
+                return ERR_LIMIT;
+            };
+            let object: alloc::sync::Arc<dyn super::files::Object> = alloc::sync::Arc::new(Watcher { queue });
+            match super::with_current(|program| program.files.install_object(object, true)) {
+                Some(Ok(fd)) => fd as i64,
+                Some(Err(err)) => errno(err),
+                None => ERR_NO_PROGRAM,
+            }
+        }
+        user_abi::FSWATCH_ADD => {
+            let (len, mask) = (a2 & 0xffff_ffff, (a2 >> 32) as u32);
+            let mut buffer = [0u8; MAX_PATH];
+            let path = match copy_path(a1, len, &mut buffer) {
+                Ok(path) => path,
+                Err(err) => return err,
+            };
+            // Следить можно за тем, что можно читать.
+            match crate::fs::resolve_as(super::credentials(), path, crate::vfs::perm::Access::READ) {
+                Some(Ok(node)) if node.metadata().kind == crate::vfs::NodeKind::Directory => {}
+                Some(Ok(_)) => return vfs_errno(crate::vfs::VfsError::WrongKind),
+                Some(Err(err)) => return vfs_errno(err),
+                None => return ERR_NO_FILESYSTEM,
+            }
+            let queue = match queue_of(fd) {
+                Ok(queue) => queue,
+                Err(err) => return err,
+            };
+            queue.add(path, mask).map_or(ERR_LIMIT, i64::from)
+        }
+        user_abi::FSWATCH_REMOVE => match queue_of(fd) {
+            Ok(queue) if queue.remove(a1 as i32) => 0,
+            Ok(_) => user_abi::ERR_NOT_FOUND,
+            Err(err) => err,
+        },
+        user_abi::FSWATCH_READ => {
+            let queue = match queue_of(fd) {
+                Ok(queue) => queue,
+                Err(err) => return err,
+            };
+            let len = a2.min(64 * 1024);
+            if len == 0 {
+                return 0;
+            }
+            if !space::user_can(a1, len, PageFlags::WRITE) {
+                return ERR_BAD_ADDRESS;
+            }
+            // Сначала в память ядра: очередь под своим замком, а страница
+            // программы может потребовать подгрузки.
+            let mut staged = alloc::vec![0u8; len];
+            let used = match queue.read_into(&mut staged) {
+                Ok(used) => used,
+                Err(_) => return ERR_LIMIT,
+            };
+            // SAFETY: диапазон проверен по таблицам программы и доступен ей на
+            // запись; ядро и программа не исполняются одновременно.
+            let out = unsafe { core::slice::from_raw_parts_mut(a1 as *mut u8, used) };
+            out.copy_from_slice(&staged[..used]);
+            used as i64
+        }
+        _ => ERR_UNSUPPORTED,
     }
 }
 

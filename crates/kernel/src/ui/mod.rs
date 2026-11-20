@@ -2256,6 +2256,14 @@ pub fn tick() {
         desktop.refresh_panel(&status);
         check_gesture_hold(desktop, &status);
         desktop.reload_icons_if_packages_changed();
+        // Каталог стола поменяли (20.11): программа сохранила туда файл,
+        // терминал удалил — значки следом, без «Обновить».
+        if icons::desktop_folder_changed(desktop.icon_editing().is_none()) {
+            desktop.reload_icons();
+            let (total, entries) = desktop.icon_counts();
+            kprintln!("  desktop     : desktop folder changed, icons {total}, {entries} from {}", context::desktop_dir());
+            desktop.repaint_all();
+        }
         desktop.expire_toast();
         desktop.refresh_lock_clock();
         watch_hung(desktop);
@@ -2797,7 +2805,8 @@ fn wheel(desktop: &mut Compositor, x: i32, y: i32, clicks: i32) {
     } else if desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open() {
         None
     } else {
-        desktop.program_under(x, y).map(|(app, _, _)| app)
+        // Окно, ждущее ответа модального окна (20.11), колесо не крутит.
+        desktop.program_under(x, y).map(|(app, _, _)| app).filter(|app| !desktop.has_modal(*app))
     };
     if let Some(window) = target.and_then(|app| desktop.find(app)) {
         window.push_event(WinEvent { kind: WIN_WHEEL, code: 0, x: clicks, y: 0 });
@@ -3875,6 +3884,14 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         // ни щелчка содержимому (оно досталось бы вопросу, в чужих
         // координатах), ни перетаскивания, ни уголка.
         let popup = app.is_some_and(|app| desktop.is_popup(app));
+        // Окно ждёт ответа модального подчинённого (20.11, «Сохранить как»):
+        // ни содержимое, ни заголовок с кнопками ввода не принимают, как в
+        // Windows; поднятие уже вернуло человека к вопросу.
+        if let Some(owner) = app.filter(|app| !popup && desktop.has_modal(*app)) {
+            kprintln!("  desktop     : '{}' waits for its dialog", name_of(desktop, owner));
+            desktop.present();
+            return;
+        }
         // Двойной щелчок по заголовку (20.11): развернуть или вернуть, как в
         // Windows. Первый щелчок мог прийтись на неактивное окно — он только
         // поднял его, но запомнить его надо и тогда.
@@ -3893,7 +3910,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
             if double {
                 desktop.set_drag(None);
                 let name = name_of(desktop, app);
-                if desktop.find(app).is_some_and(|window| window.resizable()) && desktop.toggle_maximize(app) {
+                if desktop.find(app).is_some_and(|window| window.resizable() && !window.dialog) && desktop.toggle_maximize(app) {
                     kprintln!("  desktop     : title double-click on '{name}'");
                     kprintln!("  desktop     : resized '{name}'");
                     log_window(desktop, app, true);
@@ -6505,9 +6522,10 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
         let Some(window) = desktop.find(app) else {
             return Err(WindowError::NoWindow);
         };
-        // Диалог (20.11) размера не меняет, что бы ни просили вместе с ним.
+        // Диалог (20.11) — один крестик в заголовке; края тянутся, только если
+        // он попросил это вместе с ним (окно выбора файла, как в Windows).
         let dialog = flags & user_abi::WIN_STYLE_DIALOG != 0;
-        let resizable = flags & user_abi::WIN_STYLE_RESIZABLE != 0 && !dialog;
+        let resizable = flags & user_abi::WIN_STYLE_RESIZABLE != 0;
         if window.dialog != dialog {
             window.dialog = dialog;
             window.draw_decorations(focused);
@@ -6590,15 +6608,22 @@ pub fn title_window(task: u32, slot: u32, title: &str) -> Result<(), WindowError
 
 /// Назначить окну программы владельца — её же окно `owner` (фаза 62d,
 /// `user_abi::SYS_WINOWNER`); `None` снимает связь.
-pub fn owner_window(task: u32, slot: u32, owner: Option<u32>, modal: bool) -> Result<(), WindowError> {
+pub fn owner_window(task: u32, slot: u32, owner: Option<(u32, u32)>, modal: bool, center: bool) -> Result<(), WindowError> {
     let app = App::Program(task, slot);
-    let owner = owner.map(|slot| App::Program(task, slot));
+    let owner = owner.map(|(task, slot)| App::Program(task, slot));
     with_desktop(|desktop| {
         if desktop.find(app).is_none() {
             return Err(WindowError::NoWindow);
         }
         if !desktop.set_owner(app, owner, modal) {
             return Err(WindowError::NoWindow);
+        }
+        // Посередине владельца (20.11, окно выбора файла), в пределах
+        // рабочей области; владелец уже поднят вместе с ним (`set_owner`).
+        if let Some(owner) = owner.filter(|_| center) {
+            if desktop.center_over(app, owner) {
+                log_window(desktop, app, desktop.focused_app() == Some(app));
+            }
         }
         if let Some(owner) = owner {
             let kind = if modal { "modal over" } else { "owned by" };

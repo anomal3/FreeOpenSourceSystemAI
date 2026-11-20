@@ -86,6 +86,12 @@ struct Open {
     /// Брал ли этот открытый файл блокировки OFD или `flock` (08.11.2026):
     /// только тогда при его уничтожении есть что снимать в таблице блокировок.
     ofd_locked: AtomicBool,
+    /// Путь файла, открытого на запись по имени (20.11): закрытие после
+    /// записи — событие `FSN_CLOSE_WRITE` наблюдающим за каталогом
+    /// ([`crate::fs::notify`]).
+    path: Option<alloc::boxed::Box<str>>,
+    /// Писали ли в файл через этот открытый.
+    wrote: AtomicBool,
 }
 
 impl Drop for Open {
@@ -94,6 +100,10 @@ impl Drop for Open {
     fn drop(&mut self) {
         if self.ofd_locked.load(Ordering::Relaxed) {
             crate::fs::locks::release(crate::fs::locks::Owner::Open(self as *const Open as usize));
+        }
+        if let Some(path) = self.path.as_deref().filter(|_| self.wrote.load(Ordering::Relaxed)) {
+            crate::fs::notify::emit(path, crate::fs::notify::MODIFY);
+            crate::fs::notify::emit(path, crate::fs::notify::CLOSE_WRITE);
         }
     }
 }
@@ -201,7 +211,7 @@ impl Handle {
     /// (`SCM_RIGHTS`; раскладка клавиатуры Wayland, фаза 71i).
     #[must_use]
     pub fn of_node(node: Arc<dyn Node>, writable: bool) -> Self {
-        Self(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None, append: AtomicBool::new(false), ofd_locked: AtomicBool::new(false) })))
+        Self(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None, append: AtomicBool::new(false), ofd_locked: AtomicBool::new(false), path: None, wrote: AtomicBool::new(false) })))
     }
 }
 
@@ -649,7 +659,8 @@ impl Table {
             None
         };
 
-        if flags & O_TRUNC != 0 && writable {
+        let truncated = flags & O_TRUNC != 0 && writable;
+        if truncated {
             node.truncate(0).map_err(FileError::Vfs)?;
         }
 
@@ -661,6 +672,8 @@ impl Table {
             entries,
             append: AtomicBool::new(false),
             ofd_locked: AtomicBool::new(false),
+            path: writable.then(|| alloc::boxed::Box::from(path)),
+            wrote: AtomicBool::new(truncated),
         })));
         Ok(fd)
     }
@@ -672,7 +685,7 @@ impl Table {
         // Каталог в памяти (`/proc`, фаза 71h) — со снимком имён, как у
         // открытого с диска.
         let entries = if node.metadata().kind == NodeKind::Directory { node.list().ok() } else { None };
-        self.put(fd, Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries, append: AtomicBool::new(false), ofd_locked: AtomicBool::new(false) })));
+        self.put(fd, Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries, append: AtomicBool::new(false), ofd_locked: AtomicBool::new(false), path: None, wrote: AtomicBool::new(false) })));
         Ok(fd)
     }
 
@@ -703,6 +716,8 @@ impl Table {
             entries: None,
             append: AtomicBool::new(false),
             ofd_locked: AtomicBool::new(false),
+            path: Some(alloc::boxed::Box::from(path)),
+            wrote: AtomicBool::new(false),
         })));
         Ok(fd)
     }
@@ -721,6 +736,9 @@ impl Table {
                 };
                 let written = open.node.write_at(at, data).map_err(FileError::Vfs)?;
                 open.offset.store(at + written as u64, Ordering::Relaxed);
+                if open.path.is_some() {
+                    open.wrote.store(true, Ordering::Relaxed);
+                }
                 Ok(written)
             }
             // Запись в канал через дескриптор **не ждёт** места, и это не

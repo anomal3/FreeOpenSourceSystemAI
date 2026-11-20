@@ -336,6 +336,16 @@ pub fn two_thirds(info: &SysInfo) -> (u32, u32) {
     (width, height)
 }
 
+/// Номер окна программы каркаса у стола (ноль — окна ещё нет).
+static WINDOW_ID: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// Номер окна этой программы (20.11): им окно выбора файла
+/// (`crate::filedlg::Dialog`) называет своего владельца.
+#[must_use]
+pub fn window_id() -> i64 {
+    WINDOW_ID.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Открыть окно размера `size` и крутить его, пока не закроют.
 ///
 /// Состояние программы строится **после** открытия окна (`make`): строка
@@ -363,6 +373,7 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
     };
 
     let mut area = Rect::new(0, 0, width, height);
+    WINDOW_ID.store(window.id(), core::sync::atomic::Ordering::Relaxed);
     println(&format!("{}: window '{}' opened, {width}x{height}", spec.name, spec.title));
     let mut app = make(Ctx::scaled(scale), area);
     // Тянуть за край и разворачивать — как всякое окно (Роман, 27.10:

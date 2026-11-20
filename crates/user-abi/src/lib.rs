@@ -1443,6 +1443,17 @@ pub const SYS_WINOWNER: usize = 76;
 /// поднятии уходит подчинённому.
 pub const WIN_OWNER_MODAL: u32 = 1;
 
+/// [`SYS_WINOWNER`] (20.11): поставить окно посередине владельца (в
+/// пределах рабочей области) — так открываются окна выбора файла.
+///
+/// С 20.11 владелец бывает и окном **другой** программы того же
+/// пользователя: `/bin/filedlg` открывает «Сохранить как» над Блокнотом,
+/// который его запустил. Номер окна несёт номер задачи (см. [`SYS_WINOPEN`]),
+/// так что владелец назван однозначно. Модальное окно чужой программы не
+/// получает своей кнопки на панели задач, владелец ввода не принимает, пока
+/// оно открыто, а закрытие владельца закрывает и его.
+pub const WIN_OWNER_CENTER: u32 = 2;
+
 /// Открыть всплывающее окно над окном-владельцем. `(указатель на
 /// WindowSpec, id владельца, (x << 32) | y) -> 0` (фаза 62e).
 ///
@@ -1697,6 +1708,55 @@ pub const SYS_SIGACTION: usize = 91;
 /// Выход из обработчика отказа: регистры, флаги и x87/SSE — из `ucontext`,
 /// на который указывает стек (`ret` обработчика снял адрес возврата).
 pub const SYS_SIGRETURN: usize = 92;
+
+/// Наблюдение за каталогами (20.11, как `inotify` Linux):
+/// `((действие << 32) | дескриптор, a1, a2)` — действие [`FSWATCH_OPEN`],
+/// [`FSWATCH_ADD`], [`FSWATCH_REMOVE`] или [`FSWATCH_READ`].
+///
+/// * `OPEN: (0, 0, 0) -> дескриптор` — очередь событий (не ждущая);
+///   закрывается обычным [`SYS_CLOSE`], вместе с ней снимаются все её
+///   наблюдения.
+/// * `ADD: (…, указатель на путь, (маска << 32) | длина) -> номер наблюдения`
+///   — следить за каталогом (маска — `FSN_*`, ноль — все).
+/// * `REMOVE: (…, номер, 0) -> 0`.
+/// * `READ: (…, буфер, длина) -> байт` — события, разобранные
+///   записями [`FsEvent`] с именем следом (как `struct inotify_event`: имя
+///   с нулём и выравниванием до 16 байт входит в `len`). Ноль — событий нет:
+///   вызов не ждёт.
+///
+/// Событие говорит об **имени в каталоге**: создан, удалён, переименован,
+/// записан и закрыт файл. Стол обновляет по ним значки, «Файлы» — открытые
+/// папки, окно выбора файла — свой список.
+pub const SYS_FSWATCH: usize = 93;
+/// Действия [`SYS_FSWATCH`].
+pub const FSWATCH_OPEN: usize = 0;
+pub const FSWATCH_ADD: usize = 1;
+pub const FSWATCH_REMOVE: usize = 2;
+pub const FSWATCH_READ: usize = 3;
+/// Маска события [`SYS_FSWATCH`] — те же биты, что у `inotify` Linux.
+pub const FSN_MODIFY: u32 = 0x2;
+pub const FSN_ATTRIB: u32 = 0x4;
+pub const FSN_CLOSE_WRITE: u32 = 0x8;
+pub const FSN_MOVED_FROM: u32 = 0x40;
+pub const FSN_MOVED_TO: u32 = 0x80;
+pub const FSN_CREATE: u32 = 0x100;
+pub const FSN_DELETE: u32 = 0x200;
+pub const FSN_DELETE_SELF: u32 = 0x400;
+/// Очередь переполнилась: часть событий потеряна, перечитать каталог целиком.
+pub const FSN_OVERFLOW: u32 = 0x4000;
+/// Имя — каталог.
+pub const FSN_ISDIR: u32 = 0x4000_0000;
+
+/// Запись события [`SYS_FSWATCH`] (раскладка `struct inotify_event`); за ней
+/// `len` байт имени — с нулём в конце и нулями до кратного 16.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FsEvent {
+    pub wd: i32,
+    pub mask: u32,
+    pub cookie: u32,
+    pub len: u32,
+}
 
 /// Размер буфера вывода [`SYS_KERNEL_COMMAND`].
 pub const KERNEL_COMMAND_OUT: usize = 64 * 1024;
@@ -2803,6 +2863,7 @@ mod tests {
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
             SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK, SYS_MODEM, SYS_FLOCK,
+            SYS_FSWATCH,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(

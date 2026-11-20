@@ -1524,11 +1524,14 @@ impl Compositor {
         order
             .into_iter()
             // Всплывающему окну кнопка не положена: меню — часть формы.
-            .filter(|(_, window)| !window.popup)
+            // Модальному подчинённому (20.11, «Сохранить как») — тоже: кнопка
+            // одна, у владельца, и она активна, пока активен его вопрос.
+            .filter(|(_, window)| !window.popup && !(window.modal && window.owner.is_some()))
             .map(|(index, window)| super::panel::Entry {
                 app: window.app,
                 caption: window.label(),
-                focused: index == self.focus,
+                focused: index == self.focus
+                    || self.windows.get(self.focus).is_some_and(|top| top.modal && top.owner == Some(window.app)),
                 minimized: window.minimized,
                 art: window.icon_art(),
                 group: if window.group.is_empty() { alloc::string::String::from(window.app.title()) } else { window.group.clone() },
@@ -1707,6 +1710,39 @@ impl Compositor {
                 self.raise(index);
             }
         }
+        true
+    }
+
+    /// Есть ли у окна `app` открытое модальное подчинённое (20.11): пока оно
+    /// открыто, владелец ввода не принимает — ни щелчков, ни колеса, ни кнопок
+    /// заголовка, как окно под «Сохранить как» в Windows.
+    #[must_use]
+    pub fn has_modal(&self, app: App) -> bool {
+        self.windows.iter().any(|window| window.owner == Some(app) && window.modal)
+    }
+
+    /// Поставить окно `app` посередине окна `owner` в пределах рабочей
+    /// области (20.11, `WIN_OWNER_CENTER`). `true` — сдвинуто.
+    pub fn center_over(&mut self, app: App, owner: App) -> bool {
+        let Some(over) = self.rect_of(owner) else {
+            return false;
+        };
+        let work = self.app_area_for(over);
+        let Some(window) = self.find(app) else {
+            return false;
+        };
+        let before = window.rect;
+        let (w, h) = (before.w as i32, before.h as i32);
+        let x = (over.x + (over.w as i32 - w) / 2).min(work.right() - w).max(work.x);
+        let y = (over.y + (over.h as i32 - h) / 2).min(work.bottom() - h).max(work.y);
+        if (x, y) == (before.x, before.y) {
+            return false;
+        }
+        window.rect.x = x;
+        window.rect.y = y;
+        let after = window.rect;
+        self.mark_layer(before);
+        self.mark_layer(after);
         true
     }
 
@@ -2678,6 +2714,17 @@ impl Compositor {
         let rect = window.rect;
         self.mark_layer(rect);
         self.start_flight(app, rect, false);
+        // Модальное подчинённое (20.11, «Сохранить как») уходит вместе с
+        // владельцем и вместе с ним вернётся (см. [`Self::restore`]).
+        let mut owned = Vec::new();
+        for other in self.windows.iter_mut().filter(|other| other.owner == Some(app) && other.modal && !other.minimized) {
+            other.minimized = true;
+            other.minimized_at_ms = crate::time::uptime_ms();
+            owned.push(other.rect);
+        }
+        for rect in owned {
+            self.mark_layer(rect);
+        }
         // Фокус переезжает на **верхнее из оставшихся видимых**. Прежде здесь
         // стоял `focus_next`, а тот поднимает нулевое окно, не спрашивая, не
         // свёрнуто ли оно: свернув последнее видимое, система делала активным
@@ -2687,7 +2734,7 @@ impl Compositor {
         // [`Compositor::focused_app`] назовёт его неактивным, то есть ввод
         // достанется оболочке — единственному месту, где команду ещё можно
         // набрать.
-        if self.focus == index {
+        if self.focus == index || self.windows.get(self.focus).is_some_and(|window| window.minimized) {
             if let Some(next) = self.windows.iter().rposition(|window| !window.minimized) {
                 self.raise(next);
             }
@@ -2710,6 +2757,17 @@ impl Compositor {
         // значит показать надо всё окно целиком, а не то, что в нём изменилось.
         window.damage = Rect::new(0, 0, window.rect.w, window.rect.h);
         let rect = window.rect;
+        // Модальное подчинённое, свёрнутое вместе с владельцем (20.11), —
+        // обратно сразу: полёт показывает только владельца.
+        let mut owned = Vec::new();
+        for other in self.windows.iter_mut().filter(|other| other.owner == Some(app) && other.modal && other.minimized) {
+            other.minimized = false;
+            other.damage = Rect::new(0, 0, other.rect.w, other.rect.h);
+            owned.push(other.rect);
+        }
+        for rect in owned {
+            self.mark_layer(rect);
+        }
         // Окно возвращается полётом из стопки. Свёрнутым оно остаётся до конца
         // полёта: иначе на экране было бы сразу два окна — готовое на месте и
         // летящее к нему.
@@ -2862,6 +2920,12 @@ impl Compositor {
         // Подчинённые закрытого окна остаются без владельца, а не с номером
         // окна, которого нет: следующее окно с тем же номером их бы «усыновило».
         for other in self.windows.iter_mut().filter(|other| other.owner == Some(app)) {
+            // Модальное окно другой программы (20.11, окно выбора файла)
+            // без владельца не нужно никому: его просят закрыться.
+            let foreign = matches!((other.app, app), (App::Program(mine, _), App::Program(theirs, _)) if mine != theirs);
+            if foreign && other.modal {
+                other.push_event(user_abi::WinEvent { kind: user_abi::WIN_CLOSE, code: 0, x: 0, y: 0 });
+            }
             other.owner = None;
             other.modal = false;
         }
