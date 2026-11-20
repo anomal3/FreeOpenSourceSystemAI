@@ -643,7 +643,12 @@ fn report_dir() -> String {
         return desktop;
     }
     // Живая система без домашней папки (у root на флешке её нет) — /tmp.
-    if stat(&home, &mut info) >= 0 && info.kind == KIND_DIRECTORY { home } else { String::from("/tmp") }
+    if stat(&home, &mut info) >= 0 && info.kind == KIND_DIRECTORY {
+        return home;
+    }
+    // На живой системе и /tmp может не быть: заводится при нужде.
+    let _ = user_progs::mkdir("/tmp", 0o1777);
+    String::from("/tmp")
 }
 
 fn list_dirs(path: &str) -> Vec<String> {

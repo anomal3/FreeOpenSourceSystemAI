@@ -2489,6 +2489,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("services: closing on request", 15_000),
             Step::Wait(1_000),
             // ── «Очистка диска»: файл в /tmp, очистить, файла нет
+            Step::Line("mkdir /tmp"),
+            Step::Wait(300),
             Step::Line("echo junk for the cleanup test > /tmp/junk.txt"),
             Step::Wait(500),
             Step::Line("run -b /bin/cleanmgr"),
