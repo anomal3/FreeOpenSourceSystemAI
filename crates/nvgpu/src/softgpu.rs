@@ -692,7 +692,14 @@ impl Exec<'_> {
         if mthd < host::LIMIT {
             return self.host_method(ch, subc, mthd, data);
         }
-        let class = ch.subch[subc as usize];
+        let mut class = ch.subch[subc as usize];
+        // Подканал 4 у Volta+ — копировальный движок и без SET_OBJECT:
+        // NVK его не привязывает (`nvk_upload_queue.c`, заливки и копии
+        // `nvk_cmd_copy.c` идут сразу методами NV90B5), и железо это
+        // принимает (20.11, `gpu gametest soft`: канал убивался на 0x408).
+        if class == 0 && subc == 4 {
+            class = 0xc7b5;
+        }
         if class == 0 {
             return Err(format!("метод {mthd:#x} на подканале {subc} без объекта"));
         }
