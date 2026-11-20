@@ -158,11 +158,11 @@ impl Info {
         let path = format!("{}/sysinfo.txt", report_dir());
         match save(&path, &text) {
             Ok(()) => {
-                println(&format!("sysinfo: exported {} line(s) to {path}", text.lines().count()));
+                println(&format!("sysinfo: export to {path}: ok, {} line(s)", text.lines().count()));
                 self.note = Some(format!("Сведения сохранены: {path}"));
             }
             Err(code) => {
-                println(&format!("sysinfo: FAILED exporting to {path}: {code}"));
+                println(&format!("sysinfo: export to {path}: FAILED {code} (no writable folder?)"));
                 self.note = Some(format!("Не удалось записать {path} (код {code})"));
             }
         }
@@ -687,8 +687,8 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         let path = args.get(2).map_or_else(|| format!("{}/sysinfo.txt", report_dir()), String::from);
         let text = full_report();
         match save(&path, &text) {
-            Ok(()) => println(&format!("sysinfo: exported {} line(s) to {path}", text.lines().count())),
-            Err(code) => println(&format!("sysinfo: FAILED exporting to {path}: {code}")),
+            Ok(()) => println(&format!("sysinfo: export to {path}: ok, {} line(s)", text.lines().count())),
+            Err(code) => println(&format!("sysinfo: export to {path}: FAILED {code}")),
         }
         user_progs::exit(0);
     }

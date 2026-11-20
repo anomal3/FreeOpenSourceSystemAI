@@ -444,10 +444,10 @@ impl EventLog {
             close(fd);
         }
         if ok {
-            println(&format!("eventlog: report saved to {path}, {} byte(s), {} event(s)", text.len(), self.events.len()));
+            println(&format!("eventlog: report to {path}: ok, {} byte(s), {} event(s)", text.len(), self.events.len()));
             self.note = Some(format!("Отчёт сохранён: {path}"));
         } else {
-            println(&format!("eventlog: FAILED saving the report to {path} ({fd})"));
+            println(&format!("eventlog: report to {path}: FAILED {fd} (no writable folder?)"));
             self.note = Some(format!("Не удалось сохранить {path}"));
         }
     }
