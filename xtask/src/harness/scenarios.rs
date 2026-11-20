@@ -12543,8 +12543,9 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            // Писать живая система умеет только на том btrfs (`/data`): дома
-            // у root здесь нет, и окно начинает с корня.
+            // Писать живая система умеет на томе btrfs (`/data`) и в RAM-папках
+            // /tmp и /root (8d05a09): окно заводит в доме root стандартные папки
+            // и начинает с «Документов».
             Step::Await("data        : mounted read-write", BOOT),
             Step::Await(PROMPT, 60_000),
             Step::Line("rm /data/dialog-test.txt"),
@@ -12556,17 +12557,23 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_000),
             Step::Type("hello dialog"),
             Step::Key("ctrl-shift-s"),
-            Step::Await("notepad: save dialog at /", 15_000),
+            Step::Await("notepad: save dialog at /root/Documents", 15_000),
             Step::Wait(1_500),
             Step::Shot("01-save-as"),
-            // Мышью (окно 853x480, карточка 829x456 в точке 12,12): «Этот
-            // компьютер» в быстром доступе, затем двойной щелчок по первому
-            // тому — «Данные (/data)».
-            Step::Aim(Aim::Program("Notepad", 100, 126)),
+            // Мышью (карточка в точке 12,12 окна): «Этот компьютер» в быстром
+            // доступе — под «Главной» и шестью стандартными папками дома: строки
+            // по 30 точек от 126, перед «Этим компьютером» зазор 11 (place_rects).
+            Step::Aim(Aim::Program("Notepad", 100, 126 + 7 * 30 + 11)),
             Step::Click,
             Step::Await("notepad: filedlg: at computer:", 15_000),
             Step::Wait(1_000),
             Step::Shot("02-computer"),
+            // В «Этом компьютере» рядом с томами — те же папки дома, все по
+            // алфавиту: поиск «data» (Ctrl+F) оставляет один «Данные (/data)»,
+            // двойной щелчок по первой строке — в него.
+            Step::Key("ctrl-f"),
+            Step::Type("data"),
+            Step::Wait(800),
             Step::Aim(Aim::Program("Notepad", 350, 155)),
             Step::DoubleClick,
             Step::Await("notepad: filedlg: at /data", 15_000),
