@@ -803,7 +803,9 @@ exec 2>&1
 P=/opt/proton/bin/fossai-proton
 B=/opt/debian/bin/bash
 X=/opt/proton/share/fossai/d3dprobe.exe
-NVK="--env=FOSSAI_VULKAN=nvk"
+# Только NVK (fossai-proton читает FOSSAI_VULKAN до разбора `--env=`).
+export FOSSAI_VULKAN=nvk
+NVK=
 WHAT=${1:-all}
 VKFAIL=
 pass=0; fail=0; names=

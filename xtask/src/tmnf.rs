@@ -91,7 +91,7 @@ done\n\
 # и NVK за 60 с называет себя в vulkaninfo - Direct3D 9 через DXVK на\n\
 # видеокарте (RTX 3060 через GSP-RM). Иначе - как раньше, процессор.\n\
 if [ \"$GPU\" = auto ] && [ -e /dev/dri/renderD128 ] && [ \"$FOSSAI_VULKAN\" != lvp ]; then\n\
-    I=$(/opt/debian/bin/timeout -k 5 60 /opt/debian/bin/bash $P --env=FOSSAI_VULKAN=nvk --run=vulkaninfo --summary 2>&1)\n\
+    I=$(FOSSAI_VULKAN=nvk /opt/debian/bin/timeout -k 5 60 /opt/debian/bin/bash $P --run=vulkaninfo --summary 2>&1)\n\
     case $I in\n\
         *NVK*) GPU=nvk; echo \"tmnf: the video card answers through NVK - DXVK on the GPU\" ;;\n\
         *) GPU=cpu; echo \"tmnf: NVK did not answer in 60 s - drawing on the CPU: ${I:0:300}\" ;;\n\

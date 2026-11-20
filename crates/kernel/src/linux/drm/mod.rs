@@ -366,7 +366,7 @@ pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
     let object = object_of(fd)?;
     let request = request as u32;
     if let Some(file) = object.as_any().downcast_ref::<DrmFile>() {
-        let answer = file_ioctl(file, request, arg);
+        let answer = file_ioctl(file, canonical(request), arg);
         if trace() || (answer < 0 && answer != -e::EAGAIN && answer != -ETIME) {
             log_ioctl(request, answer);
         }
@@ -379,6 +379,56 @@ pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
         return Some(-e::ENOTTY);
     }
     None
+}
+
+/// Номер ioctl так, как его знает ядро. Linux (`drm_ioctl`) берёт из запроса
+/// программы только тип, номер и размер, а направление копирования — из своей
+/// таблицы: libdrm `drmCommandWrite` шлёт `DRM_IOW` там, где в заголовке
+/// `DRM_IOWR` (20.11, QEMU: Mesa NVK звал VM_INIT как 0x40106450, а не
+/// 0xc0106450, получал ENOTTY и откатывался на lavapipe). Неизвестное —
+/// как есть (NVIF разбирается по одному номеру).
+fn canonical(request: u32) -> u32 {
+    const KNOWN: &[u32] = &[
+        nvgpu::uapi::DRM_IOCTL_VERSION,
+        nvgpu::uapi::DRM_IOCTL_GET_UNIQUE,
+        nvgpu::uapi::DRM_IOCTL_GET_MAGIC,
+        nvgpu::uapi::DRM_IOCTL_GEM_CLOSE,
+        nvgpu::uapi::DRM_IOCTL_GET_CAP,
+        nvgpu::uapi::DRM_IOCTL_SET_CLIENT_CAP,
+        nvgpu::uapi::DRM_IOCTL_AUTH_MAGIC,
+        nvgpu::uapi::DRM_IOCTL_SET_MASTER,
+        nvgpu::uapi::DRM_IOCTL_DROP_MASTER,
+        nvgpu::uapi::DRM_IOCTL_PRIME_HANDLE_TO_FD,
+        nvgpu::uapi::DRM_IOCTL_PRIME_FD_TO_HANDLE,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_CREATE,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_DESTROY,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_WAIT,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_RESET,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_SIGNAL,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_QUERY,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_TRANSFER,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+        nvgpu::uapi::DRM_IOCTL_SYNCOBJ_EVENTFD,
+        nvgpu::uapi::DRM_IOCTL_NOUVEAU_GETPARAM,
+        nvgpu::uapi::DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC,
+        nvgpu::uapi::DRM_IOCTL_NOUVEAU_CHANNEL_FREE,
+        nvgpu::uapi::DRM_IOCTL_NOUVEAU_VM_INIT,
+        nvgpu::uapi::DRM_IOCTL_NOUVEAU_VM_BIND,
+        nvgpu::uapi::DRM_IOCTL_NOUVEAU_EXEC,
+        nvgpu::uapi::DRM_IOCTL_NOUVEAU_GEM_NEW,
+        nvgpu::uapi::DRM_IOCTL_NOUVEAU_GEM_PUSHBUF,
+        nvgpu::uapi::DRM_IOCTL_NOUVEAU_GEM_CPU_PREP,
+        nvgpu::uapi::DRM_IOCTL_NOUVEAU_GEM_CPU_FINI,
+        nvgpu::uapi::DRM_IOCTL_NOUVEAU_GEM_INFO,
+    ];
+    if (request >> 8) & 0xff != DRM_TYPE {
+        return request;
+    }
+    let key = request & 0x3fff_ffff;
+    KNOWN.iter().copied().find(|k| k & 0x3fff_ffff == key).unwrap_or(request)
 }
 
 /// Сколько строк об ошибках ioctl уже ушло в журнал (без `nvk trace` — не
