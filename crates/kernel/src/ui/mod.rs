@@ -2734,6 +2734,11 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
     } else {
         desktop.hover_title(-1, -1);
     }
+    // Макеты прилипания от кнопки «Развернуть» (20.11): подсветка зоны,
+    // уход с плашки и кнопки — закрыть.
+    if desktop.dragging().is_none() {
+        desktop.snap_layouts_hover(x, y);
+    }
     // Форма курсора (72c): растяжка у уголка и пока тянут, текст над
     // терминалом, иначе стрелка.
     let shape = if desktop.resizing() {
@@ -2742,11 +2747,6 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
         pointer::Shape::Arrow
     } else {
         match desktop.window_at(x, y) {
-    // Макеты прилипания от кнопки «Развернуть» (20.11): подсветка зоны,
-    // уход с плашки и кнопки — закрыть.
-    if desktop.dragging().is_none() {
-        desktop.snap_layouts_hover(x, y);
-    }
             Some((_, Hit::Resize(edges))) => resize_shape(edges),
             Some((index, Hit::Body)) if desktop.app_at(index).is_some_and(App::is_terminal) => pointer::Shape::Text,
             // Окно программы выбирает форму само (SYS_WINCURSOR): рука над
@@ -2949,6 +2949,8 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         // прилипает к краю соседнего.
         if let Some(window) = desktop.find(App::Settings).filter(|w| w.settings_dragging()) {
             if window.settings_drag(x, y) {
+                // Ползунок размера Dock (20.11): Dock пересобирается живьём.
+                desktop.refresh_panel(status);
                 desktop.present();
             }
         }
@@ -2958,8 +2960,6 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     if (dx != 0 || dy != 0) && event.buttons.contains(Buttons::LEFT) {
         // Палец ведут по полоске жеста — запомнить, где он и когда сдвинулся.
         if let Some(swipe) = SWIPE.lock().as_mut() {
-                // Ползунок размера Dock (20.11): Dock пересобирается живьём.
-                desktop.refresh_panel(status);
             swipe.move_to(x, y, crate::time::uptime_ms());
         }
         icon_gesture_to(desktop, x, y);
@@ -3645,15 +3645,6 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         return;
     }
 
-    // 0-thumbs. Миниатюры окон над панелью (72e).
-    if desktop.thumbs_open() && press_thumbs(desktop, x, y, status) {
-        return;
-    }
-
-    // 0. Меню стола — оно поверх всего, включая меню запуска.
-    if desktop.context_open() {
-        // Пока в меню набирают имя или отвечают на вопрос об удалении, щелчок
-        // внутрь него не пункт: пунктов там сейчас не нарисовано. Щелчок мимо
     // 0-snap. Макеты прилипания (20.11, как Snap Layouts в Windows 11):
     // щелчок по зоне ставит окно в неё, мимо плашки — закрывает её.
     if desktop.snap_layouts_open() {
@@ -3669,6 +3660,15 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         }
     }
 
+    // 0-thumbs. Миниатюры окон над панелью (72e).
+    if desktop.thumbs_open() && press_thumbs(desktop, x, y, status) {
+        return;
+    }
+
+    // 0. Меню стола — оно поверх всего, включая меню запуска.
+    if desktop.context_open() {
+        // Пока в меню набирают имя или отвечают на вопрос об удалении, щелчок
+        // внутрь него не пункт: пунктов там сейчас не нарисовано. Щелчок мимо
         // — отказ, как и Esc.
         if desktop.context_editing() {
             if !desktop.context_contains(x, y) {
@@ -4624,23 +4624,6 @@ fn desktop_plan(primary: &boot_info::Framebuffer, size: Option<(u32, u32)>) -> V
             entry.rect.y = py;
             x += entry.rect.w as i32;
         }
-    }
-    // Стол начинается в левом верхнем углу охватывающего прямоугольника.
-    let min_x = plan.iter().map(|p| p.rect.x).min().unwrap_or(0);
-    let min_y = plan.iter().map(|p| p.rect.y).min().unwrap_or(0);
-    for entry in &mut plan {
-        entry.rect = entry.rect.translate(-min_x, -min_y);
-    }
-    plan
-}
-
-/// Основной монитор сменил размер `from` → `to`: мониторы правее и ниже
-/// него сдвигаются на разницу, чтобы раскладка не разъехалась щелью или
-/// наложением.
-fn shift_registry(primary: Option<crate::display::outputs::Backend>, from: (u32, u32), to: (u32, u32)) {
-    use crate::display::outputs;
-    let Some(primary) = primary else { return };
-    let registry = outputs::list();
     } else if plan.len() > 1 && plan.iter().enumerate().any(|(i, a)| !plan.iter().enumerate().any(|(j, b)| i != j && touches(a.rect, b.rect))) {
         // Щель между мониторами (железо Романа, 20.11: раскладка, сохранённая
         // при 1280×720 прошивки, после 2560×1440 оставила второй монитор в
@@ -4660,6 +4643,30 @@ fn shift_registry(primary: Option<crate::display::outputs::Backend>, from: (u32,
             });
         }
         kprintln!("  desktop     : monitor layout had gaps -- packed edge to edge");
+    }
+    // Стол начинается в левом верхнем углу охватывающего прямоугольника.
+    let min_x = plan.iter().map(|p| p.rect.x).min().unwrap_or(0);
+    let min_y = plan.iter().map(|p| p.rect.y).min().unwrap_or(0);
+    for entry in &mut plan {
+        entry.rect = entry.rect.translate(-min_x, -min_y);
+    }
+    plan
+}
+
+/// Мониторы соприкасаются краями (общий отрезок стороны).
+fn touches(a: Rect, b: Rect) -> bool {
+    let side = (a.right() == b.x || b.right() == a.x) && a.y < b.bottom() && b.y < a.bottom();
+    let stack = (a.bottom() == b.y || b.bottom() == a.y) && a.x < b.right() && b.x < a.right();
+    side || stack
+}
+
+/// Основной монитор сменил размер `from` → `to`: мониторы правее и ниже
+/// него сдвигаются на разницу, чтобы раскладка не разъехалась щелью или
+/// наложением.
+fn shift_registry(primary: Option<crate::display::outputs::Backend>, from: (u32, u32), to: (u32, u32)) {
+    use crate::display::outputs;
+    let Some(primary) = primary else { return };
+    let registry = outputs::list();
     let Some(main) = registry.iter().find(|o| o.backend == primary) else { return };
     let (right, bottom) = (main.x + from.0 as i32, main.y + from.1 as i32);
     let (dx, dy) = (to.0 as i32 - from.0 as i32, to.1 as i32 - from.1 as i32);
@@ -4670,13 +4677,6 @@ fn shift_registry(primary: Option<crate::display::outputs::Backend>, from: (u32,
         let (nx, ny) = (if o.x >= right { o.x + dx } else { o.x }, if o.y >= bottom { o.y + dy } else { o.y });
         if (nx, ny) != (o.x, o.y) {
             outputs::update(o.backend, |out| {
-/// Мониторы соприкасаются краями (общий отрезок стороны).
-fn touches(a: Rect, b: Rect) -> bool {
-    let side = (a.right() == b.x || b.right() == a.x) && a.y < b.bottom() && b.y < a.bottom();
-    let stack = (a.bottom() == b.y || b.bottom() == a.y) && a.x < b.right() && b.x < a.right();
-    side || stack
-}
-
                 out.x = nx;
                 out.y = ny;
             });
