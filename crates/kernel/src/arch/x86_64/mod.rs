@@ -394,10 +394,16 @@ pub fn live_user_bases() -> (Option<u64>, Option<u64>) {
     use core::sync::atomic::Ordering::Relaxed;
     let cpu = crate::smp::cpu();
     let known = |value: u64| (value != u64::MAX).then_some(value);
-    let fs = if user_fs_selector() != 0 {
-        None
-    } else if fsgsbase() {
+    // С FSGSBASE база FS — своё состояние, независимое от селектора, как у
+    // Linux (`x86_fsgsbase_load`): Wine в WoW64 входит в unix-часть с
+    // селектором TEB32 в FS и ставит базу pthread `wrfsbase`. Сохранять её
+    // надо и при ненулевом селекторе, иначе после переключения селектор
+    // вернул бы базу TEB32, и glibc читал бы мимо (TMNF setup, 20.11:
+    // page fault at 0x308).
+    let fs = if fsgsbase() {
         Some(rdfsbase())
+    } else if user_fs_selector() != 0 {
+        None
     } else {
         known(FS_BASE_NOW[cpu].load(Relaxed))
     };
@@ -473,6 +479,12 @@ pub fn enter_user_segments(tls: u64, fs_selector: u16, tls_entries: &[u64; 3]) {
     }
     if fs_selector != 0 {
         load_fs_selector(fs_selector);
+        // База — та, что была при уходе (см. `live_user_bases`): загрузка
+        // селектора поставила базу дескриптора.
+        if fsgsbase() {
+            wrfsbase(tls);
+            FS_BASE_NOW[crate::smp::cpu()].store(tls, core::sync::atomic::Ordering::Relaxed);
+        }
         return;
     }
     if user_fs_selector() != 0 {
