@@ -2272,6 +2272,11 @@ fn ui_status(argument: &str) {
         ui::taskbar_command(words);
         return;
     }
+    // «Оформление» и глубина цвета (20.11): `ui look simple`, `ui look depth 8`.
+    if let Some(words) = argument.trim().strip_prefix("look") {
+        ui::look::command(words);
+        return;
+    }
     if let Some(words) = argument.trim().strip_prefix("start") {
         ui::start_command(words);
         return;

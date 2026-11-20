@@ -66,6 +66,8 @@ pub enum Section {
     Personal,
     Wallpaper,
     Colors,
+    /// «Оформление» (20.11): наборы «Современный»/«Простой» и эффекты.
+    Appearance,
     Dock,
     /// «Пуск» (20.11): ширина, разделы, закреплённые.
     Start,
@@ -102,7 +104,7 @@ const NAV: [Section; 13] = [
 ];
 
 /// Все страницы — для поиска.
-const ALL: [Section; 25] = [
+const ALL: [Section; 26] = [
     Section::Home,
     Section::System,
     Section::Display,
@@ -116,6 +118,7 @@ const ALL: [Section; 25] = [
     Section::Personal,
     Section::Wallpaper,
     Section::Colors,
+    Section::Appearance,
     Section::Dock,
     Section::Start,
     Section::Explorer,
@@ -147,6 +150,7 @@ impl Section {
             Section::Personal => "Персонализация",
             Section::Wallpaper => "Фон",
             Section::Colors => "Цвета",
+            Section::Appearance => "Оформление",
             Section::Dock => "Dock и панель задач",
             Section::Start => "Пуск",
             Section::Explorer => "Проводник",
@@ -177,7 +181,7 @@ impl Section {
                 Some(Section::System)
             }
             Section::Keyboard | Section::Usb => Some(Section::Devices),
-            Section::Wallpaper | Section::Colors => Some(Section::Personal),
+            Section::Wallpaper | Section::Colors | Section::Appearance => Some(Section::Personal),
             Section::Start => Some(Section::Dock),
             Section::Packages | Section::Services | Section::DefaultApps => Some(Section::Apps),
             _ => None,
@@ -205,6 +209,7 @@ impl Section {
             Section::Network => Fi::Globe,
             Section::Personal | Section::Colors => Fi::Palette,
             Section::Wallpaper => Fi::Image,
+            Section::Appearance => Fi::Sliders,
             Section::Dock => Fi::Dock,
             Section::Start => Fi::Apps,
             Section::Explorer => Fi::Folder,
@@ -256,9 +261,10 @@ impl Section {
             Section::Keyboard => "Раскладка и горячие клавиши",
             Section::Usb => "Подключённые устройства и контроллеры",
             Section::Network => "Адрес: по DHCP или постоянный",
-            Section::Personal => "Фон, цвета, тема",
+            Section::Personal => "Фон, цвета, тема, оформление",
             Section::Wallpaper => "Градиент рабочего стола",
             Section::Colors => "Тема, акцентный цвет, заголовок окна",
+            Section::Appearance => "Современный или простой вид, эффекты, контур окна",
             Section::Dock => "Вид, сторона экрана, автоскрытие, значки",
             Section::Start => "Ширина, разделы и закреплённые программы",
             Section::Explorer => "Файловый менеджер",
@@ -279,7 +285,7 @@ impl Section {
         match self {
             Section::Home => "главная обзор",
             Section::System => "система уведомления",
-            Section::Display => "дисплей экран разрешение масштаб режим монитор мониторы частота основной расположение",
+            Section::Display => "дисплей экран разрешение масштаб режим монитор мониторы частота основной расположение глубина цвета бит цветов",
             Section::Power => "питание выключить перезагрузить гасить экран сон",
             Section::Storage => "хранилище диск том проверка fsck смонтировано место",
             Section::About => "о системе версия архитектура процессор память время работы сборка",
@@ -290,6 +296,7 @@ impl Section {
             Section::Personal => "персонализация оформление",
             Section::Wallpaper => "фон обои градиент",
             Section::Colors => "цвета тема тёмная светлая акцент заголовок",
+            Section::Appearance => "оформление интерфейс вид эффекты анимация сворачивание открытие тени прозрачность размытие подсмотр контур перетаскивание простой классический современный быстродействие",
             Section::Dock => "панель задач dock аптайм дата часы расположение скрывать автоскрытие сверху слева справа значки",
             Section::Start => "пуск меню закреплённые недавние все программы ширина широкий",
             Section::Explorer => "проводник файлы папки files",
@@ -374,6 +381,8 @@ enum Deed {
     Taskbar(super::deskcfg::TaskbarDeed),
     /// «Пуск» (20.11).
     Start(super::deskcfg::StartDeed),
+    /// «Оформление» и глубина цвета (20.11, `look`).
+    Look(LookDeed),
     Layout(crate::input::keymap::Layout),
     Timezone(i32),
     NetDhcp,
@@ -426,6 +435,14 @@ enum Deed {
     DisplaysKeep,
     /// «Отменить изменения» там же.
     DisplaysRevert,
+}
+
+/// Что меняют на странице «Оформление» и в «Глубине цвета».
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LookDeed {
+    Preset(super::look::Preset),
+    Flag(super::look::Flag, bool),
+    Depth(u32),
 }
 
 /// Какое из двух полей раздела «Сеть» правится.
@@ -1234,6 +1251,30 @@ impl SettingsView {
                 self.request = Some(Request::Panel);
                 let (text, result) = super::deskcfg::apply_taskbar(deed);
                 kprintln!("  settings    : taskbar {}", super::deskcfg::describe());
+                self.report = Some(match result {
+                    Ok(()) => Report::ok(text),
+                    Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
+                });
+            }
+            Deed::Look(deed) => {
+                use super::look;
+                let (text, result) = match deed {
+                    LookDeed::Preset(preset) => {
+                        look::apply_preset(preset);
+                        (format!("набор «{}» применён и запомнен", pages::preset_title(preset)), look::store())
+                    }
+                    LookDeed::Flag(flag, on) => {
+                        look::set(flag, on);
+                        (String::from(if on { "включено и запомнено" } else { "выключено и запомнено" }), look::store())
+                    }
+                    LookDeed::Depth(bits) => {
+                        look::set_depth(bits);
+                        (format!("глубина цвета: {}", look::depth_title(look::depth())), look::store_depth())
+                    }
+                };
+                // Перерисовать всё: рамки окон, тени, кадр в новой глубине.
+                self.theme_changed = true;
+                kprintln!("  settings    : look {}", look::describe());
                 self.report = Some(match result {
                     Ok(()) => Report::ok(text),
                     Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),

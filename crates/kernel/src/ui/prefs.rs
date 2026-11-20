@@ -116,6 +116,9 @@ pub fn adopt() {
         }
         crate::kprintln!("  desktop     : {key} {} from {}", sysconf::value(text, key).unwrap_or(""), path);
     }
+    // «Оформление» и глубина цвета (20.11, см. `look`) — после `animations=`:
+    // строка `look=` новее и главнее.
+    super::look::adopt(text, &path);
     // Панель задач и «Пуск» одним набором (20.11, см. `deskcfg`).
     super::deskcfg::adopt(text, &path);
     if let Some(height) = sysconf::title_bar(text) {
@@ -214,7 +217,10 @@ pub fn store_panel(pref: super::settings::PanelPref, on: bool) -> Result<(), cra
         super::settings::PanelPref::Uptime => "panel_uptime",
         super::settings::PanelPref::Date => "panel_date",
         super::settings::PanelPref::Labels => "panel_labels",
-        super::settings::PanelPref::Animations => "animations",
+        super::settings::PanelPref::Animations => {
+            // Обе анимации «Оформления» (20.11): строка `look=` главнее.
+            return super::look::store();
+        }
     };
     store_key(key, if on { "on" } else { "off" })
 }

@@ -49,6 +49,7 @@ pub mod deskcfg;
 pub mod dialog;
 pub mod icons;
 pub mod lock;
+pub mod look;
 pub mod panel;
 pub mod powersheet;
 pub mod pointer;
@@ -2028,8 +2029,6 @@ pub fn timing() -> (u64, u64, u64, u64, u64) {
 /// один на 200 мс дают в среднем 5 мс, а палец чувствует именно двести.
 static WORST_FRAME_NS: AtomicU64 = AtomicU64::new(0);
 
-/// Анимация окон включена в «Параметрах» (по умолчанию — да).
-static ANIMATIONS: AtomicBool = AtomicBool::new(true);
 
 /// Сколько стоит кадр во весь экран, наносекунды, — сглаженная оценка по
 /// собранным кадрам. Ноль — ещё не мерили.
@@ -2059,18 +2058,23 @@ pub fn note_screen_cost(ns: u64, points: u64, screen: u64) {
 pub fn animations_allowed() -> bool {
     // Телефону анимация — часть жестов (окно улетает в стопку дока), и
     // отключать её по цене кадра там нельзя.
-    ANIMATIONS.load(Ordering::Relaxed)
+    // Какая именно анимация — решает «Оформление» (`look`, 20.11): здесь
+    // только «включена хоть одна и машина успевает».
+    animations_enabled()
         && (theme::is_mobile() || SCREEN_FRAME_NS.load(Ordering::Relaxed) <= ANIMATION_FRAME_BUDGET_NS)
 }
 
-/// Включена ли анимация окон в «Параметрах».
+/// Включена ли анимация окон в «Параметрах» (хоть одна из двух в
+/// «Оформлении»).
 #[must_use]
 pub fn animations_enabled() -> bool {
-    ANIMATIONS.load(Ordering::Relaxed)
+    look::on(look::Flag::MinMax) || look::on(look::Flag::OpenClose)
 }
 
+/// «Анимация окон» быстрых настроек — обе анимации «Оформления» сразу.
 pub fn set_animations(on: bool) {
-    ANIMATIONS.store(on, Ordering::Relaxed);
+    look::set(look::Flag::MinMax, on);
+    look::set(look::Flag::OpenClose, on);
 }
 
 /// Записать длительность кадра, если он хуже прежнего худшего.

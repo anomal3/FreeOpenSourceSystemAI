@@ -526,7 +526,9 @@ fn edge_points(w: u32, h: u32, radius: u32, mut f: impl FnMut(u32, u32)) {
     if w < 4 || h < 4 {
         return;
     }
-    let c = (radius + 1).min(w / 2).min(h / 2);
+    // Не меньше двух: у прямых углов (классические рамки, 20.11) кромка — в
+    // две полные строки и два столбца.
+    let c = (radius + 1).max(2).min(w / 2).min(h / 2);
     // Внутри круга радиуса `radius - 2.5` с центром в центре скругления
     // обводки нет. Всё в удвоенных координатах, чтобы остаться в целых.
     let r2 = 2 * i64::from(radius);
@@ -563,6 +565,63 @@ fn edge_points(w: u32, h: u32, radius: u32, mut f: impl FnMut(u32, u32)) {
             }
         }
     }
+}
+
+/// Классический заголовок (20.11, «Простой»): часть `part` полосы `bar`,
+/// залитая горизонтальным градиентом — синим у активного окна, серым у
+/// неактивного. По строке один цвет на столбец: дёшево, без смешивания.
+fn classic_caption(surface: &mut Surface, part: Rect, bar: Rect, focused: bool) {
+    let (from, to) = if focused {
+        (Color::rgb(0x00, 0x00, 0x80), Color::rgb(0x10, 0x84, 0xD0))
+    } else {
+        (Color::rgb(0x80, 0x80, 0x80), Color::rgb(0xB5, 0xB5, 0xB5))
+    };
+    let part = part.intersect(&bar).intersect(&surface.bounds());
+    if part.is_empty() {
+        return;
+    }
+    let span = bar.w.max(2) - 1;
+    let mut line = Vec::new();
+    if line.try_reserve_exact(part.w as usize).is_err() {
+        surface.fill(part, from);
+        return;
+    }
+    for x in part.x..part.right() {
+        let weight = ((x - bar.x).max(0) as u32 * 255 / span).min(255) as u8;
+        line.push(from.mix(to, weight).pixel());
+    }
+    for y in part.y..part.bottom() {
+        let row = surface.row_mut(y as u32);
+        row[part.x as usize..part.right() as usize].copy_from_slice(&line);
+    }
+}
+
+/// Выпуклая (`raised`) или вдавленная кромка в две точки внутри `rect`.
+fn bevel(surface: &mut Surface, rect: Rect, raised: bool) {
+    if rect.w < 4 || rect.h < 4 {
+        return;
+    }
+    let (light, hi, shade, dark) = (
+        Color::rgb(0xFF, 0xFF, 0xFF),
+        Color::rgb(0xD4, 0xD0, 0xC8),
+        Color::rgb(0x80, 0x80, 0x80),
+        Color::rgb(0x40, 0x40, 0x40),
+    );
+    let (tl_out, tl_in, br_in, br_out) = if raised { (hi, light, shade, dark) } else { (shade, dark, light, hi) };
+    let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
+    draw::hline(surface, x, y, w, tl_out, 255);
+    draw::vline(surface, x, y, h, tl_out, 255);
+    draw::hline(surface, x, rect.bottom() - 1, w, br_out, 255);
+    draw::vline(surface, rect.right() - 1, y, h, br_out, 255);
+    draw::hline(surface, x + 1, y + 1, w - 2, tl_in, 255);
+    draw::vline(surface, x + 1, y + 1, h - 2, tl_in, 255);
+    draw::hline(surface, x + 1, rect.bottom() - 2, w - 2, br_in, 255);
+    draw::vline(surface, rect.right() - 2, y + 1, h - 2, br_in, 255);
+}
+
+/// Кромка всего окна: светлая сверху-слева, тёмная снизу-справа.
+fn outer_bevel(surface: &mut Surface, bounds: Rect) {
+    bevel(surface, bounds, true);
 }
 
 /// Счётчик для [`Window::born`].
@@ -1303,18 +1362,25 @@ impl Window {
         // терминала верхняя строка оказывалась срезанной пополам.
         // Заливка сплошная (72b): у активного окна полоса светлее, у
         // неактивного — цвета окна.
-        let fill = ctx.flat(if focused { p.tb1 } else { p.tb2 });
-        self.surface.fill(bar, fill);
-        draw::hline(
-            &mut self.surface,
-            0,
-            title_h as i32 - 1,
-            bounds.w,
-            p.tbline.color,
-            p.tbline.alpha,
-        );
-        if focused {
-            draw::crown(&mut self.surface, bounds, radius, p.crown.color, p.crown.alpha);
+        let classic = Self::classic();
+        if classic {
+            // Классический заголовок (20.11, «Простой»): горизонтальный
+            // градиент на всю полосу.
+            classic_caption(&mut self.surface, bar, bar, focused);
+        } else {
+            let fill = ctx.flat(if focused { p.tb1 } else { p.tb2 });
+            self.surface.fill(bar, fill);
+            draw::hline(
+                &mut self.surface,
+                0,
+                title_h as i32 - 1,
+                bounds.w,
+                p.tbline.color,
+                p.tbline.alpha,
+            );
+            if focused {
+                draw::crown(&mut self.surface, bounds, radius, p.crown.color, p.crown.alpha);
+            }
         }
 
         // Значок программы: тот же скруглённый квадрат, что у неё на столе и в
@@ -1352,7 +1418,12 @@ impl Window {
         // под крестик, читается как ошибка отрисовки.
         let text_x = badge.right() + ctx.px(8) as i32;
         let room = (self.leftmost_button().x - ctx.px(12) as i32 - text_x).max(0) as u32;
-        let ink = if focused { p.ink } else { p.ink4 };
+        let ink = match (classic, focused) {
+            (true, true) => Color::rgb(0xFF, 0xFF, 0xFF),
+            (true, false) => Color::rgb(0xD4, 0xD0, 0xC8),
+            (false, true) => p.ink,
+            (false, false) => p.ink4,
+        };
         if !tabs_here {
             let label = self.label();
             paint::text_clipped(
@@ -1411,8 +1482,35 @@ impl Window {
                 (self.maximize_button(), restore_icon, Hit::Maximize),
             ]
         });
+        let classic = Self::classic();
+        let bar = Rect::new(0, 0, self.surface.width(), Self::title_height(self.scale));
         for (button, icon, hit) in keyboard.into_iter().chain(sizing.into_iter().flatten()).chain([(self.close_button(), Icon::Close, Hit::Close)]) {
             let hot = self.hot == Some(hit);
+            if classic {
+                // Выпуклая серая кнопка на градиенте заголовка (20.11).
+                classic_caption(&mut self.surface, button, bar, focused);
+                let side = button.h.saturating_sub(ctx.px(8)).max(ctx.px(12));
+                let knob = Rect::new(
+                    button.x + (button.w as i32 - side as i32 - ctx.px(2) as i32) / 2,
+                    button.y + (button.h as i32 - side as i32) / 2,
+                    side + ctx.px(2),
+                    side,
+                );
+                let face = if hot { Color::rgb(0xE0, 0xDC, 0xD4) } else { Color::rgb(0xD4, 0xD0, 0xC8) };
+                self.surface.fill(knob, face);
+                bevel(&mut self.surface, knob, true);
+                let glyph = ctx.px(8);
+                glyphicon::draw(
+                    &mut self.surface,
+                    icon,
+                    knob.x + (knob.w as i32 - glyph as i32) / 2,
+                    knob.y + (knob.h as i32 - glyph as i32) / 2,
+                    glyph,
+                    Color::rgb(0, 0, 0),
+                    255,
+                );
+                continue;
+            }
             // Нажатая кнопка клавиатуры — цветом акцента: видно, что
             // клавиатура открыта для этого окна.
             let (plate, ink) = match (hot, hit) {
@@ -1480,6 +1578,7 @@ impl Window {
             book.h = h;
             book.radius = radius;
         }
+        let classic = Self::classic();
         // Первый проход: основа под каждой точкой — прежняя, если точка
         // хранит нарисованное обводкой, иначе её нынешнее значение.
         // `drawn` до второго прохода хранит то, что было в точке до вызова.
@@ -1496,7 +1595,12 @@ impl Window {
             surface.row_mut(y)[x as usize] = book.base[i];
             i += 1;
         });
-        draw::rounded_stroke(surface, bounds, radius, ink.color, ink.alpha);
+        if classic {
+            // Объёмная кромка в две точки, как у окон Windows 98 (20.11).
+            outer_bevel(surface, bounds);
+        } else {
+            draw::rounded_stroke(surface, bounds, radius, ink.color, ink.alpha);
+        }
         let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
         let mut i = 0usize;
         edge_points(w, h, radius, |x, y| {
@@ -1521,7 +1625,12 @@ impl Window {
     /// экрана, и скругления у них нет — ни в обводке, ни в кромке (20.11).
     fn corner_radius(&self) -> u32 {
         // Телефон — как был: там окна всегда во весь экран и со скруглением.
-        if self.fullscreen || (self.is_maximized() && !theme::is_mobile()) { 0 } else { self.ctx().px(theme::R_WINDOW) }
+        if self.fullscreen || (self.is_maximized() && !theme::is_mobile()) { 0 } else { super::look::corner(self.ctx().px(theme::R_WINDOW)) }
+    }
+
+    /// Классические рамки (20.11, «Оформление»; на телефоне — нет).
+    fn classic() -> bool {
+        super::look::on(super::look::Flag::Classic) && !theme::is_mobile()
     }
 
     /// Задевает ли прямоугольник поверхности место обводки (с запасом на

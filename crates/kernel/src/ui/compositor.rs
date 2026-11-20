@@ -278,6 +278,11 @@ pub struct Compositor {
     /// Прямоугольник целиком (`x, y, w, h`): тянуть можно за любой край, и у
     /// левого и верхнего вместе с размером едет угол окна (01.11).
     pending_size: Option<(App, i32, i32, i32, i32)>,
+    /// Контур перетаскивания (20.11, «Оформление»): где окажется окно, если
+    /// его отпустить. Само окно стоит на месте до отпускания.
+    outline: Option<Rect>,
+    /// Отпускание: отложенный размер применяется и в режиме контура.
+    settling: bool,
     /// Какие края тянут ([`super::window::EDGE_LEFT`] и прочие).
     resize_edges: u8,
     /// Окно программы, над содержимым которого указатель был в прошлый раз
@@ -450,6 +455,8 @@ impl Compositor {
             snap: None,
             moved: None,
             pending_size: None,
+            outline: None,
+            settling: false,
             resize_edges: 0,
             hovered: None,
             peek: None,
@@ -1015,7 +1022,7 @@ impl Compositor {
     /// Начать рост окна из плитки (`open`) или уход в неё.
     fn start_zoom(&mut self, app: App, rect: Rect, open: bool) -> bool {
         self.finish_flight();
-        if self.panel.is_none() || rect.is_empty() || !super::animations_allowed() {
+        if self.panel.is_none() || rect.is_empty() || !super::animations_allowed() || !super::look::anim(super::look::Flag::OpenClose) {
             return false;
         }
         // Плитки нет — окно растёт из середины своего места, с четырёх пятых.
@@ -1110,7 +1117,9 @@ impl Compositor {
         // Подсмотр начался или кончился: стол целиком меняет вид - размытый
         // под окном или обычный.
         match app {
-            Some(_) if self.peek_back.is_none() => {
+            // Без «Прозрачности и размытия» (20.11) окно подсматривается
+            // поверх как есть — без размытого стола под ним.
+            Some(_) if self.peek_back.is_none() && super::look::on(super::look::Flag::Effects) => {
                 self.build_peek_back();
                 if self.peek_back.is_some() {
                     self.mark_layer(self.union);
@@ -1975,6 +1984,9 @@ impl Compositor {
 
     /// Начать или закончить перетаскивание окна.
     pub fn set_drag(&mut self, app: Option<App>) {
+        // Контур прежнего захвата — стереть (отпускание уже перенесло окно в
+        // `settle_drag`; здесь — отмена).
+        self.set_outline(None);
         self.drag = app;
         if let Some(app) = app {
             self.drag_press = self.pointer.position();
@@ -2000,6 +2012,7 @@ impl Compositor {
     /// Начать изменение размера окна за края `edges`: тот же захват, другое
     /// действие.
     pub fn set_resize_drag(&mut self, app: App, edges: u8) {
+        self.set_outline(None);
         self.drag = Some(app);
         self.drag_from = self.rect_of(app).map_or((0, 0), |rect| (rect.x, rect.y));
         self.drag_resizes = true;
@@ -2083,6 +2096,16 @@ impl Compositor {
         // Так же прилепленное к половине монитора (20.11).
         if self.windows.get(index).is_some_and(|window| window.is_maximized() || window.is_snapped()) {
             self.unmaximize_dragged(index, app, &areas[..n]);
+            self.update_snap();
+            return;
+        }
+        // «Показывать контур при перетаскивании» (20.11): едет рамка, окно
+        // переедет при отпускании ([`Self::settle_drag`]).
+        if super::look::outline_drag() {
+            if let Some(rect) = self.windows.get(index).map(|window| window.rect) {
+                let ghost = self.outline.unwrap_or(rect).translate(dx, dy);
+                self.set_outline(Some(ghost));
+            }
             self.update_snap();
             return;
         }
@@ -2174,7 +2197,7 @@ impl Compositor {
         self.mark_layer(after);
         self.follow_owner(app);
         self.finish_flight();
-        if self.panel.is_some() && !before.is_empty() && !after.is_empty() && super::animations_allowed() {
+        if self.panel.is_some() && !before.is_empty() && !after.is_empty() && super::animations_allowed() && super::look::anim(super::look::Flag::MinMax) {
             self.flight = Some(Flight::morph(app, after, before, crate::time::uptime_ns()));
             super::set_animating(true);
         }
@@ -2353,7 +2376,7 @@ impl Compositor {
         // Окно перетекает в новый размер. Поверхность уже нового размера и
         // готова: `Window::resize` перерисовал её.
         self.finish_flight();
-        if self.panel.is_some() && !before.is_empty() && !after.is_empty() && super::animations_allowed() {
+        if self.panel.is_some() && !before.is_empty() && !after.is_empty() && super::animations_allowed() && super::look::anim(super::look::Flag::MinMax) {
             self.flight = Some(Flight::morph(app, after, before, crate::time::uptime_ns()));
             super::set_animating(true);
         }
@@ -2613,7 +2636,7 @@ impl Compositor {
     /// разглядит, а держать список ради этого незачем.
     fn start_flight(&mut self, app: App, rect: Rect, restore: bool) -> bool {
         self.finish_flight();
-        if self.panel.is_none() || !super::animations_allowed() {
+        if self.panel.is_none() || !super::animations_allowed() || !super::look::anim(super::look::Flag::MinMax) {
             return false;
         }
         self.flight = Some(Flight::new(app, rect, restore, crate::time::uptime_ns()));
@@ -3250,7 +3273,44 @@ impl Compositor {
 
     /// Довести отложенное изменение размера — палец отпустили.
     pub fn settle_drag(&mut self) {
+        // Контур (20.11): окно переезжает туда, где рамку отпустили.
+        if let Some(ghost) = self.outline {
+            self.set_outline(None);
+            if let (Some(app), false) = (self.drag, self.drag_resizes) {
+                let (areas, n) = self.work_rects();
+                if let Some(window) = self.windows.iter_mut().find(|window| window.app == app) {
+                    let before = window.rect;
+                    window.move_within(ghost.x - before.x, ghost.y - before.y, &areas[..n]);
+                    let after = window.rect;
+                    if after != before {
+                        self.note_moved(app, before, after);
+                        self.follow_owner(app);
+                    }
+                }
+            }
+        }
+        self.settling = true;
         self.apply_pending_size();
+        self.settling = false;
+    }
+
+    /// Толщина контура перетаскивания.
+    fn outline_width(&self) -> u32 {
+        (4 * self.scale.pct() / 100).max(2)
+    }
+
+    /// Поставить или убрать контур; перерисовываются только его полосы.
+    fn set_outline(&mut self, ghost: Option<Rect>) {
+        if self.outline == ghost {
+            return;
+        }
+        let t = self.outline_width();
+        for rect in [self.outline, ghost].into_iter().flatten() {
+            for strip in super::look::outline_strips(rect, t) {
+                self.mark(strip);
+            }
+        }
+        self.outline = ghost;
     }
 
     /// Применить размер, который просил уголок, — один раз за кадр.
@@ -3265,6 +3325,14 @@ impl Compositor {
     /// опозданием — Роман так и описал. Последний размер к моменту кадра — это
     /// всё, что человек увидит.
     fn apply_pending_size(&mut self) {
+        // Контур (20.11): пока тянут, меняется только рамка; размер —
+        // при отпускании ([`Self::settle_drag`]).
+        if !self.settling && self.drag_resizes && self.drag.is_some() && super::look::outline_drag() {
+            if let Some((_, x, y, w, h)) = self.pending_size {
+                self.set_outline(Some(Rect::new(x, y, w.max(1) as u32, h.max(1) as u32)));
+            }
+            return;
+        }
         let Some((app, _, _, w, h)) = self.pending_size.take() else {
             return;
         };
@@ -3278,6 +3346,7 @@ impl Compositor {
         };
         // Пределы — монитора, на котором окно (по его середине).
         let work = self.work_rect_under(before);
+        let focused = index == self.focus;
         let Some(window) = self.windows.get_mut(index) else {
             return;
         };
@@ -3299,6 +3368,9 @@ impl Compositor {
         if !window.resize(w, h) {
             return;
         }
+        // `resize` рисует заголовок неактивным — по настоящему фокусу
+        // (классический заголовок иначе серел у активного окна, 20.11).
+        window.draw_decorations(focused);
         // Окно могло упереться в наименьший размер: угол ставится от
         // неподвижной стороны по тому размеру, что получился.
         if left || top {
@@ -3378,7 +3450,7 @@ impl Compositor {
         // означал бы прямоугольник на 56 точек шире нужного с каждой стороны —
         // два таких накрывают экран целиком, учёт изменённого переполняется, и
         // кадр перерисовывает всё.
-        if theme::is_mobile() {
+        if theme::is_mobile() || !super::look::on(super::look::Flag::Shadows) {
             0
         } else {
             (SHADOW_SPREAD + SHADOW_DROP) * self.scale
@@ -3805,7 +3877,7 @@ impl Compositor {
         ) else {
             return;
         };
-        let radius = theme::R_WINDOW * self.scale;
+        let radius = super::look::corner(theme::R_WINDOW * self.scale);
         let mut top = bounds.y;
         while top < bounds.bottom() {
             let h = PEEK_STRIP.min((bounds.bottom() - top) as u32);
@@ -4367,7 +4439,7 @@ impl Compositor {
     /// Общее у кадра и у сцены под полётом — чтобы сцена не разошлась с тем,
     /// что кадр нарисовал бы сам.
     fn draw_lower(&self, back: &mut Surface, band: Rect, dy: i32) {
-        let radius = theme::R_WINDOW * self.scale;
+        let radius = super::look::corner(theme::R_WINDOW * self.scale);
         self.draw_background(back, band, dy);
         super::statusbar::draw(back, band, dy, self.primary.w, self.scale);
         self.icons.draw(back, band, dy);
@@ -4419,6 +4491,9 @@ impl Compositor {
             // вовсе, а различить надо прежде, чем что-то менять.
             let t0 = crate::time::uptime_ns();
             self.compose_band(&mut back, band);
+            // Глубина цвета меньше 32 бит (20.11, «Дисплей»): полоса
+            // сводится к палитре перед выводом.
+            super::look::quantize(&mut back, band.x, band.w, band.h, band.y);
             let t1 = crate::time::uptime_ns();
             // Буфер во всю ширину стола, поэтому по горизонтали координаты
             // совпадают со столом, и сдвигать надо только начало по
@@ -4499,7 +4574,7 @@ impl Compositor {
             }
             return;
         }
-        let radius = theme::R_WINDOW * self.scale;
+        let radius = super::look::corner(theme::R_WINDOW * self.scale);
         // Разложение сборки по слоям. Общее число уже сказало, что виновата
         // сборка, а не вывод; теперь надо знать, какой её кусок, — иначе
         // правка снова окажется догадкой.
@@ -4713,6 +4788,10 @@ impl Compositor {
                 self.stack(back, shade.surface(), rect, band, dy, r);
             }
         }
+        // Контур перетаскивания (20.11) — над всеми слоями, под указателем.
+        if let Some(ghost) = self.outline {
+            super::look::draw_outline(back, band, dy, ghost, self.outline_width());
+        }
         // Курсор — последним и без проверки пересечения: он мал, а обрезка
         // однобитной картинки уже сделана внутри `draw_bitmap`. Проверка
         // «попадает ли он в полосу» стоила бы больше, чем экономила.
@@ -4806,7 +4885,8 @@ impl Compositor {
         // Отказаться можно без потери: тень заведена, чтобы плавающая плашка
         // не сливалась со светлыми обоями настольной темы. На телефоне слои
         // занимают экран целиком и лежат на тёмном фоне — отделять нечего.
-        if theme::is_mobile() {
+        // Тени выключены в «Оформлении» (20.11).
+        if theme::is_mobile() || !super::look::on(super::look::Flag::Shadows) {
             return;
         }
         let spread = SHADOW_SPREAD * self.scale;

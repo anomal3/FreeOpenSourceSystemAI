@@ -20,7 +20,7 @@ use crate::input::keymap::Layout as KeyLayout;
 use crate::{arch, config, fs};
 
 use super::kit::{self, Ctl, Pass, line_h, row};
-use super::{Deed, Field, MODES, PanelPref, Programs, Section, SettingsView};
+use super::{Deed, Field, LookDeed, MODES, PanelPref, Programs, Section, SettingsView};
 
 impl SettingsView {
     /// Тело страницы: от `y` (уже с учётом прокрутки) вниз.
@@ -48,12 +48,13 @@ impl SettingsView {
             Section::Network => self.network(pass, x, y, w),
             Section::Personal => {
                 let mut y = y;
-                for section in [Section::Wallpaper, Section::Colors, Section::Dock] {
+                for section in [Section::Wallpaper, Section::Colors, Section::Appearance, Section::Dock] {
                     y = nav_row(pass, x, y, w, section);
                 }
             }
             Section::Wallpaper => wallpaper(pass, x, y, w),
             Section::Colors => colors(pass, x, y, w),
+            Section::Appearance => appearance(pass, x, y, w),
             Section::Dock => dock(pass, x, y, w),
             Section::Start => start_page(pass, x, y, w),
             Section::Explorer => explorer(pass, x, y, w),
@@ -238,7 +239,8 @@ impl SettingsView {
             y = row(pass, x, y, w, None, label, hint, Ctl::Radio(chosen == choice), Some(Deed::Scale(choice)));
         }
         y = pass.note(x, y + ctx.px(4) as i32, w, "Масштаб применяется сразу ко всему: панели, окнам и программам.");
-        row(pass, x, y, w, Some(Fi::Monitor), "Ориентация", "", Ctl::Value("Альбомная"), None);
+        y = row(pass, x, y, w, Some(Fi::Monitor), "Ориентация", "", Ctl::Value("Альбомная"), None);
+        depth_rows(pass, x, y, w);
     }
 
     fn storage(&self, pass: &mut Pass, x: i32, y: i32, w: u32) {
@@ -1399,4 +1401,55 @@ fn update_servers() -> Vec<String> {
         .map(|value| value.to_string())
         .take(4)
         .collect()
+}
+
+// ── Оформление (20.11, `ui::look`) ──────────────────────────────────────────
+
+/// Имя набора на странице и в отчёте.
+pub(super) const fn preset_title(preset: crate::ui::look::Preset) -> &'static str {
+    match preset {
+        crate::ui::look::Preset::Modern => "Современный",
+        crate::ui::look::Preset::Simple => "Простой",
+        crate::ui::look::Preset::Custom => "Своё",
+    }
+}
+
+/// «Оформление»: два набора и переключатель на каждый эффект. Всё действует
+/// сразу и запоминается в `desktop.cfg` (`look=`).
+fn appearance(pass: &mut Pass, x: i32, y: i32, w: u32) {
+    use crate::ui::look::{self, Flag, Preset};
+    let ctx = pass.ctx;
+    let current = look::preset();
+    let mut y = pass.group(x, y, w, "Вид");
+    y = row(pass, x, y, w, Some(Fi::Palette), "Современный", "Тени, анимация, размытие, скруглённые окна", Ctl::Radio(current == Preset::Modern), Some(Deed::Look(LookDeed::Preset(Preset::Modern))));
+    y = row(pass, x, y, w, Some(Fi::Monitor), "Простой", "Классические рамки, без теней и анимации, контур при перетаскивании — дешевле всего рисовать", Ctl::Radio(current == Preset::Simple), Some(Deed::Look(LookDeed::Preset(Preset::Simple))));
+    if current == Preset::Custom {
+        y = row(pass, x, y, w, Some(Fi::Sliders), "Своё", "Переключатели ниже отличаются от обоих наборов", Ctl::Radio(true), None);
+    }
+    y = pass.group(x, y + ctx.px(8) as i32, w, "Эффекты");
+    for (flag, icon, title, hint) in [
+        (Flag::MinMax, Fi::Monitor, "Анимация сворачивания и разворачивания", "Окно летит в кнопку панели и обратно, плавный разворот"),
+        (Flag::OpenClose, Fi::Layers, "Анимация открытия и закрытия окон", "Окно вырастает из значка и уходит в него"),
+        (Flag::Shadows, Fi::Layers, "Тени окон", "Мягкая тень под окнами, меню и панелью"),
+        (Flag::Effects, Fi::Image, "Прозрачность и размытие", "Размытый стол под подсмотром окна из панели задач"),
+        (Flag::Outline, Fi::Sliders, "Показывать контур при перетаскивании", "Окно переносится и меняет размер при отпускании — меньше перерисовки"),
+        (Flag::Classic, Fi::Palette, "Классические рамки окон", "Прямые углы, объёмная кромка, заголовок с градиентом"),
+    ] {
+        let on = look::on(flag);
+        y = row(pass, x, y, w, Some(icon), title, hint, Ctl::Toggle(on), Some(Deed::Look(LookDeed::Flag(flag, !on))));
+    }
+    y = pass.note(x, y + ctx.px(4) as i32, w, "Плавной прокрутки в системе нет — прокрутка и так идёт строками, без анимации.");
+    row(pass, x, y, w, Some(Fi::Monitor), "Глубина цвета", "", Ctl::NavValue(look::depth_title(look::depth())), Some(Deed::Open(Section::Display)));
+}
+
+/// «Глубина цвета» на странице «Дисплей».
+fn depth_rows(pass: &mut Pass, x: i32, y: i32, w: u32) {
+    use crate::ui::look;
+    let ctx = pass.ctx;
+    let mut y = pass.group(x, y + ctx.px(8) as i32, w, "Глубина цвета");
+    let current = look::depth();
+    for bits in [32, 16, 8, 4] {
+        y = row(pass, x, y, w, None, look::depth_title(bits), "", Ctl::Radio(current == bits), Some(Deed::Look(LookDeed::Depth(bits))));
+    }
+    pass.note(x, y + ctx.px(4) as i32, w, "Меняется сразу. Кадр собирается в 32 битах и сводится к выбранной палитре при выводе на экран.");
 }
