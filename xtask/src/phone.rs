@@ -262,6 +262,11 @@ pub const LEAN_SKIP: &[&str] = &[
     "usr/share/fonts/fossai/Hack-Regular.ttf",
     "usr/share/fonts/fossai/IBMPlexMono-Regular.ttf",
     "usr/share/fonts/fossai/SourceCodePro.ttf",
+    // Ряды дробного масштаба: телефон рисует своими двумя встроенными.
+    "usr/share/fonts/fossai/ui-125.fnt",
+    "usr/share/fonts/fossai/ui-150.fnt",
+    "usr/share/fonts/fossai/ui-175.fnt",
+    "usr/share/fonts/fossai/ui-200.fnt",
 ];
 
 /// NetSurf (04.11) для RAM-диска телефона — из sysroot сборки, как ставит его

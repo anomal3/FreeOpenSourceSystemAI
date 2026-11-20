@@ -321,7 +321,7 @@ pub const FONTS: [(&str, &str, &str); 3] = [
 /// репозитории, поэтому едут всегда. Рисует их своя растеризация
 /// (`crates/ttf`). Список обязан совпадать с `SYSTEM_FONTS` в
 /// `crates/installer/src/payload.rs`.
-pub const SYSTEM_FONTS: [(&str, &str, &str); 20] = [
+pub const SYSTEM_FONTS: [(&str, &str, &str); 24] = [
     ("Inter.ttf", "usr/share/fonts/fossai", "INTER.TTF"),
     ("Inter-OFL.txt", "usr/share/fonts/fossai", "INTEROFL.TXT"),
     ("JetBrainsMono.ttf", "usr/share/fonts/fossai", "JBMONO.TTF"),
@@ -342,6 +342,12 @@ pub const SYSTEM_FONTS: [(&str, &str, &str); 20] = [
     ("IBMPlexMono-OFL.txt", "usr/share/fonts/fossai", "PLEXOFL.TXT"),
     ("Hack-Regular.ttf", "usr/share/fonts/fossai", "HACK.TTF"),
     ("Hack-LICENSE.md", "usr/share/fonts/fossai", "HACKLIC.TXT"),
+    // Ряды шрифта интерфейса под дробный масштаб (20.11, `genfont.py
+    // --packs`): Inter и JetBrains Mono, растеризованные под 125/150/175/200 %.
+    ("ui-125.fnt", "usr/share/fonts/fossai", "UI125.FNT"),
+    ("ui-150.fnt", "usr/share/fonts/fossai", "UI150.FNT"),
+    ("ui-175.fnt", "usr/share/fonts/fossai", "UI175.FNT"),
+    ("ui-200.fnt", "usr/share/fonts/fossai", "UI200.FNT"),
 ];
 
 /// Где лежат шрифты системы.

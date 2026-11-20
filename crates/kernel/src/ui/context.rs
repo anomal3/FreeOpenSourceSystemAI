@@ -565,7 +565,7 @@ pub enum Reply {
 pub struct ContextMenu {
     surface: Surface,
     pub rect: Rect,
-    scale: u32,
+    scale: mini_ui::Scale,
     /// Пункты этого открытия — они зависят от того, куда щёлкнули.
     items: Vec<Action>,
     selected: usize,
@@ -606,7 +606,7 @@ pub struct ContextMenu {
 
 impl ContextMenu {
     #[must_use]
-    pub fn new(scale: u32) -> Option<Self> {
+    pub fn new(scale: mini_ui::Scale) -> Option<Self> {
         let ctx = Ctx::scaled(scale);
         // Ширина считается по самому длинному пункту и по самой длинной
         // подсказке: меню, которое меняет ширину вместе с содержимым, прыгало

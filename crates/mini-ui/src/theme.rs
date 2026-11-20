@@ -43,7 +43,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
-use crate::Color;
+use crate::{Color, Scale};
 
 /// Цвет вместе с прозрачностью — ровно в том виде, в каком он записан в макете.
 #[derive(Clone, Copy)]
@@ -786,24 +786,25 @@ pub const fn form_for(width: u32, height: u32) -> Form {
 /// окна там слишком крупные, при 100 % — «компактно и аккуратно». Программы
 /// масштаб сами не считают: ядро отдаёт им масштаб стола в `SysInfo::flags`.
 #[must_use]
-pub const fn geometry_scale(width: u32, height: u32) -> u32 {
+pub const fn geometry_scale(width: u32, height: u32) -> Scale {
     if width >= 3840 {
-        return 2;
+        return Scale::TWO;
     }
     if matches!(form_for(width, height), Form::Mobile) {
-        return 2;
+        return Scale::TWO;
     }
-    1
+    Scale::ONE
 }
 
-/// Множитель с учётом выбора человека: 0 — по экрану ([`geometry_scale`]),
-/// 1 или 2 — заданный в «Параметрах» (01.11: на мониторе 2560 автоматические
-/// 200 % слишком крупны, а выбрать было нечем).
+/// Масштаб с учётом выбора человека: 0 — по экрану ([`geometry_scale`]),
+/// иначе — проценты, заданные в «Параметрах» (100/125/150/175/200, 20.11;
+/// прежние 1 и 2 — это 100 и 200 %).
 #[must_use]
-pub const fn geometry_scale_for(choice: u32, width: u32, height: u32) -> u32 {
+pub const fn geometry_scale_for(choice: u32, width: u32, height: u32) -> Scale {
     match choice {
-        1 | 2 => choice,
-        _ => geometry_scale(width, height),
+        0 => geometry_scale(width, height),
+        1 | 2 => Scale::whole(choice),
+        pct => Scale::percent(pct),
     }
 }
 
@@ -832,45 +833,57 @@ pub const fn window_share(screen_w: u32) -> (u32, u32) {
 /// `scale`, но не больше [`window_share`] рабочей области `work` экрана
 /// шириной `screen_w`.
 #[must_use]
-pub const fn default_window(logical: (u32, u32), scale: u32, work: (u32, u32), screen_w: u32) -> (u32, u32) {
+pub const fn default_window(logical: (u32, u32), scale: Scale, work: (u32, u32), screen_w: u32) -> (u32, u32) {
     let (sw, sh) = window_share(screen_w);
     let (max_w, max_h) = (work.0 * sw / 100, work.1 * sh / 100);
-    let (w, h) = (logical.0 * scale, logical.1 * scale);
+    let (w, h) = (scale.px(logical.0), scale.px(logical.1));
     (if w < max_w { w } else { max_w }, if h < max_h { h } else { max_h })
 }
 
-/// Выбор масштаба, запомненный в настройках (0 — авто, 1, 2). Действует он
-/// с запуска стола: стол перестраивать на ходу дорого и рискованно.
+/// Выбор масштаба, запомненный в настройках: 0 — авто, иначе проценты
+/// (100/125/150/175/200). Применяется сразу (20.11).
 static SCALE_CHOICE: AtomicU8 = AtomicU8::new(0);
 
-/// Запомнить выбор масштаба.
+/// Запомнить выбор масштаба (0 — авто, проценты; прежние 1 и 2 — 100 и 200).
 pub fn set_scale_choice(choice: u32) {
-    SCALE_CHOICE.store(if choice <= 2 { choice as u8 } else { 0 }, Ordering::Relaxed);
+    let value = match choice {
+        0 => 0,
+        1 | 2 => choice * 100,
+        pct => Scale::percent(pct).pct(),
+    };
+    SCALE_CHOICE.store(value as u8, Ordering::Relaxed);
 }
 
-/// Выбор масштаба: 0 — авто, 1 — 100 %, 2 — 200 %.
+/// Выбор масштаба: 0 — авто, иначе проценты.
 #[must_use]
 pub fn scale_choice() -> u32 {
     u32::from(SCALE_CHOICE.load(Ordering::Relaxed))
 }
 
-/// Слово выбора для файла настроек и журнала.
+/// Слово выбора для файла настроек и журнала: `auto`, `100`, `125`…
 #[must_use]
-pub const fn scale_choice_tag(choice: u32) -> &'static str {
+pub fn scale_choice_tag(choice: u32) -> &'static str {
     match choice {
-        1 => "100",
-        2 => "200",
+        100 | 1 => "100",
+        125 => "125",
+        150 => "150",
+        175 => "175",
+        200 | 2 => "200",
         _ => "auto",
     }
 }
 
-/// Выбор из слова файла настроек.
+/// Выбор из слова файла настроек (`auto`, `100`, `125`, `150`, `175`,
+/// `200`; можно со знаком `%`).
 #[must_use]
 pub fn scale_choice_from_tag(tag: &str) -> Option<u32> {
-    match tag {
+    match tag.trim().trim_end_matches('%').trim() {
         "auto" => Some(0),
-        "100" => Some(1),
-        "200" => Some(2),
+        "100" => Some(100),
+        "125" => Some(125),
+        "150" => Some(150),
+        "175" => Some(175),
+        "200" => Some(200),
         _ => None,
     }
 }

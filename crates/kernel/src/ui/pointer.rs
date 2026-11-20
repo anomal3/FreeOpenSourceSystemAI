@@ -121,8 +121,9 @@ impl Pointer {
     }
 
     /// Картинки для экрана с этим множителем геометрии.
-    pub fn set_scale(&mut self, scale: u32) {
-        self.large = scale >= 2;
+    pub fn set_scale(&mut self, scale: mini_ui::Scale) {
+        // Указатель растровый: 150 % и выше — крупная картинка (ближайшая).
+        self.large = scale.pct() >= 150;
     }
 
     /// Показывать «программа запускается» до `until` (мс от запуска).

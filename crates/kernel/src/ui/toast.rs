@@ -89,7 +89,7 @@ pub fn ago(at_ms: u64) -> alloc::string::String {
 
 impl Toast {
     #[must_use]
-    pub fn new(caption: &str, art: &Art, start: String, rights: fpk::Rights, area: Rect, panel_top: i32, scale: u32) -> Option<Self> {
+    pub fn new(caption: &str, art: &Art, start: String, rights: fpk::Rights, area: Rect, panel_top: i32, scale: mini_ui::Scale) -> Option<Self> {
         remember(&alloc::format!("{caption} установлен"), "Пакеты · программа готова к запуску");
         let ctx = Ctx::scaled(scale);
         let p = ctx.palette;

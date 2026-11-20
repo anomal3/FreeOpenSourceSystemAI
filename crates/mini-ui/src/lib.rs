@@ -63,6 +63,9 @@ pub mod kit;
 pub mod paint;
 /// Картинки QOI — обои стола (фаза 72a).
 pub mod qoi;
+/// Масштаб интерфейса в процентах (100/125/150/175/200, 20.11).
+pub mod scale;
+pub use scale::Scale;
 /// Подсветка синтаксиса Блокнота (02.11).
 pub mod syntax;
 pub mod text;

@@ -55,7 +55,7 @@ const RECENT_H: u32 = 14 * 2 + 10 + 10 + 48;
 
 /// Где стоит карточка «Система».
 #[must_use]
-pub fn system_card(screen_w: u32, scale: u32) -> Rect {
+pub fn system_card(screen_w: u32, scale: mini_ui::Scale) -> Rect {
     let ctx = Ctx::scaled(scale);
     Rect::new(
         ctx.px(SIDE) as i32,
@@ -67,14 +67,14 @@ pub fn system_card(screen_w: u32, scale: u32) -> Rect {
 
 /// Верх сетки значков — под карточкой «Система».
 #[must_use]
-pub fn grid_top(scale: u32) -> u32 {
+pub fn grid_top(scale: mini_ui::Scale) -> u32 {
     Ctx::scaled(scale).px(TOP + SYSTEM_H + GAP)
 }
 
 /// Где стоит карточка «Последнее» — под сеткой, нижний край которой известен
 /// только значкам.
 #[must_use]
-pub fn recent_card(screen_w: u32, scale: u32, grid_bottom: i32) -> Rect {
+pub fn recent_card(screen_w: u32, scale: mini_ui::Scale, grid_bottom: i32) -> Rect {
     let ctx = Ctx::scaled(scale);
     Rect::new(
         ctx.px(SIDE) as i32,
@@ -93,7 +93,7 @@ fn glass(back: &mut Surface, ctx: Ctx, card: Rect, radius: u32) {
 }
 
 /// Нарисовать карточку «Система» в полосу кадра.
-pub fn draw_system(back: &mut Surface, band: Rect, dy: i32, screen_w: u32, scale: u32, facts: &Facts) {
+pub fn draw_system(back: &mut Surface, band: Rect, dy: i32, screen_w: u32, scale: mini_ui::Scale, facts: &Facts) {
     let screen_card = system_card(screen_w, scale);
     if screen_card.intersect(&band).is_empty() {
         return;
@@ -178,7 +178,7 @@ pub struct Recent {
 }
 
 /// Нарисовать карточку «Последнее» в полосу кадра. Пустой список — карточки нет.
-pub fn draw_recent(back: &mut Surface, band: Rect, dy: i32, screen_card: Rect, scale: u32, rows: &[Recent], background: usize) {
+pub fn draw_recent(back: &mut Surface, band: Rect, dy: i32, screen_card: Rect, scale: mini_ui::Scale, rows: &[Recent], background: usize) {
     if rows.is_empty() || screen_card.intersect(&band).is_empty() {
         return;
     }

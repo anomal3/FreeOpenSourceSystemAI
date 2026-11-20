@@ -62,6 +62,13 @@ impl Image {
         if rect.w == 0 || rect.h == 0 {
             return;
         }
+        // Увеличение (дробный масштаб, 20.11: значок 32×32 в плитке 40 точек
+        // на 125 %) — билинейно: ближайшая точка при нецелом отношении
+        // рисует ступеньки разной ширины.
+        if rect.w > self.width || rect.h > self.height {
+            self.draw_bilinear(surface, rect);
+            return;
+        }
         for ty in 0..rect.h {
             let sy0 = ty * self.height / rect.h;
             let sy1 = ((ty + 1) * self.height / rect.h).max(sy0 + 1).min(self.height);
@@ -85,6 +92,43 @@ impl Image {
                 }
                 let color = Color::rgb((r / a) as u8, (g / a) as u8, (b / a) as u8);
                 let alpha = (a / n).min(255) as u8;
+                draw::blend_pixel(surface, rect.x + tx as i32, rect.y + ty as i32, color, alpha);
+            }
+        }
+    }
+
+    /// Увеличить билинейно, с умножением на альфу (прозрачный край не
+    /// тянет цвет в чёрное). Координаты — в 1/256 точки.
+    fn draw_bilinear(&self, surface: &mut Surface, rect: Rect) {
+        let (w, h) = (self.width, self.height);
+        for ty in 0..rect.h {
+            // Центр точки цели в точках источника минус половина.
+            let fy = ((2 * ty + 1) * h * 128 / rect.h).saturating_sub(128);
+            let (y0, wy) = (fy / 256, fy % 256);
+            let y1 = (y0 + 1).min(h - 1);
+            for tx in 0..rect.w {
+                let fx = ((2 * tx + 1) * w * 128 / rect.w).saturating_sub(128);
+                let (x0, wx) = (fx / 256, fx % 256);
+                let x1 = (x0 + 1).min(w - 1);
+                let taps = [
+                    (self.pixel(x0, y0), (256 - wx) * (256 - wy)),
+                    (self.pixel(x1, y0), wx * (256 - wy)),
+                    (self.pixel(x0, y1), (256 - wx) * wy),
+                    (self.pixel(x1, y1), wx * wy),
+                ];
+                let (mut r, mut g, mut b, mut a) = (0u64, 0u64, 0u64, 0u64);
+                for ([pr, pg, pb, pa], weight) in taps {
+                    let pa = u64::from(pa) * u64::from(weight);
+                    r += u64::from(pr) * pa;
+                    g += u64::from(pg) * pa;
+                    b += u64::from(pb) * pa;
+                    a += pa;
+                }
+                if a == 0 {
+                    continue;
+                }
+                let color = Color::rgb((r / a) as u8, (g / a) as u8, (b / a) as u8);
+                let alpha = (a / 65536).min(255) as u8;
                 draw::blend_pixel(surface, rect.x + tx as i32, rect.y + ty as i32, color, alpha);
             }
         }

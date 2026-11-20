@@ -47,7 +47,7 @@ pub const CARD_RISE: u32 = 40;
 
 /// Высота полосы жеста в точках экрана.
 #[must_use]
-pub fn bar_height(scale: u32) -> u32 {
+pub fn bar_height(scale: mini_ui::Scale) -> u32 {
     Ctx::scaled(scale).px(BAR_H)
 }
 
@@ -55,7 +55,7 @@ pub fn bar_height(scale: u32) -> u32 {
 /// клавиатурой, когда та открыта (низ клавиатуры отстоит от края на поле
 /// [`theme::M_INSET`]).
 #[must_use]
-pub fn pill(screen_w: u32, screen_h: u32, scale: u32) -> Rect {
+pub fn pill(screen_w: u32, screen_h: u32, scale: mini_ui::Scale) -> Rect {
     let ctx = Ctx::scaled(scale);
     // Всегда лёжа (05.11): не шире трети экрана и не толще четверти своей
     // длины — на узком экране или крупном масштабе пилюля не встанет торчком.
@@ -67,7 +67,7 @@ pub fn pill(screen_w: u32, screen_h: u32, scale: u32) -> Rect {
 
 /// Попадает ли нажатие в место, откуда начинается жест.
 #[must_use]
-pub fn in_zone(y: i32, screen_h: u32, scale: u32) -> bool {
+pub fn in_zone(y: i32, screen_h: u32, scale: mini_ui::Scale) -> bool {
     y >= screen_h as i32 - Ctx::scaled(scale).px(ZONE_H) as i32
 }
 
@@ -119,7 +119,7 @@ impl Swipe {
 
     /// Простоял ли поднятый палец достаточно, чтобы открыть переключатель.
     #[must_use]
-    pub fn held(&self, now: u64, scale: u32) -> bool {
+    pub fn held(&self, now: u64, scale: mini_ui::Scale) -> bool {
         !self.done
             && self.rise() >= Ctx::scaled(scale).px(HOLD_RISE) as i32
             && now.saturating_sub(self.moved_at) >= HOLD_MS
@@ -127,7 +127,7 @@ impl Swipe {
 
     /// Что значит жест, если палец отпустили здесь.
     #[must_use]
-    pub fn outcome(&self, screen_h: u32, scale: u32) -> Outcome {
+    pub fn outcome(&self, screen_h: u32, scale: mini_ui::Scale) -> Outcome {
         if self.done {
             return Outcome::Nothing;
         }

@@ -191,7 +191,7 @@ struct Popup {
 pub struct Keyboard {
     surface: Surface,
     pub rect: Rect,
-    scale: u32,
+    scale: mini_ui::Scale,
     visible: bool,
     shift: bool,
     page: Page,
@@ -242,11 +242,11 @@ impl Keyboard {
     /// Собрать клавиатуру под этот экран. `None` — не телефон или не хватило
     /// памяти; тогда клавиатуры просто нет.
     #[must_use]
-    pub fn new(screen_w: u32, screen_h: u32, scale: u32) -> Option<Self> {
+    pub fn new(screen_w: u32, screen_h: u32, scale: mini_ui::Scale) -> Option<Self> {
         if !theme::is_mobile() {
             return None;
         }
-        let scale = scale.max(1);
+        let scale = scale;
         let ctx = Ctx::scaled(scale);
         let inset = ctx.px(theme::M_INSET);
         let width = screen_w.checked_sub(inset * 2).filter(|w| *w > 0)?;
@@ -1185,6 +1185,6 @@ const SYMBOL_ROWS: [(&str, &str); 3] =
 
 /// Сколько места клавиатура отнимает снизу у окна над ней, в точках экрана.
 #[must_use]
-pub fn reserved(scale: u32) -> u32 {
+pub fn reserved(scale: mini_ui::Scale) -> u32 {
     Ctx::scaled(scale).px(HEIGHT + theme::M_INSET + GAP)
 }

@@ -329,7 +329,7 @@ pub struct Compositor {
     /// остался бы нажатым, а выделение текста не узнало бы, где кончилось.
     captured: Option<(App, u32)>,
     /// Масштаб глифа для новых окон.
-    scale: u32,
+    scale: mini_ui::Scale,
     /// Буфер, в котором собирается кадр, — полоса во всю ширину экрана.
     back: Surface,
     damage: [Rect; MAX_DAMAGE],
@@ -408,7 +408,7 @@ impl Compositor {
     /// прямо на экран, без буфера» здесь намеренно нет: он означал бы две
     /// сборки кадра, из которых вторая проверялась бы только на машине, где не
     /// хватило памяти, — то есть никогда.
-    pub fn new(outputs: Vec<OutputSlot>, scale: u32) -> Option<Self> {
+    pub fn new(outputs: Vec<OutputSlot>, scale: mini_ui::Scale) -> Option<Self> {
         let (union, primary, out_rects) = layout_of(&outputs)?;
         let mut pointer = Pointer::new(primary);
         pointer.set_scale(scale);
@@ -425,7 +425,7 @@ impl Compositor {
             menu: None,
             pointer,
             icons: Icons::new(scale),
-            context: ContextMenu::new(scale.min(2)),
+            context: ContextMenu::new(scale),
             shade: None,
             keyboard: None,
             flight: None,
@@ -474,7 +474,7 @@ impl Compositor {
             cursor_sent: (0, 0),
             cursor_key: usize::MAX,
         };
-        compositor.panel = Panel::new(compositor.primary, scale.min(2));
+        compositor.panel = Panel::new(compositor.primary, scale);
         let panel_top = compositor.work_bottom();
         compositor.menu = compositor.new_menu();
         // Шторка заводится только на телефоне — [`Shade::new`] сам вернёт
@@ -535,7 +535,7 @@ impl Compositor {
     /// «Пуск» под нынешнюю панель.
     fn new_menu(&self) -> Option<Menu> {
         let (home, cfg) = self.panel.as_ref().map_or((Rect::EMPTY, super::deskcfg::taskbar()), |panel| (panel.home(), panel.config()));
-        Menu::new(self.primary, home, cfg, self.scale.min(2))
+        Menu::new(self.primary, home, cfg, self.scale)
     }
 
     /// Пересобрать панель и «Пуск» под новые настройки (`deskcfg`, 20.11):
@@ -545,7 +545,7 @@ impl Compositor {
         if theme::is_mobile() {
             return;
         }
-        let Some(panel) = Panel::new(self.primary, self.scale.min(2)) else {
+        let Some(panel) = Panel::new(self.primary, self.scale) else {
             return;
         };
         if let Some(old) = self.panel.as_ref() {
@@ -582,8 +582,8 @@ impl Compositor {
     /// окон ядра, шрифт терминала — всё от одного числа. Программам масштаб
     /// уходит через `SysInfo::flags` (его выставляет вызывающий). `false` —
     /// масштаб тот же, делать нечего.
-    pub fn set_scale(&mut self, scale: u32, status: &Status) -> bool {
-        let scale = scale.clamp(1, 2);
+    pub fn set_scale(&mut self, scale: mini_ui::Scale, status: &Status) -> bool {
+        let scale = scale.min(mini_ui::Scale::TWO);
         if scale == self.scale || theme::is_mobile() {
             return false;
         }
@@ -598,16 +598,27 @@ impl Compositor {
         self.peek = None;
         self.peek_back = None;
         self.toast = None;
+        for window in &mut self.windows {
+            window.set_scale(scale);
+        }
+        // Панель, «Пуск», сетка значков — заново; рабочая область — уже с
+        // панелью нового размера (на 125 % она выше на 12 точек, и окно,
+        // поджатое по прежней, уходило низом под неё).
+        self.rebuild_taskbar();
         let works: Vec<Rect> = self.windows.iter().map(|window| self.work_rect_under(window.rect)).collect();
         for (window, work) in self.windows.iter_mut().zip(works) {
-            window.set_scale(scale);
-            // Выросшее окно не шире и не выше рабочей области своего монитора.
-            if !window.is_maximized() && (window.rect.w > work.w || window.rect.h > work.h) {
+            if window.is_maximized() {
+                continue;
+            }
+            // Выросшее окно не шире и не выше рабочей области своего монитора
+            // и целиком в ней: правый и нижний край не за экраном.
+            if window.rect.w > work.w || window.rect.h > work.h {
                 let _ = window.resize(window.rect.w.min(work.w), window.rect.h.min(work.h));
             }
+            let (w, h) = (window.rect.w as i32, window.rect.h as i32);
+            window.rect.x = window.rect.x.min(work.right() - w).max(work.x);
+            window.rect.y = window.rect.y.min(work.bottom() - h).max(work.y);
         }
-        // Панель, «Пуск», сетка значков и окна в рабочей области — заново.
-        self.rebuild_taskbar();
         self.restyle(status);
         crate::kprintln!("  desktop     : ui scale {scale} (was {old}), {} window(s) rescaled", self.windows.len());
         true
@@ -894,7 +905,7 @@ impl Compositor {
         self.work_rect_under(rect)
     }
 
-    pub const fn scale(&self) -> u32 {
+    pub const fn scale(&self) -> mini_ui::Scale {
         self.scale
     }
 
@@ -2118,7 +2129,7 @@ impl Compositor {
     fn snap_zone(&self, x: i32, y: i32) -> Option<(Snap, Rect)> {
         let index = self.output_near(x, y);
         let monitor = *self.output_rects().get(index)?;
-        let edge = (2 * self.scale.max(1)) as i32;
+        let edge = (2u32 * self.scale) as i32;
         let outside = |x: i32, y: i32| !self.output_rects().iter().any(|rect| rect.contains(x, y));
         let zone = if x < monitor.x + edge && outside(monitor.x - 1, y) {
             Snap::Left
@@ -2193,7 +2204,7 @@ impl Compositor {
     fn unmaximize_dragged(&mut self, index: usize, app: App, areas: &[Rect]) {
         let (px, py) = self.pointer.position();
         let (ax, ay) = self.drag_press;
-        let threshold = 4 * self.scale.max(1) as i32;
+        let threshold = 4 * self.scale.pct() as i32 / 100;
         if (px - ax).abs() < threshold && (py - ay).abs() < threshold {
             return;
         }
@@ -4088,10 +4099,10 @@ impl Compositor {
     pub fn prepare_layout(&self, rects: &[Rect], primary: usize) -> Option<Layers> {
         let (union, primary, _) = layout_of_rects(rects, primary)?;
         let back = band_buffer(union)?;
-        let panel = Panel::new(primary, self.scale.min(2));
+        let panel = Panel::new(primary, self.scale);
         let (home, cfg) = panel.as_ref().map_or((Rect::EMPTY, super::deskcfg::taskbar()), |panel| (panel.home(), panel.config()));
-        let menu = Menu::new(primary, home, cfg, self.scale.min(2));
-        let context = ContextMenu::new(self.scale.min(2));
+        let menu = Menu::new(primary, home, cfg, self.scale);
+        let context = ContextMenu::new(self.scale);
         Some(Layers { back, panel, menu, context })
     }
 

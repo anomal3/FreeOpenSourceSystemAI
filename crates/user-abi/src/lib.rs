@@ -1869,7 +1869,36 @@ pub const SYSINFO_SCALE_100: u32 = 2;
 /// [`SysInfo::flags`]: масштаб стола задан человеком — 200 %.
 pub const SYSINFO_SCALE_200: u32 = 4;
 
+/// [`SysInfo::flags`]: масштаб стола в процентах (100/125/150/175/200) —
+/// биты 8..16 (20.11, дробный масштаб). Ноль — ядро старое, смотреть на
+/// [`SYSINFO_SCALE_100`]/[`SYSINFO_SCALE_200`]. Старые биты ядро ставит
+/// по-прежнему (125 % — `SCALE_100`, от 150 % — `SCALE_200`): программа,
+/// собранная раньше, рисует в ближайшем целом масштабе.
+pub const SYSINFO_SCALE_PCT_SHIFT: u32 = 8;
+/// Маска поля [`SYSINFO_SCALE_PCT_SHIFT`].
+pub const SYSINFO_SCALE_PCT_MASK: u32 = 0xFF << SYSINFO_SCALE_PCT_SHIFT;
+
+/// Признаки масштаба для [`SysInfo::flags`] по процентам стола.
+#[must_use]
+pub const fn sysinfo_scale_flags(percent: u32) -> u32 {
+    let legacy = if percent >= 150 { SYSINFO_SCALE_200 } else { SYSINFO_SCALE_100 };
+    legacy | ((percent & 0xFF) << SYSINFO_SCALE_PCT_SHIFT)
+}
+
+/// Масштаб стола из [`SysInfo::flags`] в процентах; 0 — не задан (по
+/// экрану). Понимает и старое ядро (только биты 100/200).
+#[must_use]
+pub const fn sysinfo_scale_percent(flags: u32) -> u32 {
+    let pct = (flags & SYSINFO_SCALE_PCT_MASK) >> SYSINFO_SCALE_PCT_SHIFT;
+    if pct != 0 {
+        pct
+    } else {
+        sysinfo_scale_choice(flags) * 100
+    }
+}
+
 /// Выбор масштаба из [`SysInfo::flags`]: 0 — по экрану, 1 или 2 — задан.
+/// Только целые; дробный — [`sysinfo_scale_percent`].
 #[must_use]
 pub const fn sysinfo_scale_choice(flags: u32) -> u32 {
     if flags & SYSINFO_SCALE_200 != 0 {

@@ -117,7 +117,7 @@ impl Lock {
     }
 
     /// Нарисовать экран поверх уже нарисованных обоев в `s` (весь экран).
-    pub fn draw(&mut self, s: &mut Surface, scale: u32) {
+    pub fn draw(&mut self, s: &mut Surface, scale: mini_ui::Scale) {
         let ctx = Ctx::scaled(scale);
         let p = ctx.palette;
         let px = |value: u32| value * scale;
@@ -196,7 +196,7 @@ impl Default for Lock {
 
 /// Текст заголовком, увеличенный в [`CLOCK_ZOOM`] раз со сглаживанием:
 /// рисуется белым по чёрному в маску, яркость маски — прозрачность.
-fn big_text(ctx: Ctx, s: &mut Surface, x: i32, y: i32, text: &str, scale: u32) {
+fn big_text(ctx: Ctx, s: &mut Surface, x: i32, y: i32, text: &str, scale: mini_ui::Scale) {
     let face = ctx.face(Role::Heading);
     let (w, h) = (face.width(text).max(1) + 2, u32::from(face.line).max(1));
     let Some(mut mask) = Surface::new(w, h, Color::rgb(0, 0, 0)) else {
@@ -225,7 +225,7 @@ fn big_text(ctx: Ctx, s: &mut Surface, x: i32, y: i32, text: &str, scale: u32) {
 }
 
 /// То же по центру прямоугольника.
-fn big_text_centered(ctx: Ctx, s: &mut Surface, area: Rect, text: &str, scale: u32) {
+fn big_text_centered(ctx: Ctx, s: &mut Surface, area: Rect, text: &str, scale: mini_ui::Scale) {
     let face = ctx.face(Role::Heading);
     let (w, h) = (face.width(text) * CLOCK_ZOOM, u32::from(face.line) * CLOCK_ZOOM);
     big_text(ctx, s, area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 2, text, scale);

@@ -142,7 +142,7 @@ pub enum EditReply {
 /// Значки стола: их места и то, какой из них выбран.
 pub struct Icons {
     /// Масштаб — тот же, что у всего стола.
-    scale: u32,
+    scale: mini_ui::Scale,
     /// Системные значки и содержимое каталога стола, в порядке показа.
     items: Vec<Item>,
     /// Выбранный значок — номер в [`Icons::items`]: тот, по которому щёлкнули
@@ -268,13 +268,13 @@ impl Icons {
 
     /// Масштаб стола сменился (20.11). Сетку перерисует следующий
     /// [`Self::set_area`].
-    pub fn set_scale(&mut self, scale: u32) {
+    pub fn set_scale(&mut self, scale: mini_ui::Scale) {
         self.scale = scale;
         self.edit = None;
     }
 
     #[must_use]
-    pub fn new(scale: u32) -> Self {
+    pub fn new(scale: mini_ui::Scale) -> Self {
         let mut icons = Self {
             scale,
             items: Vec::new(),

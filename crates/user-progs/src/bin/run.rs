@@ -626,10 +626,10 @@ fn byte_at(text: &str, index: usize) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
-    let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), info.screen_w.max(1), info.screen_h.max(1));
+    let scale = app::ui_scale(&info);
     // Компактный диалог, как «Выполнить» в Windows (20.11: был 520×300 с
     // пустым полем посередине); подсказки ложатся поверх кнопок.
-    let width = (480 * scale).min(info.screen_w);
-    let height = (250 * scale).min(info.screen_h);
+    let width = (480u32 * scale).min(info.screen_w);
+    let height = (250u32 * scale).min(info.screen_h);
     app::run(&SPEC, &info, (width, height), |_, _| Runner::new())
 }

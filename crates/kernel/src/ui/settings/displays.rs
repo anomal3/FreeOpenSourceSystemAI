@@ -611,7 +611,7 @@ impl Displays {
         let inner = canvas.shrink(ctx.px(24));
         let map = match &self.drag {
             Some(drag) => drag.map,
-            None => fit(&self.heads, inner, i64::from(ctx.scale) * 128),
+            None => fit(&self.heads, inner, i64::from(ctx.scale.pct()) * 128 / 100),
         };
         self.map.set(Some(map));
         let gap = ctx.px(3);

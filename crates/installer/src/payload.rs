@@ -534,7 +534,7 @@ const FONTS: [(&CStr16, &str); 3] = [
 
 /// Шрифты системы (02.11). Список обязан совпадать с `SYSTEM_FONTS` в
 /// `xtask/src/cbuild.rs`.
-const SYSTEM_FONTS: [(&CStr16, &str); 20] = [
+const SYSTEM_FONTS: [(&CStr16, &str); 24] = [
     (cstr16!("\\FREEOS\\FONTS\\INTER.TTF"), "usr/share/fonts/fossai/Inter.ttf"),
     (cstr16!("\\FREEOS\\FONTS\\INTEROFL.TXT"), "usr/share/fonts/fossai/Inter-OFL.txt"),
     (cstr16!("\\FREEOS\\FONTS\\JBMONO.TTF"), "usr/share/fonts/fossai/JetBrainsMono.ttf"),
@@ -555,6 +555,10 @@ const SYSTEM_FONTS: [(&CStr16, &str); 20] = [
     (cstr16!("\\FREEOS\\FONTS\\PLEXOFL.TXT"), "usr/share/fonts/fossai/IBMPlexMono-OFL.txt"),
     (cstr16!("\\FREEOS\\FONTS\\HACK.TTF"), "usr/share/fonts/fossai/Hack-Regular.ttf"),
     (cstr16!("\\FREEOS\\FONTS\\HACKLIC.TXT"), "usr/share/fonts/fossai/Hack-LICENSE.md"),
+    (cstr16!("\\FREEOS\\FONTS\\UI125.FNT"), "usr/share/fonts/fossai/ui-125.fnt"),
+    (cstr16!("\\FREEOS\\FONTS\\UI150.FNT"), "usr/share/fonts/fossai/ui-150.fnt"),
+    (cstr16!("\\FREEOS\\FONTS\\UI175.FNT"), "usr/share/fonts/fossai/ui-175.fnt"),
+    (cstr16!("\\FREEOS\\FONTS\\UI200.FNT"), "usr/share/fonts/fossai/ui-200.fnt"),
 ];
 
 /// Страница, которую веб-сервер отдаёт по умолчанию, и её оформление.

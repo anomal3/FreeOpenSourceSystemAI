@@ -358,8 +358,8 @@ fn home_dir() -> String {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
-    let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), info.screen_w.max(1), info.screen_h.max(1));
-    let width = (640 * scale).min(info.screen_w);
-    let height = (560 * scale).min(info.screen_h.saturating_sub(60 * scale)).max(400);
+    let scale = app::ui_scale(&info);
+    let width = (640u32 * scale).min(info.screen_w);
+    let height = (560u32 * scale).min(info.screen_h.saturating_sub(60u32 * scale)).max(400);
     app::run(&SPEC, &info, (width, height), |_, _| Cleaner::new())
 }

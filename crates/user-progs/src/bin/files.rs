@@ -5249,12 +5249,8 @@ fn window_size(info: &SysInfo) -> (u32, u32) {
     // боковой колонкой (240 + TABLE_MIN_W + поля, 850 точек макета): на 2560
     // при 200 % доля в 56 % (20.11) прятала «Размер» за прокруткой вбок.
     let (w, h) = app::window_size(info, app::size::FILES);
-    let scale = mini_ui::theme::geometry_scale_for(
-        user_abi::sysinfo_scale_choice(info.flags),
-        info.screen_w.max(1),
-        info.screen_h.max(1),
-    );
-    let fit = (850 * scale).min(info.screen_w * 85 / 100);
+    let scale = app::ui_scale(info);
+    let fit = (850u32 * scale).min(info.screen_w * 85 / 100);
     (w.max(fit), h)
 }
 

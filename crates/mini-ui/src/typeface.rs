@@ -35,6 +35,12 @@
 
 pub mod data;
 
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicPtr, Ordering};
+
 use crate::{Color, Rect, Surface};
 
 /// Один глиф: где его картинка лежит в общем массиве и куда её ставить.
@@ -67,6 +73,9 @@ pub struct Face {
     /// в тот день, когда в набор добавят знак пошире.
     pub mono: u8,
     pub glyphs: &'static [Glyph],
+    /// Покрытие, на которое указывают `Glyph::off`: у встроенных рядов —
+    /// общий [`data::COVERAGE`], у рядов из файла — свой (20.11).
+    pub coverage: &'static [u8],
 }
 
 /// Назначение текста, а не его размер.
@@ -103,9 +112,24 @@ pub enum Tier {
     Normal,
     /// От 2560 и выше.
     Large,
+    /// Дробный масштаб стола (20.11): кегли обычного ряда × 125/150/175/200 %,
+    /// из файла `ui-NNN.fnt` ([`install_pack`]); не загружен — ближайший
+    /// встроенный ряд ([`Tier::Normal`] для 125 %, [`Tier::Large`] выше).
+    Scaled(u16),
 }
 
 impl Tier {
+    /// Ряд для масштаба стола. На телефоне — прежние два ряда: его 200 % —
+    /// плотность экрана, а не выбор человека.
+    #[must_use]
+    pub fn for_scale(scale: crate::Scale, mobile: bool) -> Self {
+        match scale.pct() {
+            100 => Self::Normal,
+            _ if mobile => Self::Large,
+            pct => Self::Scaled(pct as u16),
+        }
+    }
+
     /// Ряд для экрана такой ширины.
     ///
     /// Порог один и высокий: на 1920 кегль 13 читается так же, как на 1280, —
@@ -120,6 +144,15 @@ impl Tier {
 /// Начертание для роли в этом ряду.
 #[must_use]
 pub fn face(role: Role, tier: Tier) -> &'static Face {
+    let tier = match tier {
+        Tier::Scaled(pct) => {
+            if let Some(set) = pack(u32::from(pct)) {
+                return &set[role_index(role)];
+            }
+            if pct < 150 { Tier::Normal } else { Tier::Large }
+        }
+        other => other,
+    };
     match (tier, role) {
         (Tier::Normal, Role::Caption) => &data::CAPTIONNORMAL,
         (Tier::Normal, Role::Body) => &data::BODYNORMAL,
@@ -139,7 +172,119 @@ pub fn face(role: Role, tier: Tier) -> &'static Face {
         (Tier::Large, Role::Mono) => &data::MONOLARGE,
         (Tier::Large, Role::MonoSmall) => &data::MONOSMALLLARGE,
         (Tier::Large, Role::MonoCaps) => &data::MONOCAPSLARGE,
+        (Tier::Scaled(_), _) => &data::BODYNORMAL,
     }
+}
+
+// ── Ряды дробного масштаба из файлов (20.11) ────────────────────────────────
+
+/// Каталог файлов рядов в образе.
+pub const PACK_DIR: &str = "/usr/share/fonts/fossai";
+/// Масштабы, под которые есть файлы `ui-NNN.fnt`.
+pub const PACK_PERCENTS: [u32; 4] = [125, 150, 175, 200];
+/// Начертаний в ряду — по одному на [`Role`].
+const ROLES: usize = 9;
+
+type FaceSet = [Face; ROLES];
+
+static PACKS: [AtomicPtr<FaceSet>; 4] = [const { AtomicPtr::new(core::ptr::null_mut()) }; 4];
+
+fn pack_slot(pct: u32) -> Option<usize> {
+    PACK_PERCENTS.iter().position(|&p| p == pct)
+}
+
+fn pack(pct: u32) -> Option<&'static FaceSet> {
+    let ptr = PACKS.get(pack_slot(pct)?)?.load(Ordering::Acquire);
+    // SAFETY: в ячейку кладётся только `Box::leak` ([`install_pack`]), и
+    // освобождать его некому: ряд живёт до конца программы.
+    unsafe { ptr.as_ref() }
+}
+
+const fn role_index(role: Role) -> usize {
+    match role {
+        Role::Caption => 0,
+        Role::Body => 1,
+        Role::Label => 2,
+        Role::Title => 3,
+        Role::Strong => 4,
+        Role::Heading => 5,
+        Role::Mono => 6,
+        Role::MonoSmall => 7,
+        Role::MonoCaps => 8,
+    }
+}
+
+/// Путь файла ряда для масштаба `pct` (`None` — такого ряда нет).
+#[must_use]
+pub fn pack_path(pct: u32) -> Option<String> {
+    pack_slot(pct).map(|_| format!("{PACK_DIR}/ui-{pct}.fnt"))
+}
+
+/// Нужен ли файл ряда для этого масштаба: ряд есть и ещё не загружен.
+#[must_use]
+pub fn pack_wanted(pct: u32) -> bool {
+    pack_slot(pct).is_some() && pack(pct).is_none()
+}
+
+/// Загрузить ряд из байт файла `ui-NNN.fnt` (формат — `tools/font/genfont.py
+/// --packs`). Байты остаются за рядом навсегда. Возвращает проценты ряда;
+/// файл испорчен — `None`, и рисуется встроенный ряд.
+///
+/// Файл — из образа, но читается как недоверенный: каждое смещение
+/// проверено, глиф за краем покрытия отбрасывается целиком.
+pub fn install_pack(bytes: &'static [u8]) -> Option<u32> {
+    let u16_at = |at: usize| bytes.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    if bytes.get(..4)? != b"FUI1" {
+        return None;
+    }
+    let pct = u32::from(u16_at(4)?);
+    let slot = pack_slot(pct)?;
+    if usize::from(u16_at(6)?) != ROLES {
+        return None;
+    }
+    let cov_len = u32_at(8)? as usize;
+    let mut at = 12;
+    let mut heads = [(0u8, 0u8, 0u8, 0usize); ROLES];
+    for head in &mut heads {
+        let b = bytes.get(at..at + 8)?;
+        *head = (b[0], b[1], b[2], usize::from(u16::from_le_bytes([b[4], b[5]])));
+        at += 8;
+    }
+    let glyph_bytes: usize = heads.iter().map(|h| h.3 * 12).sum();
+    let coverage = bytes.get(at + glyph_bytes..at + glyph_bytes + cov_len)?;
+    let mut faces: Vec<Face> = Vec::with_capacity(ROLES);
+    for &(line, ascent, mono, count) in &heads {
+        let mut glyphs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let b = bytes.get(at..at + 12)?;
+            at += 12;
+            let glyph = Glyph {
+                code: u16::from_le_bytes([b[0], b[1]]),
+                adv: b[2],
+                left: b[3] as i8,
+                top: b[4] as i8,
+                w: b[5],
+                h: b[6],
+                off: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+            };
+            let size = usize::from(glyph.w).div_ceil(2) * usize::from(glyph.h);
+            if glyph.off as usize + size > coverage.len() {
+                return None;
+            }
+            glyphs.push(glyph);
+        }
+        faces.push(Face { line, ascent, mono, glyphs: glyphs.leak(), coverage });
+    }
+    let set: Box<FaceSet> = faces.into_boxed_slice().try_into().ok()?;
+    let fresh = Box::into_raw(set);
+    // Гонка двух загрузок одного ряда безвредна: проигравший ряд остаётся
+    // висеть в памяти, но рисуют все одним.
+    if PACKS[slot].compare_exchange(core::ptr::null_mut(), fresh, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        // SAFETY: `fresh` только что получен из `Box::into_raw` и никому не отдан.
+        drop(unsafe { Box::from_raw(fresh) });
+    }
+    Some(pct)
 }
 
 impl Face {
@@ -260,7 +405,7 @@ pub fn draw_tracked(
     let mut pen = 0;
     for ch in text.chars() {
         let Some(glyph) = face.glyph(ch) else { continue };
-        blit(surface, glyph, x + pen, y, color, alpha);
+        blit(surface, face.coverage, glyph, x + pen, y, color, alpha);
         pen += i32::from(glyph.adv) + tracking as i32;
     }
     // Последний знак разрядку за собой не тянет: иначе строка, выровненная по
@@ -292,11 +437,11 @@ pub fn draw_clipped(
     let mut pen = 0;
     for ch in text.chars().take(taken) {
         let Some(glyph) = face.glyph(ch) else { continue };
-        blit(surface, glyph, x + pen, y, color, alpha);
+        blit(surface, face.coverage, glyph, x + pen, y, color, alpha);
         pen += i32::from(glyph.adv);
     }
     if let Some(glyph) = face.glyph('…') {
-        blit(surface, glyph, x + pen, y, color, alpha);
+        blit(surface, face.coverage, glyph, x + pen, y, color, alpha);
         pen += i32::from(glyph.adv);
     }
     pen.max(0) as u32
@@ -335,7 +480,7 @@ pub fn draw_right(
 ///
 /// Отдельная функция, а не тело цикла: она же нужна и обрезке, и разрядке, и
 /// терминалу, который ставит знаки по одному в свои ячейки.
-fn blit(surface: &mut Surface, glyph: &Glyph, x: i32, y: i32, color: Color, alpha: u8) {
+fn blit(surface: &mut Surface, coverage: &[u8], glyph: &Glyph, x: i32, y: i32, color: Color, alpha: u8) {
     if glyph.w == 0 || glyph.h == 0 {
         return;
     }
@@ -354,7 +499,7 @@ fn blit(surface: &mut Surface, glyph: &Glyph, x: i32, y: i32, color: Color, alph
             if px < 0 || px >= surface.width() as i32 {
                 continue;
             }
-            let Some(byte) = data::COVERAGE.get(line + (column as usize) / 2) else {
+            let Some(byte) = coverage.get(line + (column as usize) / 2) else {
                 return;
             };
             // Младшая тетрада — левая точка: так упаковано генератором, и

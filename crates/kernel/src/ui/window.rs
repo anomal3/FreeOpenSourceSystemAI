@@ -376,7 +376,7 @@ pub struct Window {
     /// Из него же выводится размерный ряд шрифта — порог у них общий, и хранить
     /// два числа значило бы однажды нарисовать кнопку одного ряда шрифтом
     /// другого.
-    scale: u32,
+    scale: mini_ui::Scale,
     /// Окно свёрнуто: его нет на экране, но оно есть в панели задач.
     ///
     /// Свёрнутое окно сохраняет и поверхность, и содержимое: свернуть — это
@@ -589,7 +589,7 @@ impl Window {
     /// это несколько мегабайт, отказ выделения совершенно реален, и система
     /// обязана продолжить работу без этого окна.
     #[must_use]
-    pub fn text(app: App, rect: Rect, scale: u32) -> Option<Self> {
+    pub fn text(app: App, rect: Rect, scale: mini_ui::Scale) -> Option<Self> {
         let ctx = Ctx::scaled(scale);
         // Терминал — почти чёрный при любой теме, как у терминалов Linux и
         // Windows Terminal (T5); заливка окна остаётся под заголовком.
@@ -613,7 +613,7 @@ impl Window {
 
     /// Создать окно параметров.
     #[must_use]
-    pub fn settings(rect: Rect, scale: u32, screen: (u32, u32)) -> Option<Self> {
+    pub fn settings(rect: Rect, scale: mini_ui::Scale, screen: (u32, u32)) -> Option<Self> {
         let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
         let content = Content::Settings(SettingsView::new(screen));
         let title = own(App::Settings.caption())?;
@@ -625,7 +625,7 @@ impl Window {
 
     /// Создать окно, которое сообщает или спрашивает.
     #[must_use]
-    pub fn dialog(app: App, rect: Rect, scale: u32, dialog: Dialog) -> Option<Self> {
+    pub fn dialog(app: App, rect: Rect, scale: mini_ui::Scale, dialog: Dialog) -> Option<Self> {
         let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
         let content = Content::Dialog(DialogView::new(dialog));
         let mut window = Self::wrap(app, rect, surface, content, scale, own(app.caption())?);
@@ -646,7 +646,7 @@ impl Window {
     /// иначе значило бы отдавать программе окно, в котором её же рисунок
     /// наполовину закрыт заголовком.
     #[must_use]
-    pub fn program(app: App, rect: Rect, scale: u32, title: &str, pixels: Surface) -> Option<Self> {
+    pub fn program(app: App, rect: Rect, scale: mini_ui::Scale, title: &str, pixels: Surface) -> Option<Self> {
         let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
         let content = Content::Program(ProgramView {
             pixels,
@@ -664,7 +664,7 @@ impl Window {
     /// Создать всплывающее окно программы (фаза 62e): то же, что
     /// [`Self::program`], но без полосы заголовка — окно ровно с поверхность.
     #[must_use]
-    pub fn popup_program(app: App, rect: Rect, scale: u32, title: &str, pixels: Surface) -> Option<Self> {
+    pub fn popup_program(app: App, rect: Rect, scale: mini_ui::Scale, title: &str, pixels: Surface) -> Option<Self> {
         let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
         let content = Content::Program(ProgramView {
             pixels,
@@ -690,7 +690,7 @@ impl Window {
         rect: Rect,
         surface: Surface,
         content: Content,
-        scale: u32,
+        scale: mini_ui::Scale,
         title: String,
     ) -> Self {
         Self {
@@ -803,7 +803,7 @@ impl Window {
     /// С фазы С6 — настройка, а не константа: [`theme::title_h`] выбирает
     /// человек в «Параметрах».
     #[must_use]
-    pub fn title_height(scale: u32) -> u32 {
+    pub fn title_height(scale: mini_ui::Scale) -> u32 {
         theme::title_h() * scale
     }
 
@@ -1000,9 +1000,9 @@ impl Window {
     /// Окну программы, умеющему менять размер, уходит просьба о новом размере
     /// (содержимое она перерисует сама: масштаб ей сообщает `SysInfo`);
     /// не умеющему — меняется только заголовок.
-    pub fn set_scale(&mut self, scale: u32) -> bool {
-        let old = self.scale.max(1);
-        let scale = scale.clamp(1, 2);
+    pub fn set_scale(&mut self, scale: mini_ui::Scale) -> bool {
+        let old = self.scale;
+        let scale = scale.min(mini_ui::Scale::TWO);
         if old == scale {
             return true;
         }
@@ -1015,21 +1015,21 @@ impl Window {
             }
         }
         if let Some(restore) = self.restore.as_mut() {
-            restore.w = restore.w * scale / old;
-            restore.h = restore.h * scale / old;
+            restore.w = scale.rescale(restore.w, old);
+            restore.h = scale.rescale(restore.h, old);
         }
-        let w = self.rect.w * scale / old;
+        let w = scale.rescale(self.rect.w, old);
         let bar_old = Self::title_height(old);
         let fits = self.fit;
         match &self.content {
             Content::Program(view) if view.resizable && !fits => {
                 let content_h = self.rect.h.saturating_sub(if self.popup || self.frameless { 0 } else { bar_old });
-                let h = content_h * scale / old + self.bar();
+                let h = scale.rescale(content_h, old) + self.bar();
                 self.rebuild(w, h)
             }
             Content::Program(_) => self.retitle(),
             _ => {
-                let h = self.rect.h * scale / old;
+                let h = scale.rescale(self.rect.h, old);
                 self.rebuild(w, h)
             }
         }
@@ -1213,7 +1213,7 @@ impl Window {
     /// Какие края окна под точкой `local` (координаты окна): полоса
     /// [`EDGE_GRAB`] у каждой стороны, у углов — вдвое шире вдоль стороны.
     fn edges_at(&self, x: i32, y: i32) -> u8 {
-        let grab = ((EDGE_GRAB * self.scale.max(1)) as i32).max(3);
+        let grab = ((EDGE_GRAB * self.scale) as i32).max(3);
         let corner = grab * 3;
         let (w, h) = (self.rect.w as i32, self.rect.h as i32);
         let mut edges = 0;
@@ -1987,8 +1987,13 @@ impl Window {
         for (session, tab, close) in tabs {
             let active = session == self.session;
             if active {
-                // Видимая вкладка сливается с терминалом под ней.
-                draw::rounded(&mut self.surface, Rect::new(tab.x, tab.y, tab.w, tab.h + ctx.px(8)), ctx.px(6), mini_ui::text::TERM_BG, 255);
+                // Видимая вкладка сливается с терминалом под ней: скругление
+                // сверху, низ прямой. Не ниже полосы (20.11): прямоугольник
+                // «на px(8) ниже вкладки» залезал в сетку и срезал верх первой
+                // строки терминала — на 200 % на 3–4 точки.
+                draw::rounded(&mut self.surface, tab, ctx.px(6), mini_ui::text::TERM_BG, 255);
+                let half = tab.h / 2;
+                self.surface.fill(Rect::new(tab.x, tab.y + half as i32, tab.w, tab.h - half), mini_ui::text::TERM_BG);
                 if !theme::is_mobile() {
                     let bottom = Self::title_height(self.scale) as i32;
                     self.surface.fill(Rect::new(tab.x, bottom - ctx.px(2) as i32, tab.w, ctx.px(2)), mini_ui::text::TERM_BG);
@@ -2993,7 +2998,7 @@ fn own(text: &str) -> Option<String> {
 /// которая обязана доходить до края окна, до него не доходит.
 /// Где лежит сетка терминала: область содержимого без полосы вкладок и с
 /// полем в четыре точки.
-fn grid_area(surface: &Surface, scale: u32, strip: bool) -> Rect {
+fn grid_area(surface: &Surface, scale: mini_ui::Scale, strip: bool) -> Rect {
     let ctx = Ctx::scaled(scale);
     // С 72h вкладки ПК — в заголовке (макет 15), своя полоса только у
     // телефона.

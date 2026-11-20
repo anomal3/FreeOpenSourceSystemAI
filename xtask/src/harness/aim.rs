@@ -139,7 +139,9 @@ pub enum Aim {
 /// строку заново. Первая описывала бы экран, которого уже нет.
 fn desktop_line(log: &str) -> Result<&str> {
     log.lines()
-        .filter(|line| line.contains("desktop     : ") && line.contains("ui scale"))
+        // `, ui scale` — с запятой: строки смены масштаба (`ui scale 1.5
+        // (was 2)`, `scale 150 -> ui scale 1.5`, 20.11) размера экрана не несут.
+        .filter(|line| line.contains("desktop     : ") && line.contains(", ui scale"))
         .last()
         .context("в журнале нет строки с размером экрана")
 }
@@ -222,8 +224,31 @@ fn title_button(log: &str, title: &str, from_right: i32) -> Result<(i32, i32)> {
 /// масштабировать перестали — под каждый размерный ряд он растеризован
 /// отдельно, — а геометрию по-прежнему надо, и число в строке теперь означает
 /// именно её.
-fn ui_scale(log: &str) -> Result<i32> {
-    field(log, "ui scale")
+///
+/// С 20.11 масштаб дробный: в строке `ui scale 1.5` — множитель с точкой,
+/// здесь он хранится в процентах, и `точки_макета * scale` округляет до
+/// целой точки так же, как `mini_ui::Scale`.
+fn ui_scale(log: &str) -> Result<Pct> {
+    let line = desktop_line(log)?;
+    let rest = line.split("ui scale").nth(1).context("в строке стола нет 'ui scale'")?;
+    let word: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let value: f64 = word.parse().with_context(|| format!("за 'ui scale' не число: '{word}'"))?;
+    Ok(Pct((value * 100.0).round() as i32))
+}
+
+/// Масштаб в процентах (см. [`ui_scale`]).
+#[derive(Clone, Copy)]
+struct Pct(i32);
+
+impl std::ops::Mul<Pct> for i32 {
+    type Output = i32;
+    fn mul(self, scale: Pct) -> i32 {
+        if self == 1 {
+            return scale.0 / 100;
+        }
+        let v = self * scale.0;
+        if v >= 0 { (v + 50) / 100 } else { -((-v + 50) / 100) }
+    }
 }
 
 /// Высота панели задач в точках.

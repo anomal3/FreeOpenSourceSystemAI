@@ -687,7 +687,7 @@ impl SettingsView {
     fn layout(&self) -> Layout {
         let seen = self.seen.get().unwrap_or(Seen {
             area: Rect::new(0, 0, self.screen.0 * 7 / 8, self.screen.1 * 8 / 10),
-            ctx: Ctx::scaled(1),
+            ctx: Ctx::scaled(mini_ui::Scale::ONE),
         });
         self.run(seen.ctx, seen.area, None)
     }
@@ -728,7 +728,7 @@ impl SettingsView {
     /// Колесо мыши над окном. `true` — содержимое сдвинулось.
     pub fn wheel(&mut self, clicks: i32) -> bool {
         let before = self.scroll;
-        let step = self.seen.get().map_or(1, |seen| seen.ctx.scale) as i32 * 64;
+        let step = self.seen.get().map_or(64, |seen| seen.ctx.px(64)) as i32;
         let layout = self.layout();
         // Положительное — от себя: содержимое едет вниз, то есть к началу.
         self.scroll -= clicks * step;

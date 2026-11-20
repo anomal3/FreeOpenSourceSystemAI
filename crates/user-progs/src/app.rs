@@ -26,7 +26,7 @@ use alloc::format;
 use alloc::string::String;
 
 use mini_ui::paint::Ctx;
-use mini_ui::{Rect, Surface, theme};
+use mini_ui::{Rect, Scale, Surface, theme, typeface};
 
 use crate::{
     SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_POINTER, WIN_RESIZE, WIN_WHEEL, Window, exit, monotonic_ms, nanosleep,
@@ -234,6 +234,54 @@ pub fn start(spec: &Spec) -> SysInfo {
     info
 }
 
+/// Масштаб стола из `SysInfo` (проценты, дробный — с 20.11) и ряд шрифта
+/// под него. Один вход для всех программ: и каркаса [`run`], и тех, у кого
+/// цикл свой (`dotnet`), — чтобы масштаб считался одинаково.
+#[must_use]
+pub fn ui_scale(info: &SysInfo) -> Scale {
+    let (w, h) = (info.screen_w.max(1), info.screen_h.max(1));
+    let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_percent(info.flags), w, h);
+    if !matches!(theme::form_for(w, h), theme::Form::Mobile) {
+        load_font_pack(scale);
+    }
+    scale
+}
+
+/// Ряд шрифта для дробного масштаба (`/usr/share/fonts/fossai/ui-NNN.fnt`,
+/// см. `mini_ui::typeface::install_pack`): читается один раз за жизнь
+/// программы. Нет файла — ближайший встроенный ряд, без ошибки.
+fn load_font_pack(scale: Scale) {
+    let pct = scale.pct();
+    if !typeface::pack_wanted(pct) {
+        return;
+    }
+    let Some(path) = typeface::pack_path(pct) else {
+        return;
+    };
+    let fd = crate::open(&path);
+    if fd < 0 {
+        return;
+    }
+    let size = crate::file_size(fd);
+    let mut bytes = alloc::vec::Vec::new();
+    if size > 0 && size <= 2 * 1024 * 1024 && bytes.try_reserve_exact(size as usize).is_ok() {
+        bytes.resize(size as usize, 0u8);
+        let mut got = 0usize;
+        while got < bytes.len() {
+            let step = crate::read(fd, &mut bytes[got..]);
+            if step <= 0 {
+                break;
+            }
+            got += step as usize;
+        }
+        bytes.truncate(got);
+    }
+    crate::close(fd);
+    if !bytes.is_empty() {
+        let _ = typeface::install_pack(alloc::boxed::Box::leak(bytes.into_boxed_slice()));
+    }
+}
+
 /// Желаемые размеры окон системных программ в точках макета (множитель 1).
 ///
 /// # Почему числом, а не долей экрана
@@ -269,7 +317,7 @@ pub mod size {
 #[must_use]
 pub fn window_size(info: &SysInfo, logical: (u32, u32)) -> (u32, u32) {
     let (screen_w, screen_h) = (info.screen_w.max(1), info.screen_h.max(1));
-    let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), screen_w, screen_h);
+    let scale = ui_scale(info);
     let work_h = screen_h.saturating_sub((theme::PANEL_H + theme::TITLE_H) * scale);
     let (width, height) = theme::default_window(logical, scale, (screen_w, work_h), screen_w);
     let width = width.max(MIN_W.min(screen_w));
@@ -299,7 +347,7 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
     // телефоне порог по ширине не срабатывает вовсе, и содержимое окна
     // рисовалось бы вдвое мельче рамки, которую вокруг него рисует стол.
     theme::set_form(theme::form_for(info.screen_w.max(1), info.screen_h.max(1)));
-    let mut scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), info.screen_w.max(1), info.screen_h.max(1));
+    let mut scale = ui_scale(info);
 
     let Some(mut window) = open_patiently(spec, width, height) else {
         println(&format!("{}: FAILED the desktop never freed up; no window", spec.name));
@@ -417,9 +465,25 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
                 }
                 // Масштаб стола сменился на ходу (20.11): ядро отдаёт его
                 // в `flags`, и содержимое рисуется в том же, что и рамка.
-                let fresh_scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(fresh.flags), fresh.screen_w.max(1), fresh.screen_h.max(1));
+                let fresh_scale = ui_scale(&fresh);
                 if fresh_scale != scale {
+                    let old = scale;
                     scale = fresh_scale;
+                    // Окно, которое тянуть нельзя (калькулятор, «Выполнить»),
+                    // стол не перекраивает — его раскладка на один размер.
+                    // Размер меняет сама программа: тот же в точках макета.
+                    if !app.resizable() {
+                        let (w, h) = (scale.rescale(area.w, old), scale.rescale(area.h, old));
+                        if window.resize(w, h).is_ok() {
+                            let base = window.pixels().as_mut_ptr();
+                            // SAFETY: как у WIN_RESIZE выше — ядро только что
+                            // отобразило ровно `w * h` точек по этому адресу.
+                            if let Some(fresh) = unsafe { Surface::from_raw(base, w, h) } {
+                                surface = fresh;
+                                area = Rect::new(0, 0, w, h);
+                            }
+                        }
+                    }
                     println(&format!("{}: repainted at ui scale {scale}", spec.name));
                     dirty = true;
                 }

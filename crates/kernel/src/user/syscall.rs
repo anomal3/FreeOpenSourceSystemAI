@@ -2238,10 +2238,10 @@ fn sysinfo(out: usize) -> i64 {
         // Масштаб — тот, которым рисует стол сейчас (один источник правды,
         // 20.11): он меняется на ходу, и программы перерисовываются в нём.
         flags: (if mini_ui::theme::is_dark() { SYSINFO_DARK } else { 0 })
+            // Проценты (дробный масштаб, 20.11) и старые биты 100/200 разом.
             | match crate::ui::applied_scale_choice() {
-                1 => user_abi::SYSINFO_SCALE_100,
-                2 => user_abi::SYSINFO_SCALE_200,
-                _ => 0,
+                0 => 0,
+                pct => user_abi::sysinfo_scale_flags(pct),
             },
         // Число берётся у самого `mini-ui`, а не собирается здесь заново: тот
         // же счётчик, который читает `Color::pixel`, отвечает и на этот вопрос.

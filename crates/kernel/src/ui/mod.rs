@@ -689,16 +689,44 @@ static DESK_FOCUS: AtomicBool = AtomicBool::new(false);
 /// Возвращает `false`, если экрана нет или памяти под окна не хватило. Ядро в
 /// этом случае продолжает работать с оболочкой в серийной консоли — графика не
 /// является условием работы системы.
-/// Масштаб, которым рисует стол (1 или 2; 0 — стола ещё нет): его получают
+/// Масштаб, которым рисует стол, в процентах (100…200; 0 — стола ещё нет): его получают
 /// программы в `SysInfo::flags`. Один источник правды (20.11): раньше здесь
 /// лежал выбор человека («Авто» = 0), и программа считала «авто» от ширины
 /// экрана сама — после смены режима NVIDIA 1280 → 2560 стол остался в 100 %,
 /// а «Файлы» рисовали в 200 %.
 static APPLIED_SCALE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Масштаб стола для программ (0 — стола нет, программа считает сама).
+/// Масштаб стола для программ в процентах (0 — стола нет, программа
+/// считает сама).
 pub fn applied_scale_choice() -> u32 {
     APPLIED_SCALE.load(Ordering::Relaxed)
+}
+
+/// Ряд шрифта для дробного масштаба (20.11): кегли под 125/150/175/200 %
+/// лежат файлами `ui-NNN.fnt` в `/usr/share/fonts/fossai` (в каждый бинарь
+/// их не вшить — это ~0,6 МБ на программу). Читается один раз и остаётся в
+/// памяти. Файла нет — рисуется ближайший встроенный ряд.
+pub fn load_font_pack(scale: mini_ui::Scale) {
+    use mini_ui::typeface;
+    let pct = scale.pct();
+    if theme::is_mobile() || !typeface::pack_wanted(pct) {
+        return;
+    }
+    let Some(path) = typeface::pack_path(pct) else {
+        return;
+    };
+    match crate::fs::read(&path, 2 * 1024 * 1024) {
+        Some(Ok((bytes, _))) => {
+            let size = bytes.len();
+            let bytes: &'static [u8] = alloc::boxed::Box::leak(bytes.into_boxed_slice());
+            if typeface::install_pack(bytes).is_some() {
+                kprintln!("  desktop     : font tier {pct}% from {path} ({} KiB)", size / 1024);
+            } else {
+                kprintln!("  desktop     : font tier {pct}%: {path} damaged, nearest built-in");
+            }
+        }
+        _ => kprintln!("  desktop     : font tier {pct}%: no {path}, nearest built-in"),
+    }
 }
 
 pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
@@ -719,7 +747,8 @@ pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
     prefs::adopt();
     let choice = theme::scale_choice();
     let scale = theme::geometry_scale_for(choice, screen.width(), screen.height());
-    APPLIED_SCALE.store(scale.clamp(1, 2), Ordering::Relaxed);
+    load_font_pack(scale);
+    APPLIED_SCALE.store(scale.pct(), Ordering::Relaxed);
     // Буфер кадра — условие работы стола, а не украшение: без него собирать
     // картинку негде. Не хватило памяти — система работает в серийной линии,
     // ровно как на машине без фреймбуфера.
@@ -1174,7 +1203,7 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
             let scale = desktop.scale();
             let (w, h) = theme::default_window((1100, 760), scale, (width, work), screen_w);
             let w = w.max(560.min(width));
-            let h = h.max((520 * scale).min(work * 9 / 10)).max(360.min(work));
+            let h = h.max((520u32 * scale).min(work * 9 / 10)).max(360.min(work));
             centered(w, h)
         }
         // Размер диалога — от его содержимого, а не доля экрана: текст и
@@ -1182,8 +1211,8 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
         // было бы пустым полем с кнопками в дальнем углу.
         App::About => {
             let scale = desktop.scale();
-            let w = (540 * scale).min(width);
-            let h = (440 * scale).min(work);
+            let w = (540u32 * scale).min(width);
+            let h = (440u32 * scale).min(work);
             Rect::new(
                 ((width - w) / 2) as i32,
                 ((work.saturating_sub(h)) / 2) as i32,
@@ -1197,15 +1226,15 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
         // «Программа не отвечает» и «Удаление файла» — по макету 18.
         App::Hung | App::DeleteAsk => {
             let scale = desktop.scale();
-            let w = (480 * scale).min(width);
-            let h = (230 * scale).min(work);
+            let w = (480u32 * scale).min(width);
+            let h = (230u32 * scale).min(work);
             Rect::new(((width.saturating_sub(w)) / 2) as i32, ((work.saturating_sub(h)) / 2) as i32, w, h)
         }
         // «Как открыть этот файл?» — по макету 18: 480 на 500.
         App::OpenWith => {
             let scale = desktop.scale();
-            let w = (480 * scale).min(width);
-            let h = (500 * scale).min(work);
+            let w = (480u32 * scale).min(width);
+            let h = (500u32 * scale).min(work);
             Rect::new(
                 ((width.saturating_sub(w)) / 2) as i32,
                 ((work.saturating_sub(h)) / 2) as i32,
@@ -1215,8 +1244,8 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
         }
         App::Shutdown | App::Restart => {
             let scale = desktop.scale();
-            let w = (500 * scale).min(width);
-            let h = (260 * scale).min(work);
+            let w = (500u32 * scale).min(width);
+            let h = (260u32 * scale).min(work);
             Rect::new(
                 ((width.saturating_sub(w)) / 2) as i32,
                 ((work.saturating_sub(h)) / 2) as i32,
@@ -1582,13 +1611,13 @@ fn drag_tab(desktop: &mut Compositor, x: i32, y: i32) {
     let Some(drag) = *TAB_DRAG.lock() else {
         return;
     };
-    let scale = desktop.scale() as i32;
+    let scale = desktop.scale();
     let Some(window) = desktop.find(drag.app) else {
         *TAB_DRAG.lock() = None;
         return;
     };
     let top = window.rect.y;
-    let bottom = top + Window::title_height(scale as u32) as i32;
+    let bottom = top + Window::title_height(scale) as i32;
     let away = if y < top { top - y } else if y >= bottom { y - bottom + 1 } else { 0 };
     if away > TEAR_OFF * scale && (y - drag.y0).abs() > TEAR_OFF * scale {
         *TAB_DRAG.lock() = None;
@@ -1754,7 +1783,7 @@ fn tab_action(desktop: &mut Compositor, action: context::Action) {
         }
         context::Action::TabDetach => {
             let rect = desktop.rect_of(app).unwrap_or(Rect::new(0, 0, 1, 1));
-            let scale = desktop.scale() as i32;
+            let scale = desktop.scale();
             let (x, y) = (rect.x + 96 * scale, rect.y + 48 * scale);
             tear_off(desktop, app, session, x, y, false);
         }
@@ -3820,7 +3849,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         // поднял его, но запомнить его надо и тогда.
         if let Some(app) = app.filter(|_| hit == Hit::Title && !popup) {
             let now = if at_ms == 0 { crate::time::uptime_ms() } else { at_ms };
-            let slop = 6 * desktop.scale().max(1) as i32;
+            let slop = 6 * desktop.scale().pct() as i32 / 100;
             let double = {
                 let mut last = LAST_TITLE.lock();
                 let double = last.is_some_and(|(was, at, lx, ly)| {
@@ -4620,8 +4649,11 @@ fn adopt_plan(
 fn apply_scale(desktop: &mut Compositor, status: &Status) {
     let p = desktop.primary_rect();
     let scale = theme::geometry_scale_for(theme::scale_choice(), p.w, p.h);
+    // Ряд шрифта под дробный масштаб — с диска, до перестройки окон: иначе
+    // первый кадр нарисовал бы ближайшим встроенным.
+    load_font_pack(scale);
     desktop.set_scale(scale, status);
-    APPLIED_SCALE.store(desktop.scale().clamp(1, 2), Ordering::Relaxed);
+    APPLIED_SCALE.store(desktop.scale().pct(), Ordering::Relaxed);
     remember_sizes(desktop);
 }
 
@@ -4871,11 +4903,11 @@ pub fn taskbar_command(words: &str) {
     });
 }
 
-/// `ui scale auto|100|200`: выбрать масштаб, как в «Параметрах», и сразу
+/// `ui scale auto|100|125|150|175|200`: выбрать масштаб, как в «Параметрах», и сразу
 /// применить ко всему столу (стенд, 20.11).
 pub fn scale_command(word: &str) {
     let Some(choice) = theme::scale_choice_from_tag(word) else {
-        kprintln!("  desktop     : ui scale: auto, 100 or 200");
+        kprintln!("  desktop     : ui scale: auto, 100, 125, 150, 175 or 200");
         return;
     };
     theme::set_scale_choice(choice);
@@ -4892,9 +4924,12 @@ pub fn scale_command(word: &str) {
 
 pub fn start_command(words: &str) {
     let status = status_now();
-    if words.trim() == "settings" {
+    // `ui start settings` — страница «Пуск»; `... display` — «Дисплей»
+    // (масштаб, стенд scale-live 20.11).
+    if let Some(rest) = words.trim().strip_prefix("settings") {
+        let section = if rest.trim() == "display" { Section::Display } else { Section::Start };
         with_desktop(|desktop| {
-            open_settings(desktop, Section::Start, &status);
+            open_settings(desktop, section, &status);
             desktop.present();
         });
         return;
@@ -6396,7 +6431,7 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
         if flags & user_abi::WIN_STYLE_AT_START != 0 && !theme::is_mobile() {
             let work = desktop.primary_work();
             let home = desktop.start_button_rect();
-            let margin = (12 * desktop.scale()) as i32;
+            let margin = (12u32 * desktop.scale()) as i32;
             let placed = desktop.find(app).map(|window| {
                 let (w, h) = (window.rect.w as i32, window.rect.h as i32);
                 let (cx, cy) = if home.is_empty() { (work.x, work.bottom()) } else { (home.x + home.w as i32 / 2, home.y + home.h as i32 / 2) };

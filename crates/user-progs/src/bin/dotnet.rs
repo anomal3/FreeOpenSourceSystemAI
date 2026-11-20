@@ -90,6 +90,10 @@ struct Console {
     windows: Vec<Option<ProgramWindow>>,
     /// Шрифт форм, когда графика уже приготовлена.
     face: Option<&'static Face>,
+    /// Масштаб стола, под который выбран `face`, и когда его сверяли (мс):
+    /// масштаб меняется на ходу (20.11), и шрифт форм идёт за ним.
+    scale: mini_ui::Scale,
+    scale_checked: u64,
     /// Имя программы без `.dll` — заголовок окна, которому C# не дал своего.
     program: String,
     /// Начатая, но не законченная строка вывода.
@@ -116,6 +120,24 @@ impl Console {
     /// `None` — графики у машины нет.
     fn graphics(&mut self) -> Option<&'static Face> {
         if let Some(face) = self.face {
+            // Свой цикл, не `app::run`: масштаб стола сверяется здесь, не
+            // чаще раза в секунду — следующая перерисовка формы уже новым
+            // кеглем (раскладка форм — в точках самой программы, как у
+            // WinForms без AutoScale).
+            let now = monotonic_ms();
+            if now < self.scale_checked + 1000 {
+                return Some(face);
+            }
+            self.scale_checked = now;
+            let Some(info) = sysinfo() else { return Some(face) };
+            let scale = user_progs::app::ui_scale(&info);
+            if scale == self.scale {
+                return Some(face);
+            }
+            self.scale = scale;
+            let face = typeface::face(Role::Body, mini_ui::paint::Ctx::scaled(scale).tier);
+            self.face = Some(face);
+            error(&format!("dotnet: forms font follows ui scale {scale}\n"));
             return Some(face);
         }
         let deadline = monotonic_ms() + WAIT_GRAPHICS_MS;
@@ -130,13 +152,9 @@ impl Console {
         };
         mini_ui::use_raw_format(info.pixel_format);
         mini_ui::theme::set_dark(info.flags & SYSINFO_DARK != 0);
-        let tier = mini_ui::paint::Ctx::scaled(mini_ui::theme::geometry_scale_for(
-            user_abi::sysinfo_scale_choice(info.flags),
-            info.screen_w,
-            info.screen_h,
-        ))
-        .tier;
-        let face = typeface::face(Role::Body, tier);
+        self.scale = user_progs::app::ui_scale(&info);
+        self.scale_checked = monotonic_ms();
+        let face = typeface::face(Role::Body, mini_ui::paint::Ctx::scaled(self.scale).tier);
         self.face = Some(face);
         Some(face)
     }
@@ -376,7 +394,7 @@ impl Host for Console {
         coverage.try_reserve_exact(width as usize * height as usize).ok()?;
         for row in 0..usize::from(glyph.h) {
             for column in 0..usize::from(glyph.w) {
-                let byte = typeface::data::COVERAGE.get(glyph.off as usize + row * stride + column / 2).copied().unwrap_or(0);
+                let byte = face.coverage.get(glyph.off as usize + row * stride + column / 2).copied().unwrap_or(0);
                 let level = if column % 2 == 0 { byte & 0x0F } else { byte >> 4 };
                 coverage.push(level * 17);
             }
@@ -573,6 +591,8 @@ extern "C" fn run(start: usize) -> ! {
         offset_minutes: sysconf::timezone_minutes(&settings).unwrap_or(0),
         windows: Vec::new(),
         face: None,
+        scale: mini_ui::Scale::ONE,
+        scale_checked: 0,
         program: String::from(name.strip_suffix(".dll").unwrap_or(name)),
         pending: String::new(),
     };

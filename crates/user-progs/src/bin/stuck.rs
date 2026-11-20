@@ -36,7 +36,7 @@ pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     if let Some(mut surface) = unsafe { Surface::from_raw(base, width, height) } {
         let area = Rect::new(0, 0, width, height);
         surface.fill(area, theme::window_bg());
-        let ctx = Ctx::scaled(1);
+        let ctx = Ctx::scaled(mini_ui::Scale::ONE);
         paint::text(ctx, &mut surface, Role::Body, 20, 60, "Это окно не отвечает на события.", ctx.palette.ink);
         let _ = window.commit();
     }

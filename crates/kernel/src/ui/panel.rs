@@ -66,7 +66,7 @@ const WHITE: Color = Color::rgb(0xFF, 0xFF, 0xFF);
 /// Подложка — стекло поверх обоев: плитка значка и подложка выбранной строки
 /// сводятся к ней, и возьми они подложку окна, строка меню оказалась бы светлее
 /// карточки, на которой стоит.
-fn desk_ctx(scale: u32) -> Ctx {
+fn desk_ctx(scale: mini_ui::Scale) -> Ctx {
     Ctx::scaled(scale).on(glass_bg())
 }
 
@@ -347,7 +347,7 @@ pub struct Panel {
     /// чужого оттенка поверх обоев.
     pub rect: Rect,
     /// Множитель геометрии стола.
-    scale: u32,
+    scale: mini_ui::Scale,
     damage: Rect,
     /// Кнопка меню в координатах поверхности.
     brand: Rect,
@@ -421,7 +421,7 @@ impl Panel {
     /// же, как плашка: окно, доведённое до края рабочей области, не ложится
     /// под его тень.
     #[must_use]
-    pub fn thickness(cfg: deskcfg::Taskbar, scale: u32) -> u32 {
+    pub fn thickness(cfg: deskcfg::Taskbar, scale: mini_ui::Scale) -> u32 {
         if theme::is_mobile() {
             // Док у телефона выше панели и отстоит от края дальше: под нижним
             // краем экрана лежит место жеста «домой», а по бокам — скруглённые
@@ -506,8 +506,8 @@ impl Panel {
     /// трей, док — в её собственных координатах, поэтому сдвиг монитора
     /// касается одного `rect`.
     #[must_use]
-    pub fn new(area: Rect, scale: u32) -> Option<Self> {
-        let scale = scale.max(1);
+    pub fn new(area: Rect, scale: mini_ui::Scale) -> Option<Self> {
+        let scale = scale;
         let cfg = deskcfg::taskbar();
         let home = if theme::is_mobile() {
             let inset = theme::M_INSET * scale;
@@ -1697,7 +1697,7 @@ fn centered_icon(surface: &mut Surface, rect: Rect, icon: Icon, size: u32, color
 /// Где стоит видимая плашка ПК с этими настройками. `length` — длина
 /// Dock вдоль стороны (по содержимому); `None` — пока неизвестна, берётся
 /// короткая заготовка, первая перерисовка подгонит её.
-fn plate_home(area: Rect, cfg: deskcfg::Taskbar, scale: u32, length: Option<u32>) -> Option<Rect> {
+fn plate_home(area: Rect, cfg: deskcfg::Taskbar, scale: mini_ui::Scale, length: Option<u32>) -> Option<Rect> {
     let thick = Panel::thickness(cfg, scale);
     if area.w <= thick || area.h <= thick {
         return None;
@@ -2334,7 +2334,7 @@ pub struct Menu {
     surface: Surface,
     pub rect: Rect,
     /// Множитель геометрии стола.
-    scale: u32,
+    scale: mini_ui::Scale,
     items: Vec<Item>,
     /// Выбранная строка — номер в `visible`.
     row: usize,
@@ -2426,8 +2426,8 @@ impl Menu {
     /// «Пуск» у панели основного монитора: `area` — его место на столе,
     /// `panel` — место видимой панели, `cfg` — её настройки.
     #[must_use]
-    pub fn new(area: Rect, panel: Rect, cfg: deskcfg::Taskbar, scale: u32) -> Option<Self> {
-        let scale = scale.max(1);
+    pub fn new(area: Rect, panel: Rect, cfg: deskcfg::Taskbar, scale: mini_ui::Scale) -> Option<Self> {
+        let scale = scale;
         let ctx = desk_ctx(scale);
         let m = Metrics::new(ctx);
         let panel_top = if panel.is_empty() { area.bottom() } else { panel.y };

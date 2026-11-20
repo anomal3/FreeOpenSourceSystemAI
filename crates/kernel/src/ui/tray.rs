@@ -89,7 +89,7 @@ pub struct Card<'a> {
 pub struct Sheet {
     surface: Surface,
     pub rect: Rect,
-    scale: u32,
+    scale: mini_ui::Scale,
     rows: Vec<(Rect, Rect, App)>,
     restore_all: Rect,
     /// Переключатель программ, а не лист свёрнутых: другие заголовок и
@@ -106,7 +106,7 @@ impl Sheet {
     /// Собрать лист над доком. `None` — строк нет или не хватило памяти.
     /// `switcher` — это переключатель программ (жест полоски, 04.11).
     #[must_use]
-    pub fn open(screen_w: u32, screen_h: u32, scale: u32, rows: &[Row], switcher: bool) -> Option<Self> {
+    pub fn open(screen_w: u32, screen_h: u32, scale: mini_ui::Scale, rows: &[Row], switcher: bool) -> Option<Self> {
         if rows.is_empty() {
             return None;
         }
@@ -143,7 +143,7 @@ impl Sheet {
     /// начало файла), и пересчитывать миниатюры в каждом кадре незачем.
     /// `None` — карточек нет, экран слишком мал или не хватило памяти.
     #[must_use]
-    pub fn cards(screen_w: u32, screen_h: u32, scale: u32, cards: &[Card]) -> Option<Self> {
+    pub fn cards(screen_w: u32, screen_h: u32, scale: mini_ui::Scale, cards: &[Card]) -> Option<Self> {
         if cards.is_empty() {
             return None;
         }

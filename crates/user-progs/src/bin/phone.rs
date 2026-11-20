@@ -395,9 +395,9 @@ impl Phone {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
-    let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), info.screen_w.max(1), info.screen_h.max(1));
-    let width = (380 * scale).min(info.screen_w);
-    let height = (640 * scale).min(info.screen_h.saturating_sub(80 * scale)).max(420);
+    let scale = app::ui_scale(&info);
+    let width = (380u32 * scale).min(info.screen_w);
+    let height = (640u32 * scale).min(info.screen_h.saturating_sub(80u32 * scale)).max(420);
     app::run(&SPEC, &info, (width, height), |_, _| Phone {
         number: String::new(),
         call_state: user_abi::CALL_NO_MODEM,

@@ -217,14 +217,23 @@ impl SettingsView {
     fn scale_rows(&self, pass: &mut Pass, x: i32, y: i32, w: u32) {
         let ctx = pass.ctx;
         let mut y = pass.group(x, y, w, "Масштаб и макет");
-        let scale = if ctx.scale >= 2 { "200 %" } else { "100 %" };
+        let scale = match ctx.scale.pct() {
+            125 => "125 %",
+            150 => "150 %",
+            175 => "175 %",
+            200 => "200 %",
+            _ => "100 %",
+        };
         y = row(pass, x, y, w, Some(Fi::Sliders), "Масштаб сейчас", "", Ctl::Value(scale), None);
         // Выбор действует сразу (20.11): стол перестраивается целиком.
         let chosen = theme::scale_choice();
         for (choice, label, hint) in [
             (0, "Авто", "200 % на экранах от 3840 точек (4K), иначе 100 %"),
-            (1, "100 %", ""),
-            (2, "200 %", "для 4K и мелких точек"),
+            (100, "100 %", ""),
+            (125, "125 %", ""),
+            (150, "150 %", "для 2560×1440 — крупнее и чётко"),
+            (175, "175 %", ""),
+            (200, "200 %", "для 4K и мелких точек"),
         ] {
             y = row(pass, x, y, w, None, label, hint, Ctl::Radio(chosen == choice), Some(Deed::Scale(choice)));
         }

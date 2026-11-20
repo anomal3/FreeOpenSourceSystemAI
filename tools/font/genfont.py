@@ -22,6 +22,10 @@
 
     python tools/font/genfont.py
 
+Ряды дробного масштаба (файлы `assets/fonts/ui-NNN.fnt`) — тем же скриптом:
+
+    python tools/font/genfont.py --packs
+
 Почему 4 бита на точку
 ======================
 
@@ -97,6 +101,17 @@ FACES = [
 
 TIERS = [("Normal", 2), ("Large", 3)]  # индекс кегля в кортеже FACES
 
+# Дробный масштаб стола (20.11): 125/150/175/200 %. Кегль — обычный ряд,
+# умноженный на масштаб и округлённый: текст растёт вместе с геометрией, как в
+# Windows, и раскладка, сделанная под 100 %, помещается так же. В каждый бинарь
+# эти ряды не вшиваются (это ~0,6 МБ на программу) — они лежат файлами
+# `assets/fonts/ui-NNN.fnt` и едут в образ к шрифтам системы
+# (`/usr/share/fonts/fossai`); ядро и программы читают нужный при смене
+# масштаба (`mini_ui::typeface::install_pack`). Нет файла — ближайший
+# встроенный ряд.
+PACKS = [125, 150, 175, 200]
+PACK_DIR = os.path.join(HERE, "..", "..", "assets", "fonts")
+
 
 def load(path, size, weight):
     font = ImageFont.truetype(path, size)
@@ -152,7 +167,66 @@ def pack4(data, w, h):
     return bytes(out)
 
 
+def build_face(path, size, weight, blob, seen):
+    """Растеризовать одно начертание в общий `blob`; вернуть его описание."""
+    font = load(path, size, weight)
+    ascent, descent = font.getmetrics()
+    glyphs = []
+    widths = set()
+    for ch in CHARS:
+        adv, left, top, w, h, data = render(font, ch)
+        widths.add(adv)
+        if w == 0 or h == 0:
+            off = 0
+        else:
+            packed = pack4(data, w, h)
+            key = (w, h, packed)
+            if key in seen:
+                off = seen[key]
+            else:
+                off = len(blob)
+                seen[key] = off
+                blob += packed
+        glyphs.append((ord(ch), adv, left, top, w, h, off))
+    mono = min(widths) if len(widths) == 1 else 0
+    return {"line": ascent + descent, "ascent": ascent, "mono": mono, "glyphs": glyphs, "size": size}
+
+
+def write_pack(percent):
+    """Файл ряда `ui-NNN.fnt` (формат — `mini_ui::typeface::install_pack`).
+
+    Заголовок: `FUI1`, проценты u16, число начертаний u16, длина покрытия
+    u32; на каждое начертание (в порядке `Role`) — line, ascent, mono, 0
+    (по байту), число глифов u16, 0 u16; потом все глифы подряд по 12 байт
+    (code u16, adv u8, left i8, top i8, w u8, h u8, 0, off u32); потом
+    покрытие. Числа — младшим байтом вперёд.
+    """
+    import struct
+
+    blob, seen, faces = bytearray(), {}, []
+    for role, path, normal, _large, weight in FACES:
+        size = int(normal * percent / 100 + 0.5)
+        faces.append(build_face(path, size, weight, blob, seen))
+    out = bytearray(b"FUI1")
+    out += struct.pack("<HHI", percent, len(faces), len(blob))
+    for face in faces:
+        out += struct.pack("<BBBBHH", face["line"], face["ascent"], face["mono"], 0, len(face["glyphs"]), 0)
+    for face in faces:
+        for code, adv, left, top, w, h, off in face["glyphs"]:
+            out += struct.pack("<HBbbBBBI", code, adv, left, top, w, h, 0, off)
+    out += blob
+    target = os.path.normpath(os.path.join(PACK_DIR, f"ui-{percent}.fnt"))
+    with open(target, "wb") as handle:
+        handle.write(out)
+    sizes = ",".join(str(face["size"]) for face in faces)
+    print(f"{percent} %: кегли {sizes}, {len(out)} байт -> {target}")
+
+
 def main():
+    if "--packs" in sys.argv:
+        for percent in PACKS:
+            write_pack(percent)
+        return 0
     blob = bytearray()
     # Одинаковые картинки встречаются постоянно: пробел, точки, повторы между
     # начертаниями одного кегля. Общий словарь режет образ примерно на шестую.
@@ -236,6 +310,7 @@ def main():
         push(f"    ascent: {face['ascent']},")
         push(f"    mono: {face['mono']},")
         push(f"    glyphs: &{name.upper()}_GLYPHS,")
+        push("    coverage: &COVERAGE,")
         push("};")
         push("")
 

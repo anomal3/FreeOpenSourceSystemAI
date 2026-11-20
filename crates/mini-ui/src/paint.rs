@@ -25,15 +25,16 @@ use crate::draw;
 use crate::glyphicon::{self, Icon};
 use crate::theme::{self, Ink, Palette};
 use crate::typeface::{self, Face, Role, Tier};
-use crate::{Color, Rect, Surface};
+use crate::{Color, Rect, Scale, Surface};
 
 /// Всё, что нужно знать, чтобы нарисовать элемент.
 #[derive(Clone, Copy)]
 pub struct Ctx {
     pub palette: &'static Palette,
     pub tier: Tier,
-    /// Множитель геометрии: 1 на обычном экране, 2 на очень плотном.
-    pub scale: u32,
+    /// Масштаб геометрии: 100 % на обычном экране, до 200 % на плотном;
+    /// с 20.11 — дробный (125/150/175 %), см. [`Scale`].
+    pub scale: Scale,
     /// Цвет, поверх которого рисуют. Нужен сведению полупрозрачных токенов
     /// там, где подложка не окно: карточка внутри карточки, панель на обоях.
     pub under: Color,
@@ -46,11 +47,11 @@ impl Ctx {
     /// другой экран, а множитель у стола один. Ряд шрифта выводится из
     /// множителя, потому что порог у них общий — тот же 2560.
     #[must_use]
-    pub fn scaled(scale: u32) -> Self {
+    pub fn scaled(scale: Scale) -> Self {
         Self {
             palette: theme::palette(),
-            tier: if scale >= 2 { Tier::Large } else { Tier::Normal },
-            scale: scale.max(1),
+            tier: Tier::for_scale(scale, theme::is_mobile()),
+            scale,
             under: theme::window_bg(),
         }
     }
@@ -66,10 +67,16 @@ impl Ctx {
         Self { under, ..self }
     }
 
-    /// Размер из макета, приведённый к этому экрану.
+    /// Размер из макета, приведённый к этому экрану (до целой точки).
     #[must_use]
     pub const fn px(self, value: u32) -> u32 {
-        value * self.scale
+        self.scale.px(value)
+    }
+
+    /// То же для знаковых смещений.
+    #[must_use]
+    pub const fn pxi(self, value: i32) -> i32 {
+        self.scale.pxi(value)
     }
 
     /// Начертание для роли.

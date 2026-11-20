@@ -91,7 +91,7 @@ const SLIDER_H: u32 = 44;
 pub struct Shade {
     surface: Surface,
     pub rect: Rect,
-    scale: u32,
+    scale: mini_ui::Scale,
     open: bool,
     damage: Rect,
     /// Идёт выезд или уход: когда начался и куда (`true` — открывается).
@@ -110,11 +110,11 @@ impl Shade {
     /// `None` — не хватило памяти под поверхность. Это не отказ стола: шторки
     /// просто не будет, а всё остальное работает.
     #[must_use]
-    pub fn new(screen_w: u32, work_bottom: i32, scale: u32) -> Option<Self> {
+    pub fn new(screen_w: u32, work_bottom: i32, scale: mini_ui::Scale) -> Option<Self> {
         if !theme::is_mobile() || work_bottom <= 0 {
             return None;
         }
-        let scale = scale.max(1);
+        let scale = scale;
         let ctx = Ctx::scaled(scale);
         // Макет (экран 02): от верха экрана, с полями по 8, и строка времени —
         // своя, внутри шторки: она закрывает строку состояния, а не лежит под ней.
