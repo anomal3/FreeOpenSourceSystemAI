@@ -460,6 +460,10 @@ struct Manager {
     /// Прокрутка таблицы открытого раздела (20.11): колесо и полоса двигают
     /// вид, а не выбранную строку.
     scroll: kit::Scroll,
+    /// Где указатель над окном (20.11): строка таблицы под ним подсвечена.
+    pointer: Option<(i32, i32)>,
+    /// Подсвеченная строка — окно перерисовывается при её смене.
+    hot_row: Option<usize>,
 }
 
 impl Manager {
@@ -491,6 +495,8 @@ impl Manager {
             log_error: None,
             last_summary: String::new(),
             scroll: kit::Scroll::new(),
+            pointer: None,
+            hot_row: None,
         };
         manager.refresh();
         manager
@@ -1184,6 +1190,20 @@ impl Manager {
     }
 
     /// Простая таблица: шапка и строки, у первой колонки — значок.
+    /// Строка таблицы под указателем (20.11) — для подсветки. Пока открыто
+    /// меню или «Запустить», над полосой и мимо таблицы — никакой.
+    fn row_under(&self, ctx: Ctx, plan: &Plan) -> Option<usize> {
+        let (x, y) = self.pointer?;
+        if self.menu.is_some() || self.run.is_some() || self.scroll.dragging() {
+            return None;
+        }
+        let (view, _, row_h) = self.view_metrics(ctx, plan);
+        if !view.contains(x, y) || self.bar(ctx, plan).is_some_and(|bar| bar.contains(x, y)) {
+            return None;
+        }
+        self.scroll.row_at(y, view.y, row_h)
+    }
+
     fn draw_table(&self, s: &mut Surface, ctx: Ctx, plan: &Plan, titles: &[&str], widths: &[u32], rows: &[(Fi, Color, Vec<String>)], selected: Option<usize>) {
         let p = ctx.palette;
         let body = plan.body;
@@ -1203,12 +1223,15 @@ impl Manager {
         let (area, content, row_h) = self.view_metrics(ctx, plan);
         self.scroll.sync(area.h, content, row_h);
         let at = self.scroll.offset();
+        let hot = self.row_under(ctx, plan);
         for index in self.scroll.rows(area.h, row_h, rows.len()) {
             let (icon, tint, cells) = &rows[index];
             let rect = Rect::new(area.x, area.y + (index as u32 * row_h) as i32 - at, area.w, row_h);
             if selected == Some(index) {
                 draw::blend_rect(s, rect, p.acctint.color, p.acctint.alpha);
                 draw::vline(s, rect.x, rect.y, rect.h, p.acc, 255);
+            } else if hot == Some(index) {
+                draw::blend_rect(s, rect, p.hover1.color, p.hover1.alpha);
             }
             draw::hline(s, rect.x, rect.bottom() - 1, rect.w, p.line.color, p.line.alpha / 2);
             for (index, (col, text)) in cols.iter().zip(cells).enumerate() {
@@ -1716,14 +1739,22 @@ impl App for Manager {
         self.scroll.release()
     }
 
+    /// Полоса прокрутки под указателем шире, строка под ним подсвечена (20.11).
     fn hover(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = Plan::new(ctx, area, self.folded);
         let bar = self.bar(ctx, &plan);
-        self.scroll.hover(bar.as_ref(), x, y)
+        let hot = self.scroll.hover(bar.as_ref(), x, y);
+        self.pointer = Some((x, y));
+        let row = self.row_under(ctx, &plan);
+        let changed = row != self.hot_row;
+        self.hot_row = row;
+        hot | changed
     }
 
     fn leave(&mut self) -> bool {
-        self.scroll.hover(None, 0, 0)
+        self.pointer = None;
+        let changed = self.hot_row.take().is_some();
+        self.scroll.hover(None, 0, 0) | changed
     }
 
     fn tick(&mut self, info: &SysInfo) -> bool {

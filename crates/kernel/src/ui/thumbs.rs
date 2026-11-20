@@ -69,6 +69,16 @@ impl Thumbs {
         Self { apps, rect, cards, hovered: None, cross: false, button }
     }
 
+    /// Переставить полосу углом в `x, y` вместе с карточками: панель сверху
+    /// или сбоку (20.11), и полоса встаёт под ней или рядом с ней.
+    pub fn move_to(&mut self, x: i32, y: i32) {
+        let (dx, dy) = (x - self.rect.x, y - self.rect.y);
+        self.rect = self.rect.translate(dx, dy);
+        for card in &mut self.cards {
+            *card = card.translate(dx, dy);
+        }
+    }
+
     /// Крестик карточки `card` (координаты экрана).
     #[must_use]
     pub fn cross_rect(card: Rect, scale: u32) -> Rect {

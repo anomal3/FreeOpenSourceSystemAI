@@ -1950,6 +1950,15 @@ impl App for Editor {
         }
     }
 
+    /// Подсветка строк, мест и полосы прокрутки в окне выбора файла (20.11).
+    fn hover(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        self.dialog.as_mut().is_some_and(|dialog| dialog.hover(ctx, area, x, y))
+    }
+
+    fn leave(&mut self) -> bool {
+        self.dialog.as_mut().is_some_and(FileDialog::leave)
+    }
+
     fn tick(&mut self, _info: &SysInfo) -> bool {
         false
     }
@@ -2147,6 +2156,8 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     let args = unsafe { Args::new(argc, argv) };
     let path = args.get(1).map(String::from);
     let info = app::start(&SPEC);
-    let size = app::two_thirds(&info);
+    // Один размер на глаз на 1280×720 и 2560×1440 (20.11), а не две трети
+    // экрана.
+    let size = app::window_size(&info, app::size::NOTEPAD);
     app::run(&SPEC, &info, size, move |_, _| Editor::new(path.as_deref()))
 }

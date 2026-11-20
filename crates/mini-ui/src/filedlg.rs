@@ -598,8 +598,13 @@ pub struct FileDialog {
     /// Переименование строки (новая папка): номер в `rows` и поле.
     rename: Option<(usize, Line)>,
     last_click: Option<(Target, u64)>,
-    /// Тянут ползунок прокрутки: где его схватили (от верха ползунка).
-    grab: Option<i32>,
+    /// Полоса прокрутки (20.11 — общая [`kit::ScrollBar`]): смещение в
+    /// точках, захват бегунка и подсветка. Список листается линиями, и
+    /// смещение — всегда `top`, умноженное на высоту линии.
+    scroll: kit::Scroll,
+    /// Где указатель над окном (20.11): строка и место под ним
+    /// подсвечиваются, как в Проводнике.
+    hover: Option<(i32, i32)>,
     /// Раскладка последней отрисовки — клавишам (PageDown листает ровно на
     /// экран, а сколько это — знает только отрисовка).
     geometry: Cell<Option<(Ctx, Rect)>>,
@@ -666,7 +671,8 @@ impl FileDialog {
             type_menu: None,
             rename: None,
             last_click: None,
-            grab: None,
+            scroll: kit::Scroll::new(),
+            hover: None,
             geometry: Cell::new(None),
         };
         dialog.places = dialog.make_places(host);
@@ -1300,25 +1306,86 @@ impl FileDialog {
     }
 
     /// Указатель движется с зажатой кнопкой: ползунок прокрутки.
-    pub fn drag(&mut self, ctx: Ctx, area: Rect, _x: i32, y: i32) -> bool {
-        let Some(grab) = self.grab else {
+    pub fn drag(&mut self, ctx: Ctx, area: Rect, x: i32, y: i32) -> bool {
+        if !self.scroll.dragging() {
             return false;
-        };
+        }
         let lay = Layout::new(ctx, area, self);
-        let (per_line, lines) = lay.page(ctx, self.view);
-        let total = self.shown.len().div_ceil(per_line);
-        if let Some((track, thumb)) = scrollbar(&lay, total, lines, self.top) {
-            let room = (track.h - thumb.h).max(1) as i32;
-            let offset = (y - grab - track.y).clamp(0, room);
-            let last = total.saturating_sub(lines);
-            self.top = ((offset as usize * last + room as usize / 2) / room as usize).min(last);
+        if let Some(bar) = self.bar(ctx, &lay) {
+            bar.drag(&self.scroll, x, y);
+            self.top_from_scroll(ctx, &lay);
         }
         true
     }
 
     /// Кнопку отпустили.
     pub fn release(&mut self) {
-        self.grab = None;
+        self.scroll.release();
+    }
+
+    /// Указатель движется без нажатых кнопок (20.11): подсветить строку,
+    /// место быстрого доступа и полосу прокрутки под ним. `true` — подсветка
+    /// сменилась, надо перерисовать.
+    pub fn hover(&mut self, ctx: Ctx, area: Rect, x: i32, y: i32) -> bool {
+        let lay = Layout::new(ctx, area, self);
+        let before = self.hover_target(ctx, &lay);
+        self.hover = Some((x, y));
+        let bar = self.bar(ctx, &lay);
+        let hot = self.scroll.hover(bar.as_ref(), x, y);
+        hot || self.hover_target(ctx, &lay) != before
+    }
+
+    /// Указатель ушёл с окна: погасить подсветку.
+    pub fn leave(&mut self) -> bool {
+        let had = self.hover.take().is_some();
+        self.scroll.hover(None, 0, 0) || had
+    }
+
+    /// Что под указателем подсвечено: строка (номер в `shown`) или место.
+    fn hover_target(&self, ctx: Ctx, lay: &Layout) -> Option<Target> {
+        let (x, y) = self.hover?;
+        if self.type_menu.is_some() || self.confirm.is_some() {
+            return None;
+        }
+        if lay.places.contains(x, y) {
+            return lay.place_rects(ctx, &self.places).iter().position(|rect| rect.contains(x, y)).map(Target::Place);
+        }
+        if !lay.rows.contains(x, y) {
+            return None;
+        }
+        let (per_line, lines) = lay.page(ctx, self.view);
+        (0..self.shown.len())
+            .skip(self.top * per_line)
+            .take(per_line * (lines + 1))
+            .find(|at| lay.item_rect(ctx, self, *at).is_some_and(|rect| rect.contains(x, y)))
+            .map(Target::Row)
+    }
+
+    /// Полоса прокрутки списка, если он не помещается. Смещение [`Self::scroll`]
+    /// перед этим ставится по `top`: листают и клавиши, и колесо, а они
+    /// двигают линии.
+    fn bar(&self, ctx: Ctx, lay: &Layout) -> Option<kit::ScrollBar> {
+        let (per_line, lines) = lay.page(ctx, self.view);
+        let total = self.shown.len().div_ceil(per_line);
+        if total <= lines || lay.scroll.h == 0 {
+            return None;
+        }
+        let step = lay.line_h(ctx, self.view);
+        if !self.scroll.dragging() {
+            self.scroll.set((self.top as u32 * step) as i32);
+        }
+        let view = Rect::new(lay.rows.x, lay.scroll.y, (lay.scroll.right() - lay.rows.x).max(0) as u32, lay.scroll.h);
+        kit::ScrollBar::vertical(ctx, view, total as u32 * step, &self.scroll)
+    }
+
+    /// Бегунок сдвинули: первая видимая линия — по смещению полосы.
+    fn top_from_scroll(&mut self, ctx: Ctx, lay: &Layout) {
+        let (per_line, lines) = lay.page(ctx, self.view);
+        let total = self.shown.len().div_ceil(per_line);
+        let step = lay.line_h(ctx, self.view).max(1) as i32;
+        let last = total.saturating_sub(lines);
+        self.top = ((self.scroll.offset().max(0) + step - 1) / step).max(0) as usize;
+        self.top = self.top.min(last);
     }
 
     /// Щелчок левой кнопкой в точке окна программы.
@@ -1445,16 +1512,16 @@ impl FileDialog {
             }
             return Outcome::Pending;
         }
-        // Полоса прокрутки.
+        // Полоса прокрутки: бегунок — ухватить, дорожка — страница.
         let (per_line, lines) = lay.page(ctx, self.view);
-        let total = self.shown.len().div_ceil(per_line);
-        if let Some((track, thumb)) = scrollbar(&lay, total, lines, self.top) {
-            if track.contains(x, y) {
-                if thumb.contains(x, y) {
-                    self.grab = Some(y - thumb.y);
+        if let Some(bar) = self.bar(ctx, &lay) {
+            if bar.contains(x, y) {
+                if bar.thumb.contains(x, y) {
+                    bar.press(&self.scroll, x, y);
                 } else {
+                    let total = self.shown.len().div_ceil(per_line);
                     let last = total.saturating_sub(lines);
-                    self.top = if y < thumb.y { self.top.saturating_sub(lines.max(1)) } else { (self.top + lines.max(1)).min(last) };
+                    self.top = if y < bar.thumb.y { self.top.saturating_sub(lines.max(1)) } else { (self.top + lines.max(1)).min(last) };
                 }
                 return Outcome::Pending;
             }
@@ -1573,6 +1640,10 @@ impl FileDialog {
         paint::sunk(inner, s, lay.body, ctx.px(theme::R_CARD));
         let well = inner.on(inner.flat(p.sunk));
         if !lay.places.is_empty() {
+            let hovered = match self.hover_target(ctx, &lay) {
+                Some(Target::Place(at)) => Some(at),
+                _ => None,
+            };
             draw::vline(s, lay.places.right(), lay.body.y + ctx.px(8) as i32, lay.body.h.saturating_sub(ctx.px(16)), p.line.color, p.line.alpha);
             for (index, (place, rect)) in self.places.iter().zip(lay.place_rects(ctx, &self.places)).enumerate() {
                 if rect.is_empty() {
@@ -1585,7 +1656,7 @@ impl FileDialog {
                 let cursor = self.focus == Focus::Places && index == self.place_cursor;
                 if current {
                     paint::row(well, s, rect, RowState::Selected);
-                } else if cursor {
+                } else if cursor || hovered == Some(index) {
                     paint::row(well, s, rect, RowState::Hover);
                 }
                 if cursor {
@@ -1699,6 +1770,10 @@ impl FileDialog {
 
         let columns = lay.columns(ctx);
         let first = self.top * per_line;
+        let hovered = match self.hover_target(ctx, lay) {
+            Some(Target::Row(at)) => Some(at),
+            _ => None,
+        };
         for at in first..(first + per_line * lines).min(self.shown.len()) {
             let Some(rect) = lay.item_rect(ctx, self, at) else {
                 continue;
@@ -1711,6 +1786,8 @@ impl FileDialog {
                 if self.focus == Focus::List {
                     draw::rounded_stroke(s, rect, ctx.px(theme::R_ROW), p.acc, 255);
                 }
+            } else if hovered == Some(at) {
+                paint::row(ctx, s, rect, RowState::Hover);
             }
             let renaming = self.rename.as_ref().filter(|(rename, _)| *rename == index).map(|(_, line)| line);
             if self.view == View::Details {
@@ -1753,12 +1830,9 @@ impl FileDialog {
             }
         }
 
-        // Полоса прокрутки (TODO: перейти на kit::ScrollBar, когда он появится в kit.rs).
-        let total = self.shown.len().div_ceil(per_line);
-        if let Some((track, thumb)) = scrollbar(lay, total, lines, self.top) {
-            draw::rounded(s, track, track.w / 2, p.hover1.color, p.hover1.alpha);
-            let ink = if self.grab.is_some() { p.ink3 } else { p.ink5 };
-            draw::rounded(s, thumb, thumb.w / 2, ink, 255);
+        // Полоса прокрутки — общая (20.11): тонкая, под указателем шире.
+        if let Some(bar) = self.bar(ctx, lay) {
+            bar.draw(ctx, s, &self.scroll);
         }
     }
 
@@ -2006,6 +2080,14 @@ impl Layout {
         (ctx.px(104), ctx.px(96))
     }
 
+    /// Высота линии списка: строки таблицы или ряда значков.
+    fn line_h(&self, ctx: Ctx, view: View) -> u32 {
+        match view {
+            View::Details => Self::row_h(ctx),
+            View::Icons => Self::cell(ctx).1,
+        }
+    }
+
     /// Сколько элементов в линии и сколько линий помещается.
     fn page(&self, ctx: Ctx, view: View) -> (usize, usize) {
         match view {
@@ -2081,19 +2163,6 @@ impl Layout {
         }
         out
     }
-}
-
-/// Дорожка и ползунок полосы прокрутки, если всё не помещается.
-fn scrollbar(lay: &Layout, total: usize, visible: usize, top: usize) -> Option<(Rect, Rect)> {
-    if total <= visible || lay.scroll.h == 0 {
-        return None;
-    }
-    let track = lay.scroll;
-    let min = (track.w * 3).min(track.h);
-    let thumb_h = ((u64::from(track.h) * visible as u64 / total as u64) as u32).clamp(min, track.h);
-    let last = total - visible;
-    let y = track.y + ((u64::from(track.h - thumb_h) * top.min(last) as u64) / last.max(1) as u64) as i32;
-    Some((track, Rect::new(track.x, y, track.w, thumb_h)))
 }
 
 /// Карточка «Заменить?» и её кнопки «Да», «Нет».

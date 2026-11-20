@@ -91,6 +91,29 @@ const SHADOW_DROP: u32 = 10;
 /// прямоугольники лежит в самом столе (см. [`Compositor::out_rects`]).
 pub const MAX_OUTPUTS: usize = 8;
 
+/// Куда прилипает окно, брошенное у края экрана (20.11, как Snap в Windows).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Snap {
+    /// Левая половина рабочей области монитора.
+    Left,
+    /// Правая половина.
+    Right,
+    /// Верхний край — развернуть.
+    Top,
+}
+
+impl Snap {
+    /// Для журнала.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Snap::Left => "to the left half",
+            Snap::Right => "to the right half",
+            Snap::Top => "maximized",
+        }
+    }
+}
+
 /// Монитор стола: экран, в который выводятся собранные полосы, и его место
 /// на общем столе.
 ///
@@ -238,6 +261,10 @@ pub struct Compositor {
     drag_from: (i32, i32),
     /// Захват меняет размер окна, а не его место.
     drag_resizes: bool,
+    /// Окно тащат к краю экрана (20.11, как Snap в Windows): куда оно
+    /// прилипнет, если его отпустить, и где это место — его показывает
+    /// полупрозрачная рамка под окном.
+    snap: Option<(Snap, Rect)>,
     /// Окно, переехавшее с прошлого кадра, и где оно стояло **до первого**
     /// сдвига в этом кадре. См. [`Compositor::note_moved`].
     moved: Option<(App, Rect)>,
@@ -420,6 +447,7 @@ impl Compositor {
             drag: None,
             drag_from: (0, 0),
             drag_resizes: false,
+            snap: None,
             moved: None,
             pending_size: None,
             resize_edges: 0,
@@ -1875,6 +1903,9 @@ impl Compositor {
         } else {
             self.drag_resizes = false;
         }
+        if let Some((_, preview)) = self.snap.take() {
+            self.mark_layer(preview);
+        }
     }
 
     /// Переехало ли окно с тех пор, как его взяли.
@@ -1969,8 +2000,10 @@ impl Compositor {
         if self.windows.get(index).is_some_and(|window| window.fullscreen) {
             return;
         }
-        if self.windows.get(index).is_some_and(Window::is_maximized) {
+        // Так же прилепленное к половине монитора (20.11).
+        if self.windows.get(index).is_some_and(|window| window.is_maximized() || window.is_snapped()) {
             self.unmaximize_dragged(index, app, &areas[..n]);
+            self.update_snap();
             return;
         }
         let Some(window) = self.windows.get_mut(index) else {
@@ -1978,12 +2011,109 @@ impl Compositor {
         };
         let before = window.rect;
         window.move_within(dx, dy, &areas[..n]);
-        if window.rect == before {
+        let after = window.rect;
+        if after != before {
+            self.note_moved(app, before, after);
+            self.follow_owner(app);
+        }
+        // Окно упирается в край рабочей области раньше указателя — к краю
+        // экрана подходит указатель, и прилипание считается по нему.
+        self.update_snap();
+    }
+
+    /// Указатель с тащимым окном у края экрана (20.11, как Snap в Windows):
+    /// слева и справа — половина рабочей области этого монитора, сверху —
+    /// развернуть. Край — только внешний: на стыке двух мониторов окно
+    /// переезжает на соседний, а не прилипает.
+    fn update_snap(&mut self) {
+        let next = if theme::is_mobile() || self.drag_resizes || self.drag.is_none() {
+            None
+        } else {
+            let (x, y) = self.pointer.position();
+            self.snap_zone(x, y)
+        };
+        if next == self.snap {
             return;
         }
+        if let Some((_, old)) = self.snap {
+            self.mark_layer(old);
+        }
+        if let Some((zone, rect)) = next {
+            self.mark_layer(rect);
+            crate::kprintln!("  desktop     : snap preview {} at {},{} {}x{}", zone.name(), rect.x, rect.y, rect.w, rect.h);
+        }
+        self.snap = next;
+    }
+
+    /// Куда прилипнет окно, если указатель у края `x, y`, и место для него.
+    fn snap_zone(&self, x: i32, y: i32) -> Option<(Snap, Rect)> {
+        let index = self.output_near(x, y);
+        let monitor = *self.output_rects().get(index)?;
+        let edge = (2 * self.scale.max(1)) as i32;
+        let outside = |x: i32, y: i32| !self.output_rects().iter().any(|rect| rect.contains(x, y));
+        let zone = if x < monitor.x + edge && outside(monitor.x - 1, y) {
+            Snap::Left
+        } else if x >= monitor.right() - edge && outside(monitor.right(), y) {
+            Snap::Right
+        } else if y < monitor.y + edge && outside(x, monitor.y - 1) {
+            Snap::Top
+        } else {
+            return None;
+        };
+        let area = self.work_rect_of(index);
+        if area.is_empty() {
+            return None;
+        }
+        let half = area.w / 2;
+        let rect = match zone {
+            Snap::Top => area,
+            Snap::Left => Rect::new(area.x, area.y, half, area.h),
+            Snap::Right => Rect::new(area.x + half as i32, area.y, area.w - half, area.h),
+        };
+        Some((zone, rect))
+    }
+
+    /// Окно, которое тащили, отпустили (20.11): у края экрана оно прилипает
+    /// к половине монитора или разворачивается. Ответ — куда прилипло.
+    pub fn drop_snap(&mut self, app: App) -> Option<Snap> {
+        let (zone, target) = self.snap.take()?;
+        self.mark_layer(target);
+        let index = self.index_of(app)?;
+        let focused = index == self.focus;
+        let (from_x, from_y) = self.drag_from;
+        let window = self.windows.get_mut(index)?;
+        let before = window.rect;
+        // Вернётся окно к размеру, с которым его взяли, и туда, откуда взяли.
+        let previous = Rect::new(from_x, from_y, before.w, before.h);
+        if !window.snap_to(target, previous, zone == Snap::Top) {
+            return None;
+        }
+        window.draw_decorations(focused);
         let after = window.rect;
-        self.note_moved(app, before, after);
+        self.mark_layer(before);
+        self.mark_layer(after);
         self.follow_owner(app);
+        self.finish_flight();
+        if self.panel.is_some() && !before.is_empty() && !after.is_empty() && super::animations_allowed() {
+            self.flight = Some(Flight::morph(app, after, before, crate::time::uptime_ns()));
+            super::set_animating(true);
+        }
+        Some(zone)
+    }
+
+    /// Нарисовать место, куда прилипнет окно: полупрозрачная плашка цвета
+    /// акцента с обводкой, на поле от краёв — как у Windows 11.
+    fn draw_snap(&self, back: &mut Surface, band: Rect, dy: i32, rect: Rect) {
+        let ctx = mini_ui::paint::Ctx::scaled(self.scale);
+        let shown = rect.shrink(ctx.px(8));
+        if shown.intersect(&band).is_empty() {
+            return;
+        }
+        let p = theme::palette();
+        let radius = ctx.px(theme::R_WINDOW);
+        let at = shown.translate(0, dy);
+        draw::rounded(back, at, radius, p.acc, 64);
+        draw::rounded_stroke(back, at, radius, p.acc, 190);
     }
 
     /// Развёрнутое окно тащат за заголовок: как только указатель отошёл от
@@ -2003,9 +2133,10 @@ impl Compositor {
             return;
         };
         let before = window.rect;
-        let Some(back) = window.restore_rect() else {
+        let Some(back) = window.drag_restore_rect() else {
             return;
         };
+        let what = if window.is_snapped() { "snapped" } else { "maximized" };
         let along = i64::from((ax - before.x).clamp(0, before.w as i32));
         let x = ax - (along * i64::from(back.w) / i64::from(before.w.max(1))) as i32;
         let y = before.y;
@@ -2015,7 +2146,7 @@ impl Compositor {
         // Дальше окно идёт за указателем от этого места: то, на что он
         // успел отойти от точки нажатия, — уже сдвиг.
         window.move_within(px - ax, py - ay, areas);
-        crate::kprintln!("  desktop     : restored '{}' from maximized by dragging", window.caption());
+        crate::kprintln!("  desktop     : restored '{}' from {what} by dragging", window.caption());
         self.drag_unmaximized = true;
         let after = window.rect;
         self.mark_layer(before);
@@ -2330,13 +2461,23 @@ impl Compositor {
             }
         }
         // Настройки панели сменились («Параметры», 20.11) — пересобрать.
-        if !theme::is_mobile() && self.panel.as_ref().is_some_and(|panel| panel.config() != super::deskcfg::taskbar()) {
+        let rebuilt = !theme::is_mobile() && self.panel.as_ref().is_some_and(|panel| panel.config() != super::deskcfg::taskbar());
+        if rebuilt {
             self.rebuild_taskbar();
         }
         let buttons = self.buttons();
         let menu_open = self.menu_open();
         if let Some(panel) = self.panel.as_mut() {
             panel.redraw(&buttons, menu_open, status);
+        }
+        // Где теперь кнопки окон (20.11): стенд наводит на них указатель,
+        // чтобы открыть миниатюры у панели сверху или сбоку.
+        if rebuilt {
+            for app in self.windows.iter().filter(|window| !window.popup).map(|window| window.app).collect::<Vec<App>>() {
+                if let Some(button) = self.button_of(app) {
+                    crate::kprintln!("  desktop     : button of '{}' at {},{} {}x{}", app.title(), button.x, button.y, button.w, button.h);
+                }
+            }
         }
     }
 
@@ -3448,7 +3589,10 @@ impl Compositor {
         let button = self.button_of(anchor)?;
         let panel_top = self.panel.as_ref().map_or(self.primary.bottom(), |panel| panel.rect.y);
         self.close_thumbs();
-        let thumbs = super::thumbs::Thumbs::new(apps, button, self.primary, panel_top, self.scale);
+        let mut thumbs = super::thumbs::Thumbs::new(apps, button, self.primary, panel_top, self.scale);
+        // Панель сверху или сбоку (20.11) — полоса под ней или рядом с ней.
+        let placed = self.beside_panel(thumbs.rect, button);
+        thumbs.move_to(placed.x, placed.y);
         let rect = thumbs.rect;
         self.thumbs = Some(thumbs);
         self.mark_layer(rect);
@@ -4350,6 +4494,10 @@ impl Compositor {
             // Диалог поверх всего — под ним стол затемнён на 40 % (макет 18).
             if dims(window.app) {
                 draw::blend_rect(back, Rect::new(band.x, band.y + dy, band.w, band.h), Color::rgb(0, 0, 0), 102);
+            }
+            // Куда прилипнет тащимое окно (20.11) — под ним, над остальными.
+            if let Some((_, preview)) = self.snap.filter(|_| self.drag == Some(window.app)) {
+                self.draw_snap(back, band, dy, preview);
             }
             if !window.shaped {
                 self.drop_shadow(back, window.rect, band, dy, r);

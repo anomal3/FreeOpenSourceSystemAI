@@ -324,6 +324,17 @@ const XDG_TOPLEVEL_FULLSCREEN: u32 = 2;
 const XDG_TOPLEVEL_ACTIVATED: u32 = 4;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
+
+/// Кнопка evdev по коду кнопки в событии окна: 1 левая, 2 правая, 4 средняя
+/// (средняя приходит с 20.11).
+const fn evdev_button(code: u32) -> u32 {
+    match code {
+        2 => BTN_RIGHT,
+        4 => BTN_MIDDLE,
+        _ => BTN_LEFT,
+    }
+}
 
 #[derive(Clone)]
 struct Buffer {
@@ -2180,7 +2191,7 @@ impl Client {
                     user_abi::WIN_RELEASE if self.swallow_release => self.swallow_release = false,
                     user_abi::WIN_POINTER | user_abi::WIN_RELEASE => {
                         let target = self.pointer_motion_at(surface, x, y, time);
-                        let button = if event.code == 2 { BTN_RIGHT } else { BTN_LEFT };
+                        let button = evdev_button(event.code);
                         let state = u32::from(event.kind == user_abi::WIN_POINTER);
                         // Нажатие — в журнал: «щелчок не доходит до программы»
                         // иначе снаружи не разобрать (крестик диалога Java,
@@ -2285,7 +2296,7 @@ impl Client {
                     }
                     user_abi::WIN_POINTER | user_abi::WIN_RELEASE => {
                         let target = self.pointer_motion_at(surface, x, y, time);
-                        let button = if event.code == 2 { BTN_RIGHT } else { BTN_LEFT };
+                        let button = evdev_button(event.code);
                         let state = u32::from(event.kind == user_abi::WIN_POINTER);
                         // Нажатие — в журнал: «щелчок не доходит до программы»
                         // иначе снаружи не разобрать (крестик диалога Java,

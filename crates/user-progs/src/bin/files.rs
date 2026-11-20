@@ -67,7 +67,7 @@ use user_progs::{
     Args, SysInfo, WIN_KEY_DELETE, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT,
     WIN_KEY_MENU, WIN_KEY_NAMED, WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP,
     close, create, mkdir, monotonic_ms, mounts, open, open_write, println, read, readdir_raw, remove,
-    clipboard_set, rename, spawn, stat, sysinfo, time_now, write,
+    clipboard_get, clipboard_set, rename, spawn, stat, sysinfo, time_now, write,
 };
 
 /// Имя окна.
@@ -575,7 +575,82 @@ struct Files {
     tab_menu: Option<(usize, i32, i32, usize)>,
     /// Закрыли последнюю вкладку — окно закрывается.
     quit: bool,
+    /// Где указатель над окном (20.11, ядро присылает движения без кнопок):
+    /// строка, место слева и вкладка под ним подсвечиваются. `None` —
+    /// указатель ушёл с окна.
+    pointer: Option<(i32, i32)>,
+    /// Что подсвечено сейчас: окно перерисовывается только при смене.
+    hot: Hot,
+    /// Вкладку вынесли из полосы и отпустили (20.11): она предложена другому
+    /// окну «Файлов» ([`TAB_DROP`]) — какая, метка предложения и до какого
+    /// времени ждать ответа. Не взяли — уходит в своё окно.
+    offer: Option<(usize, String, u64)>,
+    /// Предложение лежит в буфере обмена: что там было до него.
+    offer_clip: Option<String>,
+    /// Указатель вошёл в окно над полосой вкладок: до этого времени
+    /// проверять, не бросили ли сюда вкладку другого окна.
+    drop_watch: Option<u64>,
 }
+
+/// Что под указателем подсвечено.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Hot {
+    #[default]
+    Nothing,
+    /// Строка списка или плитка.
+    Row(usize),
+    /// Место в боковой колонке.
+    Place(usize),
+    /// Вкладка, её крестик или «+».
+    Tab(kit::TabHit),
+}
+
+/// Почтовый ящик переноса вкладок между окнами «Файлов» (20.11).
+///
+/// Окна — разные задачи, а указатель, пока тянут вкладку, захвачен окном,
+/// из которого её тянут: второе окно не знает ни о нажатии, ни о
+/// перетаскивании. Знает оно одно — после отпускания стол присылает окну под
+/// указателем движение ([`App::hover`]). Поэтому так: окно-источник,
+/// отпустив вынесенную вкладку, кладёт сюда предложение `offer <метка>
+/// <время> <путь>` и ждёт [`TAB_DROP_WAIT_MS`]; окно, в которое указатель
+/// вошёл над полосой вкладок, находит свежее чужое предложение, открывает
+/// путь новой вкладкой и пишет `taken <метка>`. Источник видит ответ и
+/// закрывает свою вкладку; не дождался — выносит её в новое окно, как раньше.
+///
+/// Где писать некуда (живая система: корень — FAT только для чтения, `/tmp`
+/// не завести), ящик — буфер обмена стола с меткой [`TAB_DROP_TAG`];
+/// источник потом возвращает в него то, что там было.
+const TAB_DROP: &str = "/tmp/.files-tab-drop";
+
+/// Метка письма в буфере обмена.
+const TAB_DROP_TAG: &str = "\u{1f}files-tab ";
+
+/// Положить письмо в ящик. `Some(true)` — через буфер обмена, `None` — некуда.
+fn mailbox_write(text: &str) -> Option<bool> {
+    let _ = make_dirs("/tmp");
+    if write_file(TAB_DROP, format!("{text}\n").as_bytes()).is_ok() {
+        return Some(false);
+    }
+    clipboard_set(&format!("{TAB_DROP_TAG}{text}")).then_some(true)
+}
+
+/// Письма в ящике: из файла и из буфера обмена.
+fn mailbox_read() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(text) = read_small(TAB_DROP) {
+        out.push(String::from(text.trim_end()));
+    }
+    if let Some(text) = clipboard_get().strip_prefix(TAB_DROP_TAG) {
+        out.push(String::from(text));
+    }
+    out
+}
+
+/// Сколько окно-источник ждёт, что вкладку возьмут.
+const TAB_DROP_WAIT_MS: u64 = 450;
+
+/// Сколько окно, в которое вошёл указатель, высматривает предложение.
+const TAB_DROP_WATCH_MS: u64 = 400;
 
 /// Вкладка «Файлов» (20.11, как у Проводника Windows 11): своя папка, своя
 /// история «назад/вперёд», своё выделение и прокрутка.
@@ -701,6 +776,11 @@ impl Files {
             tab_drag: None,
             tab_menu: None,
             quit: false,
+            pointer: None,
+            hot: Hot::Nothing,
+            offer: None,
+            offer_clip: None,
+            drop_watch: None,
             path,
             back: Vec::new(),
             forward: Vec::new(),
@@ -2726,6 +2806,7 @@ impl Files {
         let at = self.scroll.offset();
         let first = ((at - top).max(0) as u32 / cell_h) as usize * cols;
         let per_page = (view.h / cell_h + 2) as usize * cols;
+        let hot = self.hot_now(ctx, plan);
         if self.rows.is_empty() {
             paint::text_clipped(
                 ctx,
@@ -2746,6 +2827,8 @@ impl Files {
             if selected {
                 draw::rounded(s, cell, ctx.px(theme::R_CARD), p.hover1.color, p.hover1.alpha.max(40));
                 draw::rounded_stroke(s, cell, ctx.px(theme::R_CARD), p.accline.color, p.accline.alpha);
+            } else if hot == Hot::Row(index) {
+                draw::rounded(s, cell, ctx.px(theme::R_CARD), p.hover1.color, p.hover1.alpha);
             }
             let side = ctx.px(theme::ICON_TILE);
             let tile = Rect::new(
@@ -3027,12 +3110,16 @@ impl Files {
         let inner = ctx.on(theme::panel_bg());
         let pad = ctx.px(10);
 
-        for slot in place_slots(inner, side, &self.home) {
+        // Колонка не прокручивается — подсвеченное запомнено верно.
+        let hot = if self.pointer.is_some_and(|(x, y)| side.contains(x, y)) { self.hot } else { Hot::Nothing };
+        for (index, slot) in place_slots(inner, side, &self.home).into_iter().enumerate() {
             if slot.head.is_some() {
                 draw::hline(s, slot.rect.x, slot.head_y + ctx.px(6) as i32, slot.rect.w, p.line2.color, p.line2.alpha);
             }
             let state = if slot.path == self.path {
                 RowState::Selected
+            } else if hot == Hot::Place(index) {
+                RowState::Hover
             } else {
                 RowState::Idle
             };
@@ -3112,11 +3199,18 @@ impl Files {
         self.page_rows.set((view.h / step.max(1)).max(1) as usize);
         let at = self.scroll.offset();
         let pad = ctx.px(12);
+        let hot = self.hot_now(ctx, plan);
         for index in self.scroll.rows(view.h, step, self.rows.len()) {
             let row = &self.rows[index];
             let rect = Rect::new(table.x + pad as i32, table.y + (index as u32 * step) as i32 - at, table.w.saturating_sub(pad * 2), plan.row_h);
             let selected = index == self.selected || self.picked.contains(&index);
-            let state = if selected { RowState::Selected } else { RowState::Idle };
+            let state = if selected {
+                RowState::Selected
+            } else if hot == Hot::Row(index) {
+                RowState::Hover
+            } else {
+                RowState::Idle
+            };
             paint::row(ctx, s, rect, state);
 
             let side = ctx.px(18);
@@ -4452,16 +4546,18 @@ impl App for Files {
         if self.scroll.release() | self.hscroll.release() {
             return true;
         }
-        // Вкладку, вытянутую из полосы, — в своё окно (20.11).
+        // Вкладку, вытянутую из полосы, — другому окну «Файлов», если её
+        // бросили на него, иначе в своё окно (20.11).
         if let Some(drag) = self.tab_drag.take() {
-            return if drag.out { self.tear_off(drag.index) } else { false };
+            return if drag.out { self.offer_tab(drag.index) } else { false };
         }
         self.on_release()
     }
 
-    /// Копирование кусками — на каждом витке цикла окна.
+    /// Копирование кусками — на каждом витке цикла окна; перенос вкладки
+    /// между окнами.
     fn step(&mut self) -> bool {
-        self.copy_step()
+        self.copy_step() | self.offer_step() | self.watch_drop()
     }
 
     fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
@@ -4526,15 +4622,30 @@ impl App for Files {
         moved
     }
 
-    /// Указатель над полосой прокрутки — она шире и ярче.
+    /// Указатель над окном без нажатых кнопок (20.11): полоса прокрутки под
+    /// ним шире и ярче, строка, место слева и вкладка подсвечены. Окно
+    /// перерисовывается, только когда подсвеченное сменилось.
     fn hover(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = layout(ctx, area);
         let (v, h) = self.bars(ctx, &plan);
-        self.scroll.hover(v.as_ref(), x, y) | self.hscroll.hover(h.as_ref(), x, y)
+        let bars = self.scroll.hover(v.as_ref(), x, y) | self.hscroll.hover(h.as_ref(), x, y);
+        // Указатель только что вошёл в окно над полосой вкладок — не бросили
+        // ли сюда вкладку другого окна (см. [`TAB_DROP`]).
+        if self.pointer.is_none() && plan.tabs.union(&plan.toolbar).contains(x, y) {
+            self.drop_watch = Some(monotonic_ms() + TAB_DROP_WATCH_MS);
+        }
+        self.pointer = Some((x, y));
+        let hot = self.hot_at(ctx, &plan, x, y);
+        let changed = hot != self.hot;
+        self.hot = hot;
+        bars | changed
     }
 
     fn leave(&mut self) -> bool {
-        self.scroll.hover(None, 0, 0) | self.hscroll.hover(None, 0, 0)
+        self.pointer = None;
+        let changed = self.hot != Hot::Nothing;
+        self.hot = Hot::Nothing;
+        self.scroll.hover(None, 0, 0) | self.hscroll.hover(None, 0, 0) | changed
     }
 
     /// Средняя кнопка (20.11), как в Проводнике: по папке — открыть её в
@@ -4755,7 +4866,8 @@ impl Files {
     }
 
     /// Вынести вкладку в своё окно (перетащили из полосы или «Переместить в
-    /// новое окно»). Вернуть её обратно в чужое окно пока нельзя — ROADMAP.
+    /// новое окно»). Брошенная на другое окно «Файлов» переезжает туда —
+    /// [`Self::offer_tab`].
     fn tear_off(&mut self, index: usize) -> bool {
         if self.tabs.len() < 2 {
             self.note = Some(String::from("Единственная вкладка уже в своём окне"));
@@ -4767,6 +4879,122 @@ impl Files {
             self.close_tab(index);
         }
         true
+    }
+
+    /// Вынесенную и отпущенную вкладку предложить окну «Файлов» под
+    /// указателем (20.11, [`TAB_DROP`]); ответ ждёт [`Self::offer_step`].
+    fn offer_tab(&mut self, index: usize) -> bool {
+        if self.tabs.len() < 2 || index >= self.tabs.len() {
+            return self.tear_off(index);
+        }
+        let path = if index == self.tab { self.path.clone() } else { self.tabs[index].path.clone() };
+        let now = monotonic_ms();
+        let token = format!("{now}.{}", self.tabs.len());
+        // Буфер обмена, если писать некуда, — вернуть потом как был.
+        let saved = clipboard_get();
+        let Some(by_clipboard) = mailbox_write(&format!("offer {token} {now} {path}")) else {
+            return self.tear_off(index);
+        };
+        self.offer = Some((index, token, now + TAB_DROP_WAIT_MS));
+        self.offer_clip = by_clipboard.then_some(saved);
+        true
+    }
+
+    /// Ждать, возьмёт ли вкладку другое окно: взяли — закрыть её здесь, не
+    /// дождались — вынести в своё окно.
+    fn offer_step(&mut self) -> bool {
+        let Some((index, token, deadline)) = self.offer.clone() else {
+            return false;
+        };
+        let answer = format!("taken {token}");
+        let taken = mailbox_read().iter().any(|text| *text == answer);
+        if !taken && monotonic_ms() < deadline {
+            return false;
+        }
+        self.offer = None;
+        let _ = remove(TAB_DROP);
+        if let Some(saved) = self.offer_clip.take() {
+            clipboard_set(&saved);
+        }
+        if index >= self.tabs.len() {
+            return true;
+        }
+        if taken {
+            println(&format!("files: tab {} moved to another window", index + 1));
+            return self.close_tab(index);
+        }
+        self.tear_off(index)
+    }
+
+    /// Указатель вошёл в окно над полосой вкладок: свежее чужое предложение
+    /// вкладки — открыть её путь новой вкладкой и ответить «взята».
+    fn watch_drop(&mut self) -> bool {
+        let Some(until) = self.drop_watch else {
+            return false;
+        };
+        let now = monotonic_ms();
+        if now > until {
+            self.drop_watch = None;
+            return false;
+        }
+        for text in mailbox_read() {
+            let mut parts = text.splitn(4, ' ');
+            let (Some("offer"), Some(token), Some(at), Some(path)) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            if self.offer.as_ref().is_some_and(|(_, own, _)| own == token) {
+                continue;
+            }
+            if !at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) <= TAB_DROP_WAIT_MS) {
+                continue;
+            }
+            if mailbox_write(&format!("taken {token}")).is_none() {
+                return false;
+            }
+            self.drop_watch = None;
+            println(&format!("files: tab '{path}' taken from another window"));
+            self.open_tab(String::from(path), true);
+            return true;
+        }
+        false
+    }
+
+    /// Что подсвечено под указателем `x, y`. Пока открыто меню, свойства или
+    /// что-то тянут — ничего.
+    fn hot_at(&self, ctx: Ctx, plan: &Plan, x: i32, y: i32) -> Hot {
+        let busy = self.menu.is_some()
+            || self.tab_menu.is_some()
+            || self.pop.is_some()
+            || self.props.is_some()
+            || self.job.is_some()
+            || self.tab_drag.is_some()
+            || self.drag.as_ref().is_some_and(|drag| drag.active)
+            || self.scroll.dragging()
+            || self.hscroll.dragging();
+        if busy {
+            return Hot::Nothing;
+        }
+        if let Some(hit) = self.tab_strip(ctx, plan).hit(x, y) {
+            return if hit == kit::TabHit::Strip { Hot::Nothing } else { Hot::Tab(hit) };
+        }
+        if let Some(side) = plan.side.filter(|side| side.contains(x, y)) {
+            let inner = ctx.on(theme::panel_bg());
+            return place_slots(inner, side, &self.home).iter().position(|slot| slot.rect.contains(x, y)).map_or(Hot::Nothing, Hot::Place);
+        }
+        if self.preview.is_some() || self.on_computer() || self.error.is_some() {
+            return Hot::Nothing;
+        }
+        let (v, h) = self.bars(ctx, plan);
+        if v.as_ref().is_some_and(|bar| bar.contains(x, y)) || h.as_ref().is_some_and(|bar| bar.contains(x, y)) {
+            return Hot::Nothing;
+        }
+        self.row_at(plan, ctx, x, y).map_or(Hot::Nothing, Hot::Row)
+    }
+
+    /// Подсвеченное сейчас — от места указателя, а не от запомненного: после
+    /// прокрутки колесом под указателем уже другая строка.
+    fn hot_now(&self, ctx: Ctx, plan: &Plan) -> Hot {
+        self.pointer.map_or(Hot::Nothing, |(x, y)| self.hot_at(ctx, plan, x, y))
     }
 
     fn click_tab(&mut self, hit: kit::TabHit) -> bool {
@@ -4868,14 +5096,18 @@ impl Files {
     fn draw_tabs(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
         let titles = self.tab_titles();
         let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
-        self.tab_strip(ctx, plan).draw(ctx, s, &titles, self.tab, Some(Icon::Folder));
+        let hover = match self.hot_now(ctx, plan) {
+            Hot::Tab(hit) => Some(hit),
+            _ => None,
+        };
+        self.tab_strip(ctx, plan).draw_hover(ctx, s, &titles, self.tab, Some(Icon::Folder), hover);
     }
 
     /// Вытянутая вкладка у указателя и меню вкладки.
     fn draw_tab_extras(&self, s: &mut Surface, ctx: Ctx, area: Rect) {
         if let Some(drag) = self.tab_drag.as_ref().filter(|drag| drag.out) {
             let title = self.tab_titles().get(drag.index).cloned().unwrap_or_default();
-            let label = format!("Переместить в новое окно: {title}");
+            let label = format!("Переместить: {title}");
             let w = ctx.face(Role::Body).width(&label) + ctx.px(20);
             let chip = Rect::new(drag.at.0 + ctx.px(14) as i32, drag.at.1 + ctx.px(10) as i32, w, ctx.px(28));
             let inner = kit::card(ctx, s, chip);
@@ -4988,6 +5220,11 @@ fn starting_dir(argument: Option<&str>) -> String {
     };
     if path.is_empty() {
         return String::from("/");
+    }
+    // «Этот компьютер» — вкладку с ним выносят в новое окно (20.11); без
+    // этой строки окно открывалось на корне.
+    if path == COMPUTER {
+        return String::from(COMPUTER);
     }
     let mut info = Stat::default();
     if stat(path, &mut info) >= 0 && info.kind == KIND_DIRECTORY {

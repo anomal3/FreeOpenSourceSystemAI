@@ -388,6 +388,10 @@ pub struct Window {
     pub minimized_at_ms: u64,
     /// Куда вернуть окно, если оно развёрнуто. `None` — окно обычного размера.
     restore: Option<Rect>,
+    /// Окно прилеплено к половине монитора (брошено у края, 20.11, как Snap
+    /// в Windows): его прежний прямоугольник. Потащили — окно возвращает
+    /// прежний размер под указателем, как развёрнутое.
+    snap_from: Option<Rect>,
     /// Окно-владелец той же программы (фаза 62d, `user_abi::SYS_WINOWNER`):
     /// это окно всегда стоит над ним, и поднять владельца — поднять и его.
     pub owner: Option<App>,
@@ -696,6 +700,7 @@ impl Window {
             minimized: false,
             minimized_at_ms: 0,
             restore: None,
+            snap_from: None,
             owner: None,
             modal: false,
             popup: false,
@@ -2604,26 +2609,71 @@ impl Window {
         }
     }
 
-    /// Куда вернётся развёрнутое окно; `None` — оно не развёрнуто.
-    #[must_use]
-    pub const fn restore_rect(&self) -> Option<Rect> {
-        self.restore
-    }
-
     /// Вернуть развёрнутое окно к прежнему размеру, но поставить его углом в
     /// `x`, `y` (20.11): развёрнутое окно потащили за заголовок, и оно
     /// уменьшается под указателем, как в Windows.
+    ///
+    /// Так же возвращается окно, прилепленное к половине монитора (20.11): к
+    /// размеру, который был до прилипания, — даже если его потом ещё и
+    /// развернули.
     pub fn unmaximize_at(&mut self, x: i32, y: i32, focused: bool) -> bool {
-        let Some(rect) = self.restore.take() else {
+        let Some(rect) = self.drag_restore_rect() else {
             return false;
         };
+        let (restore, snap) = (self.restore.take(), self.snap_from.take());
         if !self.resize(rect.w, rect.h) {
-            self.restore = Some(rect);
+            self.restore = restore;
+            self.snap_from = snap;
             return false;
         }
         self.rect.x = x;
         self.rect.y = y;
         self.draw_decorations(focused);
+        true
+    }
+
+    /// Каким окно станет, если его потащить за заголовок: прилепленное — тем,
+    /// что было до прилипания, развёрнутое — прежним. `None` — окно обычное.
+    #[must_use]
+    pub const fn drag_restore_rect(&self) -> Option<Rect> {
+        match self.snap_from {
+            Some(rect) => Some(rect),
+            None => self.restore,
+        }
+    }
+
+    /// Прилеплено ли окно к половине монитора.
+    #[must_use]
+    pub const fn is_snapped(&self) -> bool {
+        self.snap_from.is_some()
+    }
+
+    /// Окно бросили у края экрана (20.11, как Snap в Windows): занять
+    /// `area` — половину рабочей области монитора, или развернуться на неё
+    /// (`maximize`, край сверху). `previous` — прямоугольник, к которому
+    /// окно вернётся, когда его потащат или «восстановят»: окно, уже
+    /// прилепленное, помнит самый первый. `false` — размер окну не меняется
+    /// (калькулятор).
+    pub fn snap_to(&mut self, area: Rect, previous: Rect, maximize: bool) -> bool {
+        if area.is_empty() || self.fullscreen {
+            return false;
+        }
+        let (snap, restore) = (self.snap_from.take(), self.restore.take());
+        let previous = snap.unwrap_or(previous);
+        if maximize {
+            // «Развёрнуто» — до пересборки: углы без скругления.
+            self.restore = Some(previous);
+        }
+        if !self.resize(area.w, area.h) {
+            self.restore = restore;
+            self.snap_from = snap;
+            return false;
+        }
+        if !maximize {
+            self.snap_from = Some(previous);
+        }
+        self.rect.x = area.x;
+        self.rect.y = area.y;
         true
     }
 
@@ -2893,8 +2943,20 @@ fn grid_area(surface: &Surface, scale: u32, strip: bool) -> Rect {
     // С 72h вкладки ПК — в заголовке (макет 15), своя полоса только у
     // телефона.
     let top = Window::title_height(scale) + if strip && theme::is_mobile() { ctx.px(STRIP_H) } else { 0 };
-    content_area(surface, top).shrink(ctx.px(4))
+    let mut area = content_area(surface, top).shrink(ctx.px(4));
+    // Справа — поле под уголок размера (20.11). Сетка прокручивается
+    // сдвигом пикселей (`Surface::scroll_up`), и точки уголка, лежавшие в
+    // её прямоугольнике, уезжали вверх с каждой строкой вывода — вдоль
+    // правого края терминала оставался столбик серых точек.
+    if !theme::is_mobile() {
+        area.w = area.w.saturating_sub(ctx.px(GRIP_GUTTER));
+    }
+    area
 }
+
+/// Ширина поля справа от сетки терминала, где лежит уголок размера: точки
+/// уголка — не дальше 13 точек от края окна, сетка кончается в 4.
+const GRIP_GUTTER: u32 = 10;
 
 /// Сделать точки прямоугольника непрозрачными (старший байт — 0xFF).
 ///

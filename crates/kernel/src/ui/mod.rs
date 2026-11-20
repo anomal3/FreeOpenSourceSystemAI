@@ -2597,7 +2597,30 @@ pub fn dispatch_pointer(event: PointerEvent) {
     }
 }
 
-/// Кнопку `button` (1 левая, 2 правая) отпустили в точке `x, y` экрана.
+/// Код средней кнопки в [`WIN_POINTER`] и [`WIN_RELEASE`] (20.11) — третий
+/// бит маски кнопок, как у [`WIN_MOVE`]: 1 левая, 2 правая, 4 средняя.
+const MIDDLE_BUTTON: u32 = 4;
+
+/// Среднюю кнопку нажали (20.11): окну программы под указателем — нажатие с
+/// кодом [`MIDDLE_BUTTON`] и захват до отпускания. Окно не поднимается и
+/// фокус не меняется: вкладка, открытая средней кнопкой, открывается фоном.
+/// Над окнами стола, панелью и меню средняя кнопка ничего не делает.
+fn press_middle(desktop: &mut Compositor, x: i32, y: i32) {
+    if desktop.menu_open() || desktop.context_open() || desktop.dragging().is_some() || desktop.captured().is_some() {
+        return;
+    }
+    let Some((app, local_x, local_y)) = desktop.program_under(x, y) else {
+        return;
+    };
+    let Some(window) = desktop.find(app) else {
+        return;
+    };
+    window.push_event(WinEvent { kind: WIN_POINTER, code: MIDDLE_BUTTON, x: local_x, y: local_y });
+    desktop.capture(app, MIDDLE_BUTTON);
+    kprintln!("  desktop     : middle click at {local_x},{local_y} of '{}'", name_of(desktop, app));
+}
+
+/// Кнопку `button` (1 левая, 2 правая, 4 средняя) отпустили в точке `x, y` экрана.
 ///
 /// Отпускание достаётся окну, над которым кнопку **нажали** (фаза 62b), и точка
 /// тогда бывает за краем его поверхности. Когда отпущены все кнопки, захват
@@ -3100,6 +3123,15 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     if event.released(Buttons::RIGHT) {
         release_pointer(desktop, x, y, 2, status);
     }
+    // Средняя кнопка (20.11) — окну программы под указателем, кодом 4
+    // ([`MIDDLE_BUTTON`]): «Файлы» открывают по ней папку в новой вкладке и
+    // закрывают вкладку, как Проводник.
+    if event.pressed(Buttons::MIDDLE) {
+        press_middle(desktop, x, y);
+    }
+    if event.released(Buttons::MIDDLE) {
+        release_pointer(desktop, x, y, MIDDLE_BUTTON, status);
+    }
     if event.released(Buttons::LEFT) {
         // Жест по полоске и карточка переключателя — раньше прочего: нажатие,
         // с которого они начались, дальше никуда не ходило.
@@ -3169,6 +3201,14 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         if let Some(app) = desktop.dragging().filter(|_| carried && !desktop.drag_resizes()) {
             if drop_on_strip(desktop, app, x, y) {
                 desktop.set_drag(None);
+            }
+        }
+        // Окно бросили у края экрана — прилипает к половине монитора или
+        // разворачивается (20.11, как Snap в Windows).
+        if let Some(app) = desktop.dragging().filter(|_| !desktop.drag_resizes()) {
+            if let Some(zone) = desktop.drop_snap(app) {
+                kprintln!("  desktop     : snapped '{}' {}", name_of(desktop, app), zone.name());
+                log_window(desktop, app, true);
             }
         }
         // Где окно оказалось — в журнал: это единственное видимое снаружи

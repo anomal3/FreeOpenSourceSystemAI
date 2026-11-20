@@ -988,6 +988,12 @@ impl TabStrip {
 
     /// Нарисовать: `titles` — подписи вкладок, `active` — открытая.
     pub fn draw(&self, ctx: Ctx, s: &mut Surface, titles: &[&str], active: usize, icon: Option<Icon>) {
+        self.draw_hover(ctx, s, titles, active, icon, None);
+    }
+
+    /// То же с подсветкой под указателем `hover` (20.11): у неоткрытой
+    /// вкладки — подложка, у крестика и «+» — своя плашка, как у Проводника.
+    pub fn draw_hover(&self, ctx: Ctx, s: &mut Surface, titles: &[&str], active: usize, icon: Option<Icon>, hover: Option<TabHit>) {
         let p = ctx.palette;
         if self.rect.is_empty() {
             return;
@@ -995,8 +1001,17 @@ impl TabStrip {
         s.fill(self.rect, theme::window_bg());
         let panel = ctx.flat(p.panel);
         let r = ctx.px(theme::R_CARD);
+        let hot_tab = match hover {
+            Some(TabHit::Tab(index) | TabHit::Close(index)) => Some(index),
+            _ => None,
+        };
         for (index, (tab, title)) in self.tabs.iter().zip(titles).enumerate() {
             let on = index == active;
+            if !on && hot_tab == Some(index) {
+                let inset = ctx.px(3);
+                let plate = Rect::new(tab.x + inset as i32, tab.y + inset as i32, tab.w.saturating_sub(inset * 2), tab.h.saturating_sub(inset * 2));
+                draw::rounded(s, plate, ctx.px(theme::R_ROW), p.hover1.color, p.hover1.alpha);
+            }
             if on {
                 // Верх скруглён, низ уходит в панель под полосой.
                 draw::rounded(s, *tab, r, panel, 255);
@@ -1018,7 +1033,11 @@ impl TabStrip {
             let room = (close.x - x - ctx.px(4) as i32).max(0) as u32;
             paint::text_clipped(inner, s, Role::Body, x, paint::baseline(inner, Role::Body, *tab), room, title, if on { p.ink } else { p.ink3 });
             let g = ctx.px(10);
-            iconset::draw(s, Fi::X, close.x + (close.w as i32 - g as i32) / 2, close.y + (close.h as i32 - g as i32) / 2, g, if on { p.ink3 } else { p.ink4 }, 255);
+            let close_hot = hover == Some(TabHit::Close(index));
+            if close_hot {
+                draw::rounded(s, close, ctx.px(theme::R_ROW), p.hover2.color, p.hover2.alpha);
+            }
+            iconset::draw(s, Fi::X, close.x + (close.w as i32 - g as i32) / 2, close.y + (close.h as i32 - g as i32) / 2, g, if on || close_hot { p.ink2 } else { p.ink4 }, 255);
         }
         // Линия под полосой — кроме места под активной вкладкой.
         let line_y = self.rect.bottom() - 1;
@@ -1030,6 +1049,9 @@ impl TabStrip {
             None => draw::hline(s, self.rect.x, line_y, self.rect.w, p.line2.color, p.line2.alpha),
         }
         let g = ctx.px(14);
-        iconset::draw(s, Fi::Plus, self.plus.x + (self.plus.w as i32 - g as i32) / 2, self.plus.y + (self.plus.h as i32 - g as i32) / 2, g, p.ink3, 255);
+        if hover == Some(TabHit::New) {
+            draw::rounded(s, self.plus, ctx.px(theme::R_ROW), p.hover1.color, p.hover1.alpha);
+        }
+        iconset::draw(s, Fi::Plus, self.plus.x + (self.plus.w as i32 - g as i32) / 2, self.plus.y + (self.plus.h as i32 - g as i32) / 2, g, if hover == Some(TabHit::New) { p.ink } else { p.ink3 }, 255);
     }
 }

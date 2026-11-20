@@ -212,6 +212,8 @@ pub enum Step {
     DoubleClick,
     /// Щелчок правой кнопкой — меню рабочего стола.
     RightClick,
+    /// Щелчок средней кнопкой (20.11): папка «Файлов» — в новую вкладку.
+    MiddleClick,
     /// Нажать левую кнопку и **не** отпускать — начало перетаскивания.
     Press,
     /// Навести на первую точку, нажать и провести через остальные, **не**
@@ -913,6 +915,11 @@ const LAG_STEPS: &[Step] = &[
 ];
 
 /// Шаги сценариев «Пуска» и панели (20.11) — одни на 1280×720 и на 2K.
+/// Точка на полосе вкладок первого окна «Файлов» в сценарии `files-tabs`
+/// (20.11), видная слева от второго, прилепленного к правой половине: окно
+/// открывается в одном и том же месте экрана 1280×720.
+const FILES_A_STRIP: (i32, i32) = (300, 99);
+
 const START_STEPS: &[Step] = &[
     Step::Await(PROMPT, BOOT),
     Step::Key("f1"),
@@ -985,10 +992,24 @@ const START_STEPS: &[Step] = &[
     Step::Shot("11-top-start"),
     Step::Key("f1"),
     Step::Await("desktop     : menu closed", 15_000),
+    // Миниатюры у панели сверху — под ней, а не над краем экрана (20.11).
+    Step::Aim(aim::Aim::Button("Terminal")),
+    Step::Await("desktop     : thumbnails at ", 15_000),
+    Step::Wait(800),
+    Step::Shot("11b-top-thumbs"),
+    Step::Aim(aim::Aim::Empty),
+    Step::Await("desktop     : thumbnails closed", 15_000),
     Step::Line("ui taskbar panel right"),
     Step::Await("desktop     : taskbar mode:panel edge:right autohide:off", 15_000),
     Step::Wait(800),
     Step::Shot("12-panel-right"),
+    // У панели справа — левее неё, напротив кнопки.
+    Step::Aim(aim::Aim::Button("Terminal")),
+    Step::Await("desktop     : thumbnails at ", 15_000),
+    Step::Wait(800),
+    Step::Shot("12b-right-thumbs"),
+    Step::Aim(aim::Aim::Empty),
+    Step::Await("desktop     : thumbnails closed", 15_000),
     Step::Line("ui taskbar dock right"),
     Step::Await("desktop     : taskbar mode:dock edge:right autohide:off", 15_000),
     Step::Wait(800),
@@ -3463,6 +3484,53 @@ pub const ALL: &[Scenario] = &[
             Step::Move(0, 200),
             Step::Wait(1_500),
             Step::Shot("04-after-hover"),
+            // Окно тащат к левому краю экрана — полупрозрачная рамка показывает
+            // левую половину; отпустили — окно прилипло (20.11, как Snap).
+            Step::Aim(Aim::Title("System")),
+            Step::Press,
+            Step::Await("desktop     : drag 'System'", 15_000),
+            Step::Aim(Aim::Point(0, 360)),
+            Step::Await("desktop     : snap preview to the left half", 15_000),
+            Step::Wait(800),
+            Step::Shot("05-snap-preview"),
+            Step::Release,
+            Step::Await("desktop     : snapped 'System' to the left half", 15_000),
+            Step::Await("window      : 'System' at 0,", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("06-snapped-left"),
+            // Прилепленное потащили — прежний размер под указателем.
+            Step::Aim(Aim::Title("System")),
+            Step::Press,
+            Step::Await("desktop     : drag 'System'", 15_000),
+            Step::Move(160, 60),
+            Step::Move(100, 40),
+            Step::Release,
+            Step::Await("desktop     : restored 'System' from snapped by dragging", 15_000),
+            Step::Await("window      : 'System' at", 15_000),
+            // К правому краю — правая половина.
+            Step::Aim(Aim::Title("System")),
+            Step::Press,
+            Step::Await("desktop     : drag 'System'", 15_000),
+            Step::Aim(Aim::Point(1279, 300)),
+            Step::Await("desktop     : snap preview to the right half", 15_000),
+            Step::Release,
+            Step::Await("desktop     : snapped 'System' to the right half", 15_000),
+            Step::Await("window      : 'System' at", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("07-snapped-right"),
+            // К верхнему краю — развернуть.
+            Step::Aim(Aim::Title("System")),
+            Step::Press,
+            Step::Await("desktop     : drag 'System'", 15_000),
+            Step::Aim(Aim::Point(640, 0)),
+            Step::Await("desktop     : snap preview maximized", 15_000),
+            Step::Wait(800),
+            Step::Shot("08-snap-top-preview"),
+            Step::Release,
+            Step::Await("desktop     : snapped 'System' maximized", 15_000),
+            Step::Await("window      : 'System' at", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("09-snapped-top"),
             Step::Absent("KERNEL PANIC"),
         ],
     },
@@ -14910,11 +14978,52 @@ pub const ALL: &[Scenario] = &[
             Step::Await("window      : 'Files' at", 30_000),
             Step::Wait(2_500),
             Step::Shot("07-torn-off"),
-            // Ctrl+W на последней вкладке закрывает окно — по очереди оба.
+            // Новое окно — к правому краю: прилипает к правой половине, первое
+            // остаётся видным слева (20.11).
+            Step::Aim(Aim::Title("Files")),
+            Step::Press,
+            Step::Await("desktop     : drag 'Files'", 15_000),
+            Step::Aim(Aim::Point(1279, 360)),
+            Step::Await("desktop     : snap preview to the right half", 15_000),
+            Step::Release,
+            Step::Await("desktop     : snapped 'Files' to the right half", 15_000),
+            Step::Await("window      : 'Files' at 640,", 15_000),
+            Step::Wait(1_500),
+            // В нём — корень (с «Этого компьютера» — первый том).
+            Step::Key("ret"),
+            Step::Await("files: / has ", 15_000),
+            Step::Wait(1_000),
+            // Наведение подсвечивает строку (ядро присылает движения без
+            // кнопок), средняя кнопка открывает папку новой вкладкой фоном.
+            Step::Aim(Aim::FilesRow(1)),
+            Step::Wait(1_000),
+            Step::Shot("08-hover-row"),
+            Step::MiddleClick,
+            Step::Await("desktop     : middle click at ", 15_000),
+            Step::Await("files: tab 2 opened '/", 15_000),
+            Step::Wait(1_000),
+            Step::Aim(Aim::Program("Files", 368, 19)),
+            Step::Wait(800),
+            Step::Shot("09-middle-tab"),
+            // Вкладку второго окна бросают на полосу вкладок первого: она
+            // переезжает туда, во втором окне закрывается.
+            Step::Press,
+            Step::Move(0, 60),
+            Step::Move(0, 40),
+            Step::Aim(Aim::Point(FILES_A_STRIP.0, FILES_A_STRIP.1)),
+            Step::Release,
+            Step::Await("taken from another window", 15_000),
+            Step::Await("files: tab 2 moved to another window", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("10-merged"),
+            // Ctrl+W: второе окно (одна вкладка) закрывается, в первом — две.
             Step::Key("ctrl-w"),
             Step::Await("files: last tab closed", 15_000),
             Step::Await("files: closing on request", 15_000),
             Step::Wait(1_500),
+            Step::Key("ctrl-w"),
+            Step::Await("files: tab 2 closed, 1 left", 15_000),
+            Step::Wait(800),
             Step::Key("ctrl-w"),
             Step::Await("files: last tab closed", 15_000),
             Step::Await("files: closing on request", 15_000),

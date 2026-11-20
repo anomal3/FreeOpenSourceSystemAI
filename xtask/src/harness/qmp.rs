@@ -44,6 +44,8 @@ const ABS_MAX: i64 = 0x7FFF;
 pub const BUTTON_LEFT: &str = "left";
 /// Правая кнопка — ею открывается меню рабочего стола.
 pub const BUTTON_RIGHT: &str = "right";
+/// Средняя кнопка (20.11): «Файлы» открывают по ней папку в новой вкладке.
+pub const BUTTON_MIDDLE: &str = "middle";
 
 pub struct Qmp {
     stream: TcpStream,
