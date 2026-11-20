@@ -352,6 +352,8 @@ pub enum Request {
     Restart,
     /// Перерисовать панель задач: сменилось то, что она показывает.
     Panel,
+    /// Сменился выбор масштаба — применить ко всему столу сразу (20.11).
+    Scale,
 }
 
 /// Что делает пункт, по которому нажали.
@@ -1139,10 +1141,11 @@ impl SettingsView {
             }
             Deed::Scale(choice) => {
                 theme::set_scale_choice(choice);
+                self.request = Some(Request::Scale);
                 self.report = Some(match super::prefs::store_scale(choice) {
                     Ok(()) => {
                         kprintln!("  settings    : scale {} saved", theme::scale_choice_tag(choice));
-                        Report::ok(String::from("масштаб запомнен, применится после перезагрузки"))
+                        Report::ok(String::from("масштаб применён и запомнен"))
                     }
                     Err(err) => Report::bad(format!("масштаб не запомнен: {err}")),
                 });

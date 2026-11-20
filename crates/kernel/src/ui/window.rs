@@ -994,6 +994,47 @@ impl Window {
         self.rebuild(w, h)
     }
 
+    /// Масштаб стола сменился на ходу (20.11, «Масштаб» в «Параметрах» или
+    /// смена режима экрана): заголовок, рамка, шрифт терминала и содержимое
+    /// окон ядра — в новом масштабе, размер окна — тот же в точках макета.
+    /// Окну программы, умеющему менять размер, уходит просьба о новом размере
+    /// (содержимое она перерисует сама: масштаб ей сообщает `SysInfo`);
+    /// не умеющему — меняется только заголовок.
+    pub fn set_scale(&mut self, scale: u32) -> bool {
+        let old = self.scale.max(1);
+        let scale = scale.clamp(1, 2);
+        if old == scale {
+            return true;
+        }
+        self.scale = scale;
+        let face = Ctx::scaled(scale).face(Role::Mono);
+        if let Content::Text(grid) = &mut self.content {
+            grid.set_face(face);
+            for tab in &mut self.tabs {
+                tab.grid.set_face(face);
+            }
+        }
+        if let Some(restore) = self.restore.as_mut() {
+            restore.w = restore.w * scale / old;
+            restore.h = restore.h * scale / old;
+        }
+        let w = self.rect.w * scale / old;
+        let bar_old = Self::title_height(old);
+        let fits = self.fit;
+        match &self.content {
+            Content::Program(view) if view.resizable && !fits => {
+                let content_h = self.rect.h.saturating_sub(if self.popup || self.frameless { 0 } else { bar_old });
+                let h = content_h * scale / old + self.bar();
+                self.rebuild(w, h)
+            }
+            Content::Program(_) => self.retitle(),
+            _ => {
+                let h = self.rect.h * scale / old;
+                self.rebuild(w, h)
+            }
+        }
+    }
+
     /// Контекст отрисовки этого окна.
     fn ctx(&self) -> Ctx {
         Ctx::scaled(self.scale)

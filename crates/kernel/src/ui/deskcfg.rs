@@ -208,7 +208,12 @@ pub fn task_pins() -> Vec<String> {
 /// 20.11), а у Dock — набор по умолчанию: пустой Dock — это одна кнопка.
 #[must_use]
 pub fn task_pins_for(mode: Mode) -> Vec<String> {
-    match (TASK_PINS.lock().clone(), mode) {
+    // Список копируется отдельной строкой: замок, взятый прямо в `match`,
+    // живёт до конца всего `match`, и ветка Dock (`task_pins` берёт тот же
+    // замок) вешала стол намертво — «Панель → Dock» без своих закреплённых
+    // (железо, 20.11).
+    let saved = TASK_PINS.lock().clone();
+    match (saved, mode) {
         (Some(list), _) => list,
         (None, Mode::Dock) => task_pins(),
         (None, Mode::Panel) => Vec::new(),

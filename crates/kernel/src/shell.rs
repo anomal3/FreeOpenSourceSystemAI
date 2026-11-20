@@ -2259,6 +2259,11 @@ fn ui_status(argument: &str) {
         ui::start_command(words);
         return;
     }
+    // Масштаб стола на ходу (20.11): `ui scale auto|100|200`.
+    if let Some(word) = argument.trim().strip_prefix("scale") {
+        ui::scale_command(word.trim());
+        return;
+    }
     if argument.trim() == "reset" {
         ui::reset_timing();
         sprintln!("  ui       frame counters reset");

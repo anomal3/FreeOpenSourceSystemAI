@@ -689,11 +689,14 @@ static DESK_FOCUS: AtomicBool = AtomicBool::new(false);
 /// Возвращает `false`, если экрана нет или памяти под окна не хватило. Ядро в
 /// этом случае продолжает работать с оболочкой в серийной консоли — графика не
 /// является условием работы системы.
-/// Выбор масштаба, с которым поднялся стол (0 — по экрану, 1, 2): его
-/// получают программы в `SysInfo::flags`.
+/// Масштаб, которым рисует стол (1 или 2; 0 — стола ещё нет): его получают
+/// программы в `SysInfo::flags`. Один источник правды (20.11): раньше здесь
+/// лежал выбор человека («Авто» = 0), и программа считала «авто» от ширины
+/// экрана сама — после смены режима NVIDIA 1280 → 2560 стол остался в 100 %,
+/// а «Файлы» рисовали в 200 %.
 static APPLIED_SCALE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Выбор масштаба, действующий с запуска стола.
+/// Масштаб стола для программ (0 — стола нет, программа считает сама).
 pub fn applied_scale_choice() -> u32 {
     APPLIED_SCALE.load(Ordering::Relaxed)
 }
@@ -715,8 +718,8 @@ pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
     // на каждой загрузке. Масштаб — после неё: выбор человека лежит там же.
     prefs::adopt();
     let choice = theme::scale_choice();
-    APPLIED_SCALE.store(choice, Ordering::Relaxed);
     let scale = theme::geometry_scale_for(choice, screen.width(), screen.height());
+    APPLIED_SCALE.store(scale.clamp(1, 2), Ordering::Relaxed);
     // Буфер кадра — условие работы стола, а не украшение: без него собирать
     // картинку негде. Не хватило памяти — система работает в серийной линии,
     // ровно как на машине без фреймбуфера.
@@ -4602,11 +4605,24 @@ fn adopt_plan(
     }
     let count = slots.len();
     desktop.adopt_outputs(slots, layers, status);
+    // Основной монитор мог смениться размером (NVIDIA: 1280×720 прошивки →
+    // 2560×1440) — масштаб «Авто» заново от него.
+    apply_scale(desktop, status);
     remember_sizes(desktop);
     if count > 1 {
         log_outputs(desktop);
     }
     Ok(())
+}
+
+/// Масштаб стола по выбору человека («Авто» — от основного монитора) —
+/// сразу, на всё: стол, окна ядра и программы (им — через `SysInfo`).
+fn apply_scale(desktop: &mut Compositor, status: &Status) {
+    let p = desktop.primary_rect();
+    let scale = theme::geometry_scale_for(theme::scale_choice(), p.w, p.h);
+    desktop.set_scale(scale, status);
+    APPLIED_SCALE.store(desktop.scale().clamp(1, 2), Ordering::Relaxed);
+    remember_sizes(desktop);
 }
 
 /// Размеры, которые спрашивают без захвата стола: окно оболочки в знаках,
@@ -4851,6 +4867,25 @@ pub fn taskbar_command(words: &str) {
     deskcfg::command(words);
     with_desktop(|desktop| {
         desktop.refresh_panel(&status);
+        desktop.present();
+    });
+}
+
+/// `ui scale auto|100|200`: выбрать масштаб, как в «Параметрах», и сразу
+/// применить ко всему столу (стенд, 20.11).
+pub fn scale_command(word: &str) {
+    let Some(choice) = theme::scale_choice_from_tag(word) else {
+        kprintln!("  desktop     : ui scale: auto, 100 or 200");
+        return;
+    };
+    theme::set_scale_choice(choice);
+    if let Err(err) = prefs::store_scale(choice) {
+        kprintln!("  desktop     : scale not saved: {err}");
+    }
+    let status = status_now();
+    with_desktop(|desktop| {
+        apply_scale(desktop, &status);
+        kprintln!("  desktop     : scale {} -> ui scale {}", theme::scale_choice_tag(choice), desktop.scale());
         desktop.present();
     });
 }
@@ -5602,6 +5637,7 @@ fn settings_request(desktop: &mut Compositor, request: settings::Request, status
         settings::Request::Shutdown => launch(desktop, App::Shutdown),
         settings::Request::Restart => launch(desktop, App::Restart),
         settings::Request::Panel => {}
+        settings::Request::Scale => apply_scale(desktop, status),
     }
     kprintln!("  desktop     : settings asked for {request:?}");
     desktop.refresh_panel(status);

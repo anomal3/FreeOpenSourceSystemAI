@@ -299,7 +299,7 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
     // телефоне порог по ширине не срабатывает вовсе, и содержимое окна
     // рисовалось бы вдвое мельче рамки, которую вокруг него рисует стол.
     theme::set_form(theme::form_for(info.screen_w.max(1), info.screen_h.max(1)));
-    let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), info.screen_w.max(1), info.screen_h.max(1));
+    let mut scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), info.screen_w.max(1), info.screen_h.max(1));
 
     let Some(mut window) = open_patiently(spec, width, height) else {
         println(&format!("{}: FAILED the desktop never freed up; no window", spec.name));
@@ -413,6 +413,14 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
                         spec.name,
                         if dark { "dark" } else { "light" }
                     ));
+                    dirty = true;
+                }
+                // Масштаб стола сменился на ходу (20.11): ядро отдаёт его
+                // в `flags`, и содержимое рисуется в том же, что и рамка.
+                let fresh_scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(fresh.flags), fresh.screen_w.max(1), fresh.screen_h.max(1));
+                if fresh_scale != scale {
+                    scale = fresh_scale;
+                    println(&format!("{}: repainted at ui scale {scale}", spec.name));
                     dirty = true;
                 }
                 if app.tick(&fresh) {

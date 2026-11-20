@@ -219,16 +219,16 @@ impl SettingsView {
         let mut y = pass.group(x, y, w, "Масштаб и макет");
         let scale = if ctx.scale >= 2 { "200 %" } else { "100 %" };
         y = row(pass, x, y, w, Some(Fi::Sliders), "Масштаб сейчас", "", Ctl::Value(scale), None);
-        // Выбор действует с перезагрузки: стол перестраивается целиком.
+        // Выбор действует сразу (20.11): стол перестраивается целиком.
         let chosen = theme::scale_choice();
         for (choice, label, hint) in [
-            (0, "Авто", "200 % на экранах от 2560 точек, иначе 100 %"),
+            (0, "Авто", "200 % на экранах от 3840 точек (4K), иначе 100 %"),
             (1, "100 %", ""),
             (2, "200 %", "для 4K и мелких точек"),
         ] {
             y = row(pass, x, y, w, None, label, hint, Ctl::Radio(chosen == choice), Some(Deed::Scale(choice)));
         }
-        y = pass.note(x, y + ctx.px(4) as i32, w, "Масштаб применяется после перезагрузки.");
+        y = pass.note(x, y + ctx.px(4) as i32, w, "Масштаб применяется сразу ко всему: панели, окнам и программам.");
         row(pass, x, y, w, Some(Fi::Monitor), "Ориентация", "", Ctl::Value("Альбомная"), None);
     }
 

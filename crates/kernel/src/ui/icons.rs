@@ -266,6 +266,13 @@ impl Icons {
         package_signature() != self.packages
     }
 
+    /// Масштаб стола сменился (20.11). Сетку перерисует следующий
+    /// [`Self::set_area`].
+    pub fn set_scale(&mut self, scale: u32) {
+        self.scale = scale;
+        self.edit = None;
+    }
+
     #[must_use]
     pub fn new(scale: u32) -> Self {
         let mut icons = Self {

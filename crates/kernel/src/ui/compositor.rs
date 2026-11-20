@@ -577,6 +577,42 @@ impl Compositor {
         crate::kprintln!("  desktop     : taskbar {} (work area {},{} {}x{})", super::deskcfg::describe(), work.x, work.y, work.w, work.h);
     }
 
+    /// Сменить масштаб всего стола на ходу (20.11, как «Масштаб» в Windows):
+    /// панель или Dock, «Пуск», значки, указатель, меню, рамки и содержимое
+    /// окон ядра, шрифт терминала — всё от одного числа. Программам масштаб
+    /// уходит через `SysInfo::flags` (его выставляет вызывающий). `false` —
+    /// масштаб тот же, делать нечего.
+    pub fn set_scale(&mut self, scale: u32, status: &Status) -> bool {
+        let scale = scale.clamp(1, 2);
+        if scale == self.scale || theme::is_mobile() {
+            return false;
+        }
+        let old = self.scale;
+        self.scale = scale;
+        self.pointer.set_scale(scale);
+        self.icons.set_scale(scale);
+        self.context = ContextMenu::new(scale);
+        // Всплывающее собрано в прежнем масштабе — закрыть.
+        self.thumbs = None;
+        self.tray_pop = None;
+        self.peek = None;
+        self.peek_back = None;
+        self.toast = None;
+        let works: Vec<Rect> = self.windows.iter().map(|window| self.work_rect_under(window.rect)).collect();
+        for (window, work) in self.windows.iter_mut().zip(works) {
+            window.set_scale(scale);
+            // Выросшее окно не шире и не выше рабочей области своего монитора.
+            if !window.is_maximized() && (window.rect.w > work.w || window.rect.h > work.h) {
+                let _ = window.resize(window.rect.w.min(work.w), window.rect.h.min(work.h));
+            }
+        }
+        // Панель, «Пуск», сетка значков и окна в рабочей области — заново.
+        self.rebuild_taskbar();
+        self.restyle(status);
+        crate::kprintln!("  desktop     : ui scale {scale} (was {old}), {} window(s) rescaled", self.windows.len());
+        true
+    }
+
     /// Указатель сдвинулся: автоскрытие панели.
     pub fn taskbar_pointer(&mut self, x: i32, y: i32) {
         let busy = self.menu_open() || self.context_open() || self.thumbs_open() || self.tray_pop.is_some();
