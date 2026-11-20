@@ -1563,6 +1563,21 @@ pub const ALL: &[Scenario] = &[
             // проверено списком выше, а регистр — латиницей.
             Step::Line("cat /usb/d2rlan/d2r.EXE"),
             Step::Await("fake D2R executable", 15_000),
+            // Замер (21.11, кэш данных exFAT): поиск пути в каталоге на 400
+            // файлов, чтение 9 МиБ подряд (первое и повторное), 4 КиБ вразброс:
+            // сначала по-старому (`exfatcache off`), потом с кэшем.
+            Step::Line("exfatcache off"),
+            Step::Await("exfat: fast path off", 10_000),
+            Step::Line("fsbench /usb/D2RLAN/Data/data.bin"),
+            Step::Await("fsbench: /usb/D2RLAN/Data/data.bin open", 180_000),
+            Step::Line("fsbench /usb/many/file399.txt"),
+            Step::Await("fsbench: /usb/many/file399.txt open", 60_000),
+            Step::Line("exfatcache on"),
+            Step::Await("exfat: fast path on", 10_000),
+            Step::Line("fsbench /usb/D2RLAN/Data/data.bin"),
+            Step::Await("fsbench: /usb/D2RLAN/Data/data.bin open", 180_000),
+            Step::Line("fsbench /usb/many/file399.txt"),
+            Step::Await("fsbench: /usb/many/file399.txt open", 60_000),
             // Непрерывный файл (NoFatChain) и файл цепочкой FAT вперемешку с
             // соседом — суммы те же, что у создателя образа.
             Step::Line("sum /usb/D2RLAN/Data/data.bin"),

@@ -447,6 +447,45 @@ impl<D: BlockDevice> Volume<D> {
         self.dev
     }
 
+    /// Носитель под томом (21.11): ядро держит под ним кэш блоков и читает
+    /// данные файлов мимо замка тома.
+    pub fn device_mut(&mut self) -> &mut D {
+        &mut self.dev
+    }
+
+    /// Первый сектор тома на носителе, размер сектора носителя и длина тома
+    /// в байтах.
+    #[must_use]
+    pub fn geometry(&self) -> (u64, u64, u64) {
+        (self.base, self.dev_sector, self.dev_bytes)
+    }
+
+    /// Таблица прописных букв тома (для сравнения имён без учёта регистра).
+    #[must_use]
+    pub fn upcase_table(&self) -> &[u16] {
+        &self.upcase
+    }
+
+    /// План чтения `[offset, offset + len)` файла без самого чтения (21.11):
+    /// куски тома (смещение от начала тома, длина) для байтов до
+    /// `ValidDataLength`, сколько байт из них с носителя и сколько всего
+    /// (дальше `from_disk` до `total` — нули). Как [`Volume::read`].
+    pub fn plan_read(&mut self, node: &Node, offset: u64, len: u64, cursor: &mut Cursor) -> Result<(Vec<(u64, u64)>, u64, u64)> {
+        if node.is_dir() {
+            return Err(Error::IsDir);
+        }
+        let size = node.data.size;
+        if offset >= size || len == 0 {
+            return Ok((Vec::new(), 0, 0));
+        }
+        let total = len.min(size - offset);
+        let valid = node.valid.min(size);
+        let disk_end = valid.max(offset).min(offset + total);
+        let from_disk = disk_end - offset;
+        let extents = if from_disk > 0 { self.extents(&node.data, offset, from_disk, cursor)? } else { Vec::new() };
+        Ok((extents, from_disk, total))
+    }
+
     #[must_use]
     pub fn root(&self) -> Node {
         Node {

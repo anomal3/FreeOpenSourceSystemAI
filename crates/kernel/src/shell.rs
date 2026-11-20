@@ -1387,6 +1387,22 @@ fn run_builtin(line: &str) -> bool {
                 checksum(&path);
             }
         }
+        "fsbench" => {
+            if argument.is_empty() {
+                sprintln!("  usage: fsbench <file>");
+            } else if let Some(path) = human_path(argument) {
+                fsbench(&path);
+            }
+        }
+        // `exfatcache on|off` (21.11) — быстрый путь exFAT (кэш блоков, чтение
+        // мимо замка тома, кэш каталогов); `off` — как до 21.11, для замера.
+        "exfatcache" => match argument {
+            "on" | "off" => {
+                fs::exfatfs::set_fast(argument == "on");
+                sprintln!("  exfat: fast path {argument}");
+            }
+            _ => sprintln!("  exfat: fast path {} (usage: exfatcache on|off)", if fs::exfatfs::fast() { "on" } else { "off" }),
+        },
         "cp" => match argument.split_once(' ') {
             Some((from, to)) if !to.trim().is_empty() => {
                 if let (Some(from), Some(to)) = (human_path(from.trim()), human_path(to.trim())) {
@@ -3280,6 +3296,65 @@ fn checksum(path: &str) {
         }
     }
     sprintln!("  sum: {path} {offset} bytes crc32 {:08x}", crc.finish());
+}
+
+/// `fsbench <файл>` (21.11): задержки файловой системы — поиск пути (то, что
+/// делает `openat`), чтение подряд кусками по 64 КиБ (первое и повторное) и
+/// 4-КиБ чтения вразброс. Замер exFAT-диска (D2R читает с /usb1 так).
+fn fsbench(path: &str) {
+    let cred = user::session::credentials();
+    let t = time::uptime_ns();
+    let node = match fs::resolve_as(cred, path, Access::READ) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return sprintln!("  {path}: {err}"),
+        None => return sprintln!("  no filesystem is mounted"),
+    };
+    let first_open = time::uptime_ns() - t;
+    const OPENS: u64 = 200;
+    let t = time::uptime_ns();
+    for _ in 0..OPENS {
+        if let Some(Err(err)) = fs::resolve_as(cred, path, Access::READ) {
+            return sprintln!("  {path}: {err}");
+        }
+    }
+    let open_avg = (time::uptime_ns() - t) / OPENS;
+    let size = node.metadata().size;
+    let mut buf = alloc::vec![0u8; 64 << 10];
+    let mut seq = [(0u64, 0u64); 2];
+    for pass in &mut seq {
+        let t = time::uptime_ns();
+        let mut offset = 0u64;
+        loop {
+            match node.read_at(offset, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => offset += n as u64,
+                Err(err) => return sprintln!("  {path}: {err} at byte {offset}"),
+            }
+        }
+        *pass = (offset, (time::uptime_ns() - t).max(1));
+    }
+    const RANDOM: u64 = 500;
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let t = time::uptime_ns();
+    for _ in 0..RANDOM {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        let at = ((x >> 16) % size.max(1)) & !4095;
+        if let Err(err) = node.read_at(at, &mut buf[..4096]) {
+            return sprintln!("  {path}: {err} at byte {at}");
+        }
+    }
+    let random_avg = (time::uptime_ns() - t) / RANDOM;
+    let mbs = |(bytes, ns): (u64, u64)| bytes * 1000 / ns;
+    sprintln!(
+        "  fsbench: {path} open {} us first, {} us avg; read 64K cold {} MB/s ({} ms), warm {} MB/s ({} ms); random 4K {} us avg",
+        first_open / 1000,
+        open_avg / 1000,
+        mbs(seq[0]),
+        seq[0].1 / 1_000_000,
+        mbs(seq[1]),
+        seq[1].1 / 1_000_000,
+        random_avg / 1000
+    );
 }
 
 /// `cp`: копия файла кусками по мегабайту; цель создаётся или обрезается.
