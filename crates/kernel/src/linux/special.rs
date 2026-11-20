@@ -23,6 +23,51 @@ enum Device {
     Null,
     Zero,
     Random,
+    /// `/dev/kmsg` (20.11): строка программы — в журнал ядра. Так fps игры
+    /// (`fossai-proton` сводит `+fps` Wine раз в 5 с) попадает в журнал на
+    /// флешке, даже если игру запустили со стола без терминала.
+    Kmsg,
+}
+
+/// Не больше стольких строк `/dev/kmsg` в секунду на всех: болтливая
+/// программа не должна вытеснить из кольца журнала всё остальное.
+const KMSG_LINES_PER_SECOND: u64 = 20;
+
+fn kmsg_write(data: &[u8]) {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static SECOND: AtomicU64 = AtomicU64::new(0);
+    static LINES: AtomicU64 = AtomicU64::new(0);
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+    let now = crate::time::uptime_ms() / 1000;
+    if SECOND.swap(now, Relaxed) != now {
+        LINES.store(0, Relaxed);
+        let dropped = DROPPED.swap(0, Relaxed);
+        if dropped != 0 {
+            crate::kprintln!("  kmsg        : {dropped} line(s) dropped (more than {KMSG_LINES_PER_SECOND} per second)");
+        }
+    }
+    // Номер задачи, а не процесса: запись идёт под замком программы
+    // (`files.write`), и `user::with_current` здесь ждал бы сам себя.
+    let pid = crate::sched::current().as_u32();
+    for line in data.split(|&byte| byte == b'\n') {
+        // Приоритет `<N>` в начале строки, как его пишут в Linux, — прочь.
+        let mut line = line;
+        if line.first() == Some(&b'<') {
+            if let Some(end) = line.iter().take(5).position(|&byte| byte == b'>') {
+                line = &line[end + 1..];
+            }
+        }
+        let text = String::from_utf8_lossy(&line[..line.len().min(240)]);
+        let text = text.trim_end();
+        if text.is_empty() {
+            continue;
+        }
+        if LINES.fetch_add(1, Relaxed) >= KMSG_LINES_PER_SECOND {
+            DROPPED.fetch_add(1, Relaxed);
+            continue;
+        }
+        crate::kprintln!("  kmsg        : #{pid} {text}");
+    }
 }
 
 struct DeviceNode(Device);
@@ -33,7 +78,7 @@ impl Node for DeviceNode {
     }
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         match self.0 {
-            Device::Null => Ok(0),
+            Device::Null | Device::Kmsg => Ok(0),
             Device::Zero => {
                 buf.fill(0);
                 Ok(buf.len())
@@ -50,8 +95,12 @@ impl Node for DeviceNode {
     fn lookup(&self, _name: &str) -> VfsResult<Box<dyn Node>> {
         Err(VfsError::WrongKind)
     }
-    /// Запись в любое из трёх принимается и забывается.
+    /// Запись в любое из трёх принимается и забывается; в `/dev/kmsg` —
+    /// уходит в журнал.
     fn write_at(&self, _offset: u64, data: &[u8]) -> VfsResult<usize> {
+        if self.0 == Device::Kmsg {
+            kmsg_write(data);
+        }
         Ok(data.len())
     }
 }
@@ -99,6 +148,7 @@ pub fn node(path: &str) -> Option<(Arc<dyn Node>, bool)> {
         "/dev/null" => Some(Device::Null),
         "/dev/zero" => Some(Device::Zero),
         "/dev/urandom" | "/dev/random" => Some(Device::Random),
+        "/dev/kmsg" => Some(Device::Kmsg),
         _ => None,
     };
     if let Some(device) = device {
@@ -174,7 +224,7 @@ fn directory(path: &str) -> Option<Vec<(String, NodeKind)>> {
 
 /// Есть ли такой особый путь — для `stat` и `access`.
 pub fn exists(path: &str) -> bool {
-    matches!(path, "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random")
+    matches!(path, "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random" | "/dev/kmsg")
         || text(path).is_some()
         || super::drm::sysfs::exists(path)
 }

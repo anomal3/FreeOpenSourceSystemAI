@@ -99,7 +99,10 @@ if [ \"$GPU\" = auto ] && [ -e /dev/dri/renderD128 ] && [ \"$FOSSAI_VULKAN\" != 
 fi\n\
 if [ \"$GPU\" = nvk ]; then MODE=--dxvk; export FOSSAI_VULKAN=nvk; fi\n\
 if [ \"$GPU\" = cpu ] && [ -z \"$MODE\" ]; then export FOSSAI_VULKAN=lvp; fi\n\
-if [ -n \"$MODE\" ]; then export DXVK_HUD=${DXVK_HUD:-fps,frametimes}; else export WINEDEBUG=${WINEDEBUG:-fixme-all,+fps}; fi\n\
+# `+fps` и у DXVK (20.11): Wine 11 считает кадры Vulkan в win32u, а\n\
+# fossai-proton раз в 5 с кладёт сводку в журнал ядра (/dev/kmsg).\n\
+[ -n \"$MODE\" ] && export DXVK_HUD=${DXVK_HUD:-fps,frametimes}\n\
+export WINEDEBUG=${WINEDEBUG:-fixme-all,+fps}\n\
 A=()\n\
 [ -n \"$SIZE\" ] && A+=(\"--desktop=$SIZE\")\n\
 R=dxvk; [ -z \"$MODE\" ] && R=wined3d; [ \"$GPU\" = nvk ] && R=dxvk-nvk\n\

@@ -683,14 +683,47 @@ if [ -n "$D" ]; then
     echo "fossai-proton: virtual desktop $D"
     set -- explorer "/desktop=FossAi,$D" "$@"
 fi
-[ -z "$B" ] && exec $W "$@"
+# Кадры в журнал ядра (20.11): с `+fps` в WINEDEBUG (`tmnf` ставит его сам)
+# строки Wine `trace:fps:… approx N fps` раз в 5 с сводятся в одну
+# `fps: ПРОГРАММА СРЕДНЕЕ (min, max)` в `/dev/kmsg` - fps игры видно в журнале
+# на флешке, даже при запуске со стола. Остальной вывод - в stderr как был.
+if [ -z "$B" ]; then
+    case ,$WINEDEBUG, in *,+fps,*) [ -e /dev/kmsg ] || exec $W "$@" ;; *) exec $W "$@" ;; esac
+    p=${1##*/}; p=${p##*\\}; [ "$p" = explorer ] && { p=${3##*/}; p=${p##*\\}; }
+    $W "$@" 2>&1 | {
+        n=0; sum=0; lo=; hi=0; t=$SECONDS
+        while IFS= read -r line; do
+            case $line in
+                *'trace:fps:'*'approx '*)
+                    v=${line#*approx }; v=${v%%fps*}
+                    case $v in ''|*[!0-9.]*|.*) continue ;; esac
+                    i=${v%%.*}; f=${v#*.}; [ "$f" = "$v" ] && f=0; f=${f}00
+                    c=$((10#$i * 100 + 10#${f:0:2}))
+                    n=$((n + 1)); sum=$((sum + c))
+                    if [ -z "$lo" ] || [ $c -lt $lo ]; then lo=$c; fi
+                    [ $c -gt $hi ] && hi=$c ;;
+                *) printf '%s\n' "$line" >&2 ;;
+            esac
+            if [ $n -gt 0 ] && [ $((SECONDS - t)) -ge 5 ]; then
+                a=$((sum / n))
+                printf 'fps: %s %d.%02d (min %d.%02d, max %d.%02d, %d samples in %d s)\n' "$p" $((a / 100)) $((a % 100)) \
+                    $((lo / 100)) $((lo % 100)) $((hi / 100)) $((hi % 100)) $n $((SECONDS - t)) > /dev/kmsg
+                n=0; sum=0; lo=; hi=0; t=$SECONDS
+            fi
+        done
+    }
+    exit ${PIPESTATUS[0]}
+fi
 # Замер (`--bench`): вывод Wine идёт через этот цикл и дальше в stderr как
 # был; значения кадров - сотыми, арифметика bash целая. Источник один:
 # первый встреченный (`trace:fps:ФУНКЦИЯ`), но d3dprobe важнее строк Wine.
 secs=${B%%,*}; label=${B#*,}
 [ "$label" = "$B" ] && { p=${1##*/}; [ "$p" = explorer ] && p=${3##*/}; label="${p##*\\} $R ${D:-window}"; }
 case ,$WINEDEBUG, in *,+fps,*) ;; *) export WINEDEBUG="${WINEDEBUG:+$WINEDEBUG,}+fps" ;; esac
-echo "bench: $label for $secs s, LP_NUM_THREADS=$LP_NUM_THREADS"
+# Строки `bench:` - и в журнал ядра (20.11): со стола у программы нет
+# терминала, а в терминале строку рвут коды курсора.
+say() { echo "$1"; [ -e /dev/kmsg ] && echo "$1" > /dev/kmsg; }
+say "bench: $label for $secs s, LP_NUM_THREADS=$LP_NUM_THREADS"
 t0=${EPOCHREALTIME/[.,]/}
 $W "$@" 2>&1 | {
     # СЕКУНДЫ считаются от первых кадров (запуск Wine в QEMU - десятки
@@ -731,9 +764,9 @@ $W "$@" 2>&1 | {
         printf -v a '%d.%02d' $((a / 100)) $((a % 100))
         printf -v lo '%d.%02d' $((lo / 100)) $((lo % 100))
         printf -v hi '%d.%02d' $((hi / 100)) $((hi % 100))
-        echo "bench: $label avg $a fps (min $lo, max $hi, $n samples from $src), first frames after $((first / 10)).$((first % 10)) s, LP_NUM_THREADS=$LP_NUM_THREADS"
+        say "bench: $label avg $a fps (min $lo, max $hi, $n samples from $src), first frames after $((first / 10)).$((first % 10)) s, LP_NUM_THREADS=$LP_NUM_THREADS"
     else
-        echo "bench: $label no frames in $secs s"
+        say "bench: $label no frames in $secs s"
     fi
     # Программа, которая выходит сама (d3dprobe со своим сроком), - дождаться:
     # после `wineserver -k` следующий запуск в том же префиксе получал
@@ -745,7 +778,7 @@ $W "$@" 2>&1 | {
         if IFS= read -r -t 5 line; then printf '%s\n' "$line" >&2; elif [ $? -le 128 ]; then eof=1; fi
     done
     if [ -z "$eof" ]; then
-        echo "bench: $label still running after the measurement, wineserver -k"
+        say "bench: $label still running after the measurement, wineserver -k"
         $P/bin/wineserver -k 2>/dev/null
         $P/bin/wineserver -w 2>/dev/null & w=$!
         for i in {1..30}; do kill -0 $w 2>/dev/null || break; LD_LIBRARY_PATH= sleep 1; done
