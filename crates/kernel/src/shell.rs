@@ -1215,9 +1215,11 @@ fn run_builtin(line: &str) -> bool {
                 }
                 (Some("hw"), Some(on @ ("on" | "off"))) => crate::linux::drm::set_hw(on == "on"),
                 (Some("trace"), Some(on @ ("on" | "off"))) => crate::linux::drm::set_trace(on == "on"),
+                (Some("local"), Some(at @ ("vram" | "sys"))) => crate::linux::drm::set_local_in_vram(at == "vram"),
                 (None, None) => {}
-                _ => sprintln!("  nvk: usage `nvk [soft|hw|trace on|off]`"),
+                _ => sprintln!("  nvk: usage `nvk [soft|hw|trace on|off]`, `nvk local vram|sys`"),
             }
+            sprintln!("  nvk: local memory in {}", if crate::linux::drm::local_in_vram() { "VRAM (not shared buffers)" } else { "system RAM" });
             let (real, soft) = crate::linux::drm::backend_state();
             sprintln!(
                 "  nvk: /dev/dri/renderD128 {} (real backend {}, hw {}, soft {}, trace {})",
@@ -1258,7 +1260,10 @@ fn run_builtin(line: &str) -> bool {
         #[cfg(target_arch = "x86_64")]
         // Адресный сброс TLB и непрозрачные строки подповерхностей (19.11) —
         // тоже: `off` — как до них, для сравнения на одном образе.
-        "wlpace" | "wlping" | "lxshrwx" | "lxcfr" | "tlbtarget" | "wlopaque" => {
+        // `wlpace on|auto|off|unlimited|<Гц>` (D4, 20.11): темп по монитору.
+        "wlpace" => sprintln!("{}", crate::linux::wayland::pace_command(argument)),
+        #[cfg(target_arch = "x86_64")]
+        "wlping" | "lxshrwx" | "lxcfr" | "tlbtarget" | "wlopaque" | "wlzerocopy" => {
             use core::sync::atomic::Ordering::Relaxed;
             let on = match argument.trim() {
                 "on" => Some(true),
@@ -1267,7 +1272,7 @@ fn run_builtin(line: &str) -> bool {
             };
             if let Some(on) = on {
                 match command {
-                    "wlpace" => crate::linux::wayland::set_pace(on),
+                    "wlzerocopy" => crate::linux::wayland::ZERO_COPY.store(on, Relaxed),
                     "wlping" => crate::linux::wayland::set_ping(on),
                     "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.store(on, Relaxed),
                     "tlbtarget" => crate::arch::smp::FLUSH_TARGETED.store(on, Relaxed),
@@ -1276,7 +1281,7 @@ fn run_builtin(line: &str) -> bool {
                 }
             }
             let now = match command {
-                "wlpace" => crate::linux::wayland::pace(),
+                "wlzerocopy" => crate::linux::wayland::ZERO_COPY.load(Relaxed),
                 "wlping" => crate::linux::wayland::ping(),
                 "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.load(Relaxed),
                 "tlbtarget" => crate::arch::smp::FLUSH_TARGETED.load(Relaxed),

@@ -2887,6 +2887,16 @@ impl Window {
         true
     }
 
+    /// Запомнить, куда вернуться из полноэкранного режима (D4, 20.11.2026):
+    /// игра, сама ставшая размером с монитор, вошла в него уже огромной — и
+    /// «вернуть» давало те же 2560x1440 в стороне (hw-log12, 4523). Место
+    /// до роста — правильнее.
+    pub fn set_full_from(&mut self, rect: Rect) {
+        if self.fullscreen && !rect.is_empty() {
+            self.full_from = Some(rect);
+        }
+    }
+
     /// Выйти из полноэкранного режима туда, где окно стояло до него.
     pub fn leave_fullscreen(&mut self) -> bool {
         if !self.fullscreen {

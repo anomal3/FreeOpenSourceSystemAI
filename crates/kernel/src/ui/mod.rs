@@ -6415,6 +6415,36 @@ pub fn paint_window(task: u32, slot: u32, area: Rect, paint: impl FnOnce(&mut Su
     .unwrap_or_else(|| Err(unavailable()))
 }
 
+/// Подменить пиксели окна программы поверхностью того же размера и показать
+/// `area` (D4, 20.11.2026): сервер Wayland кладёт сюда память dma-buf
+/// клиента — кадр игры во весь экран больше не копируется в окно отдельно.
+/// Ответ — прежняя поверхность; `Err` — вернуть переданную (стол занят, окна
+/// нет, размер другой).
+pub fn swap_window_pixels(task: u32, slot: u32, pixels: Surface, area: Rect) -> Result<Surface, Surface> {
+    let app = App::Program(task, slot);
+    let mut pixels = Some(pixels);
+    let swapped = with_desktop(|desktop| {
+        let window = desktop.find(app)?;
+        let current = window.program_pixels()?;
+        let next = pixels.take()?;
+        if (current.width(), current.height()) != (next.width(), next.height()) {
+            pixels = Some(next);
+            return None;
+        }
+        let old = core::mem::replace(current, next);
+        window.commit(Some(area));
+        desktop.present();
+        Some(old)
+    })
+    .flatten();
+    match (swapped, pixels) {
+        (Some(old), _) => Ok(old),
+        (None, Some(back)) => Err(back),
+        // Не бывает: поверхность ушла в окно только вместе с ответом.
+        (None, None) => Err(Surface::EMPTY),
+    }
+}
+
 /// Сменить окну программы размер (фаза N7d): `pixels` — новая поверхность той же
 /// программы. Прежнюю [`crate::user`] снимает уже после этого вызова: до его
 /// конца композитор вправе читать старые пиксели.
@@ -6426,6 +6456,9 @@ pub fn resize_window(task: u32, slot: u32, pixels: Surface) -> Result<(), Window
             return Err(WindowError::NoWindow);
         };
         let size = (pixels.width(), pixels.height());
+        // Где окно стояло до этого размера — туда «вернуть» из полного
+        // экрана (D4, 20.11.2026).
+        let before = window.rect;
         if !window.replace_pixels(pixels, focused) {
             return Err(WindowError::NoMemory);
         }
@@ -6446,6 +6479,9 @@ pub fn resize_window(task: u32, slot: u32, pixels: Surface) -> Result<(), Window
         if monitor_sized && chosen && !full {
             if frameless {
                 if desktop.set_fullscreen(app, true) {
+                    if let Some(window) = desktop.find(app) {
+                        window.set_full_from(before);
+                    }
                     kprintln!("  desktop     : '{}' is monitor-sized, fullscreen on its monitor", name_of(desktop, app));
                 }
             } else if !maximized && desktop.toggle_maximize(app) {

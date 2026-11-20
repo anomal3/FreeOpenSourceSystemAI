@@ -19,6 +19,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -80,10 +82,16 @@ static void end(void) { end_fd(-1); }
 enum {
     ID_DISPLAY = 1, ID_REGISTRY, ID_SYNC, ID_COMPOSITOR, ID_SHM, ID_WM, ID_SEAT,
     ID_SURFACE, ID_XDG, ID_TOPLEVEL, ID_POOL, ID_BUFFER, ID_FRAME, ID_POINTER, ID_SYNC2, ID_KEYBOARD, ID_BUFFER2,
-    ID_POOL_FULL, ID_BUFFER_FULL, ID_FRAME2, ID_BUFFER_MON
+    ID_POOL_FULL, ID_BUFFER_FULL, ID_FRAME2, ID_BUFFER_MON, ID_VIEWPORTER, ID_VIEWPORT, ID_FRAME3,
+    ID_DMABUF, ID_PARAMS1, ID_DBUF1, ID_PARAMS2, ID_DBUF2, ID_FRAME4
 };
 
-static uint32_t global_compositor, global_shm, global_wm, global_seat;
+static uint32_t global_compositor, global_shm, global_wm, global_seat, global_viewporter;
+/* `done` кадра с буфером через `wp_viewport` (D4, 20.11). */
+static int frame3_done;
+/* dma-buf во весь монитор (D4): `zwp_linux_dmabuf_v1` и возврат буфера. */
+static uint32_t global_dmabuf;
+static int dbuf1_released, frame4_done;
 static int synced, synced2, formats_argb, configured, configure_serial, released, frame_done, pointer_in;
 static int protocol_error;
 static int keymap_ok, keyboard_in, key_down, key_up, key_b;
@@ -103,6 +111,8 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         if (!strcmp(interface, "wl_shm")) global_shm = name;
         if (!strcmp(interface, "xdg_wm_base")) global_wm = name;
         if (!strcmp(interface, "wl_seat")) global_seat = name;
+        if (!strcmp(interface, "wp_viewporter")) global_viewporter = name;
+        if (!strcmp(interface, "zwp_linux_dmabuf_v1")) global_dmabuf = name;
     } else if (id == ID_SYNC && opcode == 0) {
         synced = 1;
     } else if (id == ID_SYNC2 && opcode == 0) {
@@ -116,6 +126,12 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         released = 1;
     } else if (id == ID_FRAME && opcode == 0) {
         frame_done = 1;
+    } else if (id == ID_DBUF1 && opcode == 0) {
+        dbuf1_released = 1;
+    } else if (id == ID_FRAME4 && opcode == 0) {
+        frame4_done = 1;
+    } else if (id == ID_FRAME3 && opcode == 0) {
+        frame3_done = 1;
     } else if (id == ID_POINTER && opcode == 0) {
         pointer_in = 1;
     } else if (id == ID_KEYBOARD && opcode == 0) {
@@ -451,6 +467,147 @@ int main(void) {
     end();
     wait_for(&full_seen, 5000);
     check(full_seen && conf_w == mon_w && conf_h == mon_h, "a monitor-sized window becomes fullscreen");
+
+    /* wp_viewporter (D4, 20.11): Wine изображает режим игры ниже монитора
+     * буфером поменьше и `set_destination` в размер монитора. Буфер 320x200
+     * с назначением во весь монитор — окно остаётся во весь экран, кадр
+     * растянут (раньше: 1:1 в углу и выход из полного экрана). */
+    check(global_viewporter != 0, "registry lists wp_viewporter");
+    bind_global(global_viewporter, "wp_viewporter", 1, ID_VIEWPORTER);
+    begin(ID_VIEWPORTER, 1); /* get_viewport */
+    put(ID_VIEWPORT);
+    put(ID_SURFACE);
+    end();
+    begin(ID_VIEWPORT, 2); /* set_destination */
+    put((uint32_t)mon_w);
+    put((uint32_t)mon_h);
+    end();
+    begin(ID_SURFACE, 1);
+    put(ID_BUFFER);
+    put(0);
+    put(0);
+    end();
+    begin(ID_SURFACE, 9); /* damage_buffer */
+    put(0);
+    put(0);
+    put(width);
+    put(height);
+    end();
+    begin(ID_SURFACE, 3);
+    put(ID_FRAME3);
+    end();
+    full_clear = 0;
+    begin(ID_SURFACE, 6);
+    end();
+    wait_for(&frame3_done, 5000);
+    printf("waylandcheck: viewport shown\n");
+    fflush(stdout);
+    wait_for(&never, 2500);
+    check(frame3_done && !full_clear, "a 320x200 buffer with set_destination to the monitor stays fullscreen");
+
+    /* Из полного экрана — туда и тем размером, что было до того, как окно
+     * само выросло до монитора (D4: раньше оставалось огромным). */
+    full_clear = 0;
+    configured = 0;
+    begin(ID_TOPLEVEL, 12); /* unset_fullscreen */
+    end();
+    wait_for(&full_clear, 5000);
+    wait_for(&configured, 2000);
+    printf("waylandcheck: unset_fullscreen after growing configure %dx%d\n", conf_w, conf_h);
+    check(full_clear && conf_w == width && conf_h == height, "unset_fullscreen after growing to the monitor gives back the size before it");
+    begin(ID_XDG, 4);
+    put((uint32_t)configure_serial);
+    end();
+    begin(ID_VIEWPORT, 0); /* destroy: снова в размер буфера */
+    end();
+    begin(ID_SURFACE, 1);
+    put(ID_BUFFER);
+    put(0);
+    put(0);
+    end();
+    begin(ID_SURFACE, 6);
+    end();
+    full_seen = 0;
+    wait_for(&never, 2000);
+    check(!full_seen, "the restored window stays windowed");
+
+    /* dma-buf во весь монитор (D4, 20.11): буфер GEM узла DRM (`nvk soft on`
+     * в QEMU) — окно показывает его без копии, а прежний буфер возвращает,
+     * когда показан следующий. Нет узла — пропуск. */
+    int drm = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    if (drm >= 0 && global_dmabuf && big) {
+        bind_global(global_dmabuf, "zwp_linux_dmabuf_v1", 3, ID_DMABUF);
+        uint32_t bufs[2] = {ID_DBUF1, ID_DBUF2}, params[2] = {ID_PARAMS1, ID_PARAMS2};
+        int made = 0;
+        for (int b = 0; b < 2; b++) {
+            /* drm_nouveau_gem_new: info {handle, domain, size, offset,
+             * map_handle, tile_mode, tile_flags}, channel_hint, align. */
+            struct { uint32_t handle, domain; uint64_t size, offset, map_handle; uint32_t tile_mode, tile_flags, channel_hint, align; } gem = {0};
+            gem.domain = 4 | 8; /* GART | MAPPABLE */
+            gem.size = full_bytes;
+            struct { uint32_t handle, flags; int32_t fd; } prime = {0};
+            if (ioctl(drm, 0xC0306480, &gem) != 0) break;
+            uint32_t *px = mmap(NULL, full_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, drm, (off_t)gem.map_handle);
+            if (px == MAP_FAILED) break;
+            for (int y = 0; y < mon_h; y++)
+                for (int x = 0; x < mon_w; x++)
+                    px[(size_t)y * mon_w + x] = b ? 0x00305030u + (uint32_t)(x * 128 / mon_w) : 0x00503030u + (uint32_t)((y * 128 / mon_h) << 8);
+            munmap(px, full_bytes);
+            prime.handle = gem.handle;
+            prime.flags = 02000000; /* O_CLOEXEC */
+            if (ioctl(drm, 0xC00C642D, &prime) != 0) break;
+            begin(ID_DMABUF, 1); /* create_params */
+            put(params[b]);
+            end();
+            begin(params[b], 1); /* add(fd, plane, offset, stride, mod_hi, mod_lo) */
+            put(0);
+            put(0);
+            put((uint32_t)mon_w * 4);
+            put(0);
+            put(0);
+            end_fd(prime.fd);
+            close(prime.fd);
+            begin(params[b], 3); /* create_immed(id, w, h, XRGB8888, flags) */
+            put(bufs[b]);
+            put((uint32_t)mon_w);
+            put((uint32_t)mon_h);
+            put(0x34325258);
+            put(0);
+            end();
+            made++;
+        }
+        check(made == 2, "two monitor-sized GEM buffers are shared as dma-buf");
+        for (int b = 0; b < 2 && made == 2; b++) {
+            begin(ID_SURFACE, 1);
+            put(bufs[b]);
+            put(0);
+            put(0);
+            end();
+            begin(ID_SURFACE, 2);
+            put(0);
+            put(0);
+            put((uint32_t)mon_w);
+            put((uint32_t)mon_h);
+            end();
+            frame4_done = 0;
+            begin(ID_SURFACE, 3);
+            put(ID_FRAME4);
+            end();
+            begin(ID_SURFACE, 6);
+            end();
+            wait_for(&frame4_done, 5000);
+            if (b == 0) {
+                printf("waylandcheck: dma-buf shown\n");
+                fflush(stdout);
+                struct timespec pause = {1, 500000000};
+                nanosleep(&pause, NULL);
+            }
+        }
+        wait_for(&dbuf1_released, 3000);
+        check(made == 2 && frame4_done && dbuf1_released, "a monitor-sized dma-buf is shown and released once the next one is shown");
+    } else {
+        printf("waylandcheck: no /dev/dri/renderD128 - dma-buf check skipped\n");
+    }
 
     struct timespec nap = {2, 0};
     nanosleep(&nap, NULL);

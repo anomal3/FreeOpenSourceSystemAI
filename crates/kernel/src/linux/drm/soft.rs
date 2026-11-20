@@ -37,6 +37,18 @@ impl SoftHost for KernelHost {
         Some(frame.0)
     }
 
+    fn alloc_run(&self, count: u64) -> Option<u64> {
+        let base = crate::mm::frame::with(|pool| {
+            if pool.stats().free <= crate::user::RESERVE_FRAMES + count as usize {
+                return None;
+            }
+            // Кадры выдаются обнулёнными.
+            pool.allocate_contiguous(count as usize)
+        })
+        .flatten()?;
+        Some(base.0)
+    }
+
     fn free_frame(&self, phys: u64) {
         crate::mm::frame::with(|pool| {
             // SAFETY: кадр выдан `alloc_frame` этого хозяина, и `SoftGpu`

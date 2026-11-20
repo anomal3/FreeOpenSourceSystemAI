@@ -7323,6 +7323,9 @@ pub const ALL: &[Scenario] = &[
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("run /bin/pkg install /media/debian-12.fpk"),
             Step::Await("pkg: installed debian 12, ", 300_000),
+            // Узел DRM на SoftGpu — для проверки dma-buf без копии (D4).
+            Step::Line("nvk soft on"),
+            Step::Await("nvk: /dev/dri/renderD128 present", 30_000),
             Step::Line("run /opt/debian/usr/libexec/fossai/waylandcheck"),
             Step::Await("waylandcheck: ok connect to the compositor", 60_000),
             Step::Await("waylandcheck: ok registry lists wl_compositor, wl_shm, xdg_wm_base and wl_seat", 30_000),
@@ -7352,6 +7355,21 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_000),
             Step::Shot("wayland-windowed"),
             Step::Await("waylandcheck: ok a monitor-sized window becomes fullscreen", 30_000),
+            // wp_viewporter (D4, 20.11): буфер 320x200 растянут на весь
+            // монитор, окно остаётся во весь экран; выход — к размеру до роста.
+            Step::Await("waylandcheck: ok registry lists wp_viewporter", 30_000),
+            Step::Await("waylandcheck: viewport shown", 30_000),
+            Step::Wait(1_000),
+            Step::Shot("wayland-viewport"),
+            Step::Await("waylandcheck: ok a 320x200 buffer with set_destination to the monitor stays fullscreen", 30_000),
+            Step::Await("waylandcheck: ok unset_fullscreen after growing to the monitor gives back the size before it", 30_000),
+            Step::Await("waylandcheck: ok the restored window stays windowed", 30_000),
+            // dma-buf во весь монитор — пиксели окна без копии (D4).
+            Step::Await("waylandcheck: ok two monitor-sized GEM buffers are shared as dma-buf", 30_000),
+            Step::Await("without a copy", 30_000),
+            Step::Await("waylandcheck: dma-buf shown", 30_000),
+            Step::Shot("wayland-dmabuf"),
+            Step::Await("waylandcheck: ok a monitor-sized dma-buf is shown and released once the next one is shown", 30_000),
             Step::Await("waylandcheck: ok no protocol errors", 30_000),
             Step::Await("waylandcheck: 0 failed", 30_000),
             Step::Line("run /bin/pkg remove debian"),

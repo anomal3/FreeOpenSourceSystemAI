@@ -116,12 +116,69 @@ static PING: AtomicBool = AtomicBool::new(true);
 /// `wlopaque off` — через `over` по точкам, как раньше.
 pub static OPAQUE_ROWS: AtomicBool = AtomicBool::new(true);
 
-pub fn set_pace(on: bool) {
-    PACE.store(on, Ordering::Relaxed);
+
+/// Частота темпа, заданная руками (`wlpace <Гц>`, мГц); 0 — по монитору.
+static PACE_FORCED_MHZ: AtomicU64 = AtomicU64::new(0);
+/// Частота самого быстрого включённого монитора (мГц) и когда её смотрели.
+static PACE_OUTPUT_MHZ: AtomicU64 = AtomicU64::new(60_000);
+static PACE_CHECKED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `wlpace on|off|unlimited|auto|<Гц>` (D4, 20.11.2026): темп ответов на
+/// `frame`. `auto` (`on`) — частота монитора (у RTX 3060 с монитором на
+/// 144 Гц — 144, у GOP и virtio — 60), `<Гц>` — своя, `off`/`unlimited` — без
+/// темпа (замеры: кадры столько, сколько стол успевает показать). Ответ —
+/// строка для терминала.
+pub fn pace_command(argument: &str) -> String {
+    match argument.trim() {
+        "on" | "auto" => {
+            PACE_FORCED_MHZ.store(0, Ordering::Relaxed);
+            PACE.store(true, Ordering::Relaxed);
+        }
+        "off" | "unlimited" => PACE.store(false, Ordering::Relaxed),
+        "" => {}
+        hz => match hz.parse::<u64>() {
+            Ok(hz @ 10..=1000) => {
+                PACE_FORCED_MHZ.store(hz * 1000, Ordering::Relaxed);
+                PACE.store(true, Ordering::Relaxed);
+            }
+            _ => return String::from("  wlpace: usage `wlpace [on|auto|off|unlimited|<10..1000 Hz>]`"),
+        },
+    }
+    PACE_CHECKED_MS.store(0, Ordering::Relaxed);
+    if !PACE.load(Ordering::Relaxed) {
+        return String::from("  wlpace: off (unlimited)");
+    }
+    let mhz = pace_mhz();
+    let forced = PACE_FORCED_MHZ.load(Ordering::Relaxed) != 0;
+    alloc::format!("  wlpace: on, {}.{:03} Hz ({})", mhz / 1000, mhz % 1000, if forced { "forced" } else { "fastest monitor" })
 }
-#[must_use]
-pub fn pace() -> bool {
-    PACE.load(Ordering::Relaxed)
+
+/// Частота темпа в мГц: заданная руками или самого быстрого включённого
+/// монитора (реестр выходов смотрится не чаще раза в секунду).
+fn pace_mhz() -> u64 {
+    let forced = PACE_FORCED_MHZ.load(Ordering::Relaxed);
+    if forced != 0 {
+        return forced;
+    }
+    let now = crate::time::uptime_ms();
+    let checked = PACE_CHECKED_MS.load(Ordering::Relaxed);
+    if checked == 0 || now.saturating_sub(checked) >= 1000 {
+        PACE_CHECKED_MS.store(now.max(1), Ordering::Relaxed);
+        let best = crate::display::outputs::list()
+            .iter()
+            .filter(|output| output.enabled)
+            .filter_map(|output| output.current.map(|(_, _, mhz)| u64::from(mhz)))
+            .filter(|mhz| (10_000..=1_000_000).contains(mhz))
+            .max()
+            .unwrap_or(60_000);
+        PACE_OUTPUT_MHZ.store(best, Ordering::Relaxed);
+    }
+    PACE_OUTPUT_MHZ.load(Ordering::Relaxed)
+}
+
+/// Кадр экрана в микросекундах (темп ответов на `frame`).
+fn frame_us() -> u64 {
+    1_000_000_000 / pace_mhz().max(1)
 }
 pub fn set_ping(on: bool) {
     PING.store(on, Ordering::Relaxed);
@@ -306,9 +363,10 @@ const MOD_CONTROL: u32 = 4;
 const MOD_ALT: u32 = 8;
 const MOD_NUM: u32 = 16;
 const MOD_SUPER: u32 = 64;
-/// Темп ответов на `wl_surface.frame` — кадр экрана 60 Гц (P8): клиент в
-/// режиме FIFO (DXVK, Mesa WSI) рисует не чаще, чем стол показывает.
-const FRAME_MS: u64 = 16;
+// Темп ответов на `wl_surface.frame` (P8): клиент в режиме FIFO (DXVK, Mesa
+// WSI) рисует не чаще, чем стол показывает. До 20.11 — постоянные 16 мс
+// (потолок ~62 к/с и на мониторе 144 Гц, hw-log12); теперь — кадр самого
+// быстрого монитора ([`frame_us`]), `wlpace` меняет.
 /// Дольше этого ответ на `frame` не откладывается, даже если окно ещё не
 /// показано (стол занят): клиент не должен стоять.
 const FRAME_HOLD_MAX_MS: u64 = 100;
@@ -517,6 +575,46 @@ struct SurfaceState {
     /// Перерисовать целиком: новый буфер без объявленных изменений или
     /// другого размера.
     full: bool,
+    /// `wp_viewport` поверхности: действующий и ждущий `commit`.
+    view: View,
+    view_next: Option<View>,
+}
+
+/// Кусок буфера и размер поверхности (`wp_viewport`, D4 20.11.2026): Wine
+/// изображает режим игры ниже монитора буфером 1280x720 с
+/// `set_destination(2560, 1440)` — раньше это игнорировалось, и кадр
+/// ложился 1:1 в угол («четверть экрана», hw-log12).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct View {
+    /// `set_source`: x, y, w, h в `wl_fixed` (24.8); `None` — весь буфер.
+    src: Option<(i32, i32, i32, i32)>,
+    /// `set_destination`: размер поверхности; `None` — по куску буфера.
+    dst: Option<(u32, u32)>,
+}
+
+impl View {
+    /// Кусок буфера `(x, y, w, h)` в точках буфера, обрезанный по нему.
+    fn source(&self, buf: &Buffer) -> (u32, u32, u32, u32) {
+        let Some((x, y, w, h)) = self.src else {
+            return (0, 0, buf.width, buf.height);
+        };
+        let x = ((x.max(0) as u32) >> 8).min(buf.width.saturating_sub(1));
+        let y = ((y.max(0) as u32) >> 8).min(buf.height.saturating_sub(1));
+        let w = ((w.max(256) as u32 + 255) >> 8).clamp(1, buf.width - x);
+        let h = ((h.max(256) as u32 + 255) >> 8).clamp(1, buf.height - y);
+        (x, y, w, h)
+    }
+
+    /// Размер поверхности с этим буфером.
+    fn size(&self, buf: &Buffer) -> (u32, u32) {
+        match self.dst {
+            Some((w, h)) => (w.clamp(1, 8192), h.clamp(1, 8192)),
+            None => {
+                let (_, _, w, h) = self.source(buf);
+                (w, h)
+            }
+        }
+    }
 }
 
 impl SurfaceState {
@@ -530,7 +628,14 @@ impl SurfaceState {
             damage: Rect::EMPTY,
             ready: Rect::EMPTY,
             full: true,
+            view: View::default(),
+            view_next: None,
         }
+    }
+
+    /// Размер поверхности: буфер через `wp_viewport`; без буфера — `None`.
+    fn size(&self) -> Option<(u32, u32)> {
+        self.shown.as_ref().map(|(_, buf)| self.view.size(buf))
     }
 }
 
@@ -560,6 +665,12 @@ struct Win {
     /// `set_fullscreen` пришёл до того, как окно открылось (20.11): исполнить
     /// при открытии.
     want_full: bool,
+    /// Буфер, который окно стола показывает без копии (D4, 20.11.2026):
+    /// пиксели окна — прямо память dma-buf клиента. Держит память живой и
+    /// возвращается клиенту, когда окно перейдёт на другой.
+    adopted: Option<(u32, Buffer)>,
+    /// Собственные пиксели окна, отложенные на время показа без копии.
+    stash: Option<Surface>,
 }
 
 /// Всплывающее окно стола за `xdg_popup`.
@@ -611,7 +722,8 @@ enum Obj {
     /// Предложение выделения, которое сервер прислал клиенту.
     DataOffer,
     Viewporter,
-    Viewport,
+    /// `wp_viewport` поверхности с этим номером.
+    Viewport(u32),
     Dmabuf,
     DmabufParams(dmabuf::Params),
 }
@@ -645,7 +757,7 @@ impl Obj {
             Self::DataDevice => "wl_data_device",
             Self::DataOffer => "wl_data_offer",
             Self::Viewporter => "wp_viewporter",
-            Self::Viewport => "wp_viewport",
+            Self::Viewport(_) => "wp_viewport",
             Self::Dmabuf => "zwp_linux_dmabuf_v1",
             Self::DmabufParams(_) => "zwp_linux_buffer_params_v1",
         }
@@ -707,9 +819,9 @@ struct Client {
     ping_sent: u64,
     /// О молчании на `ping` уже сказано в журнале.
     ping_silence_told: bool,
-    /// Когда клиенту последний раз ответили на `frame` (темп, P8) и с какого
-    /// мига ответ отложен.
-    frame_answered: u64,
+    /// Когда клиенту последний раз ответили на `frame` (темп, P8; мкс) и с
+    /// какого мига ответ отложен (мс).
+    frame_answered_us: u64,
     frames_held_since: u64,
 }
 
@@ -749,7 +861,7 @@ impl Client {
             ping: None,
             ping_sent: 0,
             ping_silence_told: false,
-            frame_answered: 0,
+            frame_answered_us: 0,
             frames_held_since: 0,
         }
     }
@@ -977,15 +1089,53 @@ impl Client {
                 0 => self.delete(id),
                 1 => {
                     let new = args.u32()?;
-                    self.objects.insert(new, Obj::Viewport);
+                    let surface = args.u32()?;
+                    self.objects.insert(new, Obj::Viewport(surface));
                 }
                 _ => {}
             },
-            // `destroy`, `set_source`, `set_destination`: окно стола — в размер
-            // буфера, масштаба нет.
-            Obj::Viewport => {
-                if opcode == 0 {
-                    self.delete(id);
+            // `destroy`, `set_source(x, y, w, h)` (`wl_fixed`, все -1 — снять),
+            // `set_destination(w, h)` (-1, -1 — снять). Действуют с `commit`
+            // поверхности (D4, 20.11.2026).
+            Obj::Viewport(surface) => {
+                let surface = *surface;
+                let current = match self.objects.get(&surface) {
+                    Some(Obj::Surface(state)) => state.view_next.unwrap_or(state.view),
+                    _ => View::default(),
+                };
+                let next = match opcode {
+                    0 => {
+                        self.delete(id);
+                        Some(View::default())
+                    }
+                    1 => {
+                        let (x, y, w, h) = (args.i32()?, args.i32()?, args.i32()?, args.i32()?);
+                        let src = if (x, y, w, h) == (-256, -256, -256, -256) {
+                            None
+                        } else if x < 0 || y < 0 || w <= 0 || h <= 0 {
+                            self.fail(id, 0, "bad source rectangle");
+                            return Ok(());
+                        } else {
+                            Some((x, y, w, h))
+                        };
+                        Some(View { src, ..current })
+                    }
+                    2 => {
+                        let (w, h) = (args.i32()?, args.i32()?);
+                        let dst = if (w, h) == (-1, -1) {
+                            None
+                        } else if w <= 0 || h <= 0 {
+                            self.fail(id, 0, "bad destination size");
+                            return Ok(());
+                        } else {
+                            Some((w as u32, h as u32))
+                        };
+                        Some(View { dst, ..current })
+                    }
+                    _ => None,
+                };
+                if let (Some(next), Some(Obj::Surface(state))) = (next, self.objects.get_mut(&surface)) {
+                    state.view_next = Some(next);
                 }
             }
             Obj::Subcompositor => match opcode {
@@ -1336,7 +1486,11 @@ impl Client {
                 // Физический размер — как у экрана 96 точек на дюйм.
                 let (mm_w, mm_h) = ((width * 254 / 960) as i32, (height * 254 / 960) as i32);
                 self.send(Msg::new(new, 0).i32(0).i32(0).i32(mm_w).i32(mm_h).i32(0).str("FossAi").str("Screen").i32(0));
-                self.send(Msg::new(new, 1).u32(3).i32(width as i32).i32(height as i32).i32(60_000));
+                // Частота — настоящая (D4, 20.11): Wine и DXVK видят 144 Гц,
+                // а не всегда 60.
+                let _ = pace_mhz();
+                let refresh = PACE_OUTPUT_MHZ.load(Ordering::Relaxed) as i32;
+                self.send(Msg::new(new, 1).u32(3).i32(width as i32).i32(height as i32).i32(refresh));
                 if version >= 2 {
                     self.send(Msg::new(new, 3).i32(1));
                     self.send(Msg::new(new, 2));
@@ -1421,6 +1575,8 @@ impl Client {
                     title_due: false,
                     close_asked: 0,
                     want_full: false,
+                    adopted: None,
+                    stash: None,
                 });
             }
             2 => {
@@ -1568,6 +1724,17 @@ impl Client {
             if attached && damage.is_empty() {
                 state.full = true;
             }
+            if let Some(view) = state.view_next.take() {
+                if view != state.view {
+                    state.view = view;
+                    state.full = true;
+                }
+            }
+            // Изменения у масштабируемой поверхности — в точках буфера, а
+            // окно — в точках поверхности: проще перерисовать целиком.
+            if state.view != View::default() {
+                state.full = true;
+            }
         }
         if let Some(next) = pending {
             let shown = next.and_then(|buffer| match self.objects.get(&buffer) {
@@ -1584,9 +1751,11 @@ impl Client {
                 }
                 _ => None,
             };
-            // Прежний буфер больше не читается — вернуть его клиенту.
+            // Прежний буфер больше не читается — вернуть его клиенту. Кроме
+            // буфера, который окно показывает без копии (D4): его вернёт
+            // `present`, когда окно перейдёт на следующий.
             if let Some((old, _)) = old {
-                if Some(old) != next {
+                if Some(old) != next && !self.wins.iter().any(|win| win.adopted.as_ref().is_some_and(|(adopted, _)| *adopted == old)) {
                     self.release(old);
                 }
             }
@@ -1648,6 +1817,15 @@ impl Client {
         }
     }
 
+    /// Вернуть буфер, который окно показывало без копии, — если поверхность
+    /// не показывает его и сейчас (тогда его вернёт обычный путь).
+    fn release_unless_shown(&mut self, _surface: u32, buffer: u32) {
+        let shown = self.objects.values().any(|obj| matches!(obj, Obj::Surface(SurfaceState { shown: Some((id, _)), .. }) if *id == buffer));
+        if !shown {
+            self.release(buffer);
+        }
+    }
+
     /// `wl_buffer.release`, если буфер ещё жив.
     fn release(&mut self, buffer: u32) {
         if self.released.contains(&buffer) {
@@ -1678,7 +1856,10 @@ impl Client {
         }
         let held = now.saturating_sub(self.frames_held_since);
         let unshown = self.wins.iter().any(|win| win.dirty) || self.pops.iter().any(|pop| pop.dirty);
-        let early = now < self.frame_answered.saturating_add(FRAME_MS);
+        // Срок — в микросекундах: кадр 144 Гц — 6,94 мс, миллисекундами
+        // темп сбивался бы на целую.
+        let now_us = crate::time::uptime_ns() / 1000;
+        let early = now_us < self.frame_answered_us.saturating_add(frame_us());
         if PACE.load(Ordering::Relaxed) && held < FRAME_HOLD_MAX_MS && (unshown || early) {
             return;
         }
@@ -1690,14 +1871,14 @@ impl Client {
                 super::perfdiag::WL_FRAMES.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.frame_answered = now;
+        self.frame_answered_us = now_us;
         self.frames_held_since = 0;
     }
 
-    /// Когда этому клиенту пора ответить на отложенные `frame` — чтобы
-    /// задача сервера проснулась к сроку, а не на следующем опросе.
+    /// Когда этому клиенту пора ответить на отложенные `frame` (мс, вверх) —
+    /// чтобы задача сервера проснулась к сроку, а не на следующем опросе.
     fn frames_due_at(&self) -> Option<u64> {
-        (!self.frames_due.is_empty()).then(|| self.frame_answered.saturating_add(FRAME_MS))
+        (!self.frames_due.is_empty()).then(|| self.frame_answered_us.saturating_add(frame_us()).div_ceil(1000))
     }
 
     /// `ping` клиенту и «не отвечает» столу (P4, 18.11.2026).
@@ -1756,8 +1937,7 @@ impl Client {
     fn present(&mut self, index: usize) {
         let surface = self.wins[index].surface;
         let (width, height) = match self.objects.get(&surface) {
-            Some(Obj::Surface(SurfaceState { shown: Some((_, buf)), .. })) => (buf.width, buf.height),
-            Some(Obj::Surface(_)) => (0, 0),
+            Some(Obj::Surface(state)) => state.size().unwrap_or((0, 0)),
             _ => return,
         };
         if width == 0 || height == 0 {
@@ -1770,7 +1950,19 @@ impl Client {
         let (gw, gh) = (gw.clamp(1, 4096), gh.clamp(1, 4096));
         let mut layers = Vec::new();
         self.layers(surface, -gx, -gy, 0, &mut layers);
+        // Один буфер на всё окно (до отбора видимых): только такой можно
+        // вернуть клиенту сразу после копии.
+        let single = layers.len() == 1;
+        cull_hidden(&mut layers, gw, gh);
         let damaged = self.damaged(surface, -gx, -gy, 0);
+        // Окно сменит размер — пиксели окна станут новыми, показ без копии
+        // кончается (буфер вернётся клиенту ниже).
+        let mut freed = None;
+        if self.wins[index].open.is_some_and(|size| size != (gw, gh)) {
+            let win = &mut self.wins[index];
+            win.stash = None;
+            freed = win.adopted.take().map(|(id, _)| id);
+        }
         let win = &mut self.wins[index];
         let pid = self.pid;
         let mut whole = win.dirty;
@@ -1817,10 +2009,82 @@ impl Client {
         };
         if area.is_empty() {
             win.dirty = false;
+            if let Some(id) = freed {
+                self.release_unless_shown(surface, id);
+            }
             return;
         }
+        // Без копии (D4, 20.11.2026): кадр dma-buf во всё окно становится
+        // пикселями окна; стол переносит его на поверхность окна сам.
+        let shown_id = layers.first().map(|layer| layer.id);
+        let win = &mut self.wins[index];
+        if let (Some(ptr), Some(id)) = (zero_copy_source(&layers, gw, gh, swap), shown_id) {
+            // SAFETY: `ptr` — `gw * gh` точек подряд (`zero_copy_source`:
+            // строка = ширина, кадры подряд), память держит `Buffer` в
+            // `win.adopted`, пока окно её показывает; клиент не пишет в
+            // буфер до `release`, а он уходит только после смены пикселей.
+            if let Some(pixels) = unsafe { Surface::from_raw(ptr, gw, gh) } {
+                let started = crate::time::uptime_ns();
+                match crate::ui::swap_window_pixels(pid, win.slot, pixels, area) {
+                    Ok(old) => {
+                        if win.adopted.is_none() {
+                            win.stash = Some(old);
+                            kprintln!("  wayland     : #{pid} window '{}' shows its {gw}x{gh} dma-buf without a copy", win.title);
+                        }
+                        let buffer = layers[0].buf.clone();
+                        let previous = win.adopted.replace((id, buffer)).map(|(old, _)| old);
+                        win.dirty = false;
+                        super::perfdiag::WL_ZERO_COPY.fetch_add(1, Ordering::Relaxed);
+                        super::perfdiag::WL_ZERO_COPY_NS.fetch_add(crate::time::uptime_ns().saturating_sub(started), Ordering::Relaxed);
+                        if win.see_through && crate::ui::alpha_window(pid, win.slot, false, win.geometry.is_none()).is_ok() {
+                            win.see_through = false;
+                        }
+                        self.clear_damage(surface, 0);
+                        for old in [previous, freed].into_iter().flatten() {
+                            if old != id {
+                                self.release_unless_shown(surface, old);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        win.dirty = true;
+                        super::perfdiag::WL_BUSY.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return;
+            }
+        }
+        // Окно показывало буфер без копии, а этот кадр так нельзя: вернуть
+        // окну свои пиксели (в них сейчас и нарисуем).
+        if let Some((old, old_buf)) = win.adopted.take() {
+            let own = match win.stash.take() {
+                Some(own) if (own.width(), own.height()) == (gw, gh) => Some(own),
+                _ => Surface::new(gw, gh, theme::window_bg()),
+            };
+            match own.map(|own| crate::ui::swap_window_pixels(pid, win.slot, own, Rect::EMPTY)) {
+                Some(Ok(_borrowed)) => {
+                    whole = true;
+                    self.release_unless_shown(surface, old);
+                }
+                back => {
+                    // Стол занят (или нет памяти) — снова на следующем витке;
+                    // буфер, который окно показывает, пока держим.
+                    if let Some(Err(own)) = back {
+                        win.stash = Some(own);
+                    }
+                    win.adopted = Some((old, old_buf));
+                    win.dirty = true;
+                    super::perfdiag::WL_BUSY.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+        if let Some(id) = freed {
+            self.release_unless_shown(surface, id);
+        }
+        let area = if whole { bounds } else { area };
+        let win = &mut self.wins[index];
         let alpha = has_alpha(&layers);
-        let single = layers.len() == 1;
         let mut clear = false;
         // Копия буфера клиента в окно стола — отдельно от сборки и вывода,
         // которые `paint_window` делает тут же (P1: `perf-diag`).
@@ -1862,8 +2126,7 @@ impl Client {
             // получить прежний обратно. Только без подповерхностей: их кадр
             // сводится из нескольких буферов при каждой перерисовке.
             if single {
-                if let Some(Obj::Surface(SurfaceState { shown: Some((buffer, _)), .. })) = self.objects.get(&surface) {
-                    let buffer = *buffer;
+                if let Some(buffer) = layers.first().map(|layer| layer.id) {
                     self.release(buffer);
                 }
             }
@@ -1910,8 +2173,7 @@ impl Client {
     fn present_popup(&mut self, index: usize) {
         let surface = self.pops[index].surface;
         let (width, height) = match self.objects.get(&surface) {
-            Some(Obj::Surface(SurfaceState { shown: Some((_, buf)), .. })) => (buf.width, buf.height),
-            Some(Obj::Surface(_)) => (0, 0),
+            Some(Obj::Surface(state)) => state.size().unwrap_or((0, 0)),
             _ => return,
         };
         if width == 0 || height == 0 {
@@ -2007,14 +2269,16 @@ impl Client {
         // потом лежащие над ней — каждая группа в порядке `children`.
         for under in [true, false] {
             if !under {
-                if let Some((_, buf)) = &state.shown {
+                if let Some((id, buf)) = &state.shown {
                     if out.try_reserve(1).is_err() {
                         return;
                     }
                     // Поверх того, что под ней, поверхность смешивается по
                     // альфе; нижний слой окна — копией, как было.
                     let blend = (depth > 0 || !out.is_empty()) && buf.format == SHM_ARGB8888;
-                    out.push(Layer { buf: buf.clone(), x: dx, y: dy, blend });
+                    let (w, h) = state.view.size(buf);
+                    let src = state.view.source(buf);
+                    out.push(Layer { id: *id, buf: buf.clone(), x: dx, y: dy, w, h, src, blend });
                 }
             }
             if depth >= 8 {
@@ -2042,6 +2306,12 @@ impl Client {
         if win.open.take().is_some() {
             close_slot(self.pid, win.slot);
         }
+        // Окна больше нет — и пикселей из буфера клиента тоже.
+        win.stash = None;
+        if let Some((buffer, _)) = win.adopted.take() {
+            self.release(buffer);
+        }
+        let win = &mut self.wins[index];
         if self.pointer_on == Some(win.surface) {
             self.pointer_on = None;
         }
@@ -2451,8 +2721,8 @@ impl Client {
         if let Some(hit) = child_hit(false) {
             return Some(hit);
         }
-        if let Some((_, buf)) = &state.shown {
-            if x >= 0 && y >= 0 && (x as u32) < buf.width && (y as u32) < buf.height {
+        if let Some((w, h)) = state.size() {
+            if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
                 return Some((id, x, y));
             }
         }
@@ -2519,16 +2789,71 @@ fn close_slot(pid: u32, slot: u32) {
 
 /// Буфер на своём месте в окне.
 struct Layer {
+    /// Номер `wl_buffer`.
+    id: u32,
     buf: Buffer,
     x: i32,
     y: i32,
+    /// Размер слоя в окне (`wp_viewport`: может отличаться от буфера).
+    w: u32,
+    h: u32,
+    /// Кусок буфера, который ложится в `w`×`h`: x, y, ширина, высота.
+    src: (u32, u32, u32, u32),
     blend: bool,
+}
+
+impl Layer {
+    /// Буфер ложится 1:1 (без масштаба).
+    fn unscaled(&self) -> bool {
+        (self.src.2, self.src.3) == (self.w, self.h)
+    }
+
+    /// Слой непрозрачен и закрывает всё окно `w`×`h`.
+    fn covers(&self, w: u32, h: u32) -> bool {
+        !self.blend
+            && self.buf.format == SHM_XRGB8888
+            && self.x <= 0
+            && self.y <= 0
+            && self.x + self.w as i32 >= w as i32
+            && self.y + self.h as i32 >= h as i32
+    }
+}
+
+/// Слои под непрозрачным слоем во всё окно не видны — убрать (D4,
+/// 20.11.2026). Окно игры Wine — поверхность ARGB во весь размер и над ней
+/// подповерхность с кадром Vulkan (dma-buf XRGB): раньше на каждый кадр
+/// заливалась подложка, копировалась нижняя поверхность и поверх неё —
+/// кадр игры с проходом по точкам (альфа); 0 строк одной копией в hw-log12.
+fn cull_hidden(layers: &mut Vec<Layer>, w: u32, h: u32) {
+    if let Some(top) = layers.iter().rposition(|layer| layer.covers(w, h)) {
+        layers.drain(..top);
+    }
 }
 
 /// Может ли окно быть прозрачным: нижний слой с альфой. Нижний XRGB
 /// закрывает всё, что над ним смешивается.
 fn has_alpha(layers: &[Layer]) -> bool {
     layers.first().is_some_and(|layer| layer.buf.format == SHM_ARGB8888)
+}
+
+/// Показ окна без копии (D4, 20.11.2026; `wlzerocopy off` — как раньше).
+pub static ZERO_COPY: AtomicBool = AtomicBool::new(true);
+
+/// Кадр, который окно может показать прямо из памяти клиента: один
+/// непрозрачный слой ровно в размер окна, 1:1, без перестановки каналов,
+/// строки подряд, кадры буфера подряд (буфер DRM одним куском). Ответ —
+/// адрес первой точки.
+fn zero_copy_source(layers: &[Layer], w: u32, h: u32, swap: bool) -> Option<*mut u32> {
+    let [layer] = layers else { return None };
+    if swap || !ZERO_COPY.load(Ordering::Relaxed) || layer.blend || layer.buf.format != SHM_XRGB8888 {
+        return None;
+    }
+    let buf = &layer.buf;
+    if (layer.x, layer.y) != (0, 0) || (layer.w, layer.h) != (w, h) || layer.src != (0, 0, w, h) || buf.stride != w * 4 || buf.offset % 4 != 0 {
+        return None;
+    }
+    let len = u64::from(buf.stride) * u64::from(h);
+    buf.mem.contiguous(buf.offset, len).map(|ptr| ptr.cast::<u32>())
 }
 
 /// Нарисовать слои в поверхность окна — строками прямо из памяти клиентов.
@@ -2556,8 +2881,8 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
         !layer.blend
             && layer.x <= ax0
             && layer.y <= ay0
-            && layer.x + layer.buf.width as i32 >= ax1
-            && layer.y + layer.buf.height as i32 >= ay1
+            && layer.x + layer.w as i32 >= ax1
+            && layer.y + layer.h as i32 >= ay1
     };
     if !covered {
         for y in ay0..ay1 {
@@ -2575,22 +2900,30 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
     row.resize(area.w as usize, 0u32);
     for layer in layers {
         let buf = &layer.buf;
+        // `wp_viewport` с масштабом (D4) — своим путём.
+        if !layer.unscaled() {
+            if !paint_scaled(target, layer, area, swap, keep) {
+                return false;
+            }
+            super::perfdiag::WL_SCALED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let x0 = layer.x.max(ax0);
-        let x1 = (layer.x + buf.width as i32).min(ax1);
+        let x1 = (layer.x + layer.w as i32).min(ax1);
         if x0 >= x1 {
             continue;
         }
         let count = (x1 - x0) as usize;
-        let first_column = (x0 - layer.x) as u64;
+        let first_column = (x0 - layer.x) as u64 + u64::from(layer.src.0);
         // Только строки слоя, попадающие в изменившуюся область.
         let sy0 = (ay0 - layer.y).max(0) as u32;
-        let sy1 = ((ay1 - layer.y).max(0) as u32).min(buf.height);
+        let sy1 = ((ay1 - layer.y).max(0) as u32).min(layer.h);
         for sy in sy0..sy1 {
             let ty = sy as i32 + layer.y;
             if ty < ay0 || ty >= ay1 {
                 continue;
             }
-            let at = buf.offset + u64::from(sy) * u64::from(buf.stride) + first_column * 4;
+            let at = buf.offset + u64::from(sy + layer.src.1) * u64::from(buf.stride) + first_column * 4;
             if !layer.blend {
                 // Короткий путь (13.11): строка клиента — прямо на место в окне,
                 // затем один простой проход (альфа, при нужде — красный с
@@ -2650,6 +2983,73 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
         super::perfdiag::WL_DIRECT.fetch_add(1, Ordering::Relaxed);
     }
     alpha && (ay0..ay1).any(|y| !row_opaque(&target.row(y as u32)[ax0 as usize..ax1 as usize]))
+}
+
+/// Слой с масштабом (`wp_viewport`, D4 20.11.2026): кусок буфера `src`
+/// ложится в `w`×`h` по ближайшей точке. Wine так растягивает кадр игры в
+/// режиме ниже монитора (1280x720 → 2560x1440). Строка буфера читается один
+/// раз; одинаковые строки окна (растяжение по высоте) — копией соседней.
+/// `false` — память буфера не прочиталась.
+fn paint_scaled(target: &mut Surface, layer: &Layer, area: Rect, swap: bool, keep: u32) -> bool {
+    let buf = &layer.buf;
+    let (sx, sy, sw, sh) = layer.src;
+    let bounds = Rect::new(layer.x, layer.y, layer.w, layer.h);
+    let clip = area.intersect(&bounds);
+    if clip.is_empty() || sw == 0 || sh == 0 {
+        return true;
+    }
+    let (cx0, cx1) = (clip.x, clip.right());
+    // Шаг 16.16 по обеим осям; точка окна — середина, как у растяжения GPU.
+    let step_x = (u64::from(sw) << 16) / u64::from(layer.w.max(1));
+    let step_y = (u64::from(sh) << 16) / u64::from(layer.h.max(1));
+    let column = |tx: i32| -> u32 { ((((tx - layer.x) as u64) * step_x + step_x / 2) >> 16).min(u64::from(sw - 1)) as u32 };
+    // Столбцы буфера, нужные этой полосе окна.
+    let (src_x0, src_x1) = (column(cx0), column(cx1 - 1) + 1);
+    let width = (src_x1 - src_x0) as usize;
+    let mut row: Vec<u32> = Vec::new();
+    if row.try_reserve_exact(width).is_err() {
+        return false;
+    }
+    row.resize(width, 0);
+    // Номер столбца буфера для каждой точки полосы — один раз.
+    let mut map: Vec<u32> = Vec::new();
+    if map.try_reserve_exact((cx1 - cx0) as usize).is_err() {
+        return false;
+    }
+    map.extend((cx0..cx1).map(|tx| column(tx) - src_x0));
+    let or = if buf.format == SHM_XRGB8888 { 0xff00_0000 } else { 0 };
+    // Последняя собранная строка окна (непрозрачный слой): соседняя строка
+    // окна с той же строкой буфера — её копия.
+    let mut scaled: Vec<u32> = Vec::new();
+    if !layer.blend && scaled.try_reserve_exact(map.len()).is_err() {
+        return false;
+    }
+    let mut last: Option<u32> = None;
+    for ty in clip.y..clip.bottom() {
+        let line = ((((ty - layer.y) as u64) * step_y + step_y / 2) >> 16).min(u64::from(sh - 1)) as u32;
+        if !layer.blend && last == Some(line) {
+            target.row_mut(ty as u32)[cx0 as usize..cx1 as usize].copy_from_slice(&scaled);
+            continue;
+        }
+        let at = buf.offset + u64::from(sy + line) * u64::from(buf.stride) + u64::from(sx + src_x0) * 4;
+        // SAFETY: байты тех же `width` точек.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(row.as_mut_ptr().cast::<u8>(), width * 4) };
+        if !buf.mem.read(at, bytes) {
+            return false;
+        }
+        let out = &mut target.row_mut(ty as u32)[cx0 as usize..cx1 as usize];
+        for (pixel, &index) in out.iter_mut().zip(map.iter()) {
+            let src = u32::from_le(row[index as usize]) | or;
+            let src = if swap { (src & 0xff00_ff00) | ((src >> 16) & 0xff) | ((src & 0xff) << 16) } else { src };
+            *pixel = if layer.blend { mini_ui::over(src, *pixel) } else { src } & keep;
+        }
+        if !layer.blend {
+            scaled.clear();
+            scaled.extend_from_slice(out);
+            last = Some(line);
+        }
+    }
+    true
 }
 
 /// Привести строку клиента к виду стола: старший байт (`or`, `keep`) и, при

@@ -54,6 +54,12 @@ pub static WL_BUSY: AtomicU64 = AtomicU64::new(0);
 /// Перерисовки по короткому пути: строки клиента — одной копией, без
 /// прохода по точкам (P8).
 pub static WL_DIRECT: AtomicU64 = AtomicU64::new(0);
+/// Кадры, показанные без копии (D4, 20.11.2026): пиксели окна — сам
+/// dma-buf клиента; и сколько нс ушло на подмену с переносом в окно.
+pub static WL_ZERO_COPY: AtomicU64 = AtomicU64::new(0);
+pub static WL_ZERO_COPY_NS: AtomicU64 = AtomicU64::new(0);
+/// Слои с масштабом `wp_viewport` (D4).
+pub static WL_SCALED: AtomicU64 = AtomicU64::new(0);
 /// Самая быстрая копия за окно, нс на мегаточку (19.11.2026): среднее — это
 /// время по часам, и на загруженной машине в него входит вытеснение задачи
 /// Wayland посреди копии (очередь из пяти-шести готовых потоков llvmpipe по
@@ -100,7 +106,7 @@ struct Mark {
     deferred: (u64, u64),
     switches: u64,
     idle_ticks: u64,
-    wayland: [u64; 7],
+    wayland: [u64; 10],
     desktop: (u64, u64, u64, u64, u64),
     flush_ns: u64,
     outputs: [(u64, u64); crate::ui::OUTPUT_STATS],
@@ -133,6 +139,9 @@ impl Mark {
                 load(&WL_FRAMES),
                 load(&WL_BUSY),
                 load(&WL_DIRECT),
+                load(&WL_ZERO_COPY),
+                load(&WL_ZERO_COPY_NS),
+                load(&WL_SCALED),
             ],
             desktop: crate::ui::timing(),
             flush_ns: crate::ui::flush_ns(),
@@ -297,7 +306,7 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     );
 
     // 4. Кадры: сервер Wayland (копия буфера клиента) и стол (сборка, вывод).
-    let wl: [u64; 7] = core::array::from_fn(|i| new.wayland[i].saturating_sub(old.wayland[i]));
+    let wl: [u64; 10] = core::array::from_fn(|i| new.wayland[i].saturating_sub(old.wayland[i]));
     let paints = wl[1].max(1);
     let (frames, _bands, draw, blit, points) = (
         new.desktop.0.saturating_sub(old.desktop.0),
@@ -312,11 +321,14 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     let mut line = String::new();
     let _ = write!(
         line,
-        "{secs} s frames: wayland {} commits ({}/s), {} paints ({} direct), copy {} ms/paint ({} Kpx, {} MB/s, best {} MB/s), {} frame callbacks, {} busy; desktop {frames} frames ({}/s): compose {} ms, blit {} ms, flush {} ms per frame, {} Kpx/frame, worst {} ms",
+        "{secs} s frames: wayland {} commits ({}/s), {} paints ({} direct), {} zero-copy ({} ms each), {} scaled, copy {} ms/paint ({} Kpx, {} MB/s, best {} MB/s), {} frame callbacks, {} busy; desktop {frames} frames ({}/s): compose {} ms, blit {} ms, flush {} ms per frame, {} Kpx/frame, worst {} ms",
         wl[0],
         rate(wl[0]),
         wl[1],
         wl[6],
+        wl[7],
+        ms(wl[8] / wl[7].max(1)),
+        wl[9],
         ms(wl[2] / paints),
         wl[3] / paints / 1000,
         // Байт за микросекунду — это и есть МБ/с (по 4 байта на точку).

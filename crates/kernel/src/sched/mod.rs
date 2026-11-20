@@ -487,7 +487,7 @@ impl Scheduler {
             .filter(|&i| {
                 self.tasks[i]
                     .as_ref()
-                    .is_some_and(|task| task.state == TaskState::Finished && task.cpu.is_none())
+                    .is_some_and(|task| task.state == TaskState::Finished && off_cpu(task))
             })
             .min_by_key(|&i| self.tasks[i].as_ref().map_or(u32::MAX, |task| task.id.as_u32()))
     }
@@ -515,7 +515,7 @@ impl Scheduler {
                 continue;
             }
             if let Some(task) = &self.tasks[slot] {
-                if task.boost && task.state == TaskState::Ready && task.cpu.is_none() {
+                if task.boost && task.state == TaskState::Ready && off_cpu(task) {
                     return Some(slot);
                 }
             }
@@ -542,7 +542,7 @@ impl Scheduler {
                     continue;
                 }
                 if let Some(task) = &self.tasks[slot] {
-                    if task.state == TaskState::Ready && task.cpu.is_none() && rank_of(task.name) == Some(rank) {
+                    if task.state == TaskState::Ready && off_cpu(task) && rank_of(task.name) == Some(rank) {
                         return Some(slot);
                     }
                 }
@@ -554,7 +554,7 @@ impl Scheduler {
                 continue;
             }
             if let Some(task) = &self.tasks[slot] {
-                if task.state == TaskState::Ready && task.cpu.is_none() {
+                if task.state == TaskState::Ready && off_cpu(task) {
                     return Some(slot);
                 }
             }
@@ -632,7 +632,7 @@ impl Scheduler {
                 continue;
             }
             if let Some(task) = entry {
-                if task.state == TaskState::Finished && task.cpu.is_none() && task.stack.is_some() {
+                if task.state == TaskState::Finished && off_cpu(task) && task.stack.is_some() {
                     // Вот здесь и происходит освобождение: `Drop for Stack`
                     // возвращает блок куче.
                     task.stack = None;
@@ -661,15 +661,6 @@ impl Scheduler {
     }
 
     /// Снять метку процессора с задачи, уступившей процессор вызывающему.
-    fn finish_switch(&mut self) {
-        let cpu = smp::cpu();
-        if let Some(previous) = self.cpus[cpu].previous.take() {
-            if let Some(task) = self.tasks[previous].as_mut() {
-                task.cpu = None;
-            }
-        }
-    }
-
     /// Сколько всего было переключений, на всех процессорах.
     fn switches(&self) -> u64 {
         self.cpus.iter().map(|cpu| cpu.switches).sum()
@@ -1816,6 +1807,12 @@ fn schedule_with(cause: Cause) {
                             if let Some(gs) = gs {
                                 task.gs = gs;
                             }
+                            // Метка процессора снимается сразу, а «ещё
+                            // уходит» — флагом, который снимет пришедшая без
+                            // замка (D4, см. `Task::leaving`).
+                            task.cpu = None;
+                            task.leaving.store(true, Ordering::Relaxed);
+                            LEAVING[cpu].store(core::ptr::from_ref(&task.leaving) as usize, Ordering::Relaxed);
                         }
                         if let Some(task) = sched.tasks[next].as_mut() {
                             task.state = TaskState::Running;
@@ -1877,7 +1874,24 @@ fn schedule_with(cause: Cause) {
 /// Снять метку процессора с задачи, только что уступившей его. См. заголовок
 /// модуля.
 fn finish_switch() {
-    sched_lock().finish_switch();
+    let flag = LEAVING[smp::cpu()].swap(0, Ordering::AcqRel);
+    if flag != 0 {
+        // SAFETY: флаг лежит в `Box<Task>` уходившей задачи; пока он `true`,
+        // ни уборщик, ни новая задача на её месте ([`off_cpu`]) её не тронут,
+        // так что он жив до этой записи включительно. `Release` — всё, что
+        // `switch_context` сохранил в её контекст, видно тому, кто возьмёт
+        // её следующим (он читает флаг с `Acquire` под замком).
+        unsafe { (*(flag as *const AtomicBool)).store(false, Ordering::Release) };
+    }
+}
+
+/// Флаг [`Task::leaving`] задачи, уходящей с процессора, — по процессору;
+/// ноль — нет такой.
+static LEAVING: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
+/// Задачу можно взять или убрать: не исполняется и не уходит с процессора.
+fn off_cpu(task: &Task) -> bool {
+    task.cpu.is_none() && !task.leaving.load(Ordering::Acquire)
 }
 
 /// Батут, с которого начинает любая задача, созданная [`spawn_raw`].
@@ -1888,9 +1902,9 @@ fn finish_switch() {
 /// задача осталась бы помеченной навсегда: её не взял бы ни один процессор, а
 /// завершившуюся — не убрал бы уборщик.
 extern "C" fn task_start(slot: usize) -> ! {
+    finish_switch();
     let start = {
-        let mut sched = sched_lock();
-        sched.finish_switch();
+        let sched = sched_lock();
         sched.tasks[slot]
             .as_ref()
             .and_then(|task| task.entry.map(|entry| (entry, task.arg)))
