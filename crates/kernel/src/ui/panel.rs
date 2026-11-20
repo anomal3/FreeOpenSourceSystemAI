@@ -2349,8 +2349,13 @@ enum Target {
 }
 
 /// Маленькие кнопки слева от питания: диспетчер задач, диспетчер
-/// устройств, параметры (Роман, 20.11).
-const TOOLS: [(&str, Fi); 3] = [("Диспетчер задач", Fi::Activity), ("Диспетчер устройств", Fi::Cpu), ("Параметры", Fi::Sliders)];
+/// устройств, «Администрирование» (П3), параметры (Роман, 20.11).
+const TOOLS: [(&str, Fi); 4] = [
+    ("Диспетчер задач", Fi::Activity),
+    ("Диспетчер устройств", Fi::Cpu),
+    ("Администрирование", Fi::ShieldAdmin),
+    ("Параметры", Fi::Sliders),
+];
 
 /// Что делает строка всплывающего меню.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -3282,6 +3287,7 @@ impl Menu {
             Target::Tool(tool) => MenuClick::Launch(match tool {
                 0 => Choice::Program("taskmgr", ""),
                 1 => Choice::Program("devmgr", ""),
+                2 => Choice::Program("admin", ""),
                 _ => Choice::App(App::Settings),
             }),
             Target::Bar(list) => {

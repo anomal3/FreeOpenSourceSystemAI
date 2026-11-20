@@ -74,6 +74,12 @@ pub fn tool_art(program: &str) -> Option<Art> {
         "eventlog" => (Icon::Log, Tone::Warn),
         "services" => (Icon::Service, Tone::Ok),
         "cleanmgr" => (Icon::Disk, Tone::Bad),
+        // П3 (20.11): «Администрирование» и его инструменты.
+        "admin" => (Icon::Settings, Tone::Accent),
+        "compmgmt" => (Icon::Computer, Tone::Ok),
+        "resmon" => (Icon::Chart, Tone::Warn),
+        "startup" => (Icon::Power, Tone::Ok),
+        "cfgedit" => (Icon::File, Tone::Accent),
         _ => return None,
     };
     Some(Art::Tile(icon, tone))

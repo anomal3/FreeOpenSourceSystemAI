@@ -339,7 +339,7 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 54] = [
+pub const USER_PROGRAMS: [&str; 60] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sockfd", "sshd",
     "cat", "sysupdate", "fetch", "memtest", "filemap", "posix", "winshow", "sysmon", "files",
@@ -349,6 +349,8 @@ pub const USER_PROGRAMS: [&str; 54] = [
     "run", "charmap", "sysinfo", "eventlog", "services", "cleanmgr",
     // Окно «Открыть» / «Сохранить как» / «Выбор папки» для всех программ (20.11).
     "filedlg",
+    // «Администрирование» и его инструменты (фаза П3, 20.11).
+    "admin", "compmgmt", "resmon", "startup", "autorun", "cfgedit",
 ];
 
 /// Программы, которые в `/bin` **не** едут.

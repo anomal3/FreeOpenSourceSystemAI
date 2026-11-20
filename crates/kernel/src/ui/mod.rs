@@ -2538,6 +2538,13 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
             desktop.refresh_panel(status);
             return None;
         }
+        // Win+X — меню опытного пользователя, как в Windows (П3, 20.11):
+        // окно `/bin/admin --winx` у кнопки «Пуск».
+        KeyCode::X if event.mods.contains(Modifiers::META) => {
+            run_choice(desktop, panel::Choice::Program("admin", "--winx"));
+            desktop.refresh_panel(status);
+            return None;
+        }
         // Win+L — заблокировать, как в Windows (72h-4).
         KeyCode::L if event.mods.contains(Modifiers::META) => {
             desktop.lock_screen();
@@ -5012,6 +5019,76 @@ pub fn start_command(words: &str) {
     with_desktop(|desktop| {
         desktop.reload_menu();
     });
+}
+
+/// Страница «Параметров» по имени (П3, 20.11): наши ключи и привычные имена
+/// `ms-settings:` Windows — для `ui open settings <имя>` и «Выполнить».
+fn section_named(name: &str) -> Option<Section> {
+    let name = name.trim().trim_start_matches("ms-settings:").trim_start_matches("settings:").to_ascii_lowercase();
+    Some(match name.as_str() {
+        "" | "home" => Section::Home,
+        "system" => Section::System,
+        "display" | "screen" | "easeofaccess" | "easeofaccess-display" => Section::Display,
+        "power" | "powersleep" | "batterysaver" => Section::Power,
+        "storage" | "storagesense" => Section::Storage,
+        "about" => Section::About,
+        "devices" | "sound" | "mousetouchpad" | "mouse" | "bluetooth" | "printers" => Section::Devices,
+        "keyboard" | "typing" | "regionlanguage" | "language" => Section::Keyboard,
+        "usb" | "autoplay" => Section::Usb,
+        "network" | "network-status" | "network-ethernet" | "network-wifi" | "network-proxy" => Section::Network,
+        "personal" | "personalization" => Section::Personal,
+        "wallpaper" | "personalization-background" | "background" => Section::Wallpaper,
+        "colors" | "personalization-colors" => Section::Colors,
+        "appearance" | "themes" | "personalization-themes" => Section::Appearance,
+        "dock" | "taskbar" => Section::Dock,
+        "start" | "personalization-start" => Section::Start,
+        "explorer" | "folders" => Section::Explorer,
+        "apps" | "appsfeatures" | "startupapps" => Section::Apps,
+        "packages" | "optionalfeatures" => Section::Packages,
+        "services" => Section::Services,
+        "defaultapps" => Section::DefaultApps,
+        "accounts" | "yourinfo" | "otherusers" | "signinoptions" => Section::Accounts,
+        "time" | "dateandtime" | "region" => Section::Time,
+        "privacy" => Section::Privacy,
+        "update" | "windowsupdate" => Section::Update,
+        "recovery" => Section::Recovery,
+        _ => return None,
+    })
+}
+
+/// `ui open settings [страница]`, `ui open terminal`, `ui open about` —
+/// окно стола по просьбе программы (П3, 20.11). Программа сама открыть окно
+/// ядра не может; «Администрирование» и «Выполнить» просят об этом через
+/// `SYS_KERNEL_COMMAND` (эта команда разрешена и не root: она лишь
+/// показывает окно, то же, что щелчок в «Пуске»).
+pub fn open_command(words: &str) -> Result<String, String> {
+    let mut parts = words.split_whitespace();
+    let what = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("");
+    let status = status_now();
+    match what {
+        "settings" => {
+            let Some(section) = section_named(rest) else {
+                return Err(alloc::format!("no settings page '{rest}'"));
+            };
+            with_desktop(|desktop| {
+                open_settings(desktop, section, &status);
+                desktop.present();
+            });
+            Ok(alloc::format!("settings {section:?}"))
+        }
+        "terminal" | "about" => {
+            let app = if what == "terminal" { App::Terminal } else { App::About };
+            with_desktop(|desktop| {
+                launch(desktop, app);
+                kprintln!("  desktop     : {app:?} opened on request");
+                desktop.refresh_panel(&status);
+                desktop.present();
+            });
+            Ok(String::from(what))
+        }
+        _ => Err(alloc::format!("unknown window '{what}' (settings [page] | terminal | about)")),
+    }
 }
 
 /// Открыть или закрыть меню запуска.

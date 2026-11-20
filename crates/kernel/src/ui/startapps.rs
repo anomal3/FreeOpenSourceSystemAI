@@ -60,14 +60,14 @@ pub static FOLDERS: [Folder; 3] = [
     Folder { key: "folder:sdk", caption: "SDK C#", about: "примеры WinForms и .NET" },
     // Как «Инструменты Windows» (20.11): журнал, службы, очистка и оба
     // диспетчера (у них есть и свои кнопки в «Пуске»).
-    Folder { key: "folder:admin", caption: "Средства администрирования", about: "журнал событий, службы, очистка диска" },
+    Folder { key: "folder:admin", caption: "Средства администрирования", about: "администрирование, журнал, службы, диски" },
 ];
 
 /// Всё, что ставит в «Пуск» сама система. Порядок — порядок клавиатурного
 /// обхода: первые четыре строки («Терминал», «Параметры», «О системе»,
 /// «Файлы») стоят на своих местах с фазы С3 — на них считают нажатия
 /// сценарии стенда.
-pub static ENTRIES: [Entry; 19] = [
+pub static ENTRIES: [Entry; 24] = [
     Entry {
         key: "terminal",
         caption: "Терминал",
@@ -228,6 +228,30 @@ pub static ENTRIES: [Entry; 19] = [
         needs: "",
         group: "/bin/sysinfo",
     },
+    // «Администрирование» (П3, 20.11) — первой строкой папки: центр, из
+    // которого открывается всё остальное (ещё кнопка у питания и Win+X).
+    Entry {
+        key: "admin",
+        caption: "Администрирование",
+        about: "все настройки и инструменты по группам",
+        folder: "folder:admin",
+        art: "",
+        icon: Icon::Settings,
+        launch: Launch::Program("admin", ""),
+        needs: "",
+        group: "/bin/admin",
+    },
+    Entry {
+        key: "compmgmt",
+        caption: "Управление компьютером",
+        about: "журнал, службы, устройства, диски, пользователи",
+        folder: "folder:admin",
+        art: "",
+        icon: Icon::Computer,
+        launch: Launch::Program("compmgmt", ""),
+        needs: "",
+        group: "/bin/compmgmt",
+    },
     Entry {
         key: "eventlog",
         caption: "Журнал событий",
@@ -260,6 +284,39 @@ pub static ENTRIES: [Entry; 19] = [
         launch: Launch::Program("cleanmgr", ""),
         needs: "",
         group: "/bin/cleanmgr",
+    },
+    Entry {
+        key: "resmon",
+        caption: "Монитор ресурсов",
+        about: "процессор по ядрам, память, диск, сеть",
+        folder: "folder:admin",
+        art: "",
+        icon: Icon::Chart,
+        launch: Launch::Program("resmon", ""),
+        needs: "",
+        group: "/bin/resmon",
+    },
+    Entry {
+        key: "startup",
+        caption: "Автозагрузка",
+        about: "программы при входе и службы при запуске",
+        folder: "folder:admin",
+        art: "",
+        icon: Icon::Power,
+        launch: Launch::Program("startup", ""),
+        needs: "",
+        group: "/bin/startup",
+    },
+    Entry {
+        key: "cfgedit",
+        caption: "Редактор конфигурации",
+        about: "файлы /etc с проверкой",
+        folder: "folder:admin",
+        art: "",
+        icon: Icon::File,
+        launch: Launch::Program("cfgedit", ""),
+        needs: "",
+        group: "/bin/cfgedit",
     },
     // Оба диспетчера — ещё и в папке (их строки верхнего уровня остаются).
     Entry {

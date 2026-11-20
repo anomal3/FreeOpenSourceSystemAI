@@ -1390,7 +1390,11 @@ fn kernel_command(line: usize, len: usize, out: usize) -> i64 {
     };
     // Только root — кроме безвредного «version» (20.11): версию системы
     // показывают «Сведения о системе» и обычному пользователю.
-    if !super::credentials().is_root() && text.trim() != "version" {
+    // П3 (20.11): ещё «открой окно стола» (`ui open …` — «Администрирование»
+    // открывает страницы «Параметров») и три читающие команды видеокарты
+    // без аргументов (страница «Видеокарта и драйверы»).
+    let open_window = text.trim().starts_with("ui open ");
+    if !super::credentials().is_root() && !open_window && !matches!(text.trim(), "version" | "gpu" | "nvk" | "outputs") {
         return ERR_PERMISSION;
     }
     let text = alloc::string::String::from(text);

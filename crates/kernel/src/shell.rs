@@ -2302,6 +2302,15 @@ fn ui_status(argument: &str) {
         ui::start_command(words);
         return;
     }
+    // Окно стола по просьбе программы (П3, 20.11): `ui open settings
+    // network`, `ui open terminal` — «Администрирование», «Выполнить».
+    if let Some(words) = argument.trim().strip_prefix("open") {
+        match ui::open_command(words) {
+            Ok(what) => sprintln!("  ui open: {what}"),
+            Err(why) => sprintln!("  ui open: FAILED {why}"),
+        }
+        return;
+    }
     // Масштаб стола на ходу (20.11): `ui scale auto|100|125|150|175|200`.
     if let Some(word) = argument.trim().strip_prefix("scale") {
         ui::scale_command(word.trim());

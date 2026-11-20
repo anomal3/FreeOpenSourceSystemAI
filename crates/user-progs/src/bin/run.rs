@@ -16,11 +16,11 @@
 //! Удачный запуск закрывает окно, неудачный — говорит под полем, что именно не
 //! найдено, и окно остаётся: имя можно поправить.
 //!
-//! # Чего пока нет
+//! # Окна стола
 //!
-//! Терминал и «Параметры» — окна ядра, а программа открыть их не может: нужен
-//! узкий вызов «открой окно стола» (`settings:network`, `terminal`). Окно так
-//! и отвечает и не делает вид, что запустило.
+//! Терминал, «Параметры» и «О системе» — окна ядра. С П3 (20.11) их
+//! открывает стол по узкой просьбе `ui open …` через `SYS_KERNEL_COMMAND`
+//! (`settings:network`, `ms-settings:display`, `terminal`, `winver`).
 
 #![no_std]
 #![no_main]
@@ -76,13 +76,26 @@ const ALIASES: &[(&str, &str, &str)] = &[
     ("services", "/bin/services", "Службы"),
     ("cleanmgr", "/bin/cleanmgr", "Очистка диска"),
     ("perfmon", "/bin/sysmon", "Монитор системы"),
-    ("resmon", "/bin/sysmon", "Монитор системы"),
+    ("resmon", "/bin/resmon", "Монитор ресурсов"),
+    ("perfmon.msc", "/bin/sysmon", "Монитор системы"),
+    // П3 (20.11): «Администрирование» и его инструменты.
+    ("control", "/bin/admin", "Администрирование"),
+    ("admin", "/bin/admin", "Администрирование"),
+    ("compmgmt.msc", "/bin/compmgmt", "Управление компьютером"),
+    ("compmgmt", "/bin/compmgmt", "Управление компьютером"),
+    ("diskmgmt.msc", "/bin/compmgmt --page disks", "Диски и тома"),
+    ("lusrmgr.msc", "/bin/compmgmt --page users", "Пользователи и группы"),
+    ("dxdiag", "/bin/compmgmt --page gpu", "Видеокарта и драйверы"),
+    ("regedit", "/bin/cfgedit", "Редактор конфигурации"),
+    ("cfgedit", "/bin/cfgedit", "Редактор конфигурации"),
+    ("msconfig", "/bin/startup", "Автозагрузка"),
+    ("startup", "/bin/startup", "Автозагрузка"),
     ("sysmon", "/bin/sysmon", "Монитор системы"),
     ("mc", "/bin/mc", "Midnight Commander"),
 ];
 
-/// Имена окон ядра: программа их открыть не может (см. шапку).
-const DESKTOP_ONLY: &[&str] = &["cmd", "terminal", "powershell", "control", "settings", "ms-settings"];
+/// Имена окон ядра: их открывает стол по просьбе `ui open` (см. шапку).
+const DESKTOP_ONLY: &[&str] = &["cmd", "terminal", "powershell", "settings", "ms-settings", "winver"];
 
 /// Что получилось с командой.
 enum Outcome {
@@ -468,7 +481,12 @@ fn resolve_and_start(text: &str) -> Outcome {
     };
     let lower = word.to_lowercase();
     if lower.starts_with("settings:") || lower.starts_with("ms-settings:") || DESKTOP_ONLY.contains(&lower.as_str()) {
-        return Outcome::Failed(String::from("Это окно стола: откройте его из «Пуска» (запуск отсюда — функция запланирована)."));
+        let request = match lower.as_str() {
+            "cmd" | "terminal" | "powershell" => String::from("ui open terminal"),
+            "winver" => String::from("ui open about"),
+            _ => format!("ui open settings {}", lower.split_once(':').map_or("", |(_, page)| page)),
+        };
+        return open_desktop_window(&request);
     }
     if lower.starts_with("http://") || lower.starts_with("https://") {
         return Outcome::Failed(String::from("Для адресов в сети пока нет программы по умолчанию."));
@@ -494,11 +512,28 @@ fn resolve_and_start(text: &str) -> Outcome {
         .map(|(_, path, _)| (*path).to_string())
         .unwrap_or_else(|| format!("/bin/{word}"));
     let mut info = user_abi::Stat::default();
-    if stat(&target, &mut info) < 0 || info.kind == KIND_DIRECTORY {
+    // У имени может быть свой хвост (`diskmgmt.msc` → `compmgmt --page disks`).
+    let program = target.split_whitespace().next().unwrap_or("");
+    if stat(program, &mut info) < 0 || info.kind == KIND_DIRECTORY {
         return Outcome::Failed(format!("Не удаётся найти «{word}». Проверьте имя и повторите попытку."));
     }
     let command = if rest.is_empty() { target } else { format!("{target} {rest}") };
     start(&command)
+}
+
+/// Окно стола по просьбе `ui open …` (П3, 20.11): ответ ядра — строка
+/// `ui open: …` или `ui open: FAILED …`.
+fn open_desktop_window(request: &str) -> Outcome {
+    let mut buffer = alloc::vec![0u8; user_abi::KERNEL_COMMAND_OUT];
+    let got = user_progs::kernel_command(request, &mut buffer);
+    if got < 0 {
+        return Outcome::Failed(format!("Стол не открыл окно: код {got}."));
+    }
+    let answer = String::from_utf8_lossy(&buffer[..got as usize]).trim().to_string();
+    if answer.contains("FAILED") || answer.is_empty() {
+        return Outcome::Failed(String::from("Такой страницы «Параметров» нет."));
+    }
+    Outcome::Started(String::from(request))
 }
 
 fn start(command: &str) -> Outcome {
