@@ -74,8 +74,9 @@ impl Edge {
     }
 }
 
-/// Размеры значков дока, точки при масштабе 1.
-pub const ICON_SIZES: [u32; 4] = [32, 40, 48, 56];
+/// Пределы ползунка «Размер значков Dock» (20.11, Роман: «шире диапазон»).
+pub const ICON_MIN: u32 = 24;
+pub const ICON_MAX: u32 = 112;
 
 /// Настройки полосы.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -85,12 +86,19 @@ pub struct Taskbar {
     /// Прятать полосу, пока указатель не коснётся её края экрана. Окна тогда
     /// получают весь экран.
     pub autohide: bool,
-    /// Сторона значка в доке (одна из [`ICON_SIZES`]).
+    /// Сторона значка в доке ([`ICON_MIN`]..=[`ICON_MAX`]).
     pub icon: u32,
+    /// «Маленькие значки» панели во всю сторону (как в Windows): полоса
+    /// ниже, значки мельче, часы в одну строку.
+    pub small: bool,
+    /// Панель задач на каждом мониторе (20.11, как в Windows: «Показывать
+    /// панель задач на всех дисплеях»): у каждого — свои кнопки окон этого
+    /// монитора и свой «Пуск»; `false` — только на основном.
+    pub all: bool,
 }
 
 impl Taskbar {
-    pub const DEFAULT: Self = Self { mode: Mode::Panel, edge: Edge::Bottom, autohide: false, icon: 40 };
+    pub const DEFAULT: Self = Self { mode: Mode::Panel, edge: Edge::Bottom, autohide: false, icon: 40, small: false, all: false };
 
     fn parse(text: &str) -> Self {
         let mut out = Self::DEFAULT;
@@ -105,9 +113,11 @@ impl Taskbar {
                 }
                 "edge" => out.edge = Edge::from_tag(value).unwrap_or(Edge::Bottom),
                 "autohide" => out.autohide = value == "on",
+                "small" => out.small = value == "on",
+                "monitors" => out.all = value == "all",
                 "icon" => {
                     if let Ok(size) = value.parse::<u32>() {
-                        out.icon = size.clamp(ICON_SIZES[0], ICON_SIZES[ICON_SIZES.len() - 1]);
+                        out.icon = size.clamp(ICON_MIN, ICON_MAX);
                     }
                 }
                 _ => {}
@@ -118,11 +128,13 @@ impl Taskbar {
 
     fn format(self) -> String {
         alloc::format!(
-            "mode:{} edge:{} autohide:{} icon:{}",
+            "mode:{} edge:{} autohide:{} icon:{} small:{} monitors:{}",
             if self.mode == Mode::Dock { "dock" } else { "panel" },
             self.edge.tag(),
             if self.autohide { "on" } else { "off" },
-            self.icon
+            self.icon,
+            if self.small { "on" } else { "off" },
+            if self.all { "all" } else { "main" }
         )
     }
 }
@@ -294,6 +306,21 @@ pub fn set_task_pins(list: Vec<String>) -> Result<(), crate::vfs::VfsError> {
     super::prefs::store_line("taskbar_pins", &line)
 }
 
+/// До какого мига (мс от загрузки) спрятанная полоса показана: её размер
+/// меняют ползунком, и Dock должен быть виден, пока его тянут.
+static REVEAL_UNTIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Показать полосу на `ms` миллисекунд, даже со скрытием.
+pub fn reveal_for(ms: u64) {
+    REVEAL_UNTIL.store(crate::time::uptime_ms() + ms, Ordering::Relaxed);
+}
+
+/// До какого мига полоса показана принудительно (0 — нет).
+#[must_use]
+pub fn revealed_until() -> u64 {
+    REVEAL_UNTIL.load(Ordering::Relaxed)
+}
+
 /// Строка состояния для журнала (`taskbar ...`) — её ищут сценарии.
 #[must_use]
 pub fn describe() -> String {
@@ -357,6 +384,10 @@ pub enum TaskbarDeed {
     Edge(Edge),
     Autohide(bool),
     Icon(u32),
+    /// «Маленькие значки» панели.
+    Small(bool),
+    /// Панель на всех мониторах или только на основном.
+    AllMonitors(bool),
     ClearPins,
 }
 
@@ -387,8 +418,19 @@ pub fn apply_taskbar(deed: TaskbarDeed) -> (String, Result<(), crate::vfs::VfsEr
             String::from(if on { "панель прячется, пока к краю не подвели указатель" } else { "панель видна всегда" })
         }
         TaskbarDeed::Icon(size) => {
-            value.icon = size;
-            alloc::format!("значки Dock — {size} точек")
+            value.icon = size.clamp(ICON_MIN, ICON_MAX);
+            // Ползунок тянут — Dock показан, даже если он прячется сам:
+            // размер видно сразу (Роман, 20.11).
+            reveal_for(1500);
+            alloc::format!("значки Dock — {} точек", value.icon)
+        }
+        TaskbarDeed::Small(on) => {
+            value.small = on;
+            String::from(if on { "маленькие значки на панели" } else { "обычные значки на панели" })
+        }
+        TaskbarDeed::AllMonitors(on) => {
+            value.all = on;
+            String::from(if on { "панель задач на всех мониторах" } else { "панель задач только на основном мониторе" })
         }
         TaskbarDeed::ClearPins => {
             return (String::from("закреплённые откреплены"), set_task_pins(Vec::new()));
@@ -434,11 +476,15 @@ pub fn command(words: &str) -> Taskbar {
             "dock" => value.mode = Mode::Dock,
             "autohide" => value.autohide = true,
             "show" => value.autohide = false,
+            "small" => value.small = true,
+            "large" => value.small = false,
+            "all" => value.all = true,
+            "main" => value.all = false,
             other => {
                 if let Some(edge) = Edge::from_tag(other) {
                     value.edge = edge;
                 } else if let Ok(size) = other.parse::<u32>() {
-                    value.icon = size.clamp(ICON_SIZES[0], ICON_SIZES[ICON_SIZES.len() - 1]);
+                    value.icon = size.clamp(ICON_MIN, ICON_MAX);
                 }
             }
         }

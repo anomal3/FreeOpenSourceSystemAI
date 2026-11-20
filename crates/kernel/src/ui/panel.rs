@@ -118,6 +118,10 @@ struct Metrics {
     row_pad: u32,
     /// Поле карточки меню.
     pad: u32,
+    /// Толщина горизонтальной панели (от неё поле вокруг кнопок).
+    bar_h: u32,
+    /// Сторона значка программы на кнопке панели.
+    icon_px: u32,
 }
 
 impl Metrics {
@@ -155,7 +159,18 @@ impl Metrics {
             tile: ctx.px(20),
             row_pad: ctx.px(8),
             pad: ctx.px(10),
+            bar_h: ctx.px(theme::PANEL_H),
+            icon_px: ctx.px(24),
         }
+    }
+
+    /// «Маленькие значки» (20.11, как в Windows): полоса [`SMALL_H`],
+    /// кнопки и значки мельче.
+    const fn small(mut self) -> Self {
+        self.bar_h = self.ctx.px(SMALL_H);
+        self.btn_h = self.ctx.px(SMALL_H - 6);
+        self.icon_px = self.ctx.px(18);
+        self
     }
 
     /// Поле плашки: столько остаётся сверху и снизу от кнопки высотой
@@ -163,7 +178,7 @@ impl Metrics {
     /// слева и справа — иначе кнопка стояла бы в плашке не по центру, а
     /// «примерно по центру».
     const fn plate_pad(self) -> u32 {
-        (self.ctx.px(theme::PANEL_H) - self.btn_h) / 2
+        (self.bar_h - self.btn_h) / 2
     }
 
     /// Сторона значка внутри кнопки панели.
@@ -192,7 +207,7 @@ impl Metrics {
 
     /// Сторона значка программы на кнопке панели задач.
     const fn icon(self) -> u32 {
-        self.ctx.px(24)
+        self.icon_px
     }
 
     /// Сторона плитки в шапке меню.
@@ -390,6 +405,11 @@ pub struct Panel {
     anim: Option<(u32, u32, u64)>,
     /// Когда спрятать плашку, если указатель так и не вернулся (мс); 0 — нет.
     hide_at: u64,
+    /// Панель второго монитора (20.11, «на всех мониторах»): кнопки окон
+    /// своего монитора, без трея — как у Windows 10.
+    secondary: bool,
+    /// Номер монитора панели — для журнала (`taskbar revealed on output N`).
+    pub output: usize,
 }
 
 /// Сколько длится выезд плашки и сколько ждать, прежде чем её спрятать.
@@ -409,6 +429,9 @@ struct PinInfo {
 
 /// Толщина вертикальной панели (точки при масштабе 1).
 const PANEL_V_W: u32 = 56;
+/// Толщина панели с «маленькими значками»: горизонтальной и боковой.
+const SMALL_H: u32 = 34;
+const SMALL_V_W: u32 = 42;
 /// Поле Dock от края экрана и поле значков внутри плашки.
 const DOCK_INSET: u32 = 8;
 const DOCK_PAD: u32 = 8;
@@ -429,7 +452,8 @@ impl Panel {
             return (theme::M_DOCK_H + theme::M_INSET * 2) * scale;
         }
         match cfg.mode {
-            deskcfg::Mode::Panel if cfg.edge.vertical() => PANEL_V_W * scale,
+            deskcfg::Mode::Panel if cfg.edge.vertical() => (if cfg.small { SMALL_V_W } else { PANEL_V_W }) * scale,
+            deskcfg::Mode::Panel if cfg.small => (SMALL_H + theme::PANEL_INSET * 2) * scale,
             deskcfg::Mode::Panel => (theme::PANEL_H + theme::PANEL_INSET * 2) * scale,
             deskcfg::Mode::Dock => (cfg.icon + DOCK_PAD * 2 + DOCK_INSET * 2) * scale,
         }
@@ -542,12 +566,41 @@ impl Panel {
             pin_hits: Vec::new(),
             anim: None,
             hide_at: 0,
+            secondary: false,
+            output: 0,
         };
         if cfg.autohide && !theme::is_mobile() {
-            let hidden = panel.hidden_slide();
-            panel.set_slide(hidden);
+            // Размер Dock тянут ползунком — он виден, пока его тянут (20.11).
+            let now = crate::time::uptime_ms();
+            let until = deskcfg::revealed_until();
+            if until > now {
+                panel.hide_at = until;
+            } else {
+                let hidden = panel.hidden_slide();
+                panel.set_slide(hidden);
+            }
         }
         Some(panel)
+    }
+
+    /// Панель второго монитора `area` (20.11): те же настройки, без трея.
+    #[must_use]
+    pub fn new_side(area: Rect, scale: mini_ui::Scale) -> Option<Self> {
+        let mut panel = Self::new(area, scale)?;
+        panel.secondary = true;
+        Some(panel)
+    }
+
+    /// Место монитора, у стороны которого стоит панель.
+    #[must_use]
+    pub const fn area(&self) -> Rect {
+        self.area
+    }
+
+    /// Размеры кнопок под настройки панели («маленькие значки»).
+    fn metrics(&self) -> Metrics {
+        let m = Metrics::new(desk_ctx(self.scale));
+        if self.cfg.small && self.cfg.mode == deskcfg::Mode::Panel && !theme::is_mobile() { m.small() } else { m }
     }
 
     /// Куда плашка едет (или где стоит): 0 — видна.
@@ -564,12 +617,17 @@ impl Panel {
         let area = self.area;
         // Край — две точки у стороны экрана, по всей её длине: в край
         // попадают с размаху, целиться не надо.
-        let at_edge = match self.cfg.edge {
-            deskcfg::Edge::Bottom => y >= area.bottom() - 2 && x >= area.x && x < area.right(),
-            deskcfg::Edge::Top => y <= area.y + 1 && x >= area.x && x < area.right(),
-            deskcfg::Edge::Left => x <= area.x + 1 && y >= area.y && y < area.bottom(),
-            deskcfg::Edge::Right => x >= area.right() - 2 && y >= area.y && y < area.bottom(),
-        };
+        // Только у края **своего** монитора (20.11): указатель на соседнем
+        // справа тоже «правее края» основного, и Dock справа выезжал и
+        // уезжал на чужой экран.
+        let inside = area.contains(x, y);
+        let at_edge = inside
+            && match self.cfg.edge {
+                deskcfg::Edge::Bottom => y >= area.bottom() - 2,
+                deskcfg::Edge::Top => y <= area.y + 1,
+                deskcfg::Edge::Left => x <= area.x + 1,
+                deskcfg::Edge::Right => x >= area.right() - 2,
+            };
         let margin = desk_ctx(self.scale).px(12) as i32;
         let near = Rect::new(self.home.x - margin, self.home.y - margin, self.home.w + margin as u32 * 2, self.home.h + margin as u32 * 2);
         let shown = self.slide_target() == 0;
@@ -577,7 +635,7 @@ impl Panel {
             self.hide_at = 0;
             if !shown {
                 self.start_slide(0, now);
-                crate::kprintln!("  desktop     : taskbar revealed");
+                crate::kprintln!("  desktop     : taskbar revealed on output {} ({},{} {}x{})", self.output, self.home.x, self.home.y, self.home.w, self.home.h);
             }
         } else if shown && self.hide_at == 0 {
             self.hide_at = now + HIDE_DELAY_MS;
@@ -611,7 +669,7 @@ impl Panel {
             self.hide_at = 0;
             let hidden = self.hidden_slide();
             self.start_slide(hidden, now);
-            crate::kprintln!("  desktop     : taskbar hidden");
+            crate::kprintln!("  desktop     : taskbar hidden on output {}", self.output);
         }
         let (from, to, started) = self.anim?;
         let t = (now.saturating_sub(started)).min(SLIDE_MS);
@@ -1031,7 +1089,7 @@ impl Panel {
             return;
         }
         let ctx = desk_ctx(self.scale);
-        let m = Metrics::new(ctx);
+        let m = self.metrics();
         let p = ctx.palette;
         let plate = self.surface.bounds();
 
@@ -1062,7 +1120,8 @@ impl Panel {
         // кнопкам достаётся то, что осталось. Наоборот было бы хуже — десяток
         // открытых окон вытеснил бы часы за край экрана.
         let clock = clock_line(status);
-        let date = date_line(status);
+        // Маленькие значки — часы в одну строку, как в Windows.
+        let date = if self.cfg.small { None } else { date_line(status) };
         // Раскладка — как в трее Windows: «РУС» и «ENG».
         let lang = match crate::input::keymap::layout() {
             crate::input::keymap::Layout::Ru => "РУС",
@@ -1083,7 +1142,7 @@ impl Panel {
         // Совсем узкий экран: показать всё нельзя, и тогда правого края нет
         // вовсе. Обрезанное наполовину число хуже отсутствующего — по нему не
         // понять, что именно обрезано.
-        if status_w + m.brand_width() + m.plate_pad() * 2 + m.gap * 2 > plate.w {
+        if status_w + m.brand_width() + m.plate_pad() * 2 + m.gap * 2 > plate.w || self.secondary {
             status_w = 0;
         }
 
@@ -1324,8 +1383,9 @@ impl Panel {
                 (button, icon, ctx.px(DOCK_PAD), ctx.px(DOCK_GAP), button + ctx.px(DOCK_PAD) * 2)
             }
             deskcfg::Mode::Panel => {
-                let thick = ctx.px(PANEL_V_W);
-                (m.btn_h, m.icon(), (thick - m.btn_h) / 2, ctx.px(4), thick)
+                let thick = ctx.px(if self.cfg.small { SMALL_V_W } else { PANEL_V_W });
+                let button = m.btn_h.min(thick.saturating_sub(ctx.px(6)));
+                (button, m.icon(), (thick - button) / 2, ctx.px(4), thick)
             }
         }
     }
@@ -1358,19 +1418,20 @@ impl Panel {
     /// окна, черта, трей — вдоль оси полосы.
     fn redraw_strip(&mut self, windows: &[Entry], menu_open: bool, status: &Status) {
         let ctx = desk_ctx(self.scale);
-        let m = Metrics::new(ctx);
+        let m = self.metrics();
         let p = ctx.palette;
         let vertical = self.cfg.edge.vertical();
         let dock = self.cfg.mode == deskcfg::Mode::Dock;
         let (button, icon, pad, gap, thick) = self.strip_sizes(m);
-        let tray = self.strip_tray(m, status);
+        let tray = if self.secondary { Vec::new() } else { self.strip_tray(m, status) };
         let tray_len: u32 = tray.iter().map(|(_, len)| *len).sum();
         let plan = plan_slots(windows, &self.pins, false);
 
         // Длина Dock — по содержимому; панель — во всю сторону.
         let side_len = if vertical { self.area.h } else { self.area.w };
         let room = side_len.saturating_sub(ctx.px(DOCK_INSET) * 2);
-        let fixed = pad * 2 + button + gap + gap * 2 + 1 + tray_len;
+        // Без трея (Dock второго монитора) — без черты и поля перед ним.
+        let fixed = pad * 2 + button + gap + if tray.is_empty() { 0 } else { gap * 2 + 1 + tray_len };
         let fits = ((room.saturating_sub(fixed)) / (button + gap)) as usize;
         let shown = plan.len().min(fits);
         if dock {
@@ -1442,7 +1503,7 @@ impl Panel {
         let mut buttons = Buttons::new();
         let mut pin_hits = Vec::new();
         let mut slots = Vec::new();
-        let end = length.saturating_sub(pad + tray_len + gap * 2 + 1);
+        let end = length.saturating_sub(pad + if tray.is_empty() { 0 } else { tray_len + gap * 2 + 1 });
         for (members, pin, label) in plan.into_iter() {
             if at + button > end {
                 break;
@@ -1470,7 +1531,9 @@ impl Panel {
         // самом конце стороны.
         let mut at = if dock { at + gap } else { length.saturating_sub(pad + tray_len) };
         let rule = place(at.saturating_sub(gap + 1), 1, ctx.px(24));
-        if vertical {
+        if self.secondary {
+            // Трея у панели второго монитора нет — и черты перед ним.
+        } else if vertical {
             draw::hline(&mut self.surface, rule.x, rule.y, rule.w, p.line2.color, p.line2.alpha);
         } else {
             let rule = place(at.saturating_sub(gap + 1), 1, ctx.px(24));

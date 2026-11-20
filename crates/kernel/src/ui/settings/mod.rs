@@ -579,6 +579,8 @@ pub struct SettingsView {
     seen: Cell<Option<Seen>>,
     /// Черновик раскладки мониторов («Дисплей», 16.11).
     displays: displays::Displays,
+    /// Ползунок размера значков Dock держат (20.11): его место в окне.
+    dock_slider: Option<Rect>,
 }
 
 /// Что вернул проход.
@@ -614,6 +616,7 @@ impl SettingsView {
             cache: Cache::default(),
             seen: Cell::new(None),
             displays: displays::Displays::load(),
+            dock_slider: None,
         };
         view.refresh();
         view
@@ -823,16 +826,34 @@ impl SettingsView {
     /// Тянут ли монитор на холсте «Дисплея».
     #[must_use]
     pub fn dragging(&self) -> bool {
-        self.displays.dragging()
+        self.displays.dragging() || self.dock_slider.is_some()
     }
 
     /// Монитор тянут: указатель в точке окна `x`, `y`.
     pub fn drag_to(&mut self, x: i32, y: i32) -> bool {
+        if let Some(track) = self.dock_slider {
+            return self.slide_dock(track, x);
+        }
         self.displays.drag_to(x, y)
+    }
+
+    /// Ползунок размера значков Dock в точке `x` (20.11): Dock меняется
+    /// сразу и показан, пока его тянут. `true` — значение сменилось.
+    fn slide_dock(&mut self, track: Rect, x: i32) -> bool {
+        let scale = self.seen.get().map_or(mini_ui::Scale::ONE, |seen| seen.ctx.scale);
+        let size = pages::slider_value(scale, track, x, super::deskcfg::ICON_MIN, super::deskcfg::ICON_MAX);
+        if size == super::deskcfg::taskbar().icon {
+            return false;
+        }
+        self.perform(Deed::Taskbar(super::deskcfg::TaskbarDeed::Icon(size)));
+        true
     }
 
     /// Монитор отпустили.
     pub fn drop_drag(&mut self) {
+        if self.dock_slider.take().is_some() {
+            kprintln!("  settings    : dock icon size {} (slider released)", super::deskcfg::taskbar().icon);
+        }
         if let Some((index, x, y)) = self.displays.drop_drag() {
             kprintln!("  settings    : display {} moved to {x},{y}", index + 1);
         }
@@ -1073,6 +1094,12 @@ impl SettingsView {
                 // дальше его тянут, пока кнопка зажата (`drag_to`).
                 if let Deed::PickOutput(index) = deed {
                     self.displays.grab(index, x, y);
+                }
+                // Ползунок Dock: значение — по точке щелчка, дальше тянут.
+                if let Deed::Taskbar(super::deskcfg::TaskbarDeed::Icon(_)) = deed {
+                    self.dock_slider = Some(hit.rect);
+                    self.slide_dock(hit.rect, x);
+                    return true;
                 }
                 self.perform(deed);
                 true

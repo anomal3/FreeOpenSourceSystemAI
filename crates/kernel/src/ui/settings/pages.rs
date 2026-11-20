@@ -831,9 +831,15 @@ fn dock(pass: &mut Pass, x: i32, y: i32, w: u32) {
     let edges: Vec<(&str, Deed, bool)> = Edge::ALL.iter().map(|edge| (edge.title(), Deed::Taskbar(TaskbarDeed::Edge(*edge)), cfg.edge == *edge)).collect();
     y = seg_row(pass, x, y, w, Fi::Layers, "Расположение", "Сторона экрана, у которой стоит панель", &edges);
     y = row(pass, x, y, w, Some(Fi::Eye), "Автоматически скрывать", "Панель выезжает при наведении на край экрана, окна занимают весь экран", Ctl::Toggle(cfg.autohide), Some(Deed::Taskbar(TaskbarDeed::Autohide(!cfg.autohide))));
-    let labels: Vec<(String, Deed, bool)> = deskcfg::ICON_SIZES.iter().map(|size| (format!("{size}"), Deed::Taskbar(TaskbarDeed::Icon(*size)), cfg.icon == *size)).collect();
-    let sizes: Vec<(&str, Deed, bool)> = labels.iter().map(|(label, deed, on)| (label.as_str(), deed.clone(), *on)).collect();
-    y = seg_row(pass, x, y, w, Fi::Sliders, "Размер значков Dock", "Точки; только в режиме Dock", &sizes);
+    // Размер значков — ползунком и только у Dock; у панели во всю сторону
+    // вместо него «Маленькие значки», как в Windows (Роман, 20.11).
+    if cfg.mode == Mode::Dock {
+        let value = format!("{} точек", cfg.icon);
+        y = slider_row(pass, x, y, w, Fi::Sliders, "Размер значков Dock", &value, cfg.icon, deskcfg::ICON_MIN, deskcfg::ICON_MAX, Deed::Taskbar(TaskbarDeed::Icon(cfg.icon)));
+    } else {
+        y = row(pass, x, y, w, Some(Fi::Sliders), "Маленькие значки", "Панель ниже, значки мельче, часы в одну строку", Ctl::Toggle(cfg.small), Some(Deed::Taskbar(TaskbarDeed::Small(!cfg.small))));
+    }
+    y = row(pass, x, y, w, Some(Fi::Monitor), "Панель задач на всех мониторах", "На каждом мониторе — кнопки его окон и свой «Пуск»", Ctl::Toggle(cfg.all), Some(Deed::Taskbar(TaskbarDeed::AllMonitors(!cfg.all))));
 
     // Как «Объединять кнопки панели задач» в Windows 11: значок на программу
     // (окна стопкой) или кнопка с подписью на каждое окно.
@@ -875,6 +881,66 @@ fn start_page(pass: &mut Pass, x: i32, y: i32, w: u32) {
     y = row(pass, x, y, w, Some(Fi::Apps), "Закреплено", "Правая кнопка на программе в «Пуске» — закрепить, открепить, в начало", Ctl::Value(&count), None);
     y = row(pass, x, y, w, Some(Fi::Undo), "Вернуть как было", "Терминал, Параметры, Файлы, папки «Системные утилиты» и «SDK C#»", Ctl::Button("Вернуть", Weight::Normal), Some(Deed::Start(StartDeed::ResetPins)));
     pass.note(x, y, w, "Win или F1 — открыть «Пуск»; набор текста сразу ищет; Ctrl+Shift+Esc — диспетчер задач.");
+}
+
+/// Ширина дорожки ползунка (точки при масштабе 1).
+const SLIDER_W: u32 = 280;
+
+/// Строка-карточка с ползунком справа (20.11, размер значков Dock): щелчок
+/// по дорожке ставит значение, дальше его тянут (`SettingsView::drag_to`).
+/// Пункт `deed` заводится на всю дорожку.
+#[allow(clippy::too_many_arguments)]
+fn slider_row(pass: &mut Pass, x: i32, y: i32, w: u32, icon: Fi, title: &str, value_text: &str, value: u32, min: u32, max: u32, deed: Deed) -> i32 {
+    let ctx = pass.ctx;
+    let p = ctx.palette;
+    let h = ctx.px(60);
+    let rect = Rect::new(x, y, w, h);
+    let next = y + (h + ctx.px(4)) as i32;
+    let pad = ctx.px(18) as i32;
+    let knob = ctx.px(18);
+    let track_w = ctx.px(SLIDER_W).min(w / 2);
+    // Дорожка нажимается во всю высоту строки: попасть в 4 точки трудно.
+    let hit = Rect::new(rect.right() - pad - track_w as i32 - knob as i32 / 2, rect.y, track_w + knob, h);
+    let track = Rect::new(rect.right() - pad - track_w as i32, rect.y + h as i32 / 2 - ctx.px(2) as i32, track_w, ctx.px(4));
+    let focused = pass.deed_in(hit, rect, deed);
+    if !pass.visible(rect) {
+        return next;
+    }
+    let span = max.saturating_sub(min).max(1);
+    let at = track.x + (u64::from(track_w) * u64::from(value.clamp(min, max) - min) / u64::from(span)) as i32;
+    let card = ctx.flat(p.card);
+    let radius = ctx.px(8);
+    pass.on(|s| {
+        draw::rounded(s, rect, radius, card, 255);
+        draw::rounded_stroke(s, rect, radius, if focused { p.acc } else { p.line2.color }, if focused { 255 } else { p.line2.alpha });
+        draw::rounded(s, track, track.h / 2, p.sunk.over(card), 255);
+        let done = Rect::new(track.x, track.y, (at - track.x).max(1) as u32, track.h);
+        draw::rounded(s, done, track.h / 2, p.acc, 255);
+        let k = Rect::new(at - knob as i32 / 2, rect.y + (h as i32 - knob as i32) / 2, knob, knob);
+        draw::rounded(s, k, knob / 2, p.acc, 255);
+        draw::rounded(s, k.shrink(ctx.px(5)), (knob - ctx.px(10)) / 2, Color::rgb(0xFF, 0xFF, 0xFF), 255);
+    });
+    let size = ctx.px(22);
+    pass.icon(icon, rect.x + pad, rect.y + (h as i32 - size as i32) / 2, size, p.ink2);
+    let text_x = rect.x + pad + (size + ctx.px(16)) as i32;
+    let room = (hit.x - ctx.px(14) as i32 - text_x).max(0) as u32;
+    let both = line_h(ctx, Role::Body) + ctx.px(3) as i32 + line_h(ctx, Role::Caption);
+    let top = rect.y + (h as i32 - both) / 2;
+    pass.text(Role::Body, text_x, top, room, title, p.ink);
+    pass.text(Role::Caption, text_x, top + line_h(ctx, Role::Body) + ctx.px(3) as i32, room, value_text, p.ink4);
+    next
+}
+
+/// Значение ползунка по точке `px` на его месте `hit` (как его завёл
+/// [`slider_row`]).
+pub(super) fn slider_value(ctx_scale: mini_ui::Scale, hit: Rect, px: i32, min: u32, max: u32) -> u32 {
+    let knob = (18 * ctx_scale) as i32;
+    let left = hit.x + knob / 2;
+    let width = (hit.w as i32 - knob).max(1);
+    let t = (px - left).clamp(0, width);
+    let raw = min + ((max - min) as i64 * i64::from(t) / i64::from(width)) as u32;
+    // Шаг 4 точки: ровные размеры и меньше пересборок Dock.
+    (raw + 2) / 4 * 4
 }
 
 /// Строка-карточка с переключателем из нескольких кнопок справа.

@@ -100,6 +100,8 @@ pub enum Snap {
     Right,
     /// Верхний край — развернуть.
     Top,
+    /// Зона макета прилипания (20.11, как Snap Layouts).
+    Layout,
 }
 
 impl Snap {
@@ -110,6 +112,7 @@ impl Snap {
             Snap::Left => "to the left half",
             Snap::Right => "to the right half",
             Snap::Top => "maximized",
+            Snap::Layout => "to a layout zone",
         }
     }
 }
@@ -144,6 +147,23 @@ pub struct Compositor {
     out_rects: [Rect; MAX_OUTPUTS],
     /// Экран погашен по бездействию (см. [`Compositor::blank`]).
     blanked: bool,
+    /// Панели остальных мониторов (20.11, «Панель задач на всех
+    /// мониторах»): номер монитора и его панель. Пусто — панель только на
+    /// основном.
+    side_panels: Vec<(usize, Panel)>,
+    /// Монитор, на кнопке «Пуск» которого «Пуск» открывается; `None` —
+    /// основной.
+    menu_output: Option<usize>,
+    /// Макеты прилипания (20.11, как Snap Layouts в Windows 11).
+    snap_pop: Option<super::snaplay::Popup>,
+    /// С какого мига (мс) тащимое окно держат у верхнего края; 0 — не держат.
+    snap_top_since: u64,
+    /// Плавное появление и уход подсмотра (20.11): когда начато (мс) и
+    /// появляется ли он (`true`) или уходит.
+    peek_fade: Option<(u64, bool)>,
+    /// Указатель стоит на «Развернуть»: окно, кнопка и с какого мига (мс) —
+    /// через [`SNAP_HOVER_MS`] открываются макеты прилипания.
+    snap_hover: Option<(App, Rect, u64)>,
     /// Снизу вверх: последнее окно поверх остальных.
     windows: Vec<Window>,
     /// Индекс активного окна.
@@ -353,6 +373,14 @@ pub struct Compositor {
 /// Сколько раз картинка под окнами сбрасывалась — для разбора по журналу.
 static UNDER_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Сколько держать тащимое окно у верхнего края до макетов прилипания и
+/// указатель на «Развернуть» (20.11, как в Windows 11).
+const SNAP_HOLD_MS: u64 = 450;
+const SNAP_HOVER_MS: u64 = 500;
+
+/// Сколько длится появление и уход размытого подсмотра (20.11).
+const PEEK_FADE_MS: u64 = 150;
+
 /// Сколько памяти отдаётся под полосу, в которой собирается кадр.
 ///
 /// Полмегабайта — это сотня строк на экране 1280 точек и семь десятков на 1920.
@@ -387,6 +415,18 @@ fn layout_of_rects(rects: &[Rect], primary: usize) -> Option<(Rect, Rect, [Rect;
     // Стол начинается в (0, 0): координаты мониторов приходят уже в нём.
     let union = Rect::new(0, 0, union.right().max(0) as u32, union.bottom().max(0) as u32);
     Some((union, rects.get(primary).copied().unwrap_or(rects[0]), out))
+}
+
+/// Монитор `p` без того, что панель отнимает у своей стороны (20.11).
+fn cut_by_panel(p: Rect, panel: &Panel) -> Rect {
+    let (edge, t) = panel.reserve();
+    let t = t.min(p.w.min(p.h) / 2);
+    match edge {
+        super::deskcfg::Edge::Bottom => Rect::new(p.x, p.y, p.w, p.h - t),
+        super::deskcfg::Edge::Top => Rect::new(p.x, p.y + t as i32, p.w, p.h - t),
+        super::deskcfg::Edge::Left => Rect::new(p.x + t as i32, p.y, p.w - t, p.h),
+        super::deskcfg::Edge::Right => Rect::new(p.x, p.y, p.w - t, p.h),
+    }
 }
 
 /// Буфер полосы во всю ширину стола.
@@ -477,11 +517,18 @@ impl Compositor {
             rects: 0,
             deferred: false,
             blanked: false,
+            side_panels: Vec::new(),
+            menu_output: None,
+            snap_pop: None,
+            snap_top_since: 0,
+            peek_fade: None,
+            snap_hover: None,
             hw_cursor: false,
             cursor_sent: (0, 0),
             cursor_key: usize::MAX,
         };
         compositor.panel = Panel::new(compositor.primary, scale);
+        compositor.build_side_panels();
         let panel_top = compositor.work_bottom();
         compositor.menu = compositor.new_menu();
         // Шторка заводится только на телефоне — [`Shade::new`] сам вернёт
@@ -493,9 +540,7 @@ impl Compositor {
         // Сетка — на основном мониторе.
         // С 20.11 панель стоит у любой стороны: сетка — от угла рабочей
         // области, а не экрана.
-        let work = compositor.primary_work();
-        compositor.icons.set_origin(work.x, work.y);
-        compositor.icons.set_area(work.h as i32);
+        compositor.place_icon_grid();
         // Ширина экрана и верх сетки — телефону (см. [`Icons::set_span`]). На
         // столе вызов безвреден: мобильная раскладка спрашивает эти числа, а
         // настольная о них не знает.
@@ -522,14 +567,93 @@ impl Compositor {
         if theme::is_mobile() {
             return Rect::new(p.x, p.y, p.w, (panel.rect.y - p.y).max(0) as u32);
         }
-        let (edge, t) = panel.reserve();
-        let t = t.min(p.w.min(p.h) / 2);
-        match edge {
-            super::deskcfg::Edge::Bottom => Rect::new(p.x, p.y, p.w, p.h - t),
-            super::deskcfg::Edge::Top => Rect::new(p.x, p.y + t as i32, p.w, p.h - t),
-            super::deskcfg::Edge::Left => Rect::new(p.x + t as i32, p.y, p.w - t, p.h),
-            super::deskcfg::Edge::Right => Rect::new(p.x, p.y, p.w - t, p.h),
+        cut_by_panel(p, panel)
+    }
+
+    /// Номер основного монитора в [`Self::outputs`].
+    fn primary_index(&self) -> usize {
+        self.outputs.iter().position(|o| o.primary).unwrap_or(0)
+    }
+
+    /// Пересобрать панели остальных мониторов (20.11, «на всех
+    /// мониторах»); выключено — убрать их.
+    fn build_side_panels(&mut self) {
+        let old: Vec<Rect> = self.side_panels.drain(..).map(|(_, panel)| panel.rect).collect();
+        for rect in old {
+            self.mark_layer(rect);
         }
+        let primary = self.primary_index();
+        if let Some(panel) = self.panel.as_mut() {
+            panel.output = primary;
+        }
+        if theme::is_mobile() || !super::deskcfg::taskbar().all {
+            return;
+        }
+        let rects: Vec<Rect> = self.output_rects().to_vec();
+        for (i, rect) in rects.into_iter().enumerate() {
+            if i == primary {
+                continue;
+            }
+            if let Some(mut panel) = Panel::new_side(rect, self.scale) {
+                panel.output = i;
+                self.mark_layer(panel.rect);
+                self.side_panels.push((i, panel));
+            }
+        }
+    }
+
+    /// Панель монитора `output`: основная или своя у второго монитора.
+    fn panel_on(&self, output: usize) -> Option<&Panel> {
+        if output == self.primary_index() {
+            return self.panel.as_ref();
+        }
+        self.side_panels.iter().find(|(o, _)| *o == output).map(|(_, panel)| panel)
+    }
+
+    /// Все панели стола: основная первой.
+    fn all_panels(&self) -> impl Iterator<Item = &Panel> {
+        self.panel.iter().chain(self.side_panels.iter().map(|(_, panel)| panel))
+    }
+
+    /// На кнопке какого монитора стоит окно в `rect`: монитор под его
+    /// серединой, если на нём своя панель, иначе основной (20.11, как
+    /// «Показывать кнопки на панели, где открыто окно» в Windows).
+    fn panel_output_of(&self, rect: Rect) -> usize {
+        let o = self.output_near(rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2);
+        if self.panel_on(o).is_some() { o } else { self.primary_index() }
+    }
+
+    /// Поставить сетку значков (20.11): от угла основного монитора, столбец
+    /// той же длины при любой стороне панели — иначе панель, переехавшая
+    /// влево, меняла число строк, и значки перескакивали в другие столбцы.
+    /// Сдвиг — только на ту часть, которую панель слева или сверху
+    /// действительно закрывает.
+    fn place_icon_grid(&mut self) {
+        let work = self.primary_work();
+        let p = self.primary;
+        let Some(panel) = self.panel.as_ref().filter(|_| !theme::is_mobile()) else {
+            self.icons.set_origin(work.x, work.y);
+            self.icons.set_area(work.h as i32);
+            return;
+        };
+        let cfg = panel.config();
+        let ctx = mini_ui::paint::Ctx::scaled(self.scale);
+        let margin = ctx.px(theme::ICON_MARGIN) as i32;
+        let gap = ctx.px(6) as i32;
+        let home = panel.home();
+        let (mut ox, mut oy) = (p.x, p.y);
+        if !cfg.autohide {
+            match cfg.edge {
+                super::deskcfg::Edge::Left => ox += (home.right() + gap - (p.x + margin)).max(0),
+                super::deskcfg::Edge::Top => oy += (home.bottom() + gap - (p.y + margin)).max(0),
+                _ => {}
+            }
+        }
+        // Длина столбца — как у полосы снизу той же толщины.
+        let bar = if cfg.autohide { 0 } else { Panel::thickness(super::deskcfg::Taskbar { edge: super::deskcfg::Edge::Bottom, ..cfg }, self.scale) };
+        let height = (p.h.saturating_sub(bar) as i32 - (oy - p.y).saturating_sub(bar as i32).max(0)).max(0);
+        self.icons.set_origin(ox, oy);
+        self.icons.set_area(height);
     }
 
     /// Кнопка «Пуск» на экране (20.11: у неё открывается «Выполнить»);
@@ -541,8 +665,28 @@ impl Compositor {
 
     /// «Пуск» под нынешнюю панель.
     fn new_menu(&self) -> Option<Menu> {
-        let (home, cfg) = self.panel.as_ref().map_or((Rect::EMPTY, super::deskcfg::taskbar()), |panel| (panel.home(), panel.config()));
-        Menu::new(self.primary, home, cfg, self.scale)
+        // У «Пуска» монитора, на кнопке которого его открыли (20.11).
+        let side = self.menu_output.and_then(|o| self.side_panels.iter().find(|(i, _)| *i == o)).map(|(_, panel)| panel);
+        let (area, panel) = match side {
+            Some(panel) => (panel.area(), Some(panel)),
+            None => (self.primary, self.panel.as_ref()),
+        };
+        let (home, cfg) = panel.map_or((Rect::EMPTY, super::deskcfg::taskbar()), |panel| (panel.home(), panel.config()));
+        Menu::new(area, home, cfg, self.scale)
+    }
+
+    /// «Пуск» откроется у панели под точкой `x, y` (20.11, панели на всех
+    /// мониторах): закрытое меню пересобирается у её кнопки.
+    pub fn aim_menu_at(&mut self, x: i32, y: i32) {
+        let output = self.side_panels.iter().find(|(_, panel)| panel.rect.contains(x, y)).map(|(o, _)| *o);
+        if output == self.menu_output || self.menu_open() {
+            return;
+        }
+        self.menu_output = output;
+        if let Some(menu) = self.new_menu() {
+            self.menu = Some(menu);
+        }
+        crate::kprintln!("  desktop     : start menu on output {}", output.unwrap_or_else(|| self.primary_index()));
     }
 
     /// Пересобрать панель и «Пуск» под новые настройки (`deskcfg`, 20.11):
@@ -560,12 +704,13 @@ impl Compositor {
             self.mark_layer(rect);
         }
         self.panel = Some(panel);
+        self.build_side_panels();
+        self.menu_output = None;
         if let Some(menu) = self.new_menu() {
             self.menu = Some(menu);
         }
         let work = self.primary_work();
-        self.icons.set_origin(work.x, work.y);
-        self.icons.set_area(work.h as i32);
+        self.place_icon_grid();
         self.icons.reload();
         let works: Vec<Rect> = self.windows.iter().map(|window| self.work_rect_under(window.rect)).collect();
         for (window, work) in self.windows.iter_mut().zip(works) {
@@ -635,7 +780,9 @@ impl Compositor {
     pub fn taskbar_pointer(&mut self, x: i32, y: i32) {
         let busy = self.menu_open() || self.context_open() || self.thumbs_open() || self.tray_pop.is_some();
         let now = crate::time::uptime_ms();
-        if let Some(panel) = self.panel.as_mut() {
+        // Каждая панель — у края своего монитора (20.11).
+        let panels = self.panel.iter_mut().chain(self.side_panels.iter_mut().map(|(_, panel)| panel));
+        for panel in panels {
             panel.autohide_pointer(x, y, busy, now);
             if panel.autohide_pending() {
                 super::set_animating(true);
@@ -647,15 +794,21 @@ impl Compositor {
     fn advance_taskbar(&mut self) -> bool {
         let busy = self.menu_open() || self.context_open() || self.thumbs_open() || self.tray_pop.is_some();
         let now = crate::time::uptime_ms();
-        let Some(panel) = self.panel.as_mut() else {
-            return false;
-        };
-        if busy {
-            panel.hold(now);
+        let mut pending = false;
+        let mut moved = Vec::new();
+        let panels = self.panel.iter_mut().chain(self.side_panels.iter_mut().map(|(_, panel)| panel));
+        for panel in panels {
+            if busy {
+                panel.hold(now);
+            }
+            if let Some(rect) = panel.autohide_tick(now) {
+                // Только в пределах своего монитора: уехавшая за край
+                // плашка на соседнем не рисуется (20.11).
+                moved.push(rect.intersect(&panel.area()));
+            }
+            pending |= panel.autohide_pending();
         }
-        let moved = panel.autohide_tick(now);
-        let pending = panel.autohide_pending();
-        if let Some(rect) = moved {
+        for rect in moved {
             self.mark_layer(rect);
         }
         pending
@@ -683,12 +836,14 @@ impl Compositor {
     /// оно относится.
     #[must_use]
     pub fn beside_panel(&self, rect: Rect, anchor: Rect) -> Rect {
-        let Some(panel) = self.panel.as_ref().filter(|_| !theme::is_mobile()) else {
+        // Панель монитора, на котором кнопка (20.11).
+        let output = self.output_near(anchor.x + anchor.w as i32 / 2, anchor.y + anchor.h as i32 / 2);
+        let Some(panel) = self.panel_on(output).or(self.panel.as_ref()).filter(|_| !theme::is_mobile()) else {
             return rect;
         };
         let home = panel.home();
         let gap = mini_ui::paint::Ctx::scaled(self.scale).px(12) as i32;
-        let p = self.primary;
+        let p = panel.area();
         let fit_y = |y: i32| y.clamp(p.y + gap, (p.bottom() - rect.h as i32 - gap).max(p.y + gap));
         let center_y = anchor.y + anchor.h as i32 / 2 - rect.h as i32 / 2;
         match panel.config().edge {
@@ -797,7 +952,8 @@ impl Compositor {
         let full = self.fullscreen_front();
         if full != self.full_front_shown {
             self.full_front_shown = full;
-            if let Some(rect) = self.panel.as_ref().map(|panel| panel.rect) {
+            let rects: Vec<Rect> = self.all_panels().map(|panel| panel.rect).collect();
+            for rect in rects {
                 self.mark_layer(rect);
             }
         }
@@ -879,7 +1035,8 @@ impl Compositor {
             }
             Rect::new(r.x, r.y, r.w, (bottom - r.y).max(0) as u32)
         } else {
-            r
+            // Своя панель второго монитора отнимает своё (20.11).
+            self.side_panels.iter().find(|(o, _)| *o == i).map_or(r, |(_, panel)| cut_by_panel(r, panel))
         }
     }
 
@@ -1093,6 +1250,19 @@ impl Compositor {
         let under = self.window_at(x, y).and_then(|(index, hit)| {
             matches!(hit, Hit::Close | Hit::Maximize | Hit::Minimize).then(|| (self.windows[index].app, hit))
         });
+        // Указатель на «Развернуть» — отсчёт до макетов прилипания (20.11).
+        match under {
+            Some((app, Hit::Maximize)) if !theme::is_mobile() && self.snap_pop.is_none() => {
+                if self.snap_hover.map(|(was, _, _)| was) != Some(app) {
+                    let side = Window::title_height(self.scale);
+                    let top = self.rect_of(app).map_or(y, |rect| rect.y);
+                    let button = Rect::new(x - side as i32 / 2, top, side, side);
+                    self.snap_hover = Some((app, button, crate::time::uptime_ms()));
+                    super::set_animating(true);
+                }
+            }
+            _ => self.snap_hover = None,
+        }
         let focus = self.focus;
         for (index, window) in self.windows.iter_mut().enumerate() {
             let hot = under.filter(|(app, _)| *app == window.app).map(|(_, hit)| hit);
@@ -1122,10 +1292,33 @@ impl Compositor {
             Some(_) if self.peek_back.is_none() && super::look::on(super::look::Flag::Effects) => {
                 self.build_peek_back();
                 if self.peek_back.is_some() {
+                    // Размытие наплывает за [`PEEK_FADE_MS`], а не встаёт
+                    // разом (Роман, 20.11: «хоп и топорно»).
+                    if super::animations_allowed() {
+                        self.peek_fade = Some((crate::time::uptime_ms(), true));
+                        super::set_animating(true);
+                    }
                     self.mark_layer(self.union);
                 }
             }
-            None if self.peek_back.take().is_some() => self.mark_layer(self.union),
+            // Ушло, не успев уйти, — возвращается с той же силы.
+            Some(_) if self.peek_back.is_some() && matches!(self.peek_fade, Some((_, false))) => {
+                let alpha = u64::from(self.peek_alpha());
+                self.peek_fade = Some((crate::time::uptime_ms().saturating_sub(alpha * PEEK_FADE_MS / 255), true));
+                super::set_animating(true);
+                self.mark_layer(self.union);
+            }
+            None if self.peek_back.is_some() => {
+                if super::animations_allowed() {
+                    let alpha = u64::from(self.peek_alpha());
+                    self.peek_fade = Some((crate::time::uptime_ms().saturating_sub((255 - alpha.min(255)) * PEEK_FADE_MS / 255), false));
+                    super::set_animating(true);
+                } else {
+                    self.peek_back = None;
+                    self.peek_fade = None;
+                }
+                self.mark_layer(self.union);
+            }
             _ => {}
         }
         for old in [self.peek, app].into_iter().flatten() {
@@ -1134,6 +1327,35 @@ impl Compositor {
             }
         }
         self.peek = app;
+    }
+
+    /// Сила размытой подложки подсмотра сейчас (0..=255).
+    fn peek_alpha(&self) -> u32 {
+        match self.peek_fade {
+            None => {
+                if self.peek_back.is_some() { 255 } else { 0 }
+            }
+            Some((start, showing)) => {
+                let t = (crate::time::uptime_ms().saturating_sub(start).min(PEEK_FADE_MS) * 255 / PEEK_FADE_MS) as u32;
+                if showing { t } else { 255 - t }
+            }
+        }
+    }
+
+    /// Шаг наплыва подсмотра перед кадром. `true` — ещё идёт.
+    fn advance_peek(&mut self) -> bool {
+        let Some((start, showing)) = self.peek_fade else {
+            return false;
+        };
+        self.mark(self.union);
+        if crate::time::uptime_ms().saturating_sub(start) < PEEK_FADE_MS {
+            return true;
+        }
+        self.peek_fade = None;
+        if !showing {
+            self.peek_back = None;
+        }
+        false
     }
 
     /// Запомнить, что нажатие `key` ушло окну `app` событием `event`.
@@ -1317,6 +1539,16 @@ impl Compositor {
     /// Окна программ (не окна ядра).
     #[must_use]
     pub fn program_apps(&self) -> Vec<App> {
+    /// Кнопки панели монитора `output` (20.11): окна, чья кнопка на ней.
+    fn buttons_on(&self, output: usize) -> super::panel::Windows {
+        if self.side_panels.is_empty() {
+            return self.buttons();
+        }
+        let mut entries = self.buttons();
+        entries.retain(|entry| self.rect_of(entry.app).is_some_and(|rect| self.panel_output_of(rect) == output));
+        entries
+    }
+
         self.windows.iter().map(|window| window.app).filter(|app| matches!(app, App::Program(..))).collect()
     }
 
@@ -1975,8 +2207,12 @@ impl Compositor {
         if self.keyboard_visible() || self.app_in_front() || self.fullscreen_front() {
             return None;
         }
-        let panel = self.panel.as_ref()?;
-        if !panel.rect.contains(x, y) {
+        if let Some(panel) = self.panel.as_ref().filter(|panel| panel.rect.contains(x, y) && panel.area().contains(x, y)) {
+            return panel.hit(x, y);
+        }
+        // Панели остальных мониторов (20.11).
+        let (_, panel) = self.side_panels.iter().find(|(_, panel)| panel.rect.contains(x, y) && panel.area().contains(x, y))?;
+        if self.fullscreen_over(panel.rect) {
             return None;
         }
         panel.hit(x, y)
@@ -2024,6 +2260,11 @@ impl Compositor {
     pub const fn resize_edges(&self) -> u8 {
         self.resize_edges
     }
+        self.snap_top_since = 0;
+        self.snap_hover = None;
+        if self.snap_pop.as_ref().is_some_and(|pop| pop.dragging) || app.is_some() {
+            self.close_snap_layouts();
+        }
 
     /// Тянут ли окно за уголок (а не переносят).
     #[must_use]
@@ -2126,13 +2367,12 @@ impl Compositor {
 
     /// Указатель с тащимым окном у края экрана (20.11, как Snap в Windows):
     /// слева и справа — половина рабочей области этого монитора, сверху —
-    /// развернуть. Край — только внешний: на стыке двух мониторов окно
-    /// переезжает на соседний, а не прилипает.
+    /// развернуть. С 20.11 — у каждого края каждого монитора, и у верхнего
+    /// края, если окно там подержать, открываются макеты прилипания.
     fn update_snap(&mut self) {
         let next = if theme::is_mobile() || self.drag_resizes || self.drag.is_none() {
             None
         } else {
-            let (x, y) = self.pointer.position();
             self.snap_zone(x, y)
         };
         if next == self.snap {
@@ -2153,24 +2393,59 @@ impl Compositor {
         let index = self.output_near(x, y);
         let monitor = *self.output_rects().get(index)?;
         let edge = (2u32 * self.scale) as i32;
-        let outside = |x: i32, y: i32| !self.output_rects().iter().any(|rect| rect.contains(x, y));
-        let zone = if x < monitor.x + edge && outside(monitor.x - 1, y) {
+        let zone = if x < monitor.x + edge {
             Snap::Left
-        } else if x >= monitor.right() - edge && outside(monitor.right(), y) {
+        } else if x >= monitor.right() - edge {
             Snap::Right
-        } else if y < monitor.y + edge && outside(x, monitor.y - 1) {
+        } else if y < monitor.y + edge {
             Snap::Top
         } else {
             return None;
         };
         let area = self.work_rect_of(index);
         if area.is_empty() {
+        let (x, y) = self.pointer.position();
+        // Макеты открыты перетаскиванием: зона под указателем — место окна.
+        if self.snap_pop.as_ref().is_some_and(|pop| pop.dragging) && self.drag.is_some() {
+            let scale = self.scale;
+            let keep = self.snap_pop.as_ref().is_some_and(|pop| pop.keeps(x, y, scale) || y <= pop.rect.y);
+            if keep {
+                let changed = self.snap_pop.as_mut().is_some_and(|pop| pop.hover(x, y));
+                let zone = self.snap_pop.as_ref().and_then(|pop| pop.hot.and_then(|(l, c)| pop.target(l, c)));
+                if changed {
+                    if let Some(rect) = self.snap_pop.as_ref().map(|pop| pop.rect) {
+                        self.mark(rect);
+                    }
+                }
+                let next = match zone {
+                    Some(rect) => Some((Snap::Layout, rect)),
+                    None => self.snap_zone(x, y),
+                };
+                self.set_snap(next);
+                return;
+            }
+            self.close_snap_layouts();
+        }
             return None;
         }
         let half = area.w / 2;
         let rect = match zone {
-            Snap::Top => area,
+            Snap::Top | Snap::Layout => area,
             Snap::Left => Rect::new(area.x, area.y, half, area.h),
+        // Держат у верхнего края — отсчёт до макетов ([`Self::advance_snap_layouts`]).
+        if matches!(next, Some((Snap::Top, _))) {
+            if self.snap_top_since == 0 {
+                self.snap_top_since = crate::time::uptime_ms().max(1);
+                super::set_animating(true);
+            }
+        } else {
+            self.snap_top_since = 0;
+        }
+        self.set_snap(next);
+    }
+
+    /// Сменить показанное место прилипания.
+    fn set_snap(&mut self, next: Option<(Snap, Rect)>) {
             Snap::Right => Rect::new(area.x + half as i32, area.y, area.w - half, area.h),
         };
         Some((zone, rect))
@@ -2181,15 +2456,28 @@ impl Compositor {
     pub fn drop_snap(&mut self, app: App) -> Option<Snap> {
         let (zone, target) = self.snap.take()?;
         self.mark_layer(target);
-        let index = self.index_of(app)?;
-        let focused = index == self.focus;
         let (from_x, from_y) = self.drag_from;
-        let window = self.windows.get_mut(index)?;
-        let before = window.rect;
+        let before = self.rect_of(app)?;
         // Вернётся окно к размеру, с которым его взяли, и туда, откуда взяли.
         let previous = Rect::new(from_x, from_y, before.w, before.h);
-        if !window.snap_to(target, previous, zone == Snap::Top) {
-            return None;
+        // У каждого края каждого монитора, в том числе на стыке двух (20.11,
+        // как в Windows): монитор — тот, что под указателем.
+        self.snap_window_to(app, target, previous, zone == Snap::Top).then_some(zone)
+    }
+
+    /// Поставить окно в `target` (половина, зона макета или весь монитор —
+    /// `maximize`); `previous` — куда оно вернётся. Перетекает анимацией.
+    fn snap_window_to(&mut self, app: App, target: Rect, previous: Rect, maximize: bool) -> bool {
+        let Some(index) = self.index_of(app) else {
+            return false;
+        };
+        let focused = index == self.focus;
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        let before = window.rect;
+        if !window.snap_to(target, previous, maximize) {
+            return false;
         }
         window.draw_decorations(focused);
         let after = window.rect;
@@ -2201,7 +2489,117 @@ impl Compositor {
             self.flight = Some(Flight::morph(app, after, before, crate::time::uptime_ns()));
             super::set_animating(true);
         }
-        Some(zone)
+        true
+    }
+
+    /// Открыть макеты прилипания для окна `app` (20.11): `button` — кнопка
+    /// «Развернуть», под которой они встают; `None` — окно держат у верхнего
+    /// края, и они встают вверху монитора под указателем.
+    fn open_snap_layouts(&mut self, app: App, button: Option<Rect>) {
+        let Some(rect) = self.rect_of(app) else {
+            return;
+        };
+        let (x, y) = self.pointer.position();
+        let output = self.output_near(x, y);
+        let monitor = self.output_rects().get(output).copied().unwrap_or(self.primary);
+        let area = self.work_rect_of(output);
+        let gap = (8 * self.scale) as i32;
+        let pop = match button {
+            Some(button) => super::snaplay::Popup::new(app, button.x + button.w as i32 / 2, button.bottom() + gap / 2, monitor, area, false, button, self.scale),
+            None => super::snaplay::Popup::new(app, monitor.x + monitor.w as i32 / 2, area.y + gap, monitor, area, true, Rect::EMPTY, self.scale),
+        };
+        let _ = rect;
+        crate::kprintln!(
+            "  desktop     : snap layouts opened ({}) at {},{} {}x{}",
+            if pop.dragging { "drag" } else { "button" },
+            pop.rect.x,
+            pop.rect.y,
+            pop.rect.w,
+            pop.rect.h
+        );
+        for spot in pop.spots() {
+            crate::kprintln!("  desktop     : snap spot {spot}");
+        }
+        self.mark_layer(pop.rect);
+        self.snap_pop = Some(pop);
+    }
+
+    /// Закрыть макеты прилипания.
+    pub fn close_snap_layouts(&mut self) {
+        if let Some(pop) = self.snap_pop.take() {
+            self.mark_layer(pop.rect);
+            crate::kprintln!("  desktop     : snap layouts closed");
+        }
+    }
+
+    /// Открыты ли макеты, вызванные кнопкой «Развернуть».
+    #[must_use]
+    pub fn snap_layouts_open(&self) -> bool {
+        self.snap_pop.as_ref().is_some_and(|pop| !pop.dragging)
+    }
+
+    /// Указатель сдвинулся при макетах от кнопки: подсветка зоны; ушёл и с
+    /// плашки, и с кнопки — закрыть.
+    pub fn snap_layouts_hover(&mut self, x: i32, y: i32) {
+        let scale = self.scale;
+        let Some(keeps) = self.snap_pop.as_ref().filter(|pop| !pop.dragging).map(|pop| pop.keeps(x, y, scale)) else {
+            return;
+        };
+        if !keeps {
+            self.close_snap_layouts();
+            return;
+        }
+        let changed = self.snap_pop.as_mut().map(|pop| (pop.hover(x, y), pop.rect));
+        if let Some((true, rect)) = changed {
+            self.mark(rect);
+        }
+    }
+
+    /// Щелчок при макетах от кнопки. `Some((окно, раскладка, зона))` — окно
+    /// поставлено в зону; `None` — щелчок мимо, макеты закрыты.
+    pub fn snap_layouts_press(&mut self, x: i32, y: i32) -> Option<(App, usize, usize)> {
+        let pop = self.snap_pop.as_ref().filter(|pop| !pop.dragging)?;
+        let hit = pop.zone_at(x, y).and_then(|(l, c)| pop.target(l, c).map(|rect| (pop.app, l, c, rect)));
+        let inside = pop.rect.contains(x, y);
+        if hit.is_none() && inside {
+            return None;
+        }
+        self.close_snap_layouts();
+        let (app, layout, cell, target) = hit?;
+        let previous = self.windows.iter().find(|window| window.app == app).map(|window| window.drag_restore_rect().unwrap_or(window.rect))?;
+        self.snap_window_to(app, target, previous, false).then_some((app, layout, cell))
+    }
+
+    /// Щелчок пришёлся в плашку макетов (мимо зон) — его съесть.
+    #[must_use]
+    pub fn snap_layouts_contains(&self, x: i32, y: i32) -> bool {
+        self.snap_pop.as_ref().is_some_and(|pop| pop.rect.contains(x, y))
+    }
+
+    /// Такт макетов перед кадром: окно держат у верхнего края дольше
+    /// [`SNAP_HOLD_MS`] — открыть их; указатель стоит на «Развернуть» дольше
+    /// [`SNAP_HOVER_MS`] — тоже. `true` — ждём, нужны кадры.
+    fn advance_snap_layouts(&mut self) -> bool {
+        let now = crate::time::uptime_ms();
+        if self.snap_pop.is_none() {
+            if let Some(app) = self.drag.filter(|_| self.snap_top_since != 0 && !self.drag_resizes) {
+                if now.saturating_sub(self.snap_top_since) >= SNAP_HOLD_MS {
+                    self.snap_top_since = 0;
+                    self.open_snap_layouts(app, None);
+                    return false;
+                }
+                return true;
+            }
+            if let Some((app, button, since)) = self.snap_hover.filter(|_| self.drag.is_none()) {
+                if now.saturating_sub(since) >= SNAP_HOVER_MS {
+                    self.snap_hover = None;
+                    self.open_snap_layouts(app, Some(button));
+                    return false;
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// Нарисовать место, куда прилипнет окно: полупрозрачная плашка цвета
@@ -2215,6 +2613,10 @@ impl Compositor {
         let p = theme::palette();
         let radius = ctx.px(theme::R_WINDOW);
         let at = shown.translate(0, dy);
+        self.snap_top_since = 0;
+        if self.snap_pop.as_ref().is_some_and(|pop| pop.dragging) {
+            self.close_snap_layouts();
+        }
         draw::rounded(back, at, radius, p.acc, 64);
         draw::rounded_stroke(back, at, radius, p.acc, 190);
     }
@@ -2311,6 +2713,11 @@ impl Compositor {
         // Окно возвращается полётом из стопки. Свёрнутым оно остаётся до конца
         // полёта: иначе на экране было бы сразу два окна — готовое на месте и
         // летящее к нему.
+        // Куда летит — для стенда (20.11): кнопка на панели своего монитора.
+        if let Some(button) = self.button_of(app) {
+            let output = self.output_near(button.x + button.w as i32 / 2, button.y + button.h as i32 / 2);
+            crate::kprintln!("  desktop     : minimizing '{}' to its button on output {output}", app.title());
+        }
         if self.start_flight(app, rect, true) {
             return true;
         }
@@ -2408,8 +2815,9 @@ impl Compositor {
         let after = window.rect;
         self.mark_layer(before);
         self.mark_layer(after);
-        if let Some(panel) = self.panel.as_ref().map(|panel| panel.rect) {
-            self.mark_layer(panel);
+        let rects: Vec<Rect> = self.all_panels().map(|panel| panel.rect).collect();
+        for rect in rects {
+            self.mark_layer(rect);
         }
         self.follow_owner(app);
         true
@@ -2492,6 +2900,20 @@ impl Compositor {
     // -----------------------------------------------------------------------
 
     pub fn menu_mut(&mut self) -> Option<&mut Menu> {
+    /// То же для панели второго монитора: впереди на её мониторе — окно во
+    /// весь экран (20.11).
+    fn fullscreen_over(&self, rect: Rect) -> bool {
+        if self.start.is_some() || self.menu_open() {
+            return false;
+        }
+        self.windows
+            .iter()
+            .rev()
+            .filter(|window| !window.minimized && !window.popup)
+            .find(|window| !window.rect.intersect(&rect).is_empty())
+            .is_some_and(|window| window.fullscreen)
+    }
+
         self.menu.as_mut()
     }
 
@@ -2568,10 +2990,16 @@ impl Compositor {
         if rebuilt {
             self.rebuild_taskbar();
         }
-        let buttons = self.buttons();
         let menu_open = self.menu_open();
         if let Some(panel) = self.panel.as_mut() {
-            panel.redraw(&buttons, menu_open, status);
+            panel.redraw(&buttons, menu_here, status);
+        }
+        let sides: Vec<(usize, super::panel::Windows)> = self.side_panels.iter().map(|(o, _)| (*o, self.buttons_on(*o))).collect();
+        for (o, buttons) in sides {
+            let menu_here = menu_open && self.menu_output == Some(o);
+            if let Some((_, panel)) = self.side_panels.iter_mut().find(|(i, _)| *i == o) {
+                panel.redraw(&buttons, menu_here, status);
+            }
         }
         // Где теперь кнопки окон (20.11): стенд наводит на них указатель,
         // чтобы открыть миниатюры у панели сверху или сбоку.
@@ -2596,6 +3024,9 @@ impl Compositor {
             self.damage_overflow = true;
             // Переполнение — отдельный счётчик: «весь экран перерисован» имеет
             // две причины, и лечатся они по-разному. Двенадцать накопившихся
+        for (_, panel) in &mut self.side_panels {
+            panel.forget();
+        }
             // прямоугольников — это учёт, который не справляется; смена режима
             // или темы — это честная полная перерисовка, которой так и надо.
             super::note_overflow();
@@ -2634,6 +3065,11 @@ impl Compositor {
     /// Полёт один: второе сворачивание, пришедшее во время первого, сначала
     /// доводит первое до конца — два окна, летящие в одну стопку, человек не
     /// разглядит, а держать список ради этого незачем.
+        // У каждой панели — кнопки окон своего монитора (20.11); панель
+        // одна — все окна у неё.
+        let primary = self.primary_index();
+        let buttons = self.buttons_on(primary);
+        let menu_here = menu_open && self.menu_output.is_none();
     fn start_flight(&mut self, app: App, rect: Rect, restore: bool) -> bool {
         self.finish_flight();
         if self.panel.is_none() || !super::animations_allowed() || !super::look::anim(super::look::Flag::MinMax) {
@@ -2651,7 +3087,9 @@ impl Compositor {
         }
         let app = flight.app;
         let fallback = Rect::new(self.primary.x + self.primary.w as i32 / 2, self.primary.bottom(), 1, 1);
-        self.panel.as_ref().and_then(|panel| panel.anchor(app)).unwrap_or(fallback)
+        // Кнопка на панели монитора окна (20.11): окно левого монитора не
+        // летит через весь стол на панель правого.
+        self.button_of(app).unwrap_or(fallback)
     }
 
     /// Шаг полёта перед кадром: пометить, что стёрто и что нарисовано.
@@ -3558,6 +3996,24 @@ impl Compositor {
         }
         let (was, now) = shade.advance(crate::time::uptime_ns());
         let moving = shade.is_moving();
+        let mut side = Vec::new();
+        for (_, panel) in &mut self.side_panels {
+            let damage = panel.take_damage();
+            let vacated = panel.take_vacated();
+            if !damage.is_empty() {
+                side.push((damage.translate(panel.rect.x, panel.rect.y), false));
+            }
+            if !vacated.is_empty() {
+                side.push((vacated.union(&panel.rect), true));
+            }
+        }
+        for (rect, layer) in side {
+            if layer {
+                self.mark_layer(rect);
+            } else {
+                self.mark(rect);
+            }
+        }
         // Под прошлым местом — стол и окна, которые никто не перерисовывал:
         // они не «изменились», но их снова видно. Тень шире самой шторки.
         let pad = mini_ui::paint::Ctx::scaled(self.scale).px(24) as i32;
@@ -3719,7 +4175,8 @@ impl Compositor {
     /// Где на экране кнопка окна на панели задач.
     #[must_use]
     pub fn button_of(&self, app: App) -> Option<Rect> {
-        self.panel.as_ref().and_then(|panel| panel.anchor(app))
+        let own = self.rect_of(app).and_then(|rect| self.panel_on(self.panel_output_of(rect))).and_then(|panel| panel.anchor(app));
+        own.or_else(|| self.all_panels().find_map(|panel| panel.anchor(app)))
     }
 
     /// Ярлык программы ли это (из пакета, со стрелкой).
@@ -3739,9 +4196,14 @@ impl Compositor {
     /// Возвращает место полосы.
     pub fn open_thumbs(&mut self, apps: Vec<App>, anchor: App) -> Option<Rect> {
         let button = self.button_of(anchor)?;
-        let panel_top = self.panel.as_ref().map_or(self.primary.bottom(), |panel| panel.rect.y);
+        // Монитор кнопки и его панель (20.11, панели на всех мониторах).
+        let output = self.output_near(button.x + button.w as i32 / 2, button.y + button.h as i32 / 2);
+        let (area, panel_top) = match self.panel_on(output) {
+            Some(panel) => (panel.area(), panel.rect.y),
+            None => (self.primary, self.panel.as_ref().map_or(self.primary.bottom(), |panel| panel.rect.y)),
+        };
         self.close_thumbs();
-        let mut thumbs = super::thumbs::Thumbs::new(apps, button, self.primary, panel_top, self.scale);
+        let mut thumbs = super::thumbs::Thumbs::new(apps, button, area, panel_top, self.scale);
         // Панель сверху или сбоку (20.11) — полоса под ней или рядом с ней.
         let placed = self.beside_panel(thumbs.rect, button);
         thumbs.move_to(placed.x, placed.y);
@@ -3921,7 +4383,7 @@ impl Compositor {
     /// Подложка подсмотра в полосу кадра: растяжение в [`PEEK_STEP`] раз с
     /// линейной интерполяцией - сначала по вертикали в строку, потом по
     /// горизонтали.
-    fn draw_peek_back(&self, back: &mut Surface, band: Rect, dy: i32, small: &Surface) {
+    fn draw_peek_back(&self, back: &mut Surface, band: Rect, dy: i32, small: &Surface, alpha: u32) {
         let bounds = self.union;
         let (sw, sh) = (small.width(), small.height());
         if sw == 0 || sh == 0 {
@@ -3958,7 +4420,8 @@ impl Compositor {
                 let (c0, fx) = ((u >> 8) as u32, (u & 255) as u32);
                 let c0 = c0.min(sw - 1);
                 let c1 = (c0 + 1).min(sw - 1);
-                out[x as usize] = lerp(line[c0 as usize], line[c1 as usize], fx);
+                let value = lerp(line[c0 as usize], line[c1 as usize], fx);
+                out[x as usize] = if alpha >= 255 { value } else { lerp(out[x as usize], value, alpha) };
             }
         }
     }
@@ -4201,6 +4664,9 @@ impl Compositor {
         // курсор адаптера снова заведётся при первом движении мыши.
         if self.hw_cursor && outputs.len() > 1 {
             let (x, y) = self.pointer.position();
+        for (_, panel) in &mut self.side_panels {
+            panel.forget();
+        }
             crate::display::cursor_visible(false, x, y);
             self.hw_cursor = false;
         }
@@ -4225,9 +4691,11 @@ impl Compositor {
         self.under_valid = false;
         self.scene = None;
         self.drag = None;
-        let work = self.primary_work();
-        self.icons.set_origin(work.x, work.y);
-        self.icons.set_area(work.h as i32);
+        self.side_panels.clear();
+        self.menu_output = None;
+        self.snap_pop = None;
+        self.build_side_panels();
+        self.place_icon_grid();
         self.icons.reload();
         // Развёрнутое на телефоне окно («на весь экран», 05.11) и после
         // смены режима — во весь новый экран, а не прежнего размера.
@@ -4372,7 +4840,7 @@ impl Compositor {
         // Палец держат на полоске жеста — задержку считает `ui::tick`, и
         // будить его надо кадрами, как и долгое нажатие на значок.
         super::set_animating(
-            self.flight.is_some() || trail || spinning || shade_moving || taskbar_moving || super::icon_holding() || super::gesture_holding(),
+            self.flight.is_some() || trail || spinning || shade_moving || taskbar_moving || peek_moving || snap_waiting || super::icon_holding() || super::gesture_holding(),
         );
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
@@ -4409,6 +4877,9 @@ impl Compositor {
             }
         }
         self.damage_count = 0;
+        // Наплыв подсмотра и отсчёт до макетов прилипания (20.11).
+        let peek_moving = self.advance_peek();
+        let snap_waiting = self.advance_snap_layouts();
         let spent = crate::time::uptime_ns().wrapping_sub(started);
         super::note_frame_ns(spent);
         // Площадь мониторов, а не охватывающего прямоугольника: щели между
@@ -4603,9 +5074,12 @@ impl Compositor {
         let covered = covered || scene;
         // Подсмотр окна из миниатюр (20.11): всё, что под ним, - размытая
         // приглушённая подложка, собранная один раз при наведении.
-        let peeking = match self.peek_back.as_ref().filter(|_| !scene && self.peek.is_some()) {
+        // Наплыв (20.11): пока подложка не в полную силу, стол рисуется как
+        // обычно, а она ложится поверх окон с этой силой.
+        let peek_alpha = self.peek_alpha();
+        let peeking = match self.peek_back.as_ref().filter(|_| !scene && self.peek.is_some() && peek_alpha >= 255) {
             Some(small) => {
-                self.draw_peek_back(back, band, dy, small);
+                self.draw_peek_back(back, band, dy, small, 255);
                 true
             }
             None => false,
@@ -4674,6 +5148,7 @@ impl Compositor {
         let keyboard_up = match self.keyboard.as_ref() {
             Some(keyboard) if keyboard.is_visible() => {
                 if !keyboard.rect.intersect(&band).is_empty() {
+        let peek_blend = if !scene && !peeking && peek_alpha > 0 { self.peek_back.as_ref() } else { None };
                     let r = mini_ui::paint::Ctx::scaled(self.scale).px(34);
                     self.drop_shadow(back, keyboard.rect, band, dy, r);
                     self.stack(back, keyboard.surface(), keyboard.rect, band, dy, r);
@@ -4702,14 +5177,21 @@ impl Compositor {
             // работы. `stack` проверяет то же самое, но уже внутри — а нам
             // нужно знать, сколько раз он вызывается вхолостую: счётчик
             // `top` растёт и при тапе в верх экрана, где дока нет вовсе.
-            if !panel.rect.intersect(&band).is_empty() {
+            // Только в пределах своего монитора (20.11): спрятанный Dock у
+            // стыка с соседним монитором уезжал на соседний.
+            let clip = if theme::is_mobile() { band } else { band.intersect(&panel.area()) };
+            if !panel.rect.intersect(&clip).is_empty() {
                 super::note_dock_band();
                 let t0 = crate::time::uptime_ns();
                 // Панель ПК — во всю ширину и без скругления (72b); Dock —
                 // плашка со скруглёнными углами (20.11).
                 let r = if theme::is_mobile() { radius } else { panel.corner() };
-                self.drop_shadow(back, panel.rect, band, dy, r);
-                self.stack(back, panel.surface(), panel.rect, band, dy, r);
+                // Тень — только у плашки целиком на своём мониторе: тень
+                // уезжающей рисовалась бы и на соседнем.
+                if theme::is_mobile() || panel.rect.intersect(&panel.area()) == panel.rect {
+                    self.drop_shadow(back, panel.rect, clip, dy, r);
+                }
+                self.stack(back, panel.surface(), panel.rect, clip, dy, r);
                 // Док считается отдельно от прочих верхних слоёв: он попадает
                 // в девять-двенадцать полос, а `top` стоит восемь миллисекунд,
                 // и одно с другим не сходится. Пока время не разведено, любое
@@ -4724,6 +5206,9 @@ impl Compositor {
             if let Some(window) = closing.or_else(|| self.windows.iter().find(|window| window.app == flight.app)) {
                 let to = self.flight_target(flight);
                 let t = flight.phase(crate::time::uptime_ns());
+        if let Some(small) = peek_blend {
+            self.draw_peek_back(back, band, dy, small, peek_alpha);
+        }
                 flight.draw(back, window.surface(), to, t, band, dy);
             }
         }
@@ -4761,6 +5246,17 @@ impl Compositor {
         if let Some(thumbs) = self.thumbs.as_ref() {
             let halo = self.halo() as i32;
             let grown = Rect::new(thumbs.rect.x - halo, thumbs.rect.y - halo, thumbs.rect.w + halo as u32 * 2, thumbs.rect.h + halo as u32 * 2);
+        // Панели остальных мониторов (20.11) — каждая только на своём.
+        for (_, panel) in self.side_panels.iter().filter(|_| !keyboard_up) {
+            let clip = band.intersect(&panel.area());
+            if !panel.rect.intersect(&clip).is_empty() && !self.fullscreen_over(panel.rect) {
+                let r = panel.corner();
+                if panel.rect.intersect(&panel.area()) == panel.rect {
+                    self.drop_shadow(back, panel.rect, clip, dy, r);
+                }
+                self.stack(back, panel.surface(), panel.rect, clip, dy, r);
+            }
+        }
             if !grown.intersect(&band).is_empty() {
                 self.draw_thumbs(back, band, dy, thumbs);
             }
@@ -4829,6 +5325,12 @@ impl Compositor {
         let p = theme::palette();
         let height = self.primary.h.max(1) as i32;
 
+        // Макеты прилипания (20.11) — над миниатюрами, под меню стола.
+        if let Some(pop) = self.snap_pop.as_ref() {
+            let r = theme::R_WINDOW * self.scale;
+            self.drop_shadow(back, pop.rect, band, dy, r);
+            pop.draw(back, band, dy, self.scale);
+        }
         // Готовые цвета основы: двести пятьдесят шесть оттенков перехода, и
         // цвет точки — это выбор из массива, а не смешивание.
         let mut base = [0u32; 256];

@@ -267,6 +267,10 @@ pub fn window(log: &str, title: &str) -> Result<Rect> {
     let mut rect: Option<Rect> = None;
 
     for line in log.lines() {
+        // `button of 'X' at` — кнопка окна на панели, не само окно (20.11).
+        if line.contains("button of '") {
+            continue;
+        }
         if let Some(rest) = line.split(&placed).nth(1) {
             if let Some(found) = parse_placement(rest) {
                 rect = Some(found);
@@ -476,7 +480,11 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         }
         Aim::Point(x, y) => (x, y),
         Aim::Spot(name) => {
-            let key = format!("start spot {name} at ");
+            // `snap:L.C` — зона макета прилипания (20.11).
+            let key = match name.strip_prefix("snap:") {
+                Some(zone) => format!("snap spot {zone} at "),
+                None => format!("start spot {name} at "),
+            };
             let rect = log
                 .lines()
                 .filter_map(|line| line.split(&key).nth(1).and_then(parse_placement))
@@ -486,8 +494,19 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         }
     };
 
+    // Мониторов несколько (20.11, `multihead-ui`) — предел весь стол
+    // (`desktop     : 2 outputs, desktop 2560x800`), а не основной монитор.
+    let (width, height) = desk_extent(log).map_or((width, height), |(w, h)| (w.max(width), h.max(height)));
     if point.0 < 0 || point.1 < 0 || point.0 >= width || point.1 >= height {
         bail!("цель {aim:?} оказалась за экраном {width}x{height}: {point:?}");
     }
     Ok(point)
+}
+
+/// Размер всего стола из последней строки `N outputs, desktop WxH`.
+fn desk_extent(log: &str) -> Option<(i32, i32)> {
+    let line = log.lines().filter(|line| line.contains(" outputs, desktop ")).last()?;
+    let dims = line.split(" outputs, desktop ").nth(1)?.split_whitespace().next()?;
+    let (w, h) = dims.split_once('x')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
