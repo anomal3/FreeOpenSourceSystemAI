@@ -1112,6 +1112,16 @@ fn play(
                     bail!("шаг {index}: за {prefix:?} стоит {number}, а нужно не меньше {limit}");
                 }
             }
+            Step::SeenAtLeast(prefix, limit) => {
+                say!("  [{at:>6} мс] шаг {index}: число за {prefix:?} в выводе, не меньше {limit}");
+                let Some(number) = line.seen_number(prefix) else {
+                    bail!("шаг {index}: в выводе нет числа за {prefix:?}");
+                };
+                say!("             получено {number}");
+                if number < *limit {
+                    bail!("шаг {index}: за {prefix:?} стоит {number}, а нужно не меньше {limit}");
+                }
+            }
             Step::Expect(needle) => {
                 let needle = fill(needle, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: проверяем {needle:?}");

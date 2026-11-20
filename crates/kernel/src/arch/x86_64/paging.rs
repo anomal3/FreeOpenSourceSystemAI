@@ -1567,7 +1567,14 @@ fn map_physical_memory(
         // Порог намеренно щедрый: настоящая RAM отдельными регионами такого
         // размера в карте не описывается, а мелкие окна прошивки (ACPI, LAPIC,
         // HPET) под него не подпадают и остаются на месте.
-        if region.kind != KIND_USABLE && end - start > LARGE_DEVICE_WINDOW {
+        //
+        // Образ initrd загрузчик отдаёт как Reserved, но это память, а не окно
+        // устройства: при образе больше порога (20.11.2026, 80 МиБ отладочной
+        // сборки) он пропускался, и первое же чтение initrd было #PF.
+        let initrd = info.initrd.is_present()
+            && start <= info.initrd.base
+            && info.initrd.base.saturating_add(info.initrd.size) <= end;
+        if region.kind != KIND_USABLE && !initrd && end - start > LARGE_DEVICE_WINDOW {
             crate::kprintln!(
                 "paging: skipping {} MiB device window at {start:#018x}",
                 (end - start) / (1024 * 1024)
@@ -1579,7 +1586,7 @@ fn map_physical_memory(
         // нельзя. Обычная память идёт как RW без исполнения: код ядра получит
         // свои права отдельно, поверх этого отображения.
         let mut flags = PageFlags::READ | PageFlags::WRITE;
-        if matches!(region.kind, KIND_RESERVED | KIND_ACPI_NVS) {
+        if matches!(region.kind, KIND_RESERVED | KIND_ACPI_NVS) && !initrd {
             flags |= PageFlags::DEVICE;
         }
         // Кадровый буфер — особый случай: кешировать его нельзя (за ним экран,

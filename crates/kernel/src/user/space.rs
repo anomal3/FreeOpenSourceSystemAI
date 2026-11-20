@@ -703,7 +703,14 @@ pub fn user_can(ptr: usize, len: usize, need: PageFlags) -> bool {
                     return false;
                 }
                 match arch::translate(root, virt) {
-                    Some((_, flags)) => flags,
+                    // `fault_in` подтвердил: область пускает запись (копия
+                    // разорвана, код переключён). Если запись страницы снова
+                    // «только на чтение» — это `fork` соседнего потока успел
+                    // разделить её после разбора (20.11.2026, `forkpoll` в
+                    // выпускной сборке: `poll` отвечал `EINVAL`). Право от
+                    // этого не пропало: отказ записи ядра разберётся как у
+                    // программы (`kernel_fault_in`), а `put_user` — фиксапом.
+                    Some((_, flags)) => flags | PageFlags::WRITE,
                     None => return false,
                 }
             }
@@ -724,6 +731,9 @@ pub fn user_can(ptr: usize, len: usize, need: PageFlags) -> bool {
                     return false;
                 }
                 match arch::translate(root, virt) {
+                    // Та же гонка с `fork` соседа, что и выше: подкачанную
+                    // страницу он мог уже разделить «только на чтение».
+                    Some((_, flags)) if write => flags | PageFlags::WRITE,
                     Some((_, flags)) => flags,
                     // Подкачка сказала «сделано», а страницы нет. Верить ей на
                     // слово нельзя: соврала бы она — ядро следующей же строкой

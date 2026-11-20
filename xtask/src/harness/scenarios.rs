@@ -20,6 +20,22 @@ use super::aim::{self, Aim};
 /// приглашения — `пользователь@fossai:каталог$` — меняется с каталогом, метка
 /// — нет.
 pub const PROMPT: &str = "\x1b]133;B\x07";
+
+/// Сколько программ в `/bin` есть при любой сборке: все Rust-программы
+/// (`USER_PROGRAMS`, без скрытого `init`) и программы на C, которым хватает
+/// libc (без чужих библиотек `thirdparty`). Нижняя граница для сценария
+/// `desktop` — новая программа её не ломает, пропавшая из `/bin` — ломает.
+pub const BIN_PROGRAMS_ALWAYS: u64 = {
+    let mut count = crate::build::USER_PROGRAMS.len() - 1;
+    let mut index = 0;
+    while index < crate::cbuild::C_PROGRAMS.len() {
+        if crate::cbuild::C_PROGRAMS[index].needs.is_none() {
+            count += 1;
+        }
+        index += 1;
+    }
+    count as u64
+};
 use crate::arch::Arch;
 use crate::qemu::DiskBus;
 
@@ -172,6 +188,11 @@ pub enum Step {
     /// то же самое другим способом, и никакая проверка «работает ли» её не
     /// отличит.
     AtLeast(&'static str, u64, u64),
+    /// Число за подстрокой, уже напечатанной **где угодно** в выводе (как
+    /// [`Step::Expect`]), — не меньше предела. Для строк, которые гость пишет
+    /// при запуске, задолго до шага: «/bin holds N programs» (20.11: точное
+    /// число ломалось с каждой новой программой).
+    SeenAtLeast(&'static str, u64),
     /// Проверить, что подстрока встречалась хоть раз за прогон.
     Expect(&'static str),
     /// Проверить, что подстроки не было ни разу.
@@ -2915,7 +2936,11 @@ pub const ALL: &[Scenario] = &[
             // Шестьдесят — `phone` (03.11, номеронабиратель). Семьдесят — к
             // 20.11 (среди прибавившихся — системные инструменты П1/П2: `run`,
             // `charmap`, `sysinfo`, `eventlog`, `services`, `cleanmgr`).
-            Step::Expect("/bin holds 70 programs"),
+            // С 20.11 (`filedlg`, `filedialogs` — 71) не точным числом: оно
+            // менялось с каждой новой программой и с тем, собран ли
+            // `thirdparty`. Нижняя граница выводится из списков сборки —
+            // всё, что едет в `/bin` всегда ([`BIN_PROGRAMS_ALWAYS`]).
+            Step::SeenAtLeast("/bin holds ", BIN_PROGRAMS_ALWAYS),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
