@@ -701,6 +701,12 @@ fn polaris(device: &crate::pci::Device, lines: &mut Vec<String>) {
     );
     say(lines, format!("firmware Linux would load: {}", polaris_firmware(device.device, device.revision).join(", ")));
     *POLARIS_MMIO.lock() = Some((mmio.as_usize(), device.device, device.revision));
+    // Состояние SMC — тоже на загрузке (19.11: клавиатура на живой флешке не
+    // всегда опознаётся, а команду `amd smc` без неё не набрать). Только
+    // чтение, плюс индекс косвенного доступа, как у `amd smc`.
+    for line in polaris_smc() {
+        say(lines, format!("smc: {line}"));
+    }
 }
 
 /// `amd vbios`: прочитать VBIOS Polaris из ПЗУ карты через SMC, как
