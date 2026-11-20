@@ -93,15 +93,21 @@ while :; do\n\
         *) break ;;\n\
     esac\n\
 done\n\
-# Есть узел видеокарты (/dev/dri/renderD128: `nvk hw on` или `gpu gametest`)\n\
-# и NVK за 60 с называет себя в vulkaninfo - Direct3D 9 через DXVK на\n\
-# видеокарте (RTX 3060 через GSP-RM). Иначе - как раньше, процессор.\n\
-if [ \"$GPU\" = auto ] && [ -e /dev/dri/renderD128 ] && [ \"$FOSSAI_VULKAN\" != lvp ]; then\n\
-    I=$(FOSSAI_VULKAN=nvk /opt/debian/bin/timeout -k 5 60 /opt/debian/bin/bash $P --run=vulkaninfo --summary 2>&1)\n\
-    case $I in\n\
-        *NVK*) GPU=nvk; echo \"tmnf: the video card answers through NVK - DXVK on the GPU\" ;;\n\
-        *) GPU=cpu; echo \"tmnf: NVK did not answer in 60 s - drawing on the CPU: ${I:0:300}\" ;;\n\
-    esac\n\
+# Есть узел видеокарты (/dev/dri/renderD128: ядро поднимает его, как только\n\
+# GSP-RM ответил) и драйвер NVK в пакете Proton - Direct3D 9 через DXVK на\n\
+# видеокарте (RTX 3060 через GSP-RM), без проб. До 21.11 здесь была проба\n\
+# vulkaninfo через /opt/debian/bin/timeout, которого в образе нет: проба\n\
+# падала (код 127), и игра на ПК Романа шла на процессоре (журнал 13).\n\
+# Решение - строкой `tmnf: renderer ...` и в журнал ядра.\n\
+klog() { echo \"$1\"; [ -w /dev/kmsg ] && echo \"$1\" > /dev/kmsg; }\n\
+WHY=\n\
+if [ \"$GPU\" = auto ]; then\n\
+    if [ \"$FOSSAI_VULKAN\" = lvp ]; then GPU=cpu; WHY=\"FOSSAI_VULKAN=lvp\"\n\
+    elif [ ! -e /dev/dri/renderD128 ]; then GPU=cpu; WHY=\"no /dev/dri/renderD128 (GPU driver not attached)\"\n\
+    elif [ ! -e /opt/proton/share/vulkan/icd.d/nouveau_icd.x86_64.json ]; then GPU=cpu; WHY=\"no NVK driver in the proton package\"\n\
+    else GPU=nvk; WHY=\"render node /dev/dri/renderD128 present\"; fi\n\
+else\n\
+    WHY=\"--$GPU given\"\n\
 fi\n\
 if [ \"$GPU\" = nvk ]; then MODE=--dxvk; export FOSSAI_VULKAN=nvk; fi\n\
 if [ \"$GPU\" = cpu ] && [ -z \"$MODE\" ]; then export FOSSAI_VULKAN=lvp; fi\n\
@@ -113,7 +119,21 @@ A=()\n\
 [ -n \"$SIZE\" ] && A+=(\"--desktop=$SIZE\")\n\
 R=dxvk; [ -z \"$MODE\" ] && R=wined3d; [ \"$GPU\" = nvk ] && R=dxvk-nvk\n\
 [ -n \"$BENCH\" ] && A+=(\"--bench=$BENCH,tmnf $R ${SIZE:-native}\")\n\
+klog \"tmnf: renderer $R ($WHY), Vulkan ${FOSSAI_VULKAN:-auto}, size ${SIZE:-native}\"\n\
 echo \"tmnf: starting TmForever.exe ($R, ${SIZE:-native size})\"\n\
+# NVK выбран сам (не `--nvk`) и игра вышла с ошибкой за первые 20 с (DXVK\n\
+# не создал устройство) - ещё раз на процессоре, с причиной в журнале.\n\
+if [ \"$WHY\" = \"render node /dev/dri/renderD128 present\" ] && [ -z \"$BENCH\" ] && [ -z \"$TMNF_NO_FALLBACK\" ]; then\n\
+    t=$SECONDS\n\
+    /opt/debian/bin/bash $P \"${VS[@]}\" \"${A[@]}\" \"$@\" $MODE \"$G/TmForever.exe\"\n\
+    rc=$?\n\
+    if [ $rc -ne 0 ] && [ $((SECONDS - t)) -lt 20 ]; then\n\
+        klog \"tmnf: DXVK on NVK exited with $rc after $((SECONDS - t)) s - falling back to the CPU (wined3d on llvmpipe)\"\n\
+        export FOSSAI_VULKAN=lvp; unset DXVK_HUD\n\
+        exec /opt/debian/bin/bash $P \"${VS[@]}\" \"${A[@]}\" \"$@\" \"$G/TmForever.exe\"\n\
+    fi\n\
+    exit $rc\n\
+fi\n\
 exec /opt/debian/bin/bash $P \"${VS[@]}\" \"${A[@]}\" \"$@\" $MODE \"$G/TmForever.exe\"\n";
 
 /// Собрать пакет.

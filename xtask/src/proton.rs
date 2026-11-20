@@ -481,6 +481,8 @@ pub fn build(arch: Arch) -> Result<()> {
         # GE-Proton (12.11.2026): программы и игры Windows без Steam, окна —\n\
         # через сервер Wayland ядра, синхронизация — fsync (futex_waitv).\n\
         P=/opt/proton\n\
+        # Как пришли (21.11): для передачи TmForever.exe сценарию `tmnf`.\n\
+        FP_WINEDEBUG=$WINEDEBUG; FP_DLLOV=$WINEDLLOVERRIDES\n\
         # Своя glibc (2.41) первой: модули GE собраны под 2.38+.\n\
         export LD_LIBRARY_PATH=$P/glibc:$P/lib/x86_64-linux-gnu:$P/lib\n\
         export WINEDLLPATH=$P/lib/vkd3d:$P/lib/wine\n\
@@ -617,6 +619,24 @@ done
 # Путь от стола (P12): ядро делит строку запуска по пробелам и кавычек не
 # знает, поэтому путь приходит с `%20` (и `%25` вместо `%`).
 unpct() { local e=${1//\%/\\x}; printf -v U '%b' "$e"; }
+# Строка и в журнал ядра (21.11): со стола у программы нет терминала.
+klog() { echo "$1"; [ -w /dev/kmsg ] && echo "$1" > /dev/kmsg; }
+# Установленная TMNF (`ПРЕФИКС/drive_c/TmNationsForever/TmForever.exe`) из
+# «Файлов» или ярлыка «Пуска» (winemenubuilder установщика) - тем же путём,
+# что пункт пакета `tmnf`: его сценарий выбирает видеокарту (DXVK на NVK)
+# или процессор. До 21.11 ярлык шёл через `start` на wined3d - на процессоре.
+tmnf_handoff() {
+    local f=$1; shift
+    case "${f,,}" in */drive_c/tmnationsforever/tmforever.exe) ;; *) return 0 ;; esac
+    [ -f /opt/tmnf/bin/tmnf ] || return 0
+    export WINEPREFIX=${f%/drive_c/*}
+    klog "fossai-proton: $f -> /opt/tmnf/bin/tmnf (prefix $WINEPREFIX)"
+    export WINEDEBUG=$FP_WINEDEBUG WINEDLLOVERRIDES=$FP_DLLOV
+    [ -z "$WINEDEBUG" ] && unset WINEDEBUG
+    [ -z "$WINEDLLOVERRIDES" ] && unset WINEDLLOVERRIDES
+    unset VK_DRIVER_FILES VK_ICD_FILENAMES
+    exec /opt/debian/bin/bash /opt/tmnf/bin/tmnf "$@"
+}
 # `--open=ФАЙЛ` - двойной щелчок по .exe/.msi/.lnk/.bat в «Файлах»: в общем
 # префиксе (`$WINEPREFIX`, по умолчанию ~/.proton), из каталога файла.
 # `--shortcut=ФАЙЛ.desktop` - пункт «Пуска» из ярлыка, который
@@ -625,6 +645,7 @@ unpct() { local e=${1//\%/\\x}; printf -v U '%b' "$e"; }
 case "$1" in
     --open=*)
         unpct "${1#--open=}"; f=$U; shift
+        tmnf_handoff "$f" "$@"
         cd "${f%/*}" 2>/dev/null
         case "${f,,}" in
             *.msi) set -- msiexec /i "$f" "$@" ;;
@@ -635,7 +656,9 @@ case "$1" in
             # vkd3d-proton, как в Proton (20.11); без неё - wined3d, как было.
             *) if [ -e /dev/dri/renderD128 ]; then set -- --dxvk "$f" "$@"; else set -- "$f" "$@"; fi ;;
         esac
-        echo "fossai-proton: open $f" ;;
+        r=Wine; [ -e /dev/dri/renderD128 ] || r="Wine (no GPU node: wined3d on the CPU)"; [ "$1" = --dxvk ] && r="DXVK/vkd3d-proton (GPU node present)"
+        case "$1" in --d2r=*) r="D2R launcher" ;; esac
+        klog "fossai-proton: open $f via $r" ;;
     --shortcut=*)
         unpct "${1#--shortcut=}"; f=$U; shift
         export WINEPREFIX=${f%/drive_c/proton_shortcuts/*}
@@ -655,8 +678,13 @@ case "$1" in
             else u+=${x:i:1}; i=$((i + 1)); fi
         done
         [ -n "$w" ] && cd "$w" 2>/dev/null
-        echo "fossai-proton: shortcut $f -> $u (prefix $WINEPREFIX)"
-        set -- start /wait /unix "$u" "$@" ;;
+        klog "fossai-proton: shortcut $f -> $u (prefix $WINEPREFIX)"
+        tmnf_handoff "$u" "$@"
+        # Ярлык .exe при узле видеокарты - через DXVK/vkd3d-proton, как `--open`.
+        case "${u,,}" in
+            *.exe) if [ -e /dev/dri/renderD128 ]; then set -- --dxvk start /wait /unix "$u" "$@"; else set -- start /wait /unix "$u" "$@"; fi ;;
+            *) set -- start /wait /unix "$u" "$@" ;;
+        esac ;;
 esac
 # `--d2r[=КАТАЛОГ|=ПУТЬ.exe] [КЛЮЧИ ИГРЫ]` (20.11) - Diablo II Resurrected
 # (Direct3D 12): без пути - первый D2R.exe в /usb../D2RLAN и /usb../*
@@ -824,7 +852,7 @@ if [ -z "$B" ]; then
     case ,$WINEDEBUG, in *,+fps,*) [ -e /dev/kmsg ] || exec $W "$@" ;; *) exec $W "$@" ;; esac
     p=${1##*/}; p=${p##*\\}; [ "$p" = explorer ] && { p=${3##*/}; p=${p##*\\}; }
     $W "$@" 2>&1 | {
-        n=0; sum=0; lo=; hi=0; t=$SECONDS
+        n=0; sum=0; lo=; hi=0; t=$SECONDS; k=0
         while IFS= read -r line; do
             case $line in
                 *'trace:fps:'*'approx '*)
@@ -835,7 +863,17 @@ if [ -z "$B" ]; then
                     n=$((n + 1)); sum=$((sum + c))
                     if [ -z "$lo" ] || [ $c -lt $lo ]; then lo=$c; fi
                     [ $c -gt $hi ] && hi=$c ;;
-                *) printf '%s\n' "$line" >&2 ;;
+                *)
+                    printf '%s\n' "$line" >&2
+                    # Главное из журналов DXVK и vkd3d-proton (21.11) - и в журнал
+                    # ядра (не больше 200 строк за запуск): выбранная видеокарта,
+                    # режим показа, ошибки. Полные журналы - $DXVK_LOG_PATH.
+                    if [ $k -lt 200 ]; then
+                        case $line in
+                            *'DXVK: v'*|*'Found device:'*|*'Present mode:'*|*'Buffer size:'*|*'vkd3d-proton - build'*|err:*|*':err:'*|*'DEVICE_LOST'*|*'DXVK: Failed'*)
+                                k=$((k + 1)); printf 'proton: %s: %.300s\n' "$p" "$line" > /dev/kmsg ;;
+                        esac
+                    fi ;;
             esac
             if [ $n -gt 0 ] && [ $((SECONDS - t)) -ge 5 ]; then
                 a=$((sum / n))
