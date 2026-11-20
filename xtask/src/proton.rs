@@ -525,6 +525,8 @@ pub fn build(arch: Arch) -> Result<()> {
         # NVK (18.11.2026): есть узел nouveau ядра /dev/dri/renderD128 - оба\n\
         # драйвера, NVK первым (DXVK берёт дискретную видеокарту, lavapipe -\n\
         # запасной); FOSSAI_VULKAN=lvp - только lavapipe, =nvk - только NVK.\n\
+        # `--nvk` / `--lvp` первым ключом (20.11) - то же, что FOSSAI_VULKAN=nvk|lvp.\n\
+        case \"$1\" in --nvk) FOSSAI_VULKAN=nvk; shift ;; --lvp) FOSSAI_VULKAN=lvp; shift ;; esac\n\
         V=$P/share/vulkan/icd.d\n\
         case \"${FOSSAI_VULKAN:-auto}\" in\n\
         \tlvp) export VK_DRIVER_FILES=$V/lvp_icd.x86_64.json ;;\n\
@@ -540,6 +542,25 @@ pub fn build(arch: Arch) -> Result<()> {
         # `run` оболочки окружения нет (WAYLAND_DEBUG=client и подобные).\n\
         while case \"$1\" in --env=*) true ;; *) false ;; esac; do export \"${1#--env=}\"; shift; done\n\
         case \"$1\" in --debug=*) export WINEDEBUG=\"${1#--debug=}\"; shift ;; esac\n", r#"
+# `--vsync on|off` (D7, 21.11.2026) - только по просьбе пользователя: без
+# ключа вертикальную синхронизацию решает игра (её настройка), как в Windows.
+# Сервер Wayland держит темп монитора только для VSync (Vulkan FIFO); с
+# выключенной кадры не ждут монитора (MAILBOX/IMMEDIATE), и игра рисует
+# столько, сколько успевает видеокарта. Ключ переопределяет игру: DXVK
+# `dxgi.syncInterval` (Direct3D 10-12, d3d12 vkd3d-proton - через dxgi DXVK)
+# и `d3d9.presentInterval`, Vulkan Mesa `MESA_VK_WSI_PRESENT_MODE`, OpenGL
+# (wined3d через EGL Mesa) - `vblank_mode`. Режим, выбранный DXVK, - строка
+# `Present mode:` его журнала.
+while case "$1" in --vsync|--vsync=*) true ;; *) false ;; esac; do
+    if [ "$1" = --vsync ]; then VS=$2; shift 2; else VS=${1#--vsync=}; shift; fi
+    case $VS in
+        off|0) i=0; export MESA_VK_WSI_PRESENT_MODE=immediate vblank_mode=0 ;;
+        on|1) i=1; export MESA_VK_WSI_PRESENT_MODE=fifo vblank_mode=3 ;;
+        *) echo "fossai-proton: --vsync on|off, not '$VS' - left to the game"; continue ;;
+    esac
+    export DXVK_CONFIG="${DXVK_CONFIG:+$DXVK_CONFIG; }dxgi.syncInterval = $i; d3d9.presentInterval = $i"
+    echo "fossai-proton: vsync $VS (DXVK_CONFIG=$DXVK_CONFIG)"
+done
 # Кеши шейдеров (P3, 18.11): первый запуск игры - чёрное окно, пока LLVM
 # лавапайпа/llvmpipe компилирует шейдеры. Mesa 25.0.7 кладёт готовый машинный
 # код llvmpipe и lavapipe в дисковый кеш (`get_disk_shader_cache`, база
@@ -555,7 +576,9 @@ export MESA_SHADER_CACHE_MAX_SIZE=${MESA_SHADER_CACHE_MAX_SIZE:-1G}
 export DXVK_SHADER_CACHE_PATH=${DXVK_SHADER_CACHE_PATH:-$C/dxvk}
 export DXVK_STATE_CACHE_PATH=${DXVK_STATE_CACHE_PATH:-$C/dxvk}
 export DXVK_LOG_PATH=${DXVK_LOG_PATH:-$C/log}
-LD_LIBRARY_PATH= mkdir -p "$MESA_SHADER_CACHE_DIR" "$DXVK_SHADER_CACHE_PATH" "$DXVK_LOG_PATH"
+# Кеш конвейеров vkd3d-proton (Direct3D 12, 20.11) - туда же.
+export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$C/vkd3d}
+LD_LIBRARY_PATH= mkdir -p "$MESA_SHADER_CACHE_DIR" "$DXVK_SHADER_CACHE_PATH" "$DXVK_LOG_PATH" "$VKD3D_SHADER_CACHE_PATH"
 # Потоки рисования llvmpipe/lavapipe (P3/P9): без переменной Mesa берёт все
 # ЦП (16 на Ryzen 8 ядер/16 потоков), и каждый кадр будит 16 потоков через
 # futex. По умолчанию - физические ядра: `cpu cores` из /proc/cpuinfo, если
@@ -580,11 +603,14 @@ fi
 # `--bench=СЕКУНДЫ[,ПОДПИСЬ]` (P1) - замер: строки кадров Wine (`+fps`:
 # wined3d и Vulkan/DXVK через win32u) или d3dprobe собираются, и через
 # СЕКУНДЫ в журнал уходит `bench: ПОДПИСЬ avg N fps ...`, программа снимается.
-D=; B=; R=wined3d
+# `--drive=F:=/usb1` или `--drive F:=Z7S` (20.11) - своя буква тому, см. drives().
+D=; B=; R=wined3d; DRV=()
 while :; do
     case "$1" in
         --desktop=*) D=${1#--desktop=}; shift ;;
         --bench=*) B=${1#--bench=}; shift ;;
+        --drive=*) DRV+=("${1#--drive=}"); shift ;;
+        --drive) DRV+=("$2"); shift 2 ;;
         *) break ;;
     esac
 done
@@ -603,7 +629,11 @@ case "$1" in
         case "${f,,}" in
             *.msi) set -- msiexec /i "$f" "$@" ;;
             *.lnk|*.bat|*.cmd) set -- start /wait /unix "$f" "$@" ;;
-            *) set -- "$f" "$@" ;;
+            # Diablo II Resurrected - как `--d2r` (20.11).
+            */d2r.exe) set -- --d2r="${f//%/%25}" "$@" ;;
+            # Есть видеокарта (узел NVK) - Direct3D 8-12 через DXVK и
+            # vkd3d-proton, как в Proton (20.11); без неё - wined3d, как было.
+            *) if [ -e /dev/dri/renderD128 ]; then set -- --dxvk "$f" "$@"; else set -- "$f" "$@"; fi ;;
         esac
         echo "fossai-proton: open $f" ;;
     --shortcut=*)
@@ -627,6 +657,38 @@ case "$1" in
         [ -n "$w" ] && cd "$w" 2>/dev/null
         echo "fossai-proton: shortcut $f -> $u (prefix $WINEPREFIX)"
         set -- start /wait /unix "$u" "$@" ;;
+esac
+# `--d2r[=КАТАЛОГ|=ПУТЬ.exe] [КЛЮЧИ ИГРЫ]` (20.11) - Diablo II Resurrected
+# (Direct3D 12): без пути - первый D2R.exe в /usb../D2RLAN и /usb../*
+# (/usb, /usb1-4), /data/*, ~/*. Из каталога игры, через DXVK (dxgi) и vkd3d-proton (d3d12) на Vulkan
+# (NVK первым, если есть узел видеокарты), fps - в журнал (`+fps`). Без
+# своих ключей игре дан `-launch`: без него D2R.exe отдаёт запуск
+# Battle.net и выходит.
+case "$1" in
+    --d2r|--d2r=*)
+        g=; [ "$1" != --d2r ] && { unpct "${1#--d2r=}"; g=$U; }
+        shift
+        shopt -s nocaseglob
+        if [ -z "$g" ]; then
+            # `[e]`: без знаков шаблона nocaseglob имя не сравнивает. Тома -
+            # списком: точек монтирования в каталоге `/` нет, `/usb*` их не
+            # находил (QEMU, 20.11).
+            for v in /usb /usb1 /usb2 /usb3 /usb4 /data "$HOME"; do
+                for g in "$v"/D2RLA[N]/D2R.ex[e] "$v"/*/D2R.ex[e]; do [ -f "$g" ] && break 2; done
+            done
+        elif [ -d "$g" ]; then
+            for g in "${g%/}"/D2R.ex[e]; do break; done
+        fi
+        shopt -u nocaseglob
+        if [ ! -f "$g" ]; then
+            echo "fossai-proton: D2R.exe not found (${g:-no path}) - give the folder: --d2r=/usb1/D2RLAN"
+            exit 1
+        fi
+        cd "${g%/*}"
+        [ $# -eq 0 ] && set -- -launch
+        case ,$WINEDEBUG, in *,+fps,*) ;; *) export WINEDEBUG="${WINEDEBUG:+$WINEDEBUG,}+fps" ;; esac
+        echo "fossai-proton: D2R $g $* (DXVK + vkd3d-proton, Vulkan ${FOSSAI_VULKAN:-auto})"
+        set -- --dxvk "$g" "$@" ;;
 esac
 "#, "\
         # `--run=ПРОГРАММА` - проба из bin/ пакета (es2gears_wayland, vkcube) с\n\
@@ -666,15 +728,86 @@ esac
                     $P/lib/wine/x86_64-unix/wine wineboot -i\n\
                     $P/bin/wineserver -w\n\
                 fi\n\
-            fi ;; esac\n\
+            fi ;; esac\n", r#"
+# Буквы дисков (20.11): каждый подключённый том (/usb1.., /usb, /data,
+# /mnt/*, /media/*) - своя буква в ПРЕФИКС/dosdevices, чтобы пути вида
+# F:\D2RLAN работали. Тома и метки - из /proc/mounts ядра (устройство
+# `/dev/disk/by-label/МЕТКА`). Буква закрепляется за меткой (без метки - за
+# точкой) в ПРЕФИКС/fossai-drives и в следующий раз та же; новому тому -
+# первая свободная с D: (живая флешка /usb - последней). Свои буквы: файл
+# ~/.config/fossai-proton/drives (строки `F: Z7S` или `F: /usb1`, `#` -
+# заметка) или ключ `--drive=F:=/usb1` (`--drive F:=Z7S`) - запоминаются.
+pin() {
+    local l=${1%%:*}; l=${l,,}
+    case $l in [d-y]) ;; *) echo "fossai-proton: drive letter '$1' ignored (only D: to Y:)"; return ;; esac
+    [ -n "${kl[$l]}" ] && unset "lk[${kl[$l]}]"
+    [ -n "${lk[$2]}" ] && unset "kl[${lk[$2]}]"
+    lk[$2]=$l; kl[$l]=$2
+}
+drives() {
+    local dd=$WINEPREFIX/dosdevices map=$WINEPREFIX/fossai-drives cfg=$HOME/.config/fossai-proton/drives
+    [ -d "$dd" ] || return 0
+    declare -gA lk=() kl=()
+    local -a keys=() points=() order=()
+    local dev mnt t o r k l p i old=
+    if [ -f "$map" ]; then
+        while IFS=$'\t' read -r l k; do [ -n "$k" ] && { pin "$l" "$k"; old+=" $l"; }; done < "$map"
+    fi
+    if [ -f "$cfg" ]; then
+        while read -r l k; do
+            case $l in ''|'#'*) continue ;; *=*) k=${l#*=}; l=${l%%=*} ;; esac
+            [ -n "$k" ] && pin "$l" "$k"
+        done < "$cfg"
+    fi
+    for i in "${DRV[@]}"; do pin "${i%%=*}" "${i#*=}"; done
+    if [ -r /proc/mounts ]; then
+        while read -r dev mnt t o r; do
+            mnt=${mnt//\\040/ }
+            case $mnt in /usb|/usb[0-9]*|/data|/data[0-9]*|/mnt/?*|/media/?*) ;; *) continue ;; esac
+            k=$mnt
+            case $dev in /dev/disk/by-label/?*) k=${dev#/dev/disk/by-label/}; k=${k//\\040/ } ;; esac
+            # Та же метка у второго тома - ключ по точке.
+            for p in "${keys[@]}"; do [ "$p" = "$k" ] && k=$mnt; done
+            keys+=("$k"); points+=("$mnt")
+        done < /proc/mounts
+    else
+        for mnt in /usb1 /usb2 /usb3 /usb4 /usb /data; do [ -d "$mnt" ] && { keys+=("$mnt"); points+=("$mnt"); }; done
+    fi
+    for i in "${!points[@]}"; do [ "${points[i]}" != /usb ] && order+=("$i"); done
+    for i in "${!points[@]}"; do [ "${points[i]}" = /usb ] && order+=("$i"); done
+    for i in "${order[@]}"; do
+        k=${keys[i]}; p=${points[i]}
+        l=${lk[$k]}
+        # Свой файл может назвать том точкой (`F: /usb1`).
+        if [ -z "$l" ] && [ "$k" != "$p" ] && [ -n "${lk[$p]}" ]; then l=${lk[$p]}; pin "$l" "$k"; fi
+        if [ -z "$l" ]; then
+            for l in d e f g h i j k l m n o p q r s t u v w x y; do
+                [ -z "${kl[$l]}" ] && [ ! -e "$dd/$l:" ] && [ ! -L "$dd/$l:" ] && break
+                l=
+            done
+            [ -z "$l" ] && { echo "fossai-proton: no free drive letter for $p"; continue; }
+            pin "$l" "$k"
+        fi
+        LD_LIBRARY_PATH= ln -sfn "$p" "$dd/$l:"
+        if [ "$k" = "$p" ]; then echo "fossai-proton: drive ${l^^}: = $p"; else echo "fossai-proton: drive ${l^^}: = $p ($k)"; fi
+    done
+    # Свои старые буквы, отданные другим (`--drive`, файл), - убрать.
+    for l in $old; do [ -z "${kl[$l]}" ] && [ -L "$dd/$l:" ] && LD_LIBRARY_PATH= rm -f "$dd/$l:"; done
+    : > "$map"
+    for k in "${!lk[@]}"; do printf '%s\t%s\n' "${lk[$k]}" "$k" >> "$map"; done
+}
+case "$1" in --server-debug=*) ;; *) drives ;; esac
+"#, "\
         # `--prefix` - только приготовить префикс (`bin/tmnf`).\n\
         case \"$1\" in --prefix) exit 0 ;; esac\n\
+        # С 20.11 и Direct3D 12 - vkd3d-proton (`d3d12`, `d3d12core`), как в\n\
+        # Proton: его d3d12 показывает кадры через dxgi DXVK.\n\
         case \"$1\" in --dxvk) shift; R=dxvk\n\
             s=\"$WINEPREFIX/drive_c/windows\"\n\
             # `cp` Debian - со своей glibc, без нашего LD_LIBRARY_PATH (2.41).\n\
-            LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/x86_64-windows/*.dll \"$s/system32/\"\n\
-            [ -d \"$s/syswow64\" ] && LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/i386-windows/*.dll \"$s/syswow64/\"\n\
-            export WINEDLLOVERRIDES=\"d3d8,d3d9,d3d10core,d3d11,dxgi=n;$WINEDLLOVERRIDES\" ;; esac\n\
+            LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/x86_64-windows/*.dll $P/lib/wine/vkd3d-proton/x86_64-windows/*.dll \"$s/system32/\"\n\
+            [ -d \"$s/syswow64\" ] && LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/i386-windows/*.dll $P/lib/wine/vkd3d-proton/i386-windows/*.dll \"$s/syswow64/\"\n\
+            export WINEDLLOVERRIDES=\"d3d8,d3d9,d3d10core,d3d11,d3d12,d3d12core,dxgi=n;$WINEDLLOVERRIDES\" ;; esac\n\
         [ $# -eq 0 ] && set -- notepad\n\
         # Загрузчик архитектуры напрямую: `bin/wine` GE ищет `ntdll.so` в\n\
         # `lib/wine/`, а не в `lib/wine/x86_64-unix/` (12.11).\n\
@@ -826,7 +959,7 @@ $W "$@" 2>&1 | {
     Ok(())
 }
 
-/// `bin/fossai-gametest [vk|d3d|tmnf|all]` (20.11.2026): пользовательская
+/// `bin/fossai-gametest [vk|d3d|d3d12|tmnf|all]` (20.11.2026): пользовательская
 /// часть `gpu gametest` — всё на NVK (видеокарта через GSP-RM), по ступени на
 /// строку `gametest: PASS|FAIL имя за N мс`, в конце `gametest: summary`.
 /// Ядро запускает её с выводом в канал и переписывает строки в свой журнал
@@ -885,6 +1018,25 @@ if [ -n "$VKFAIL" ] && [ "$WHAT" = all ]; then
     say "vkprobe failed - skipping d3d9-dxvk-nvk and tmnf-nvk (the log above has the NVK ioctl trace)"
     WHAT=none
 fi
+case $WHAT in present)
+    # Режимы показа (D7, 21.11.2026; не входит в `all`): vkcube с
+    # --present_mode 0 IMMEDIATE / 1 MAILBOX / 2 FIFO на lavapipe и NVK, затем
+    # d3dprobe (Direct3D 9 через DXVK на NVK) с VSync off и on. Ожидается: без
+    # VSync к/с выше частоты монитора (сколько успевает рисовать), с ней -
+    # около частоты (60 в QEMU). IMMEDIATE есть только при
+    # wp_tearing_control_v1 сервера - не выбрался - FAIL ступени.
+    for drv in lvp nvk; do
+        for m in 0 1 2; do
+            t=$(now)
+            if step vkcube-$drv-mode$m 180 $B $P --$drv --run=vkcube --wsi wayland --present_mode $m --c 600; then
+                ms=$(( $(now) - t )); [ $ms -gt 0 ] && say "present: vkcube $drv mode $m: 600 frames in $ms ms = $(( 600000 / ms )) fps (with start-up)"
+            fi
+        done
+    done
+    for vs in off on; do
+        step d3d9-vsync-$vs 600 $B $P --vsync $vs --bench=20,d3dprobe9-vsync-$vs --dxvk $X 9 20
+    done ;;
+esac
 case $WHAT in all|d3d)
     # 4. Direct3D 9 (как у TMNF) через DXVK на NVK: 20 с кадров, замер.
     step d3d9-dxvk-nvk 600 $B $P $NVK --bench=20,d3dprobe9-dxvk-nvk --dxvk $X 9 20 ;;
@@ -896,6 +1048,12 @@ case $WHAT in all|tmnf)
     else
         say "tmnf: package not installed - skipped"
     fi ;;
+esac
+case $WHAT in all|d3d12)
+    # 6. Direct3D 12 (как у Diablo II Resurrected) через vkd3d-proton и dxgi
+    # DXVK на NVK: очистка и показ, заборы ID3D12Fence - timeline-семафоры
+    # (SYNCOBJ_TIMELINE_*). Последней: зависание vkd3d не мешает TMNF.
+    step d3d12-vkd3d-nvk 600 $B $P $NVK --bench=20,d3dprobe12-vkd3d-nvk --dxvk $X 12 20 ;;
 esac
 say "summary: $pass passed, $fail failed${names:+ ($names )}"
 "#;

@@ -195,7 +195,7 @@ fn directory(path: &str) -> Option<Vec<(String, NodeKind)>> {
     let file = |name: &str| (String::from(name), NodeKind::File);
     let dir = |name: &str| (String::from(name), NodeKind::Directory);
     match path {
-        "/proc" => Some(alloc::vec![dir("self"), dir("net"), file("cpuinfo"), file("meminfo"), file("version")]),
+        "/proc" => Some(alloc::vec![dir("self"), dir("net"), file("cpuinfo"), file("meminfo"), file("mounts"), file("version")]),
         "/proc/self" | "/proc/thread-self" => Some(alloc::vec![
             file("maps"),
             file("status"),
@@ -270,6 +270,7 @@ fn text(path: &str) -> Option<String> {
             }
             "cmdline" => Some(format!("{name}\0")),
             "comm" => Some(format!("{short}\n")),
+            "mounts" => Some(mounts_text()),
             _ => None,
         };
     }
@@ -301,6 +302,7 @@ fn text(path: &str) -> Option<String> {
         // `getpwuid` glibc получал `EACCES`, и .NET (`dotnet new`) крутил
         // попытки узнать домашний каталог. Здесь — без отпечатков, для всех.
         "/etc/passwd" | "/etc/group" => Some(accounts_text(path == "/etc/group")),
+        "/proc/mounts" => Some(mounts_text()),
         "/proc/version" => Some(String::from("Linux version 6.1.0-fossai (FossAi) #1 SMP\n")),
         "/proc/sys/kernel/osrelease" => Some(String::from("6.1.0-fossai\n")),
         // Пределы `inotify` (31.10): `fsnotifier` Rider читает предел
@@ -314,6 +316,24 @@ fn text(path: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `/proc/mounts` (20.11.2026): тома в формате Linux (`устройство точка тип
+/// права 0 0`, пробелы — `\040`). Устройство — `/dev/disk/by-label/МЕТКА`, если
+/// у тома есть метка (`Z7S` у exFAT-диска Романа), иначе имя файловой системы:
+/// по метке `fossai-proton` закрепляет за томом букву диска Wine.
+fn mounts_text() -> String {
+    let esc = |s: &str| s.replace('\\', "\\134").replace(' ', "\\040").replace('\t', "\\011").replace('\n', "\\012");
+    let mut out = String::new();
+    for (point, kind, _, label) in crate::fs::mounted_space() {
+        let point = if point.is_empty() { "/" } else { point };
+        let device = match label.filter(|label| !label.trim().is_empty()) {
+            Some(label) => format!("/dev/disk/by-label/{}", esc(label.trim())),
+            None => String::from(kind),
+        };
+        out.push_str(&format!("{device} {} {kind} rw 0 0\n", esc(point)));
+    }
+    out
 }
 
 /// `/etc/passwd` (или `/etc/group`) Linux из учётных записей системы: `root`

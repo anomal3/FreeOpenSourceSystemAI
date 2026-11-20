@@ -14954,6 +14954,92 @@ volume» — драйвера exFAT не было. UAS не нужен.
   много мелких записей медленнее, чем могли бы. UAS не сделан (не
   понадобился).
 
+## Diablo II Resurrected через Proton на RTX 3060 (20.11, D6) — **готово к пробе на железе**
+
+Игра — на USB SSD Романа (exFAT, метка `Z7S`, в Windows `F:\D2RLAN`; у нас
+`/usb1/D2RLAN`, живая флешка — `/usb`). D2R рисует через **Direct3D 12**.
+
+- **Буквы дисков Wine** (`fossai-proton`, функция `drives`): при каждом запуске
+  все подключённые тома (`/usb*`, `/data*`, `/mnt/*`, `/media/*`) получают
+  букву в `ПРЕФИКС/dosdevices`. Тома и метки ядро отдаёт в новом
+  `/proc/mounts` (`linux/special.rs`: `/dev/disk/by-label/Z7S /usb1 exfat rw 0 0`).
+  Буква закрепляется за **меткой** (без метки — за точкой) в
+  `ПРЕФИКС/fossai-drives`: диск получает ту же букву, даже если в другой раз
+  станет `/usb2`. Новому тому — первая свободная с `D:` (живая флешка —
+  последней). Своя буква: `~/.config/fossai-proton/drives` (строки `F: Z7S`
+  или `F: /usb1`) или ключ `--drive=F:=Z7S` (запоминается). Wine берёт самую
+  длинную подходящую букву, так что `/usb1/D2RLAN/D2R.exe` для игры —
+  `F:\D2RLAN\D2R.exe`, а не `Z:\usb1\…`.
+- **Direct3D 12**: в пакете `proton-11` уже лежит vkd3d-proton GE-Proton11-12
+  (`lib/wine/vkd3d-proton`, сборка 8293130eb, `d3d12.dll` + `d3d12core.dll`) и
+  DXVK v3.1.1-174. `--dxvk` теперь кладёт в префикс и vkd3d-proton
+  (`d3d12,d3d12core=n`, как Proton: его d3d12 показывает кадры через dxgi DXVK);
+  кеш конвейеров — `~/.cache/fossai-proton/vkd3d`. `--nvk`/`--lvp` первым
+  ключом — то же, что `FOSSAI_VULKAN=nvk|lvp`.
+- **Двойной щелчок по .exe** в «Файлах» (`--open=`) от пути не зависит —
+  `/usb1/…` работает так же. С 20.11: `D2R.exe` уходит в `--d2r`; любой
+  другой .exe при узле видеокарты (`/dev/dri/renderD128`) идёт через
+  DXVK+vkd3d-proton (как Proton), без узла — wined3d, как было.
+- **`fossai-proton --d2r[=КАТАЛОГ] [ключи игры]`**: ищет `D2R.exe` (без учёта
+  регистра) в `/usb*/D2RLAN`, `/usb*/*`, `/data/*`, `~/*`; запускает из
+  каталога игры через DXVK+vkd3d-proton, `+fps` (fps — строками `fps:` в
+  журнал). Без своих ключей даёт `-launch` (без него D2R.exe отдаёт запуск
+  Battle.net и выходит).
+- **NVK и vkd3d-proton** (Mesa 25.0.7 в пакете): требования vkd3d-proton —
+  Vulkan 1.3, descriptor indexing (≥1M update-after-bind), `VK_EXT_robustness2`,
+  `VK_KHR_push_descriptor`, `samplerMirrorClampToEdge`, `shaderDrawParameters`;
+  желательно `VK_EXT_mutable_descriptor_type`, `VK_EXT_image_view_min_lod`,
+  `VK_EXT_descriptor_buffer` (не обязательно). NVK в Mesa 25.0 — Vulkan 1.4
+  (Collabora: «большая часть того, что нужно VKD3D-Proton»), DXVK-вики: с 25.0
+  «большинство игр идёт на NVK, тяжёлые — медленно». Синхронизация: заборы
+  D3D12 — timeline-семафоры → у NVK `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT/QUERY/
+  TRANSFER/TIMELINE_SIGNAL` — **все уже есть** (`linux/drm/sync.rs`, WP-C,
+  `DRM_CAP_SYNCOBJ_TIMELINE` = 1); `SYNCOBJ_EVENTFD` — `EOPNOTSUPP` (Mesa 25.0
+  его не зовёт). Ожидание — опрос раз в 1 мс (прерываний нет).
+- **Проба D3D12**: `d3dprobe.exe 12 [секунды] [ШxВ]` — устройство, очередь,
+  цепочка FLIP_DISCARD на 2 буфера, переходы ресурсов, очистка, `Present`,
+  `ID3D12Fence` с событием. На Windows ПК (RTX 3060, родной D3D12): 180 fps,
+  уровень привязки ресурсов 3. `gpu gametest -- d3d12` (и в `all`, последней
+  ступенью) — `d3d12-vkd3d-nvk`: 20 с замера через vkd3d-proton на NVK.
+- **Проверка в QEMU** (`work\g\g-d3d12.ps1`: живая флешка + exFAT-образ Z7S
+  вторым USB-диском), 20.11: `/proc/mounts` отдаёт `/dev/disk/by-label/Z7S /usb
+  exfat`; `fossai-proton` пишет `drive D: = /usb1`, `drive E: = /usb (Z7S)`.
+  D3D12 через vkd3d-proton на **lavapipe** — 39.9 fps 640x480, окно залито
+  (снимок); `--d2r` нашёл `D2R.exe` (копия d3dprobe) на exFAT-томе и запустил
+  его из каталога игры — 49.3 fps; `gpu gametest soft -- d3d12` (NVK поверх
+  SoftGpu): устройство «NVIDIA GeForce RTX 3060 (NVK GA106)», привязка
+  ресурсов tier 3, SM 6.8, `VK_EXT_mutable_descriptor_type` есть, 56.4 fps,
+  `PASS d3d12-vkd3d-nvk` (заборы D3D12 — timeline-syncobj NVK — работают).
+  Двойной щелчок по .exe на `/usb*` в «Файлах» в QEMU не прогонялся (код пути
+  не различает). Первый поиск `--d2r` шаблоном `/usb*` не нашёл ничего:
+  точек монтирования в листинге `/` нет — тома перечисляются списком.
+  DXVK показывает игре видеокарту как AMD (`Hiding actual GPU`, без NVAPI —
+  как Proton): DLSS D2R не предложит.
+
+**Роману — проба D2R (по шагам):**
+1. Загрузить живую флешку с подключённым SSD; в «Файлах» должен быть
+   «Z7S (/usb1)».
+2. Терминал: `gpu gametest` (поднимет видеокарту и NVK; в журнале
+   `gametest: PASS d3d12-vkd3d-nvk` и строка `bench: d3dprobe12-vkd3d-nvk avg …`).
+   Если `d3d12` упал — дальше D2R не пробовать, прислать `G:\FREEOS\LOG.TXT`.
+3. Запуск (одной строкой; `--nvk` — первым ключом, `--drive=F:=Z7S` — буква
+   как в Windows, запоминается, без неё диск получит `D:` — игре всё равно):
+   `run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --nvk --drive=F:=Z7S --d2r=/usb1/D2RLAN`.
+   Потом можно и двойным щелчком по `D2R.exe` в «Файлах». В журнале:
+   `fossai-proton: drive F: = /usb1 (Z7S)`, `fossai-proton: D2R …`, затем
+   строки `fps: D2R.exe …` раз в 5 с.
+4. Первый запуск долгий (vkd3d-proton собирает шейдеры) — подождать пару минут.
+5. Если игра просит лаунчер или сразу выходит — свои ключи после пути
+   (`--d2r=/usb1/D2RLAN -launch -mod ИМЯ -txt`, как в ярлыке Windows) или
+   лаунчер сборки: `fossai-proton --nvk --open=/usb1/D2RLAN/ЛАУНЧЕР.exe`.
+   Кадр меньше экрана: `--desktop=1920x1080` перед `--d2r`.
+6. Прислать LOG.TXT в любом случае (строки `vkd3d`, `err:`, `fps:`).
+
+**TODO**: D2R на NVK не пробовался (игры у стенда нет); первый запуск —
+долгая сборка шейдеров (кеш vkd3d в `~/.cache`, на живой флешке — до
+перезагрузки). Античита у офлайн-сборки нет; Battle.net-проверка в ней,
+если есть, — за пределами Proton.
+
 ## Игры
 
 Роман спросил, потянет ли система игру и нужен ли «подход Proton». Ответ по
