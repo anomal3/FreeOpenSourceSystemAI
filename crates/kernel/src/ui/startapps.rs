@@ -55,16 +55,19 @@ pub struct Folder {
     pub about: &'static str,
 }
 
-pub static FOLDERS: [Folder; 2] = [
+pub static FOLDERS: [Folder; 3] = [
     Folder { key: "folder:utils", caption: "Системные утилиты", about: "калькулятор, блокнот и другие" },
     Folder { key: "folder:sdk", caption: "SDK C#", about: "примеры WinForms и .NET" },
+    // Как «Инструменты Windows» (20.11): журнал, службы, очистка и оба
+    // диспетчера (у них есть и свои кнопки в «Пуске»).
+    Folder { key: "folder:admin", caption: "Средства администрирования", about: "журнал событий, службы, очистка диска" },
 ];
 
 /// Всё, что ставит в «Пуск» сама система. Порядок — порядок клавиатурного
 /// обхода: первые четыре строки («Терминал», «Параметры», «О системе»,
 /// «Файлы») стоят на своих местах с фазы С3 — на них считают нажатия
 /// сценарии стенда.
-pub static ENTRIES: [Entry; 11] = [
+pub static ENTRIES: [Entry; 19] = [
     Entry {
         key: "terminal",
         caption: "Терминал",
@@ -190,10 +193,101 @@ pub static ENTRIES: [Entry; 11] = [
         needs: "/usr/share/dotnet/samples/gallery.dll",
         group: "",
     },
+    // Системные инструменты (фаза П1/П2, 20.11): в «Системные утилиты» —
+    // то, что нужно каждому, в «Средства администрирования» — остальное.
+    Entry {
+        key: "run",
+        caption: "Выполнить",
+        about: "открыть программу, папку или файл по имени (Win+R)",
+        folder: "folder:utils",
+        art: "",
+        icon: Icon::Prompt,
+        launch: Launch::Program("run", ""),
+        needs: "",
+        group: "/bin/run",
+    },
+    Entry {
+        key: "charmap",
+        caption: "Таблица символов",
+        about: "знаки шрифтов системы, копирование",
+        folder: "folder:utils",
+        art: "",
+        icon: Icon::File,
+        launch: Launch::Program("charmap", ""),
+        needs: "",
+        group: "/bin/charmap",
+    },
+    Entry {
+        key: "sysinfo",
+        caption: "Сведения о системе",
+        about: "процессор, память, устройства, диски, сеть",
+        folder: "folder:utils",
+        art: "",
+        icon: Icon::Info,
+        launch: Launch::Program("sysinfo", ""),
+        needs: "",
+        group: "/bin/sysinfo",
+    },
+    Entry {
+        key: "eventlog",
+        caption: "Журнал событий",
+        about: "журнал загрузки и прошлого сбоя",
+        folder: "folder:admin",
+        art: "",
+        icon: Icon::Log,
+        launch: Launch::Program("eventlog", ""),
+        needs: "",
+        group: "/bin/eventlog",
+    },
+    Entry {
+        key: "services",
+        caption: "Службы",
+        about: "службы системы: состояние, перезапуск",
+        folder: "folder:admin",
+        art: "",
+        icon: Icon::Service,
+        launch: Launch::Program("services", ""),
+        needs: "",
+        group: "/bin/services",
+    },
+    Entry {
+        key: "cleanmgr",
+        caption: "Очистка диска",
+        about: "временные файлы, корзина, кэши",
+        folder: "folder:admin",
+        art: "",
+        icon: Icon::Disk,
+        launch: Launch::Program("cleanmgr", ""),
+        needs: "",
+        group: "/bin/cleanmgr",
+    },
+    // Оба диспетчера — ещё и в папке (их строки верхнего уровня остаются).
+    Entry {
+        key: "admin:taskmgr",
+        caption: "Диспетчер задач",
+        about: "процессы, память и службы",
+        folder: "folder:admin",
+        art: "task-manager",
+        icon: Icon::Chart,
+        launch: Launch::Program("taskmgr", ""),
+        needs: "",
+        group: "/bin/taskmgr",
+    },
+    Entry {
+        key: "admin:devmgr",
+        caption: "Диспетчер устройств",
+        about: "устройства и их драйверы",
+        folder: "folder:admin",
+        art: "device-manager",
+        icon: Icon::Devices,
+        launch: Launch::Program("devmgr", ""),
+        needs: "",
+        group: "/bin/devmgr",
+    },
 ];
 
 /// Закреплённое в «Пуске», пока человек ничего не менял.
-pub static DEFAULT_PINS: [&str; 7] = ["terminal", "settings", "about", "files", "taskmgr", "folder:utils", "folder:sdk"];
+pub static DEFAULT_PINS: [&str; 8] = ["terminal", "settings", "about", "files", "taskmgr", "folder:utils", "folder:admin", "folder:sdk"];
 
 /// Закреплённое на панели задач по умолчанию.
 pub static DEFAULT_TASK_PINS: [&str; 3] = ["files", "terminal", "settings"];
