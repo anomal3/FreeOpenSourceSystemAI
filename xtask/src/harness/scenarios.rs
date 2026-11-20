@@ -8318,6 +8318,27 @@ pub const ALL: &[Scenario] = &[
             Step::Await("heapgrow: 0 failed", 15_000),
             Step::Await("exited with code 0", 15_000),
             Step::Absent("heapgrow: FAILED"),
+            // Ядро пишет в память процесса, пока соседний поток делает `fork`
+            // (20.11.2026, сбой TrackMania: CPU FAULT в `poll`): 300 `fork`
+            // под `poll`/`read`/`clock_gettime` трёх потоков; запись `revents`
+            // в страницу, ставшую «только на чтение», разбирает отказ ядра
+            // (строки `kernel write fault … resolved`) — ни EFAULT, ни сбоя.
+            Step::Line("run /compat/linux/bin/forkpoll"),
+            Step::Await("forkpoll: start", 30_000),
+            // Итог печатается всегда — провал не ждёт полный срок.
+            Step::Await("forkpoll: forks ", 300_000),
+            Step::Await("forkpoll: ok 300 forks while three threads poll/read into the forked pages", 15_000),
+            Step::Await("forkpoll: ok wait4 got every child with status 0", 15_000),
+            Step::Await("forkpoll: ok poll answered every entry ready every time (no EFAULT)", 15_000),
+            Step::Await("forkpoll: ok read and clock_gettime into forked pages never failed", 15_000),
+            Step::Await("forkpoll: ok the children's writes did not reach the parent (copy on write)", 15_000),
+            Step::Await("forkpoll: 0 failed", 15_000),
+            // Гонка действительно случилась: ядро писало в разделённую страницу.
+            Step::AwaitAny("resolved like the program's own", 15_000),
+            Step::Await("exited with code 0", 15_000),
+            Step::Absent("forkpoll: FAILED"),
+            Step::Absent("in the program's memory not resolved"),
+            Step::Absent("switched tasks holding"),
             // P5 плана Proton (18.11.2026): mprotect «запись и исполнение»
             // поверх частного файла и `memfd` под MAP_SHARED (секция Wine),
             // и P10: `copy_file_range`. Право `jit` пробе — `lxjit on`.

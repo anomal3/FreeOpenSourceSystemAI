@@ -709,32 +709,10 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
         return;
     }
 
-    // Ядро пишет в память программы и натыкается на страницу только на чтение
-    // (фаза 71h). Так бывает законно: ядро проверило буфер (`user_can`), а
-    // соседний поток программы между проверкой и записью сделал `fork`, и
-    // страница стала разделённой до копирования (71g). Проверять ещё раз
-    // бесполезно — `fork` идёт параллельно, — поэтому отказ разбирается, как у
-    // самой программы: копия страницы, и запись повторяется. Только запись в
-    // присутствующую страницу окна программы, когда этот процессор не держит ни
-    // одного `SpinLock`; всё остальное, как и прежде, — остановка машины. Флаг
-    // прерываний здесь не признак: вызовы программ Linux входят через `syscall`
-    // и исполняются с запрещёнными прерываниями, но без локов.
-    if vector == VECTOR_PAGE_FAULT
-        && frame.cs & 3 == 0
-        && frame.error & (PF_PRESENT | PF_WRITE) == PF_PRESENT | PF_WRITE
-        && !crate::sync::spin_held()
-        && crate::user::is_running()
-    {
-        let addr = read_cr2();
-        if crate::user::owns(addr, 1) {
-            // Прерывания — как были у прерванного кода.
-            if frame.rflags & 0x200 != 0 {
-                enable();
-            }
-            if crate::user::fault_in(addr, crate::user::Touch::Write, true) {
-                return;
-            }
-        }
+    // Отказ страницы ядра по адресу программы (фаза 71h, переделано
+    // 20.11.2026) — см. [`kernel_user_fault`].
+    if vector == VECTOR_PAGE_FAULT && frame.cs & 3 == 0 && kernel_user_fault(frame) {
+        return;
     }
 
     match vector {
@@ -746,6 +724,159 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
         VECTOR_GENERAL_PROTECTION => general_protection(frame),
         _ => fatal(frame, Fault::Other(u64::from(vector))),
     }
+}
+
+// --- Обращения ядра к памяти программы (20.11.2026) ---------------------------
+//
+// Ядро проверяет буфер программы (`space::user_can`) и потом пишет в него
+// своими правами. Между проверкой и записью соседний поток программы вправе
+// сделать что угодно: `fork` (страница стала разделённой «только на чтение» —
+// сбой TrackMania 20.11: запись `revents` в `linux::poll::wait`), `munmap`,
+// `mprotect`. Проверять ещё раз бесполезно — сосед идёт параллельно. Поэтому,
+// как у Linux, отказ ядра по адресу программы разбирается тем же путём, что
+// отказ самой программы (копия при записи, подкачка, ленивая страница), а
+// неразрешимый — если он пришёл из [`user_copy`] — возвращается ей ответом
+// «не скопировано» (таблица исключений Linux, здесь из одной команды).
+
+global_asm!(
+    ".pushsection .text.uaccess, \"ax\", @progbits",
+    ".balign 16",
+    ".globl fossai_user_copy",
+    ".hidden fossai_user_copy",
+    // RDI — куда, RSI — откуда, RDX — сколько; RAX — сколько НЕ скопировано.
+    // `rep movsb` прерываем и продолжаем: при отказе RCX — остаток, RSI/RDI —
+    // где остановились. DF = 0 у ядра всегда (`cld` в `isr_common`).
+    "fossai_user_copy:",
+    "mov rcx, rdx",
+    ".globl fossai_user_copy_insn",
+    ".hidden fossai_user_copy_insn",
+    "fossai_user_copy_insn:",
+    "rep movsb",
+    "xor eax, eax",
+    "ret",
+    ".globl fossai_user_copy_fixup",
+    ".hidden fossai_user_copy_fixup",
+    "fossai_user_copy_fixup:",
+    "mov rax, rcx",
+    "ret",
+    ".popsection",
+);
+
+unsafe extern "C" {
+    fn fossai_user_copy(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    #[link_name = "fossai_user_copy_insn"]
+    static USER_COPY_INSN: [u8; 0];
+    #[link_name = "fossai_user_copy_fixup"]
+    static USER_COPY_FIXUP: [u8; 0];
+}
+
+/// Скопировать `len` байт между ядром и памятью программы, пережив отказ
+/// страницы: отказ разбирается как у программы ([`kernel_user_fault`]), а
+/// неразрешимый обрывает копирование. Ответ — сколько байт **не**
+/// скопировано (0 — всё).
+///
+/// # Safety
+///
+/// Сторона ядра — действительная память ядра на `len` байт; сторона
+/// программы проверена вызывающим на попадание в окно программы
+/// (`user::owns`): по чужому адресу ядра отказ не ловится.
+pub unsafe fn user_copy(dst: *mut u8, src: *const u8, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    // SAFETY: контракт функции.
+    unsafe { fossai_user_copy(dst, src, len) }
+}
+
+/// Куда продолжить после неразрешимого отказа в команде `rip` — если это
+/// команда копирования [`user_copy`].
+fn user_copy_fixup(rip: u64) -> Option<u64> {
+    let insn = (&raw const USER_COPY_INSN).cast::<u8>() as u64;
+    (rip == insn).then(|| (&raw const USER_COPY_FIXUP).cast::<u8>() as u64)
+}
+
+/// Отказов ядра по памяти программы с загрузки: разобранных, оборванных
+/// копированием, неразобранных. Первые [`KERNEL_FAULT_LOG`] каждого вида
+/// пишутся в журнал строкой.
+static KERNEL_USER_FAULTS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+const KERNEL_FAULT_LOG: u64 = 8;
+
+/// Отказ страницы в кольце 0 по адресу окна программы. `true` — разобран
+/// (команда повторится) или оборван копированием (продолжит исправление
+/// [`user_copy`]); `false` — остановка машины, как прежде.
+///
+/// До 20.11 разбиралась только запись в присутствующую страницу, и только
+/// копией при записи; строки о причине отказа не было — сбой TrackMania не
+/// говорил, какое из условий не сошлось. Теперь любой отказ данных (чтение и
+/// запись, присутствующая страница и нет) идёт в `user::kernel_fault_in`, а
+/// неразобранный пишет причину.
+///
+/// Флаг прерываний — как у прерванного кода: вызовы программ Linux входят
+/// через `syscall` и исполняются с запрещёнными прерываниями, но без локов;
+/// разбор под ними может уснуть на мьютексе — как и сам вызов.
+fn kernel_user_fault(frame: &mut TrapFrame) -> bool {
+    let addr = read_cr2();
+    if frame.error & (PF_INSTRUCTION_FETCH | PF_RESERVED) != 0
+        || !crate::user::is_running()
+        || !crate::user::owns(addr, 1)
+    {
+        return false;
+    }
+    let write = frame.error & PF_WRITE != 0;
+    let present = frame.error & PF_PRESENT != 0;
+    let held = crate::sync::spin_held_count();
+    let why = if held != 0 {
+        // Разбор берёт мьютексы и может уснуть — под `SpinLock` нельзя.
+        "a spin lock is held"
+    } else {
+        if frame.rflags & 0x200 != 0 {
+            enable();
+        }
+        let access = if write { crate::user::Touch::Write } else { crate::user::Touch::Read };
+        let result = crate::user::kernel_fault_in(addr, access, present);
+        disable();
+        match result {
+            Ok(()) => {
+                let n = KERNEL_USER_FAULTS[0].fetch_add(1, Ordering::Relaxed);
+                if n < KERNEL_FAULT_LOG {
+                    kprintln!(
+                        "  user        : kernel {} fault at {addr:#x} ({}, rip {:#x}) resolved like the program's own",
+                        if write { "write" } else { "read" },
+                        if present { "present" } else { "not present" },
+                        frame.rip
+                    );
+                }
+                return true;
+            }
+            Err(why) => why,
+        }
+    };
+    if let Some(fixup) = user_copy_fixup(frame.rip) {
+        let n = KERNEL_USER_FAULTS[1].fetch_add(1, Ordering::Relaxed);
+        // Под спинлоком печать могла бы ждать сама себя (замок вывода).
+        if n < KERNEL_FAULT_LOG && held == 0 {
+            kprintln!(
+                "  user        : kernel {} fault at {addr:#x} ({}) not resolved ({why}), the copy returns EFAULT",
+                if write { "write" } else { "read" },
+                if present { "present" } else { "not present" }
+            );
+        }
+        frame.rip = fixup;
+        return true;
+    }
+    KERNEL_USER_FAULTS[2].fetch_add(1, Ordering::Relaxed);
+    if held != 0 {
+        if let Some(report) = crate::sync::switch_held_report() {
+            kprintln!("  user        : spin lock count: {report}");
+        }
+    }
+    kprintln!(
+        "  user        : kernel {} fault at {addr:#x} ({}, rip {:#x}) in the program's memory not resolved: {why}; spin locks held {held}",
+        if write { "write" } else { "read" },
+        if present { "present" } else { "not present" },
+        frame.rip
+    );
+    false
 }
 
 /// Отказ страницы: перевести аппаратные признаки в [`Fault::PageFault`].

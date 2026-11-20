@@ -84,6 +84,24 @@ pub fn hwcap2() -> usize {
     0
 }
 
+/// Копирование между ядром и памятью программы, переживающее отказ страницы
+/// (20.11.2026); обёртки — `user::space::{put_user, get_user, …}`.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::interrupts::user_copy;
+
+/// На AArch64 слоя Linux нет, и отказ ядра по памяти программы не ловится —
+/// простое копирование (вызывающие проверяют буфер `user_can`, как прежде).
+///
+/// # Safety
+///
+/// Обе стороны — действительная память на `len` байт.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn user_copy(dst: *mut u8, src: *const u8, len: usize) -> usize {
+    // SAFETY: контракт функции.
+    unsafe { core::ptr::copy(src, dst, len) };
+    0
+}
+
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(target_arch = "aarch64")]

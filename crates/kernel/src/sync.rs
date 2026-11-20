@@ -42,7 +42,60 @@ static SPIN_HELD: [AtomicU32; crate::smp::MAX_CPUS] = [const { AtomicU32::new(0)
 /// Держит ли этот процессор хоть один [`SpinLock`]. Звать с запрещёнными
 /// прерываниями — иначе ответ может относиться к соседнему процессору.
 pub fn spin_held() -> bool {
-    SPIN_HELD[crate::smp::cpu()].load(Ordering::Relaxed) != 0
+    spin_held_count() != 0
+}
+
+/// Сколько [`SpinLock`] держит этот процессор — для строки журнала о
+/// неразобранном отказе ядра (20.11.2026): число больше разумного значит, что
+/// счёт разошёлся (лок взят на одном процессоре, отпущен на другом).
+pub fn spin_held_count() -> u32 {
+    SPIN_HELD[crate::smp::cpu()].load(Ordering::Relaxed)
+}
+
+/// Где этот процессор взял последний [`SpinLock`] (`&'static Location`,
+/// 0 — ещё нигде) — для сторожа [`check_switch`].
+static LAST_TAKEN: [AtomicUsize; crate::smp::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::smp::MAX_CPUS];
+
+/// Первое переключение задач с удержанным [`SpinLock`]: `(процессор, счёт,
+/// место последнего захвата)`; процессор `usize::MAX` — не было.
+static SWITCH_HELD: [AtomicUsize; 3] = [AtomicUsize::new(usize::MAX), AtomicUsize::new(0), AtomicUsize::new(0)];
+
+/// Сторож счёта удерживаемых спинлоков (20.11.2026): к переключению задач
+/// процессор не держит ни одного (планировщик берёт свой после этой
+/// проверки). Задача, уснувшая с локом, отпустит его на другом процессоре —
+/// счёт разойдётся навсегда, и [`spin_held`] на обоих будет «держит»: отказ
+/// ядра по памяти программы там больше не разбирается. Печатать отсюда нельзя
+/// (лок мог быть замком вывода) — запоминается первый случай, а строку пишет
+/// разбор отказа ([`switch_held_report`]). Прерывания запрещены вызывающим.
+pub fn check_switch() {
+    let cpu = crate::smp::cpu();
+    let held = SPIN_HELD[cpu].load(Ordering::Relaxed);
+    if held != 0
+        && SWITCH_HELD[0].compare_exchange(usize::MAX, cpu, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    {
+        SWITCH_HELD[1].store(held as usize, Ordering::Relaxed);
+        SWITCH_HELD[2].store(LAST_TAKEN[cpu].load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
+/// Строка о первом переключении задач с удержанным спинлоком, если такое было.
+pub fn switch_held_report() -> Option<alloc::string::String> {
+    let cpu = SWITCH_HELD[0].load(Ordering::Relaxed);
+    if cpu == usize::MAX {
+        return None;
+    }
+    let at = SWITCH_HELD[2].load(Ordering::Relaxed);
+    let place = if at == 0 {
+        alloc::string::String::from("?")
+    } else {
+        // SAFETY: туда пишут только `&'static Location` из `SpinLock::lock`.
+        let location = unsafe { &*(at as *const core::panic::Location<'static>) };
+        alloc::format!("{}:{}", location.file(), location.line())
+    };
+    Some(alloc::format!(
+        "cpu {cpu} switched tasks holding {} spin lock(s), last taken at {place}",
+        SWITCH_HELD[1].load(Ordering::Relaxed)
+    ))
 }
 
 /// Глобальная переменная, к которой обращаются через сырой указатель.
@@ -143,8 +196,10 @@ impl<T> SpinLock<T> {
             }
         }
         SPIN_HELD[me].fetch_add(1, Ordering::Relaxed);
+        let at = core::panic::Location::caller();
+        LAST_TAKEN[me].store(core::ptr::from_ref(at) as usize, Ordering::Relaxed);
 
-        SpinGuard { lock: self, irq_was_enabled, since, at: core::panic::Location::caller() }
+        SpinGuard { lock: self, irq_was_enabled, since, at }
     }
 
     /// Захватить лок, если его не держит **этот же** процессор.
@@ -175,6 +230,7 @@ impl<T> SpinLock<T> {
             ) {
                 Ok(_) => {
                     SPIN_HELD[me].fetch_add(1, Ordering::Relaxed);
+                    LAST_TAKEN[me].store(core::ptr::from_ref(at) as usize, Ordering::Relaxed);
                     return Some(SpinGuard { lock: self, irq_was_enabled, since, at });
                 }
                 Err(holder) if holder == me => {
@@ -227,8 +283,12 @@ impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
         // Порядок обратный захвату: сначала отпустить лок, потом вернуть
         // прерывания. Иначе обработчик успел бы прийти на ещё удерживаемый лок.
-        // Прерывания ещё запрещены: процессор тот же, что брал лок.
-        SPIN_HELD[crate::smp::cpu()].fetch_sub(1, Ordering::Relaxed);
+        // Счёт снимается с того процессора, что брал лок (он записан в
+        // `owner`), а не с текущего (20.11.2026): уснувшая с локом задача
+        // (ошибка, которую ловит [`check_switch`]) отпускает его на другом
+        // процессоре — и прежде счёт расходился у обоих навсегда.
+        let taken_on = self.lock.owner.load(Ordering::Relaxed);
+        SPIN_HELD[taken_on.min(crate::smp::MAX_CPUS - 1)].fetch_sub(1, Ordering::Relaxed);
         self.lock.owner.store(FREE, Ordering::Release);
         if self.irq_was_enabled {
             crate::latency::irq_off_ended(self.since, self.at);
@@ -376,6 +436,13 @@ impl<T> Mutex<T> {
                 core::hint::spin_loop();
             }
         }
+    }
+
+    /// Держит ли лок исполняющаяся задача (20.11.2026): отказ страницы ядра
+    /// по адресу программы разбирается, только если разбору не понадобится
+    /// лок, который задача уже держит, — второй захват был бы сном навсегда.
+    pub fn held_by_current(&self) -> bool {
+        self.locked.load(Ordering::Relaxed) && self.owner.load(Ordering::Relaxed) == crate::sched::running_slot() + 1
     }
 
     /// Чем этот лок отличается от остальных для планировщика.

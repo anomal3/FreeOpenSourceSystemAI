@@ -134,8 +134,7 @@ impl Space {
     #[cfg(target_arch = "x86_64")]
     pub fn duplicate(&mut self, class: &dyn Fn(usize) -> Dup, shared_vm: bool) -> Result<(Self, bool), MapError> {
         let mut copy = Self::new()?;
-        let mut downgraded = false;
-        // С нижней области программ Linux ([`super::LOW_BASE`]) до конца окна.
+        let mut downgraded = false;        // С нижней области программ Linux ([`super::LOW_BASE`]) до конца окна.
         let end = super::WINDOW_BASE + (1usize << 39);
         let mut virt = super::LOW_BASE;
         while virt < end {
@@ -739,6 +738,50 @@ pub fn user_can(ptr: usize, len: usize, need: PageFlags) -> bool {
         }
     }
     true
+}
+
+/// Записать `bytes` в память программы по `ptr` (20.11.2026). Отказ страницы
+/// по дороге разбирается, как у программы (копия при записи после `fork`
+/// соседнего потока, ленивая страница), неразрешимый — `false` (`EFAULT`), а
+/// не остановка машины. Права страниц не проверяет — это дело
+/// [`user_can`] до записи; здесь — только окно программы.
+#[must_use]
+pub fn copy_to_user(ptr: usize, bytes: &[u8]) -> bool {
+    if !super::owns(ptr, bytes.len()) {
+        return bytes.is_empty();
+    }
+    // SAFETY: сторона ядра — срез, сторона программы — в её окне.
+    unsafe { arch::user_copy(ptr as *mut u8, bytes.as_ptr(), bytes.len()) == 0 }
+}
+
+/// Прочитать `bytes.len()` байт памяти программы с `ptr` — как
+/// [`copy_to_user`], в обратную сторону.
+#[must_use]
+pub fn copy_from_user(bytes: &mut [u8], ptr: usize) -> bool {
+    if !super::owns(ptr, bytes.len()) {
+        return bytes.is_empty();
+    }
+    // SAFETY: см. `copy_to_user`.
+    unsafe { arch::user_copy(bytes.as_mut_ptr(), ptr as *const u8, bytes.len()) == 0 }
+}
+
+/// Записать значение в память программы ([`copy_to_user`]); выравнивание не
+/// требуется.
+#[must_use]
+pub fn put_user<T: Copy>(ptr: usize, value: T) -> bool {
+    // SAFETY: `T: Copy` — простые байты значения на стеке ядра.
+    let bytes = unsafe { core::slice::from_raw_parts((&raw const value).cast::<u8>(), size_of::<T>()) };
+    copy_to_user(ptr, bytes)
+}
+
+/// Прочитать значение из памяти программы ([`copy_from_user`]). Только для
+/// типов, у которых годна любая комбинация байт (целые и массивы целых).
+#[must_use]
+pub fn get_user<T: Copy + Default>(ptr: usize) -> Option<T> {
+    let mut value = T::default();
+    // SAFETY: см. выше; любые байты — допустимое значение (контракт типа).
+    let bytes = unsafe { core::slice::from_raw_parts_mut((&raw mut value).cast::<u8>(), size_of::<T>()) };
+    copy_from_user(bytes, ptr).then_some(value)
 }
 
 /// Отображён ли адрес в пространстве **ядра**.

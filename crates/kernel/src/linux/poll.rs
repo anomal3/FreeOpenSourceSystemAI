@@ -47,11 +47,19 @@ fn wait(fds: usize, count: usize, deadline: Option<u64>) -> i64 {
         let mut ready = 0;
         for index in 0..count {
             let at = fds + index * 8;
-            // SAFETY: массив проверен на запись выше.
-            let (fd, events) = unsafe { (core::ptr::read_unaligned(at as *const i32), core::ptr::read_unaligned((at + 4) as *const u16)) };
+            // Проверка выше — не обещание: соседний поток вправе сделать `fork`
+            // (страница станет «только на чтение» до копии) или `munmap` между
+            // ней и записью (20.11.2026, сбой TrackMania). Поэтому чтение и
+            // запись — через `get_user`/`put_user`: отказ разбирается как у
+            // программы, неразрешимый — `EFAULT`, а не остановка машины.
+            let Some(entry) = space::get_user::<u64>(at) else {
+                return -e::EFAULT;
+            };
+            let (fd, events) = (entry as u32 as i32, (entry >> 32) as u16);
             let revents = if fd < 0 { 0 } else { revents_of(fd as usize, events) };
-            // SAFETY: тот же проверенный массив.
-            unsafe { core::ptr::write_unaligned((at + 6) as *mut u16, revents) };
+            if !space::put_user::<u16>(at + 6, revents) {
+                return -e::EFAULT;
+            }
             if revents != 0 {
                 ready += 1;
                 let pid = u64::from(crate::user::with_current(|program| program.linux_pid).unwrap_or(0));
@@ -76,8 +84,9 @@ fn wait(fds: usize, count: usize, deadline: Option<u64>) -> i64 {
         }
         // `timerfd` становится готов сам, по времени (фаза 71e).
         for index in 0..count {
-            // SAFETY: массив проверен на запись выше.
-            let fd = unsafe { core::ptr::read_unaligned((fds + index * 8) as *const i32) };
+            let Some(fd) = space::get_user::<i32>(fds + index * 8) else {
+                return -e::EFAULT;
+            };
             if fd >= 0 {
                 if let Some(at) = crate::user::with_current(|program| program.files.deadline(fd as usize)).flatten() {
                     until = until.min(at.max(crate::time::uptime_ms() + 1));
@@ -176,8 +185,7 @@ fn select_until(count: usize, read: usize, write: usize, except: usize, deadline
                 return Err(-e::EFAULT);
             }
             for (index, word) in out.iter_mut().take(words).enumerate() {
-                // SAFETY: проверено выше.
-                *word = unsafe { core::ptr::read_unaligned((set + index * 8) as *const u64) };
+                *word = space::get_user(set + index * 8).ok_or(-e::EFAULT)?;
             }
         }
         Ok(out)
@@ -225,8 +233,11 @@ fn select_until(count: usize, read: usize, write: usize, except: usize, deadline
                     return -e::EFAULT;
                 }
                 for (index, word) in got.iter().take(words).enumerate() {
-                    // SAFETY: проверено строкой выше.
-                    unsafe { core::ptr::write_unaligned((set + index * 8) as *mut u64, *word) };
+                    // Через `put_user` — см. `wait`: проверка выше не
+                    // переживает `fork` соседнего потока.
+                    if !space::put_user(set + index * 8, *word) {
+                        return -e::EFAULT;
+                    }
                 }
             }
             return ready;
@@ -270,7 +281,8 @@ pub fn pipe(fds: usize, flags: usize) -> i64 {
         program.files.set_cloexec(write_fd, flags & O_CLOEXEC != 0);
     });
     let pair: [i32; 2] = [read_fd as i32, write_fd as i32];
-    // SAFETY: проверено выше.
-    unsafe { core::ptr::write_unaligned(fds as *mut [i32; 2], pair) };
+    if !space::put_user(fds, pair) {
+        return -e::EFAULT;
+    }
     0
 }

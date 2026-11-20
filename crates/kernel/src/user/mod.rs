@@ -5749,6 +5749,32 @@ pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
     done
 }
 
+/// Отказ страницы **ядра** по адресу программы (20.11.2026, сбой TrackMania:
+/// ядро проверило массив `poll`, соседний поток сделал `fork`, и запись ядра
+/// пришла в разделённую страницу «только на чтение»). Разбирается тем же
+/// [`fault_in`], что отказ самой программы, — копия при записи, подкачка,
+/// ленивая страница, — если разбору не нужен лок, который задача уже держит:
+/// таблица программ или замок своего процесса (под ним ядро, например,
+/// копирует прочитанное из файла; второй захват был бы сном навсегда).
+/// `Err` — почему не разобран (для журнала).
+pub fn kernel_fault_in(addr: usize, access: Touch, present: bool) -> Result<(), &'static str> {
+    if PROGRAMS.held_by_current() {
+        return Err("the program table lock is held by this task");
+    }
+    let Some(process) = current_process() else {
+        return Err("no program");
+    };
+    if process.held_by_current() {
+        return Err("the process lock is held by this task");
+    }
+    drop(process);
+    if fault_in(addr, access, present) {
+        Ok(())
+    } else {
+        Err(last_fault_why().name())
+    }
+}
+
 /// Вид последнего отказа «страницы не было» у потока слота — для `lxstat`:
 /// 503 общая память, 504 из кэша страниц, 505 пустая (без файла), 506 чтение
 /// файла; 500 — не дошёл до решения.

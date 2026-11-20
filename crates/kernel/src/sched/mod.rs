@@ -1635,6 +1635,8 @@ fn schedule_with(cause: Cause) {
     // заголовке модуля («Главная ловушка»).
     let irq_was_enabled = arch::interrupts::enabled();
     arch::interrupts::disable();
+    // Ни одного спинлока к переключению (20.11.2026, см. `sync::check_switch`).
+    crate::sync::check_switch();
 
     let mut from: *mut Context = ptr::null_mut();
     let mut to: *const Context = ptr::null();
