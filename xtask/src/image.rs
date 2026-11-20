@@ -297,6 +297,17 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     payload.push(read_payload(esp, &source)?);
                 }
             }
+            // Прошивка SMC видеокарты AMD Polaris (19.11): linux-firmware
+            // `amdgpu/polaris10_k_smc.bin` (для RX 590, `ASICID_IS_P20`),
+            // положенная в `build/amd-fw`. Её нет — образ собирается без неё,
+            // и `amd smc start` скажет, что прошивки нет.
+            let amd_firmware = crate::paths::work_dir().join("amd-fw");
+            for (name, esp) in [("polaris10_k_smc.bin", "FREEOS/AMD/SMC.BIN")] {
+                let source = amd_firmware.join(name);
+                if source.is_file() {
+                    payload.push(read_payload(esp, &source)?);
+                }
+            }
             // Браузер OBSOS (16.11, Роман: «в образ ещё браузер обсос запиши,
             // хочу на ПК проверить на живом»). Корень живой системы только на
             // чтение, поэтому пакет едет файлом `\FREEOS\PKG\OBSOS.FPK`, а ядро,
