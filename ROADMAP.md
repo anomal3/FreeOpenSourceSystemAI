@@ -14383,10 +14383,16 @@ vkcube выбирает NVK; DXVK (d3dprobe, D3D9) создаёт устройс
 это сам прогон: libdrm `drmCommandWrite` шлёт VM_INIT как `DRM_IOW`
 (0x40106450), а наш слой сверял полный номер с `DRM_IOWR` и отвечал ENOTTY —
 Mesa молча уходила на lavapipe; теперь ioctl сверяются по типу/номеру/размеру,
-направление — из своей таблицы (как `drm_ioctl` Linux). Ещё не проходит на
-SoftGpu: заливка+копия vkprobe и кадры vkcube/DXVK — программная видеокарта
-убивает канал (причина теперь пишется строкой `nvgpu: softgpu: channel
-killed - …`); на настоящей карте эти команды исполняет GPU. `nvk-soft-vk`
+направление — из своей таблицы (как `drm_ioctl` Linux). Второй найденный —
+подканал 4: NVK шлёт методы копировального движка без SET_OBJECT (так и на
+железе Volta+), SoftGpu теперь это принимает. Итог прогона 05:45 (образ
+0.8.983): **vkprobe на NVK — 0 failed** (заливка + копия 1 МиБ через CE,
+забор), **Direct3D 9 через DXVK на NVK — PASS, 61 к/с, кадры буферами
+zwp_linux_dmabuf_v1** (`wayland : client #57 dmabuf buffer 640x480`); vkcube
+тоже отдаёт dmabuf-кадры, но SoftGpu не умеет блочную раскладку CE
+(`nvgpu: softgpu: channel killed - … BLOCKLINEAR`) — на карте это делает
+GPU. Шейдеры SoftGpu не исполняет, так что картинка в QEMU не проверяется —
+только весь путь Wine → DXVK → NVK → наш uAPI → бэкенд → dmabuf → стол. `nvk-soft-vk`
 (установленная система) не дошёл: установка пакета Proton (1,9 ГБ) на
 том `/opt` btrfs падает «cannot write … (error -4)» через 17 мин — не NVK.
 
