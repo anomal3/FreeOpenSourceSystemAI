@@ -11125,6 +11125,29 @@ VFCT в ACPI нет (у дискретной карты и не ожидалос
 коммитить (`build/amd-fw/`). Не прочитано: `amd vbios` (вывод Роман не
 присылал).
 
+**Polaris, P2: SMC ЗАПУЩЕНА (21.11, образ 0.8.7, проверено на железе).**
+После POST от UEFI SMC крутит загрузочное ПЗУ (`ck_disable` 0, `SMC_PC_C` ≈
+0x2a44…0x2b4c < порога 0x20100; режим защищённый: `SMU_FIRMWARE` `0x00030006`,
+`smu_mode` 1, `smu_sel` 1 → образ `polaris10_k_smc.bin`). `amd smc start`
+(`display/amd.rs`, `polaris_smc_start`) повторяет `polaris10_start_smu_in_protection_mode`:
+rst_reg=1 → образ 129 988 байт в SRAM SMC с 0x20000 (через `SMC_IND_INDEX_11`/
+`DATA_11`, автоинкремент `SMC_IND_ACCESS_CNTL` бит 11) → `SMU_STATUS`=0, ck_disable=0,
+rst_reg=0 → сообщение `Test(0x20000)` (ответ 1) → `SMU_STATUS` `0x3` (done+pass) →
+`FIRMWARE_FLAGS`=0, импульс сброса → `FIRMWARE_FLAGS` бит 0 = 1; итог `SMC_PC_C`
+≈ 0x205f0 (выше порога), `SMU_FIRMWARE` `0x0003001e`. Машина не зависла, экран
+остался. Повторный `amd smc start` честно отвечает «already runs». **Автозапуск без
+клавиатуры:** USB-клавиатура живой флешки опознаётся не всегда (порт 4, USB 1.1,
+таймаут первого чтения дескрипторов 500 мс; повтор «через 4000 мс» в журнале не
+виден — **отдельная ошибка USB-стека, не разобрана**). Образ, собранный с
+`FOSSAI_AMD_SMC_START=1`, кладёт на флешку `\FREEOS\AMD\START.TXT`, и фоновая
+задача `amd` запускает SMC сама, как только появится флешка; без маркера в карту
+ничего не пишется. Прошивка SMC едет файлом `\FREEOS\AMD\SMC.BIN` (из
+`build/amd-fw/polaris10_k_smc.bin`, в репозиторий не коммитится). **Дальше (P3):**
+`smu7_request_smu_load_fw` — таблица ucode `SMU_DRAMData_TOC` в видеопамяти (через
+BAR0, GPU-адрес `0xf400000000+смещение`), сообщения `DRV_DRAM_ADDR_HI/LO` и
+`LoadUcodes` (0x254) с маской блоков (CP CE/PFP/ME/MEC/MEC2, RLC, SDMA0/1), ожидание
+`UcodeLoadStatus`; потом RLC/CP/SDMA, кольца, IH и VM (GMC v8).
+
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
 `drmGetDevices2`, ioctl для `vulkaninfo` и для рендера, поля
