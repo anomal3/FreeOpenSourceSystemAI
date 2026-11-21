@@ -585,14 +585,18 @@ impl Positioner {
     }
 
     /// Место с учётом экрана: `parent` — где на экране угол родителя,
-    /// `screen` — размер экрана. Не влезающее переворачивается к другой
-    /// стороне привязки, а если и так не влезает — сдвигается внутрь, если
-    /// клиент это разрешил.
-    fn constrain(&self, parent: (i32, i32), screen: (i32, i32)) -> (i32, i32) {
+    /// `area` — монитор, в пределах которого всплывать (G5, 21.11: тот, на
+    /// котором привязка, — прежде размер основного от угла стола, и меню
+    /// окна на правом мониторе уезжали на левый). Не влезающее
+    /// переворачивается к другой стороне привязки, а если и так не влезает —
+    /// сдвигается внутрь, если клиент это разрешил.
+    fn constrain(&self, parent: (i32, i32), area: Rect) -> (i32, i32) {
         let (w, h) = (self.width.max(1), self.height.max(1));
         let (mut x, mut y) = self.place();
-        let out_x = |x: i32| parent.0 + x < 0 || parent.0 + x + w > screen.0;
-        let out_y = |y: i32| parent.1 + y < 0 || parent.1 + y + h > screen.1;
+        let (left, top) = (area.x, area.y);
+        let (right, bottom) = (area.x + area.w as i32, area.y + area.h as i32);
+        let out_x = |x: i32| parent.0 + x < left || parent.0 + x + w > right;
+        let out_y = |y: i32| parent.1 + y < top || parent.1 + y + h > bottom;
         if self.adjust & ADJUST_FLIP_X != 0 && out_x(x) {
             let flipped = Self {
                 edge: flip_horizontal(self.edge),
@@ -618,10 +622,10 @@ impl Positioner {
             }
         }
         if self.adjust & ADJUST_SLIDE_X != 0 && out_x(x) {
-            x = (screen.0 - w).min(parent.0 + x).max(0) - parent.0;
+            x = (right - w).min(parent.0 + x).max(left) - parent.0;
         }
         if self.adjust & ADJUST_SLIDE_Y != 0 && out_y(y) {
-            y = (screen.1 - h).min(parent.1 + y).max(0) - parent.1;
+            y = (bottom - h).min(parent.1 + y).max(top) - parent.1;
         }
         (x, y)
     }
@@ -954,6 +958,8 @@ struct Client {
     /// Нажатые клавиши (коды evdev): повтор ядра отличается от нажатия.
     keys_down: Vec<u32>,
     seat_version: u32,
+    /// G5: version of the client's `xdg_wm_base` (`wm_capabilities` from 5).
+    wm_version: u32,
     broken: bool,
     /// `xdg_wm_base` клиента — ему идут `ping` (P4).
     wm_base: Option<u32>,
@@ -1015,6 +1021,7 @@ impl Client {
             next_server_id: 0xff00_0000,
             keys_down: Vec::new(),
             seat_version: 1,
+            wm_version: 1,
             broken: false,
             wm_base: None,
             ping: None,
@@ -1825,6 +1832,7 @@ impl Client {
         self.objects.insert(new, object);
         if name == 4 {
             self.wm_base = Some(new);
+            self.wm_version = version;
         }
         match name {
             11 => self.send(Msg::new(new, 0).u32(PRESENTATION_CLOCK)),
@@ -1936,6 +1944,21 @@ impl Client {
                 if let Some(Obj::Surface(state)) = self.objects.get_mut(&surface) {
                     state.role = Role::Toplevel(id);
                 }
+                // G5 (21.11): `wm_capabilities` (xdg_wm_base 5+) before the
+                // first configure - maximize (2), fullscreen (3), minimize (4).
+                // GE-Proton's winewayland takes "configured, no capabilities"
+                // as "no minimize" and keeps a minimized window mapped: TMNF,
+                // minimized (its corner button, focus loss of a fullscreen
+                // game), stayed on the desktop as a small window showing the
+                // last frame, and the first click on it restored the game to
+                // fullscreen - "windowed TMNF can't be dragged" (hw-log13).
+                if self.wm_version >= 5 {
+                    let mut caps = Vec::with_capacity(12);
+                    for cap in [2u32, 3, 4] {
+                        caps.extend_from_slice(&cap.to_ne_bytes());
+                    }
+                    self.send(Msg::new(new, 3).bytes(&caps));
+                }
                 let slot = self.next_slot;
                 self.next_slot += 1;
                 self.wins.push(Win {
@@ -1985,9 +2008,16 @@ impl Client {
                     self.send(Msg::new(new, 1));
                     return Ok(());
                 };
-                let origin = crate::ui::window_rect(self.pid, owner).map_or((0, 0), |rect| (rect.x, rect.y));
-                let (sw, sh) = crate::ui::screen_size();
-                let (x, y) = place.constrain((origin.0 + base.0, origin.1 + base.1), (sw as i32, sh as i32));
+                // G5: bounds - the monitor under the anchor rectangle (its
+                // middle), counted from the owner's pixels like the popup
+                // itself (`Compositor::popup_rect`).
+                let (ax, ay, aw, ah) = place.anchor;
+                let point = (base.0 + ax + aw / 2, base.1 + ay + ah / 2);
+                let (origin, area) = crate::ui::popup_bounds(self.pid, owner, point).unwrap_or_else(|| {
+                    let (sw, sh) = crate::ui::screen_size();
+                    ((0, 0), Rect::new(0, 0, sw, sh))
+                });
+                let (x, y) = place.constrain((origin.0 + base.0, origin.1 + base.1), area);
                 let slot = self.next_slot;
                 self.next_slot += 1;
                 self.pops.push(Pop {

@@ -86,8 +86,15 @@ enum {
     ID_DMABUF, ID_PARAMS1, ID_DBUF1, ID_PARAMS2, ID_DBUF2, ID_FRAME4,
     /* G3 (21.11): mouse for games, activation, fractional scale. */
     ID_RELMGR, ID_REL, ID_CONSTR, ID_LOCK, ID_REGION, ID_CONFINE, ID_ACT, ID_TOKEN, ID_FRACMGR, ID_FRAC, ID_SYNC3,
-    ID_OUTPUT
+    ID_OUTPUT,
+    /* G5 (21.11): popups on the second monitor, minimize, confinement. */
+    ID_POS, ID_PSURF, ID_PXDG, ID_POPUP, ID_PPOOL, ID_PBUF, ID_TOKEN2, ID_CONFINE2, ID_SYNC4
 };
+/* G5: `wm_capabilities`, popup configure, pointer buttons/leave, focus. */
+static int caps_seen, caps_min, caps_full, caps_before_configure;
+static int popup_x = -99999, popup_y = -99999, popup_conf, pxdg_serial, pxdg_conf, popup_done;
+static int button_serial, button_down, pointer_left, keyboard_left, key_p, key_q, key_c;
+static int confined2, confine2_on, confine2_moves, confine2_min_x = 1 << 30, leave_confined, token2_done, synced4;
 /* `wl_output.mode` (bench): the monitor size. */
 static uint32_t global_output;
 static int out_w, out_h;
@@ -155,9 +162,50 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         rel_seen = 1;
         rel_dx += (int32_t)args[4] / 256;
         rel_dy += (int32_t)args[5] / 256;
+    } else if (id == ID_TOPLEVEL && opcode == 3) {
+        /* wm_capabilities(array): 2 maximize, 3 fullscreen, 4 minimize. */
+        caps_seen = 1;
+        caps_before_configure = !configured;
+        for (uint32_t i = 0; i < args[0] / 4; i++) {
+            if (args[1 + i] == 3) caps_full = 1;
+            if (args[1 + i] == 4) caps_min = 1;
+        }
+    } else if (id == ID_POPUP && opcode == 0) {
+        popup_x = (int32_t)args[0];
+        popup_y = (int32_t)args[1];
+        popup_conf = 1;
+    } else if (id == ID_POPUP && opcode == 1) {
+        popup_done = 1;
+    } else if (id == ID_PXDG && opcode == 0) {
+        pxdg_serial = (int)args[0];
+        pxdg_conf = 1;
+    } else if (id == ID_TOKEN2 && opcode == 0) {
+        token2_done = 1;
+    } else if (id == ID_SYNC4 && opcode == 0) {
+        synced4 = 1;
+    } else if (id == ID_CONFINE2 && opcode == 0) {
+        confined2 = 1;
+        confine2_on = 1;
+    } else if (id == ID_CONFINE2 && opcode == 1) {
+        confine2_on = 0;
+    } else if (id == ID_POINTER && opcode == 1) {
+        pointer_left = 1;
+        if (confine2_on) leave_confined = 1;
+    } else if (id == ID_POINTER && opcode == 3) {
+        /* button(serial, time, button, state) */
+        if (args[3] == 1) {
+            button_serial = (int)args[0];
+            button_down = 1;
+        }
+    } else if (id == ID_KEYBOARD && opcode == 2) {
+        keyboard_left = 1;
     } else if (id == ID_POINTER && opcode == 2) {
         /* motion(time, x, y) */
         int x = (int32_t)args[1] / 256, y = (int32_t)args[2] / 256;
+        if (confine2_on) {
+            confine2_moves++;
+            if (x < confine2_min_x) confine2_min_x = x;
+        }
         if (lock_on) motion_locked++;
         if (confine_on) {
             if (x > confine_max_x) confine_max_x = x;
@@ -197,6 +245,9 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         if (args[2] == 30 && args[3] == 1) key_down = 1;
         if (args[2] == 30 && args[3] == 0 && key_down) key_up = 1;
         if (args[2] == 48 && args[3] == 0) key_b = 1;
+        if (args[2] == 25 && args[3] == 0) key_p = 1;
+        if (args[2] == 16 && args[3] == 0) key_q = 1;
+        if (args[2] == 46 && args[3] == 0) key_c = 1;
     } else if (id == ID_TOPLEVEL && opcode == 0) {
         int full = 0;
         conf_w = (int)args[0];
@@ -400,6 +451,255 @@ static int bench(int frames) {
     return shown == frames ? 0 : 1;
 }
 
+/* A memfd pool with one `w`x`h` ARGB buffer filled with `color` (white
+ * 3-pixel border). */
+static void shm_buffer(uint32_t pool, uint32_t buffer, int w, int h, uint32_t color) {
+    size_t bytes = (size_t)w * (size_t)h * 4;
+    int fd = memfd_create("waylandcheck-g5", MFD_CLOEXEC);
+    uint32_t *px = fd >= 0 && ftruncate(fd, (off_t)bytes) == 0 ? mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+    if (px != MAP_FAILED) {
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                px[(size_t)y * w + x] = (x < 3 || y < 3 || x >= w - 3 || y >= h - 3) ? 0xffffffffu : color;
+        munmap(px, bytes);
+    }
+    begin(ID_SHM, 0); /* create_pool */
+    put(pool);
+    put((uint32_t)bytes);
+    end_fd(fd);
+    if (fd >= 0) close(fd);
+    begin(pool, 0); /* create_buffer */
+    put(buffer);
+    put(0);
+    put((uint32_t)w);
+    put((uint32_t)h);
+    put((uint32_t)w * 4);
+    put(0);
+    end();
+}
+
+static void show(uint32_t surface, uint32_t buffer, int w, int h) {
+    begin(surface, 1); /* attach */
+    put(buffer);
+    put(0);
+    put(0);
+    end();
+    begin(surface, 2); /* damage */
+    put(0);
+    put(0);
+    put((uint32_t)w);
+    put((uint32_t)h);
+    end();
+    begin(surface, 6); /* commit */
+    end();
+}
+
+static void say(const char *text) {
+    printf("waylandcheck: %s\n", text);
+    fflush(stdout);
+}
+
+/* `waylandcheck g5` (21.11, hw: two monitors, the primary on the left):
+ * wm_capabilities before the first configure (GE-Proton keeps minimized
+ * windows mapped without it), an xdg_popup of a window dragged to the right
+ * monitor opens at its anchor (it was pushed onto the primary monitor),
+ * set_minimized and back with xdg_activation, a confinement asked while the
+ * pointer is off the window starts at once and holds the pointer in. The
+ * scenario `wayland-multihead` drives it. */
+static int g5(void) {
+    begin(ID_DISPLAY, 1);
+    put(ID_REGISTRY);
+    end();
+    begin(ID_DISPLAY, 0);
+    put(ID_SYNC);
+    end();
+    wait_for(&synced, 5000);
+    check(synced && global_compositor && global_shm && global_wm && global_seat && global_constraints && global_activation,
+          "g5 registry lists the compositor, shm, xdg_wm_base, seat, pointer constraints and xdg_activation");
+    bind_global(global_compositor, "wl_compositor", 4, ID_COMPOSITOR);
+    bind_global(global_shm, "wl_shm", 1, ID_SHM);
+    bind_global(global_wm, "xdg_wm_base", 5, ID_WM);
+    bind_global(global_seat, "wl_seat", 5, ID_SEAT);
+    bind_global(global_constraints, "zwp_pointer_constraints_v1", 1, ID_CONSTR);
+    bind_global(global_activation, "xdg_activation_v1", 1, ID_ACT);
+    begin(ID_SEAT, 0);
+    put(ID_POINTER);
+    end();
+    begin(ID_SEAT, 1);
+    put(ID_KEYBOARD);
+    end();
+    begin(ID_DISPLAY, 0);
+    put(ID_SYNC2);
+    end();
+    wait_for(&synced2, 5000);
+
+    const int width = 320, height = 200;
+    begin(ID_COMPOSITOR, 0);
+    put(ID_SURFACE);
+    end();
+    begin(ID_WM, 2);
+    put(ID_XDG);
+    put(ID_SURFACE);
+    end();
+    begin(ID_XDG, 1);
+    put(ID_TOPLEVEL);
+    end();
+    begin(ID_TOPLEVEL, 2);
+    put_str("waylandcheck");
+    end();
+    begin(ID_SURFACE, 6);
+    end();
+    wait_for(&configured, 5000);
+    check(caps_seen && caps_before_configure && caps_min && caps_full,
+          "xdg_toplevel gets wm_capabilities with fullscreen and minimize before the first configure");
+    begin(ID_XDG, 4);
+    put((uint32_t)configure_serial);
+    end();
+    shm_buffer(ID_POOL, ID_BUFFER, width, height, 0xff305090u);
+    frame_done = 0;
+    begin(ID_SURFACE, 3);
+    put(ID_FRAME);
+    end();
+    show(ID_SURFACE, ID_BUFFER, width, height);
+    wait_for(&frame_done, 5000);
+
+    /* Drag to the right monitor: a press on the window asks the desktop to
+     * move it (`xdg_toplevel.move`, like Wine's caption). */
+    say("g5 window shown, drag it to the right monitor");
+    wait_for(&button_down, 60000);
+    begin(ID_TOPLEVEL, 5); /* move(seat, serial) */
+    put(ID_SEAT);
+    put((uint32_t)button_serial);
+    end();
+    wait_for(&key_p, 60000);
+
+    /* A 200x150 menu below-right of the point (300,150) of the window, with
+     * flip and slide allowed: it fits on the right monitor, so it opens
+     * exactly there. */
+    begin(ID_WM, 1); /* create_positioner */
+    put(ID_POS);
+    end();
+    begin(ID_POS, 1); /* set_size */
+    put(200);
+    put(150);
+    end();
+    begin(ID_POS, 2); /* set_anchor_rect */
+    put(300);
+    put(150);
+    put(1);
+    put(1);
+    end();
+    begin(ID_POS, 3); /* set_anchor: top_left (5) */
+    put(5);
+    end();
+    begin(ID_POS, 4); /* set_gravity: bottom_right (8) */
+    put(8);
+    end();
+    begin(ID_POS, 5); /* set_constraint_adjustment: slide x/y, flip x/y */
+    put(1 | 2 | 4 | 8);
+    end();
+    begin(ID_COMPOSITOR, 0);
+    put(ID_PSURF);
+    end();
+    begin(ID_WM, 2);
+    put(ID_PXDG);
+    put(ID_PSURF);
+    end();
+    begin(ID_PXDG, 2); /* get_popup(id, parent, positioner) */
+    put(ID_POPUP);
+    put(ID_XDG);
+    put(ID_POS);
+    end();
+    begin(ID_PSURF, 6);
+    end();
+    wait_for(&pxdg_conf, 5000);
+    printf("waylandcheck: popup configure at %d,%d\n", popup_x, popup_y);
+    check(popup_conf && popup_x == 300 && popup_y == 150,
+          "an xdg_popup of a window on the right monitor opens at its anchor, not pushed onto the primary monitor");
+    begin(ID_PXDG, 4);
+    put((uint32_t)pxdg_serial);
+    end();
+    shm_buffer(ID_PPOOL, ID_PBUF, 200, 150, 0xffc06020u);
+    show(ID_PSURF, ID_PBUF, 200, 150);
+    say("g5 popup shown");
+    wait_for(&key_q, 60000);
+    begin(ID_POPUP, 0);
+    end();
+    begin(ID_PXDG, 0);
+    end();
+    begin(ID_PSURF, 0);
+    end();
+
+    /* Minimize (Wine: a minimized game) and back through xdg_activation. */
+    keyboard_left = 0;
+    begin(ID_TOPLEVEL, 13); /* set_minimized */
+    end();
+    wait_for(&keyboard_left, 5000);
+    check(keyboard_left, "set_minimized minimizes the window (it loses the keyboard)");
+    say("g5 minimized");
+    struct timespec pause = {1, 0};
+    nanosleep(&pause, NULL);
+    begin(ID_ACT, 1);
+    put(ID_TOKEN2);
+    end();
+    begin(ID_TOKEN2, 3);
+    end();
+    wait_for(&token2_done, 3000);
+    keyboard_in = 0;
+    configured = 0;
+    begin(ID_ACT, 2);
+    put_str("fossai-check");
+    put(ID_SURFACE);
+    end();
+    wait_for(&keyboard_in, 5000);
+    wait_for(&configured, 2000);
+    check(keyboard_in && configured, "activation restores the minimized window with a configure (Wine restores on it)");
+    begin(ID_XDG, 4);
+    put((uint32_t)configure_serial);
+    end();
+    show(ID_SURFACE, ID_BUFFER, width, height);
+
+    /* Confinement asked while the pointer is off the window (on the other
+     * monitor): it starts at once, the pointer is brought in and stays. */
+    say("g5 move the pointer off the window");
+    wait_for(&key_c, 60000);
+    begin(ID_CONSTR, 2); /* confine_pointer(id, surface, pointer, region = whole, persistent) */
+    put(ID_CONFINE2);
+    put(ID_SURFACE);
+    put(ID_POINTER);
+    put(0);
+    put(2);
+    end();
+    wait_for(&confined2, 5000);
+    check(confined2, "a confinement asked while the pointer is off the window starts at once");
+    say("g5 confined, push the pointer away");
+    struct timespec pause2 = {3, 0};
+    nanosleep(&pause2, NULL);
+    begin(ID_DISPLAY, 0);
+    put(ID_SYNC4);
+    end();
+    wait_for(&synced4, 3000);
+    wait_for(&never, 1500);
+    printf("waylandcheck: confined motions %d, leftmost x %d, left the window %d\n", confine2_moves, confine2_min_x, leave_confined);
+    check(confine2_on && !leave_confined && confine2_moves > 0 && confine2_min_x == 0,
+          "the confined pointer stops at the window's edge and does not leave it");
+    say("g5 shot");
+    wait_for(&never, 2500);
+    begin(ID_CONFINE2, 0);
+    end();
+    begin(ID_TOPLEVEL, 0);
+    end();
+    begin(ID_XDG, 0);
+    end();
+    begin(ID_SURFACE, 0);
+    end();
+    wait_for(&never, 500);
+    check(!protocol_error, "no protocol errors");
+    close(sock);
+    printf("waylandcheck: %d failed\n", failed);
+    return failed;
+}
+
 int main(int argc, char **argv) {
     const char *dir = getenv("XDG_RUNTIME_DIR");
     const char *display = getenv("WAYLAND_DISPLAY");
@@ -410,6 +710,10 @@ int main(int argc, char **argv) {
     int connected = sock >= 0 && connect(sock, (struct sockaddr *)&addr, sizeof addr) == 0;
     if (argc > 1 && !strcmp(argv[1], "bench"))
         return connected ? bench(argc > 2 ? atoi(argv[2]) : 300) : 1;
+    if (argc > 1 && !strcmp(argv[1], "g5")) {
+        check(connected, "connect to the compositor");
+        return connected ? g5() : 1;
+    }
     check(connected, "connect to the compositor");
     if (!connected) {
         printf("waylandcheck: %d failed\n", failed);

@@ -6601,6 +6601,15 @@ pub fn window_rect(task: u32, slot: u32) -> Option<Rect> {
     with_desktop(|desktop| desktop.rect_of(App::Program(task, slot))).flatten()
 }
 
+/// G5 (21.11): where a popup of the program window `slot` may go - the
+/// corner of the window's pixels (popup anchors count from it) and the
+/// monitor under `point` (relative to that corner; the popup's anchor). A
+/// menu of a window on the right monitor stays there instead of being
+/// pushed onto the primary one.
+pub fn popup_bounds(task: u32, slot: u32, point: (i32, i32)) -> Option<((i32, i32), Rect)> {
+    with_desktop(|desktop| desktop.popup_bounds(App::Program(task, slot), point)).flatten()
+}
+
 /// Свернуть окно программы (`xdg_toplevel.set_minimized`).
 pub fn minimize_window(task: u32, slot: u32) -> Result<(), WindowError> {
     let app = App::Program(task, slot);

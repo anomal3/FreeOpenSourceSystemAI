@@ -1164,11 +1164,28 @@ impl Compositor {
         let y = oy.saturating_add(anchor.1);
         // В пределах экрана, а не формы: ради этого всплывающие окна и стали
         // окнами стола. Не влезающее сдвигается внутрь экрана.
-        // Мониторов несколько — в пределах того, на котором угол владельца.
-        let o = self.output_rects()[self.output_near(x, y)];
+        // Мониторов несколько — в пределах того, на котором середина окна
+        // (G5: по углу меню, отвёрнутого влево у края монитора, оно
+        // перескакивало на соседний).
+        let o = self.output_rects()[self.output_near(x.saturating_add(w as i32 / 2), y.saturating_add(h as i32 / 2))];
         let max_x = (o.right() - w as i32).max(o.x);
         let max_y = (o.bottom() - h as i32).max(o.y);
         Some(Rect::new(x.clamp(o.x, max_x), y.clamp(o.y, max_y), w, h))
+    }
+
+    /// G5: the corner of `owner`'s pixels and the monitor under `point`
+    /// (relative to that corner) - the bounds a Wayland popup is
+    /// constrained to (`xdg_positioner`).
+    #[must_use]
+    pub fn popup_bounds(&self, owner: App, point: (i32, i32)) -> Option<((i32, i32), Rect)> {
+        let owner = self.windows.iter().find(|window| window.app == owner)?;
+        let (ox, oy) = owner.content_origin();
+        let rects = self.output_rects();
+        if rects.is_empty() {
+            return None;
+        }
+        let o = rects[self.output_near(ox.saturating_add(point.0), oy.saturating_add(point.1))];
+        Some(((ox, oy), o))
     }
 
     /// Переставить всплывающее окно: новое место от угла владельца (фаза 62e,
@@ -1988,12 +2005,21 @@ impl Compositor {
     pub fn window_at(&self, x: i32, y: i32) -> Option<(usize, Hit)> {
         // Сверху вниз: перекрытое окно щелчок получать не должно. Свёрнутого
         // окна на экране нет — щелчок проходит сквозь его прежнее место.
+        // G5: the window holding the pointer constraint has no resize border
+        // - the confined pointer rests on its edge, and that is the game's
+        // pixel (motion, clicks), not a grip.
+        let held = self.active_constraint().map(|(app, _)| app);
         self.windows
             .iter()
             .enumerate()
             .rev()
             .filter(|(_, window)| !window.minimized)
-            .find_map(|(index, window)| window.hit(x, y).map(|hit| (index, hit)))
+            .find_map(|(index, window)| {
+                window.hit(x, y).map(|hit| match hit {
+                    Hit::Resize(_) if held == Some(window.app) => (index, Hit::Body),
+                    hit => (index, hit),
+                })
+            })
     }
 
     /// Значок стола под точкой — если она не накрыта окном.
@@ -5344,11 +5370,36 @@ impl Compositor {
         let (ox, oy) = window.content_origin();
         let inside = window.rect.contains(px, py)
             && c.region.is_none_or(|region| region.contains(px - ox, py - oy));
-        if !inside {
-            return;
-        }
         if let Some(active) = self.constraint.as_mut() {
             active.active = true;
+        }
+        // G5 (21.11, hw: the pointer left the TMNF window): the focused
+        // window's constraint starts at once, like ClipCursor on Windows -
+        // a pointer outside (on the other monitor, beside the window) is
+        // brought in: into the confinement area, or to the middle of the
+        // window for a lock. Before, it waited for the pointer to come over
+        // the window, and until then the pointer roamed both monitors and
+        // its clicks went past the game.
+        if !inside {
+            let area = if c.lock {
+                None
+            } else {
+                self.confine_rect()
+            };
+            let target = match area {
+                Some(area) => (px.clamp(area.x, area.right() - 1), py.clamp(area.y, area.bottom() - 1)),
+                None => {
+                    let r = self.windows.iter().find(|window| window.app == c.app).map_or(Rect::EMPTY, |w| w.rect);
+                    (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2)
+                }
+            };
+            let outs = self.out_rects;
+            let before = self.pointer.rect();
+            if self.pointer.move_to(target.0, target.1, &outs[..self.outputs.len().min(MAX_OUTPUTS)]) && !self.hand_cursor(false) {
+                self.mark(before);
+                let after = self.pointer.rect();
+                self.mark(after);
+            }
         }
         crate::kprintln!("  desktop     : pointer {} by '{}'", if c.lock { "locked" } else { "confined" }, self.label(c.app));
         if c.lock {
