@@ -918,6 +918,14 @@ fn run_session(have_input: bool) -> ! {
         }
     }
 
+    // Настройки живой флешки (21.11): вернуть с `\FREEOS\SETTINGS.DAT`, когда
+    // флешка найдётся, и сохранять туда изменения.
+    if fs::ramvol::live() {
+        if let Err(err) = sched::spawn_daemon("stickcfg", usb::stick_settings::task) {
+            kprintln!("  spawn stick settings failed: {err}");
+        }
+    }
+
     if let Err(err) = sched::spawn_daemon("lockwatch", sched::lock_watch_task) {
         kprintln!("  sched       : the lock watch task did not start: {err}");
     }

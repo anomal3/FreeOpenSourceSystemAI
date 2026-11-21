@@ -177,6 +177,14 @@ pub fn offer(device: &Shared, first_lba: u64) {
             *DISPLAY.lock() = Some(Target { device: device.clone(), runs, size, flushed: 0, fresh: false, failures: 0 });
         }
     }
+    // Настройки живой системы (21.11): `\FREEOS\SETTINGS.DAT` заранее нужного
+    // размера, его читает и переписывает `super::stick_settings`.
+    if SETTINGS.lock().is_none() {
+        if let Some((runs, size)) = file_runs(&fat, &mut device, dir, b"SETTINGSDAT") {
+            kprintln!("  stick-log   : live settings file \\FREEOS\\SETTINGS.DAT ({} KiB)", size / 1024);
+            *SETTINGS.lock() = Some(Target { device: device.clone(), runs, size, flushed: 0, fresh: false, failures: 0 });
+        }
+    }
     if TARGET.lock().is_some() {
         return;
     }
@@ -238,6 +246,34 @@ pub fn store_layout(text: &str) -> bool {
     let ok = layout.write_range(text.as_bytes(), 0, 0, size);
     let _ = layout.device.flush();
     *LAYOUT.lock() = Some(layout);
+    ok
+}
+
+/// Файл настроек живой системы на флешке, если он есть.
+static SETTINGS: SpinLock<Option<Target>> = SpinLock::new(None);
+
+/// Размер `\FREEOS\SETTINGS.DAT`, если флешка с ним уже найдена.
+pub fn settings_size() -> Option<usize> {
+    SETTINGS.lock().as_ref().map(|target| target.size)
+}
+
+/// Прочитать `\FREEOS\SETTINGS.DAT` целиком.
+pub fn settings_read() -> Option<Vec<u8>> {
+    let mut target = SETTINGS.lock().take()?;
+    let bytes = target.read_all();
+    *SETTINGS.lock() = Some(target);
+    Some(bytes)
+}
+
+/// Переписать кусок `\FREEOS\SETTINGS.DAT` с байта `offset` (кратен
+/// сектору): `bytes`, хвост последнего сектора — пробелы. Не трогает ни FAT,
+/// ни каталог; `false` — файла нет, кусок не влезает или запись не удалась.
+pub fn settings_write(offset: usize, bytes: &[u8]) -> bool {
+    let Some(mut target) = SETTINGS.lock().take() else { return false };
+    let end = offset + bytes.len().div_ceil(SECTOR) * SECTOR;
+    let ok = offset % SECTOR == 0 && end <= target.size && target.write_range(bytes, offset, offset, end);
+    let _ = target.device.flush();
+    *SETTINGS.lock() = Some(target);
     ok
 }
 

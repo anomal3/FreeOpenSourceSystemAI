@@ -2274,7 +2274,15 @@ pub fn tick() {
     let status = status_now();
     let request = MODE_REQUEST.swap(0, core::sync::atomic::Ordering::Relaxed);
     let layout = LAYOUT_REQUEST.lock().take();
-    with_desktop(|desktop| {
+    // Настройки живой флешки вернулись после запуска стола (21.11).
+    let restored = PREFS_RESTORED.swap(false, Ordering::AcqRel);
+    if restored {
+        prefs::adopt();
+    }
+    let done = with_desktop(|desktop| {
+        if restored {
+            apply_restored(desktop, &status);
+        }
         if request != 0 {
             change_mode(desktop, ((request >> 32) as u32, request as u32), &status);
         }
@@ -2317,6 +2325,9 @@ pub fn tick() {
         }
         desktop.present();
     });
+    if restored && done.is_none() {
+        PREFS_RESTORED.store(true, Ordering::Release);
+    }
     // «Завершить программу» — вне замка стола: снятие задачи берёт свои.
     let task = HUNG_KILL.swap(0, Ordering::Relaxed);
     if task != 0 {
@@ -2326,6 +2337,33 @@ pub fn tick() {
             Ok(count) => kprintln!("  desktop     : killed #{task} ({count} process(es)), it did not respond"),
             Err(_) => kprintln!("  desktop     : #{task} could not be ended"),
         }
+    }
+}
+
+/// Настройки живой флешки вернулись в `/etc` (21.11, `usb::stick_settings`):
+/// стол перечитывает `desktop.cfg` в ближайшем [`tick`].
+static PREFS_RESTORED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Заказать столу перечитать и применить восстановленные настройки.
+pub fn settings_restored() {
+    PREFS_RESTORED.store(true, Ordering::Release);
+}
+
+/// Применить перечитанный `desktop.cfg` (тема, масштаб, панель и «Пуск»,
+/// значки) ко всему столу; раскладка мониторов — заказом, как при загрузке.
+fn apply_restored(desktop: &mut Compositor, status: &Status) {
+    apply_scale(desktop, status);
+    desktop.reload_icons();
+    // Высота заголовка, тема, акцент, обои, панель — и перерисовка всего.
+    desktop.retitle_all(status);
+    kprintln!(
+        "  desktop     : settings from the stick applied (theme {}, scale {}, ui scale {})",
+        if theme::is_dark() { "dark" } else { "light" },
+        theme::scale_choice_tag(theme::scale_choice()),
+        desktop.scale()
+    );
+    if let Some(plan) = saved_layout() {
+        LAYOUT_REQUEST.lock().replace(Some(plan));
     }
 }
 

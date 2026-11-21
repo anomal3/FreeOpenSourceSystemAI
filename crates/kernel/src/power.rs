@@ -181,7 +181,9 @@ pub fn shut_down(restart: bool) {
     // ограничено, неудача только пишется в журнал.
     let _ = crate::display::nvidia_gsp::unload(if restart { "restart" } else { "power off" });
 
-    // Журнал на живую флешку — последний раз, пока USB ещё обслуживается.
+    // Настройки живой системы на флешку (21.11) и журнал — последний раз,
+    // пока USB ещё обслуживается.
+    crate::usb::stick_settings::save_now();
     crate::usb::stick_log::flush_now();
 
     sched::set_preemption(false);

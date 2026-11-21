@@ -618,6 +618,11 @@ fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
         // чтения, и ядро переписывает этот файл на месте.
         logs.write_file_path(&mut dev, "FREEOS/LAYOUT.TXT", &vec![b' '; 4096])
             .map_err(|err| anyhow::anyhow!("не удалось записать файл раскладки: {err}"))?;
+        // Настройки живой системы (21.11): два снимка по 128 КиБ, ядро
+        // переписывает их на месте (`usb::stick_settings`). Пробелы — «снимка
+        // ещё нет».
+        logs.write_file_path(&mut dev, "FREEOS/SETTINGS.DAT", &vec![b' '; 256 * 1024])
+            .map_err(|err| anyhow::anyhow!("не удалось записать файл настроек: {err}"))?;
         logs.finish(&mut dev)
             .map_err(|err| anyhow::anyhow!("не удалось завершить раздел журнала: {err}"))?;
     }
