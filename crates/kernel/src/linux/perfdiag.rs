@@ -354,6 +354,13 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
         g2[0], g2[1], g2[2], g2[3], g2[4],
         crate::sched::fast_yields(),
     );
+    // 22.11: `schedq` mode and its picks since boot.
+    let (percpu, local, stolen, lost, locked) = crate::sched::percpu_stats();
+    let _ = write!(
+        line,
+        "; schedq {} (picks since boot: {local} own queue, {stolen} elsewhere, {lost} lost claims, {locked} switches with the lock)",
+        if percpu { "percpu" } else { "global" }
+    );
     kprintln!("  perf-diag   : {line}");
     // hw-log14 fixes at work (since boot): fence waits answered by the short
     // poll vs after sleeping, mprotect without shootdown, faults on a stale

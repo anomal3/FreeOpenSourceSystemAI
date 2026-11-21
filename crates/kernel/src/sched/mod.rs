@@ -110,7 +110,7 @@ pub use task::{
 };
 
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 
@@ -334,6 +334,38 @@ impl SlotBits {
             self.scan(0, start, &mut visit);
         }
     }
+
+    /// Visit slots set both here and in `other` of `[from, to)`.
+    fn scan_and(&self, other: &SlotBits, from: usize, to: usize, visit: &mut impl FnMut(usize) -> bool) -> bool {
+        let mut word = from / 64;
+        while word * 64 < to {
+            let mut bits = self.0[word].load(Ordering::Relaxed) & other.0[word].load(Ordering::Relaxed);
+            let base = word * 64;
+            if base < from {
+                bits &= !0u64 << (from - base);
+            }
+            if to - base < 64 {
+                bits &= (1u64 << (to - base)) - 1;
+            }
+            while bits != 0 {
+                let slot = base + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if visit(slot) {
+                    return true;
+                }
+            }
+            word += 1;
+        }
+        false
+    }
+
+    /// [`SlotBits::scan_and`] round-robin from `start`, below `high`.
+    fn scan_and_from(&self, other: &SlotBits, start: usize, high: usize, mut visit: impl FnMut(usize) -> bool) {
+        let start = start.min(high);
+        if !self.scan_and(other, start, high, &mut visit) {
+            self.scan_and(other, 0, start, &mut visit);
+        }
+    }
 }
 
 /// Tasks in state `Ready` (pick_next looks only here).
@@ -374,6 +406,455 @@ fn has_work() -> bool {
         || DEFERRED_WAKES_ANY.load(Ordering::Acquire)
         || REAP_PENDING.load(Ordering::Relaxed)
         || crate::time::uptime_ms() >= NEXT_DUE.load(Ordering::Relaxed)
+}
+
+// --- Per-CPU ready queues (`schedq percpu`, 22.11.2026) -----------------------
+//
+// hw-log14: D2R on 16 CPUs waited 340-600 ms per 30 s for the one scheduler
+// lock, mostly in `schedule_with`. In `percpu` mode the switch itself - who
+// runs next, the bookkeeping of the two tasks - takes no global lock:
+//
+// * every CPU has its ready queue (`HOMEQ`, a slot bitmap); a woken task goes
+//   to an idle CPU (its last one if that idles) and that CPU is kicked, else
+//   to the queue of the CPU it last ran on. `READY` stays the union of all
+//   queues (`has_work`, and `global` mode picks from it);
+// * a CPU picks boosted, then driver, then (with input waiting) desktop tasks
+//   from anywhere, then its own queue round-robin, then steals any ready task;
+// * a task is taken by a compare-and-swap of its `ON_CPU` flag (set while its
+//   context lives on a CPU, cleared by `finish_switch` of the next task), then
+//   its queue bits are cleared, and only then is `RUNSTATE` checked: a waker
+//   writes `RUNSTATE` before it sets the bits, so a wake-up is never lost;
+// * the global lock stays for what needs it - going to sleep (wakers check
+//   the state under it), wake-ups, deadlines, reaping, spawn, diagnostics -
+//   and for those only when there is something to do.
+//
+// `global` is the old path (one lock around the whole switch). Both modes keep
+// the same task fields; `set_percpu` flips the mode under the lock, waiting
+// for CPUs inside a lock-free switch (`IN_PERCPU`).
+
+/// Per-CPU mode is on (`schedq percpu|global`).
+static PERCPU: AtomicBool = AtomicBool::new(true);
+/// A CPU is inside the lock-free part of a `percpu` switch.
+static IN_PERCPU: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+/// Ready queue of each CPU (superset: a bit may outlive the task's stay).
+static HOMEQ: [SlotBits; MAX_CPUS] = [const { SlotBits::new() }; MAX_CPUS];
+/// Which CPU's queue a ready task was put in.
+static HOME: [AtomicU16; MAX_TASKS] = [const { AtomicU16::new(0) }; MAX_TASKS];
+/// The CPU a task last ran on (where its cache is).
+static LAST_CPU: [AtomicU16; MAX_TASKS] = [const { AtomicU16::new(0) }; MAX_TASKS];
+/// The task's context lives on a CPU (running, or still being saved): nobody
+/// else may take it. Both modes (the old `Task::cpu` + `Task::leaving` pair).
+static ON_CPU: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
+/// `Task::state` without its payload, readable without the lock.
+static RUNSTATE: [AtomicU8; MAX_TASKS] = [const { AtomicU8::new(RS_EMPTY) }; MAX_TASKS];
+const RS_EMPTY: u8 = 0;
+const RS_READY: u8 = 1;
+const RS_RUNNING: u8 = 2;
+const RS_BLOCKED: u8 = 3;
+const RS_FINISHED: u8 = 4;
+/// Tasks with `Task::boost`, driver and desktop tasks (`rank_of`).
+static BOOSTED: SlotBits = SlotBits::new();
+static DRIVERS: SlotBits = SlotBits::new();
+static DESKTOPS: SlotBits = SlotBits::new();
+/// The task in each slot, for the lock-free switch (published under the lock
+/// when the slot gets its task; the `Box` does not move).
+static TASK_PTR: [core::sync::atomic::AtomicPtr<Task>; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicPtr::new(ptr::null_mut()) }; MAX_TASKS];
+/// The slot that ran before the current one on each CPU (both modes).
+static PREV_SLOT: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
+/// Switches (and forced ones) done by `percpu` switches, per CPU.
+static PC_SWITCHES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static PC_FORCED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// `perf-diag`: picks from the own queue, from elsewhere (steals and the
+/// priority classes), lost claims, switches that needed the global lock.
+static PC_LOCAL: AtomicU64 = AtomicU64::new(0);
+static PC_STOLEN: AtomicU64 = AtomicU64::new(0);
+static PC_LOST: AtomicU64 = AtomicU64::new(0);
+static PC_LOCKED: AtomicU64 = AtomicU64::new(0);
+
+fn runstate_of(state: TaskState) -> u8 {
+    match state {
+        TaskState::Ready => RS_READY,
+        TaskState::Running => RS_RUNNING,
+        TaskState::Blocked(_) => RS_BLOCKED,
+        TaskState::Finished => RS_FINISHED,
+    }
+}
+
+/// Write `task.state` and its lock-free mirror. Every state change goes here.
+fn set_state(slot: usize, task: &mut Task, state: TaskState) {
+    task.state = state;
+    RUNSTATE[slot].store(runstate_of(state), Ordering::SeqCst);
+}
+
+fn set_boost(slot: usize, task: &mut Task, on: bool) {
+    task.boost = on;
+    if on {
+        BOOSTED.set(slot);
+    } else {
+        BOOSTED.clear(slot);
+    }
+}
+
+/// Is `schedq percpu` on.
+#[must_use]
+pub fn percpu() -> bool {
+    PERCPU.load(Ordering::Relaxed)
+}
+
+/// `(percpu on, own-queue picks, picks from elsewhere, lost claims, switches
+/// that took the global lock)` for `perf-diag`.
+#[must_use]
+pub fn percpu_stats() -> (bool, u64, u64, u64, u64) {
+    (
+        percpu(),
+        PC_LOCAL.load(Ordering::Relaxed),
+        PC_STOLEN.load(Ordering::Relaxed),
+        PC_LOST.load(Ordering::Relaxed),
+        PC_LOCKED.load(Ordering::Relaxed),
+    )
+}
+
+/// `schedq percpu|global`: switch the scheduler mode now. Under the global
+/// lock; to `global` it waits for CPUs that are inside a lock-free switch.
+pub fn set_percpu(on: bool) {
+    let sched = sched_lock();
+    if PERCPU.load(Ordering::SeqCst) == on {
+        return;
+    }
+    if on {
+        // Every ready task goes to the queue of the CPU it last ran on.
+        let high = sched.high;
+        READY.scan_from(MAX_CPUS, high, |slot| {
+            if !is_idle_slot(slot) && RUNSTATE[slot].load(Ordering::SeqCst) == RS_READY {
+                let home = usize::from(LAST_CPU[slot].load(Ordering::Relaxed));
+                let home = if home < MAX_CPUS && smp::is_online(home) { home } else { 0 };
+                HOME[slot].store(home as u16, Ordering::Relaxed);
+                HOMEQ[home].set(slot);
+            }
+            false
+        });
+        PERCPU.store(true, Ordering::SeqCst);
+    } else {
+        PERCPU.store(false, Ordering::SeqCst);
+        // `READY` already holds every queued task; wait out the CPUs that
+        // decided on `percpu` before the flag moved.
+        for flag in &IN_PERCPU {
+            while flag.load(Ordering::SeqCst) {
+                core::hint::spin_loop();
+            }
+        }
+    }
+    drop(sched);
+}
+
+/// Where a task made ready goes: an idle CPU (its last one first) that has not
+/// been kicked yet, else the CPU it last ran on.
+fn choose_cpu(slot: usize) -> usize {
+    let me = smp::cpu();
+    let last = usize::from(LAST_CPU[slot].load(Ordering::Relaxed));
+    let last_ok = last < MAX_CPUS && smp::is_online(last);
+    let free = |cpu: usize| smp::is_online(cpu) && ON_IDLE[cpu].load(Ordering::Relaxed) && !KICKED[cpu].load(Ordering::Relaxed);
+    if !RUNNING.load(Ordering::Relaxed) {
+        return if last_ok { last } else { me };
+    }
+    if last_ok && free(last) {
+        return last;
+    }
+    let online = smp::online().clamp(1, MAX_CPUS);
+    for step in 1..=online {
+        let cpu = (me + step) % online;
+        if free(cpu) {
+            return cpu;
+        }
+    }
+    if last_ok { last } else { me }
+}
+
+/// Put a ready task in a CPU's queue and kick that CPU if it idles.
+/// `RUNSTATE` must already say ready (see the protocol above).
+fn enqueue_percpu(slot: usize) {
+    let target = choose_cpu(slot);
+    HOME[slot].store(target as u16, Ordering::Relaxed);
+    HOMEQ[target].set(slot);
+    READY.set(slot);
+    let me = smp::cpu();
+    let quiet = QUIET_WAKER[RUNNING_SLOT[me].load(Ordering::Relaxed)].load(Ordering::Relaxed);
+    if target != me && !quiet && ON_IDLE[target].load(Ordering::Relaxed) {
+        kick_cpu(target);
+    }
+}
+
+/// The task wakes everybody on a key (`wake_futex(.., 0)`, I/O events): no
+/// kicks, as in `global` mode (10k IPIs a second on Wine's start, 18.11).
+static QUIET_WAKER: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
+
+/// Try to take the ready task in `slot` for this CPU (found in `found_in`'s
+/// queue, or in no queue). `true` - it is ours: `ON_CPU` is set and its bits
+/// are cleared.
+fn try_claim(slot: usize, found_in: Option<usize>) -> bool {
+    if is_idle_slot(slot) || RUNSTATE[slot].load(Ordering::SeqCst) != RS_READY {
+        return false;
+    }
+    if ON_CPU[slot].compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+        return false;
+    }
+    // Ours for now: clear the bits first, then look at the state - a waker
+    // writes the state first and then sets the bits.
+    if let Some(cpu) = found_in {
+        HOMEQ[cpu].clear(slot);
+    }
+    HOMEQ[usize::from(HOME[slot].load(Ordering::Relaxed)).min(MAX_CPUS - 1)].clear(slot);
+    READY.clear(slot);
+    core::sync::atomic::fence(Ordering::SeqCst);
+    if RUNSTATE[slot].load(Ordering::SeqCst) == RS_READY && !TASK_PTR[slot].load(Ordering::Acquire).is_null() {
+        return true;
+    }
+    // Not ready after all (a stale bit): give it back. A wake-up after the
+    // bits were cleared set them again.
+    ON_CPU[slot].store(false, Ordering::SeqCst);
+    PC_LOST.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+/// The `percpu` choice for `cpu`, whose current task is `current`. `None` -
+/// nobody else is ready.
+fn pick_percpu(cpu: usize, current: usize) -> Option<usize> {
+    let high = HIGH.load(Ordering::Acquire).min(MAX_TASKS);
+    let mut got = None;
+    // Boosted (woken by an interrupt or input), then drivers, then the
+    // desktop while input waits - from any queue, as `pick_next` does.
+    let classes: [(&SlotBits, bool); 3] = [
+        (&BOOSTED, true),
+        (&DRIVERS, true),
+        (&DESKTOPS, crate::input::has_events_now() || crate::ui::input_waiting()),
+    ];
+    for (class, wanted) in classes {
+        if !wanted || got.is_some() {
+            continue;
+        }
+        READY.scan_and_from(class, current + 1, high, |slot| {
+            if try_claim(slot, None) {
+                got = Some(slot);
+                return true;
+            }
+            false
+        });
+    }
+    if got.is_some() {
+        PC_STOLEN.fetch_add(1, Ordering::Relaxed);
+        return got;
+    }
+    // The own queue, round-robin after the current task.
+    HOMEQ[cpu].scan_from(current + 1, high, |slot| {
+        if try_claim(slot, Some(cpu)) {
+            got = Some(slot);
+            return true;
+        }
+        false
+    });
+    if got.is_some() {
+        PC_LOCAL.fetch_add(1, Ordering::Relaxed);
+        return got;
+    }
+    // Steal: any ready task, starting at a different place for each CPU.
+    let start = MAX_CPUS + (cpu * 37) % high.saturating_sub(MAX_CPUS).max(1);
+    READY.scan_from(start, high, |slot| {
+        if try_claim(slot, None) {
+            got = Some(slot);
+            return true;
+        }
+        false
+    });
+    if got.is_some() {
+        PC_STOLEN.fetch_add(1, Ordering::Relaxed);
+    }
+    got
+}
+
+/// The task in `slot` through its published pointer.
+///
+/// # Safety
+///
+/// The caller owns the task's switch fields: it is the current task of this
+/// CPU, or this CPU just claimed it (`ON_CPU`).
+unsafe fn task_at(slot: usize) -> Option<&'static mut Task> {
+    let pointer = TASK_PTR[slot].load(Ordering::Acquire);
+    // SAFETY: the function's contract; the `Box` lives while the slot does.
+    unsafe { pointer.as_mut() }
+}
+
+/// What a switch decided, carried out after the decision (both modes).
+#[derive(Default)]
+struct Plan {
+    from: Option<*mut Context>,
+    to: Option<*const Context>,
+    to_tls: u64,
+    to_gs: u64,
+    to_fs_selector: u16,
+    to_tls_entries: [u64; 3],
+    switch_user: Option<task::UserMachine>,
+    save_to: Option<*mut u8>,
+    load_from: Option<*mut u8>,
+    expired: usize,
+}
+
+/// The `percpu` switch decision. `None` - the mode went back to `global`
+/// meanwhile; the caller takes the global path.
+fn schedule_percpu(cause: Cause, block: Option<Block>) -> Option<Plan> {
+    let cpu = smp::cpu();
+    let mut plan = Plan::default();
+    // 1. What needs the global lock, only when there is some of it: going to
+    //    sleep (wakers look at the state under the lock), deferred wakes,
+    //    deadlines, reaping. Without a sleep, a busy lock is left to others.
+    let due = DEFERRED_WAKES_ANY.load(Ordering::Acquire)
+        || REAP_PENDING.load(Ordering::Relaxed)
+        || crate::time::uptime_ms() >= NEXT_DUE.load(Ordering::Relaxed);
+    if block.is_some() || due {
+        let guard = if block.is_some() { Some(sched_lock()) } else { SCHED.try_lock() };
+        if let Some(mut sched) = guard {
+            PC_LOCKED.fetch_add(1, Ordering::Relaxed);
+            if !PERCPU.load(Ordering::SeqCst) {
+                return None;
+            }
+            KICKED[cpu].store(false, Ordering::Release);
+            let current = RUNNING_SLOT[cpu].load(Ordering::Relaxed);
+            if let Some(block) = block {
+                let woken = waitq::woken(current).is_some() || WAKE_SEQ[current].load(Ordering::SeqCst) != block.seq;
+                if !woken && !is_idle_slot(current) {
+                    if let Some(task) = sched.tasks[current].as_mut() {
+                        if task.state == TaskState::Running {
+                            set_state(current, task, TaskState::Blocked(block.wait));
+                            if let Some(at) = block.until {
+                                note_deadline(current, at);
+                            }
+                        }
+                    }
+                }
+            }
+            sched.take_deferred_wakes();
+            if sched.running {
+                sched.reap();
+                plan.expired = sched.wake_expired(crate::time::uptime_ms());
+            }
+        }
+    }
+
+    // 2. The decision, without the global lock.
+    IN_PERCPU[cpu].store(true, Ordering::SeqCst);
+    if !PERCPU.load(Ordering::SeqCst) || !RUNNING.load(Ordering::Acquire) {
+        IN_PERCPU[cpu].store(false, Ordering::SeqCst);
+        return if PERCPU.load(Ordering::SeqCst) { Some(plan) } else { None };
+    }
+    KICKED[cpu].store(false, Ordering::Release);
+    let current = RUNNING_SLOT[cpu].load(Ordering::Relaxed);
+    // SAFETY: the current task of this CPU.
+    let current_state = unsafe { task_at(current) }.map(|task| task.state);
+    let next = match pick_percpu(cpu, current) {
+        Some(next) => Some(next),
+        None if is_idle_slot(current) => None,
+        None => match current_state {
+            Some(TaskState::Running | TaskState::Ready) => {
+                // Stays: woken before it went - it runs, not waits.
+                // SAFETY: as above.
+                if let Some(task) = unsafe { task_at(current) } {
+                    if task.state == TaskState::Ready {
+                        set_state(current, task, TaskState::Running);
+                    }
+                }
+                None
+            }
+            // Asleep or finished, and nobody else: this CPU's idle task.
+            _ => Some(cpu),
+        },
+    };
+    if let Some(next) = next {
+        // SAFETY: `current` runs here; `next` was claimed by this CPU (or is
+        // its idle task).
+        let (Some(source), Some(target)) = (unsafe { task_at(current) }, unsafe { task_at(next) }) else {
+            // No task behind a slot (cannot happen: both are published
+            // before they run): give the claim back, stay.
+            if !is_idle_slot(next) && next != current {
+                ON_CPU[next].store(false, Ordering::SeqCst);
+                HOMEQ[cpu].set(next);
+                READY.set(next);
+            }
+            IN_PERCPU[cpu].store(false, Ordering::SeqCst);
+            return Some(plan);
+        };
+        if let Some(stack) = source.stack.as_ref() {
+            if !stack.guard_intact() {
+                report_overflow(source.name, source.id);
+            }
+        }
+        plan.to = Some(target.context.as_ptr());
+        plan.from = Some(source.context.as_mut_ptr());
+        plan.switch_user = Some(target.user);
+        plan.save_to = source.fpu.as_ref().map(task::FpuArea::as_ptr);
+        plan.load_from = target.fpu.as_ref().map(task::FpuArea::as_ptr);
+        let now = crate::time::uptime_ms();
+        let now_ns = crate::time::uptime_ns();
+        // The leaving task: back into this CPU's queue if it still wants
+        // the CPU (claimable once `finish_switch` clears its `ON_CPU`).
+        if source.state == TaskState::Running {
+            set_state(current, source, TaskState::Ready);
+            if !is_idle_slot(current) {
+                HOME[current].store(cpu as u16, Ordering::Relaxed);
+                HOMEQ[cpu].set(current);
+                READY.set(current);
+            }
+        }
+        if source.ran_since_ms != 0 {
+            source.cpu_ms += now.saturating_sub(source.ran_since_ms);
+            source.ran_since_ms = 0;
+        }
+        cputime_switch_out(current, now_ns);
+        if cause == Cause::Preempted {
+            source.preempted += 1;
+        }
+        source.fs_selector = arch::user_fs_selector();
+        let (fs, gs) = arch::live_user_bases();
+        if let Some(fs) = fs {
+            source.tls = fs;
+        }
+        if let Some(gs) = gs {
+            source.gs = gs;
+        }
+        source.cpu = None;
+        LEAVING[cpu].store(current + 1, Ordering::Release);
+        // The coming task.
+        set_state(next, target, TaskState::Running);
+        target.cpu = Some(cpu);
+        target.switches += 1;
+        if target.boost {
+            set_boost(next, target, false);
+        }
+        target.ran_since_ms = now;
+        cputime_switch_in(next, now_ns, target.user.space_root.map_or(0, |root| root.as_u64()));
+        if target.woken_by_irq_ms != 0 {
+            let waited = now.saturating_sub(target.woken_by_irq_ms);
+            target.longest_irq_wait_ms = target.longest_irq_wait_ms.max(waited);
+            target.woken_by_irq_ms = 0;
+        }
+        plan.to_tls = target.tls;
+        plan.to_gs = target.gs;
+        plan.to_fs_selector = target.fs_selector;
+        plan.to_tls_entries = target.tls_entries;
+        if !is_idle_slot(next) {
+            LAST_CPU[next].store(cpu as u16, Ordering::Relaxed);
+        }
+        ON_CPU[next].store(true, Ordering::SeqCst);
+        PREV_SLOT[cpu].store(current, Ordering::Relaxed);
+        RUNNING_SLOT[cpu].store(next, Ordering::Relaxed);
+        PC_SWITCHES[cpu].fetch_add(1, Ordering::Relaxed);
+        if cause == Cause::Preempted {
+            PC_FORCED[cpu].fetch_add(1, Ordering::Relaxed);
+        }
+        SLICE_LEFT[cpu].store(SLICE_TICKS, Ordering::Relaxed);
+        ON_IDLE[cpu].store(is_idle_slot(next), Ordering::Relaxed);
+    }
+    IN_PERCPU[cpu].store(false, Ordering::SeqCst);
+    Some(plan)
 }
 
 /// Ожидание замка планировщика (20.11, `perf-diag`): сколько раз замок
@@ -643,7 +1124,9 @@ impl Scheduler {
     /// Вызывать только под локом: лок запрещает прерывания, и номер процессора
     /// не может смениться между вопросом и ответом.
     fn current(&self) -> usize {
-        self.cpus[smp::cpu()].current
+        // `RUNNING_SLOT`, written with every switch in both modes (a
+        // `percpu` switch does not touch `cpus`).
+        RUNNING_SLOT[smp::cpu()].load(Ordering::Relaxed)
     }
 
     /// Куда положить новую задачу.
@@ -669,7 +1152,7 @@ impl Scheduler {
             .filter(|&i| {
                 self.tasks[i]
                     .as_ref()
-                    .is_some_and(|task| task.state == TaskState::Finished && off_cpu(task))
+                    .is_some_and(|task| task.state == TaskState::Finished && off_cpu(i))
             })
             .min_by_key(|&i| self.tasks[i].as_ref().map_or(u32::MAX, |task| task.id.as_u32()))
     }
@@ -687,7 +1170,7 @@ impl Scheduler {
     /// переключений; на нескольких такая задача на миг становилась готовой и
     /// ничьей — и её было видно в `tasks` вместо «исполняется».
     fn pick_next(&self, cpu: usize) -> Option<usize> {
-        let current = self.cpus[cpu].current;
+        let current = RUNNING_SLOT[cpu].load(Ordering::Relaxed);
         // One walk over the ready set (G2, 21.11.2026) instead of three walks
         // over every slot: round-robin from the slot after the current one,
         // the first boosted task wins at once, otherwise remember the first
@@ -711,7 +1194,7 @@ impl Scheduler {
                 READY.clear(slot);
                 return false;
             }
-            if !off_cpu(task) {
+            if !off_cpu(slot) {
                 return false;
             }
             if task.boost {
@@ -749,9 +1232,39 @@ impl Scheduler {
     /// Make the task in `slot` ready (and visible to `pick_next`).
     fn set_ready(&mut self, slot: usize) {
         if let Some(task) = self.tasks[slot].as_mut() {
-            task.state = TaskState::Ready;
+            set_state(slot, task, TaskState::Ready);
             if !is_idle_slot(slot) {
-                READY.set(slot);
+                if PERCPU.load(Ordering::Relaxed) {
+                    enqueue_percpu(slot);
+                } else {
+                    READY.set(slot);
+                }
+            }
+        }
+    }
+
+    /// Пробуждения, отложенные `wake` при занятом замке (13.11).
+    fn take_deferred_wakes(&mut self) {
+        if !DEFERRED_WAKES_ANY.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if DEFERRED_OVERFLOW.swap(false, Ordering::AcqRel) {
+            for slot in MAX_CPUS..self.high {
+                if self.tasks[slot].as_ref().is_some_and(|task| matches!(task.state, TaskState::Blocked(_))) {
+                    self.set_ready(slot);
+                }
+            }
+        }
+        for cell in &DEFERRED_WAKES {
+            let raw = cell.swap(0, Ordering::AcqRel);
+            if raw == 0 {
+                continue;
+            }
+            let id = TaskId::new(raw);
+            if let Some(slot) = slot_of(id) {
+                if self.tasks[slot].as_ref().is_some_and(|task| task.id == id && matches!(task.state, TaskState::Blocked(_))) {
+                    self.set_ready(slot);
+                }
             }
         }
     }
@@ -841,7 +1354,7 @@ impl Scheduler {
             }
             if let Some(task) = entry {
                 if task.state == TaskState::Finished && task.stack.is_some() {
-                    if !off_cpu(task) {
+                    if !off_cpu(slot) {
                         left = true;
                         continue;
                     }
@@ -878,12 +1391,12 @@ impl Scheduler {
     /// Снять метку процессора с задачи, уступившей процессор вызывающему.
     /// Сколько всего было переключений, на всех процессорах.
     fn switches(&self) -> u64 {
-        self.cpus.iter().map(|cpu| cpu.switches).sum()
+        self.cpus.iter().map(|cpu| cpu.switches).sum::<u64>() + PC_SWITCHES.iter().map(|n| n.load(Ordering::Relaxed)).sum::<u64>()
     }
 
     /// Сколько из них по истёкшему кванту.
     fn forced(&self) -> u64 {
-        self.cpus.iter().map(|cpu| cpu.forced).sum()
+        self.cpus.iter().map(|cpu| cpu.forced).sum::<u64>() + PC_FORCED.iter().map(|n| n.load(Ordering::Relaxed)).sum::<u64>()
     }
 }
 
@@ -980,13 +1493,40 @@ pub fn spawn_raw(
     sched.next_id += 1;
     cputime_reset(slot);
     sched.tasks[slot] = Some(boxed);
+    publish(&mut sched, slot);
+    match rank_of(name) {
+        Some(Rank::Driver) => DRIVERS.set(slot),
+        _ => DRIVERS.clear(slot),
+    }
+    match rank_of(name) {
+        Some(Rank::Desktop) => DESKTOPS.set(slot),
+        _ => DESKTOPS.clear(slot),
+    }
+    BOOSTED.clear(slot);
+    LAST_CPU[slot].store(smp::cpu() as u16, Ordering::Relaxed);
     sched.high = sched.high.max(slot + 1);
     HIGH.store(sched.high, Ordering::Release);
     SLOT_ID[slot].store(id.as_u32(), Ordering::Relaxed);
     ALIVE.fetch_add(1, Ordering::Relaxed);
     // A new task is `Ready` from the start.
-    READY.set(slot);
+    RUNSTATE[slot].store(RS_READY, Ordering::SeqCst);
+    if PERCPU.load(Ordering::Relaxed) {
+        enqueue_percpu(slot);
+    } else {
+        READY.set(slot);
+    }
     Ok(id)
+}
+
+/// The slot got (or lost) its task: publish the pointer for the lock-free
+/// switch. Under the lock.
+fn publish(sched: &mut Scheduler, slot: usize) {
+    // The pointer before the state: a CPU that sees "ready" (with a stale
+    // queue bit) must find this task, not the one that had the slot before.
+    let pointer = sched.tasks[slot].as_mut().map_or(ptr::null_mut(), |task| &mut **task as *mut Task);
+    TASK_PTR[slot].store(pointer, Ordering::SeqCst);
+    let state = sched.tasks[slot].as_ref().map_or(RS_EMPTY, |task| runstate_of(task.state));
+    RUNSTATE[slot].store(state, Ordering::SeqCst);
 }
 
 /// Сколько сессий терминала (вкладок) бывает одновременно.
@@ -1287,7 +1827,7 @@ pub fn wait(id: TaskId) -> Option<i64> {
                 Some(_) => {
                     let current = sched.current();
                     if let Some(task) = sched.tasks[current].as_mut() {
-                        task.state = TaskState::Blocked(Wait::Task(id));
+                        set_state(current, task, TaskState::Blocked(Wait::Task(id)));
                     }
                 }
             }
@@ -1314,7 +1854,7 @@ pub fn sleep_until(at_ms: u64) {
         }
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
-            task.state = TaskState::Blocked(Wait::Until(at_ms));
+            set_state(current, task, TaskState::Blocked(Wait::Until(at_ms)));
             note_deadline(current, at_ms);
         }
     }
@@ -1338,7 +1878,7 @@ pub fn block_on_input(until: u64, changed: impl FnOnce() -> bool) {
         }
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
-            task.state = TaskState::Blocked(Wait::Input(until));
+            set_state(current, task, TaskState::Blocked(Wait::Input(until)));
             note_deadline(current, until);
             INPUT_WAITERS.set(current);
         }
@@ -1389,7 +1929,7 @@ pub fn block_on_irq_until(source: u32, ms: u64, ready: impl FnOnce() -> bool) {
         }
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
-            task.state = TaskState::Blocked(Wait::IrqUntil(source, until));
+            set_state(current, task, TaskState::Blocked(Wait::IrqUntil(source, until)));
             note_deadline(current, until);
             IRQ_WAITERS.set(current);
         }
@@ -1411,7 +1951,7 @@ pub fn block_on_irq(source: u32, ready: impl FnOnce() -> bool) {
         }
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
-            task.state = TaskState::Blocked(Wait::Irq(source));
+            set_state(current, task, TaskState::Blocked(Wait::Irq(source)));
             IRQ_WAITERS.set(current);
         }
     }
@@ -1452,7 +1992,7 @@ pub fn wake_irq(source: u32) {
         if let Some(task) = sched.tasks[slot].as_mut() {
             // Не ноль, даже если часы ещё на нуле: ноль значит «отметки нет».
             task.woken_by_irq_ms = crate::time::uptime_ms().max(1);
-            task.boost = true;
+            set_boost(slot, task, true);
             woken += 1;
         }
     }
@@ -1478,7 +2018,7 @@ pub fn wake_lock(address: usize) {
     // Пинок одному простаивающему (20.11): лок возьмёт один, остальные
     // уснут снова; без пинка разбуженный ждал тика (10 мс) на холостом ЦП.
     if woke > 0 {
-        kick_idle(1);
+        kick_woken(1);
     }
 }
 
@@ -1606,13 +2146,23 @@ pub fn block_on_futex(key: usize, until: Option<u64>, ready: impl FnOnce() -> bo
 /// стоило ли вообще звать ядро.
 pub fn wake_futex(key: usize, count: usize) -> usize {
     // Only the bucket of `key` and one short scheduler-lock round (G2).
-    let woken = waitq::wake(waitq::Kind::Futex, key, count, make_ready_slots);
+    let woken = if count == 0 && PERCPU.load(Ordering::Relaxed) {
+        // `percpu` kicks the CPU it queues a task on; not for "wake all" -
+        // see below.
+        let slot = current_slot();
+        QUIET_WAKER[slot].store(true, Ordering::Relaxed);
+        let woken = waitq::wake(waitq::Kind::Futex, key, count, make_ready_slots);
+        QUIET_WAKER[slot].store(false, Ordering::Relaxed);
+        woken
+    } else {
+        waitq::wake(waitq::Kind::Futex, key, count, make_ready_slots)
+    };
     // Пинок — только адресному пробуждению (futex программы: передача работы
     // потоку). «Всех» (`count` 0) будит `io_events::notify` на каждое событие
     // ввода-вывода — с пинком это было 10 тыс. IPI в секунду и вдвое больше
     // переключений на запуске Wine (Блокнот 56 с вместо 36 с, 18.11).
     if count != 0 {
-        kick_idle(woken);
+        kick_woken(woken);
     }
     woken
 }
@@ -1655,17 +2205,36 @@ fn kick_idle(count: usize) {
         if cpu == me || !smp::is_online(cpu) || !ON_IDLE[cpu].load(Ordering::Relaxed) {
             continue;
         }
-        if !KICKED[cpu].swap(true, Ordering::SeqCst) {
-            // Крутящемуся в `idle_wait` пинок — сам флаг (20.11): IPI ему не
-            // нужен. Порядок SeqCst — пара с `idle_wait`: либо он увидит флаг,
-            // либо мы — что он уже не крутится и идёт в `hlt`.
-            if POLLING[cpu].load(Ordering::SeqCst) {
-                POLL_KICKS.fetch_add(1, Ordering::Relaxed);
-            } else {
-                arch::smp::kick(cpu);
-            }
+        if kick_cpu(cpu) {
             left -= 1;
         }
+    }
+}
+
+/// Пнуть один процессор, если его ещё не пнули. `false` — уже пнут.
+fn kick_cpu(cpu: usize) -> bool {
+    if !KICKS.load(Ordering::Relaxed) || !RUNNING.load(Ordering::Relaxed) || smp::online() <= 1 {
+        return false;
+    }
+    if KICKED[cpu].swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    // Крутящемуся в `idle_wait` пинок — сам флаг (20.11): IPI ему не
+    // нужен. Порядок SeqCst — пара с `idle_wait`: либо он увидит флаг,
+    // либо мы — что он уже не крутится и идёт в `hlt`.
+    if POLLING[cpu].load(Ordering::SeqCst) {
+        POLL_KICKS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        arch::smp::kick(cpu);
+    }
+    true
+}
+
+/// Kick after a wake-up: `percpu` mode already kicked the CPU it queued the
+/// task on.
+fn kick_woken(count: usize) {
+    if !PERCPU.load(Ordering::Relaxed) {
+        kick_idle(count);
     }
 }
 
@@ -1809,7 +2378,7 @@ pub fn wake_input() {
         INPUT_WAITERS.clear(slot);
         sched.set_ready(slot);
         if let Some(task) = sched.tasks[slot].as_mut() {
-            task.boost = true;
+            set_boost(slot, task, true);
             woke = true;
         }
     }
@@ -1862,7 +2431,7 @@ pub fn wake(id: TaskId) {
     }
     drop(sched);
     if woke {
-        kick_idle(1);
+        kick_woken(1);
     }
 }
 
@@ -2006,8 +2575,32 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
     let mut save_to = None;
     let mut load_from = None;
 
-    {
+    loop {
+        // `schedq percpu`: the decision without the global lock.
+        if PERCPU.load(Ordering::Acquire) {
+            if let Some(plan) = schedule_percpu(cause, block) {
+                if let (Some(source), Some(target)) = (plan.from, plan.to) {
+                    from = source;
+                    to = target;
+                }
+                to_tls = plan.to_tls;
+                to_gs = plan.to_gs;
+                to_fs_selector = plan.to_fs_selector;
+                to_tls_entries = plan.to_tls_entries;
+                expired = plan.expired;
+                switch_user = plan.switch_user;
+                save_to = plan.save_to;
+                load_from = plan.load_from;
+                break;
+            }
+        }
         let mut sched = sched_lock();
+        // The mode moved to `percpu` while we waited: the global path must
+        // not take a task that a lock-free switch may take too.
+        if PERCPU.load(Ordering::SeqCst) {
+            drop(sched);
+            continue;
+        }
         // Номер процессора стабилен до конца блока: прерывания запрещены, и
         // перенести эту задачу на другой процессор нечем.
         let cpu = smp::cpu();
@@ -2016,12 +2609,12 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
         // lock that also picks the next task, unless a wake already came -
         // a key took it out of its queue, or `wake(id)` moved its sequence.
         if let Some(block) = block {
-            let current = sched.cpus[cpu].current;
+            let current = RUNNING_SLOT[cpu].load(Ordering::Relaxed);
             let woken = waitq::woken(current).is_some() || WAKE_SEQ[current].load(Ordering::SeqCst) != block.seq;
             if !woken && !is_idle_slot(current) {
                 if let Some(task) = sched.tasks[current].as_mut() {
                     if task.state == TaskState::Running {
-                        task.state = TaskState::Blocked(block.wait);
+                        set_state(current, task, TaskState::Blocked(block.wait));
                         if let Some(at) = block.until {
                             note_deadline(current, at);
                         }
@@ -2030,27 +2623,7 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
             }
         }
         // Пробуждения, отложенные `wake` при занятом замке (13.11).
-        if DEFERRED_WAKES_ANY.swap(false, Ordering::AcqRel) {
-            if DEFERRED_OVERFLOW.swap(false, Ordering::AcqRel) {
-                for slot in MAX_CPUS..sched.high {
-                    if sched.tasks[slot].as_ref().is_some_and(|task| matches!(task.state, TaskState::Blocked(_))) {
-                        sched.set_ready(slot);
-                    }
-                }
-            }
-            for cell in &DEFERRED_WAKES {
-                let raw = cell.swap(0, Ordering::AcqRel);
-                if raw == 0 {
-                    continue;
-                }
-                let id = TaskId::new(raw);
-                if let Some(slot) = slot_of(id) {
-                    if sched.tasks[slot].as_ref().is_some_and(|task| task.id == id && matches!(task.state, TaskState::Blocked(_))) {
-                        sched.set_ready(slot);
-                    }
-                }
-            }
-        }
+        sched.take_deferred_wakes();
         if sched.running {
             sched.reap();
             // Сроки проверяются здесь, а не в обработчике таймера: обработчик
@@ -2060,7 +2633,7 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
             // считает (см. `block_on_irq_until`).
             expired = sched.wake_expired(crate::time::uptime_ms());
 
-            let current = sched.cpus[cpu].current;
+            let current = RUNNING_SLOT[cpu].load(Ordering::Relaxed);
             match sched.pick_next(cpu) {
                 None => {
                     // Остаёмся. Задача, которую разбудили до того, как она ушла,
@@ -2068,7 +2641,7 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
                     if !is_idle_slot(current) {
                         if let Some(task) = sched.tasks[current].as_mut() {
                             if task.state == TaskState::Ready {
-                                task.state = TaskState::Running;
+                                set_state(current, task, TaskState::Running);
                             }
                         }
                     }
@@ -2130,7 +2703,7 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
                         let now_ns = crate::time::uptime_ns();
                         if let Some(task) = sched.tasks[current].as_mut() {
                             if task.state == TaskState::Running {
-                                task.state = TaskState::Ready;
+                                set_state(current, task, TaskState::Ready);
                                 if !is_idle_slot(current) {
                                     READY.set(current);
                                 }
@@ -2168,16 +2741,16 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
                             }
                             // Метка процессора снимается сразу, а «ещё
                             // уходит» — флагом, который снимет пришедшая без
-                            // замка (D4, см. `Task::leaving`).
+                            // замка (D4; since 22.11 its `ON_CPU` flag, the
+                            // same in both modes).
                             task.cpu = None;
-                            task.leaving.store(true, Ordering::Relaxed);
-                            LEAVING[cpu].store(core::ptr::from_ref(&task.leaving) as usize, Ordering::Relaxed);
+                            LEAVING[cpu].store(current + 1, Ordering::Release);
                         }
                         if let Some(task) = sched.tasks[next].as_mut() {
-                            task.state = TaskState::Running;
+                            set_state(next, task, TaskState::Running);
                             task.cpu = Some(cpu);
                             task.switches += 1;
-                            task.boost = false;
+                            set_boost(next, task, false);
                             task.ran_since_ms = now;
                             cputime_switch_in(next, now_ns, task.user.space_root.map_or(0, |root| root.as_u64()));
                             if task.woken_by_irq_ms != 0 {
@@ -2190,6 +2763,11 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
                             to_fs_selector = task.fs_selector;
                             to_tls_entries = task.tls_entries;
                         }
+                        ON_CPU[next].store(true, Ordering::SeqCst);
+                        if !is_idle_slot(next) {
+                            LAST_CPU[next].store(cpu as u16, Ordering::Relaxed);
+                        }
+                        PREV_SLOT[cpu].store(current, Ordering::Relaxed);
                         let state = &mut sched.cpus[cpu];
                         state.previous = Some(current);
                         state.current = next;
@@ -2206,6 +2784,8 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
         }
         // Охранник уничтожается здесь — до `switch_context`. Прерывания при
         // этом не включаются: `lock()` застал их уже запрещёнными.
+        drop(sched);
+        break;
     }
     if let Some(next_user) = switch_user {
         // Стек ловушки — тот же адрес, что стек возврата из третьего кольца,
@@ -2240,7 +2820,7 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
     // Tasks whose deadline passed became ready here; idle CPUs take them now
     // instead of at their next tick (G2: ready tasks waited while CPUs idled).
     if expired > 1 {
-        kick_idle(expired - 1);
+        kick_woken(expired - 1);
     }
 
     if !from.is_null() && !to.is_null() {
@@ -2269,24 +2849,22 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
 /// Снять метку процессора с задачи, только что уступившей его. См. заголовок
 /// модуля.
 fn finish_switch() {
-    let flag = LEAVING[smp::cpu()].swap(0, Ordering::AcqRel);
-    if flag != 0 {
-        // SAFETY: флаг лежит в `Box<Task>` уходившей задачи; пока он `true`,
-        // ни уборщик, ни новая задача на её месте ([`off_cpu`]) её не тронут,
-        // так что он жив до этой записи включительно. `Release` — всё, что
-        // `switch_context` сохранил в её контекст, видно тому, кто возьмёт
-        // её следующим (он читает флаг с `Acquire` под замком).
-        unsafe { (*(flag as *const AtomicBool)).store(false, Ordering::Release) };
+    let leaving = LEAVING[smp::cpu()].swap(0, Ordering::AcqRel);
+    if let Some(slot) = leaving.checked_sub(1) {
+        // `Release` (SeqCst) — всё, что `switch_context` сохранил в её
+        // контекст, видно тому, кто возьмёт её следующим (он берёт флаг
+        // сравнением с обменом или читает его с `Acquire` под замком).
+        ON_CPU[slot].store(false, Ordering::SeqCst);
     }
 }
 
-/// Флаг [`Task::leaving`] задачи, уходящей с процессора, — по процессору;
-/// ноль — нет такой.
+/// Слот задачи, уходящей с процессора (плюс один), — по процессору; ноль —
+/// нет такой. Её `ON_CPU` снимает [`finish_switch`].
 static LEAVING: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
 /// Задачу можно взять или убрать: не исполняется и не уходит с процессора.
-fn off_cpu(task: &Task) -> bool {
-    task.cpu.is_none() && !task.leaving.load(Ordering::Acquire)
+fn off_cpu(slot: usize) -> bool {
+    !ON_CPU[slot].load(Ordering::Acquire)
 }
 
 /// Батут, с которого начинает любая задача, созданная [`spawn_raw`].
@@ -2384,10 +2962,14 @@ pub fn diag_tick(ticks: u64) {
         return;
     };
     let mut stale = 0usize;
+    let cpu_current = |c: usize| RUNNING_SLOT[c].load(Ordering::Relaxed);
+    let cpu_previous = |c: usize| Some(PREV_SLOT[c].load(Ordering::Relaxed)).filter(|&slot| slot != usize::MAX);
+    // `percpu` switches write the labels without this lock: no stale check.
+    let check = !PERCPU.load(Ordering::Relaxed);
     for (slot, entry) in sched.slots().iter().enumerate() {
         let Some(task) = entry else { continue };
-        if let Some(c) = task.cpu {
-            let on = sched.cpus[c].current == slot || sched.cpus[c].previous == Some(slot);
+        if let Some(c) = task.cpu.filter(|_| check) {
+            let on = cpu_current(c) == slot || cpu_previous(c) == Some(slot);
             if !on && task.state != TaskState::Running {
                 stale += 1;
                 if dump || STALE_SEEN.load(Ordering::Relaxed) == 0 {
@@ -2396,8 +2978,8 @@ pub fn diag_tick(ticks: u64) {
                         task.id.as_u32(),
                         task.name,
                         task.state,
-                        sched.cpus[c].current,
-                        sched.cpus[c].previous
+                        cpu_current(c),
+                        cpu_previous(c)
                     );
                 }
             }
@@ -2408,8 +2990,9 @@ pub fn diag_tick(ticks: u64) {
         // Экран не забирается: забор идёт через локи консоли, и зависни он —
         // не было бы и журнала гипервизора, единственного надёжного здесь.
         dumpln!("  dump        : uptime {} ms, {} stale label(s)", crate::time::uptime_ms(), stale);
-        for (c, state) in sched.cpus.iter().enumerate().take(smp::online()) {
-            dumpln!("  dump        : cpu {c} runs slot {} (prev {:?})", state.current, state.previous);
+        dumpln!("  dump        : scheduler queues {}", if PERCPU.load(Ordering::Relaxed) { "per cpu" } else { "global" });
+        for c in 0..smp::online().min(MAX_CPUS) {
+            dumpln!("  dump        : cpu {c} runs slot {} (prev {:?})", cpu_current(c), cpu_previous(c));
         }
         for (slot, entry) in sched.slots().iter().enumerate() {
             let Some(task) = entry else { continue };
@@ -2600,6 +3183,7 @@ pub fn prepare_cpu(index: usize) -> Option<usize> {
 
     let mut sched = sched_lock();
     sched.tasks[index] = Some(boxed);
+    publish(&mut sched, index);
     sched.cpus[index].current = index;
     RUNNING_SLOT[index].store(index, Ordering::Relaxed);
     Some(top)
@@ -2615,7 +3199,12 @@ pub fn forget_cpu(index: usize) {
     }
     // Задача уничтожается после охранника: `Drop` стека трогает кучу, и делать
     // это под локом планировщика незачем.
-    let task = sched_lock().tasks[index].take();
+    let task = {
+        let mut sched = sched_lock();
+        let task = sched.tasks[index].take();
+        publish(&mut sched, index);
+        task
+    };
     drop(task);
 }
 
@@ -2636,6 +3225,7 @@ pub fn run() -> ! {
             arch::halt();
         }
         sched.tasks[0] = Some(idle);
+        publish(&mut sched, 0);
         sched.cpus[0].current = 0;
         sched.running = true;
     }
@@ -3006,10 +3596,11 @@ pub fn dump() {
     // задачи не могут исполняться в один миг на одном процессоре.
     for &cpu in &online {
         let state = &sched.cpus[cpu];
-        let what = if is_idle_slot(state.current) {
+        let current = RUNNING_SLOT[cpu].load(Ordering::Relaxed);
+        let what = if is_idle_slot(current) {
             alloc::string::String::from("idle")
         } else {
-            match sched.tasks[state.current].as_ref() {
+            match sched.tasks[current].as_ref() {
                 Some(task) => alloc::format!("running {} ({})", task.id, task.name),
                 None => alloc::string::String::from("unknown"),
             }
@@ -3021,8 +3612,8 @@ pub fn dump() {
         let idle_percent = if ticks == 0 { 0 } else { idle * 100 / ticks };
         kprintln!(
             "  cpu {cpu}      : {what}, {} switches ({} forced), idle {idle_percent}% of its ticks",
-            state.switches,
-            state.forced
+            state.switches + PC_SWITCHES[cpu].load(Ordering::Relaxed),
+            state.forced + PC_FORCED[cpu].load(Ordering::Relaxed)
         );
     }
 }
@@ -3064,7 +3655,7 @@ pub fn exit_current_with(result: i64) -> ! {
                 ALIVE.fetch_sub(1, Ordering::AcqRel);
             }
             REAP_PENDING.store(true, Ordering::Release);
-            task.state = TaskState::Finished;
+            set_state(current, task, TaskState::Finished);
             task.result = result;
             id = task.id;
             // Программы у завершившейся задачи больше нет, и её адресное

@@ -1371,6 +1371,21 @@ fn run_builtin(line: &str) -> bool {
             }
             sprintln!("  schedkick: {}", if crate::sched::kicks() { "on" } else { "off" });
         }
+        // Ready queues per CPU with work stealing, or the one global queue
+        // under the scheduler lock (22.11.2026, A/B in one boot).
+        "schedq" => {
+            match argument.trim() {
+                "percpu" => crate::sched::set_percpu(true),
+                "global" => crate::sched::set_percpu(false),
+                "" => {}
+                _ => sprintln!("  schedq: usage `schedq [percpu|global]`"),
+            }
+            let (on, local, stolen, lost, locked) = crate::sched::percpu_stats();
+            sprintln!(
+                "  schedq: {} (per-cpu picks: {local} own queue, {stolen} elsewhere, {lost} lost claims, {locked} with the global lock)",
+                if on { "percpu" } else { "global" }
+            );
+        }
         // Право `jit` проверочным программам Linux из `/compat/linux/bin`
         // (P5, 18.11.2026): там нет пакета, который назвал бы его, а проба
         // `rwxprobe` проверяет именно память «на запись и исполнение».
