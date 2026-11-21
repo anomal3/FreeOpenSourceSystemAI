@@ -4187,7 +4187,13 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
             kprintln!("  desktop     : closed '{}'", app.title());
         }
         let entries = core::mem::take(&mut *DELETE_PENDING.lock());
-        if answer == Answer::Confirm {
+        if EMPTY_PENDING.swap(false, Ordering::Relaxed) {
+            if answer == Answer::Confirm {
+                empty_trash(desktop);
+            } else {
+                kprintln!("  desktop     : emptying the trash cancelled");
+            }
+        } else if answer == Answer::Confirm {
             trash_entries(desktop, &entries);
         } else {
             kprintln!("  desktop     : delete cancelled");
@@ -5597,16 +5603,33 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             desktop.close_context();
             kprintln!("  desktop     : context menu closed");
             *DELETE_PENDING.lock() = entries;
+            EMPTY_PENDING.store(false, Ordering::Relaxed);
             let rect = layout(desktop, App::DeleteAsk);
-            if let Some(window) = Window::dialog(App::DeleteAsk, rect, desktop.scale(), Dialog::Delete { question }) {
+            if let Some(window) = Window::dialog(App::DeleteAsk, rect, desktop.scale(), Dialog::Delete { question, forever: false }) {
                 desktop.push(window);
                 kprintln!("  desktop     : opened '{}'", App::DeleteAsk.title());
                 log_focus(desktop);
             }
         }
+        // «Очистить корзину» спрашивает тем же окном, что и удаление (21.11),
+        // а не строкой в карточке меню: вопрос о безвозвратном стирании —
+        // не место для мелкого шрифта.
         context::Action::EmptyTrash => match trash::usage() {
             (0, _) => desktop.context_note("Корзина пуста"),
-            (count, _) => desktop.context_confirm(&alloc::format!("Объектов в корзине: {count}"), true),
+            (count, _) => {
+                desktop.close_context();
+                kprintln!("  desktop     : context menu closed");
+                DELETE_PENDING.lock().clear();
+                EMPTY_PENDING.store(true, Ordering::Relaxed);
+                let question = alloc::format!("Очистить корзину? Объектов: {count}");
+                let rect = layout(desktop, App::DeleteAsk);
+                if let Some(mut window) = Window::dialog(App::DeleteAsk, rect, desktop.scale(), Dialog::Delete { question, forever: true }) {
+                    window.set_caption("Очистка корзины", true);
+                    desktop.push(window);
+                    kprintln!("  desktop     : opened '{}' to empty the trash", App::DeleteAsk.title());
+                    log_focus(desktop);
+                }
+            }
         },
         context::Action::Properties => {
             let trash_selected = desktop.icon_selection().is_some_and(|index| matches!(desktop.icon_kind(index), Some(icons::Kind::Trash(_))));
@@ -6006,36 +6029,18 @@ fn handle_context_key(desktop: &mut Compositor, event: KeyEvent, status: &Status
             desktop.present();
             true
         }
-        context::Reply::Delete => {
-            // Всё выделенное, что лежит в каталоге стола; если выделен один
-            // значок — прежний путь (он же для единственного файла).
-            let mut entries = selected_entries(desktop);
-            if entries.is_empty() {
-                entries.extend(selected_entry(desktop));
-            }
-            if entries.is_empty() {
-                desktop.context_note("nothing is selected");
-            }
-            trash_entries(desktop, &entries);
-            desktop.present();
-            true
-        }
-        context::Reply::EmptyTrash => {
-            match trash::empty() {
-                Ok(count) => {
-                    kprintln!("  desktop     : emptied the trash, {count} items");
-                    desktop.context_note(&alloc::format!("Стёрто объектов: {count}"));
-                }
-                Err(err) => {
-                    kprintln!("  desktop     : cannot empty the trash: {err}");
-                    desktop.context_note(&err);
-                }
-            }
-            desktop.reload_icons();
-            desktop.present();
-            true
-        }
     }
+}
+
+/// Стереть содержимое корзины — ответ «Удалить навсегда» на вопрос об очистке.
+fn empty_trash(desktop: &mut Compositor) {
+    match trash::empty() {
+        Ok(count) => {
+            kprintln!("  desktop     : emptied the trash, {count} items");
+        }
+        Err(err) => kprintln!("  desktop     : cannot empty the trash: {err}"),
+    }
+    desktop.reload_icons();
 }
 
 /// «Свойства» записи стола одной строкой: тип и размер (у ярлыка — команда).
@@ -6058,6 +6063,10 @@ fn entry_facts(path: &str, label: &str) -> String {
 
 /// Что ждёт ответа окна «Удаление файла»: путь и подпись.
 static DELETE_PENDING: SpinLock<alloc::vec::Vec<(String, String)>> = SpinLock::new(alloc::vec::Vec::new());
+
+/// Окно «Удаление» открыто вопросом об очистке корзины, а не об удалении
+/// выделенного (21.11).
+static EMPTY_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Перенести записи стола в корзину; ответ — в меню (если открыто) и журнал.
 fn trash_entries(desktop: &mut Compositor, entries: &[(String, String)]) {

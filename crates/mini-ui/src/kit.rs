@@ -1055,3 +1055,136 @@ impl TabStrip {
         iconset::draw(s, Fi::Plus, self.plus.x + (self.plus.w as i32 - g as i32) / 2, self.plus.y + (self.plus.h as i32 - g as i32) / 2, g, if hover == Some(TabHit::New) { p.ink } else { p.ink3 }, 255);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Вопрос поверх окна
+// ---------------------------------------------------------------------------
+
+/// Вопрос «Удалить?», «Очистить корзину?» поверх окна программы (21.11).
+///
+/// Тот же вид, что у окон-вопросов ядра (`ui::dialog`: «Удаление файла»,
+/// «Выключение»): плитка со значком слева, заголовок, пояснение, черта и
+/// кнопки в правом нижнем углу — действие, потом «Отмена»; кнопка, которую
+/// нажмёт Enter, обведена. Окно под вопросом притушено: отвечать надо ему.
+/// Состояния нет, как и у остального здесь: выбранную кнопку держит
+/// программа, клавиши (Enter, Esc, Tab, стрелки) разбирает она же.
+pub struct Ask<'a> {
+    pub icon: Icon,
+    pub tone: paint::Tone,
+    pub title: &'a str,
+    /// Что именно спрашивается — имя файла, число объектов; строкой между
+    /// заголовком и пояснением. Пусто — строки нет.
+    pub detail: &'a str,
+    pub text: &'a str,
+    /// Подпись и вес кнопки действия; вторая кнопка — «Отмена».
+    pub action: &'a str,
+    pub weight: paint::Weight,
+}
+
+/// Где карточка вопроса и её кнопки: `[действие, отмена]`.
+#[derive(Clone, Copy)]
+pub struct AskLayout {
+    pub card: Rect,
+    pub buttons: [Rect; 2],
+}
+
+/// Поля карточки вопроса.
+const ASK_PAD: u32 = 24;
+/// Плитка со значком.
+const ASK_TILE: u32 = 44;
+/// Высота кнопки.
+const ASK_BUTTON_H: u32 = 32;
+/// Самая узкая кнопка.
+const ASK_BUTTON_MIN_W: u32 = 104;
+
+/// Строки пояснения, разбитые по словам под ширину `width`.
+fn ask_lines(ctx: Ctx, text: &str, width: u32) -> Vec<String> {
+    let face = ctx.face(Role::Body);
+    let space = face.width(" ");
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0;
+    for word in text.split(' ') {
+        let word_w = face.width(word);
+        if !current.is_empty() && current_w + space + word_w > width {
+            out.push(core::mem::take(&mut current));
+            current_w = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+            current_w += space;
+        }
+        current.push_str(word);
+        current_w += word_w;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Раскладка вопроса посреди `area` — одна для отрисовки и для щелчка.
+#[must_use]
+pub fn ask_layout(ctx: Ctx, area: Rect, ask: &Ask<'_>) -> AskLayout {
+    let pad = ctx.px(ASK_PAD);
+    // Заголовок не обрезается: карточка шире, если он длинный.
+    let fit = ctx.face(Role::Heading).width(ask.title) + pad * 2 + ctx.px(ASK_TILE + 16 + 4);
+    let w = fit.max(ctx.px(460)).min(area.w.saturating_sub(ctx.px(24)));
+    let text_w = w.saturating_sub(pad * 2 + ctx.px(ASK_TILE + 16));
+    let lines = ask_lines(ctx, ask.text, text_w).len().max(1) as u32;
+    let heading = u32::from(ctx.face(Role::Heading).line);
+    let body = u32::from(ctx.face(Role::Body).line);
+    let detail = if ask.detail.is_empty() { 0 } else { body + ctx.px(4) };
+    let top = (heading + ctx.px(8) + detail + body * lines).max(ctx.px(ASK_TILE));
+    let h = pad + top + ctx.px(28) + ctx.px(ASK_BUTTON_H) + pad;
+    let card = Rect::new(area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 2, w, h);
+    let face = ctx.face(Role::Label);
+    let width = |label: &str| (face.width(label) + ctx.px(36)).max(ctx.px(ASK_BUTTON_MIN_W));
+    let (yes_w, no_w) = (width(ask.action), width("Отмена"));
+    let gap = ctx.px(8);
+    let by = card.bottom() - (pad + ctx.px(ASK_BUTTON_H)) as i32;
+    let no = Rect::new(card.right() - (pad + no_w) as i32, by, no_w, ctx.px(ASK_BUTTON_H));
+    let yes = Rect::new(no.x - (gap + yes_w) as i32, by, yes_w, ctx.px(ASK_BUTTON_H));
+    AskLayout { card, buttons: [yes, no] }
+}
+
+/// Нарисовать вопрос поверх `area`; `focus` — кнопка под Enter (0 — действие).
+pub fn draw_ask(ctx: Ctx, s: &mut Surface, area: Rect, ask: &Ask<'_>, focus: usize) {
+    let lay = ask_layout(ctx, area, ask);
+    draw::blend_rect(s, area, crate::Color::rgb(0, 0, 0), 70);
+    let inner = card(ctx, s, lay.card);
+    let p = inner.palette;
+    let pad = ctx.px(ASK_PAD) as i32;
+    let tile = Rect::new(lay.card.x + pad, lay.card.y + pad, ctx.px(ASK_TILE), ctx.px(ASK_TILE));
+    paint::icon_tile(inner, s, tile, ask.icon, ask.tone, true);
+    let x = tile.right() + ctx.px(16) as i32;
+    let width = (lay.card.right() - pad - x).max(0) as u32;
+    let mut y = lay.card.y + pad;
+    paint::text_clipped(inner, s, Role::Heading, x, y, width, ask.title, p.ink);
+    y += i32::from(ctx.face(Role::Heading).line) + ctx.px(8) as i32;
+    if !ask.detail.is_empty() {
+        paint::text_clipped(inner, s, Role::Body, x, y, width, ask.detail, p.ink2);
+        y += i32::from(ctx.face(Role::Body).line) + ctx.px(4) as i32;
+    }
+    for line in ask_lines(ctx, ask.text, width) {
+        paint::text_clipped(inner, s, Role::Body, x, y, width, &line, p.ink3);
+        y += i32::from(ctx.face(Role::Body).line);
+    }
+    paint::separator(inner, s, lay.card.x, lay.buttons[0].y - ctx.px(16) as i32, lay.card.w);
+    let specs = [(ask.weight, ask.action), (paint::Weight::Normal, "Отмена")];
+    for (index, (rect, (weight, label))) in lay.buttons.iter().zip(specs).enumerate() {
+        paint::button(inner, s, *rect, weight, label, false);
+        if index == focus {
+            let ring = ctx.px(3);
+            let around = Rect::new(rect.x - ring as i32, rect.y - ring as i32, rect.w + ring * 2, rect.h + ring * 2);
+            draw::rounded_stroke(s, around, ctx.px(theme::R_ROW) + ring, p.accedge, 255);
+        }
+    }
+}
+
+/// Кнопка вопроса под точкой: `Some(true)` — действие, `Some(false)` — отмена.
+#[must_use]
+pub fn ask_hit(ctx: Ctx, area: Rect, ask: &Ask<'_>, x: i32, y: i32) -> Option<bool> {
+    let lay = ask_layout(ctx, area, ask);
+    lay.buttons.iter().position(|rect| rect.contains(x, y)).map(|index| index == 0)
+}

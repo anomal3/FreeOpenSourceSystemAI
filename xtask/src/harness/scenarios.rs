@@ -1102,8 +1102,10 @@ const WINSIZE_STEPS: &[Step] = &[
     Step::Aim(aim::Aim::Minimize("Terminal")),
     Step::Click,
     Step::Await("desktop     : minimized 'Terminal'", 15_000),
-    Step::Aim(aim::Aim::Icon(2)),
-    Step::DoubleClick,
+    Step::Key("f1"),
+    Step::Await("desktop     : menu opened", 15_000),
+    Step::Key("down"),
+    Step::Key("ret"),
     Step::Await("desktop     : opened 'Settings'", 15_000),
     Step::Wait(2_000),
     // «Главная», «Система», «Устройства», «Сеть» — три вниз.
@@ -3273,6 +3275,37 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("desktop     : closed 'About'", 15_000),
             Step::Await("desktop     : focus 'Terminal'", 15_000),
+            // Корзина (21.11): «Очистить корзину» спрашивает тем же окном, что
+            // и удаление, — плитка, заголовок, пояснение, кнопки внизу справа,
+            // Enter нажимает выбранную. «Параметров» на столе больше нет:
+            // корзина — четвёртый значок (Файлы, Терминал, О системе, Корзина).
+            Step::Line("mkdir /root/.local"),
+            Step::Await("created /root/.local", 15_000),
+            Step::Line("mkdir /root/.local/share"),
+            Step::Await("created /root/.local/share", 15_000),
+            Step::Line("mkdir /root/.local/share/Trash"),
+            Step::Await("created /root/.local/share/Trash", 15_000),
+            Step::Line("mkdir /root/.local/share/Trash/files"),
+            Step::Await("created /root/.local/share/Trash/files", 15_000),
+            Step::Line("mkdir /root/.local/share/Trash/files/junk"),
+            Step::Await("created /root/.local/share/Trash/files/junk", 15_000),
+            Step::Aim(aim::Aim::Minimize("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : minimized 'Terminal'", 15_000),
+            Step::Aim(aim::Aim::Icon(3)),
+            Step::RightClick,
+            Step::Await("for trash", 15_000),
+            Step::Aim(aim::Aim::ContextItem(1, 1)),
+            Step::Click,
+            Step::Await("desktop     : opened 'Delete' to empty the trash", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("05b-empty-trash"),
+            Step::Key("ret"),
+            Step::Await("desktop     : emptied the trash, 1 items", 15_000),
+            Step::Aim(aim::Aim::Icon(1)),
+            Step::DoubleClick,
+            Step::Await("desktop     : restored 'Terminal'", 15_000),
+            Step::Wait(1_000),
             // «Пуск» с фазы С3 — только то, у чего есть окно: консольные
             // программы из `/bin` запускаются в терминале по имени, и их список
             // печатает `help`. Число программ в `/bin` — точным числом: оно от
@@ -4697,8 +4730,11 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Minimize("Terminal")),
             Step::Click,
             Step::Await("desktop     : minimized 'Terminal'", 15_000),
-            Step::Aim(Aim::Icon(2)),
-            Step::DoubleClick,
+            // «Параметров» на столе нет с 21.11 — они в «Пуске».
+            Step::Key("f1"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Key("down"),
+            Step::Key("ret"),
             Step::Await("desktop     : opened 'Settings'", 15_000),
             Step::Wait(2_000),
             Step::Shot("08-settings"),
@@ -6756,7 +6792,7 @@ pub const ALL: &[Scenario] = &[
             // Строка печатается при запуске стола, то есть **до** приглашения,
             // которого сценарий дождался выше, — поэтому проверка по всему
             // журналу, а не ожидание вперёд от курсора.
-            Step::Expect("desktop     : icons 5, 0 from /home/roman/Desktop"),
+            Step::Expect("desktop     : icons 4, 0 from /home/roman/Desktop"),
             // Монитор системы запускается **вручную**, и это не забывчивость
             // сценария. С фазы 47b он программа (`/bin/sysmon`), а службой быть
             // не должен: открытие окна держит стол сотни миллисекунд, и всё,
@@ -6790,7 +6826,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : context menu closed", 15_000),
             // Созданное обязано появиться **на столе**, а не только на диске:
             // четыре системных значка плюс один из каталога.
-            Step::Await("desktop     : icons 6, 1 from /home/roman/Desktop", 15_000),
+            Step::Await("desktop     : icons 5, 1 from /home/roman/Desktop", 15_000),
             Step::Await("desktop     : naming 'Новая папка'", 15_000),
             // Щелчок мимо поля оставляет предложенное имя.
             Step::Aim(Aim::EmptyBelow),
@@ -6801,7 +6837,7 @@ pub const ALL: &[Scenario] = &[
             // Меню на самом значке: пункты у него другие — открыть,
             // переименовать, удалить. Значок пятый сверху, то есть первый после
             // системных.
-            Step::Aim(Aim::Icon(5)),
+            Step::Aim(Aim::Icon(4)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
             Step::Expect("for entry"),
@@ -6823,12 +6859,12 @@ pub const ALL: &[Scenario] = &[
                 "desktop     : renamed '/home/roman/Desktop/Новая папка' to 'Reports'",
                 15_000,
             ),
-            Step::Await("desktop     : icons 6, 1 from /home/roman/Desktop", 15_000),
+            Step::Await("desktop     : icons 5, 1 from /home/roman/Desktop", 15_000),
             Step::Line("ls /home/roman/Desktop"),
             Step::Await("Reports", 15_000),
             // Удаление спрашивает окном «Удаление файла» (макет 18) и
             // переносит в корзину; `y` — «Удалить».
-            Step::Aim(Aim::Icon(5)),
+            Step::Aim(Aim::Icon(4)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
             Step::Aim(Aim::ContextItem(7, 2)),
@@ -6837,12 +6873,12 @@ pub const ALL: &[Scenario] = &[
             Step::Shot("04-delete-confirm"),
             Step::Key("y"),
             Step::Await("desktop     : deleted '/home/roman/Desktop/Reports' to the trash as 'Reports'", 15_000),
-            Step::Await("desktop     : icons 5, 0 from /home/roman/Desktop", 15_000),
+            Step::Await("desktop     : icons 4, 0 from /home/roman/Desktop", 15_000),
             Step::Line("ls /home/roman/.local/share/Trash/info"),
             Step::Await("Reports.trashinfo", 15_000),
-            // Меню корзины (она — пятый значок, последний из системных):
+            // Меню корзины (она — четвёртый значок, последний из системных):
             // открыть, очистить, свойства. Очистка спрашивает и стирает.
-            Step::Aim(Aim::Icon(4)),
+            Step::Aim(Aim::Icon(3)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
             Step::Expect("for trash"),
@@ -6853,9 +6889,6 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_000),
             Step::Key("y"),
             Step::Await("desktop     : emptied the trash, 1 items", 15_000),
-            Step::Aim(Aim::EmptyBelow),
-            Step::Click,
-            Step::Await("desktop     : context menu closed", 15_000),
             // «Выбрать другую программу…» (02.11, макет 18): текстовый файл,
             // окно «Как открыть этот файл?», ОК с «Всегда» — блокнот открыл
             // файл, выбор запомнен. Имя без пробелов: команда делится по ним.
@@ -6872,11 +6905,11 @@ pub const ALL: &[Scenario] = &[
             Step::Type("note.txt"),
             Step::Key("ret"),
             Step::Await("note.txt'", 15_000),
-            Step::Await("desktop     : icons 6, 1 from /home/roman/Desktop", 15_000),
+            Step::Await("desktop     : icons 5, 1 from /home/roman/Desktop", 15_000),
             // Меню файла (макет 10): Открыть, Открыть с помощью › | Вырезать,
             // Копировать | Переименовать, Удалить | Свойства. В подменю —
             // Блокнот | Выбрать другую программу….
-            Step::Aim(Aim::Icon(5)),
+            Step::Aim(Aim::Icon(4)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
             Step::Expect("for entry"),
@@ -6906,7 +6939,7 @@ pub const ALL: &[Scenario] = &[
             Step::Line("cat /etc/desktop.cfg"),
             Step::Await("open_with=txt:/bin/notepad", 15_000),
             // Убрать за собой: в корзину и очистить — стол снова пуст.
-            Step::Aim(Aim::Icon(5)),
+            Step::Aim(Aim::Icon(4)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
             Step::Aim(Aim::ContextItem(5, 2)),
@@ -6914,8 +6947,8 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_000),
             Step::Key("y"),
             Step::Await("desktop     : deleted '/home/roman/Desktop/note.txt' to the trash", 15_000),
-            Step::Await("desktop     : icons 5, 0 from /home/roman/Desktop", 15_000),
-            Step::Aim(Aim::Icon(4)),
+            Step::Await("desktop     : icons 4, 0 from /home/roman/Desktop", 15_000),
+            Step::Aim(Aim::Icon(3)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
             Step::Aim(Aim::ContextItem(1, 1)),
@@ -6923,9 +6956,6 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_000),
             Step::Key("y"),
             Step::Await("desktop     : emptied the trash, 1 items", 15_000),
-            Step::Aim(Aim::EmptyBelow),
-            Step::Click,
-            Step::Await("desktop     : context menu closed", 15_000),
             // Каталог стола остаётся пустым, и это условие повторяемости:
             // созданное предыдущим прогоном заняло бы имя «Новая папка», а
             // проверки выше считают значки поимённо. Сам каталог остаётся —
@@ -8650,7 +8680,7 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Minimize("Terminal")),
             Step::Click,
             Step::Await("desktop     : minimized 'Terminal'", 15_000),
-            Step::Aim(Aim::Icon(5)),
+            Step::Aim(Aim::Icon(4)),
             Step::DoubleClick,
             Step::Await("desktop     : started '/opt/debian/bin/bash /opt/chromium/bin/chromium'", 30_000),
             Step::Await("wayland     : client #", 300_000),

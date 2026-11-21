@@ -538,9 +538,6 @@ pub static UNPIN_TASKBAR: core::sync::atomic::AtomicBool = core::sync::atomic::A
 enum Mode {
     /// Обычный список пунктов.
     Menu,
-    /// Ждём подтверждения удаления: `forever` — стереть (очистка корзины),
-    /// иначе — перенести в корзину.
-    Confirm { name: String, forever: bool },
 }
 
 /// Что меню просит сделать в ответ на клавишу.
@@ -555,10 +552,6 @@ pub enum Reply {
     Close,
     /// Выполнить пункт.
     Run(Action),
-    /// Перенос в корзину подтверждён.
-    Delete,
-    /// Очистка корзины подтверждена.
-    EmptyTrash,
 }
 
 /// Меню стола: где оно, что в нём выбрано и чем оно занято.
@@ -898,26 +891,6 @@ impl ContextMenu {
         Rect::new(0, 0, self.rect.w, self.rect.h)
     }
 
-    /// Спросить, точно ли удалять: `forever` — стереть безвозвратно (очистка
-    /// корзины), иначе — перенести в корзину (макет 18).
-    pub fn start_confirm(&mut self, name: &str, forever: bool) {
-        self.widen();
-        self.mode = Mode::Confirm { name: name.to_string(), forever };
-        self.note = None;
-        self.fit(confirm_height(self.ctx()));
-        self.redraw();
-    }
-
-    /// Поле имени и вопрос об удалении шире пунктов: подсказки под ними
-    /// длинные. Карточка расширяется влево, если справа не хватает экрана.
-    fn widen(&mut self) {
-        let wide = self.surface.width();
-        if self.rect.w < wide {
-            self.rect.w = wide;
-            let max_x = (self.area.right() - wide as i32).max(self.area.x);
-            self.rect.x = self.rect.x.clamp(self.area.x, max_x);
-        }
-    }
 
     /// Подогнать карточку под новую высоту, не дав ей выехать вниз.
     ///
@@ -939,16 +912,6 @@ impl ContextMenu {
         }
         match &mut self.mode {
             Mode::Menu => self.menu_key(event.code),
-            Mode::Confirm { forever, .. } => match event.code {
-                KeyCode::Y | KeyCode::Enter if *forever => Reply::EmptyTrash,
-                KeyCode::Y | KeyCode::Enter => Reply::Delete,
-                KeyCode::N | KeyCode::Escape => {
-                    self.mode = Mode::Menu;
-                    self.redraw();
-                    Reply::Handled
-                }
-                _ => Reply::Handled,
-            },
         }
     }
 
@@ -1131,10 +1094,6 @@ impl ContextMenu {
                     }
                 }
             }
-            Mode::Confirm { name, forever } => {
-                let s = &mut self.surface;
-                draw_confirm(inner, s, card, name, *forever);
-            }
         }
 
         if let Some(note) = &self.note {
@@ -1241,13 +1200,6 @@ fn rows_height(ctx: Ctx, items: &[Action]) -> u32 {
     (last + ctx.px(CARD_PAD) as i32).max(0) as u32
 }
 
-/// Высота карточки с вопросом об удалении.
-fn confirm_height(ctx: Ctx) -> u32 {
-    let title = u32::from(ctx.face(Role::Strong).line);
-    let caption = u32::from(ctx.face(Role::Caption).line);
-    ctx.px(CARD_PAD + 4) + title + ctx.px(8) + caption * 2 + ctx.px(10) + caption + ctx.px(CARD_PAD + 4)
-}
-
 /// Ширина места под крестик в строке окна.
 const CROSS: u32 = 28;
 
@@ -1335,30 +1287,6 @@ fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool,
     // подтянутая к краю, ломает колонку подписей.
     let x = slot.rect.x + (pad_l + icon + ctx.px(ICON_GAP)) as i32;
     paint::text_clipped(ctx, s, Role::Body, x, paint::baseline(ctx, Role::Body, slot.rect), (right - x).max(0) as u32, label, ink);
-}
-
-/// Вопрос об удалении.
-fn draw_confirm(ctx: Ctx, s: &mut Surface, card: Rect, name: &str, forever: bool) {
-    let p = ctx.palette;
-    let pad = ctx.px(CARD_PAD + ROW_PAD);
-    let left = card.x + pad as i32;
-    let width = card.w.saturating_sub(pad * 2);
-    let mut y = card.y + ctx.px(CARD_PAD + 4) as i32;
-
-    // Макет 18: вопрос, пояснение, что будет; ответ — клавишей.
-    let (question, first, second) = if forever {
-        (alloc::format!("Стереть: {name}?"), "Удалённое из корзины стирается навсегда.", "Вернуть его будет нельзя.")
-    } else {
-        (alloc::format!("Удалить «{name}»?"), "Файл будет перемещён в корзину.", "Его можно восстановить, пока корзина не очищена.")
-    };
-    paint::text_clipped(ctx, s, Role::Strong, left, y, width, &question, p.ink);
-    y += (u32::from(ctx.face(Role::Strong).line) + ctx.px(8)) as i32;
-    for line in [first, second] {
-        paint::text_clipped(ctx, s, Role::Caption, left, y, width, line, p.ink3);
-        y += i32::from(ctx.face(Role::Caption).line);
-    }
-    y += ctx.px(10) as i32;
-    paint::text_clipped(ctx, s, Role::Caption, left, y, width, CONFIRM_HINT, if forever { p.bad_ink } else { p.acc_ink });
 }
 
 /// Каталог стола — там появляется всё, что создаётся его меню.

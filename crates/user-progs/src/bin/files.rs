@@ -464,8 +464,34 @@ enum MenuMode {
     Items,
     /// Просит новое имя.
     Rename(String),
-    /// Спрашивает, удалять ли.
-    Confirm,
+    /// Спрашивает, удалять ли, — вопросом посреди окна (`kit::draw_ask`,
+    /// 21.11); число — кнопка под Enter: 0 — «Удалить», 1 — «Отмена».
+    Confirm(usize),
+}
+
+/// Вопрос об удалении словами — для `kit::Ask` (21.11).
+struct Question {
+    title: String,
+    text: &'static str,
+    /// Что именно удаляется — строкой над пояснением; пусто — не нужно.
+    detail: String,
+    action: &'static str,
+    /// Стирается безвозвратно: кнопка красная, значок — тревожный.
+    forever: bool,
+}
+
+impl Question {
+    fn as_ask(&self) -> kit::Ask<'_> {
+        kit::Ask {
+            icon: Icon::Close,
+            tone: if self.forever { Tone::Bad } else { Tone::Accent },
+            title: &self.title,
+            detail: &self.detail,
+            text: self.text,
+            action: self.action,
+            weight: if self.forever { Weight::Danger } else { Weight::Primary },
+        }
+    }
 }
 
 /// Контекстное меню — карточка поверх окна.
@@ -1002,7 +1028,7 @@ impl Files {
                 }
                 self.open_menu(None, Some(self.selected));
                 if let Some(menu) = self.menu.as_mut() {
-                    menu.mode = MenuMode::Confirm;
+                    menu.mode = MenuMode::Confirm(0);
                 }
             }
         }
@@ -1301,7 +1327,7 @@ impl Files {
                 if self.rows.get(self.selected).is_some_and(|row| !row.is_volume()) {
                     self.open_menu(None, Some(self.selected));
                     if let Some(menu) = self.menu.as_mut() {
-                        menu.mode = MenuMode::Confirm;
+                        menu.mode = MenuMode::Confirm(0);
                     }
                     return true;
                 }
@@ -1608,7 +1634,17 @@ impl Files {
                 }
                 _ => false,
             },
-            MenuMode::Confirm => match code {
+            // Как у окон-вопросов ядра: Enter — выбранная кнопка, Tab и
+            // стрелки переводят выбор, Esc — отмена; `y`/`n` остались.
+            MenuMode::Confirm(focus) => match code {
+                0x09 | WIN_KEY_LEFT | WIN_KEY_RIGHT => {
+                    *focus = 1 - (*focus).min(1);
+                    true
+                }
+                ENTER if *focus == 1 => {
+                    self.close_menu();
+                    true
+                }
                 ENTER | YES => {
                     self.finish_delete();
                     true
@@ -1617,7 +1653,8 @@ impl Files {
                     self.close_menu();
                     true
                 }
-                _ => false,
+                // Вопрос модальный: прочие клавиши не уходят списку под ним.
+                _ => true,
             },
         }
     }
@@ -1653,7 +1690,7 @@ impl Files {
             }
             MenuItem::Delete => {
                 if let Some(menu) = self.menu.as_mut() {
-                    menu.mode = MenuMode::Confirm;
+                    menu.mode = MenuMode::Confirm(0);
                 }
             }
             MenuItem::CopyPath => {
@@ -1694,10 +1731,64 @@ impl Files {
             MenuItem::EmptyTrash => {
                 if let Some(menu) = self.menu.as_mut() {
                     menu.target = None;
-                    menu.mode = MenuMode::Confirm;
+                    menu.mode = MenuMode::Confirm(0);
                 }
             }
         }
+    }
+
+    /// Что спрашивает вопрос об удалении: очистка корзины, стирание из неё
+    /// или перенос в неё (макет 18) — те же слова, что у окна ядра.
+    fn ask(&self) -> Question {
+        let target = self.menu.as_ref().and_then(|menu| menu.target);
+        let name = target.and_then(|index| self.rows.get(index)).map_or(String::new(), |row| row.name.clone());
+        let many = self.picked.len() > 1;
+        match (target, self.in_trash()) {
+            (None, _) => Question {
+                title: format!("Очистить корзину? Объектов: {}", self.rows.len()),
+                text: "Объекты будут стёрты безвозвратно. Восстановить их из корзины будет нельзя.",
+                detail: String::new(),
+                action: "Удалить навсегда",
+                forever: true,
+            },
+            (Some(_), true) => Question {
+                title: if many { format!("Удалить навсегда объекты ({})?", self.picked.len()) } else { format!("Удалить «{name}» навсегда?") },
+                text: "Объект будет стёрт безвозвратно. Восстановить его будет нельзя.",
+                detail: String::new(),
+                action: "Удалить навсегда",
+                forever: true,
+            },
+            // Том без корзины (`/data`, флешка): `rename` в корзину между
+            // томами не бывает, и удаление стирает целиком — так и спросить.
+            (Some(_), false) if !self.trash_reachable() => Question {
+                title: String::from("Удалить без возможности восстановления?"),
+                text: if many { "На этом томе нет корзины: отмеченные объекты будут стёрты безвозвратно." } else { "На этом томе нет корзины: объект будет стёрт безвозвратно." },
+                detail: if many { format!("Объектов: {}", self.picked.len()) } else { format!("«{name}»") },
+                action: "Удалить навсегда",
+                forever: true,
+            },
+            (Some(_), false) => Question {
+                title: if many { format!("Удалить объекты ({})?", self.picked.len()) } else { format!("Удалить «{name}»?") },
+                text: "Файл будет перемещён в корзину. Его можно будет восстановить, пока корзина не очищена.",
+                detail: String::new(),
+                action: "Удалить",
+                forever: false,
+            },
+        }
+    }
+
+    /// Лежит ли открытая папка на том же томе, что и корзина: перенос в
+    /// корзину — `rename`, а между томами его нет (тогда удаление стирает).
+    fn trash_reachable(&self) -> bool {
+        let points = mount_points();
+        let mount = |path: &str| {
+            points
+                .iter()
+                .filter(|point| *point == "/" || path == point.as_str() || path.starts_with(&format!("{point}/")))
+                .max_by_key(|point| point.len())
+                .cloned()
+        };
+        mount(&self.path) == mount(&self.trash)
     }
 
     /// Открыта ли корзина.
@@ -2109,6 +2200,17 @@ impl Files {
     /// изменении размера окна, и попасть в них будет можно только наугад.
     fn on_click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = layout(ctx, area);
+
+        // Вопрос об удалении — модальный (21.11): отвечают его кнопками,
+        // щелчок мимо них ничего не делает.
+        if let Some(MenuMode::Confirm(_)) = self.menu.as_ref().map(|menu| &menu.mode) {
+            match kit::ask_hit(ctx, area, &self.ask().as_ask(), x, y) {
+                Some(true) => self.finish_delete(),
+                Some(false) => self.close_menu(),
+                None => return false,
+            }
+            return true;
+        }
 
         // Меню вкладки — первым, как всякое открытое меню.
         if self.tab_menu.is_some() {
@@ -2551,8 +2653,8 @@ impl Files {
         let pad = ctx.px(6);
         match &menu.mode {
             MenuMode::Items => kit::menu_size(ctx, &entries(&menu.items)),
-            MenuMode::Rename(_) | MenuMode::Confirm => {
-                let hint = ctx.face(Role::Caption).width(RENAME_HINT).max(ctx.face(Role::Caption).width(CONFIRM_HINT));
+            MenuMode::Rename(_) | MenuMode::Confirm(_) => {
+                let hint = ctx.face(Role::Caption).width(RENAME_HINT);
                 (hint.max(ctx.px(320)) + ctx.px(28), ctx.px(40) + ctx.px(32) + ctx.px(28) + pad * 2)
             }
         }
@@ -3031,6 +3133,10 @@ impl Files {
             kit::draw_menu(ctx, s, card, &entries(&menu.items), menu.selected);
             return;
         }
+        if let MenuMode::Confirm(focus) = menu.mode {
+            kit::draw_ask(ctx, s, area, &self.ask().as_ask(), focus);
+            return;
+        }
         let inner = kit::card(ctx, s, card);
         let p = inner.palette;
         match &menu.mode {
@@ -3057,38 +3163,7 @@ impl Files {
                 y += field.h as i32 + ctx.px(10) as i32;
                 paint::text_clipped(inner, s, Role::Caption, x, y, room, RENAME_HINT, p.ink4);
             }
-            MenuMode::Confirm => {
-                let x = card.x + ctx.px(14) as i32;
-                let room = card.w.saturating_sub(ctx.px(28));
-                let mut y = card.y + ctx.px(12) as i32;
-                let name = menu
-                    .target
-                    .and_then(|index| self.rows.get(index))
-                    .map_or(String::new(), |row| row.name.clone());
-                let question = match (menu.target, self.in_trash()) {
-                    (None, _) => String::from("Очистить корзину? Всё в ней сотрётся навсегда"),
-                    (Some(_), true) => format!("Удалить «{name}» навсегда?"),
-                    // Макет 18: вопрос «Удалить?», в корзину — главной кнопкой.
-                    (Some(_), false) if self.picked.len() > 1 => format!("Удалить {} объектов в корзину?", self.picked.len()),
-                    (Some(_), false) => format!("Удалить «{name}» в корзину?"),
-                };
-                let forever = menu.target.is_none() || self.in_trash();
-                paint::text_clipped(inner, s, Role::Body, x, y, room, &question, p.ink);
-                y += ctx.px(30) as i32;
-                let btn_w = ctx.px(120);
-                let btn_h = ctx.px(30);
-                paint::button(inner, s, Rect::new(x, y, btn_w, btn_h), if forever { Weight::Danger } else { Weight::Primary }, "Удалить", false);
-                paint::button(
-                    inner,
-                    s,
-                    Rect::new(x + btn_w as i32 + ctx.px(8) as i32, y, btn_w, btn_h),
-                    Weight::Normal,
-                    "Отмена",
-                    false,
-                );
-                y += btn_h as i32 + ctx.px(10) as i32;
-                paint::text_clipped(inner, s, Role::Caption, x, y, room, CONFIRM_HINT, p.ink4);
-            }
+            MenuMode::Confirm(_) => {}
         }
     }
 
@@ -3455,7 +3530,6 @@ const YES: u32 = 'y' as u32;
 const NO: u32 = 'n' as u32;
 /// Подсказки под полем имени и под вопросом.
 const RENAME_HINT: &str = "Enter — переименовать    Esc — отмена    Ctrl+U — очистить";
-const CONFIRM_HINT: &str = "Enter или Y — удалить    Esc или N — оставить";
 
 /// Обновить список. `r` — потому что F-ряд договор программам не отдаёт.
 const REFRESH: u32 = 'r' as u32;
@@ -3875,6 +3949,21 @@ fn volume_title(point: &str, label: &str) -> String {
         other if other.starts_with("/usb") => format!("USB-накопитель ({other})"),
         other => other.to_string(),
     }
+}
+
+/// Точки монтирования томов (`SYS_MOUNTS`, первое поле строки).
+fn mount_points() -> Vec<String> {
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(MOUNTS_LIMIT).is_err() {
+        return Vec::new();
+    }
+    buffer.resize(MOUNTS_LIMIT, 0u8);
+    let got = mounts(&mut buffer);
+    if got <= 0 {
+        return Vec::new();
+    }
+    let text = core::str::from_utf8(&buffer[..(got as usize).min(buffer.len())]).unwrap_or("");
+    text.lines().filter_map(|line| line.split('\t').next()).filter(|point| !point.is_empty()).map(String::from).collect()
 }
 
 /// Тома — из ядра, по строке на каждый.

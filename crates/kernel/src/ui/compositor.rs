@@ -4259,34 +4259,6 @@ impl Compositor {
         }
     }
 
-    /// Спросить в меню, точно ли удалять: `forever` — стереть (очистка
-    /// корзины), иначе — в корзину.
-    pub fn context_confirm(&mut self, name: &str, forever: bool) {
-        let before = self.context.as_ref().map(|menu| menu.rect);
-        if let Some(menu) = self.context.as_mut() {
-            menu.start_confirm(name, forever);
-        }
-        self.mark_shrunk(before);
-    }
-
-    /// Стереть то, что осталось от прежнего, большего меню.
-    ///
-    /// Карточка меняет высоту вместе с тем, что в ней: список пунктов выше
-    /// поля ввода имени. Меню сообщает об изменившемся в собственных
-    /// координатах, а их композитор сдвигает на **новый** прямоугольник — и
-    /// освободившаяся полоса под ним остаётся на экране куском прошлой
-    /// карточки. Помечается разница, а не всё подряд: обычно она пуста.
-    fn mark_shrunk(&mut self, before: Option<Rect>) {
-        let Some(before) = before else { return };
-        let Some(after) = self.context.as_ref().map(|menu| menu.rect) else {
-            return;
-        };
-        if before == after {
-            return;
-        }
-        self.mark_layer(before.union(&after));
-    }
-
     /// Подсветить в меню пункт, по которому щёлкнули.
     pub fn context_select(&mut self, action: Action) {
         if let Some(menu) = self.context.as_mut() {
