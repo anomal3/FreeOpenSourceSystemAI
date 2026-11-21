@@ -1020,6 +1020,24 @@ impl<D: BlockDevice> Volume<D> {
         Ok(())
     }
 
+    /// Чистое закрытие тома (21.11, выключение и перезагрузка): как
+    /// [`Volume::clean`], но пометку снимает и с тома, грязного при открытии,
+    /// — так делает `umount` у Linux. Иначе однажды выдернутый диск оставался
+    /// грязным навсегда (журнал 13: Z7S «not closed cleanly» при каждой
+    /// загрузке).
+    pub fn close(&mut self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        self.dev.flush()?;
+        if self.dirty || self.was_dirty {
+            self.set_volume_flags(false)?;
+        }
+        self.dirty = false;
+        self.was_dirty = false;
+        Ok(())
+    }
+
     /// Сбросить кэш носителя.
     pub fn flush(&mut self) -> Result<()> {
         self.dev.flush()?;

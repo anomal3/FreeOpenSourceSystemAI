@@ -4245,8 +4245,17 @@ pub fn storage_bulk(handle: StorageHandle, dir_in: bool, buffer: StorageBuffer, 
         }
         core::hint::spin_loop();
     }
-    // Дождаться завершения.
+    // Дождаться завершения. Первые витки — опросом (короткие команды
+    // кончаются за микросекунды), дальше между опросами процессор отдаётся
+    // другим задачам (21.11): ожидание записи на флешку журнала или чтения
+    // большого куска не держит процессор и не долбит общий замок
+    // контроллеров, нужный диску игры и задаче USB.
+    let mut polls = 0u32;
     loop {
+        polls = polls.saturating_add(1);
+        if polls > 64 && crate::arch::interrupts::enabled() && crate::sched::preemption_on() {
+            crate::sched::yield_now();
+        }
         let done = with_storage(handle, |c, i| {
             // SAFETY: окно регистров отображено, кольцо событий сообщено.
             unsafe { c.drain_events(None) };

@@ -137,3 +137,19 @@ pub fn report_recent() {
 }
 
 static RECENT: Record = Record::new();
+
+/// Самый долгий участок с закрытыми прерываниями с прошлого вызова —
+/// микросекунды и место — и сбросить (21.11, строка `perf-diag`: искали
+/// повторяющиеся 14-15 мс глухоты в журнале 13).
+#[must_use]
+pub fn take_recent() -> Option<(u64, &'static Location<'static>)> {
+    let hz = arch::monotonic::frequency();
+    let longest = RECENT.longest.swap(0, Ordering::Relaxed);
+    let at = RECENT.at.swap(ptr::null_mut(), Ordering::Relaxed);
+    if hz == 0 || at.is_null() {
+        return None;
+    }
+    // SAFETY: как в `Record::print` — только из `&'static Location`.
+    let at = unsafe { &*at };
+    Some(((u128::from(longest) * 1_000_000 / u128::from(hz)) as u64, at))
+}

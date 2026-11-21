@@ -58,6 +58,10 @@ pub static WL_DIRECT: AtomicU64 = AtomicU64::new(0);
 /// dma-buf клиента; и сколько нс ушло на подмену с переносом в окно.
 pub static WL_ZERO_COPY: AtomicU64 = AtomicU64::new(0);
 pub static WL_ZERO_COPY_NS: AtomicU64 = AtomicU64::new(0);
+/// Из них — сборка, вывод и сброс кадра стола (21.11); и то же после копии
+/// (у `copy ms/paint` его нет). Счёт за окно: снимается при отчёте.
+pub static WL_ZERO_COPY_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+pub static WL_PAINT_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 /// Слои с масштабом `wp_viewport` (D4).
 pub static WL_SCALED: AtomicU64 = AtomicU64::new(0);
 /// Кадры без темпа (`MAILBOX`/`IMMEDIATE`), пришедшие раньше кадра монитора
@@ -335,8 +339,14 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     let idle_pct = if ticks == 0 { 0 } else { (idle * 100 / ticks).min(100) };
     let samples = queue.samples.max(1);
     let avg = |sum: u64| alloc::format!("{}.{}", sum / samples, sum * 10 / samples % 10);
+    // Самый долгий участок с закрытыми прерываниями за окно и где он начался
+    // (21.11): SpinLock и `without_interrupts`, обработчики не в счёт.
+    let irq_off = match crate::latency::take_recent() {
+        Some((micros, at)) => alloc::format!("{}.{:03} ms at {}:{}", micros / 1000, micros % 1000, at.file(), at.line()),
+        None => String::from("not measured"),
+    };
     kprintln!(
-        "  perf-diag   : {secs} s cpu: idle {idle_pct}% of {cpus} cpus, run queue {} ready on average (worst {}), {} running; {} switches",
+        "  perf-diag   : {secs} s cpu: idle {idle_pct}% of {cpus} cpus, run queue {} ready on average (worst {}), {} running; {} switches; irq-off worst {irq_off}",
         avg(queue.ready),
         queue.worst,
         avg(queue.running),
@@ -359,16 +369,18 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     let mut line = String::new();
     let _ = write!(
         line,
-        "{secs} s frames: wayland {} commits ({}/s), {} paints ({} direct), {} zero-copy ({} ms each), {} scaled, {} unpaced held, copy {} ms/paint ({} Kpx, {} MB/s, best {} MB/s), {} frame callbacks, {} busy; desktop {frames} frames ({}/s): compose {} ms, blit {} ms, flush {} ms per frame, {} Kpx/frame, worst {} ms",
+        "{secs} s frames: wayland {} commits ({}/s), {} paints ({} direct), {} zero-copy ({} ms each, desktop present {} ms of it), {} scaled, {} unpaced held, copy {} ms/paint + present {} ms ({} Kpx, {} MB/s, best {} MB/s), {} frame callbacks, {} busy; desktop {frames} frames ({}/s): compose {} ms, blit {} ms, flush {} ms per frame, {} Kpx/frame, worst {} ms",
         wl[0],
         rate(wl[0]),
         wl[1],
         wl[6],
         wl[7],
         ms(wl[8] / wl[7].max(1)),
+        ms(WL_ZERO_COPY_PRESENT_NS.swap(0, Ordering::Relaxed) / wl[7].max(1)),
         wl[9],
         wl[10],
         ms(wl[2] / paints),
+        ms(WL_PAINT_PRESENT_NS.swap(0, Ordering::Relaxed) / paints),
         wl[3] / paints / 1000,
         // Байт за микросекунду — это и есть МБ/с (по 4 байта на точку).
         if wl[2] == 0 { 0 } else { wl[3] * 4 * 1000 / wl[2] },

@@ -1833,6 +1833,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("FossAi/", 15_000),
             Step::Line("mounts"),
             Step::Await("exFAT", 15_000),
+            // Живая система (21.11): `/etc` в памяти — настройки стола
+            // (громкость и прочее) записываются до перезагрузки.
+            Step::Line("echo probe > /etc/probe.txt"),
+            Step::Await("bytes to /etc/probe.txt", 15_000),
             // «Файлы»: содержимое диска, потом «Этот компьютер» с меткой.
             Step::Line("run -b /bin/files /usb/D2RLAN"),
             Step::Await("files: /usb/D2RLAN has 3 entries", 30_000),

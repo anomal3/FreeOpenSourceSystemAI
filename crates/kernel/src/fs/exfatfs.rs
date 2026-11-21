@@ -272,8 +272,17 @@ impl FileSystem for ExfatFs {
         result
     }
 
+    /// `sync` зовут выключение и перезагрузка (`fs::sync_all`): том
+    /// закрывается чисто, пометка «грязный» снимается и с тома, грязного при
+    /// открытии (21.11).
     fn sync(&self) -> VfsResult<()> {
-        self.0.volume.lock().clean().map_err(convert)
+        let mut volume = self.0.volume.lock();
+        let was = volume.was_dirty();
+        volume.close().map_err(convert)?;
+        if was {
+            crate::kprintln!("  exfat       : '{}' was not clean at mount - marked clean on close", volume.label());
+        }
+        Ok(())
     }
 
     /// Записи и так идут на носитель сразу; здесь — сброс его кэша и снятие

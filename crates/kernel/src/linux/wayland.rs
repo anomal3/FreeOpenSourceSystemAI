@@ -1879,6 +1879,31 @@ impl Client {
                         _ => "with frame callbacks (FIFO, vsync): paced by the monitor",
                     };
                     kprintln!("  wayland     : #{} surface {id} presents {how}", self.pid);
+                    // Темп и где стоит окно (21.11, журнал 13: D2R на мониторе
+                    // 60 Гц, второй — 180 Гц; темп FIFO — по самому быстрому
+                    // монитору, показ — с частотой монитора окна).
+                    if let Some(win) = self.wins.iter().find(|win| win.surface == id) {
+                        let mhz = pace_mhz();
+                        let rect = crate::ui::window_rect(self.pid, win.slot);
+                        let monitor = rect.and_then(|r| {
+                            let (cx, cy) = (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2);
+                            crate::display::outputs::list().iter().filter(|o| o.enabled).find_map(|o| {
+                                let (w, h, hz) = o.current?;
+                                let inside = cx >= o.x && cy >= o.y && cx < o.x + w as i32 && cy < o.y + h as i32;
+                                inside.then(|| (Rect::new(o.x, o.y, w, h), u64::from(hz)))
+                            })
+                        });
+                        match monitor {
+                            Some((o, hz_mhz)) => kprintln!(
+                                "  wayland     : #{} surface {id}: window on the monitor at {},{} ({}.{:03} Hz), FIFO pace {}.{:03} Hz",
+                                self.pid, o.x, o.y, hz_mhz / 1000, hz_mhz % 1000, mhz / 1000, mhz % 1000
+                            ),
+                            None => kprintln!(
+                                "  wayland     : #{} surface {id}: FIFO pace {}.{:03} Hz (window monitor unknown)",
+                                self.pid, mhz / 1000, mhz % 1000
+                            ),
+                        }
+                    }
                 }
             }
         }
@@ -2299,8 +2324,19 @@ impl Client {
             // буфер до `release`, а он уходит только после смены пикселей.
             if let Some(pixels) = unsafe { Surface::from_raw(ptr, gw, gh) } {
                 let started = crate::time::uptime_ns();
+                let (desk, flush) = (crate::ui::timing(), crate::ui::flush_ns());
                 match crate::ui::swap_window_pixels(pid, win.slot, pixels, area) {
                     Ok(old) => {
+                        // Сборка, вывод полос и сброс кадра стола внутри
+                        // показа (21.11): журнал 13 видел 3,3-4 мс на показ
+                        // без копии — это и есть они (кадр 2560x1440 стол
+                        // собирает и выводит целиком), у пути с копией та же
+                        // цена не входила в `copy ms/paint`.
+                        let (desk2, flush2) = (crate::ui::timing(), crate::ui::flush_ns());
+                        super::perfdiag::WL_ZERO_COPY_PRESENT_NS.fetch_add(
+                            desk2.2.saturating_sub(desk.2) + desk2.3.saturating_sub(desk.3) + flush2.saturating_sub(flush),
+                            Ordering::Relaxed,
+                        );
                         if win.adopted.is_none() {
                             win.stash = Some(old);
                             kprintln!("  wayland     : #{pid} window '{}' shows its {gw}x{gh} dma-buf without a copy", win.title);
@@ -2363,12 +2399,20 @@ impl Client {
         // Копия буфера клиента в окно стола — отдельно от сборки и вывода,
         // которые `paint_window` делает тут же (P1: `perf-diag`).
         let mut copy_ns = 0u64;
+        let (desk, flush) = (crate::ui::timing(), crate::ui::flush_ns());
         let painted = crate::ui::paint_window(pid, win.slot, area, |target| {
             let started = crate::time::uptime_ns();
             clear = paint(target, &layers, swap, area, alpha);
             copy_ns = crate::time::uptime_ns().saturating_sub(started);
         });
         if painted.is_ok() {
+            // Показ после копии (сборка + вывод + сброс), 21.11 — для честного
+            // сравнения с показом без копии.
+            let (desk2, flush2) = (crate::ui::timing(), crate::ui::flush_ns());
+            super::perfdiag::WL_PAINT_PRESENT_NS.fetch_add(
+                desk2.2.saturating_sub(desk.2) + desk2.3.saturating_sub(desk.3) + flush2.saturating_sub(flush),
+                Ordering::Relaxed,
+            );
             super::perfdiag::WL_PAINTS.fetch_add(1, Ordering::Relaxed);
             super::perfdiag::WL_PAINT_NS.fetch_add(copy_ns, Ordering::Relaxed);
             let px = u64::from(area.w) * u64::from(area.h);
