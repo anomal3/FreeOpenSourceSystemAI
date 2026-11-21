@@ -711,7 +711,7 @@ impl GpuBackend for RmBackend {
             // Крупный буфер — сначала одним куском (D4, 20.11.2026): кадр
             // WSI (dma-buf) тогда виден ядру подряд, и стол показывает его без
             // копии (`SharedMem::contiguous`). Нет куска — по страницам.
-            Place::Sysmem if size >= CONTIGUOUS_FROM => match crate::mm::frame::with(|f| f.allocate_contiguous((size / PAGE) as usize)).flatten() {
+            Place::Sysmem if size >= CONTIGUOUS_FROM => match crate::mm::frame::take_contiguous_zeroed((size / PAGE) as usize, 0) {
                 Some(base) => {
                     let frames = (0..size / PAGE).map(|i| base.as_u64() + i * PAGE).collect();
                     Bo { place, size, vram: 0, frames }

@@ -670,6 +670,19 @@ impl BitmapFrameAllocator {
     }
 }
 
+impl BitmapFrameAllocator {
+    /// [`FrameAllocator::allocate`] without zeroing - for [`take_zeroed`],
+    /// which zeroes outside the pool lock. The caller must zero the frame
+    /// before anybody sees it.
+    fn allocate_unzeroed(&mut self) -> Option<PhysAddr> {
+        let index = self.find_run(1)?;
+        self.set_used(index);
+        self.free -= 1;
+        self.cursor = index + 1;
+        Some(frame_addr(index))
+    }
+}
+
 impl FrameAllocator for BitmapFrameAllocator {
     fn allocate(&mut self) -> Option<PhysAddr> {
         let index = self.find_run(1)?;
@@ -767,6 +780,9 @@ pub unsafe fn init(info: &BootInfo) -> Result<FrameStats, FrameInitError> {
 /// войти повторно из вложенного вызова: выдать второй `&mut` на то же состояние
 /// нельзя, а тихо вернуть `None` — значит превратить ошибку в загадочную
 /// нехватку памяти где-то дальше.
+/// `#[track_caller]` (G2): the interrupts-off record of `perf-diag` names
+/// the caller, not this line.
+#[track_caller]
 pub fn with<R>(f: impl FnOnce(&mut BitmapFrameAllocator) -> R) -> Option<R> {
     // `try_lock`, а не `lock`, и это не оптимизация. Лок, который держит этот же
     // процессор, означает ровно одно: мы уже внутри `with` и пришли сюда из `f`.
@@ -785,7 +801,15 @@ pub fn with<R>(f: impl FnOnce(&mut BitmapFrameAllocator) -> R) -> Option<R> {
 /// Состояние пула кадров. Нули, если аллокатор ещё не поднят.
 #[must_use]
 pub fn stats() -> FrameStats {
-    with(|allocator| allocator.stats()).unwrap_or_default()
+    // Frames waiting zeroed in the per-CPU caches are free for every
+    // purpose but the bitmap (G2): counting them as used would make the
+    // leak checks (`frames N of M used` before and after) drift.
+    with(|allocator| allocator.stats())
+        .map(|mut stats| {
+            stats.free += CACHED.load(core::sync::atomic::Ordering::Relaxed);
+            stats
+        })
+        .unwrap_or_default()
 }
 
 /// Забрать кадр ниже 640 КиБ, отложенный под код запуска остальных процессоров.
@@ -813,4 +837,198 @@ pub unsafe fn use_direct_map() {
     if switched.is_none() {
         kprintln!("mm: frame allocator is not initialised, direct map switch ignored");
     }
+}
+
+// ---- Per-CPU caches of zeroed frames (G2, 21.11.2026) ----------------------
+//
+// Every page fault of a program took the global pool lock (interrupts off)
+// and zeroed its 4 KiB *inside* it; anonymous fault-around did that up to
+// eight times per fault. On D2R (16 threads) 40-90 k faults per 30 s at
+// ~21 us each queued on that one lock. Now each CPU keeps a small stack of
+// frames that are already zeroed: a fault takes one under a per-CPU lock;
+// an empty stack is refilled in one pool-lock round of [`REFILL`] frames
+// zeroed *outside* the lock, and idle CPUs top their stacks up in advance
+// ([`refill_idle`]). The frames in the stacks count as used in
+// [`stats`] (at most [`MAGAZINE`] per CPU, 4 MiB on 16 CPUs).
+
+/// Frames a CPU keeps zeroed.
+const MAGAZINE: usize = 64;
+/// Frames taken from the pool per refill.
+const REFILL: usize = 32;
+/// Idle CPUs refill only while the pool has more than this many frames.
+const IDLE_FLOOR: usize = 16 * 1024;
+
+struct Magazine {
+    frames: [u64; MAGAZINE],
+    len: usize,
+    /// A fault took a frame since the last idle refill.
+    used: bool,
+}
+
+static MAGAZINES: [SpinLock<Magazine>; crate::smp::MAX_CPUS] =
+    [const { SpinLock::new(Magazine { frames: [0; MAGAZINE], len: 0, used: false }) }; crate::smp::MAX_CPUS];
+
+/// Frames sitting in all caches now.
+static CACHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Frames handed out from the caches and refills (`perf-diag`).
+pub static ZEROED_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static ZEROED_REFILLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Take up to `want` frames from the pool while it keeps more than
+/// `reserve` free, zero them outside the lock. Returns how many.
+fn take_batch(out: &mut [PhysAddr], reserve: usize) -> usize {
+    let taken = with(|frames| {
+        let mut n = 0;
+        while n < out.len() && frames.free > reserve {
+            match frames.allocate_unzeroed() {
+                Some(frame) => {
+                    out[n] = frame;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        (n, frames.phys_offset())
+    });
+    let Some((n, offset)) = taken else { return 0 };
+    for frame in &out[..n] {
+        // SAFETY: the frames were just marked used and belong to us alone;
+        // the direct map shows physical memory at `offset`.
+        unsafe { core::ptr::write_bytes((frame.as_u64() as usize + offset) as *mut u8, 0, PAGE_SIZE as usize) };
+    }
+    ZEROED_REFILLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    n
+}
+
+/// A zeroed frame, cheaply: from this CPU's cache, refilled in batches.
+/// `None` - the pool has `reserve` frames or fewer left (the same rule as
+/// a direct allocation with that reserve).
+pub fn take_zeroed(reserve: usize) -> Option<PhysAddr> {
+    {
+        let mut magazine = MAGAZINES[crate::smp::cpu()].lock();
+        if magazine.len > 0 {
+            magazine.len -= 1;
+            magazine.used = true;
+            CACHED.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            let frame = magazine.frames[magazine.len];
+            ZEROED_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return Some(PhysAddr::new(frame));
+        }
+    }
+    let mut batch = [PhysAddr::new(0); REFILL];
+    let n = take_batch(&mut batch, reserve);
+    if n == 0 {
+        return None;
+    }
+    let mut left = &batch[1..n];
+    {
+        let mut magazine = MAGAZINES[crate::smp::cpu()].lock();
+        magazine.used = true;
+        while let Some((&frame, rest)) = left.split_first() {
+            if magazine.len == MAGAZINE {
+                break;
+            }
+            let at = magazine.len;
+            magazine.frames[at] = frame.as_u64();
+            magazine.len += 1;
+            CACHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            left = rest;
+        }
+    }
+    if !left.is_empty() {
+        with(|frames| {
+            for &frame in left {
+                // SAFETY: taken above and never shown to anybody.
+                unsafe { frames.free(frame) };
+            }
+        });
+    }
+    Some(batch[0])
+}
+
+/// Give back a frame from [`take_zeroed`] that nobody wrote to (a fault
+/// that turned out not to need it): into the cache, or to the pool.
+pub fn put_zeroed(frame: PhysAddr) {
+    {
+        let mut magazine = MAGAZINES[crate::smp::cpu()].lock();
+        if magazine.len < MAGAZINE {
+            let at = magazine.len;
+            magazine.frames[at] = frame.as_u64();
+            magazine.len += 1;
+            CACHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    }
+    with(|frames| {
+        // SAFETY: the caller owns the frame and has not mapped it anywhere.
+        unsafe { frames.free(frame) };
+    });
+}
+
+/// From the idle loop: top this CPU's cache up if faults used it, so the
+/// next burst of faults finds zeroed frames (zeroing costs idle time, not
+/// fault time).
+pub fn refill_idle() {
+    let cpu = crate::smp::cpu();
+    let need = {
+        let Some(magazine) = MAGAZINES.get(cpu).map(SpinLock::lock) else { return };
+        if !magazine.used || magazine.len >= MAGAZINE / 2 {
+            return;
+        }
+        MAGAZINE - magazine.len
+    };
+    let mut batch = [PhysAddr::new(0); MAGAZINE];
+    let n = take_batch(&mut batch[..need.min(MAGAZINE)], IDLE_FLOOR);
+    if n == 0 {
+        return;
+    }
+    let mut left = &batch[..n];
+    {
+        let mut magazine = MAGAZINES[cpu].lock();
+        magazine.used = false;
+        while let Some((&frame, rest)) = left.split_first() {
+            if magazine.len == MAGAZINE {
+                break;
+            }
+            let at = magazine.len;
+            magazine.frames[at] = frame.as_u64();
+            magazine.len += 1;
+            CACHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            left = rest;
+        }
+    }
+    if !left.is_empty() {
+        with(|frames| {
+            for &frame in left {
+                // SAFETY: taken above and never shown to anybody.
+                unsafe { frames.free(frame) };
+            }
+        });
+    }
+}
+
+/// `count` contiguous zeroed frames, zeroed *outside* the pool lock (G2):
+/// a 14 MiB GPU buffer zeroed under it kept interrupts off for ~10 ms
+/// (`irq-off worst ... frame.rs` in perf-diag) - a deaf CPU for TLB
+/// shootdowns and the timer. `None` - no run, or the pool would keep
+/// `reserve` frames or fewer.
+pub fn take_contiguous_zeroed(count: usize, reserve: usize) -> Option<PhysAddr> {
+    let (first, offset) = with(|frames| {
+        if count == 0 || frames.free <= reserve + count {
+            return None;
+        }
+        let first = frames.find_run(count)?;
+        for index in first..first + count {
+            frames.set_used(index);
+        }
+        frames.free -= count;
+        frames.cursor = first + count;
+        Some((frame_addr(first), frames.phys_offset()))
+    })
+    .flatten()?;
+    // SAFETY: the run was just marked used and belongs to the caller alone;
+    // the direct map shows physical memory at `offset`.
+    unsafe { core::ptr::write_bytes((first.as_u64() as usize + offset) as *mut u8, 0, count * PAGE_SIZE as usize) };
+    Some(first)
 }

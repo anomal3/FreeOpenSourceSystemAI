@@ -2622,13 +2622,9 @@ fn page_cache_tight() -> bool {
 /// на живой системе штатно, и запас существует именно для того, чтобы в этот
 /// момент у ядра ещё оставалось, чем работать.
 fn take_frame_reserved() -> Option<PhysAddr> {
-    crate::mm::frame::with(|frames| {
-        if frames.stats().free <= RESERVE_FRAMES {
-            return None;
-        }
-        frames.allocate()
-    })
-    .flatten()
+    // From this CPU's cache of zeroed frames (G2): no pool lock and no
+    // zeroing on the fault path in the common case.
+    crate::mm::frame::take_zeroed(RESERVE_FRAMES)
 }
 
 /// Программы по слотам задач планировщика.
@@ -5921,6 +5917,12 @@ pub fn describe_fault(addr: usize) -> alloc::string::String {
     alloc::format!("{what}; why {}; free frames {free}, regions {regions}, process refs {refs}", last_fault_why().name())
 }
 
+/// Pages mapped per anonymous fault (the faulting one and the following
+/// untouched ones of the same lazy region): 16 since G2 (was 8) - with
+/// zeroed frames from the per-CPU cache a page costs a pop, and a game's
+/// burst of 90 k faults becomes half as many trips through the trap.
+const ANON_FAULT_AROUND: usize = 16;
+
 fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
     let page_addr = addr & !(PAGE_SIZE - 1);
     note_why(FaultWhy::Resolved);
@@ -5949,6 +5951,42 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
                 false
             }
         };
+    }
+
+    // Anonymous memory in one round under the process lock (G2, 21.11.2026):
+    // the zeroed frame is taken first (from the per-CPU cache), the plan,
+    // the mapping and the fault-around happen under one lock instead of two
+    // rounds through the program table and the process lock. Anything that
+    // needs a file or shared memory falls through to the general path.
+    if let Some(frame) = take_frame_reserved() {
+        let fast = with_current_shared(|program, shared| {
+            let plan = program.fault_plan(page_addr, access)?;
+            if plan.node.is_some() || plan.shared.is_some() || plan.want != 0 {
+                return None;
+            }
+            let commit = program.fault_commit(page_addr, frame, &plan, shared);
+            if matches!(commit, Commit::Mapped) {
+                program.fault_around_anon(page_addr, plan.flags, ANON_FAULT_AROUND);
+            }
+            Some(commit)
+        })
+        .flatten();
+        match fast {
+            Some(Commit::Mapped) => {
+                note_fault_kind(505);
+                return true;
+            }
+            Some(Commit::Raced) => {
+                crate::mm::frame::put_zeroed(frame);
+                return true;
+            }
+            Some(Commit::Failed) => {
+                return_frame(frame);
+                note_why(FaultWhy::MapFailed);
+                return false;
+            }
+            None => crate::mm::frame::put_zeroed(frame),
+        }
     }
 
     // Шаг первый, под замком: что читать. Нет плана — причина в журнал
@@ -6103,7 +6141,7 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
     let commit = with_current_shared(|program, shared| {
         let commit = program.fault_commit(page_addr, frame, &plan, shared);
         if anonymous && matches!(commit, Commit::Mapped) {
-            program.fault_around_anon(page_addr, plan.flags, 8);
+            program.fault_around_anon(page_addr, plan.flags, ANON_FAULT_AROUND);
         }
         commit
     })

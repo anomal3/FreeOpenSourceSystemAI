@@ -38,14 +38,8 @@ impl SoftHost for KernelHost {
     }
 
     fn alloc_run(&self, count: u64) -> Option<u64> {
-        let base = crate::mm::frame::with(|pool| {
-            if pool.stats().free <= crate::user::RESERVE_FRAMES + count as usize {
-                return None;
-            }
-            // Кадры выдаются обнулёнными.
-            pool.allocate_contiguous(count as usize)
-        })
-        .flatten()?;
+        // Кадры выдаются обнулёнными — вне замка пула (G2).
+        let base = crate::mm::frame::take_contiguous_zeroed(count as usize, crate::user::RESERVE_FRAMES)?;
         Some(base.0)
     }
 
