@@ -15464,7 +15464,17 @@ Proton — тремя прогонами выше.
   нажатием. Дальше: «Создать › Папку» на живой системе теперь создаёт папку в
   `/root/Desktop` (раньше ждали отказа) — проверяется создание и имя на месте.
 
-`perf-diag` до/после — см. замер ниже.
+Замер (QEMU 16 ЦП, живая флешка с Proton, `g2/g2-perf.ps1 -Smp 16 -Parts lvp,d2r`,
+те же первые 6 окон perf-diag по 30 с): до — `irq-off worst` 27,8 / 55,3 / 31,5 /
+2,7 / 3,4 / 3,6 мс, почти все `at print.rs:52`; после — 13,9 (`fs/fat.rs:427`,
+чтение пакетов при загрузке) / 3,5 / 6,5 / 2,0 / 3,5 / 5,6 мс, `print.rs` в
+худших нет ни разу; очередь линии 0-797 байт на момент строки, 0 выброшено.
+d3dprobe D3D12 lavapipe 59,6 fps, `--d2r` 59,9 fps (упор в 60 Гц, как и до).
+Сценарии: desktop, chrome, start, terminal, files-tabs, tools, filedlg,
+fsnotify, multihead, multihead-ui, appearance, scale-live, exfat, linux,
+usbstick, mouse, admin, e1-ui, obsos-downloads (`FOSSAI_LIVE_APPS=0`) — зелёные.
+Следующие кандидаты в глухоту: `fs/fat.rs:427`, `user/space.rs:706`,
+`sched/mod.rs:1301`.
 
 ## Игра во весь экран без сборки кадра, мышь для игр (21.11, G3) - **сделано, проверить на железе**
 

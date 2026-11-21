@@ -65,6 +65,16 @@ pub enum Aim {
     /// Середина места, которое «Пуск» напечатал строкой `start spot <имя> at
     /// X,Y WxH` (20.11): плитка, папка, кнопка пользователя, строка меню.
     Spot(&'static str),
+    /// Под местом «Пуска» `.0` — на его середине по горизонтали, у нижнего
+    /// края места `.1` (например, плитка и поле закреплённых). Отсюда указатель
+    /// доезжает до плитки по вертикали и не задевает по пути соседние
+    /// плитки-папки: наведение на любую из них раскрывает её поверх нужной
+    /// (21.11, «Средства администрирования» закрывали «Системные утилиты»).
+    SpotBelow(&'static str, &'static str),
+    /// В месте `.1` у его левого края, на высоте места `.0`: отсюда указатель
+    /// подъезжает к плитке по горизонтали, вдоль её ряда (например, из списка
+    /// всех программ к плитке первого ряда — мимо плиток-папок второго).
+    SpotLevel(&'static str, &'static str),
     /// Пустое место ниже [`Aim::Empty`]: туда не попадает меню, открытое в нём.
     EmptyBelow,
     /// Трей: часы у правого края панели задач. Область попадания часов
@@ -491,6 +501,20 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
                 .last()
                 .with_context(|| format!("в журнале нет места «Пуска» '{name}'"))?;
             (rect.x + rect.w / 2, rect.y + rect.h / 2)
+        }
+        Aim::SpotBelow(name, area) | Aim::SpotLevel(name, area) => {
+            let spot = |name: &str| {
+                let key = format!("start spot {name} at ");
+                log.lines()
+                    .filter_map(|line| line.split(&key).nth(1).and_then(parse_placement))
+                    .last()
+                    .with_context(|| format!("в журнале нет места «Пуска» '{name}'"))
+            };
+            let (rect, area) = (spot(name)?, spot(area)?);
+            match aim {
+                Aim::SpotBelow(..) => (rect.x + rect.w / 2, (area.y + area.h - 6).max(rect.y + rect.h / 2)),
+                _ => (area.x + 6, rect.y + rect.h / 2),
+            }
         }
     };
 

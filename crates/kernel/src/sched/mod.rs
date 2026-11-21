@@ -1619,6 +1619,8 @@ pub fn idle_wait() {
     // do (G2; returns at once unless faults used this CPU's cache).
     if RUNNING.load(Ordering::Relaxed) && !KICKED[smp::cpu()].load(Ordering::Relaxed) {
         crate::mm::frame::refill_idle();
+        // Serial lines queued by prints that kept interrupts off (G4).
+        crate::serial::pump();
     }
     let cpu = smp::cpu();
     let budget = IDLE_POLL_US.load(Ordering::Relaxed);

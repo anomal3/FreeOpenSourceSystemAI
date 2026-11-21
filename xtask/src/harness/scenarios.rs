@@ -1207,7 +1207,12 @@ const START_STEPS: &[Step] = &[
     Step::Await("desktop     : start spot user at ", 15_000),
     Step::Wait(800),
     Step::Shot("01-start"),
-    // Папка закреплённых раскрывается наведением.
+    // Папка закреплённых раскрывается наведением. Подъезд снизу, по пустому
+    // полю закреплённых: по прямой из середины экрана указатель проходил над
+    // плитками «SDK C#» и «Средства администрирования» (358b067), их папки
+    // раскрывались и закрывали «Системные утилиты».
+    Step::Aim(aim::Aim::SpotBelow("tile:folder:utils", "pins")),
+    Step::Wait(300),
     Step::Aim(aim::Aim::Spot("tile:folder:utils")),
     Step::Await("desktop     : start folder 'Системные утилиты' opened", 15_000),
     Step::Wait(600),
@@ -1229,7 +1234,11 @@ const START_STEPS: &[Step] = &[
     Step::Wait(600),
     Step::Shot("05-user-menu"),
     Step::Key("esc"),
-    // Правая кнопка на плитке: закрепить на панели задач.
+    // Правая кнопка на плитке: закрепить на панели задач. Подъезд через
+    // список и вдоль первого ряда — мимо плиток-папок второго ряда (см. выше).
+    Step::Aim(aim::Aim::Spot("list")),
+    Step::Aim(aim::Aim::SpotLevel("tile:files", "list")),
+    Step::Wait(300),
     Step::Aim(aim::Aim::Spot("tile:files")),
     Step::RightClick,
     Step::Await("desktop     : start context menu for 'files'", 15_000),
@@ -4575,6 +4584,11 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : focus 'System'", 15_000),
             // Перетаскивание: нажать, провезти, отпустить. Куда окно приехало,
             // говорит сам гость — снимок экрана этого не доказывает.
+            //
+            // Сначала пауза дольше двойного щелчка (700 мс): щелчок выше и
+            // нажатие в той же точке через 300 мс — это двойной щелчок по
+            // заголовку, и окно разворачивалось вместо перетаскивания (20.11).
+            Step::Wait(1_000),
             Step::Press,
             Step::Await("desktop     : drag 'System'", 15_000),
             Step::Move(-160, 120),
@@ -4708,23 +4722,24 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : context menu at", 15_000),
             Step::Wait(1_500),
             Step::Shot("10-context-menu"),
-            // Живой носитель ничего не хранит: корень — образ initrd в FAT, где
-            // каталогов не заводят. Меню обязано сказать это словами, а не
-            // «operation not supported»; создание же проверяется на
-            // установленной системе, где корень ext2 (сценарий `installed`).
+            // «Создать › Папку». У живой системы домашний каталог теперь в
+            // памяти (21.11: RAM /root, как /etc и «Загрузки»), и папка на
+            // столе создаётся — до этого здесь ждали отказа «the live system
+            // cannot store files». Имя сразу правится на месте.
             Step::Aim(Aim::ContextItem(3, 1)),
             Step::Click,
             Step::Await("desktop     : submenu at", 15_000),
             Step::Aim(Aim::SubItem(0, 0)),
             Step::Click,
-            Step::Await("cannot create: the live system cannot store files", 15_000),
+            Step::Await("desktop     : created 'Новая папка' in ", 15_000),
+            Step::Await("desktop     : context menu closed", 15_000),
+            Step::Await("desktop     : naming 'Новая папка'", 15_000),
             Step::Wait(1_500),
-            Step::Shot("11-context-refused"),
-            // Закрывается щелчком мимо — и «мимо» здесь ниже самого меню:
-            // точка, из которой его открыли, теперь занята им самим.
+            Step::Shot("11-context-created"),
+            // Щелчок мимо принимает имя, как в Проводнике.
             Step::Aim(Aim::EmptyBelow),
             Step::Click,
-            Step::Await("desktop     : context menu closed", 15_000),
+            Step::Await("desktop     : named 'Новая папка'", 15_000),
             // Миниатюры (72e, макет 04): указатель на кнопке свёрнутого
             // терминала — над ней полоса с карточкой; ушёл — полоса закрылась.
             Step::Aim(Aim::TaskButton(0)),
@@ -16261,7 +16276,10 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::FilesBody),
             Step::Wheel(-5),
             Step::Await("files: scrolled to ", 15_000),
-            Step::Await("selected 'ask'", 15_000),
+            // Первая строка `/bin` по алфавиту — `admin` («Администрирование»,
+            // 358b067); до него была `ask`. Новая программа на «a» раньше
+            // `admin` сдвинет и это имя.
+            Step::Await("entries, selected 'admin'", 15_000),
             Step::Wait(1_500),
             Step::Shot("02-wheel-keeps-selection"),
             // Клавиша двигает выделение, и вид едет за ним.

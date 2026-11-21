@@ -349,11 +349,13 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
         None => String::from("not measured"),
     };
     kprintln!(
-        "  perf-diag   : {secs} s cpu: idle {idle_pct}% of {cpus} cpus, run queue {} ready on average (worst {}), {} running; {} switches; irq-off worst {irq_off}",
+        "  perf-diag   : {secs} s cpu: idle {idle_pct}% of {cpus} cpus, run queue {} ready on average (worst {}), {} running; {} switches; irq-off worst {irq_off}; serial queue {} bytes, {} dropped since boot",
         avg(queue.ready),
         queue.worst,
         avg(queue.running),
         new.switches.saturating_sub(old.switches),
+        crate::serial::queued(),
+        crate::serial::dropped_total(),
     );
 
     // 4. Кадры: сервер Wayland (копия буфера клиента) и стол (сборка, вывод).
