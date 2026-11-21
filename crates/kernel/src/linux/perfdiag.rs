@@ -355,6 +355,21 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
         crate::sched::fast_yields(),
     );
     kprintln!("  perf-diag   : {line}");
+    // hw-log14 fixes at work (since boot): fence waits answered by the short
+    // poll vs after sleeping, mprotect without shootdown, faults on a stale
+    // translation, copy-on-write pages broken together with their neighbour.
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let (polled, polled_ns, slept, slept_ns) = super::drm::fence_wait_stats();
+        kprintln!(
+            "  perf-diag   : {secs} s since boot: fence waits {polled} done while polling ({} us each), {slept} after sleeping ({} us each); mprotect without shootdown {}, faults on a stale translation {}, copy-on-write pages batched {}",
+            polled_ns / polled.max(1) / 1000,
+            slept_ns / slept.max(1) / 1000,
+            crate::user::MPROTECT_NO_FLUSH.load(Relaxed),
+            crate::user::SPURIOUS_FAULTS.load(Relaxed),
+            crate::user::COW_BATCHED.load(Relaxed),
+        );
+    }
 
     // 3. Процессоры и очередь.
     let cpus = crate::smp::online().max(1) as u64;

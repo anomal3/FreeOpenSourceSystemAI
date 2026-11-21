@@ -39,6 +39,8 @@ mod sync;
 pub mod sysfs;
 mod vm;
 
+pub use sync::{FENCE_SPIN_US, fence_wait_stats};
+
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;

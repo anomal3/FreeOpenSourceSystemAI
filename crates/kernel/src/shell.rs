@@ -1327,6 +1327,20 @@ fn run_builtin(line: &str) -> bool {
             }
             sprintln!("  idlepoll: {} us", crate::sched::idle_poll_us());
         }
+        // DRM fence waits poll the GPU this long before 1 ms sleeps (hw-log14), us.
+        #[cfg(target_arch = "x86_64")]
+        "fencespin" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "off" => crate::linux::drm::FENCE_SPIN_US.store(0, Relaxed),
+                value => match value.parse::<u64>() {
+                    Ok(us) => crate::linux::drm::FENCE_SPIN_US.store(us.min(5_000), Relaxed),
+                    Err(_) => sprintln!("  fencespin: usage `fencespin [MICROSECONDS|off]`"),
+                },
+            }
+            sprintln!("  fencespin: {} us", crate::linux::drm::FENCE_SPIN_US.load(Relaxed));
+        }
         // Ожидание занятого мьютекса ядра в цикле до сна (20.11), мкс.
         "mutexspin" => {
             use core::sync::atomic::Ordering::Relaxed;

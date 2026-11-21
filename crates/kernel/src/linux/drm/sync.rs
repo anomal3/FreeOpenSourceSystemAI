@@ -198,11 +198,25 @@ impl Object for SyncFile {
 /// Ждать, пока `ready` не ответит `true`, до абсолютного срока `deadline_ns`
 /// по `CLOCK_MONOTONIC` (`None` — без срока). Сигнал или снятие процесса —
 /// `EINTR` (Linux: `ERESTARTSYS`); срок — `ETIME`.
+///
+/// hw-log14: with only 1 ms sleeps (the timer tick) every wait rounded the
+/// fence up to the next tick or two - DRM ioctls averaged 0.4-1.3 ms in D2R.
+/// There is no GPU completion interrupt to wake on (v1), so the first
+/// [`FENCE_SPIN_US`] are a poll loop that stays on the CPU (with
+/// `sched_yield` between polls - a ready task still gets the CPU); a fence
+/// that completes within it is seen within microseconds. Longer waits sleep
+/// as before.
 pub fn wait_until(deadline_ns: Option<u64>, mut ready: impl FnMut() -> Result<bool, i64>) -> Result<(), i64> {
     static KEY: u8 = 0;
+    let started = crate::time::uptime_ns();
+    let spin_ns = FENCE_SPIN_US.load(Ordering::Relaxed) * 1000;
+    let mut slept = false;
     loop {
         refresh();
         if ready()? {
+            let kind = usize::from(slept);
+            WAITS[kind].fetch_add(1, Ordering::Relaxed);
+            WAIT_NS[kind].fetch_add(crate::time::uptime_ns().saturating_sub(started), Ordering::Relaxed);
             return Ok(());
         }
         let now = crate::time::uptime_ns();
@@ -212,9 +226,40 @@ pub fn wait_until(deadline_ns: Option<u64>, mut ready: impl FnMut() -> Result<bo
         if crate::linux::signal::pending() || crate::user::kill_pending() {
             return Err(-e::EINTR);
         }
+        if now.saturating_sub(started) < spin_ns {
+            crate::sched::yield_now();
+            // A poll every ~5 us: `refresh` takes the channel registry lock
+            // and asks every channel.
+            let next = crate::time::uptime_ns() + 5_000;
+            while crate::time::uptime_ns() < next {
+                core::hint::spin_loop();
+            }
+            continue;
+        }
+        slept = true;
         let until = crate::time::uptime_ms() + 1;
         crate::sched::block_on_futex(core::ptr::addr_of!(KEY) as usize, Some(until), || false);
     }
+}
+
+/// How long a fence wait polls before it sleeps, us (`fencespin N`, 0 - sleep
+/// at once, as before).
+pub static FENCE_SPIN_US: AtomicU64 = AtomicU64::new(200);
+/// Finished fence waits: [done while polling, done after sleeping] and their
+/// total time, ns.
+static WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static WAIT_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Fence waits since boot: `(done while polling, their ns, done after
+/// sleeping, their ns)` - for perf-diag.
+#[must_use]
+pub fn fence_wait_stats() -> (u64, u64, u64, u64) {
+    (
+        WAITS[0].load(Ordering::Relaxed),
+        WAIT_NS[0].load(Ordering::Relaxed),
+        WAITS[1].load(Ordering::Relaxed),
+        WAIT_NS[1].load(Ordering::Relaxed),
+    )
 }
 
 /// Срок Linux (`timeout_nsec`, абсолютный монотонный) → наш: `i64::MAX` и
