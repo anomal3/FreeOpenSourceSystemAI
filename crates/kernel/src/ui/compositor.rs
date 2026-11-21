@@ -379,6 +379,26 @@ pub struct Compositor {
     /// G3: per output, the client buffer (physical address) the display
     /// scans out instead of the output's frame buffer (NVIDIA page flip).
     flipped: [Option<u64>; MAX_OUTPUTS],
+    /// G3: per direct output, the last logged flip state: `Some("")` - it
+    /// flips, `Some(why)` - why it does not; `None` - not direct.
+    flip_note: [Option<alloc::string::String>; MAX_OUTPUTS],
+    /// G3: per direct output, a refusal of the display for the current
+    /// window (copy until the window leaves the direct mode).
+    flip_block: [Option<alloc::string::String>; MAX_OUTPUTS],
+    /// G3: per direct output, the display had no cursor for it - the pointer
+    /// over it blocks the flip (it is drawn into the frame buffer).
+    flip_no_cursor: [bool; MAX_OUTPUTS],
+    /// G3: per output, the display's cursor over the flipped output:
+    /// `(image key, hot spot, top-left)` sent last; `None` - off.
+    flip_cursor: [Option<(usize, (u32, u32), (i32, i32))>; MAX_OUTPUTS],
+    /// G3: per output, the changed part of a flipped client buffer this
+    /// frame (virtio-gpu transfers it).
+    flip_touched: [Option<Rect>; MAX_OUTPUTS],
+    /// G3: a flip the display could not take yet - next frame tries again.
+    flip_retry: bool,
+    /// G3: the program window that hid the pointer over itself
+    /// (`wl_pointer.set_cursor` with a null surface).
+    cursor_hidden_by: Option<App>,
     /// G3: pointer lock/confinement asked by a program window
     /// (`zwp_pointer_constraints_v1`).
     constraint: Option<Constraint>,
@@ -559,6 +579,13 @@ impl Compositor {
             cursor_key: usize::MAX,
             direct: [None; MAX_OUTPUTS],
             flipped: [None; MAX_OUTPUTS],
+            flip_note: [const { None }; MAX_OUTPUTS],
+            flip_block: [const { None }; MAX_OUTPUTS],
+            flip_no_cursor: [false; MAX_OUTPUTS],
+            flip_cursor: [None; MAX_OUTPUTS],
+            flip_touched: [None; MAX_OUTPUTS],
+            flip_retry: false,
+            cursor_hidden_by: None,
             constraint: None,
             tablet_last: None,
         };
@@ -1866,6 +1893,13 @@ impl Compositor {
     /// Один объединяющий при быстром движении накрыл бы полэкрана, тогда как
     /// настоящих изменений два пятна размером с курсор.
     pub fn move_pointer(&mut self, dx: i32, dy: i32) {
+        self.move_pointer_by(dx, dy);
+        if self.cursor_hidden_by.is_some() {
+            self.sync_client_cursor();
+        }
+    }
+
+    fn move_pointer_by(&mut self, dx: i32, dy: i32) {
         let before = self.pointer.rect();
         let outs = self.out_rects;
         let moved = self.pointer.move_by(dx, dy, &outs[..self.outputs.len().min(MAX_OUTPUTS)]);
@@ -1906,6 +1940,60 @@ impl Compositor {
     /// это тот, кто хранит прежнее положение. Заодно из ответа исчезает та
     /// часть движения, которую съел край экрана.
     pub fn move_pointer_to(&mut self, x_fraction: u16, y_fraction: u16) -> (i32, i32) {
+        let moved = self.move_pointer_at(x_fraction, y_fraction);
+        if self.cursor_hidden_by.is_some() {
+            self.sync_client_cursor();
+        }
+        moved
+    }
+
+    /// G3: a program window hides (`hidden`) or shows the pointer over
+    /// itself (`wl_pointer.set_cursor`).
+    pub fn set_client_cursor(&mut self, app: App, hidden: bool) {
+        let before = self.cursor_hidden_by;
+        if hidden {
+            self.cursor_hidden_by = Some(app);
+        } else if self.cursor_hidden_by == Some(app) {
+            self.cursor_hidden_by = None;
+        }
+        if self.cursor_hidden_by != before {
+            crate::kprintln!(
+                "  desktop     : '{}' {} the pointer over its window",
+                self.label(app),
+                if hidden { "hides" } else { "shows" }
+            );
+        }
+        self.sync_client_cursor();
+    }
+
+    /// G3: hide the pointer while it is over the window that hid it, show it
+    /// elsewhere (a pointer lock hides it on its own).
+    fn sync_client_cursor(&mut self) {
+        if theme::is_mobile() || self.constraint.is_some_and(|c| c.active && c.lock) {
+            return;
+        }
+        let (x, y) = self.pointer.position();
+        let hide =self.cursor_hidden_by.is_some_and(|app| {
+            self.window_at(x, y).is_some_and(|(index, _)| self.windows.get(index).is_some_and(|window| window.app == app))
+        });
+        let rect = self.pointer.rect();
+        if hide {
+            if self.pointer.hide() {
+                if self.hw_cursor {
+                    crate::display::cursor_visible(false, x, y);
+                }
+                self.mark(rect);
+            }
+        } else if self.pointer.show() {
+            if self.hw_cursor {
+                crate::display::cursor_visible(true, x, y);
+                self.cursor_sent = (x, y);
+            }
+            self.mark(rect);
+        }
+    }
+
+    fn move_pointer_at(&mut self, x_fraction: u16, y_fraction: u16) -> (i32, i32) {
         // Планшет показывает точку на основном мониторе: устройство одно, и
         // его поле ложится на тот экран, где панель.
         let p = self.primary;
@@ -4977,7 +5065,7 @@ impl Compositor {
         // Палец держат на полоске жеста — задержку считает `ui::tick`, и
         // будить его надо кадрами, как и долгое нажатие на значок.
         super::set_animating(
-            self.flight.is_some() || trail || spinning || shade_moving || taskbar_moving || peek_moving || snap_waiting || splash_moving || super::icon_holding() || super::gesture_holding(),
+            self.flight.is_some() || trail || spinning || shade_moving || taskbar_moving || peek_moving || snap_waiting || splash_moving || super::icon_holding() || super::gesture_holding() || self.flip_retry,
         );
         self.collect();
         // G3: outputs fully covered by a fullscreen program window go to the
@@ -5121,6 +5209,9 @@ impl Compositor {
                 now.or(was).map_or_else(|| alloc::string::String::from("-"), |app| self.label(app))
             );
             self.direct[index] = now;
+            // A new window (or none) - the display may flip it again.
+            self.flip_block[index] = None;
+            self.flip_no_cursor[index] = false;
             let rect = self.outputs[index].rect;
             self.mark(rect);
         }
@@ -5128,7 +5219,7 @@ impl Compositor {
 
     /// [`Self::compose`] with the direct outputs of `plan` taken out: their
     /// part of `rect` is copied from the window pixels.
-    fn compose_planned(&mut self, rect: Rect, plan: &[Option<usize>; MAX_OUTPUTS], flips: &[Option<(u32, u64, u32)>; MAX_OUTPUTS]) {
+    fn compose_planned(&mut self, rect: Rect, plan: &[Option<usize>; MAX_OUTPUTS], flips: &[Option<(u64, u32)>; MAX_OUTPUTS]) {
         if plan.iter().all(Option::is_none) {
             self.compose(rect);
             return;
@@ -5139,8 +5230,13 @@ impl Compositor {
                 continue;
             }
             match plan[index] {
-                // The display shows the client buffer itself: nothing to copy.
-                Some(_) if flips[index].is_some() => {}
+                // The display shows the client buffer itself: nothing to copy
+                // (virtio-gpu transfers the changed part after the flip).
+                Some(_) if flips[index].is_some() => {
+                    let o = self.outputs[index].rect;
+                    let local = Rect::new(part.x - o.x, part.y - o.y, part.w, part.h);
+                    self.flip_touched[index] = Some(self.flip_touched[index].map_or(local, |r| r.union(&local)));
+                }
                 Some(window) => self.blit_direct(index, window, part),
                 None => self.compose(part),
             }
@@ -5148,80 +5244,172 @@ impl Compositor {
     }
 
     /// Outputs whose display scans the client buffer out directly (NVIDIA
-    /// page flip, opt-in `scanout flip on`): a direct output of a display
-    /// that can, a contiguous client buffer, and no pointer over it (the
-    /// pointer is only drawn into our frame buffer). `(output id, physical
-    /// address, pitch)`. An output that stops flipping gets its frame buffer
+    /// page flip, virtio-gpu stand-in; opt-in `wldirect flip on`): a direct
+    /// output of a display that can flip, a contiguous client buffer, and no
+    /// pointer over it unless the display draws it ([`Self::flip_cursor_update`]).
+    /// `(physical address, pitch)`. Why an output does not flip is logged
+    /// once per change. An output that stops flipping gets its frame buffer
     /// repainted whole first ([`Self::finish_flips`] switches back after).
-    fn flip_plan(&mut self, plan: &[Option<usize>; MAX_OUTPUTS]) -> [Option<(u32, u64, u32)>; MAX_OUTPUTS] {
+    fn flip_plan(&mut self, plan: &[Option<usize>; MAX_OUTPUTS]) -> [Option<(u64, u32)>; MAX_OUTPUTS] {
         let mut flips = [None; MAX_OUTPUTS];
         let on = crate::display::nvidia_disp::FLIP.load(core::sync::atomic::Ordering::Relaxed);
+        let stopped = crate::display::nvidia_disp::FLIP_STOPPED.load(core::sync::atomic::Ordering::Relaxed);
         for index in 0..self.outputs.len().min(MAX_OUTPUTS) {
-            let out = &self.outputs[index];
-            let crate::display::outputs::Backend::Nvidia(id) = out.backend else {
+            let Some(at) = plan[index] else {
+                self.flip_note[index] = None;
                 continue;
             };
-            let pointer_over = self.pointer.is_visible() && !self.pointer.rect().intersect(&out.rect).is_empty();
-            if !on || pointer_over {
-                continue;
-            }
-            if let Some((phys, pitch)) = plan[index].and_then(|at| self.windows.get(at)).and_then(Window::scanout_source) {
-                flips[index] = Some((id, phys, pitch));
+            let out = &self.outputs[index];
+            let pointer_over = !self.hw_cursor && self.pointer.is_visible() && !self.pointer.rect().intersect(&out.rect).is_empty();
+            let source = self.windows.get(at).map_or(Err("no window"), Window::scanout_source);
+            let decided: Result<(u64, u32), alloc::string::String> = if !on {
+                Err("flip is off (`wldirect flip on`)".into())
+            } else if stopped {
+                Err("flips stopped after a display error (`wldirect flip on` tries again)".into())
+            } else if let Some(why) = crate::display::flip_unsupported(out.backend) {
+                Err(why.into())
+            } else if let Some(why) = &self.flip_block[index] {
+                Err(why.clone())
+            } else if pointer_over && (self.flip_no_cursor[index] || !crate::display::flip_has_cursor(out.backend)) {
+                Err("the pointer is over the output and the display has no cursor for it".into())
+            } else {
+                source.map_err(Into::into)
+            };
+            match decided {
+                Ok(flip) => {
+                    flips[index] = Some(flip);
+                    if self.flip_note[index].as_deref() != Some("") && self.flipped[index].is_some() {
+                        self.flip_note[index] = Some(alloc::string::String::new());
+                    }
+                }
+                Err(why) => {
+                    if self.flip_note[index].as_deref() != Some(why.as_str()) {
+                        crate::kprintln!("  desktop     : output {index} does not flip: {why}");
+                        self.flip_note[index] = Some(why);
+                    }
+                }
             }
         }
         for index in 0..self.outputs.len().min(MAX_OUTPUTS) {
+            let rect = self.outputs[index].rect;
             if self.flipped[index].is_some() && flips[index].is_none() {
-                let rect = self.outputs[index].rect;
                 self.mark(rect);
+            } else if flips[index].is_some_and(|(phys, _)| self.flipped[index] != Some(phys)) {
+                // A flip to do (or to try again): the frame must run even
+                // without other damage; the flipped output composes nothing.
+                self.mark(Rect::new(rect.x, rect.y, 1, 1));
             }
         }
         flips
     }
 
     /// Point the displays at the planned buffers (or back at their frame
-    /// buffers, already repainted this frame). A flip the display refuses
-    /// (channel busy) falls back to the copy.
-    fn finish_flips(&mut self, plan: &[Option<usize>; MAX_OUTPUTS], flips: &[Option<(u32, u64, u32)>; MAX_OUTPUTS]) {
+    /// buffers, already repainted this frame). A flip the display cannot take
+    /// yet is tried again next frame; one it refuses falls back to the copy
+    /// for this window (logged).
+    fn finish_flips(&mut self, plan: &[Option<usize>; MAX_OUTPUTS], flips: &[Option<(u64, u32)>; MAX_OUTPUTS]) {
+        self.flip_retry = false;
         for index in 0..self.outputs.len().min(MAX_OUTPUTS) {
-            let want = flips[index].map(|(_, phys, _)| phys);
+            let backend = self.outputs[index].backend;
+            let touched = self.flip_touched[index].take();
+            let want = flips[index].map(|(phys, _)| phys);
             if want == self.flipped[index] {
-                if want.is_some() {
+                if let (Some(_), Some(r)) = (want, touched) {
+                    crate::display::flip_refresh(backend, r.x, r.y, r.w, r.h);
                     super::note_flip();
                 }
-                continue;
-            }
-            let id = match (flips[index], self.outputs[index].backend) {
-                (Some((id, _, _)), _) | (None, crate::display::outputs::Backend::Nvidia(id)) => id,
-                _ => {
-                    self.flipped[index] = None;
-                    continue;
-                }
-            };
-            let pitch = flips[index].map_or(0, |(_, _, pitch)| pitch);
-            match crate::display::nvidia_disp::scanout(id, want, pitch) {
-                Ok(()) => {
-                    if want.is_some() != self.flipped[index].is_some() {
-                        crate::kprintln!(
-                            "  desktop     : output {index} {}",
-                            if want.is_some() { "scans the fullscreen window's buffer out directly (no copy)" } else { "scans its frame buffer out again" }
-                        );
-                    }
-                    self.flipped[index] = want;
-                    if want.is_some() {
-                        super::note_flip();
-                    }
-                }
-                Err(why) => {
-                    if want.is_some() {
-                        // Copy instead; the display keeps what it showed.
-                        if let Some(at) = plan[index] {
-                            let rect = self.outputs[index].rect;
-                            self.blit_direct(index, at, rect);
+            } else {
+                let pitch = flips[index].map_or(0, |(_, pitch)| pitch);
+                match crate::display::flip(backend, want, pitch) {
+                    Ok(()) => {
+                        if want.is_some() != self.flipped[index].is_some() {
+                            crate::kprintln!(
+                                "  desktop     : output {index} {}",
+                                if want.is_some() { "scans the fullscreen window's buffer out directly (no copy)" } else { "scans its frame buffer out again" }
+                            );
                         }
-                    } else {
-                        crate::kprintln!("  desktop     : output {index} could not scan its frame buffer out again: {why}");
+                        if want.is_some() {
+                            self.flip_note[index] = Some(alloc::string::String::new());
+                            super::note_flip();
+                        }
+                        self.flipped[index] = want;
+                    }
+                    Err(crate::display::FlipError::Pending(_)) => self.flip_retry = true,
+                    Err(crate::display::FlipError::Refused(why)) => {
+                        if want.is_some() {
+                            crate::kprintln!("  desktop     : output {index} does not flip: the display refused - {why}");
+                            self.flip_note[index] = Some(why.clone());
+                            self.flip_block[index] = Some(why);
+                            if self.flipped[index].is_none() {
+                                // The display shows the frame buffer: copy now.
+                                if let Some(at) = plan[index] {
+                                    let rect = self.outputs[index].rect;
+                                    self.blit_direct(index, at, rect);
+                                }
+                            } else {
+                                // It still shows the previous client buffer:
+                                // next frame goes back to the frame buffer.
+                                let rect = self.outputs[index].rect;
+                                self.mark(rect);
+                                self.flip_retry = true;
+                            }
+                        } else {
+                            crate::kprintln!("  desktop     : output {index} could not scan its frame buffer out again: {why}");
+                            self.flipped[index] = None;
+                        }
                     }
                 }
+            }
+            self.flip_cursor_update(index);
+        }
+    }
+
+    /// The pointer over a flipped output is the display's cursor (nothing is
+    /// composed there): show, move, change or hide it; off when the output
+    /// stops flipping. A display without a cursor blocks the flip while the
+    /// pointer is over the output ([`Self::flip_no_cursor`]).
+    fn flip_cursor_update(&mut self, index: usize) {
+        let backend = self.outputs[index].backend;
+        let o = self.outputs[index].rect;
+        if self.flipped[index].is_none() || self.hw_cursor {
+            if self.flip_cursor[index].take().is_some() {
+                crate::display::flip_cursor_off(backend);
+            }
+            return;
+        }
+        let shown = self.pointer.is_visible() && !self.pointer.rect().intersect(&o).is_empty();
+        let (key, hot, image) = match self.flip_cursor[index] {
+            // Hidden and never enabled: games hiding the pointer never touch
+            // the cursor hardware.
+            None if !shown => return,
+            Some((key, hot, _)) if shown && key == self.pointer.image_key() => (key, hot, None),
+            Some((usize::MAX, hot, _)) if !shown => (usize::MAX, hot, None),
+            _ if !shown => (usize::MAX, (0, 0), Some(alloc::vec![0u32; (crate::display::FLIP_CURSOR_SIDE * crate::display::FLIP_CURSOR_SIDE) as usize])),
+            _ => {
+                let (image, hot) = self.pointer.image(crate::display::FLIP_CURSOR_SIDE);
+                (self.pointer.image_key(), hot, Some(image))
+            }
+        };
+        let (x, y) = self.pointer.position();
+        let at = if shown { (x - hot.0 as i32 - o.x, y - hot.1 as i32 - o.y) } else { self.flip_cursor[index].map_or((0, 0), |(_, _, at)| at) };
+        if image.is_none() && self.flip_cursor[index].is_some_and(|(_, _, sent)| sent == at) {
+            return;
+        }
+        let answer = crate::display::flip_cursor(backend, image.as_deref(), at);
+        if answer == Some(true) {
+            self.flip_cursor[index] = Some((key, hot, at));
+        } else if answer.is_none() {
+            // A lock is busy: the next frame sends it again.
+            self.flip_retry = true;
+            if let Some(o) = self.outputs.get(index).map(|out| out.rect) {
+                self.mark(Rect::new(o.x, o.y, 1, 1));
+            }
+        } else {
+            self.flip_no_cursor[index] = true;
+            if shown {
+                // Compose the pointer: the next frame stops the flip.
+                self.mark(o);
+                self.flip_retry = true;
             }
         }
     }

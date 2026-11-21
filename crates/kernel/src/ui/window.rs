@@ -3067,12 +3067,15 @@ impl Window {
     }
 
     /// G3: physical address and pitch of the pixels shown directly, when they
-    /// are a contiguous client buffer (see [`Self::direct_phys`]).
-    #[must_use]
-    pub fn scanout_source(&self) -> Option<(u64, u32)> {
-        let pixels = self.direct_pixels()?;
-        let (at, phys) = self.direct_phys?;
-        (pixels.row(0).as_ptr() as usize == at).then(|| (phys, pixels.width() * 4))
+    /// are a contiguous client buffer (see [`Self::direct_phys`]); `Err` -
+    /// why not (logged by the desktop when a flip cannot engage).
+    pub fn scanout_source(&self) -> Result<(u64, u32), &'static str> {
+        let pixels = self.direct_pixels().ok_or("the window is not shown straight from its pixels")?;
+        let (at, phys) = self.direct_phys.ok_or("the window pixels are not one physically contiguous client buffer (shm or scattered pages)")?;
+        if pixels.row(0).as_ptr() as usize != at {
+            return Err("the window shows other pixels than its client buffer");
+        }
+        Ok((phys, pixels.width() * 4))
     }
 
     /// G3: the program changed `area` of its pixels while the window is shown

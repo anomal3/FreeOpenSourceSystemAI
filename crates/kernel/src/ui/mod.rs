@@ -6703,24 +6703,52 @@ pub fn direct_command(argument: &str) -> String {
     match argument.trim() {
         "on" => compositor::DIRECT.store(true, Ordering::Relaxed),
         "off" => compositor::DIRECT.store(false, Ordering::Relaxed),
-        // NVIDIA: scan the game's buffer out directly (page flip, no copy).
-        "flip on" => crate::display::nvidia_disp::FLIP.store(true, Ordering::Relaxed),
+        // NVIDIA: scan the game's buffer out directly (page flip, no copy);
+        // `flip timed` - without the window notifier (two refresh periods).
+        "flip on" | "flip timed" => {
+            use crate::display::nvidia_disp::{FLIP, FLIP_STOPPED, FLIP_TIMED};
+            FLIP_TIMED.store(argument.trim() == "flip timed", Ordering::Relaxed);
+            FLIP_STOPPED.store(false, Ordering::Relaxed);
+            FLIP.store(true, Ordering::Relaxed);
+        }
         "flip off" => crate::display::nvidia_disp::FLIP.store(false, Ordering::Relaxed),
         "" => {}
-        _ => return String::from("  wldirect: usage `wldirect [on|off|flip on|flip off]`"),
+        _ => return String::from("  wldirect: usage `wldirect [on|off|flip on|flip timed|flip off]`"),
     }
     with_desktop(|desktop| {
         desktop.repaint_all();
         desktop.present();
     });
     let (pieces, ns, points, flips) = direct_stats();
-    alloc::format!(
-        "  wldirect: {} ({pieces} direct copies, {} us each, {} Kpx each; {flips} frames scanned out of client buffers since boot; scanout flip {})",
+    let flip = if !crate::display::nvidia_disp::FLIP.load(Ordering::Relaxed) {
+        "off (`wldirect flip on` to try)"
+    } else if crate::display::nvidia_disp::FLIP_STOPPED.load(Ordering::Relaxed) {
+        "stopped after a display error (`wldirect flip on` tries again)"
+    } else if crate::display::nvidia_disp::FLIP_TIMED.load(Ordering::Relaxed) {
+        "on, timed (no notifier)"
+    } else {
+        "on"
+    };
+    let line = alloc::format!(
+        "  wldirect: {} ({pieces} direct copies, {} us each, {} Kpx each; {flips} frames scanned out of client buffers since boot; scanout flip {flip})",
         if compositor::DIRECT.load(Ordering::Relaxed) { "on" } else { "off" },
         ns / pieces.max(1) / 1000,
         points / pieces.max(1) / 1000,
-        if crate::display::nvidia_disp::FLIP.load(Ordering::Relaxed) { "on" } else { "off (`wldirect flip on` to try)" }
-    )
+    );
+    // The owner's logs show what was switched (hw-log14: not visible).
+    if !argument.trim().is_empty() {
+        kprintln!("  desktop     : `wldirect {}` -> {}", argument.trim(), line.trim_start());
+    }
+    line
+}
+
+/// G3: `wl_pointer.set_cursor` - the program hides (`hidden`, null cursor
+/// surface) or shows the pointer while it is over its window.
+pub fn client_cursor(task: u32, slot: u32, hidden: bool) {
+    with_desktop(|desktop| {
+        desktop.set_client_cursor(App::Program(task, slot), hidden);
+        desktop.present();
+    });
 }
 
 /// G3: raise and focus a program window (`xdg_activation_v1.activate`).

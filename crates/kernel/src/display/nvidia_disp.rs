@@ -55,9 +55,36 @@ const OBJ_VRAM: u32 = 0x2020;
 const OBJ_FB: u32 = 0x2040;
 const OBJ_SYS: u32 = 0x2060;
 
-/// G3: direct scanout of fullscreen client buffers (`scanout flip on`).
-/// Off by default until checked on the RTX 3060.
+/// G3: direct scanout of fullscreen client buffers (`wldirect flip on`).
+/// Off by default until checked on the RTX 3060 (sysmem scanout, notifier,
+/// cursor channel - see ROADMAP "Scan-out flip").
 pub static FLIP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// G3: flips stopped after the display misbehaved (a flip not taken in
+/// [`FLIP_TIMEOUT_MS`]); `wldirect flip on` clears it.
+pub static FLIP_STOPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// G3: `wldirect flip timed` - do not use the window notifier: a flip counts
+/// as on screen two refresh periods after it was kicked (fallback in case the
+/// notifier never moves on the card).
+pub static FLIP_TIMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// G3: some head scans system memory or has a flip pending - only then does
+/// [`scanning`] need a look (the Wayland server asks on every release).
+static ANY_FLIP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// G3: a flip whose notifier has not said BEGUN/FINISHED by then stops flips.
+const FLIP_TIMEOUT_MS: u64 = 250;
+/// G3: window notifiers of the flips, one 16-byte `NV_DISP_NOTIFIER` per
+/// head inside the SYNC ctxdma (`SET_NOTIFIER_CONTROL` offset 11:4).
+const FLIP_NTFY: u64 = SYNC + 0x100;
+/// G3: hardware cursor images (64x64 A8R8G8B8, 16 KiB per head) - free VRAM
+/// between the LUTs (end 0x0604_0000) and the NVK CPU arena (0x0610_0000).
+const fn curs(head: u32) -> u64 {
+    0x0604_0000 + head as u64 * 0x4000
+}
+/// G3: side of the cursor image (HEAD_SET_CONTROL_CURSOR SIZE W64_H64).
+pub const CURSOR_SIDE: u32 = 64;
+/// G3: cursor channel (class 0xc67a, PIO) user area of head `h` in BAR0.
+const fn curs_user(head: u32) -> usize {
+    0x006d_8000 + head as usize * 0x1000
+}
 
 // --- видеопамять через BAR1 ---------------------------------------------------
 
@@ -105,6 +132,14 @@ struct Disp {
     /// G3: per head, the system memory address scanned out instead of its
     /// frame buffer (`None` - the frame buffer).
     flipped: [Option<u64>; 4],
+    /// G3: per head, a flip kicked and not on screen yet: what the display
+    /// showed before it (still read until the flip latches) and when it was
+    /// kicked (ms).
+    flip_wait: [Option<(Option<u64>, u64)>; 4],
+    /// G3: per head, the cursor channel: 0 not tried, 1 up, 2 failed.
+    cursor_chan: [u8; 4],
+    /// G3: per head, the cursor is enabled in the core channel.
+    cursor_on: [bool; 4],
 }
 
 // SAFETY: только адреса окна BAR1 и память буферов команд — владелец один.
@@ -496,6 +531,9 @@ fn bring_up(rm: &mut Rm, log: &mut Log, internal: (u32, u32), device: crate::pci
         primary: 0,
         bar,
         flipped: [None; 4],
+        flip_wait: [None; 4],
+        cursor_chan: [0; 4],
+        cursor_on: [false; 4],
     })
 }
 
@@ -783,6 +821,11 @@ fn set_head(rm: &mut Rm, log: &mut Log, disp: &mut Disp, head: u32, id: u32, lin
         }
         disp.owners_sent = true;
     }
+    // G3: a cursor left on by a flipped output goes off with the modeset.
+    if core::mem::take(&mut disp.cursor_on[head as usize]) {
+        disp.core.push(0x209c + hb, &[0xcf]);
+        disp.core.push(0x2088 + hb, &[0]);
+    }
     core_update(disp, bar, 0)?;
     log.push(format!("C2: head {head} raster {}x{} up ({:#x} armed)", mode.h_total, mode.v_total, bar.rd(0x0068_a064 + hb as usize)));
 
@@ -815,6 +858,10 @@ fn set_head(rm: &mut Rm, log: &mut Log, disp: &mut Disp, head: u32, id: u32, lin
     core_update(disp, bar, 1 << w)?;
     window.idle(bar)?;
     if let Some(slot) = disp.flipped.get_mut(head as usize) {
+        *slot = None;
+    }
+    // The modeset showed the frame buffer: no flip pending.
+    if let Some(slot) = disp.flip_wait.get_mut(head as usize) {
         *slot = None;
     }
     log.push(format!("C3: head {head} shows {}x{} from VRAM {:#x} (pitch {pitch})", mode.width, mode.height, fb(head)));
@@ -938,30 +985,58 @@ pub fn set_primary(width: u32, height: u32, refresh_mhz: u32) -> Result<boot_inf
 /// G3 (21.11): scan out `phys` (physically contiguous system memory,
 /// `pitch` bytes per row, the head's size and format) on the head of output
 /// `id` instead of its frame buffer - a page flip of the window channel, no
-/// copy; `None` - back to the frame buffer. Never waits: a channel that has
-/// not taken the previous flip yet answers `Err` and the caller copies.
-pub fn scanout(id: u32, phys: Option<u64>, pitch: u32) -> Result<(), &'static str> {
-    let mut guard = DISP.try_lock().ok_or("display busy")?;
-    let disp = guard.as_mut().ok_or("display not set up")?;
-    let (head, _, mode) = disp.heads.iter().find(|(_, o, _)| *o == id).copied().ok_or("output not lit")?;
+/// copy; `None` - back to the frame buffer. Never waits:
+/// [`super::FlipError::Pending`] - the previous flip is not on screen yet
+/// (its window notifier still says NOT_BEGUN) or the channel has not read it,
+/// try next frame; [`super::FlipError::Refused`] - copy instead. A flip the
+/// display does not take in [`FLIP_TIMEOUT_MS`] stops flips
+/// ([`FLIP_STOPPED`]).
+///
+/// The flip latches at the next vblank (window `SET_PRESENT_CONTROL`
+/// NON_TEARING, set by the modeset); its notifier (`NV_DISP_NOTIFIER` at
+/// [`FLIP_NTFY`]) leaves NOT_BEGUN when the new surface is in use - only
+/// then is the buffer shown before free for the client ([`scanning`]).
+pub fn scanout(id: u32, phys: Option<u64>, pitch: u32) -> Result<(), super::FlipError> {
+    use super::FlipError::{Pending, Refused};
+    let mut guard = DISP.try_lock().ok_or(Pending("display busy"))?;
+    let disp = guard.as_mut().ok_or_else(|| Refused("display not set up".into()))?;
+    let (head, _, mode) = disp.heads.iter().find(|(_, o, _)| *o == id).copied().ok_or_else(|| Refused("output not lit".into()))?;
     let slot = head as usize;
+    poll_flip(disp, slot, mode)?;
     if disp.flipped.get(slot).copied().flatten() == phys {
         return Ok(());
     }
     let fb_pitch = (mode.width * 4).div_ceil(64) * 64;
     if phys.is_some() && (pitch != fb_pitch || pitch % 64 != 0) {
-        return Err("pitch differs from the head's");
+        return Err(Refused(format!("rows of {pitch} bytes, the head scans {fb_pitch} (multiple of 64)")));
+    }
+    if phys.is_some_and(|addr| addr % 256 != 0) {
+        return Err(Refused("the buffer does not start on 256 bytes".into()));
     }
     let bar = disp.bar;
-    let window = disp.windows.get_mut(2 * slot).and_then(Option::as_mut).ok_or("no window channel")?;
-    // The previous flip must have been read (GET == PUT), else skip.
+    let vram = disp.vram;
+    let timed = FLIP_TIMED.load(Ordering::Relaxed);
+    let window = disp.windows.get_mut(2 * slot).and_then(Option::as_mut).ok_or_else(|| Refused("no window channel".into()))?;
+    // The previous update must have been read (GET == PUT), else next frame.
     if bar.rd(window.user + 4) != window.cur * 4 {
-        return Err("window channel busy");
+        return Err(Pending("window channel busy"));
     }
     let (ctx, at) = match phys {
         Some(addr) => (H_SYS, addr),
         None => (H_FB, fb(head)),
     };
+    let ntfy = FLIP_NTFY + slot as u64 * 0x10;
+    if timed {
+        window.push(0x021c, &[0]);
+    } else {
+        for i in 0..4 {
+            vram.w32(ntfy + i * 4, 0);
+        }
+        // SET_CONTEXT_DMA_NOTIFIER, SET_NOTIFIER_CONTROL (MODE_WRITE,
+        // OFFSET 11:4 = byte offset in the SYNC ctxdma).
+        window.push(0x021c, &[H_SYNC]);
+        window.push(0x0220, &[((ntfy - SYNC) as u32) & 0xff0]);
+    }
     window.push(0x0240, &[ctx]);
     window.push(0x0260, &[(at >> 8) as u32]);
     // No interlock with core: a plain flip (the modeset left core
@@ -969,7 +1044,225 @@ pub fn scanout(id: u32, phys: Option<u64>, pitch: u32) -> Result<(), &'static st
     window.push(0x0370, &[0, 0]);
     window.push(0x0200, &[1]);
     window.kick(bar);
+    disp.flip_wait[slot] = Some((disp.flipped[slot], crate::time::uptime_ms()));
     disp.flipped[slot] = phys;
+    ANY_FLIP.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// G3: has the last flip of head `slot` reached the screen? `Ok` - yes (or
+/// none pending), `Pending` - not yet, `Refused` - not in
+/// [`FLIP_TIMEOUT_MS`]: flips stop ([`FLIP_STOPPED`]) and the display is
+/// taken as showing the new surface from now on.
+fn poll_flip(disp: &mut Disp, slot: usize, mode: edid::Mode) -> Result<(), super::FlipError> {
+    let Some((_, kicked)) = disp.flip_wait.get(slot).copied().flatten() else {
+        return Ok(());
+    };
+    let now = crate::time::uptime_ms();
+    let elapsed = now.saturating_sub(kicked);
+    let done = if FLIP_TIMED.load(Ordering::Relaxed) {
+        // Two refresh periods: the flip latched at one of the vblanks.
+        let frame_ms = 1_000_000 / u64::from(mode.refresh_mhz().max(1)) + 1;
+        elapsed >= 2 * frame_ms
+    } else {
+        disp.vram.r32(FLIP_NTFY + slot as u64 * 0x10) >> 30 != 0
+    };
+    if done {
+        disp.flip_wait[slot] = None;
+        return Ok(());
+    }
+    if elapsed < FLIP_TIMEOUT_MS {
+        return Err(super::FlipError::Pending("previous flip not on screen yet"));
+    }
+    disp.flip_wait[slot] = None;
+    FLIP_STOPPED.store(true, Ordering::Relaxed);
+    let chn = 1 + 2 * slot;
+    let window = disp.windows.get(2 * slot).copied().flatten();
+    let why = format!(
+        "head {slot}: flip not on screen after {elapsed} ms (notifier {:#x}, GET {:#x} PUT {:#x}, exception {:#x} {:#x} {:#x}) - flips stopped (`wldirect flip timed` skips the notifier)",
+        disp.vram.r32(FLIP_NTFY + slot as u64 * 0x10),
+        window.map_or(0, |w| disp.bar.rd(w.user + 4)),
+        window.map_or(0, |w| disp.bar.rd(w.user)),
+        disp.bar.rd(0x0061_1020 + chn * 12),
+        disp.bar.rd(0x0061_1024 + chn * 12),
+        disp.bar.rd(0x0061_1028 + chn * 12),
+    );
+    crate::kprintln!("  nvidia-disp : {why}");
+    Err(super::FlipError::Refused(why))
+}
+
+/// G3: may the display still read `[start, start + len)` of system memory -
+/// a head scans it out, or showed it before a flip that is not on screen
+/// yet? The Wayland server keeps such a client buffer (no `release`) until
+/// this says `false`. A busy display lock answers `true` (ask again).
+#[must_use]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn scanning(start: u64, len: u64) -> bool {
+    if !ANY_FLIP.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(mut guard) = DISP.try_lock() else {
+        return true;
+    };
+    let Some(disp) = guard.as_mut() else {
+        return false;
+    };
+    let inside = |addr: Option<u64>| addr.is_some_and(|addr| addr >= start && addr < start.saturating_add(len));
+    let heads: Vec<(u32, edid::Mode)> = disp.heads.iter().map(|(h, _, m)| (*h, *m)).collect();
+    let mut hit = false;
+    for (head, mode) in heads {
+        let slot = head as usize;
+        if slot >= 4 {
+            continue;
+        }
+        let _ = poll_flip(disp, slot, mode);
+        hit |= inside(disp.flipped[slot]) || disp.flip_wait[slot].is_some_and(|(before, _)| inside(before));
+    }
+    if !disp.flipped.iter().any(Option::is_some) && !disp.flip_wait.iter().any(Option::is_some) {
+        ANY_FLIP.store(false, Ordering::Relaxed);
+    }
+    hit
+}
+
+/// G3: see [`ANY_FLIP`].
+#[must_use]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn flip_any() -> bool {
+    ANY_FLIP.load(Ordering::Relaxed)
+}
+
+/// G3: hardware cursor of the head of output `id` (over a flipped output the
+/// desktop does not compose, so the pointer is the display's): `image` -
+/// new picture ([`CURSOR_SIDE`]² points `0xAARRGGBB`, straight alpha; all
+/// zero hides it without a core update), `None` - keep the picture; `at` -
+/// its top-left corner in the head's coordinates. The first call allocates
+/// the cursor channel (class 0xc67a, PIO) and enables the cursor with one
+/// core UPDATE. `Err(Some(why))` - no cursor (the caller composes the
+/// pointer), `Err(None)` - a lock is busy, try again next frame.
+pub fn cursor_set(id: u32, image: Option<&[u32]>, at: (i32, i32)) -> Result<(), Option<String>> {
+    // Busy locks are `Err(None)`: try again next frame.
+    let head = {
+        let guard = DISP.try_lock().ok_or(None)?;
+        let disp = guard.as_ref().ok_or_else(|| Some(String::from("display not set up")))?;
+        let (head, _, _) = disp.heads.iter().find(|(_, o, _)| *o == id).copied().ok_or_else(|| Some(String::from("output not lit")))?;
+        if head >= 4 {
+            return Err(Some("no such head".into()));
+        }
+        match disp.cursor_chan[head as usize] {
+            2 => return Err(Some("no cursor channel".into())),
+            1 => None,
+            _ => Some(head),
+        }
+    };
+    // The channel once (lock order as in `modeset`: the RM session, then
+    // the display) - the RM session is not needed after that.
+    if let Some(head) = head {
+        let mut session = SESSION.try_lock().ok_or(None)?;
+        let session = session.as_mut().ok_or_else(|| Some(String::from("GSP-RM is not running")))?;
+        let mut guard = DISP.try_lock().ok_or(None)?;
+        let disp = guard.as_mut().ok_or_else(|| Some(String::from("display not set up")))?;
+        if disp.cursor_chan[head as usize] == 0 {
+            let internal = (session.internal_client, session.internal_subdevice);
+            let mut rm = Rm { queues: &mut session.queues, bar: disp.bar, log: Vec::new() };
+            match cursor_channel(&mut rm, internal, head) {
+                Ok(()) => {
+                    disp.cursor_chan[head as usize] = 1;
+                    crate::kprintln!("  nvidia-disp : head {head}: cursor channel 0xc67a up");
+                }
+                Err(why) => {
+                    disp.cursor_chan[head as usize] = 2;
+                    crate::kprintln!("  nvidia-disp : head {head}: no cursor channel - {why}");
+                    return Err(Some(why));
+                }
+            }
+        }
+    }
+    let mut guard = DISP.try_lock().ok_or(None)?;
+    let disp = guard.as_mut().ok_or_else(|| Some(String::from("display not set up")))?;
+    let (head, _, _) = disp.heads.iter().find(|(_, o, _)| *o == id).copied().ok_or_else(|| Some(String::from("output not lit")))?;
+    let slot = head as usize;
+    let bar = disp.bar;
+    if let Some(image) = image {
+        let points = (CURSOR_SIDE * CURSOR_SIDE) as usize;
+        if image.len() != points {
+            return Err(Some("cursor image of a wrong size".into()));
+        }
+        let base = curs(head);
+        for (i, &argb) in image.iter().enumerate() {
+            // Premultiplied for the BLEND composition (K1 x cursor +
+            // (1 - K1 x alpha) x viewport, as nouveau sets it).
+            let a = argb >> 24;
+            let mul = |c: u32| ((c & 0xff) * a + 127) / 255;
+            let pm = (a << 24) | (mul(argb >> 16) << 16) | (mul(argb >> 8) << 8) | mul(argb);
+            disp.vram.w32(base + i as u64 * 4, pm);
+        }
+    }
+    if !disp.cursor_on[slot] {
+        let hb = head * 0x400;
+        // HEAD_SET_CONTEXT_DMA_CURSOR(0), HEAD_SET_OFFSET_CURSOR(0),
+        // HEAD_SET_CONTROL_CURSOR (ENABLE, A8R8G8B8, W64_H64, hot spot 0 -
+        // the position is the top-left corner), ..._COMPOSITION (K1 0xff,
+        // cursor factor K1, viewport factor NEG_K1_TIMES_SRC, BLEND).
+        disp.core.push(0x2088 + hb, &[H_VRAM]);
+        disp.core.push(0x2090 + hb, &[(curs(head) >> 8) as u32]);
+        disp.core.push(0x209c + hb, &[(1 << 31) | (1 << 8) | 0xcf]);
+        disp.core.push(0x20a0 + hb, &[0x0000_72ff]);
+        core_update(disp, bar, 0).map_err(|why| {
+            disp.cursor_chan[slot] = 2;
+            Some(format!("cursor enable: {why}"))
+        })?;
+        disp.cursor_on[slot] = true;
+    }
+    // SET_CURSOR_HOT_SPOT_POINT_OUT(0) and UPDATE through the PIO channel,
+    // when it has room (FREE.COUNT, as nouveau's `curs507a_space`).
+    let user = curs_user(head);
+    if bar.rd(user + 0x8) & 0x3f < 4 {
+        return Ok(());
+    }
+    let (x, y) = at;
+    bar.wr(user + 0x208, (x as u32 & 0xffff) | ((y as u32 & 0xffff) << 16));
+    bar.wr(user + 0x200, 1);
+    Ok(())
+}
+
+/// G3: turn the hardware cursor of output `id` off (the flip ended - the
+/// desktop draws the pointer into the frame buffer again).
+pub fn cursor_off(id: u32) {
+    let Some(mut guard) = DISP.try_lock() else {
+        return;
+    };
+    let Some(disp) = guard.as_mut() else {
+        return;
+    };
+    let Some((head, _, _)) = disp.heads.iter().find(|(_, o, _)| *o == id).copied() else {
+        return;
+    };
+    if !disp.cursor_on.get(head as usize).copied().unwrap_or(false) {
+        return;
+    }
+    let hb = head * 0x400;
+    disp.core.push(0x209c + hb, &[0xcf]);
+    disp.core.push(0x2088 + hb, &[0]);
+    let bar = disp.bar;
+    if let Err(why) = core_update(disp, bar, 0) {
+        crate::kprintln!("  nvidia-disp : head {head}: cursor off - {why}");
+    }
+    disp.cursor_on[head as usize] = false;
+}
+
+/// G3: the cursor immediate channel of `head` (nouveau `r535_curs_init`):
+/// the push buffer control with `valid` 0 (PIO, no push buffer), then the
+/// object `(0xc67a << 16) | head` with NV50VAIO_CHANNELPIO_ALLOCATION_PARAMETERS.
+fn cursor_channel(rm: &mut Rm, internal: (u32, u32), head: u32) -> Res<()> {
+    let mut p = alloc::vec![0u8; 0x38];
+    put(&mut p, 0x1c, 0xc67a);
+    put(&mut p, 0x20, head);
+    p[0x24] = 0;
+    put(&mut p, 0x30, 1);
+    rm.control(internal.0, internal.1, 0x2080_0a58, &p)?;
+    let mut a = alloc::vec![0u8; 0x10];
+    put(&mut a, 0x00, head);
+    rm.alloc(H_ROOT, (0xc67a << 16) | head, 0xc67a, &a)?;
     Ok(())
 }
 

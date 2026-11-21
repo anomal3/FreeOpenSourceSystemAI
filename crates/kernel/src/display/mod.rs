@@ -164,6 +164,107 @@ pub fn flush_output(backend: outputs::Backend, primary: bool, x: i32, y: i32, w:
     }
 }
 
+/// G3: what a page flip of an output to a client buffer answered.
+#[derive(Debug)]
+pub enum FlipError {
+    /// Not now (the previous flip is not on screen yet, the channel or the
+    /// display is busy): try again next frame, the display keeps what it shows.
+    Pending(#[allow(dead_code)] &'static str),
+    /// Not possible: copy into the frame buffer instead.
+    Refused(alloc::string::String),
+}
+
+/// G3: why the display of `backend` cannot scan a client buffer out
+/// (`None` - it can try). The firmware frame buffer (stdvga, GOP, Intel,
+/// VMSVGA) is one fixed surface.
+#[must_use]
+pub fn flip_unsupported(backend: outputs::Backend) -> Option<&'static str> {
+    match backend {
+        outputs::Backend::Firmware => Some("the display is the firmware frame buffer (no page flip)"),
+        outputs::Backend::Virtio(_) | outputs::Backend::Nvidia(_) => None,
+    }
+}
+
+/// G3: show the client buffer at `phys` (physically contiguous, the output's
+/// size, `pitch` bytes per row, XRGB8888) on the output instead of its frame
+/// buffer; `None` - the frame buffer again (already repainted). NVIDIA: a
+/// page flip of the head's window channel (latched at vblank). virtio-gpu:
+/// a resource backed by the client buffer put on the scanout - the stand-in
+/// that lets QEMU test the flip logic (the host still copies).
+pub fn flip(backend: outputs::Backend, phys: Option<u64>, pitch: u32) -> Result<(), FlipError> {
+    match backend {
+        outputs::Backend::Nvidia(id) => nvidia_disp::scanout(id, phys, pitch),
+        outputs::Backend::Virtio(scanout) => crate::virtio::gpu::flip_scanout(scanout, phys).map_err(|why| FlipError::Refused(why.into())),
+        outputs::Backend::Firmware => match phys {
+            None => Ok(()),
+            Some(_) => Err(FlipError::Refused("the firmware frame buffer cannot flip".into())),
+        },
+    }
+}
+
+/// G3: the flipped client buffer changed `(x, y, w, h)` (output coordinates)
+/// in place. NVIDIA scans the memory itself; virtio-gpu needs a transfer.
+pub fn flip_refresh(backend: outputs::Backend, x: i32, y: i32, w: u32, h: u32) {
+    if let outputs::Backend::Virtio(scanout) = backend {
+        crate::virtio::gpu::flip_refresh(scanout, x, y, w, h);
+    }
+}
+
+/// G3: may a display still read `[phys, phys + len)` (a flipped client
+/// buffer, or the one shown before a flip that is not on screen yet)? The
+/// Wayland server releases such a buffer only after this says `false`.
+#[must_use]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn flip_scanning(phys: u64, len: u64) -> bool {
+    nvidia_disp::scanning(phys, len)
+}
+
+/// G3: does any display scan system memory or have a flip pending (cheap)?
+#[must_use]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn flip_any() -> bool {
+    nvidia_disp::flip_any()
+}
+
+/// G3: pointer over a flipped output, drawn by the display's cursor:
+/// `image` - new picture ([`FLIP_CURSOR_SIDE`]² points `0xAARRGGBB`, all
+/// zero hides it), `None` - keep it; `at` - top-left in output coordinates.
+/// `Some(false)` - no cursor here (the desktop must compose the pointer),
+/// `None` - busy, try again next frame.
+pub fn flip_cursor(backend: outputs::Backend, image: Option<&[u32]>, at: (i32, i32)) -> Option<bool> {
+    match backend {
+        outputs::Backend::Nvidia(id) => match nvidia_disp::cursor_set(id, image, at) {
+            Ok(()) => Some(true),
+            Err(None) => None,
+            Err(Some(why)) => {
+                crate::kprintln!("  display     : no hardware cursor over the flipped output: {why}");
+                Some(false)
+            }
+        },
+        // virtio-gpu has one host cursor, already used by the desktop when
+        // there is one monitor (`hw_cursor`); with more the desktop draws.
+        outputs::Backend::Virtio(_) | outputs::Backend::Firmware => Some(false),
+    }
+}
+
+/// G3: can the display of `backend` draw the pointer over a flipped
+/// output ([`flip_cursor`])? NVIDIA: a head cursor (may still fail on first
+/// use); others: no.
+#[must_use]
+pub const fn flip_has_cursor(backend: outputs::Backend) -> bool {
+    matches!(backend, outputs::Backend::Nvidia(_))
+}
+
+/// G3: side of the [`flip_cursor`] picture.
+pub const FLIP_CURSOR_SIDE: u32 = nvidia_disp::CURSOR_SIDE;
+
+/// G3: the flip of the output ended - its cursor off.
+pub fn flip_cursor_off(backend: outputs::Backend) {
+    if let outputs::Backend::Nvidia(id) = backend {
+        nvidia_disp::cursor_off(id);
+    }
+}
+
 /// Отдать курсор адаптеру (фаза 67b): картинка `side`×`side` точек
 /// (`0xAARRGGBB`) с точкой касания `hot`. `false` — адаптер так не умеет, и
 /// стрелку рисует стол.

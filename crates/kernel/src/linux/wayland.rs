@@ -269,9 +269,19 @@ fn run() {
             }
             alive
         });
+        // G3: buffers of gone clients that a display scanned out - freed
+        // once it does not any more.
+        let graves = {
+            let mut grave = SCAN_GRAVE.lock();
+            grave.retain(|buf| scanned(buf));
+            !grave.is_empty()
+        };
         // События окон приходят без уведомления — опрос раз в кадр; раньше —
         // если у клиента отложен ответ на `frame` (темп экрана, P8).
-        let due = clients.iter().filter_map(Client::frames_due_at).min().unwrap_or(u64::MAX);
+        let mut due = clients.iter().filter_map(Client::frames_due_at).min().unwrap_or(u64::MAX);
+        if graves {
+            due = 0;
+        }
         crate::io_events::wait(seen, Some(due.clamp(now + 1, now + 16)));
     }
 }
@@ -988,6 +998,9 @@ struct Client {
     pace_us: u64,
     /// G3: activation tokens handed out.
     tokens: u32,
+    /// G3: buffers replaced on screen that a display may still scan out (a
+    /// page flip not on screen yet): `wl_buffer.release` waits for it.
+    scan_held: Vec<(u32, Buffer)>,
 }
 
 impl Client {
@@ -1035,6 +1048,7 @@ impl Client {
             constraints: Vec::new(),
             pace_us: 0,
             tokens: 0,
+            scan_held: Vec::new(),
         }
     }
 
@@ -1071,6 +1085,7 @@ impl Client {
     /// Один виток: прочитать, разобрать, отправить. `false` — соединения нет.
     fn step(&mut self, now: u64) -> bool {
         let time = now as u32;
+        self.release_scanned();
         self.answer_frames(now);
         let mut buf = vec![0u8; 16 * 1024];
         loop {
@@ -1793,11 +1808,22 @@ impl Client {
                 3 => self.delete(id),
                 _ => {}
             },
-            Obj::Pointer => {
-                if opcode == 1 {
-                    self.delete(id);
+            Obj::Pointer => match opcode {
+                // G3: `set_cursor(serial, surface, hx, hy)`: a null surface
+                // hides the pointer over the window (games drawing their own
+                // cursor - then a flipped output needs no cursor at all); a
+                // surface shows ours again (cursor images are not taken yet).
+                0 => {
+                    let _serial = args.u32()?;
+                    let surface = args.u32()?;
+                    let root = self.pointer_on.map(|on| self.root_of(on));
+                    if let Some(win) = root.and_then(|root| self.wins.iter().find(|win| win.surface == root && win.open.is_some())) {
+                        crate::ui::client_cursor(self.pid, win.slot, surface == 0);
+                    }
                 }
-            }
+                1 => self.delete(id),
+                _ => {}
+            },
         }
         Ok(())
     }
@@ -2362,10 +2388,44 @@ impl Client {
 
     /// Вернуть буфер, который окно показывало без копии, — если поверхность
     /// не показывает его и сейчас (тогда его вернёт обычный путь).
+    ///
+    /// G3: a buffer a display may still scan out (page flip not on screen
+    /// yet) is held - released by [`Self::release_scanned`] once the display
+    /// is done with it; no tearing, no reuse under the scanout.
     fn release_unless_shown(&mut self, _surface: u32, buffer: u32) {
         let shown = self.objects.values().any(|obj| matches!(obj, Obj::Surface(SurfaceState { shown: Some((id, _)), .. }) if *id == buffer));
-        if !shown {
-            self.release(buffer);
+        if shown {
+            return;
+        }
+        if let Some(Obj::Buffer(buf)) = self.objects.get(&buffer) {
+            if scanned(buf) {
+                if !self.scan_held.iter().any(|(id, _)| *id == buffer) {
+                    let buf = buf.clone();
+                    self.scan_held.push((buffer, buf));
+                }
+                return;
+            }
+        }
+        self.release(buffer);
+    }
+
+    /// G3: release the held buffers the displays no longer read.
+    fn release_scanned(&mut self) {
+        if self.scan_held.is_empty() {
+            return;
+        }
+        let mut index = 0;
+        while index < self.scan_held.len() {
+            if scanned(&self.scan_held[index].1) {
+                index += 1;
+                continue;
+            }
+            let (id, _) = self.scan_held.remove(index);
+            // Attached again meanwhile - the usual path releases it later.
+            let shown = self.objects.values().any(|obj| matches!(obj, Obj::Surface(SurfaceState { shown: Some((shown, _)), .. }) if *shown == id));
+            if !shown {
+                self.release(id);
+            }
         }
     }
 
@@ -2529,7 +2589,11 @@ impl Client {
     fn frames_due_at(&self) -> Option<u64> {
         let frames = (!self.frames_due.is_empty()).then(|| self.frame_answered_us.saturating_add(self.client_frame_us()).div_ceil(1000));
         // И к сроку отложенного показа кадра без темпа (D7).
-        let held = self.wins.iter().filter(|win| win.dirty && win.hold_until_us != 0).map(|win| win.hold_until_us.div_ceil(1000)).min();
+        let mut held = self.wins.iter().filter(|win| win.dirty && win.hold_until_us != 0).map(|win| win.hold_until_us.div_ceil(1000)).min();
+        // G3: a buffer held for a flip - look again next millisecond.
+        if !self.scan_held.is_empty() {
+            held = Some(0);
+        }
         match (frames, held) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -3035,6 +3099,21 @@ impl Client {
     }
 
     fn close_all(&mut self) {
+        // G3: memory a display may still scan out stays alive after the
+        // client (the desktop flips back to its frame buffer next frame).
+        {
+            let mut grave = SCAN_GRAVE.lock();
+            for (_, buf) in self.scan_held.drain(..) {
+                grave.push(buf);
+            }
+            for win in &self.wins {
+                if let Some((_, buf)) = &win.adopted {
+                    if scanned(buf) {
+                        grave.push(buf.clone());
+                    }
+                }
+            }
+        }
         // G3: the pointer comes back if a lock of this client was active.
         let ids: Vec<u32> = self.constraints.iter().map(|c| c.id).collect();
         for id in ids {
@@ -3573,6 +3652,26 @@ fn has_alpha(layers: &[Layer]) -> bool {
 
 /// Показ окна без копии (D4, 20.11.2026; `wlzerocopy off` — как раньше).
 pub static ZERO_COPY: AtomicBool = AtomicBool::new(true);
+
+/// G3: buffers of gone clients a display may still scan out.
+static SCAN_GRAVE: crate::sync::SpinLock<Vec<Buffer>> = crate::sync::SpinLock::new(Vec::new());
+
+/// G3: may a display still read this buffer (a page flip to it, or away
+/// from it, not on screen yet)? Only physically contiguous buffers are
+/// ever scanned out.
+fn scanned(buf: &Buffer) -> bool {
+    if !crate::display::flip_any() {
+        return false;
+    }
+    let len = u64::from(buf.stride) * u64::from(buf.height);
+    let Some(ptr) = buf.mem.contiguous(buf.offset, len) else {
+        return false;
+    };
+    let Some(phys) = (ptr as u64).checked_sub(crate::mm::PHYS_MAP_BASE as u64) else {
+        return false;
+    };
+    crate::display::flip_scanning(phys, len)
+}
 
 /// Кадр, который окно может показать прямо из памяти клиента: один
 /// непрозрачный слой ровно в размер окна, 1:1, без перестановки каналов,
