@@ -318,10 +318,10 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     let _ = write!(line, "{secs} s tlb worst {} us asked at {asked_at}", shoot_worst / 1000);
     match (slow_cpu, deaf_at) {
         (Some(cpu), Some(at)) => {
-            let _ = write!(line, ", cpu {cpu} late (interrupts off in a spin lock taken at {at})");
+            let _ = write!(line, ", cpu {cpu} late (interrupts off since {at})");
         }
         (Some(cpu), None) => {
-            let _ = write!(line, ", cpu {cpu} late (not in a spin lock: interrupt handler or switch)");
+            let _ = write!(line, ", cpu {cpu} late (interrupts off in an interrupt handler or the task switch)");
         }
         _ => {}
     }

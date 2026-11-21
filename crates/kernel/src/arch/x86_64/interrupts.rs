@@ -1200,6 +1200,8 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
     let was_enabled = enabled();
     let since = if was_enabled {
         disable();
+        // Where this CPU went deaf - for the TLB shootdown report (G2).
+        crate::sync::mark_irq_off(core::ptr::from_ref(core::panic::Location::caller()) as usize);
         crate::latency::start()
     } else {
         0
@@ -1207,6 +1209,7 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
     let result = f();
     if was_enabled {
         crate::latency::irq_off_ended(since, core::panic::Location::caller());
+        crate::sync::mark_irq_off(0);
         enable();
     }
     result

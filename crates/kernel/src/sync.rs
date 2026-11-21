@@ -62,8 +62,18 @@ static LAST_TAKEN: [AtomicUsize; crate::smp::MAX_CPUS] = [const { AtomicUsize::n
 /// names the place that keeps it deaf.
 static IRQ_OFF_AT: [AtomicUsize; crate::smp::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::smp::MAX_CPUS];
 
-/// `file:line` of the spin lock that keeps `cpu` with interrupts off right
-/// now, or `None` (interrupts on, or off for another reason).
+/// `without_interrupts` marks its own stretch (`at` - a `&'static Location`
+/// as an address, 0 - ended). Interrupts must be off.
+#[inline]
+pub fn mark_irq_off(at: usize) {
+    if let Some(cell) = IRQ_OFF_AT.get(crate::smp::cpu()) {
+        cell.store(at, Ordering::Relaxed);
+    }
+}
+
+/// `file:line` of the spin lock (or `without_interrupts`) that keeps `cpu`
+/// with interrupts off right now, or `None` (interrupts on, or off for
+/// another reason: an interrupt handler, the task switch).
 #[must_use]
 pub fn irq_off_site(cpu: usize) -> Option<&'static core::panic::Location<'static>> {
     let at = IRQ_OFF_AT.get(cpu)?.load(Ordering::Relaxed);
