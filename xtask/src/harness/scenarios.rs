@@ -1113,6 +1113,89 @@ const WINSIZE_STEPS: &[Step] = &[
     Step::Shot("03-files"),
 ];
 
+/// Сценарий `e1-ui` (21.11). Окно «Файлов» на 1280×720: поле адреса
+/// начинается в 162 точках (поле 14, четыре кнопки 30 с зазором 6, поле 4),
+/// его середина по высоте — 62 (полоса вкладок 38 + половина панели 48).
+const E1_UI_STEPS: &[Step] = &[
+    Step::Await(PROMPT, BOOT),
+    Step::Wait(1_000),
+    Step::Line("run -b /bin/files /usr/share"),
+    Step::Await("window      : 'Files' at", 30_000),
+    Step::Await("files: window title '", 15_000),
+    Step::Wait(1_500),
+    // Звено «Этот компьютер» под указателем подсвечено.
+    Step::Aim(Aim::Program("Files", 200, 62)),
+    Step::Await("files: hover crumb 0", 10_000),
+    Step::Wait(600),
+    Step::Shot("01-crumb-hover"),
+    // Его шеврон — отдельная кнопка: подсветка и список томов.
+    Step::Aim(Aim::Program("Files", 296, 62)),
+    Step::Await("files: hover chevron 0", 10_000),
+    Step::Wait(600),
+    Step::Shot("02-chevron-hover"),
+    Step::Click,
+    Step::Await("files: crumb list ", 10_000),
+    Step::Wait(800),
+    Step::Shot("03-chevron-list"),
+    Step::Key("esc"),
+    Step::Wait(500),
+    // Пустое место справа от звеньев — правка пути, путь выделен целиком.
+    Step::Aim(Aim::Program("Files", 700, 62)),
+    Step::Click,
+    Step::Await("files: address editing '/usr/share'", 10_000),
+    Step::Wait(800),
+    Step::Shot("04-address-edit"),
+    Step::Type("/bin"),
+    Step::Key("ret"),
+    Step::Await("files: address -> '/bin'", 10_000),
+    Step::Await("files: entered '/bin'", 10_000),
+    Step::Wait(1_000),
+    Step::Shot("05-address-went"),
+    // Строки оболочки уходят в окно с фокусом — «Файлы» закрыть.
+    Step::Aim(Aim::Close("Files")),
+    Step::Click,
+    Step::Await("files: closing on request", 15_000),
+    Step::Wait(1_000),
+    // Заставка запуска: строка с `fossai-proton` — программа Windows.
+    // Запуск, который сразу кончается ошибкой (сценарий — не ELF):
+    // «Не удалось запустить», «Подробнее», «Закрыть».
+    Step::Line("run -b /opt/proton/bin/fossai-proton --open=/usr/share/Game%20One.exe"),
+    Step::Await("launch      : 'Game One' starting as #", 10_000),
+    Step::Await("launch      : 'Game One' failed: ", 15_000),
+    Step::Wait(1_500),
+    Step::Shot("06-splash-failed"),
+    // Идущий запуск: окно «Файлов» (не Linux) заставку не убирает —
+    // карточка с бегущей полосой поверх.
+    Step::Line("run -b /bin/files /opt/proton/bin/fossai-proton"),
+    Step::Await("launch      : 'Proton' starting as #", 10_000),
+    Step::Wait(2_500),
+    Step::Shot("07-splash-running"),
+    Step::Wait(700),
+    Step::Shot("08-splash-running-later"),
+    Step::Absent("KERNEL PANIC"),
+];
+
+/// Сценарий `e1-settings-2k` (21.11).
+const E1_SETTINGS_STEPS: &[Step] = &[
+    Step::Await(PROMPT, BOOT),
+    Step::Wait(1_500),
+    Step::Line("ui taskbar settings"),
+    Step::Await("desktop     : settings opened on Dock", 15_000),
+    Step::Wait(1_500),
+    Step::Shot("01-dock-window"),
+    Step::Aim(Aim::Maximize("Settings")),
+    Step::Click,
+    Step::Wait(2_000),
+    Step::Shot("02-dock-maximized"),
+    // Строки оболочки ушли бы в окно с фокусом: «Система» — щелчком в
+    // боковой колонке развёрнутого окна (масштаб 2).
+    Step::Aim(Aim::Point(86, 226)),
+    Step::Click,
+    Step::Wait(1_500),
+    Step::Shot("03-system-maximized"),
+    Step::Absent("KERNEL PANIC"),
+];
+
 const START_STEPS: &[Step] = &[
     Step::Await(PROMPT, BOOT),
     Step::Key("f1"),
@@ -2744,6 +2827,57 @@ pub const ALL: &[Scenario] = &[
         extra: &["-device", "virtio-gpu-pci,edid=on,xres=2560,yres=1440"],
         steps: WINSIZE_STEPS,
     },
+    // Пожелания Романа 21.11 (3, 5, 6): адрес «Файлов» звеньями с
+    // подсветкой, шевронами и правкой текстом; заставка запуска программы
+    // Windows; «Параметры» колонкой по центру.
+    Scenario {
+        name: "e1-ui",
+        about: "Адрес «Файлов» как в Проводнике (подсветка звена и шеврона, список подпапок, щелчок справа — правка пути), заставка запуска программы Windows (идёт / ошибка).",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: E1_UI_STEPS,
+    },
+    Scenario {
+        name: "e1-settings-2k",
+        about: "«Параметры» развёрнутые на 2560×1440: колонка страницы по центру, как у Windows 11.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &["-device", "virtio-gpu-pci,edid=on,xres=2560,yres=1440"],
+        steps: E1_SETTINGS_STEPS,
+    },
     // Системные инструменты (фаза П1/П2, 20.11): «Выполнить» (Win+R),
     // «Таблица символов», «Сведения о системе», «Журнал событий», «Службы»,
     // «Очистка диска» — каждая открывается, делает одно настоящее действие и
@@ -3763,6 +3897,26 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_500),
             Step::ShotHead("17-small-head0", 0),
             Step::ShotHead("18-small-head1", 1),
+            // «Показывать кнопки окон» (21.11): по умолчанию — на всех
+            // панелях (выше: «Терминал» и на левой); «только где открыто» —
+            // кнопка «Терминала» лишь на правой.
+            Step::Line("ui taskbar own"),
+            Step::Await("buttons:own", 15_000),
+            Step::Wait(1_500),
+            Step::ShotHead("19-own-head0", 0),
+            Step::ShotHead("20-own-head1", 1),
+            Step::Line("ui taskbar everywhere"),
+            Step::Await("buttons:all", 15_000),
+            Step::Line("ui taskbar settings"),
+            Step::Await("desktop     : settings opened on Dock", 15_000),
+            Step::Wait(1_500),
+            Step::Aim(Aim::Middle("Settings")),
+            Step::Wheel(-5),
+            Step::Wait(800),
+            Step::ShotHead("21-settings-dock", 0),
+            Step::Aim(Aim::Close("Settings")),
+            Step::Click,
+            Step::Wait(1_000),
             Step::Line("ui taskbar large main"),
             Step::Await("small:off monitors:main", 15_000),
             Step::Absent("KERNEL PANIC"),

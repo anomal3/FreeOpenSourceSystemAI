@@ -4415,6 +4415,9 @@ pub fn spawn_streams_rights(
         Ok(id) => {
             if daemon {
                 sched::mark_daemon(id);
+            } else {
+                // Запуск программы Windows — заставка на столе (21.11).
+                crate::ui::launch::note_spawn(id.as_u32(), line);
             }
             Ok(id)
         }
@@ -4689,6 +4692,28 @@ pub fn path_of_task(task: u32) -> Option<alloc::string::String> {
     let process = PROGRAMS.lock().get(slot).and_then(Option::as_ref).cloned()?;
     let path = process.lock().path.clone();
     Some(path)
+}
+
+/// Задание процесса Linux задачи `task` ([`Program::linux_job`]) — заставка
+/// запуска (21.11) узнаёт по нему окно запущенной игры. `None` — задача не
+/// программа Linux.
+#[must_use]
+pub fn job_of_task(task: u32) -> Option<u32> {
+    let (slot, _) = sched::lookup(sched::TaskId::new(task))?;
+    let process = PROGRAMS.lock().get(slot).and_then(Option::as_ref).cloned()?;
+    let program = process.lock();
+    program.linux.then(|| program.job())
+}
+
+/// Жив ли ещё хоть один процесс задания `job` (заставка запуска: скрипт
+/// вышел, а Wine ещё поднимает игру).
+#[must_use]
+pub fn job_alive(job: u32) -> bool {
+    let table: alloc::vec::Vec<Arc<Mutex<Program>>> = PROGRAMS.lock().iter().flatten().cloned().collect();
+    table.iter().any(|process| {
+        let program = process.lock();
+        program.linux && program.job() == job
+    })
 }
 
 /// Процесс в слоте `slot` — ссылкой (фаза 71d: `kill` и `SIGCHLD` другому

@@ -839,7 +839,15 @@ fn dock(pass: &mut Pass, x: i32, y: i32, w: u32) {
     } else {
         y = row(pass, x, y, w, Some(Fi::Sliders), "Маленькие значки", "Панель ниже, значки мельче, часы в одну строку", Ctl::Toggle(cfg.small), Some(Deed::Taskbar(TaskbarDeed::Small(!cfg.small))));
     }
-    y = row(pass, x, y, w, Some(Fi::Monitor), "Панель задач на всех мониторах", "На каждом мониторе — кнопки его окон и свой «Пуск»", Ctl::Toggle(cfg.all), Some(Deed::Taskbar(TaskbarDeed::AllMonitors(!cfg.all))));
+
+    // Несколько мониторов (21.11, как в Windows: «Показывать панель задач на
+    // всех дисплеях» и «Показывать кнопки панели задач на»).
+    y = pass.group(x, y, w, "Несколько мониторов");
+    y = row(pass, x, y, w, Some(Fi::Monitor), "Панель задач на всех мониторах", "На каждом мониторе — своя панель и свой «Пуск»", Ctl::Toggle(cfg.all), Some(Deed::Taskbar(TaskbarDeed::AllMonitors(!cfg.all))));
+    if cfg.all {
+        y = row(pass, x, y, w, Some(Fi::Dock), "Кнопки окон на всех панелях", "Каждая панель показывает все окна; активная кнопка горит на мониторе, где окно открыто", Ctl::Radio(!cfg.own), Some(Deed::Taskbar(TaskbarDeed::OwnButtons(false))));
+        y = row(pass, x, y, w, Some(Fi::Dock), "Только на панели, где открыто окно", "Кнопка окна — на панели того монитора, где оно открыто", Ctl::Radio(cfg.own), Some(Deed::Taskbar(TaskbarDeed::OwnButtons(true))));
+    }
 
     // Как «Объединять кнопки панели задач» в Windows 11: значок на программу
     // (окна стопкой) или кнопка с подписью на каждое окно.

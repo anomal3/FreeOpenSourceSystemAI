@@ -2166,7 +2166,7 @@ pub(super) fn windows_prefixes() -> Vec<String> {
 /// `proton_shortcuts/icons/` (по размерам `ШxВ/apps/`) или полный путь. PNG
 /// стол не читает: если FIMG рядом ещё нет, запускается `png2fimg`, и значок
 /// появится при следующем открытии меню; пока — общий значок Windows.
-fn shortcut_icon(dir: &str, icon: &str) -> String {
+pub(super) fn shortcut_icon(dir: &str, icon: &str) -> String {
     if icon.is_empty() {
         return String::new();
     }

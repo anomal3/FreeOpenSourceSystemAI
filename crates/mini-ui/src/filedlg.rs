@@ -322,20 +322,23 @@ pub trait Host {
 // ---------------------------------------------------------------------------
 
 /// Строка с кареткой и выделением. Позиции — в символах, не байтах.
+///
+/// Открыта наружу (21.11): ею же правят адрес в «Файлах» — щелчок справа
+/// от звеньев, как в Проводнике и в этом окне.
 #[derive(Clone, Default, Debug)]
-struct Line {
-    text: String,
+pub struct Line {
+    pub text: String,
     caret: usize,
     anchor: Option<usize>,
 }
 
 impl Line {
-    fn new(text: &str) -> Self {
+    pub fn new(text: &str) -> Self {
         Self { text: text.to_string(), caret: text.chars().count(), anchor: None }
     }
 
     /// Строка, выделенная целиком (имя по умолчанию, адрес при правке).
-    fn selected(text: &str) -> Self {
+    pub fn selected(text: &str) -> Self {
         let mut line = Self::new(text);
         if !text.is_empty() {
             line.anchor = Some(0);
@@ -392,7 +395,7 @@ impl Line {
 
     /// Клавиша правки. `None` — не своя; `Some(changed)` — разобрана, и
     /// `changed` — поменялся ли текст.
-    fn key(&mut self, code: u32, mods: i32, latin: u32) -> Option<bool> {
+    pub fn key(&mut self, code: u32, mods: i32, latin: u32) -> Option<bool> {
         let shift = mods & MOD_SHIFT != 0;
         let ctrl = mods & MOD_CTRL != 0;
         match code {
@@ -463,7 +466,7 @@ impl Line {
     }
 
     /// Каретку — к точке `x` (от левого края текста).
-    fn click(&mut self, face: &Face, room: u32, x: i32) {
+    pub fn click(&mut self, face: &Face, room: u32, x: i32) {
         let first = self.first_shown(face, room);
         let mut pen = 0i32;
         let mut at = first;
@@ -480,7 +483,7 @@ impl Line {
     }
 
     /// Нарисовать текст в `rect` (уже с полями): выделение, каретку.
-    fn draw(&self, ctx: Ctx, s: &mut Surface, rect: Rect, focused: bool, ink: Color) {
+    pub fn draw(&self, ctx: Ctx, s: &mut Surface, rect: Rect, focused: bool, ink: Color) {
         let p = ctx.palette;
         let face = ctx.face(Role::Body);
         let first = self.first_shown(face, rect.w.saturating_sub(ctx.px(2)));
@@ -579,6 +582,8 @@ enum View {
 enum Target {
     Row(usize),
     Place(usize),
+    /// Звено адреса под указателем (21.11: подсветка, как в Проводнике).
+    Crumb(usize),
 }
 
 /// Окно «Открыть» / «Сохранить как». См. заголовок модуля.
@@ -1462,6 +1467,12 @@ impl FileDialog {
         if lay.places.contains(x, y) {
             return lay.place_rects(ctx, &self.places).iter().position(|rect| rect.contains(x, y)).map(Target::Place);
         }
+        if lay.address.contains(x, y) {
+            if self.address.is_some() {
+                return None;
+            }
+            return self.crumbs(ctx, lay).iter().position(|(rect, _)| rect.contains(x, y)).map(Target::Crumb);
+        }
         if !lay.rows.contains(x, y) {
             return None;
         }
@@ -1737,8 +1748,16 @@ impl FileDialog {
             if crumbs.len() < self.crumb_paths().len() {
                 paint::text(field_ctx, s, Role::Body, lay.address.x + ctx.px(32) as i32, paint::baseline(ctx, Role::Body, lay.address), "…", p.ink3);
             }
-            for (rect, path) in &crumbs {
+            let hot = match self.hover_target(ctx, &lay) {
+                Some(Target::Crumb(at)) => Some(at),
+                _ => None,
+            };
+            for (index, (rect, path)) in crumbs.iter().enumerate() {
                 let label = self.crumb_label(path);
+                // Звено под указателем подсвечено, как строка списка.
+                if hot == Some(index) {
+                    paint::row(field_ctx, s, *rect, RowState::Hover);
+                }
                 let gs = ctx.px(10);
                 iconset::draw(s, Fi::ChevronRight, rect.x - ctx.px(14) as i32, lay.address.y + (lay.address.h as i32 - gs as i32) / 2, gs, p.ink4, 255);
                 let last = *path == self.dir;

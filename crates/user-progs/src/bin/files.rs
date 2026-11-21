@@ -55,6 +55,7 @@ use core::cell::Cell;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use mini_ui::filedlg::Line;
 use mini_ui::glyphicon::{self, Icon};
 use mini_ui::iconset::{self, Fi};
 use mini_ui::kit::{self, Entry};
@@ -600,6 +601,11 @@ struct Files {
     watch: i64,
     watched: Option<(String, i64)>,
     changed: bool,
+    /// Адрес правят текстом (21.11, как в Проводнике): щелчок справа от
+    /// звеньев, Ctrl+L, Alt+D. Строка ввода — та же, что у окна выбора файла.
+    address: Option<Line>,
+    /// Выпавший у шеврона звена список подпапок (21.11).
+    crumb_pop: Option<CrumbPop>,
 }
 
 /// Что под указателем подсвечено.
@@ -613,6 +619,10 @@ enum Hot {
     Place(usize),
     /// Вкладка, её крестик или «+».
     Tab(kit::TabHit),
+    /// Звено адреса, его шеврон, «…» спрятанных звеньев (21.11).
+    Crumb(usize),
+    Chevron(usize),
+    CrumbMore,
 }
 
 /// Почтовый ящик переноса вкладок между окнами «Файлов» (20.11).
@@ -785,6 +795,8 @@ impl Files {
             tab: 0,
             tab_drag: None,
             tab_menu: None,
+            address: None,
+            crumb_pop: None,
             quit: false,
             pointer: None,
             hot: Hot::Nothing,
@@ -2030,6 +2042,8 @@ impl Files {
     /// Переход вперёд обнуляет список «вперёд» — как в любом обозревателе: путь,
     /// с которого свернули, перестаёт существовать.
     fn go_to(&mut self, path: String) {
+        self.address = None;
+        self.crumb_pop = None;
         if path == self.path {
             return;
         }
@@ -2099,6 +2113,21 @@ impl Files {
         // Меню вкладки — первым, как всякое открытое меню.
         if self.tab_menu.is_some() {
             return self.click_tab_menu(ctx, area, x, y);
+        }
+        // Список подпапок у шеврона адреса (21.11).
+        if self.crumb_pop.is_some() {
+            return self.click_crumb_pop(ctx, area, &plan, x, y);
+        }
+        // Адрес правят текстом: щелчок в поле ставит каретку, мимо — отмена.
+        if self.address.is_some() {
+            if plan.path.contains(x, y) {
+                let text = address_text(ctx, &plan);
+                if let Some(line) = self.address.as_mut() {
+                    line.click(ctx.face(Role::Body), text.w, x - text.x);
+                }
+                return true;
+            }
+            self.address = None;
         }
         // Полоса вкладок (20.11).
         if let Some(hit) = self.tab_strip(ctx, &plan).hit(x, y) {
@@ -2227,21 +2256,28 @@ impl Files {
                 self.reload();
                 return true;
             }
-            // Звено адреса — переход в него.
+            // Звено адреса — переход в него, шеврон — список подпапок, «…» —
+            // спрятанные звенья, пустое место справа — адрес текстом (21.11,
+            // как в Проводнике).
             if plan.path.contains(x, y) {
-                let face = ctx.face(Role::Body);
-                let mut at = plan.path.x + ctx.px(12) as i32;
-                for (label, path) in breadcrumb(&self.path, &self.home) {
-                    let width = face.width(&label) as i32;
-                    if x >= at && x < at + width {
-                        if path != self.path {
-                            self.go_to(path);
+                let (slots, lead) = self.crumb_slots(ctx, &plan);
+                if lead.contains(x, y) {
+                    return self.open_crumb_pop(ctx, &plan, None);
+                }
+                for (index, slot) in slots.iter().enumerate() {
+                    if slot.rect.contains(x, y) {
+                        if slot.path != self.path {
+                            self.go_to(slot.path.clone());
                             return true;
                         }
                         return false;
                     }
-                    at += width + ctx.px(CRUMB_GAP) as i32;
+                    if slot.chevron.contains(x, y) {
+                        return self.open_crumb_pop(ctx, &plan, Some(index));
+                    }
                 }
+                self.edit_address();
+                return true;
             }
             return was;
         }
@@ -2559,6 +2595,7 @@ impl Files {
         }
         self.draw_menu(surface, ctx, area);
         self.draw_pop(surface, ctx, area, &plan);
+        self.draw_crumb_pop(surface, ctx, area, &plan);
         self.draw_job(surface, ctx, &plan);
         self.draw_drag(surface, ctx);
         self.draw_tab_extras(surface, ctx, area);
@@ -3079,27 +3116,7 @@ impl Files {
         // Адрес звеньями, как в Проводнике: «Этот компьютер › Системный диск
         // › bin».
         if !plan.path.is_empty() {
-            paint::sunk(bar, s, plan.path, ctx.px(theme::R_ROW));
-            let pad = ctx.px(12);
-            let y = paint::baseline(bar, Role::Body, plan.path);
-            let right = plan.path.right() - pad as i32;
-            let mut x = plan.path.x + pad as i32;
-            let links = breadcrumb(&self.path, &self.home);
-            let last = links.len().saturating_sub(1);
-            for (index, (label, _)) in links.iter().enumerate() {
-                let room = (right - x).max(0) as u32;
-                let used = paint::text_clipped(bar, s, Role::Body, x, y, room, label, if index == last { p.ink } else { p.ink3 });
-                x += used as i32;
-                // Разделитель — значок «›»: в шрифте такого знака нет.
-                if index != last && x + (CRUMB_GAP * ctx.scale) as i32 <= right {
-                    let glyph = ctx.px(10);
-                    glyphicon::draw(s, Icon::ChevronRight, x + ctx.px(5) as i32, plan.path.y + (plan.path.h as i32 - glyph as i32) / 2, glyph, p.ink4, 255);
-                    x += ctx.px(CRUMB_GAP) as i32;
-                }
-            }
-            if let Some(preview) = self.preview.as_ref() {
-                paint::text_clipped(bar, s, Role::Body, x, y, (right - x).max(0) as u32, &format!("  ·  {}", preview.name), p.ink4);
-            }
+            self.draw_address(s, bar, plan);
         }
 
         // Поиск: «Поиск: <папка>», с курсором, пока в поле печатают.
@@ -3703,8 +3720,12 @@ impl Command {
     }
 }
 
-/// Место под разделитель звеньев адреса.
-const CRUMB_GAP: u32 = 20;
+/// Поле подписи звена адреса слева и справа и ширина его шеврона (21.11:
+/// у каждого — своя подсветка, как в Проводнике).
+const CRUMB_PAD: u32 = 8;
+const CRUMB_CHEVRON: u32 = 22;
+/// Сколько подпапок показывает список у шеврона.
+const CRUMB_POP_MAX: usize = 24;
 
 /// Звенья адреса: подпись и куда ведёт (72g). Дом — «Главная», корень —
 /// «Этот компьютер › Системный диск».
@@ -4531,6 +4552,11 @@ impl App for Files {
             }
             return true;
         }
+        // Адрес и список подпапок у шеврона (21.11) — раньше всего прочего:
+        // буквы здесь — набор, а не сочетания.
+        if let Some(handled) = self.key_address(code, mods, latin) {
+            return handled;
+        }
         // Вкладки (20.11): Ctrl+T — новая, Ctrl+W — закрыть, Ctrl+Tab и
         // Ctrl+Shift+Tab — соседняя, Ctrl+Enter — папку в новой вкладке.
         if mods & WIN_MOD_CTRL != 0 && self.menu.is_none() {
@@ -4710,7 +4736,15 @@ impl App for Files {
         let hot = self.hot_at(ctx, &plan, x, y);
         let changed = hot != self.hot;
         self.hot = hot;
-        bars | changed
+        // Подсветка звеньев адреса — строкой для стенда (21.11).
+        if changed {
+            match hot {
+                Hot::Crumb(index) => println(&format!("files: hover crumb {index}")),
+                Hot::Chevron(index) => println(&format!("files: hover chevron {index}")),
+                _ => {}
+            }
+        }
+        bars | changed | self.hover_crumb_pop(ctx, area, &plan, x, y)
     }
 
     fn leave(&mut self) -> bool {
@@ -4760,7 +4794,7 @@ impl App for Files {
     /// проверялся лишь просмотр файла, и имя с буквой «q», набранное в поле
     /// переименования, закрывало окно на полуслове.
     fn quits_on_q(&self) -> bool {
-        self.preview.is_none() && self.menu.is_none() && self.tab_menu.is_none()
+        self.preview.is_none() && self.menu.is_none() && self.tab_menu.is_none() && self.address.is_none() && self.crumb_pop.is_none()
     }
 }
 
@@ -5037,6 +5071,7 @@ impl Files {
         let busy = self.menu.is_some()
             || self.tab_menu.is_some()
             || self.pop.is_some()
+            || self.crumb_pop.is_some()
             || self.props.is_some()
             || self.job.is_some()
             || self.tab_drag.is_some()
@@ -5048,6 +5083,25 @@ impl Files {
         }
         if let Some(hit) = self.tab_strip(ctx, plan).hit(x, y) {
             return if hit == kit::TabHit::Strip { Hot::Nothing } else { Hot::Tab(hit) };
+        }
+        // Звенья адреса и их шевроны (21.11).
+        if plan.path.contains(x, y) {
+            if self.address.is_some() {
+                return Hot::Nothing;
+            }
+            let (slots, lead) = self.crumb_slots(ctx, plan);
+            if lead.contains(x, y) {
+                return Hot::CrumbMore;
+            }
+            for (index, slot) in slots.iter().enumerate() {
+                if slot.rect.contains(x, y) {
+                    return Hot::Crumb(index);
+                }
+                if slot.chevron.contains(x, y) {
+                    return Hot::Chevron(index);
+                }
+            }
+            return Hot::Nothing;
         }
         if let Some(side) = plan.side.filter(|side| side.contains(x, y)) {
             let inner = ctx.on(theme::panel_bg());
@@ -5326,3 +5380,370 @@ fn window_size(info: &SysInfo) -> (u32, u32) {
     (w.max(fit), h)
 }
 
+
+// ---------------------------------------------------------------------------
+// Адрес (21.11): звенья с подсветкой, шевроны со списком подпапок, правка
+// текстом — как в Проводнике Windows 11 и в окне выбора файла.
+// ---------------------------------------------------------------------------
+
+/// Звено адреса на панели: подпись, путь, место подписи и шеврона.
+struct CrumbSlot {
+    label: String,
+    path: String,
+    rect: Rect,
+    chevron: Rect,
+}
+
+/// Список у шеврона: чьего звена (`None` — у «…», спрятанные звенья), где
+/// его левый край, пункты (подпись, путь; пустой путь — пояснение) и
+/// выбранный пункт.
+struct CrumbPop {
+    which: Option<usize>,
+    at: i32,
+    items: Vec<(String, String)>,
+    selected: usize,
+}
+
+/// Место текста в поле адреса, когда его правят.
+fn address_text(ctx: Ctx, plan: &Plan) -> Rect {
+    let pad = ctx.px(12);
+    Rect::new(plan.path.x + pad as i32, plan.path.y, plan.path.w.saturating_sub(pad * 2), plan.path.h)
+}
+
+/// Куда ведёт набранный адрес: `~`, `~/…`, абсолютный путь, путь от
+/// открытой папки, «Этот компьютер»; `.` и `..` разобраны.
+fn resolve_address(text: &str, here: &str, home: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    if text == "Этот компьютер" || text == COMPUTER {
+        return Some(String::from(COMPUTER));
+    }
+    let raw = if text == "~" {
+        home.to_string()
+    } else if let Some(rest) = text.strip_prefix("~/") {
+        join(home, rest)
+    } else if text.starts_with('/') {
+        text.to_string()
+    } else if here == COMPUTER {
+        format!("/{text}")
+    } else {
+        join(here, text)
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(if parts.is_empty() { String::from("/") } else { format!("/{}", parts.join("/")) })
+}
+
+/// Каталог ли это.
+fn is_directory(path: &str) -> bool {
+    let mut info = Stat::default();
+    stat(path, &mut info) >= 0 && info.kind == KIND_DIRECTORY
+}
+
+impl Files {
+    /// Звенья адреса, которые помещаются: у каждого — кнопка подписи и
+    /// шеврон справа. Не влезают — уходят первые, на их месте «…» (второе
+    /// значение — его место, пусто — нет).
+    fn crumb_slots(&self, ctx: Ctx, plan: &Plan) -> (Vec<CrumbSlot>, Rect) {
+        let field = plan.path;
+        if field.is_empty() {
+            return (Vec::new(), Rect::EMPTY);
+        }
+        let face = ctx.face(Role::Body);
+        let links = breadcrumb(&self.path, &self.home);
+        let pad = ctx.px(CRUMB_PAD) as i32;
+        let chev = ctx.px(CRUMB_CHEVRON) as i32;
+        let start = field.x + ctx.px(4) as i32;
+        let end = field.right() - ctx.px(4) as i32;
+        let widths: Vec<i32> = links.iter().map(|(label, _)| face.width(label) as i32 + pad * 2).collect();
+        let ellipsis = face.width("…") as i32 + pad * 2;
+        let mut first = 0;
+        loop {
+            let lead = if first > 0 { ellipsis + chev } else { 0 };
+            let total: i32 = lead + widths[first..].iter().map(|w| w + chev).sum::<i32>();
+            if start + total <= end || first + 1 >= links.len() {
+                break;
+            }
+            first += 1;
+        }
+        let y = field.y + ctx.px(3) as i32;
+        let h = field.h.saturating_sub(ctx.px(6));
+        let mut x = start;
+        let lead = if first > 0 {
+            let rect = Rect::new(x, y, ellipsis as u32, h);
+            x += ellipsis;
+            rect
+        } else {
+            Rect::EMPTY
+        };
+        let mut out = Vec::new();
+        for ((label, path), w) in links.into_iter().zip(widths).skip(first) {
+            let w = w.min((end - x).max(0));
+            let rect = Rect::new(x, y, w as u32, h);
+            x += w;
+            let cw = chev.min((end - x).max(0));
+            let chevron = Rect::new(x, y, cw as u32, h);
+            x += cw;
+            out.push(CrumbSlot { label, path, rect, chevron });
+        }
+        (out, lead)
+    }
+
+    /// Поле адреса: звенья с подсветкой под указателем или строка правки.
+    fn draw_address(&self, s: &mut Surface, bar: Ctx, plan: &Plan) {
+        let ctx = bar;
+        let p = ctx.palette;
+        let radius = ctx.px(theme::R_ROW);
+        paint::sunk(bar, s, plan.path, radius);
+        let field = bar.on(bar.flat(p.sunk));
+        if let Some(line) = &self.address {
+            draw::rounded_stroke(s, plan.path, radius, p.acc, 255);
+            line.draw(field, s, address_text(ctx, plan), true, p.ink);
+            return;
+        }
+        let (slots, lead) = self.crumb_slots(ctx, plan);
+        let y = paint::baseline(field, Role::Body, plan.path);
+        let pad = ctx.px(CRUMB_PAD) as i32;
+        let open = self.crumb_pop.as_ref().map(|pop| pop.which);
+        if !lead.is_empty() {
+            if self.hot == Hot::CrumbMore || open == Some(None) {
+                paint::row(field, s, lead, RowState::Hover);
+            }
+            paint::text(field, s, Role::Body, lead.x + pad, y, "…", p.ink3);
+        }
+        let last = slots.len().saturating_sub(1);
+        let mut end = plan.path.x + ctx.px(12) as i32;
+        for (index, slot) in slots.iter().enumerate() {
+            if self.hot == Hot::Crumb(index) {
+                paint::row(field, s, slot.rect, RowState::Hover);
+            }
+            let open_here = open == Some(Some(index));
+            if self.hot == Hot::Chevron(index) || open_here {
+                paint::row(field, s, slot.chevron, RowState::Hover);
+            }
+            let room = slot.rect.w.saturating_sub(pad as u32 * 2);
+            paint::text_clipped(field, s, Role::Body, slot.rect.x + pad, y, room, &slot.label, if index == last { p.ink } else { p.ink3 });
+            // Разделитель — значок «›» (в шрифте такого знака нет); у
+            // раскрытого списка — «⌄», как в Проводнике.
+            let glyph = ctx.px(10);
+            if slot.chevron.w >= glyph {
+                let icon = if open_here { Icon::ChevronDown } else { Icon::ChevronRight };
+                let gx = slot.chevron.x + (slot.chevron.w as i32 - glyph as i32) / 2;
+                glyphicon::draw(s, icon, gx, plan.path.y + (plan.path.h as i32 - glyph as i32) / 2, glyph, p.ink4, 255);
+            }
+            end = slot.chevron.right();
+        }
+        if let Some(preview) = self.preview.as_ref() {
+            let right = plan.path.right() - ctx.px(8) as i32;
+            paint::text_clipped(field, s, Role::Body, end, y, (right - end).max(0) as u32, &format!(" ·  {}", preview.name), p.ink4);
+        }
+        // Список у шеврона рисуется последним — поверх списка файлов
+        // (см. [`Files::draw_crumb_pop`]).
+    }
+
+    /// Начать правку адреса текстом: весь путь выделен, как в Проводнике.
+    fn edit_address(&mut self) {
+        let text = if self.on_computer() { String::from("Этот компьютер") } else { self.path.clone() };
+        self.address = Some(Line::selected(&text));
+        self.crumb_pop = None;
+        self.searching = false;
+        println(&format!("files: address editing '{text}'"));
+    }
+
+    /// Enter в поле адреса: перейти. Файл — открыть его папку и выбрать его.
+    fn commit_address(&mut self) -> bool {
+        let text = self.address.as_ref().map(|line| line.text.trim().to_string()).unwrap_or_default();
+        let Some(target) = resolve_address(&text, &self.path, &self.home) else {
+            self.address = None;
+            return true;
+        };
+        if target == COMPUTER || is_directory(&target) {
+            self.address = None;
+            println(&format!("files: address -> '{target}'"));
+            if target == self.path {
+                self.reload();
+            } else {
+                self.go_to(target);
+            }
+            return true;
+        }
+        if exists(&target) {
+            let name = target.rsplit('/').next().unwrap_or("").to_string();
+            self.address = None;
+            println(&format!("files: address -> file '{target}'"));
+            self.go_to(parent_of(&target));
+            if let Some(index) = self.rows.iter().position(|row| row.name == name) {
+                self.selected = index;
+            }
+            return true;
+        }
+        self.note = Some(format!("Путь «{text}» не найден"));
+        println(&format!("files: address '{text}' not found"));
+        true
+    }
+
+    /// Клавиши адреса и списка у шеврона. `None` — не их.
+    fn key_address(&mut self, code: u32, mods: i32, latin: u32) -> Option<bool> {
+        if let Some(pop) = self.crumb_pop.as_mut() {
+            match code {
+                WIN_KEY_UP => pop.selected = pop.selected.saturating_sub(1),
+                WIN_KEY_DOWN => pop.selected = (pop.selected + 1).min(pop.items.len().saturating_sub(1)),
+                ENTER => {
+                    let path = pop.items.get(pop.selected).map(|(_, path)| path.clone()).filter(|path| !path.is_empty());
+                    self.crumb_pop = None;
+                    if let Some(path) = path {
+                        self.go_to(path);
+                    }
+                }
+                _ => self.crumb_pop = None,
+            }
+            return Some(true);
+        }
+        if self.address.is_some() {
+            match code {
+                ESCAPE => {
+                    self.address = None;
+                    println("files: address editing cancelled");
+                }
+                ENTER | 0x0D => return Some(self.commit_address()),
+                _ => {
+                    if let Some(line) = self.address.as_mut() {
+                        line.key(code, mods, latin);
+                    }
+                }
+            }
+            return Some(true);
+        }
+        let letter = char::from_u32(latin).map(|ch| ch.to_ascii_lowercase());
+        let idle = self.menu.is_none() && self.props.is_none() && self.preview.is_none() && self.tab_menu.is_none();
+        if idle && ((mods & WIN_MOD_CTRL != 0 && letter == Some('l')) || (mods & WIN_MOD_ALT != 0 && letter == Some('d'))) {
+            self.edit_address();
+            return Some(true);
+        }
+        None
+    }
+
+    /// Подпапки `path` для списка у шеврона; у «Этого компьютера» — тома.
+    fn subfolders(&self, path: &str) -> Vec<(String, String)> {
+        if path == COMPUTER {
+            return list_volumes().into_iter().map(|row| (volume_title(&row.name, &row.label), row.name.clone())).collect();
+        }
+        let Ok((rows, _)) = list_dir(path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String)> = rows
+            .into_iter()
+            .filter(|row| row.directory && (self.hidden || !row.name.starts_with('.')))
+            .map(|row| (row.name.clone(), join(path, &row.name)))
+            .collect();
+        out.sort_by_key(|(name, _)| name.to_lowercase());
+        out
+    }
+
+    /// Открыть список у шеврона звена `which` (`None` — у «…»).
+    fn open_crumb_pop(&mut self, ctx: Ctx, plan: &Plan, which: Option<usize>) -> bool {
+        let (slots, lead) = self.crumb_slots(ctx, plan);
+        let (at, mut items) = match which {
+            Some(index) => {
+                let Some(slot) = slots.get(index) else { return false };
+                (slot.chevron.x, self.subfolders(&slot.path))
+            }
+            None => {
+                let links = breadcrumb(&self.path, &self.home);
+                let hidden = links.len().saturating_sub(slots.len());
+                (lead.x, links.into_iter().take(hidden).collect())
+            }
+        };
+        let total = items.len();
+        items.truncate(CRUMB_POP_MAX);
+        if total > CRUMB_POP_MAX {
+            items.push((format!("… ещё {}", total - CRUMB_POP_MAX), String::new()));
+        }
+        if items.is_empty() {
+            items.push((String::from("Нет вложенных папок"), String::new()));
+        }
+        // Выбран пункт, ведущий туда, где мы сейчас (или глубже).
+        let selected = items.iter().position(|(_, path)| !path.is_empty() && (self.path == *path || self.path.starts_with(&format!("{path}/")))).unwrap_or(0);
+        println(&format!("files: crumb list {} item(s)", total));
+        self.crumb_pop = Some(CrumbPop { which, at, items, selected });
+        self.pop = None;
+        true
+    }
+
+    /// Место списка у шеврона.
+    fn crumb_pop_rect(&self, ctx: Ctx, area: Rect, plan: &Plan) -> Option<Rect> {
+        let pop = self.crumb_pop.as_ref()?;
+        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+        let size = kit::menu_size(ctx, &entries);
+        Some(kit::place((pop.at, plan.path.bottom() + ctx.px(2) as i32), size, area))
+    }
+
+    fn draw_crumb_pop(&self, s: &mut Surface, ctx: Ctx, area: Rect, plan: &Plan) {
+        let (Some(pop), Some(rect)) = (self.crumb_pop.as_ref(), self.crumb_pop_rect(ctx, area, plan)) else {
+            return;
+        };
+        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+        kit::draw_menu(ctx, s, rect, &entries, pop.selected);
+    }
+
+    /// Щелчок при открытом списке: пункт — перейти; мимо — закрыть (по
+    /// другому шеврону — открыть его список).
+    fn click_crumb_pop(&mut self, ctx: Ctx, area: Rect, plan: &Plan, x: i32, y: i32) -> bool {
+        let rect = self.crumb_pop_rect(ctx, area, plan);
+        let Some(pop) = self.crumb_pop.take() else { return false };
+        if let Some(rect) = rect {
+            let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+            if let Some(index) = kit::menu_hit(ctx, rect, &entries, x, y) {
+                drop(entries);
+                let path = pop.items[index].1.clone();
+                if !path.is_empty() {
+                    self.go_to(path);
+                } else {
+                    self.crumb_pop = Some(pop);
+                }
+                return true;
+            }
+            if rect.contains(x, y) {
+                self.crumb_pop = Some(pop);
+                return false;
+            }
+        }
+        if plan.path.contains(x, y) {
+            let (slots, lead) = self.crumb_slots(ctx, plan);
+            if lead.contains(x, y) && pop.which.is_some() {
+                return self.open_crumb_pop(ctx, plan, None);
+            }
+            if let Some(index) = slots.iter().position(|slot| slot.chevron.contains(x, y)) {
+                if pop.which != Some(index) {
+                    return self.open_crumb_pop(ctx, plan, Some(index));
+                }
+            }
+        }
+        true
+    }
+
+    /// Указатель над списком у шеврона — пункт под ним выбран.
+    fn hover_crumb_pop(&mut self, ctx: Ctx, area: Rect, plan: &Plan, x: i32, y: i32) -> bool {
+        let Some(rect) = self.crumb_pop_rect(ctx, area, plan) else { return false };
+        let Some(pop) = self.crumb_pop.as_mut() else { return false };
+        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+        let hit = kit::menu_hit(ctx, rect, &entries, x, y);
+        drop(entries);
+        match hit {
+            Some(index) if index != pop.selected => {
+                pop.selected = index;
+                true
+            }
+            _ => false,
+        }
+    }
+}

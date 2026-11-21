@@ -329,6 +329,8 @@ pub struct Compositor {
     lock: Option<(super::lock::Lock, Surface)>,
     /// Уведомление (72h-2) и пакеты, о которых стол уже знает.
     toast: Option<super::toast::Toast>,
+    /// Заставка запуска программы Windows (21.11, `ui::launch`).
+    splash: super::launch::Splash,
     known_packages: Option<Vec<alloc::string::String>>,
     /// Активное окно, о котором программам уже сказано (фаза 62c, `WIN_FOCUS`).
     ///
@@ -504,6 +506,7 @@ impl Compositor {
             thumbs: None,
             tray_pop: None,
             toast: None,
+            splash: super::launch::Splash::default(),
             known_packages: None,
             lock: None,
             reported_focus: None,
@@ -1545,6 +1548,17 @@ impl Compositor {
             return self.buttons();
         }
         let mut entries = self.buttons();
+        // «Показывать кнопки окон» (21.11, как в Windows): по умолчанию все
+        // окна на всех панелях; активной кнопка горит только на панели
+        // монитора, где окно открыто, — видно, где его искать.
+        if !super::deskcfg::taskbar().own {
+            for entry in &mut entries {
+                if entry.focused && !self.rect_of(entry.app).is_some_and(|rect| self.panel_output_of(rect) == output) {
+                    entry.focused = false;
+                }
+            }
+            return entries;
+        }
         entries.retain(|entry| self.rect_of(entry.app).is_some_and(|rect| self.panel_output_of(rect) == output));
         entries
     }
@@ -2223,6 +2237,30 @@ impl Compositor {
     }
 
     #[must_use]
+    /// Кадр заставки запуска (21.11): карточка посреди основного монитора,
+    /// полоса бежит. `true` — анимация идёт.
+    fn advance_splash(&mut self) -> bool {
+        let area = self.primary_work();
+        let (damage, moving) = self.splash.advance(area, self.scale);
+        for rect in damage {
+            self.mark_layer(rect);
+        }
+        moving
+    }
+
+    /// Что под точкой на заставке запуска.
+    #[must_use]
+    pub fn splash_hit(&self, x: i32, y: i32) -> Option<super::launch::Hit> {
+        self.splash.hit(x, y)
+    }
+
+    /// Закрыть заставку запуска (крестик, «Закрыть»).
+    pub fn splash_dismiss(&mut self) {
+        let rect = self.splash.rect;
+        self.splash.dismiss();
+        self.mark_layer(rect);
+    }
+
     pub fn toast_hit(&self, x: i32, y: i32) -> Option<super::toast::Hit> {
         self.toast.as_ref().and_then(|toast| toast.hit(x, y))
     }
@@ -4880,6 +4918,7 @@ impl Compositor {
         // Наплыв подсмотра и отсчёт до макетов прилипания (20.11).
         let peek_moving = self.advance_peek();
         let snap_waiting = self.advance_snap_layouts();
+        let splash_moving = self.advance_splash();
         self.build_scene();
         // След пальца по клавиатуре и язык её подписей. Анимация идёт, пока
         // летит окно или тлеет след: оболочка будит стол по этому признаку.
@@ -4907,7 +4946,7 @@ impl Compositor {
         // Палец держат на полоске жеста — задержку считает `ui::tick`, и
         // будить его надо кадрами, как и долгое нажатие на значок.
         super::set_animating(
-            self.flight.is_some() || trail || spinning || shade_moving || taskbar_moving || peek_moving || snap_waiting || super::icon_holding() || super::gesture_holding(),
+            self.flight.is_some() || trail || spinning || shade_moving || taskbar_moving || peek_moving || snap_waiting || splash_moving || super::icon_holding() || super::gesture_holding(),
         );
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
@@ -5312,6 +5351,11 @@ impl Compositor {
             let r = theme::R_WINDOW * self.scale;
             self.drop_shadow(back, toast.rect, band, dy, r);
             self.stack(back, toast.surface(), toast.rect, band, dy, r);
+        }
+        if let Some((surface, rect)) = self.splash.layer() {
+            let r = theme::R_WINDOW * self.scale;
+            self.drop_shadow(back, rect, band, dy, r);
+            self.stack(back, surface, rect, band, dy, r);
         }
         if let Some(pop) = self.tray_pop.as_ref() {
             let r = theme::R_WINDOW * self.scale;

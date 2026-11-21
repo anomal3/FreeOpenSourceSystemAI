@@ -95,10 +95,14 @@ pub struct Taskbar {
     /// панель задач на всех дисплеях»): у каждого — свои кнопки окон этого
     /// монитора и свой «Пуск»; `false` — только на основном.
     pub all: bool,
+    /// «Показывать кнопки окон» при панели на всех мониторах (21.11, как в
+    /// Windows): `false` — на всех панелях все окна (по умолчанию: так ждёт
+    /// Роман), `true` — только на панели монитора, где открыто окно.
+    pub own: bool,
 }
 
 impl Taskbar {
-    pub const DEFAULT: Self = Self { mode: Mode::Panel, edge: Edge::Bottom, autohide: false, icon: 40, small: false, all: false };
+    pub const DEFAULT: Self = Self { mode: Mode::Panel, edge: Edge::Bottom, autohide: false, icon: 40, small: false, all: false, own: false };
 
     fn parse(text: &str) -> Self {
         let mut out = Self::DEFAULT;
@@ -115,6 +119,7 @@ impl Taskbar {
                 "autohide" => out.autohide = value == "on",
                 "small" => out.small = value == "on",
                 "monitors" => out.all = value == "all",
+                "buttons" => out.own = value == "own",
                 "icon" => {
                     if let Ok(size) = value.parse::<u32>() {
                         out.icon = size.clamp(ICON_MIN, ICON_MAX);
@@ -128,13 +133,14 @@ impl Taskbar {
 
     fn format(self) -> String {
         alloc::format!(
-            "mode:{} edge:{} autohide:{} icon:{} small:{} monitors:{}",
+            "mode:{} edge:{} autohide:{} icon:{} small:{} monitors:{} buttons:{}",
             if self.mode == Mode::Dock { "dock" } else { "panel" },
             self.edge.tag(),
             if self.autohide { "on" } else { "off" },
             self.icon,
             if self.small { "on" } else { "off" },
-            if self.all { "all" } else { "main" }
+            if self.all { "all" } else { "main" },
+            if self.own { "own" } else { "all" }
         )
     }
 }
@@ -388,6 +394,8 @@ pub enum TaskbarDeed {
     Small(bool),
     /// Панель на всех мониторах или только на основном.
     AllMonitors(bool),
+    /// Кнопки окон только на панели своего монитора (`true`) или на всех.
+    OwnButtons(bool),
     ClearPins,
 }
 
@@ -427,6 +435,10 @@ pub fn apply_taskbar(deed: TaskbarDeed) -> (String, Result<(), crate::vfs::VfsEr
         TaskbarDeed::Small(on) => {
             value.small = on;
             String::from(if on { "маленькие значки на панели" } else { "обычные значки на панели" })
+        }
+        TaskbarDeed::OwnButtons(on) => {
+            value.own = on;
+            String::from(if on { "кнопки окон — только на панели монитора, где открыто окно" } else { "кнопки окон — на всех панелях" })
         }
         TaskbarDeed::AllMonitors(on) => {
             value.all = on;
@@ -480,6 +492,8 @@ pub fn command(words: &str) -> Taskbar {
             "large" => value.small = false,
             "all" => value.all = true,
             "main" => value.all = false,
+            "own" => value.own = true,
+            "everywhere" => value.own = false,
             other => {
                 if let Some(edge) = Edge::from_tag(other) {
                     value.edge = edge;

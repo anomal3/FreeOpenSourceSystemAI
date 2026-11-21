@@ -68,6 +68,7 @@ pub mod term;
 pub mod thumbs;
 pub mod snaplay;
 pub mod toast;
+pub mod launch;
 pub mod traypop;
 pub mod trash;
 pub mod wallart;
@@ -2233,6 +2234,9 @@ pub fn set_screen_off(off: bool) -> bool {
 static WIFI_SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 pub fn tick() {
+    // Запуски программ Windows (21.11): кончились ли, значки — вне замка
+    // стола (см. `launch`).
+    launch::poll();
     let status = status_now();
     let request = MODE_REQUEST.swap(0, core::sync::atomic::Ordering::Relaxed);
     let layout = LAYOUT_REQUEST.lock().take();
@@ -3626,6 +3630,21 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
             kprintln!("  desktop     : shutdown from the lock screen");
             crate::power::request(false, crate::power::Source::Desktop);
         }
+        return;
+    }
+
+    // 0-launch. Заставка запуска программы Windows (21.11): крестик и
+    // «Закрыть» убирают её, «Подробнее» — журнал событий.
+    if let Some(hit) = desktop.splash_hit(x, y) {
+        match hit {
+            launch::Hit::Details => {
+                desktop.splash_dismiss();
+                start(desktop, "/bin/eventlog");
+            }
+            launch::Hit::Close => desktop.splash_dismiss(),
+            launch::Hit::Inside => {}
+        }
+        desktop.present();
         return;
     }
 
@@ -6177,7 +6196,10 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
     // Значок и группа на панели — по программе задачи. Считаются до стола:
     // путь программы лежит под её замком, а под замком стола его не берут.
     let (art, group) = appicon::of_task(task, title);
-    with_desktop(|desktop| {
+    // Задание процесса — для заставки запуска (21.11): окно ли это
+    // запущенной игры. Тоже до стола.
+    let job = crate::user::job_of_task(task);
+    let opened = with_desktop(|desktop| {
         if desktop.index_of(app).is_some() {
             return Err(WindowError::Exists);
         }
@@ -6235,7 +6257,11 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         desktop.present();
         Ok(())
     })
-    .unwrap_or_else(|| Err(unavailable()))
+    .unwrap_or_else(|| Err(unavailable()));
+    if opened.is_ok() {
+        launch::window_opened(task, job);
+    }
+    opened
 }
 
 /// Открыть всплывающее окно программы над её окном `owner` (фаза 62e,
