@@ -1266,7 +1266,7 @@ fn run_builtin(line: &str) -> bool {
         // screen (no compose), for A/B.
         "wldirect" => sprintln!("{}", crate::ui::direct_command(argument)),
         #[cfg(target_arch = "x86_64")]
-        "wlping" | "lxshrwx" | "lxcfr" | "tlbtarget" | "wlopaque" | "wlzerocopy" => {
+        "wlping" | "lxshrwx" | "lxcfr" | "tlbtarget" | "wlopaque" | "wlzerocopy" | "lxirq" => {
             use core::sync::atomic::Ordering::Relaxed;
             let on = match argument.trim() {
                 "on" => Some(true),
@@ -1275,6 +1275,8 @@ fn run_builtin(line: &str) -> bool {
             };
             if let Some(on) = on {
                 match command {
+                    // hw-log14: Linux calls with interrupts on; `off` - as before (A/B).
+                    "lxirq" => crate::arch::interrupts::LINUX_SYSCALL_IRQS.store(on, Relaxed),
                     "wlzerocopy" => crate::linux::wayland::ZERO_COPY.store(on, Relaxed),
                     "wlping" => crate::linux::wayland::set_ping(on),
                     "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.store(on, Relaxed),
@@ -1284,6 +1286,7 @@ fn run_builtin(line: &str) -> bool {
                 }
             }
             let now = match command {
+                "lxirq" => crate::arch::interrupts::LINUX_SYSCALL_IRQS.load(Relaxed),
                 "wlzerocopy" => crate::linux::wayland::ZERO_COPY.load(Relaxed),
                 "wlping" => crate::linux::wayland::ping(),
                 "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.load(Relaxed),
