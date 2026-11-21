@@ -37,7 +37,20 @@ pub fn page_origin(look: &Look) -> (u32, u32) {
 
 pub fn page_size(look: &Look, w: u32, h: u32) -> dpi::PhysicalSize<u32> {
     let (x, y) = page_origin(look);
-    dpi::PhysicalSize::new(w.saturating_sub(x).saturating_sub(dev_dock()).max(1), h.saturating_sub(y).max(1))
+    dpi::PhysicalSize::new(w.saturating_sub(x).saturating_sub(dev_dock()).max(1), h.saturating_sub(y).saturating_sub(downloads_bar()).max(1))
+}
+
+/// Полоса загрузок внизу окна (как в Chrome): страница на столько ниже.
+/// Ноль — полоса скрыта.
+pub const DOWNLOADS_BAR_H: u32 = 52;
+static DOWNLOADS_BAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn downloads_bar() -> u32 {
+    DOWNLOADS_BAR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_downloads_bar(px: u32) {
+    DOWNLOADS_BAR.store(px, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Ширина инструментов разработчика, встроенных справа (как в Chromium):
@@ -87,6 +100,9 @@ pub struct Delegate {
     pub downloads: Rc<crate::downloads::Downloads>,
     /// Консоль и сеть для инструментов разработчика (F12).
     pub devlog: RefCell<crate::devtools::DevLog>,
+    /// Запросы документов вкладок, ждущие проверки ссылки (файл или
+    /// страница, `Shell::poll_downloads`).
+    pub held_loads: RefCell<Vec<(WebViewId, servo::WebResourceLoad)>>,
 }
 
 impl Delegate {
@@ -209,6 +225,19 @@ impl WebViewDelegate for Delegate {
             drop(blocker);
             self.note(Note::Blocked(webview.id()));
             load.intercept(servo::WebResourceResponse::new(url)).cancel();
+            return;
+        }
+        // Документ вкладки: файл это или страница, скажут заголовки ответа
+        // (`Content-Disposition: attachment`, тип, который Servo не покажет), —
+        // запрос ждёт проверки ссылки (`Shell::poll_downloads`).
+        let url = request.url.as_url();
+        if request.is_for_main_frame
+            && !request.is_redirect
+            && request.method.as_str() == "GET"
+            && matches!(url.scheme(), "http" | "https")
+            && !crate::downloads::surely_page(url)
+        {
+            self.held_loads.borrow_mut().push((webview.id(), load));
         }
     }
 
@@ -368,6 +397,10 @@ pub enum Action {
     Find { back: bool },
     /// Скачать адрес в «Загрузки».
     Download(String),
+    /// «Сохранить ссылку/картинку как…»: скачать, спросив, куда.
+    SaveAs(String),
+    /// Выбрать папку загрузок окном системы.
+    ChooseDownloadDir,
     /// Блокировка рекламы на текущем сайте: выключить/включить (щит).
     ToggleBlockSite,
     /// Режим чтения: только текст статьи.
@@ -539,6 +572,35 @@ pub struct Shell {
     /// Закрытые вкладки — для Ctrl+Shift+T (последняя — в конце).
     pub closed: Vec<String>,
     pub quit: bool,
+    pub dl: DownloadsUi,
+}
+
+/// Что показывает вкладка вместо адреса, ушедшего в загрузки (пока не
+/// вернулась назад; у новой вкладки без истории — остаётся).
+const DOWNLOAD_PAGE: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Загрузка</title>\
+<style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:90vh;color:#667;background:#f4f6fb}</style></head>\
+<body><p>Файл скачивается — ход внизу окна и в «Загрузках» (Ctrl+J).</p></body></html>";
+
+/// Загрузки со стороны оболочки: ждущие проверки документы вкладок, окно
+/// «Сохранить как», полоса загрузок.
+#[derive(Default)]
+pub struct DownloadsUi {
+    /// Проверки ссылок: номер загрузки, вкладка, придержанный запрос, когда.
+    probes: Vec<(u64, WebViewId, servo::WebResourceLoad, Instant, url::Url)>,
+    /// О каких загрузках окно «Сохранить как» уже спрошено.
+    asked: BTreeSet<u64>,
+    /// Ждут окна «Сохранить как» (окно — одно за раз).
+    queue: Vec<(u64, String)>,
+    dialog: Option<(DialogFor, window::FileDialog)>,
+    /// Вкладка ушла на адрес файла — вернуть её назад, когда Servo его покажет.
+    leave: Vec<(WebViewId, url::Url, Instant)>,
+    /// Полоса загрузок внизу показана (закрывается крестиком, снова — новой загрузкой).
+    pub bar: bool,
+}
+
+enum DialogFor {
+    Save(u64),
+    Folder,
 }
 
 pub fn shown_url(url: &url::Url) -> String {
@@ -749,6 +811,21 @@ impl Shell {
                     }
                 }
                 Note::Url(id, url) => {
+                    // Вкладка показала адрес, который ушёл в загрузки (ошибка
+                    // отменённого документа) — назад, на страницу со ссылкой.
+                    if let Some(at) = self.dl.leave.iter().position(|(w, u, _)| *w == id && *u == url) {
+                        self.dl.leave.remove(at);
+                        if let Some(i) = self.tab_index(id) {
+                            let webview = self.tabs[i].webview.clone();
+                            println!("browser: download page left");
+                            if webview.can_go_back() {
+                                webview.go_back(1);
+                            } else {
+                                webview.load(url::Url::parse("obsos://newtab").expect("newtab"));
+                            }
+                        }
+                        continue;
+                    }
                     let focused = self.focus_address;
                     let active = self.active;
                     let shown = shown_url(&url);
@@ -928,7 +1005,7 @@ impl Shell {
             Some("fetch") => {
                 let Some(i) = self.tab_index(id) else { return };
                 let Some(url) = self.tabs[i].real_url.clone() else { return };
-                self.download(url.as_str());
+                self.download(url.as_str(), false);
                 let webview = self.tabs[i].webview.clone();
                 if webview.can_go_back() {
                     webview.go_back(1);
@@ -939,7 +1016,7 @@ impl Shell {
             // Ссылка `<a download>` на странице.
             Some("download") => {
                 if let Some(url) = v.str_field("url") {
-                    self.download(url);
+                    self.download(url, false);
                 }
             }
             Some("unsupported") => {
@@ -1056,7 +1133,9 @@ impl Shell {
                 }
             }
             Action::SyncNow(label) => self.sync_now(label),
-            Action::Download(url) => self.download(&url),
+            Action::Download(url) => self.download(&url, false),
+            Action::SaveAs(url) => self.download(&url, true),
+            Action::ChooseDownloadDir => self.choose_download_dir(window),
             Action::ToggleBlockSite => {
                 let Some(host) = self.tabs.get(self.active).and_then(|t| t.real_url.as_ref()?.host_str().map(str::to_string)) else { return true };
                 let allowed = self.delegate.blocker.borrow_mut().toggle_site(&host);
@@ -1102,9 +1181,145 @@ impl Shell {
         true
     }
 
-    pub fn download(&mut self, url: &str) {
-        self.delegate.downloads.start(url);
-        self.toast("Загрузка началась — Ctrl+J");
+    /// Куки Servo для адреса (`Cookie:` загрузки — файлы за входом на сайт).
+    fn cookie_for(&self, url: &url::Url) -> Option<String> {
+        let cookies = self.servo.site_data_manager().cookies_for_url(url.clone(), servo::CookieSource::HTTP);
+        let text = cookies.iter().map(|c| format!("{}={}", c.name(), c.value())).collect::<Vec<_>>().join("; ");
+        (!text.is_empty()).then_some(text)
+    }
+
+    pub fn download(&mut self, url: &str, ask: bool) {
+        let Ok(parsed) = url::Url::parse(url) else { return };
+        if !matches!(parsed.scheme(), "http" | "https") {
+            self.toast("Скачать можно только адрес http(s)");
+            return;
+        }
+        let referer = self.tabs.get(self.active).and_then(|t| t.real_url.as_ref()).map(|u| u.to_string());
+        let request = crate::downloads::Request { url: url.to_string(), cookie: self.cookie_for(&parsed), referer, ask, name: None };
+        self.delegate.downloads.start(request);
+        self.dl.bar = true;
+    }
+
+    /// Папка загрузок из настроек (пусто — `~/Downloads`).
+    pub fn apply_download_settings(&self) {
+        let s = &self.profile.settings;
+        let dir = if s.download_dir.trim().is_empty() { crate::downloads::default_dir() } else { std::path::PathBuf::from(s.download_dir.trim()) };
+        *self.delegate.downloads.dir.borrow_mut() = dir;
+        self.delegate.downloads.ask_always.set(s.download_ask);
+    }
+
+    /// Выбрать папку загрузок окном системы.
+    pub fn choose_download_dir(&mut self, window: &Window) {
+        if self.dl.dialog.is_some() {
+            return;
+        }
+        let dir = self.delegate.downloads.dir.borrow().display().to_string();
+        match window::FileDialog::folder(window.id(), "Папка для загрузок", &dir) {
+            Ok(d) => self.dl.dialog = Some((DialogFor::Folder, d)),
+            Err(e) => self.toast(format!("Окно выбора папки не открылось: {e}")),
+        }
+    }
+
+    /// Загрузки на каждом витке цикла: проверки ссылок вкладок, окно
+    /// «Сохранить как», уведомления о конце. `true` — оболочку перерисовать.
+    pub fn poll_downloads(&mut self, window: &Window) -> bool {
+        let mut changed = false;
+        let downloads = self.delegate.downloads.clone();
+        // Новые документы вкладок — проверить ссылку.
+        let held = std::mem::take(&mut *self.delegate.held_loads.borrow_mut());
+        for (webview, load) in held {
+            let url = load.request().url.as_url().clone();
+            let referer = load.request().referrer_url.as_ref().map(|u| u.as_str().to_string());
+            let id = downloads.probe(url.as_str(), self.cookie_for(&url), referer);
+            self.dl.probes.push((id, webview, load, Instant::now(), url));
+        }
+        // Решённые проверки: файл — документ отменить (качает проверка),
+        // страница — отпустить к Servo. Не решилась за 6 с — тоже отпустить:
+        // медленный сайт не должен висеть из-за проверки.
+        let mut i = 0;
+        while i < self.dl.probes.len() {
+            let (id, _, _, at, _) = &self.dl.probes[i];
+            let (id, at) = (*id, *at);
+            let decided = downloads.probe_is_file(id);
+            let late = decided.is_none() && at.elapsed() > Duration::from_secs(6);
+            if decided.is_none() && !late {
+                i += 1;
+                continue;
+            }
+            let (id, webview, load, _, url) = self.dl.probes.remove(i);
+            if decided == Some(true) {
+                println!("browser: document {} is a download", url.as_str());
+                // Отменённый документ (`cancel`) оставлял навигацию Servo
+                // висеть — следующие переходы вкладки не шли вовсе (20.11).
+                // Поэтому ответ — короткая страница «файл скачивается», а
+                // вкладка сразу уходит назад (`leave`, `Note::Url`).
+                let mut headers = http::HeaderMap::new();
+                headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("text/html; charset=utf-8"));
+                let mut answer = load.intercept(servo::WebResourceResponse::new(url.clone()).headers(headers));
+                answer.send_body_data(DOWNLOAD_PAGE.as_bytes().to_vec());
+                answer.finish();
+                self.dl.leave.push((webview, url, Instant::now()));
+                self.dl.bar = true;
+                changed = true;
+            } else {
+                if late {
+                    println!("browser: probe {} too slow — page", url.as_str());
+                    downloads.drop_probe(id);
+                }
+                drop(load);
+            }
+        }
+        self.dl.leave.retain(|(_, _, at)| at.elapsed() < Duration::from_secs(20));
+        for event in downloads.poll(&mut self.dl.asked) {
+            match event {
+                crate::downloads::Event::Ask { id, name } => self.dl.queue.push((id, name)),
+                crate::downloads::Event::Finished { name, ok } => {
+                    if ok {
+                        self.toast(format!("Загружено: {name}"));
+                    }
+                    changed = true;
+                }
+            }
+        }
+        // Окно «Сохранить как»: по одному.
+        if self.dl.dialog.is_none() && !self.dl.queue.is_empty() {
+            let (id, name) = self.dl.queue.remove(0);
+            let dir = downloads.dir.borrow().clone();
+            let _ = std::fs::create_dir_all(&dir);
+            match window::FileDialog::save(window.id(), "Сохранить как", &dir.display().to_string(), &name) {
+                Ok(d) => self.dl.dialog = Some((DialogFor::Save(id), d)),
+                Err(e) => {
+                    // Окна нет (старая система) — в папку загрузок.
+                    println!("browser: save dialog failed: {e}");
+                    downloads.answer(id, Some(crate::net::unique_path(&dir, &name)));
+                }
+            }
+        }
+        let answer = self.dl.dialog.as_mut().and_then(|(_, dialog)| dialog.poll());
+        if let Some(answer) = answer {
+            if let Some((purpose, _)) = self.dl.dialog.take() {
+                let chosen = match answer {
+                    window::DialogAnswer::Chosen(path) => Some(std::path::PathBuf::from(path)),
+                    window::DialogAnswer::Cancelled => None,
+                };
+                match purpose {
+                    DialogFor::Save(id) => {
+                        println!("browser: save as {}", chosen.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| String::from("cancelled")));
+                        downloads.answer(id, chosen);
+                    }
+                    DialogFor::Folder => {
+                        if let Some(dir) = chosen {
+                            println!("browser: download folder {}", dir.display());
+                            self.profile.settings.download_dir = dir.display().to_string();
+                            self.profile.save_settings();
+                            self.apply_download_settings();
+                        }
+                    }
+                }
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn find_step(&mut self, back: bool) {

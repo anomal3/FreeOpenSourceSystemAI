@@ -246,10 +246,27 @@ pub const SERVO_PACKAGE: &str = "obsos-0.1.fpk";
 /// (`ports/servo/builder/build-jsprobe.sh` → `build/linux/<имя>-<арх>`).
 /// Нет их — пакета нет: без Docker система собирается как раньше.
 pub fn servo(arch: Arch) -> Result<Option<Vec<u8>>> {
-    let Some(jsprobe) = crate::ruststd::linux_host_program("jsprobe", arch) else {
+    servo_package(arch, true)
+}
+
+/// Пакет OBSOS для живой флешки (20.11): только сам браузер, без проверок
+/// движка `jsprobe`/`depsprobe`/`servoprobe` — на живой системе `/opt` в
+/// памяти, и 165 МБ проверок там лишние. Имя и версия те же: стенд и
+/// человек видят один пакет `obsos`.
+pub fn servo_live(arch: Arch) -> Result<Option<Vec<u8>>> {
+    servo_package(arch, false)
+}
+
+fn servo_package(arch: Arch, probes: bool) -> Result<Option<Vec<u8>>> {
+    let jsprobe = crate::ruststd::linux_host_program("jsprobe", arch);
+    if probes && jsprobe.is_none() {
         say!("пакет servo пропущен: нет build/linux/jsprobe-{} — собрать: ports/servo/builder/build-jsprobe.sh", arch.name());
         return Ok(None);
-    };
+    }
+    if !probes && crate::ruststd::linux_host_program("servo-browser", arch).is_none() {
+        say!("браузер OBSOS пропущен: нет build/linux/servo-browser-{} — собрать: ports/servo/builder/build-servoprobe.sh", arch.name());
+        return Ok(None);
+    }
     // OBSOS — Open Browser for System Open Source («Обсос»; Роман, 08.11.2026):
     // браузер FreeOS на движке Servo.
     let mut servo = Builder::new(Kind::Package, "obsos", "0.1");
@@ -259,16 +276,18 @@ pub fn servo(arch: Arch) -> Result<Option<Vec<u8>>> {
     // depsprobe — без `net` даже bind на 127.0.0.1 отказан). `jit` — когда
     // SpiderMonkey пойдёт с JIT (N12).
     servo.field("permissions", "windows files net");
-    let data = fs::read(&jsprobe).with_context(|| format!("не удалось прочитать {}", jsprobe.display()))?;
-    servo.file(&Entry { path: String::from("bin/jsprobe"), mode: 0o755, uid: 0, gid: 0, data });
+    if let Some(jsprobe) = jsprobe.filter(|_| probes) {
+        let data = fs::read(&jsprobe).with_context(|| format!("не удалось прочитать {}", jsprobe.display()))?;
+        servo.file(&Entry { path: String::from("bin/jsprobe"), mode: 0o755, uid: 0, gid: 0, data });
+    }
     // Остальные C/C++-зависимости движка (HarfBuzz, FreeType, OTS, aws-lc,
     // SQLite, zstd) — `build-depsprobe.sh`; нет — пакет и без неё.
-    if let Some(deps) = crate::ruststd::linux_host_program("depsprobe", arch) {
+    if let Some(deps) = crate::ruststd::linux_host_program("depsprobe", arch).filter(|_| probes) {
         let data = fs::read(&deps).with_context(|| format!("не удалось прочитать {}", deps.display()))?;
         servo.file(&Entry { path: String::from("bin/depsprobe"), mode: 0o755, uid: 0, gid: 0, data });
     }
     // Сам Servo без окна: страница → снимок (N5/N6, `build-servoprobe.sh`).
-    if let Some(probe) = crate::ruststd::linux_host_program("servoprobe", arch) {
+    if let Some(probe) = crate::ruststd::linux_host_program("servoprobe", arch).filter(|_| probes) {
         let data = fs::read(&probe).with_context(|| format!("не удалось прочитать {}", probe.display()))?;
         servo.file(&Entry { path: String::from("bin/servoprobe"), mode: 0o755, uid: 0, gid: 0, data });
     }

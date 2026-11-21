@@ -2116,6 +2116,7 @@ impl Compositor {
             self.known_packages = Some(super::panel::list_packages().into_iter().map(|launcher| launcher.name).collect());
         }
         if self.icons.packages_changed() {
+            super::deskcfg::packages_changed();
             self.reload_icons();
             let (total, entries) = self.icons.counts();
             crate::kprintln!("  desktop     : packages changed, {total} icons ({entries} from the desktop folder)");

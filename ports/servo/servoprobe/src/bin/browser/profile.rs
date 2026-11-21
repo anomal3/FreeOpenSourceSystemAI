@@ -205,6 +205,10 @@ pub struct Settings {
     /// Отмечать каждую автоматическую синхронизацию точкой (тегом).
     pub sync_points_auto: bool,
     pub history_days: u32,
+    /// Папка загрузок (пусто — `~/Downloads`).
+    pub download_dir: String,
+    /// Спрашивать, куда сохранять каждый файл (окно «Сохранить как»).
+    pub download_ask: bool,
 }
 
 impl Settings {
@@ -229,6 +233,8 @@ impl Settings {
             sync_every_min: 15,
             sync_points_auto: false,
             history_days: 90,
+            download_dir: String::new(),
+            download_ask: false,
         }
     }
 
@@ -248,6 +254,8 @@ impl Settings {
             ("sync_every_min".into(), Value::Num(self.sync_every_min.to_string())),
             ("sync_points_auto".into(), Value::Bool(self.sync_points_auto)),
             ("history_days".into(), Value::Num(self.history_days.to_string())),
+            ("download_dir".into(), Value::Str(self.download_dir.clone())),
+            ("download_ask".into(), Value::Bool(self.download_ask)),
         ])
         .to_text()
     }
@@ -288,6 +296,10 @@ impl Settings {
         s.sync_every_min = num("sync_every_min", s.sync_every_min).clamp(1, 24 * 60);
         s.sync_points_auto = flag("sync_points_auto", s.sync_points_auto);
         s.history_days = num("history_days", s.history_days).clamp(1, 3650);
+        if let Some(dir) = v.str_field("download_dir") {
+            s.download_dir = dir.to_string();
+        }
+        s.download_ask = flag("download_ask", s.download_ask);
         Some(s)
     }
 }

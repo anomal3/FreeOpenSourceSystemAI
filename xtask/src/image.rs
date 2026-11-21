@@ -304,9 +304,14 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // `FOSSAI_LIVE_APPS=0` (18.11, Роман: «редакторы и OBSOS пока на
             // флешку не грузить, проверяем только Proton и игры») — без OBSOS
             // и Craft: флешка меньше, пакеты ставятся быстрее.
+            //
+            // Браузер с 20.11 решает свой ключ `FOSSAI_LIVE_BROWSER` (Роман:
+            // «браузер мне в сборку помести»): по умолчанию он едет на флешку и
+            // при `FOSSAI_LIVE_APPS=0` — без браузера только `FOSSAI_LIVE_BROWSER=0`.
             let live_apps = std::env::var("FOSSAI_LIVE_APPS").map_or(true, |v| v != "0");
-            if built.release && live_apps {
-                if let Some(bytes) = crate::package::servo(arch)? {
+            let live_browser = std::env::var("FOSSAI_LIVE_BROWSER").map_or(true, |v| v != "0");
+            if built.release && live_browser {
+                if let Some(bytes) = crate::package::servo_live(arch)? {
                     payload.push(Payload {
                         path: format!("{}/OBSOS.FPK", arch::PAYLOAD_PKG_DIR),
                         data: bytes,

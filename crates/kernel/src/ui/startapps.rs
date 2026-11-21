@@ -344,10 +344,13 @@ pub static ENTRIES: [Entry; 24] = [
 ];
 
 /// Закреплённое в «Пуске», пока человек ничего не менял.
-pub static DEFAULT_PINS: [&str; 8] = ["terminal", "settings", "about", "files", "taskmgr", "folder:utils", "folder:admin", "folder:sdk"];
+/// Браузер OBSOS (`pkg:obsos`, 20.11: Роман — «браузер мне в сборку») стоит
+/// плиткой и кнопкой панели, когда пакет установлен (на живой флешке — сам
+/// с `\FREEOS\PKG\OBSOS.FPK`); без пакета ключ молча пропускается.
+pub static DEFAULT_PINS: [&str; 9] = ["terminal", "settings", "about", "files", "pkg:obsos", "taskmgr", "folder:utils", "folder:admin", "folder:sdk"];
 
 /// Закреплённое на панели задач по умолчанию.
-pub static DEFAULT_TASK_PINS: [&str; 3] = ["files", "terminal", "settings"];
+pub static DEFAULT_TASK_PINS: [&str; 4] = ["files", "pkg:obsos", "terminal", "settings"];
 
 /// Строка манифеста по ключу.
 #[must_use]

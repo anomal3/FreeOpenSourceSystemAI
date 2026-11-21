@@ -259,6 +259,12 @@ pub fn task_pins_generation() -> u32 {
     PIN_GEN.load(Ordering::Relaxed)
 }
 
+/// Пакеты поставили или сняли (20.11): закреплённая `pkg:…` кнопка панели
+/// появляется сама, когда пакет встаёт после запуска стола (живая флешка).
+pub fn packages_changed() {
+    PIN_GEN.fetch_add(1, Ordering::Relaxed);
+}
+
 fn parse_list(text: &str) -> Vec<String> {
     text.split('|').map(str::trim).filter(|key| !key.is_empty()).map(String::from).collect()
 }

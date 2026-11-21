@@ -1163,8 +1163,11 @@ fn play(
                 }
             }
             Step::Type(text) => {
+                // Порты стенда — и в набираемом тексте (адрес сайта хоста в
+                // строке браузера).
+                let text = fill(text, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: набираем {text:?}");
-                for name in keys::spell(text).with_context(|| format!("шаг {index}"))? {
+                for name in keys::spell(&text).with_context(|| format!("шаг {index}"))? {
                     hmp.sendkey(&name).with_context(|| format!("шаг {index}"))?;
                     std::thread::sleep(KEY_DELAY);
                 }
@@ -2767,6 +2770,62 @@ fn start_host_site() -> Result<(HostServer, u16)> {
                 .into_bytes();
                 answer.extend((0..scenarios::SITE_STREAM_BYTES).map(|at| (at % 251) as u8));
                 answer
+            }
+            // Загрузки OBSOS (20.11): страница со ссылками, файл, который
+            // сервер велит сохранить (`Content-Disposition: attachment` при
+            // типе text/plain — Servo показал бы его страницей), и образ
+            // больше гигабайта без расширения в адресе — их узнаёт проверка
+            // ссылки браузера по заголовкам. Тела детерминированные, их
+            // SHA-256 записаны в сценарии `obsos-downloads`.
+            "/dl/" => {
+                let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Загрузки OBSOS</title>\
+                    <style>body{font-family:sans-serif;margin:32px;background:#f4f6fb}a{display:block;margin:14px 0;font-size:20px}</style></head>\
+                    <body><h1>Загрузки OBSOS</h1><a id=\"report\" href=\"/dl/report\">Отчёт (Content-Disposition: attachment)</a>\
+                    <a id=\"big\" href=\"/dl/fossai-live\">Образ 1,1 ГиБ (application/octet-stream)</a>\
+                    <a href=\"/hello.txt\">Текстовая страница</a></body></html>\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
+            "/dl/report" => {
+                let body: String = (0..2000).map(|n| format!("Отчёт FossAi, строка {n}\n")).collect();
+                let mut answer = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+                     Content-Disposition: attachment; filename=\"report.txt\"; filename*=UTF-8''%D0%9E%D1%82%D1%87%D1%91%D1%82%202026.txt\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                answer.extend_from_slice(body.as_bytes());
+                answer
+            }
+            "/dl/fossai-live" => {
+                // Гигабайт с лишним — потоком и в своём потоке: остальные
+                // запросы гостя (страницы, значок) не ждут конца образа.
+                std::thread::spawn(move || {
+                    let total = scenarios::SITE_DOWNLOAD_BYTES;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                    let pattern: Vec<u8> = (0..251u32).map(|b| b as u8).collect();
+                    let block: Vec<u8> = pattern.iter().copied().cycle().take(1024 * 1024 + 251).collect();
+                    let mut sent = 0u64;
+                    while sent < total {
+                        let offset = (sent % 251) as usize;
+                        let n = (total - sent).min(1024 * 1024) as usize;
+                        if stream.write_all(&block[offset..offset + n]).is_err() {
+                            say!("             сайт хоста: образ оборван на {sent} байт");
+                            return;
+                        }
+                        sent += n as u64;
+                    }
+                    say!("             сайт хоста: образ отдан, {sent} байт");
+                });
+                return;
             }
             "/chunked.txt" => {
                 // Ответ кусками. Наш прокси обязан отказаться его передавать:

@@ -442,6 +442,10 @@ pub enum Pattern {
 /// проходит за секунды даже под эмуляцией.
 pub const SITE_STREAM_BYTES: usize = 256 * 1024;
 
+/// Образ, который качает OBSOS в сценарии `obsos-downloads` (20.11): больше
+/// гигабайта — счётчики и запись потоком, а не в память. Байты — `n % 251`.
+pub const SITE_DOWNLOAD_BYTES: u64 = 1_200_000_000;
+
 /// Несколько одновременных запросов.
 pub struct HttpMany {
     pub path: &'static str,
@@ -9892,6 +9896,87 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("KERNEL PANIC"),
             Step::Key("ctrl-shift-q"),
             Step::Await("browser: closed", 60_000),
+        ],
+    },
+    Scenario {
+        name: "obsos-downloads",
+        about: "OBSOS на живой флешке и загрузки (20.11, Роман: «браузер мне в сборку … чтобы файлы из интернета скачивались»): системный образ флешкой USB, пакет OBSOS встаёт в /opt в памяти сам и закреплён на панели; файл с Content-Disposition: attachment и образ 1,1 ГиБ без расширения узнаёт проверка ссылки, оба качаются потоком в /root/Downloads, SHA-256 сходится; полоса загрузок с ходом, «Показать в папке» открывает «Файлы» на файле.",
+        target: Target::Image,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Usb,
+        network: true,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: true,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        // Образ 1,1 ГиБ ложится в /root в памяти живой системы, рядом OBSOS в /opt.
+        memory: "6144M",
+        extra: &["-smp", "4", "-cpu", "max"],
+        steps: &[
+            Step::Await(PROMPT, BOOT),
+            Step::AwaitAny("ramvol      : ", 60_000),
+            Step::AwaitAny("live pkg    : installing /usb", 120_000),
+            Step::AwaitAny("pkg: installed obsos 0.1, ", 300_000),
+            Step::AwaitAny("dhcp: lease ", 60_000),
+            // Ярлык «Браузер» на столе появляется сам, когда пакет встал
+            // (пятеро системных + он).
+            Step::AwaitAny("desktop     : packages changed, 6 icons", 30_000),
+            Step::Wait(3_000),
+            Step::Shot("obsos-dl-desktop"),
+            Step::Line("run /opt/obsos/bin/obsos http://10.0.2.2:{site}/dl/"),
+            Step::Await("desktop     : opened 'OBSOS — Браузер' for ", 180_000),
+            Step::Await("browser: title Some(\"Загрузки OBSOS\")", 180_000),
+            Step::Wait(3_000),
+            // Файл, который сервер велит сохранить: text/plain, но attachment.
+            Step::Key("ctrl-l"),
+            Step::Wait(1_500),
+            Step::Type("http://10.0.2.2:{site}/dl/report"),
+            Step::Key("ret"),
+            Step::Await("browser: probe http://10.0.2.2:{site}/dl/report → file Отчёт 2026.txt (text/plain, attachment)", 60_000),
+            Step::Await("browser: download saved /root/Downloads/Отчёт 2026.txt (72890 bytes, sha256 bcf0cba9e029b2ceeea993298f465d03233a735ed34d80f4de71900aed916afb)", 120_000),
+            Step::Wait(4_000),
+            Step::Shot("obsos-dl-report"),
+            // Образ больше гигабайта без расширения: тип application/octet-stream.
+            Step::Key("ctrl-l"),
+            Step::Wait(1_500),
+            Step::Type("http://10.0.2.2:{site}/dl/fossai-live"),
+            Step::Key("ret"),
+            Step::Await("browser: download to /root/Downloads/fossai-live (1200000000 bytes)", 60_000),
+            // Ход в журнал — по каждой сотне МиБ («… 107 MiB»).
+            Step::Await("browser: download fossai-live ", 300_000),
+            Step::Shot("obsos-dl-progress"),
+            Step::Await("browser: download saved /root/Downloads/fossai-live (1200000000 bytes, sha256 e7e7a61dc7fbf0f07d20730a9eddfcae35615773f87f8d5c5bbefbb3db2b2d69)", 1_200_000),
+            Step::Wait(3_000),
+            Step::Shot("obsos-dl-done"),
+            // Все загрузки (Ctrl+J).
+            Step::Key("ctrl-j"),
+            Step::Wait(3_000),
+            Step::Shot("obsos-dl-panel"),
+            Step::Key("esc"),
+            Step::Await("browser: panel closed", 30_000),
+            // «Показать в папке» на плашке образа (первая слева, кнопка у её
+            // правого края: поле 8 + плашка 300 − 18 = 290 от левого края; полоса
+            // 52 внизу окна — середина в 26 от низа). Окно 1024 шириной.
+            Step::Aim(Aim::ProgramCorner("OBSOS — Браузер", 1024 - 290, 26)),
+            Step::Click,
+            Step::Await("browser: show in folder /root/Downloads/fossai-live", 30_000),
+            Step::Await("files: /root/Downloads has 2 entries, selected 'fossai-live'", 60_000),
+            Step::Wait(3_000),
+            Step::Shot("obsos-dl-files"),
+            Step::Expect("browser: downloads bar shown"),
+            Step::Absent("browser: download failed"),
+            Step::Absent("panicked at"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
         ],
     },
     Scenario {

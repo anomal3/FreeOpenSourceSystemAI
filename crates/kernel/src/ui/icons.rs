@@ -1257,6 +1257,18 @@ fn system_items() -> Vec<Item> {
         path: None,
         shortcut: None,
     });
+    // Браузер OBSOS (21.11, Роман: «браузер мне в сборку»): ярлык на столе,
+    // когда пакет стоит (на живой флешке он встаёт сам после запуска стола —
+    // значки перечитываются по `packages_changed`). После корзины: места
+    // прежних значков не сдвигаются.
+    if matches!(crate::fs::list("/opt/obsos/bin"), Some(Ok(_))) {
+        out.push(Item {
+            kind: Kind::Program(Icon::Network),
+            label: String::from("Браузер"),
+            path: Some(OBSOS_COMMAND.to_string()),
+            shortcut: None,
+        });
+    }
     out
 }
 

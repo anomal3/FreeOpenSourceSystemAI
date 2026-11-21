@@ -4511,11 +4511,18 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // строку запуска ядро режет по пробелам.
     let path = (1..args.len()).filter_map(|index| args.get(index)).collect::<Vec<_>>().join(" ");
     let start = starting_dir((!path.is_empty()).then_some(path.as_str()));
+    // Путь к файлу (20.11, «Показать в папке» из загрузок браузера): папка
+    // открывается с этим файлом выделенным.
+    let reveal = (!path.is_empty() && start != path && parent_of(&path) == start).then(|| path.rsplit('/').next().unwrap_or("").to_string());
     let home = home_dir();
     let size = window_size(&info);
 
     app::run(&SPEC, &info, size, move |_, _| {
-        let view = Files::new(start, home);
+        let mut view = Files::new(start, home);
+        if let Some(at) = reveal.as_deref().and_then(|name| view.rows.iter().position(|row| row.name == name)) {
+            view.selected = at;
+            view.scroll.follow(at);
+        }
         // Что именно прочитано — в журнал, по разу на каждый каталог.
         // Нарисованное на экране снаружи не проверить, а строка проверяется:
         // она и отличает «список показан» от «окно нарисовано пустым».
