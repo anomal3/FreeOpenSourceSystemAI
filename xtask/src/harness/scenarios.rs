@@ -235,6 +235,13 @@ pub enum Step {
     RightClick,
     /// Щелчок средней кнопкой (20.11): папка «Файлов» — в новую вкладку.
     MiddleClick,
+    /// Щелчок с зажатой клавишей-модификатором (21.11): `"ctrl"`, `"shift"`
+    /// — Ctrl+щелчок и Shift+щелчок в «Файлах». Клавиша держится монитором
+    /// (`sendkey` со сроком), щелчок приходит внутри срока.
+    ClickWith(&'static str),
+    /// Нажать левую кнопку с зажатым модификатором и не отпускать: Ctrl
+    /// держится столько миллисекунд — перетаскивание с копированием.
+    PressWith(&'static str, u32),
     /// Нажать левую кнопку и **не** отпускать — начало перетаскивания.
     Press,
     /// Навести на первую точку, нажать и провести через остальные, **не**
@@ -16531,6 +16538,85 @@ pub const ALL: &[Scenario] = &[
             Step::Release,
             Step::Await("files: dropped 1 item(s) on /data/c4/Новая папка", 15_000),
             Step::Await("files: pasted 1 item(s) into /data/c4/Новая папка", 15_000),
+            // 21.11, как в Проводнике: Shift+щелчок — от якоря до строки,
+            // Ctrl+щелчок по отмеченной снимает её; выделение тянется на
+            // папку целиком; рамка по пустому месту; Ctrl+перетаскивание
+            // копирует; вид «Список». Оболочка на линии к этому времени уже
+            // закрыла сессию (20 с без ввода) — папки заводятся меню:
+            // «Новая папка», «(2)», «(3)», «(4)».
+            Step::Aim(Aim::FilesBody),
+            Step::RightClick,
+            Step::Await("files: menu opened for the folder", 15_000),
+            Step::Key("ret"),
+            Step::Await("files: created 'Новая папка (2)' in /data/c4", 15_000),
+            Step::RightClick,
+            Step::Await("files: menu opened for the folder", 15_000),
+            Step::Key("ret"),
+            Step::Await("files: created 'Новая папка (3)' in /data/c4", 15_000),
+            Step::RightClick,
+            Step::Await("files: menu opened for the folder", 15_000),
+            Step::Key("ret"),
+            Step::Await("files: created 'Новая папка (4)' in /data/c4", 15_000),
+            Step::Await("files: /data/c4 has 4 entries", 15_000),
+            Step::Wait(800),
+            Step::Aim(Aim::FilesRow(1)),
+            Step::Click,
+            Step::Aim(Aim::FilesRow(3)),
+            Step::ClickWith("shift"),
+            Step::Await("files: 3 item(s) marked", 15_000),
+            Step::Aim(Aim::FilesRow(2)),
+            Step::ClickWith("ctrl"),
+            Step::Await("files: 2 item(s) marked", 15_000),
+            Step::Wait(800),
+            Step::Shot("04e-multi"),
+            // «(2)» и «(4)» — на «Новую папку» (первая строка).
+            Step::Aim(Aim::FilesRow(1)),
+            Step::Press,
+            Step::Move(0, -6),
+            Step::Move(0, -8),
+            Step::Aim(Aim::FilesRow(0)),
+            Step::Wait(500),
+            Step::Shot("04f-drag-many"),
+            Step::Release,
+            Step::Await("files: dropped 2 item(s) on /data/c4/Новая папка", 15_000),
+            Step::Await("files: pasted 2 item(s) into /data/c4/Новая папка", 15_000),
+            Step::Await("files: /data/c4 has 2 entries", 15_000),
+            // Рамка: от пустого места вверх до первой строки.
+            Step::Aim(Aim::FilesBody),
+            Step::Press,
+            Step::Move(40, -10),
+            Step::Aim(Aim::FilesRow(0)),
+            Step::Move(160, 0),
+            Step::Wait(500),
+            Step::Shot("04g-band"),
+            Step::Release,
+            Step::Await("files: 2 item(s) marked by the frame", 15_000),
+            // Ctrl+перетаскивание «(3)» на «Новую папку» — копия, «(3)»
+            // остаётся.
+            Step::Aim(Aim::FilesRow(1)),
+            Step::Click,
+            Step::Wait(700),
+            Step::PressWith("ctrl", 5_000),
+            Step::Move(0, -6),
+            Step::Move(0, -8),
+            Step::Aim(Aim::FilesRow(0)),
+            Step::Wait(500),
+            Step::Shot("04h-ctrl-drag"),
+            Step::Release,
+            Step::Await("files: dropped 1 item(s) on /data/c4/Новая папка (copy)", 15_000),
+            Step::Await("files: pasted 1 item(s) into /data/c4/Новая папка", 15_000),
+            // Монитор держит Ctrl ещё до конца срока.
+            Step::Wait(4_000),
+            // Вид «Список»: имена столбцами, щелчок по второй — «(3)».
+            Step::Key("l"),
+            Step::Await("files: view list", 15_000),
+            Step::Aim(Aim::Program("Files", 300, 176)),
+            Step::Click,
+            Step::Await("files: /data/c4 has 2 entries, selected 'Новая папка (3)'", 15_000),
+            Step::Wait(800),
+            Step::Shot("04i-list"),
+            Step::Key("l"),
+            Step::Await("files: view table", 15_000),
             // Удаление на томе без корзины — целиком, с содержимым.
             Step::Key("ctrl-a"),
             Step::Key("delete"),
@@ -16566,14 +16652,22 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("files: entered '/bin'"),
             Step::DoubleClick,
             Step::Await("files: entered '/bin'", 15_000),
+            // «Список» на длинной папке: столбцы и полоса прокрутки вбок.
+            Step::Key("l"),
+            Step::Await("files: view list", 15_000),
+            Step::Wait(1_000),
+            Step::Shot("07b-bin-list"),
+            Step::Key("l"),
+            Step::Await("files: view table", 15_000),
             // Свойства — пятый пункт меню записи. Клавиша меню у QEMU зовётся
             // `compose`: это она даёт `E0 5D` и usage 0x65; `menu` у него —
-            // другая, мультимедийная.
+            // другая, мультимедийная. Первая строка `/bin` — `admin`
+            // (358b067; до него была `ask`).
             Step::Key("compose"),
-            Step::Await("files: menu opened for 'ask'", 15_000),
+            Step::Await("files: menu opened for 'admin'", 15_000),
             Step::Repeat("down", 4),
             Step::Key("ret"),
-            Step::Await("files: properties of 'ask'", 15_000),
+            Step::Await("files: properties of 'admin'", 15_000),
             Step::Wait(1_000),
             Step::Shot("08-properties"),
             // Вкладка «Подробно» (макет 14): владелец, группа, права.

@@ -75,6 +75,12 @@ pub trait App {
         self.key(code)
     }
 
+    /// Клавишу отпустили (`WIN_KEYUP`, 21.11): «Файлам» — отпущенный Ctrl
+    /// посреди перетаскивания (копировать или переносить).
+    fn key_up(&mut self, _code: u32) -> bool {
+        false
+    }
+
     /// Окно просят закрыть (крестик, Alt+F4). `false` — не сейчас: программа
     /// спросит «Сохранить изменения?» и закроется сама ([`App::wants_quit`]).
     fn close_requested(&mut self) -> bool {
@@ -410,6 +416,7 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
                     break 'live;
                 }
                 WIN_KEY => app.key_with(event.code, event.x, event.y.max(0) as u32),
+                user_abi::WIN_KEYUP => app.key_up(event.code),
                 WIN_POINTER if event.code == RIGHT_BUTTON => {
                     pointer_mods = 0;
                     app.click_right(area, ctx, event.x, event.y)

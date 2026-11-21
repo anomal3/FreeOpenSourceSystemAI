@@ -1253,6 +1253,27 @@ fn play(
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
+            Step::ClickWith(keys) => {
+                say!("  [{at:>6} мс] шаг {index}: {keys}+щелчок");
+                // Монитор держит клавишу сам и отпускает по сроку; щелчок —
+                // внутри срока, после того как нажатие дошло до гостя.
+                hmp.sendkey(&format!("{keys} 700")).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(Duration::from_millis(200));
+                press_button(qmp.as_deref_mut(), hmp, true)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(POINTER_DELAY);
+                press_button(qmp.as_deref_mut(), hmp, false)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(Duration::from_millis(700) + KEY_DELAY);
+            }
+            Step::PressWith(keys, ms) => {
+                say!("  [{at:>6} мс] шаг {index}: {keys}+нажатие на {ms} мс");
+                hmp.sendkey(&format!("{keys} {ms}")).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(Duration::from_millis(200));
+                press_button(qmp.as_deref_mut(), hmp, true)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(KEY_DELAY);
+            }
             Step::Press => {
                 say!("  [{at:>6} мс] шаг {index}: кнопка нажата");
                 press_button(qmp.as_deref_mut(), hmp, true)

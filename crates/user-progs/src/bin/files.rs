@@ -361,6 +361,8 @@ enum MenuItem {
     Restore,
     /// Стереть всё содержимое корзины.
     EmptyTrash,
+    /// Вставить вырезанное или скопированное в эту папку (21.11).
+    Paste,
 }
 
 impl MenuItem {
@@ -386,7 +388,7 @@ impl MenuItem {
     ];
 
     /// Пункты на пустом месте списка.
-    const ON_FOLDER: [MenuItem; 3] = [MenuItem::NewFolder, MenuItem::NewTextFile, MenuItem::Refresh];
+    const ON_FOLDER: [MenuItem; 4] = [MenuItem::NewFolder, MenuItem::NewTextFile, MenuItem::Refresh, MenuItem::Paste];
 
     /// Пункты на томе.
     const ON_VOLUME: [MenuItem; 2] = [MenuItem::Open, MenuItem::Properties];
@@ -411,6 +413,7 @@ impl MenuItem {
             MenuItem::Refresh => "Обновить",
             MenuItem::Restore => "Восстановить",
             MenuItem::EmptyTrash => "Очистить корзину",
+            MenuItem::Paste => "Вставить",
         }
     }
 
@@ -426,6 +429,7 @@ impl MenuItem {
             MenuItem::Refresh => Some(Icon::Update),
             MenuItem::Restore => Some(Icon::Back),
             MenuItem::EmptyTrash => Some(Icon::Close),
+            MenuItem::Paste => None,
         }
     }
 
@@ -441,7 +445,7 @@ impl MenuItem {
             | MenuItem::EmptyTrash => 0,
             MenuItem::CopyPath | MenuItem::Properties => 1,
             MenuItem::NewFolder | MenuItem::NewTextFile => 2,
-            MenuItem::Refresh => 3,
+            MenuItem::Refresh | MenuItem::Paste => 3,
         }
     }
 
@@ -553,8 +557,40 @@ struct Files {
     /// украшает, а не прячет. Подпись, вытеснившая путь, превращает «нет такого
     /// файла» в загадку.
     friendly: bool,
-    /// Плиткой, а не таблицей.
-    tiles: bool,
+    /// Вид списка: таблица, «Список» (имена столбиками) или плитка;
+    /// помнится в `~/.config/files.cfg` (21.11).
+    view: ViewMode,
+    /// Отметка, от которой считает Shift+щелчок (21.11, как в Проводнике):
+    /// последняя строка, по которой щёлкнули без Shift.
+    anchor: usize,
+    /// Выделения нет вовсе (21.11): щёлкнули по пустому месту или обвели
+    /// рамкой пустоту. Строка `selected` остаётся курсором клавиатуры, но
+    /// не подсвечена и действиям не достаётся.
+    no_cursor: bool,
+    /// Модификаторы нажатия, которое сейчас обрабатывается (`click_with`).
+    press_mods: i32,
+    /// Ctrl зажат — перетаскивание копирует (нажатие и `WIN_KEYUP`).
+    ctrl_held: bool,
+    /// Рамка выделения по пустому месту (21.11).
+    band: Option<Band>,
+    /// Ширины столбцов «Дата», «Тип», «Размер» в точках макета (21.11:
+    /// тянутся за границу в шапке, помнятся в настройках).
+    cols: [u32; 3],
+    /// Границу столбцов тянут: какую (0 — имя|дата, 1 — дата|тип, 2 —
+    /// тип|размер), откуда и ширины до начала.
+    col_drag: Option<(usize, i32, [u32; 3])>,
+    /// Ширина столбца вида «Список» при этом масштабе (по самому длинному
+    /// имени; считается раз на папку).
+    list_w: Cell<Option<(u32, u32)>>,
+    /// Строк в столбце вида «Список» в последнем кадре — шаг стрелок вбок.
+    list_rows: Cell<usize>,
+    /// Строки вынесены за окно и отпущены (21.11): предложены другому окну
+    /// «Файлов» тем же ящиком, что вкладки, — метка, срок и что было в
+    /// буфере обмена.
+    item_offer: Option<(String, u64, Option<String>, usize)>,
+    /// Указатель вошёл в окно: до этого времени смотреть, не бросили ли
+    /// сюда строки другого окна.
+    item_watch: Option<u64>,
     /// Последний щелчок по строке: её номер и время — для двойного щелчка.
     last_click: Option<(usize, u64)>,
     menu: Option<Menu>,
@@ -649,6 +685,8 @@ enum Hot {
     Crumb(usize),
     Chevron(usize),
     CrumbMore,
+    /// Граница столбцов в шапке таблицы (21.11).
+    Grip(usize),
 }
 
 /// Почтовый ящик переноса вкладок между окнами «Файлов» (20.11).
@@ -739,7 +777,81 @@ struct Drag {
     active: bool,
     /// Папка под указателем, куда отпустить: путь и где она на экране.
     target: Option<(String, Rect)>,
+    /// Что сделать, если кнопку отпустили, не сдвинув (21.11, Проводник):
+    /// Ctrl по отмеченной строке снимает отметку при отпускании (иначе
+    /// Ctrl+перетаскивание отмеченных было бы невозможно), щелчок внутри
+    /// выделения оставляет одну эту строку.
+    after: ClickAfter,
+    /// Указатель за окном: отпускание предложит строки другому окну.
+    out: bool,
+    /// Точки монтирования: перенос между томами по умолчанию — копия.
+    points: Vec<String>,
 }
+
+/// Что делает щелчок без перетаскивания при отпускании.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClickAfter {
+    Nothing,
+    Unpick,
+    Collapse,
+}
+
+/// Рамка выделения: где нажали, где указатель, что было отмечено до неё
+/// (Ctrl — рамка добавляет к нему) и началась ли.
+struct Band {
+    start: (i32, i32),
+    at: (i32, i32),
+    base: BTreeSet<usize>,
+    active: bool,
+}
+
+/// Вид списка.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViewMode {
+    Table,
+    List,
+    Tiles,
+}
+
+impl ViewMode {
+    const ALL: [ViewMode; 3] = [ViewMode::Table, ViewMode::List, ViewMode::Tiles];
+
+    const fn tag(self) -> &'static str {
+        match self {
+            ViewMode::Table => "table",
+            ViewMode::List => "list",
+            ViewMode::Tiles => "tiles",
+        }
+    }
+
+    const fn title(self) -> &'static str {
+        match self {
+            ViewMode::Table => "Таблица",
+            ViewMode::List => "Список",
+            ViewMode::Tiles => "Плитка",
+        }
+    }
+
+    const fn icon(self) -> Icon {
+        match self {
+            ViewMode::Table => Icon::Log,
+            ViewMode::List => Icon::List,
+            ViewMode::Tiles => Icon::Grid,
+        }
+    }
+}
+
+/// Ширины столбцов «Дата изменения», «Тип», «Размер» по умолчанию и
+/// наименьшие, точки макета.
+const COLS_DEFAULT: [u32; 3] = [135, 140, 80];
+const COLS_MIN: [u32; 3] = [70, 60, 56];
+const COL_MAX: u32 = 420;
+
+/// Высота строки вида «Список», точки макета.
+const LIST_ROW_H: u32 = 26;
+
+/// Где помнятся вид и столбцы — от домашнего каталога.
+const SETTINGS: &str = ".config/files.cfg";
 
 /// По чему сортировать список.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -794,6 +906,8 @@ struct CopyJob {
     items: usize,
     from: String,
     to: String,
+    /// Папка, куда копируется (полный путь): в журнал по окончании.
+    dest: String,
     current: String,
     error: Option<String>,
 }
@@ -839,7 +953,18 @@ impl Files {
             preview: None,
             home,
             friendly: true,
-            tiles: false,
+            view: ViewMode::Table,
+            anchor: 0,
+            no_cursor: false,
+            press_mods: 0,
+            ctrl_held: false,
+            band: None,
+            cols: COLS_DEFAULT,
+            col_drag: None,
+            list_w: Cell::new(None),
+            list_rows: Cell::new(1),
+            item_offer: None,
+            item_watch: None,
             last_click: None,
             menu: None,
             props: None,
@@ -852,8 +977,72 @@ impl Files {
             watched: None,
             changed: false,
         };
+        view.load_settings();
         view.reload();
         view
+    }
+
+    /// Вид и ширины столбцов из `~/.config/files.cfg` (21.11).
+    fn load_settings(&mut self) {
+        let Some(text) = read_small(&format!("{}/{SETTINGS}", self.home)) else {
+            return;
+        };
+        if let Some(mode) = sysconf::value(&text, "view").and_then(|tag| ViewMode::ALL.into_iter().find(|mode| mode.tag() == tag.trim())) {
+            self.view = mode;
+        }
+        if let Some(list) = sysconf::value(&text, "columns") {
+            let widths: Vec<u32> = list.split(',').filter_map(|part| part.trim().parse().ok()).collect();
+            if let [date, kind, size] = widths[..] {
+                for (slot, (width, min)) in self.cols.iter_mut().zip([date, kind, size].into_iter().zip(COLS_MIN)) {
+                    *slot = width.clamp(min, COL_MAX);
+                }
+            }
+        }
+        println(&format!("files: settings view {} columns {},{},{}", self.view.tag(), self.cols[0], self.cols[1], self.cols[2]));
+    }
+
+    /// Запомнить вид и столбцы. Где писать некуда (живая система без
+    /// записываемого дома) — молча: вид всё равно сменился.
+    fn save_settings(&self) {
+        let _ = make_dirs(&format!("{}/.config", self.home));
+        let text = format!("view={}\ncolumns={},{},{}\n", self.view.tag(), self.cols[0], self.cols[1], self.cols[2]);
+        if write_file(&format!("{}/{SETTINGS}", self.home), text.as_bytes()).is_err() {
+            println("files: settings not saved");
+        }
+    }
+
+    /// Сменить вид (меню «Вид», кнопки в строке состояния, `T`, `L`).
+    fn set_view(&mut self, mode: ViewMode) -> bool {
+        if mode == self.view {
+            return false;
+        }
+        self.view = mode;
+        self.scroll.reset();
+        self.hscroll.reset();
+        self.scroll.follow(self.selected);
+        println(&format!("files: view {}", mode.tag()));
+        self.save_settings();
+        true
+    }
+
+    /// Подсвечена ли строка как выбранная: отмеченные, а без отметок —
+    /// курсор (если выделение не снято щелчком по пустому месту).
+    fn is_marked(&self, index: usize) -> bool {
+        if self.picked.is_empty() { index == self.selected && !self.no_cursor } else { self.picked.contains(&index) }
+    }
+
+    /// Строка, к которой относятся действия над одной записью
+    /// (переименовать, свойства, Enter): курсор, а если он не отмечен при
+    /// отмеченных других — первая отмеченная. `None` — выделения нет.
+    fn focus(&self) -> Option<usize> {
+        let index = if !self.picked.is_empty() && !self.picked.contains(&self.selected) {
+            *self.picked.iter().next()?
+        } else if self.picked.is_empty() && self.no_cursor {
+            return None;
+        } else {
+            self.selected
+        };
+        (index < self.rows.len()).then_some(index)
     }
 
     /// Папку открытой вкладки поменял кто-то другой (20.11: терминал создал
@@ -880,7 +1069,7 @@ impl Files {
         if !user_progs::fswatch_read(self.watch).is_empty() {
             self.changed = true;
         }
-        let idle = self.menu.is_none() && self.drag.is_none() && self.props.is_none() && self.job.is_none() && self.pop.is_none();
+        let idle = self.menu.is_none() && self.drag.is_none() && self.band.is_none() && self.props.is_none() && self.job.is_none() && self.pop.is_none();
         if !self.changed || !idle {
             return false;
         }
@@ -911,6 +1100,10 @@ impl Files {
     fn reload(&mut self) {
         self.rows.clear();
         self.selected = 0;
+        self.anchor = 0;
+        self.no_cursor = false;
+        self.band = None;
+        self.list_w.set(None);
         self.picked.clear();
         self.dropped = 0;
         self.error = None;
@@ -1004,7 +1197,9 @@ impl Files {
 
     /// Кнопка панели команд (72g, макет 14).
     fn run_command(&mut self, command: Command) -> bool {
-        let row = self.rows.get(self.selected).filter(|row| !row.is_volume()).map(|row| row.name.clone());
+        let focus = self.focus();
+        let row = focus.and_then(|index| self.rows.get(index)).filter(|row| !row.is_volume()).map(|row| row.name.clone());
+        let focus = focus.unwrap_or(self.selected);
         match command {
             Command::NewFolder => {
                 self.create_new(true);
@@ -1017,7 +1212,7 @@ impl Files {
             }
             Command::Rename => {
                 let Some(name) = row else { return false };
-                self.open_menu(None, Some(self.selected));
+                self.open_menu(None, Some(focus));
                 if let Some(menu) = self.menu.as_mut() {
                     menu.mode = MenuMode::Rename(name);
                 }
@@ -1026,7 +1221,7 @@ impl Files {
                 if row.is_none() {
                     return false;
                 }
-                self.open_menu(None, Some(self.selected));
+                self.open_menu(None, Some(focus));
                 if let Some(menu) = self.menu.as_mut() {
                     menu.mode = MenuMode::Confirm(0);
                 }
@@ -1038,6 +1233,9 @@ impl Files {
     /// Строки, к которым относится действие: отмеченные, иначе выбранная.
     fn targets(&self) -> Vec<usize> {
         if self.picked.is_empty() {
+            if self.no_cursor {
+                return Vec::new();
+            }
             self.rows.get(self.selected).filter(|row| !row.is_volume()).map(|_| self.selected).into_iter().collect()
         } else {
             self.picked.iter().copied().filter(|index| *index < self.rows.len()).collect()
@@ -1130,6 +1328,7 @@ impl Files {
             items: paths.len(),
             from,
             to,
+            dest: dir.clone(),
             current: String::new(),
             error: None,
         });
@@ -1208,7 +1407,7 @@ impl Files {
         if job.next >= job.ops.len() {
             let remove_after = core::mem::take(&mut job.remove_after);
             let items = job.items;
-            let dir = self.path.clone();
+            let dir = job.dest.clone();
             for src in &remove_after {
                 remove_tree(src, 0);
             }
@@ -1247,12 +1446,12 @@ impl Files {
                 out.push((mark(self.descending, "По убыванию"), 1));
                 out
             }
-            _ => alloc::vec![
-                (mark(!self.tiles, "Таблица"), 0),
-                (mark(self.tiles, "Плитка"), 0),
-                (check(!self.friendly, "Показывать системные файлы"), 1),
-                (check(self.hidden, "Показывать скрытые файлы"), 1),
-            ],
+            _ => {
+                let mut out: Vec<(String, u8)> = ViewMode::ALL.iter().map(|mode| (mark(*mode == self.view, mode.title()), 0)).collect();
+                out.push((check(!self.friendly, "Показывать системные файлы"), 1));
+                out.push((check(self.hidden, "Показывать скрытые файлы"), 1));
+                out
+            }
         }
     }
 
@@ -1262,11 +1461,10 @@ impl Files {
             (Command::Sort, 0..=3) => self.set_sort(SortKey::ALL[index], self.descending),
             (Command::Sort, 4) => self.set_sort(self.sort, false),
             (Command::Sort, _) => self.set_sort(self.sort, true),
-            (_, 0 | 1) => {
-                self.tiles = index == 1;
-                println(&format!("files: view {}", if self.tiles { "tiles" } else { "table" }));
+            (_, 0..=2) => {
+                self.set_view(ViewMode::ALL[index]);
             }
-            (_, 2) => {
+            (_, 3) => {
                 self.friendly = !self.friendly;
                 println(&format!("files: system files {}", if self.friendly { "hidden" } else { "shown" }));
                 self.reload();
@@ -1324,8 +1522,8 @@ impl Files {
                 true
             }
             WIN_KEY_DELETE => {
-                if self.rows.get(self.selected).is_some_and(|row| !row.is_volume()) {
-                    self.open_menu(None, Some(self.selected));
+                if let Some(focus) = self.focus().filter(|index| self.rows.get(*index).is_some_and(|row| !row.is_volume())) {
+                    self.open_menu(None, Some(focus));
                     if let Some(menu) = self.menu.as_mut() {
                         menu.mode = MenuMode::Confirm(0);
                     }
@@ -1333,11 +1531,23 @@ impl Files {
                 }
                 false
             }
-            TILES => {
-                self.tiles = !self.tiles;
-                println(&format!("files: view {}", if self.tiles { "tiles" } else { "table" }));
+            // `T` — плитка или таблица, `L` — «Список» или таблица.
+            TILES => self.set_view(if self.view == ViewMode::Tiles { ViewMode::Table } else { ViewMode::Tiles }),
+            LIST => self.set_view(if self.view == ViewMode::List { ViewMode::Table } else { ViewMode::List }),
+            // В «Списке» строки идут столбцами (21.11): стрелки вбок — в
+            // соседний столбец, как в Проводнике.
+            WIN_KEY_LEFT | WIN_KEY_RIGHT if self.view == ViewMode::List && !self.rows.is_empty() && !self.on_computer() => {
+                let per = self.list_rows.get().max(1);
+                let last = self.rows.len() - 1;
+                if code == WIN_KEY_LEFT {
+                    self.selected = self.selected.saturating_sub(per);
+                } else if self.selected / per < last / per {
+                    self.selected = (self.selected + per).min(last);
+                }
+                self.scroll.follow(self.selected);
                 true
             }
+            ENTER if self.focus().is_none() => false,
             // Клавиши двигают выделение, а вид едет за ним (20.11); колесо —
             // наоборот, см. `wheel_at`.
             WIN_KEY_UP => {
@@ -1560,7 +1770,7 @@ impl Files {
 
     /// Открыть меню у выбранной строки — клавишей.
     fn open_menu_for_selection(&mut self) {
-        let target = self.rows.get(self.selected).map(|_| self.selected);
+        let target = self.focus();
         // Место посчитает отрисовка: у клавиатуры точки нет, и меню встаёт у
         // строки, к которой относится.
         self.open_menu(None, target);
@@ -1721,6 +1931,10 @@ impl Files {
             MenuItem::Refresh => {
                 self.close_menu();
                 self.reload();
+            }
+            MenuItem::Paste => {
+                self.close_menu();
+                self.paste();
             }
             MenuItem::Restore => {
                 self.close_menu();
@@ -2279,11 +2493,14 @@ impl Files {
             return true;
         }
         // Заголовок столбца — сортировка по нему; второй щелчок — обратно.
-        if !self.tiles && plan.header.contains(x, y) && !self.on_computer() && self.preview.is_none() && self.props.is_none() {
-            let size_right = self.table_list(ctx, &plan).right() - ctx.px(16) as i32;
-            let type_x = size_right - ctx.px(80 + 140) as i32;
-            let date_x = type_x - ctx.px(135) as i32;
-            let key = if x >= size_right - ctx.px(80) as i32 {
+        if self.view == ViewMode::Table && plan.header.contains(x, y) && !self.on_computer() && self.preview.is_none() && self.props.is_none() {
+            // Граница столбцов (21.11) — тянуть ширину, а не сортировать.
+            if let Some(boundary) = self.col_grip(ctx, &plan, x) {
+                self.col_drag = Some((boundary, x, self.cols));
+                return true;
+            }
+            let (date_x, type_x, size_x, _) = self.columns(ctx, self.table_list(ctx, &plan));
+            let key = if x >= size_x {
                 SortKey::Size
             } else if x >= type_x {
                 SortKey::Kind
@@ -2326,14 +2543,8 @@ impl Files {
         }
 
         // Вид переехал в строку состояния (макет 14): две кнопки справа.
-        if plan.view[0].contains(x, y) || plan.view[1].contains(x, y) {
-            let tiles = plan.view[1].contains(x, y);
-            if tiles != self.tiles {
-                self.tiles = tiles;
-                println(&format!("files: view {}", if self.tiles { "tiles" } else { "table" }));
-                return true;
-            }
-            return false;
+        if let Some(at) = plan.view.iter().position(|rect| rect.contains(x, y)) {
+            return self.set_view(ViewMode::ALL[at]);
         }
         if let Some((command, _)) = plan.commands.iter().find(|(_, rect)| rect.contains(x, y)) {
             self.searching = false;
@@ -2426,38 +2637,78 @@ impl Files {
         }
         // В просмотре и в свойствах списка нет, и щёлкать в нём не по чему:
         // «попал в невидимую строку» — это выбор вслепую.
-        let body = if self.on_computer() { plan.list.union(&plan.header) } else { plan.list };
+        // Таблица — под шапкой, плитка и «Список» — вместе с местом шапки.
+        let body = if self.on_computer() || self.view != ViewMode::Table { plan.list.union(&plan.header) } else { plan.list };
         if self.preview.is_some() || self.props.is_some() || !body.contains(x, y) {
             return false;
         }
         let Some(index) = self.row_at(&plan, ctx, x, y) else {
-            // Щелчок по пустому месту списка снимает выделение с мысли, но не
-            // с экрана: выбранная строка остаётся, как в Windows остаётся
-            // курсор. Нужен он для того, чтобы двойной щелчок не открыл
-            // строку, по которой попали один раз.
+            // Пустое место (21.11, как в Проводнике): щелчок снимает
+            // выделение, нажатие с протяжкой — рамка выделения; с Ctrl рамка
+            // добавляет к отмеченному. Строка `selected` остаётся курсором
+            // клавиатуры, но не подсвечена.
             self.last_click = None;
-            return false;
+            if self.on_computer() || self.error.is_some() {
+                return false;
+            }
+            let ctrl = self.press_mods & WIN_MOD_CTRL != 0;
+            let had = !self.picked.is_empty() || !self.no_cursor;
+            if !ctrl {
+                self.picked.clear();
+                self.no_cursor = true;
+            }
+            self.band = Some(Band { start: (x, y), at: (x, y), base: self.picked.clone(), active: false });
+            return had && !ctrl;
         };
         // Одиночный щелчок выбирает, двойной открывает. Двойного щелчка окно
         // не получает — приходят два обычных, — и «двойной» здесь значит
         // «второй по той же строке не позже [`DOUBLE_CLICK_MS`]».
         let now = monotonic_ms();
         let double = matches!(self.last_click, Some((last, at)) if last == index && now.saturating_sub(at) <= DOUBLE_CLICK_MS);
-        // Простой щелчок снимает отметки — как в Проводнике.
-        self.picked.clear();
+        // Простой щелчок снимает отметки — как в Проводнике. Но щелчок по
+        // строке внутри выделения его не трогает до отпускания: может быть,
+        // выделение сейчас потащат (21.11).
+        let inside = self.picked.len() > 1 && self.picked.contains(&index);
+        if !inside {
+            self.picked.clear();
+        }
         self.selected = index;
+        self.anchor = index;
+        self.no_cursor = false;
         // Строка, видная краем, выезжает целиком.
         self.scroll.follow(index);
         if double {
             self.last_click = None;
+            self.picked.clear();
             return self.open_selected();
         }
         self.last_click = Some((index, now));
         // Нажатие на строке — возможно, начало перетаскивания.
-        if !self.on_computer() && self.rows.get(index).is_some_and(|row| !row.is_volume()) {
-            self.drag = Some(Drag { from: index, start: (x, y), at: (x, y), active: false, target: None });
-        }
+        self.start_drag(index, x, y, if inside { ClickAfter::Collapse } else { ClickAfter::Nothing });
         true
+    }
+
+    /// Нажали на строке: может быть, её (или выделение) сейчас потащат.
+    fn start_drag(&mut self, index: usize, x: i32, y: i32, after: ClickAfter) {
+        if !self.on_computer() && self.rows.get(index).is_some_and(|row| !row.is_volume()) {
+            self.drag = Some(Drag { from: index, start: (x, y), at: (x, y), active: false, target: None, after, out: false, points: Vec::new() });
+        }
+    }
+
+    /// Строки, которые тянут: выделение, если нажали на отмеченную, иначе
+    /// одна строка нажатия.
+    fn dragged(&self, drag: &Drag) -> Vec<usize> {
+        if self.picked.contains(&drag.from) {
+            self.picked.iter().copied().filter(|index| *index < self.rows.len()).collect()
+        } else {
+            alloc::vec![drag.from]
+        }
+    }
+
+    /// Копирует ли перетаскивание в `dir` (а не переносит): с Ctrl — всегда,
+    /// без него — между разными томами, как в Проводнике.
+    fn drag_copies(&self, drag: &Drag, dir: &str) -> bool {
+        self.ctrl_held || mount_of(&drag.points, dir) != mount_of(&drag.points, &self.path)
     }
 
     /// Указатель с зажатой кнопкой: тянуть строку, подсветить папку под ним.
@@ -2470,18 +2721,25 @@ impl Files {
             let (v, h) = self.bars(ctx, &plan);
             return v.is_some_and(|bar| bar.drag(&self.scroll, x, y)) | h.is_some_and(|bar| bar.drag(&self.hscroll, x, y));
         }
+        if let Some((boundary, from, widths)) = self.col_drag {
+            return self.drag_column(boundary, x - from, widths, ctx);
+        }
+        if self.band.is_some() {
+            return self.drag_band(area, ctx, x, y);
+        }
         if self.drag.is_none() {
             return false;
         }
         let plan = layout(ctx, area);
-        // Куда бросить: папка в списке (не та, что тянут) или место слева.
+        let dragged = self.drag.as_ref().map(|drag| self.dragged(drag)).unwrap_or_default();
+        // Куда бросить: папка в списке (не та, что тянут), место слева,
+        // звено адреса, другая вкладка (21.11).
         let mut target = None;
-        if plan.list.contains(x, y) {
+        let body = if self.view == ViewMode::Table { plan.list } else { plan.list.union(&plan.header) };
+        if body.contains(x, y) {
             if let Some(index) = self.row_at(&plan, ctx, x, y) {
-                let dragged = self.drag.as_ref().map_or(usize::MAX, |drag| drag.from);
-                if index != dragged && !self.picked.contains(&index) && self.rows.get(index).is_some_and(|row| row.directory && !row.is_volume()) {
-                    let rect = if self.tiles { Rect::EMPTY } else { plan.row_rect_at(ctx, index, self.scroll.offset()) };
-                    target = Some((join(&self.path, &self.rows[index].name), rect));
+                if !dragged.contains(&index) && self.rows.get(index).is_some_and(|row| row.directory && !row.is_volume()) {
+                    target = Some((join(&self.path, &self.rows[index].name), self.item_rect(ctx, &plan, index)));
                 }
             }
         } else if let Some(side) = plan.side.filter(|side| side.contains(x, y)) {
@@ -2491,6 +2749,28 @@ impl Files {
                     target = Some((slot.path, slot.rect));
                 }
             }
+        } else if plan.path.contains(x, y) && self.address.is_none() {
+            let (slots, _) = self.crumb_slots(ctx, &plan);
+            if let Some(slot) = slots.into_iter().find(|slot| slot.rect.contains(x, y)) {
+                if slot.path != COMPUTER && slot.path != self.path {
+                    target = Some((slot.path, slot.rect));
+                }
+            }
+        } else if let Some(kit::TabHit::Tab(index) | kit::TabHit::Close(index)) = self.tab_strip(ctx, &plan).hit(x, y) {
+            let path = self.tabs.get(index).map(|tab| tab.path.clone()).filter(|path| index != self.tab && path != COMPUTER && *path != self.path);
+            if let Some(path) = path {
+                target = Some((path, Rect::EMPTY));
+            }
+        }
+        // Сюда не бросить: в тянущуюся папку и внутрь неё.
+        if let Some((dir, _)) = &target {
+            let inside = dragged.iter().filter_map(|index| self.rows.get(*index)).any(|row| {
+                let src = join(&self.path, &row.name);
+                *dir == src || dir.starts_with(&format!("{src}/"))
+            });
+            if inside {
+                target = None;
+            }
         }
         let Some(drag) = self.drag.as_mut() else {
             return false;
@@ -2498,40 +2778,158 @@ impl Files {
         drag.at = (x, y);
         if !drag.active && ((x - drag.start.0).abs() > 8 || (y - drag.start.1).abs() > 8) {
             drag.active = true;
+            drag.points = mount_points();
+            println(&format!("files: dragging {} item(s)", dragged.len()));
         }
+        drag.out = !area.contains(x, y);
         drag.target = target;
         drag.active
     }
 
-    /// Отпустили: если тянули на папку — перенести туда.
+    /// Где строка `index` на экране — в том виде, что открыт.
+    fn item_rect(&self, ctx: Ctx, plan: &Plan, index: usize) -> Rect {
+        match self.view {
+            ViewMode::Tiles => plan.tile_rect(&plan.grid(ctx), index, self.scroll.offset()).unwrap_or(Rect::EMPTY),
+            ViewMode::List => {
+                let list = self.list_plan(ctx, plan);
+                self.list_item_rect(&list, index, self.scroll.offset())
+            }
+            ViewMode::Table => {
+                let table = self.table_list(ctx, plan);
+                let pad = ctx.px(12);
+                Rect::new(table.x + pad as i32, table.y + (index as u32 * (plan.row_h + plan.row_gap)) as i32 - self.scroll.offset(), table.w.saturating_sub(pad * 2), plan.row_h)
+            }
+        }
+    }
+
+    /// Рамку выделения тянут: отмечено то, что она задевает, плюс то, что
+    /// было отмечено до неё с Ctrl.
+    fn drag_band(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        let plan = layout(ctx, area);
+        let Some(band) = self.band.as_mut() else {
+            return false;
+        };
+        band.at = (x, y);
+        if !band.active && (x - band.start.0).abs() + (y - band.start.1).abs() < 6 {
+            return false;
+        }
+        band.active = true;
+        let frame = band_rect(band.start, band.at);
+        let mut picked = band.base.clone();
+        // Рамка не выходит за список.
+        let visible = if self.view == ViewMode::Table { plan.list } else { plan.list.union(&plan.header) };
+        let frame = frame.intersect(&visible);
+        if let Some(band) = self.band.as_mut() {
+            band.at = (band.at.0.clamp(visible.x, visible.right() - 1), band.at.1.clamp(visible.y, visible.bottom() - 1));
+        }
+        let mut first = None;
+        for index in 0..self.rows.len() {
+            let rect = self.item_rect(ctx, &plan, index);
+            if rect.is_empty() || rect.intersect(&visible).is_empty() {
+                continue;
+            }
+            if !rect.intersect(&frame).is_empty() {
+                picked.insert(index);
+                first.get_or_insert(index);
+            }
+        }
+        if let Some(index) = first {
+            self.selected = index;
+            self.no_cursor = false;
+        } else if picked.is_empty() {
+            self.no_cursor = true;
+        }
+        self.picked = picked;
+        // Рамка рисуется на каждом движении, даже без смены отметок.
+        true
+    }
+
+    /// Границу столбцов тянут на `dx` точек от нажатия.
+    fn drag_column(&mut self, boundary: usize, dx: i32, start: [u32; 3], ctx: Ctx) -> bool {
+        let dx = dx * 100 / ctx.px(100).max(1) as i32;
+        let grow = |width: u32, by: i32, min: u32| (width as i32 + by).clamp(min as i32, COL_MAX as i32) as u32;
+        let mut cols = start;
+        match boundary {
+            // Имя | дата: имя тянется за счёт даты.
+            0 => cols[0] = grow(start[0], -dx, COLS_MIN[0]),
+            // Дата | тип и тип | размер: левый шире — правый уже.
+            1 | 2 => {
+                let (left, right) = (boundary - 1, boundary);
+                let moved = (grow(start[left], dx, COLS_MIN[left]) as i32 - start[left] as i32).min(start[right] as i32 - COLS_MIN[right] as i32);
+                cols[left] = (start[left] as i32 + moved) as u32;
+                cols[right] = (start[right] as i32 - moved) as u32;
+            }
+            _ => {}
+        }
+        let changed = cols != self.cols;
+        self.cols = cols;
+        changed
+    }
+
+    /// Отпустили: рамку — убрать, границу столбца — запомнить, строки на
+    /// папке — перенести или скопировать туда, за окном — предложить
+    /// другому окну «Файлов».
     fn on_release(&mut self) -> bool {
+        if self.col_drag.take().is_some() {
+            println(&format!("files: columns {},{},{}", self.cols[0], self.cols[1], self.cols[2]));
+            self.save_settings();
+            return true;
+        }
+        if let Some(band) = self.band.take() {
+            if band.active {
+                println(&format!("files: {} item(s) marked by the frame", self.picked.len()));
+            }
+            return true;
+        }
         let Some(drag) = self.drag.take() else {
             return false;
         };
         if !drag.active {
-            return false;
+            // Щелчок без перетаскивания: Ctrl по отмеченной — снять отметку,
+            // щелчок внутри выделения — оставить одну строку.
+            return match drag.after {
+                ClickAfter::Unpick => {
+                    self.picked.remove(&drag.from);
+                    println(&format!("files: {} item(s) marked", self.picked.len()));
+                    true
+                }
+                ClickAfter::Collapse => {
+                    self.picked.clear();
+                    true
+                }
+                ClickAfter::Nothing => false,
+            };
         }
-        let Some((dir, _)) = drag.target else {
+        let paths: Vec<String> = self.dragged(&drag).iter().filter_map(|index| self.rows.get(*index)).map(|row| join(&self.path, &row.name)).collect();
+        let Some((dir, _)) = drag.target.clone() else {
+            if drag.out && !paths.is_empty() {
+                let copy = self.ctrl_held;
+                return self.offer_items(&paths, copy);
+            }
             return true;
         };
-        let mut indices = self.targets();
-        if !indices.contains(&drag.from) {
-            indices = alloc::vec![drag.from];
-        }
-        let paths: Vec<String> = indices.iter().filter_map(|index| self.rows.get(*index)).map(|row| join(&self.path, &row.name)).collect();
-        println(&format!("files: dropped {} item(s) on {dir}", paths.len()));
-        // Перенос — тем же путём, что «Вырезать» и «Вставить»; буфер человека
-        // при этом не трогается.
-        let saved = self.clip.replace((paths, true));
-        self.paste_into(dir);
-        if self.clip.is_none() {
-            self.clip = saved;
-        }
+        let copy = self.drag_copies(&drag, &dir);
+        println(&format!("files: dropped {} item(s) on {dir}{}", paths.len(), if copy { " (copy)" } else { "" }));
+        self.drop_paths(paths, dir, copy);
         true
+    }
+
+    /// Перенести (или скопировать) `paths` в `dir` — тем же путём, что
+    /// «Вырезать»/«Копировать» и «Вставить»; буфер человека не трогается.
+    fn drop_paths(&mut self, paths: Vec<String>, dir: String, copy: bool) {
+        let saved = self.clip.replace((paths, !copy));
+        self.paste_into(dir);
+        self.clip = saved;
     }
 
     /// Что тянут — подпись у указателя и рамка папки, куда бросить.
     fn draw_drag(&self, s: &mut Surface, ctx: Ctx) {
+        if let Some(band) = self.band.as_ref().filter(|band| band.active) {
+            let p = ctx.palette;
+            let frame = band_rect(band.start, band.at);
+            draw::rounded(s, frame, 0, p.acc, 48);
+            draw::rounded_stroke(s, frame, 0, p.acc, 200);
+        }
         let Some(drag) = self.drag.as_ref().filter(|drag| drag.active) else {
             return;
         };
@@ -2541,10 +2939,14 @@ impl Files {
                 draw::rounded_stroke(s, *rect, ctx.px(theme::R_ROW), p.acc, 255);
             }
         }
-        let count = if self.picked.contains(&drag.from) { self.picked.len() } else { 1 };
+        let count = self.dragged(drag).len();
         let label = if count > 1 { format!("Объектов: {count}") } else { self.rows.get(drag.from).map(|row| row.name.clone()).unwrap_or_default() };
         let label = match &drag.target {
-            Some((dir, _)) => format!("{label} → {}", dir.rsplit('/').next().unwrap_or(dir)),
+            Some((dir, _)) => {
+                let verb = if self.drag_copies(drag, dir) { "+ Копировать в" } else { "→ Переместить в" };
+                format!("{verb} «{}»: {label}", place_title(dir, &self.home).rsplit('/').next().unwrap_or(dir))
+            }
+            None if drag.out => format!("{label} — в другое окно «Файлов»{}", if self.ctrl_held { " (копия)" } else { "" }),
             None => label,
         };
         let w = ctx.face(Role::Body).width(&label) + ctx.px(20);
@@ -2571,12 +2973,26 @@ impl Files {
             self.close_menu();
             return true;
         }
-        if self.preview.is_some() || self.props.is_some() || !plan.list.contains(x, y) {
+        let body = if self.on_computer() || self.view != ViewMode::Table { plan.list.union(&plan.header) } else { plan.list };
+        if self.preview.is_some() || self.props.is_some() || !body.contains(x, y) {
             return false;
         }
         let target = self.row_at(&plan, ctx, x, y);
-        if let Some(index) = target {
-            self.selected = index;
+        // Как в Проводнике: правая кнопка по строке вне выделения выбирает
+        // её одну; по отмеченной — меню для всех отмеченных.
+        match target {
+            Some(index) => {
+                if !self.picked.contains(&index) {
+                    self.picked.clear();
+                }
+                self.selected = index;
+                self.no_cursor = false;
+            }
+            None if !self.on_computer() => {
+                self.picked.clear();
+                self.no_cursor = true;
+            }
+            None => {}
         }
         self.open_menu(Some((x, y)), target);
         true
@@ -2588,7 +3004,27 @@ impl Files {
             let (_, cards, _, _) = self.computer_layout(ctx, plan);
             return cards.iter().position(|card| card.contains(x, y));
         }
-        if self.tiles {
+        if self.view == ViewMode::List {
+            let list = self.list_plan(ctx, plan);
+            if !list.area.contains(x, y) {
+                return None;
+            }
+            let inside_x = x - list.area.x - list.pad + self.scroll.offset();
+            let inside_y = y - list.area.y - list.top;
+            if inside_x < 0 || inside_y < 0 {
+                return None;
+            }
+            let row = (inside_y / list.step.max(1) as i32) as usize;
+            if row >= list.per_col {
+                return None;
+            }
+            let index = (inside_x / list.col_w.max(1) as i32) as usize * list.per_col + row;
+            if index >= self.rows.len() || !self.list_item_rect(&list, index, self.scroll.offset()).contains(x, y) {
+                return None;
+            }
+            return Some(index);
+        }
+        if self.view == ViewMode::Tiles {
             let grid = plan.grid(ctx);
             let area = plan.list.union(&plan.header);
             if grid.cols == 0 || !area.contains(x, y) {
@@ -2626,10 +3062,14 @@ impl Files {
             // У клавиатуры точки нет: карточка встаёт у строки.
             let plan = layout(ctx, area);
             match menu.target {
-                Some(index) if self.tiles => {
+                Some(index) if self.view == ViewMode::Tiles => {
                     let grid = plan.grid(ctx);
                     plan.tile_rect(&grid, index, self.scroll.offset())
                         .map_or((plan.list.x, plan.list.y), |r| (r.x + r.w as i32 / 2, r.bottom()))
+                }
+                Some(index) if self.view == ViewMode::List => {
+                    let r = self.item_rect(ctx, &plan, index);
+                    (r.x + ctx.px(32) as i32, r.bottom())
                 }
                 Some(index) => {
                     let r = plan.row_rect_at(ctx, index, self.scroll.offset());
@@ -2675,8 +3115,10 @@ impl Files {
             self.draw_preview(surface, ctx, &plan, preview);
         } else if self.on_computer() && self.error.is_none() {
             self.draw_computer(surface, ctx, &plan);
-        } else if self.tiles {
+        } else if self.view == ViewMode::Tiles {
             self.draw_tiles(surface, ctx, &plan);
+        } else if self.view == ViewMode::List {
+            self.draw_list_view(surface, ctx, &plan);
         } else {
             self.draw_list(surface, ctx, &plan);
         }
@@ -3021,7 +3463,7 @@ impl Files {
             let Some(cell) = plan.tile_rect(&grid, index, at) else {
                 break;
             };
-            let selected = index == self.selected;
+            let selected = self.is_marked(index);
             if selected {
                 draw::rounded(s, cell, ctx.px(theme::R_CARD), p.hover1.color, p.hover1.alpha.max(40));
                 draw::rounded_stroke(s, cell, ctx.px(theme::R_CARD), p.accline.color, p.accline.alpha);
@@ -3303,41 +3745,11 @@ impl Files {
         // Узкое окно (20.11) не теряет столбцы, а листает таблицу вбок: она
         // раскладывается в свою ширину и сдвигается на прокрутку.
         let table = self.table_list(ctx, plan);
-        let size_right = table.right() - ctx.px(16) as i32;
-        let type_x = size_right - ctx.px(80 + 140) as i32;
-        let date_x = type_x - ctx.px(135) as i32;
+        let (date_x, type_x, size_x, size_right) = self.columns(ctx, table);
         // Шапка — после строк: строка, наполовину ушедшая вверх, уходит под неё.
-        let header = |s: &mut Surface| self.draw_list_header(s, ctx, plan, table.x, date_x, type_x, size_right);
+        let header = |s: &mut Surface| self.draw_list_header(s, ctx, plan, table.x, [date_x, type_x, size_x], size_right);
 
-        if let Some(error) = &self.error {
-            let rect = plan.row_rect(ctx, 0);
-            paint::text_clipped(
-                ctx,
-                s,
-                Role::Body,
-                rect.x + ctx.px(10) as i32,
-                paint::baseline(ctx, Role::Body, rect),
-                rect.w.saturating_sub(ctx.px(20)),
-                error,
-                p.bad_ink,
-            );
-            header(s);
-            return;
-        }
-        if self.rows.is_empty() {
-            // Пустая папка (макет 14): по центру значок, надпись и подсказка.
-            let side = ctx.px(64);
-            let cx = plan.list.x + plan.list.w as i32 / 2;
-            let top = plan.list.y + plan.list.h as i32 / 3 - side as i32;
-            let icon = Rect::new(cx - side as i32 / 2, top.max(plan.list.y), side, side);
-            draw_design_icon(&self.icons, s, icon, "folder");
-            let title = "Эта папка пуста";
-            let hint = "Перетащите файлы сюда или нажмите «Создать»";
-            let y = icon.bottom() + ctx.px(14) as i32;
-            let tw = ctx.face(Role::Strong).width(title) as i32;
-            paint::text(ctx, s, Role::Strong, cx - tw / 2, y, title, p.ink2);
-            let hw = ctx.face(Role::Body).width(hint) as i32;
-            paint::text(ctx, s, Role::Body, cx - hw / 2, y + ctx.px(26) as i32, hint, p.ink4);
+        if self.draw_no_rows(s, ctx, plan) {
             header(s);
             return;
         }
@@ -3354,7 +3766,7 @@ impl Files {
         for index in self.scroll.rows(view.h, step, self.rows.len()) {
             let row = &self.rows[index];
             let rect = Rect::new(table.x + pad as i32, table.y + (index as u32 * step) as i32 - at, table.w.saturating_sub(pad * 2), plan.row_h);
-            let selected = index == self.selected || self.picked.contains(&index);
+            let selected = self.is_marked(index);
             let state = if selected {
                 RowState::Selected
             } else if hot == Hot::Row(index) {
@@ -3387,8 +3799,8 @@ impl Files {
             paint::text_right(ctx, s, Role::Body, size_right, small, &size, p.ink3);
             // Программа в `/bin` — «Приложение», что бы ни было в имени.
             let kind = if !row.directory && row.program && row.mode & 0o111 != 0 { "Приложение" } else { kind_name };
-            paint::text_clipped(ctx, s, Role::Body, type_x, small, (size_right - ctx.px(90) as i32 - type_x).max(0) as u32, kind, p.ink3);
-            paint::text_clipped(ctx, s, Role::Body, date_x, small, ctx.px(140), &date_text(row.mtime, self.offset), p.ink3);
+            paint::text_clipped(ctx, s, Role::Body, type_x, small, (size_x - ctx.px(10) as i32 - type_x).max(0) as u32, kind, p.ink3);
+            paint::text_clipped(ctx, s, Role::Body, date_x, small, (type_x - ctx.px(10) as i32 - date_x).max(0) as u32, &date_text(row.mtime, self.offset), p.ink3);
             let right = date_x - ctx.px(12) as i32;
 
             let name_x = icon.right() + ctx.px(10) as i32;
@@ -3406,12 +3818,12 @@ impl Files {
 
     /// Шапка таблицы: подписи столбцов (у столбца сортировки — стрелка) и
     /// линия под ними. Фон заливается: под шапку уходят строки.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_list_header(&self, s: &mut Surface, ctx: Ctx, plan: &Plan, left: i32, date_x: i32, type_x: i32, size_right: i32) {
+    fn draw_list_header(&self, s: &mut Surface, ctx: Ctx, plan: &Plan, left: i32, bounds: [i32; 3], size_right: i32) {
         let p = ctx.palette;
         if plan.header.is_empty() {
             return;
         }
+        let [date_x, type_x, _] = bounds;
         s.fill(plan.header, theme::window_bg());
         let y = paint::baseline(ctx, Role::Caption, plan.header);
         // Столбец сортировки — со стрелкой (↑ по возрастанию, ↓ по убыванию).
@@ -3421,6 +3833,21 @@ impl Files {
         paint::text(ctx, s, Role::Caption, date_x, y, &title(SortKey::Date), p.ink4);
         paint::text(ctx, s, Role::Caption, type_x, y, &title(SortKey::Kind), p.ink4);
         paint::text_right(ctx, s, Role::Caption, size_right, y, &title(SortKey::Size), p.ink4);
+        // Границы столбцов (21.11): тонкая черта, под указателем и когда
+        // тянут — ярче; за неё тянут ширину.
+        if !self.on_computer() {
+            let grip = self.col_drag.map(|(boundary, ..)| boundary).or(match self.hot_now(ctx, plan) {
+                Hot::Grip(boundary) => Some(boundary),
+                _ => None,
+            });
+            let h = plan.header.h.saturating_sub(ctx.px(14));
+            for (index, x) in bounds.iter().enumerate() {
+                let x = x - ctx.px(8) as i32;
+                let (ink, w) = if grip == Some(index) { (p.acc, ctx.px(2)) } else { (p.line.color, 1) };
+                let alpha = if grip == Some(index) { 255 } else { p.line.alpha };
+                draw::blend_rect(s, Rect::new(x, plan.header.y + ctx.px(7) as i32, w, h), ink, alpha);
+            }
+        }
         draw::hline(
             s,
             plan.header.x + ctx.px(12) as i32,
@@ -3502,10 +3929,10 @@ impl Files {
         }
         let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
         kit::status_line(ctx, s, plan.status, &parts, "", plan.view.len());
-        // Вид — две кнопки справа (макет 14): таблица и плитка.
-        for (rect, (icon, active)) in plan.view.iter().zip([(Icon::Log, !self.tiles), (Icon::Grid, self.tiles)]) {
+        // Вид — кнопки справа (макет 14): таблица, «Список», плитка.
+        for (rect, mode) in plan.view.iter().zip(ViewMode::ALL) {
             if !rect.is_empty() {
-                kit::status_toggle(ctx, s, *rect, icon, active);
+                kit::status_toggle(ctx, s, *rect, mode.icon(), mode == self.view);
             }
         }
     }
@@ -3525,6 +3952,8 @@ const ESCAPE: u32 = 0x1B;
 const MENU: u32 = 'm' as u32;
 /// `T` — плитка или таблица.
 const TILES: u32 = 't' as u32;
+/// `L` — «Список» или таблица (21.11).
+const LIST: u32 = 'l' as u32;
 /// Ответы на вопрос об удалении.
 const YES: u32 = 'y' as u32;
 const NO: u32 = 'n' as u32;
@@ -3557,6 +3986,20 @@ struct Grid {
     margin: u32,
 }
 
+/// Раскладка вида «Список»: область, поля, шаг и высота строки, зазор
+/// между столбцами, строк в столбце, ширина столбца и всего содержимого.
+struct ListPlan {
+    area: Rect,
+    pad: i32,
+    top: i32,
+    step: u32,
+    row_h: u32,
+    gap: u32,
+    per_col: usize,
+    col_w: u32,
+    content: u32,
+}
+
 struct Plan {
     /// Полоса вкладок над панелью (20.11).
     tabs: Rect,
@@ -3569,10 +4012,10 @@ struct Plan {
     search: Rect,
     /// Панель команд под адресом.
     commands: Vec<(Command, Rect)>,
-    /// Лунка переключателя вида и две его кнопки: таблица, плитка (в строке
-    /// состояния справа).
+    /// Лунка переключателя вида и его кнопки: таблица, «Список», плитка (в
+    /// строке состояния справа).
     view_box: Rect,
-    view: [Rect; 2],
+    view: [Rect; 3],
     side: Option<Rect>,
     header: Rect,
     list: Rect,
@@ -3707,8 +4150,8 @@ fn layout(ctx: Ctx, area: Rect) -> Plan {
     let status_y = (area.bottom() - status_h as i32).max(toolbar.bottom());
     let status = Rect::new(area.x, status_y, area.w, status_h);
     // Переключатели вида — места строки состояния единого вида (`kit`).
-    let toggles = kit::status_toggles(ctx, status, 2);
-    let view = [toggles[0], toggles[1]];
+    let toggles = kit::status_toggles(ctx, status, 3);
+    let view = [toggles[0], toggles[1], toggles[2]];
 
     let top = toolbar.bottom() + command_h as i32;
     let bottom = status.y;
@@ -3951,6 +4394,21 @@ fn volume_title(point: &str, label: &str) -> String {
     }
 }
 
+/// Прямоугольник рамки выделения между двумя точками.
+fn band_rect(a: (i32, i32), b: (i32, i32)) -> Rect {
+    Rect::new(a.0.min(b.0), a.1.min(b.1), (a.0 - b.0).unsigned_abs().max(1), (a.1 - b.1).unsigned_abs().max(1))
+}
+
+/// Том, на котором лежит `path`: самая длинная точка монтирования, которой
+/// путь начинается.
+fn mount_of<'a>(points: &'a [String], path: &str) -> Option<&'a str> {
+    points
+        .iter()
+        .filter(|point| *point == "/" || path == point.as_str() || path.starts_with(&format!("{point}/")))
+        .max_by_key(|point| point.len())
+        .map(String::as_str)
+}
+
 /// Точки монтирования томов (`SYS_MOUNTS`, первое поле строки).
 fn mount_points() -> Vec<String> {
     let mut buffer = Vec::new();
@@ -3991,7 +4449,21 @@ fn list_volumes() -> Vec<Row> {
             row.label = fields.next().unwrap_or("").to_string();
             Some(row)
         })
-        .collect()
+        .fold(Vec::new(), |mut out: Vec<Row>, row| {
+            // Не диски (21.11): тома в памяти, которые ядро заводит живой
+            // системе под `/tmp`, `/root`, `/etc`, `/opt`, `/var` (метки
+            // `scratch-*`, `live-*`), — «Этот компьютер» показывал их
+            // тремя-пятью «дисками»; и один раздел состояния, смонтированный
+            // ветками (`/etc`, `/home`, `/var`…), — это один том, а не пять.
+            if row.label.starts_with("scratch-") || row.label.starts_with("live-") {
+                return out;
+            }
+            let same = |other: &Row| other.size != 0 && other.size == row.size && other.free == row.free && other.volume == row.volume && other.label == row.label;
+            if !out.iter().any(same) {
+                out.push(row);
+            }
+            out
+        })
 }
 
 /// Время работы в виде `Ч:ММ:СС`.
@@ -4638,6 +5110,15 @@ impl App for Files {
     /// Сочетания (макет 14): Ctrl+X/C/V/A, Alt+Enter — свойства, Shift+стрелки
     /// и пробел — отметить несколько. Остальное — [`Files::on_key`].
     fn key_with(&mut self, code: u32, mods: i32, latin: u32) -> bool {
+        // Сам Ctrl (21.11): посреди перетаскивания он переключает «перенести»
+        // на «копировать»; больше ничего не делает.
+        if code == user_abi::WIN_KEY_CTRL {
+            self.ctrl_held = true;
+            return self.drag.as_ref().is_some_and(|drag| drag.active);
+        }
+        if matches!(code, user_abi::WIN_KEY_SHIFT | user_abi::WIN_KEY_ALT) {
+            return false;
+        }
         // Меню вкладки: стрелки, Enter, всё прочее закрывает.
         if let Some((index, x, y, selected)) = self.tab_menu {
             match code {
@@ -4712,6 +5193,7 @@ impl App for Files {
                 return true;
             }
             if mods & WIN_MOD_SHIFT != 0 && matches!(code, WIN_KEY_UP | WIN_KEY_DOWN) && !self.rows.is_empty() {
+                self.no_cursor = false;
                 self.picked.insert(self.selected);
                 let changed = self.on_key(code);
                 self.picked.insert(self.selected);
@@ -4724,11 +5206,21 @@ impl App for Files {
                 return true;
             }
             // Стрелка без Shift снимает отметки — как в Проводнике.
-            if matches!(code, WIN_KEY_UP | WIN_KEY_DOWN | WIN_KEY_HOME | WIN_KEY_END) {
+            if matches!(code, WIN_KEY_UP | WIN_KEY_DOWN | WIN_KEY_HOME | WIN_KEY_END | WIN_KEY_PAGE_UP | WIN_KEY_PAGE_DOWN) {
                 self.picked.clear();
+                self.no_cursor = false;
+            }
+            if self.view == ViewMode::List && matches!(code, WIN_KEY_LEFT | WIN_KEY_RIGHT) {
+                self.picked.clear();
+                self.no_cursor = false;
             }
         }
-        self.on_key(code)
+        let changed = self.on_key(code);
+        // Курсор, сдвинутый клавишей, — новый якорь Shift+щелчка.
+        if !busy && mods & WIN_MOD_SHIFT == 0 && matches!(code, WIN_KEY_UP | WIN_KEY_DOWN | WIN_KEY_HOME | WIN_KEY_END | WIN_KEY_PAGE_UP | WIN_KEY_PAGE_DOWN | WIN_KEY_LEFT | WIN_KEY_RIGHT) {
+            self.anchor = self.selected;
+        }
+        changed
     }
 
     fn drag(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
@@ -4751,7 +5243,7 @@ impl App for Files {
     /// Копирование кусками — на каждом витке цикла окна; перенос вкладки
     /// между окнами.
     fn step(&mut self) -> bool {
-        self.copy_step() | self.offer_step() | self.watch_drop() | self.watch_step()
+        self.copy_step() | self.offer_step() | self.watch_drop() | self.item_offer_step() | self.watch_items() | self.watch_step()
     }
 
     fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
@@ -4761,23 +5253,38 @@ impl App for Files {
     /// Ctrl+щелчок — отметить строку или снять отметку; Shift+щелчок —
     /// отметить всё от выбранной до этой (как в Проводнике).
     fn click_with(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32, mods: i32) -> bool {
+        self.press_mods = mods;
+        self.ctrl_held = mods & WIN_MOD_CTRL != 0;
         let idle = self.menu.is_none() && self.pop.is_none() && self.job.is_none() && self.props.is_none() && self.preview.is_none();
         if mods & (WIN_MOD_CTRL | WIN_MOD_SHIFT) != 0 && idle && !self.on_computer() {
             let plan = layout(ctx, area);
-            if plan.list.contains(x, y) {
+            let body = if self.view == ViewMode::Table { plan.list } else { plan.list.union(&plan.header) };
+            let bar = { let (v, h) = self.bars(ctx, &plan); v.is_some_and(|bar| bar.contains(x, y)) || h.is_some_and(|bar| bar.contains(x, y)) };
+            if body.contains(x, y) && !bar {
                 if let Some(index) = self.row_at(&plan, ctx, x, y) {
                     if mods & WIN_MOD_SHIFT != 0 {
-                        let (from, to) = (self.selected.min(index), self.selected.max(index));
-                        self.picked.extend(from..=to);
+                        // Shift — от отметки-якоря до этой строки (21.11:
+                        // заменяет отмеченное, с Ctrl — добавляет), как в
+                        // Проводнике.
+                        let anchor = if self.anchor < self.rows.len() { self.anchor } else { self.selected };
+                        if mods & WIN_MOD_CTRL == 0 {
+                            self.picked.clear();
+                        }
+                        self.picked.extend(anchor.min(index)..=anchor.max(index));
+                        self.selected = index;
+                        self.no_cursor = false;
                     } else {
-                        if self.picked.is_empty() && self.selected != index {
+                        // Ctrl — отметить. Уже отмеченная снимается при
+                        // отпускании: Ctrl+перетаскивание её копирует.
+                        if self.picked.is_empty() && self.selected != index && !self.no_cursor && self.selected < self.rows.len() {
                             self.picked.insert(self.selected);
                         }
-                        if !self.picked.remove(&index) {
-                            self.picked.insert(index);
-                        }
+                        let was = !self.picked.insert(index);
+                        self.selected = index;
+                        self.anchor = index;
+                        self.no_cursor = false;
+                        self.start_drag(index, x, y, if was { ClickAfter::Unpick } else { ClickAfter::Nothing });
                     }
-                    self.selected = index;
                     self.last_click = None;
                     println(&format!("files: {} item(s) marked", self.picked.len()));
                     return true;
@@ -4785,6 +5292,15 @@ impl App for Files {
             }
         }
         self.on_click(area, ctx, x, y)
+    }
+
+    /// Ctrl отпустили — перетаскивание снова переносит.
+    fn key_up(&mut self, code: u32) -> bool {
+        if code == user_abi::WIN_KEY_CTRL {
+            self.ctrl_held = false;
+            return self.drag.as_ref().is_some_and(|drag| drag.active);
+        }
+        false
     }
 
     fn click_right(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
@@ -4809,9 +5325,11 @@ impl App for Files {
         }
         let plan = layout(ctx, area);
         let (view, content, line) = self.view_metrics(ctx, &plan);
-        let moved = self.scroll.wheel(clicks, view.h, content, line);
+        // «Список» колесо листает вбок — столбец за щелчок.
+        let span = if self.view == ViewMode::List && !self.on_computer() { view.w } else { view.h };
+        let moved = self.scroll.wheel(clicks, span, content, line);
         if moved {
-            println(&format!("files: scrolled to {} of {}", self.scroll.offset(), kit::Scroll::limit(view.h, content)));
+            println(&format!("files: scrolled to {} of {}", self.scroll.offset(), kit::Scroll::limit(span, content)));
         }
         moved
     }
@@ -4827,6 +5345,10 @@ impl App for Files {
         // ли сюда вкладку другого окна (см. [`TAB_DROP`]).
         if self.pointer.is_none() && plan.tabs.union(&plan.toolbar).contains(x, y) {
             self.drop_watch = Some(monotonic_ms() + TAB_DROP_WATCH_MS);
+        }
+        // Вошёл куда угодно — не бросили ли сюда строки другого окна (21.11).
+        if self.pointer.is_none() {
+            self.item_watch = Some(monotonic_ms() + TAB_DROP_WATCH_MS);
         }
         self.pointer = Some((x, y));
         let hot = self.hot_at(ctx, &plan, x, y);
@@ -5161,6 +5683,95 @@ impl Files {
         false
     }
 
+    /// Строки вынесли за окно и отпустили (21.11): предложить их окну
+    /// «Файлов» под указателем тем же ящиком, что вкладки ([`TAB_DROP`]):
+    /// `items <метка> <время> <c|m> <пути через \x1e>`. Взявшее окно само
+    /// переносит (или копирует) их в свою папку.
+    fn offer_items(&mut self, paths: &[String], copy: bool) -> bool {
+        let now = monotonic_ms();
+        let token = format!("{now}.i{}", paths.len());
+        let saved = clipboard_get();
+        let text = format!("items {token} {now} {} {}", if copy { 'c' } else { 'm' }, paths.join("\u{1e}"));
+        let Some(by_clipboard) = mailbox_write(&text) else {
+            self.note = Some(String::from("Перетаскивать в другое окно некуда: нет записываемого /tmp"));
+            return true;
+        };
+        println(&format!("files: offered {} item(s) to another window", paths.len()));
+        self.item_offer = Some((token, now + TAB_DROP_WAIT_MS, by_clipboard.then_some(saved), paths.len()));
+        true
+    }
+
+    /// Ждать, возьмёт ли строки другое окно.
+    fn item_offer_step(&mut self) -> bool {
+        let Some((token, deadline, _, count)) = self.item_offer.clone() else {
+            return false;
+        };
+        let answer = format!("taken {token}");
+        let taken = mailbox_read().iter().any(|text| *text == answer);
+        if !taken && monotonic_ms() < deadline {
+            return false;
+        }
+        if let Some((_, _, Some(saved), _)) = self.item_offer.take() {
+            clipboard_set(&saved);
+        }
+        let _ = remove(TAB_DROP);
+        if taken {
+            println(&format!("files: {count} item(s) taken by another window"));
+            self.note = Some(format!("Объектов передано в другое окно: {count}"));
+        } else {
+            // Стол брошенное не принимает (его значки рисует ядро, договора
+            // «бросить файл на стол» нет) — на «Рабочий стол» слева можно.
+            println(&format!("files: nobody took {count} item(s)"));
+            self.note = Some(String::from("Отпустите над папкой, вкладкой или окном «Файлов»"));
+        }
+        true
+    }
+
+    /// Указатель вошёл в окно: свежие строки другого окна — перенести или
+    /// скопировать в папку под указателем (или в открытую) и ответить
+    /// «взяты».
+    fn watch_items(&mut self) -> bool {
+        let Some(until) = self.item_watch else {
+            return false;
+        };
+        let now = monotonic_ms();
+        if now > until {
+            self.item_watch = None;
+            return false;
+        }
+        for text in mailbox_read() {
+            let mut parts = text.splitn(5, ' ');
+            let (Some("items"), Some(token), Some(at), Some(mode), Some(list)) = (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            if self.item_offer.as_ref().is_some_and(|(own, ..)| own == token) {
+                continue;
+            }
+            if !at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) <= TAB_DROP_WAIT_MS) {
+                continue;
+            }
+            // Некуда положить: «Этот компьютер», просмотр, идёт копирование.
+            if self.on_computer() || self.preview.is_some() || self.job.is_some() || self.error.is_some() {
+                continue;
+            }
+            let dir = match self.hot {
+                Hot::Row(index) => self.rows.get(index).filter(|row| row.directory && !row.is_volume()).map(|row| join(&self.path, &row.name)),
+                _ => None,
+            }
+            .unwrap_or_else(|| self.path.clone());
+            let paths: Vec<String> = list.split('\u{1e}').filter(|path| !path.is_empty()).map(String::from).collect();
+            if mailbox_write(&format!("taken {token}")).is_none() {
+                return false;
+            }
+            self.item_watch = None;
+            let copy = mode == "c" || paths.first().is_some_and(|path| mount_of(&mount_points(), path) != mount_of(&mount_points(), &dir));
+            println(&format!("files: took {} item(s) from another window into {dir}{}", paths.len(), if copy { " (copy)" } else { "" }));
+            self.drop_paths(paths, dir, copy);
+            return true;
+        }
+        false
+    }
+
     /// Что подсвечено под указателем `x, y`. Пока открыто меню, свойства или
     /// что-то тянут — ничего.
     fn hot_at(&self, ctx: Ctx, plan: &Plan, x: i32, y: i32) -> Hot {
@@ -5172,10 +5783,17 @@ impl Files {
             || self.job.is_some()
             || self.tab_drag.is_some()
             || self.drag.as_ref().is_some_and(|drag| drag.active)
+            || self.band.is_some()
+            || self.col_drag.is_some()
             || self.scroll.dragging()
             || self.hscroll.dragging();
         if busy {
             return Hot::Nothing;
+        }
+        if plan.header.contains(x, y) {
+            if let Some(boundary) = self.col_grip(ctx, plan, x) {
+                return Hot::Grip(boundary);
+            }
         }
         if let Some(hit) = self.tab_strip(ctx, plan).hit(x, y) {
             return if hit == kit::TabHit::Strip { Hot::Nothing } else { Hot::Tab(hit) };
@@ -5342,7 +5960,13 @@ impl Files {
 
     /// Нужна ли таблице прокрутка вбок.
     fn hbar_needed(&self, ctx: Ctx, plan: &Plan) -> bool {
-        !self.tiles && !self.on_computer() && self.preview.is_none() && self.error.is_none() && plan.list.w < ctx.px(TABLE_MIN_W)
+        self.view == ViewMode::Table && !self.on_computer() && self.preview.is_none() && self.error.is_none() && plan.list.w < ctx.px(self.table_min_w())
+    }
+
+    /// Самая узкая таблица со всеми столбцами: имя не уже 160 точек плюс
+    /// столбцы, как их растянули (по умолчанию — [`TABLE_MIN_W`]).
+    fn table_min_w(&self) -> u32 {
+        TABLE_MIN_W - COLS_DEFAULT.iter().sum::<u32>() + self.cols.iter().sum::<u32>()
     }
 
     /// Прямоугольник таблицы: в узком окне — шире окна и сдвинут на прокрутку.
@@ -5350,19 +5974,172 @@ impl Files {
         if !self.hbar_needed(ctx, plan) {
             return plan.list;
         }
-        let width = ctx.px(TABLE_MIN_W);
+        let width = ctx.px(self.table_min_w());
         self.hscroll.clamp(plan.list.w, width);
         Rect::new(plan.list.x - self.hscroll.offset(), plan.list.y, width, plan.list.h)
     }
 
+    /// Левые края столбцов «Дата», «Тип», «Размер» и правый край размера в
+    /// таблице `table` — по ширинам `cols` (21.11).
+    fn columns(&self, ctx: Ctx, table: Rect) -> (i32, i32, i32, i32) {
+        let size_right = table.right() - ctx.px(16) as i32;
+        let size_x = size_right - ctx.px(self.cols[2]) as i32;
+        let type_x = size_x - ctx.px(self.cols[1]) as i32;
+        let date_x = type_x - ctx.px(self.cols[0]) as i32;
+        (date_x, type_x, size_x, size_right)
+    }
+
+    /// Граница столбцов под `x` в шапке таблицы: 0 — имя|дата, 1 —
+    /// дата|тип, 2 — тип|размер. Черта рисуется на 8 точек левее края
+    /// столбца; хватать можно в 5 точках от неё.
+    fn col_grip(&self, ctx: Ctx, plan: &Plan, x: i32) -> Option<usize> {
+        if self.view != ViewMode::Table || self.on_computer() || self.preview.is_some() || self.error.is_some() {
+            return None;
+        }
+        let (date_x, type_x, size_x, _) = self.columns(ctx, self.table_list(ctx, plan));
+        let reach = ctx.px(5) as i32;
+        [date_x, type_x, size_x].iter().position(|edge| (x - (edge - ctx.px(8) as i32)).abs() <= reach)
+    }
+
+    /// Раскладка вида «Список» (21.11): имена с маленьким значком идут
+    /// сверху вниз, столбец за столбцом, а вид листается вбок.
+    fn list_plan(&self, ctx: Ctx, plan: &Plan) -> ListPlan {
+        let area = plan.list.union(&plan.header);
+        let step = ctx.px(LIST_ROW_H + 2);
+        let top = ctx.px(8);
+        let usable = area.h.saturating_sub(top + ctx.px(kit::SCROLLBAR_W) + ctx.px(6));
+        let per_col = (usable / step.max(1)).max(1) as usize;
+        let col_w = self.list_col_w(ctx);
+        let cols = self.rows.len().div_ceil(per_col) as u32;
+        let pad = ctx.px(12);
+        ListPlan { area, pad: pad as i32, top: top as i32, step, row_h: ctx.px(LIST_ROW_H), gap: ctx.px(6), per_col, col_w, content: pad * 2 + cols * col_w }
+    }
+
+    /// Ширина столбца «Списка»: по самому длинному имени папки, но не уже
+    /// 160 и не шире 360 точек — как у Проводника.
+    fn list_col_w(&self, ctx: Ctx) -> u32 {
+        let key = ctx.px(100);
+        if let Some((known, width)) = self.list_w.get() {
+            if known == key {
+                return width;
+            }
+        }
+        let face = ctx.face(Role::Body);
+        let widest = self.rows.iter().map(|row| face.width(self.shown_name(row))).max().unwrap_or(0);
+        let width = (widest + ctx.px(8 + 16 + 10 + 18)).clamp(ctx.px(160), ctx.px(360));
+        self.list_w.set(Some((key, width)));
+        width
+    }
+
+    /// Место строки `index` в «Списке» при прокрутке `scroll`.
+    fn list_item_rect(&self, list: &ListPlan, index: usize, scroll: i32) -> Rect {
+        let col = index / list.per_col.max(1);
+        let row = index % list.per_col.max(1);
+        Rect::new(
+            list.area.x + list.pad + (col as u32 * list.col_w) as i32 - scroll,
+            list.area.y + list.top + (row as u32 * list.step) as i32,
+            list.col_w.saturating_sub(list.gap),
+            list.row_h,
+        )
+    }
+
+    /// Ошибка чтения или пустая папка вместо строк. `true` — нарисовано.
+    fn draw_no_rows(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) -> bool {
+        let p = ctx.palette;
+        if let Some(error) = &self.error {
+            let rect = plan.row_rect(ctx, 0);
+            paint::text_clipped(
+                ctx,
+                s,
+                Role::Body,
+                rect.x + ctx.px(10) as i32,
+                paint::baseline(ctx, Role::Body, rect),
+                rect.w.saturating_sub(ctx.px(20)),
+                error,
+                p.bad_ink,
+            );
+            return true;
+        }
+        if !self.rows.is_empty() {
+            return false;
+        }
+        // Пустая папка (макет 14): по центру значок, надпись и подсказка.
+        let side = ctx.px(64);
+        let cx = plan.list.x + plan.list.w as i32 / 2;
+        let top = plan.list.y + plan.list.h as i32 / 3 - side as i32;
+        let icon = Rect::new(cx - side as i32 / 2, top.max(plan.list.y), side, side);
+        draw_design_icon(&self.icons, s, icon, "folder");
+        let title = "Эта папка пуста";
+        let hint = "Перетащите файлы сюда или нажмите «Создать»";
+        let y = icon.bottom() + ctx.px(14) as i32;
+        let tw = ctx.face(Role::Strong).width(title) as i32;
+        paint::text(ctx, s, Role::Strong, cx - tw / 2, y, title, p.ink2);
+        let hw = ctx.face(Role::Body).width(hint) as i32;
+        paint::text(ctx, s, Role::Body, cx - hw / 2, y + ctx.px(26) as i32, hint, p.ink4);
+        true
+    }
+
+    /// Вид «Список» (21.11): значок 16 и имя, столбцами; выделение,
+    /// отметки и подсветка — как у таблицы.
+    fn draw_list_view(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
+        let p = ctx.palette;
+        let list = self.list_plan(ctx, plan);
+        if list.area.is_empty() || self.draw_no_rows(s, ctx, plan) {
+            return;
+        }
+        let per = list.per_col.max(1);
+        let col_w = list.col_w.max(1);
+        let pad = list.pad;
+        self.scroll.sync_with(list.area.w, list.content, |index| Some((pad + ((index / per) as u32 * col_w) as i32, col_w)));
+        self.page_rows.set(per);
+        self.list_rows.set(per);
+        let at = self.scroll.offset();
+        let first_col = ((at - pad).max(0) as u32 / col_w) as usize;
+        let shown_cols = (list.area.w / col_w) as usize + 2;
+        let hot = self.hot_now(ctx, plan);
+        let end = ((first_col + shown_cols) * per).min(self.rows.len());
+        for index in (first_col * per).min(end)..end {
+            let row = &self.rows[index];
+            let rect = self.list_item_rect(&list, index, at);
+            if rect.right() <= list.area.x || rect.x >= list.area.right() {
+                continue;
+            }
+            let selected = self.is_marked(index);
+            let state = if selected {
+                RowState::Selected
+            } else if hot == Hot::Row(index) {
+                RowState::Hover
+            } else {
+                RowState::Idle
+            };
+            paint::row(ctx, s, rect, state);
+            let side = ctx.px(16);
+            let icon = Rect::new(rect.x + ctx.px(8) as i32, rect.y + (rect.h as i32 - side as i32) / 2, side, side);
+            let (kind_icon, _) = file_kind(&row.name, row.directory);
+            if !draw_design_icon(&self.icons, s, icon, kind_icon) {
+                let (glyph, tone, filled) = row.icon();
+                paint::icon_tile(ctx, s, icon, glyph, tone, filled);
+            }
+            let name_x = icon.right() + ctx.px(8) as i32;
+            // Край вида справа режет имя, как у Проводника.
+            let right = rect.right().min(list.area.right() - ctx.px(4) as i32) - ctx.px(6) as i32;
+            let ink = if selected { p.ink } else { p.ink2 };
+            paint::text_clipped(ctx, s, Role::Body, name_x, paint::baseline(ctx, Role::Body, rect), (right - name_x).max(0) as u32, self.shown_name(row), ink);
+        }
+    }
+
     /// Видимая часть, высота всего содержимого и шаг колеса — для прокрутки
-    /// списка (или плитки).
+    /// списка (или плитки). У «Списка» — ширина всего и шаг в треть столбца.
     fn view_metrics(&self, ctx: Ctx, plan: &Plan) -> (Rect, u32, u32) {
         let step = plan.row_h + plan.row_gap;
         if self.on_computer() || self.error.is_some() {
             return (plan.list, 0, step);
         }
-        if self.tiles {
+        if self.view == ViewMode::List {
+            let list = self.list_plan(ctx, plan);
+            return (list.area, list.content, (list.col_w / 3).max(1));
+        }
+        if self.view == ViewMode::Tiles {
             let grid = plan.grid(ctx);
             let area = plan.list.union(&plan.header);
             let rows = self.rows.len().div_ceil(grid.cols.max(1)) as u32;
@@ -5382,8 +6159,13 @@ impl Files {
             return (None, None);
         }
         let (view, content, _) = self.view_metrics(ctx, plan);
+        // «Список» листается вбок той же прокруткой `scroll`: его полоса —
+        // в первом месте, где её ищут нажатие, перетаскивание и подсветка.
+        if self.view == ViewMode::List && !self.on_computer() && self.error.is_none() {
+            return (kit::ScrollBar::horizontal(ctx, view, content, &self.scroll), None);
+        }
         let vertical = kit::ScrollBar::vertical(ctx, view, content, &self.scroll);
-        let horizontal = if self.hbar_needed(ctx, plan) { kit::ScrollBar::horizontal(ctx, plan.list, ctx.px(TABLE_MIN_W), &self.hscroll) } else { None };
+        let horizontal = if self.hbar_needed(ctx, plan) { kit::ScrollBar::horizontal(ctx, plan.list, ctx.px(self.table_min_w()), &self.hscroll) } else { None };
         (vertical, horizontal)
     }
 
