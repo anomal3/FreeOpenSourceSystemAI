@@ -324,6 +324,14 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // with FOSSAI_AMD_SMC_START=1 asks the kernel to start the SMC by itself.
             // The second marker (FOSSAI_AMD_UCODE=1) also loads the CP/RLC/SDMA
             // microcode through the started SMC (P3).
+            // The third marker (FOSSAI_AMD_RING=1) also starts the CP and tests the GFX ring (P4).
+            if std::env::var("FOSSAI_AMD_RING").is_ok_and(|v| v == "1") {
+                payload.push(Payload {
+                    path: String::from("FREEOS/AMD/RING.TXT"),
+                    data: b"ring\n".to_vec(),
+                    source: PathBuf::from("(FOSSAI_AMD_RING=1)"),
+                });
+            }
             if std::env::var("FOSSAI_AMD_UCODE").is_ok_and(|v| v == "1") {
                 payload.push(Payload {
                     path: String::from("FREEOS/AMD/UCODE.TXT"),
