@@ -11148,6 +11148,25 @@ BAR0, GPU-адрес `0xf400000000+смещение`), сообщения `DRV_D
 `LoadUcodes` (0x254) с маской блоков (CP CE/PFP/ME/MEC/MEC2, RLC, SDMA0/1), ожидание
 `UcodeLoadStatus`; потом RLC/CP/SDMA, кольца, IH и VM (GMC v8).
 
+**Polaris, P3: МИКРОКОД ЗАГРУЖЕН (21.11, образ 0.8.8, проверено на железе).**
+`amd ucode` (`display/amd.rs`, `polaris_ucode`) по схеме `smu7_request_smu_load_fw`:
+образы CE/PFP/ME/MEC(+JT)/RLC/SDMA0/1 — в **видеопамять** (Linux кладёт их в GTT,
+мы обошли GART: область 2 МиБ со смещения 192 МиБ окна BAR0, GPU-адрес
+`0xf40c000000`), таблица `SMU_DRAMData_TOC` (9 записей) и буфер SMU, сообщения
+SMC `SMU_DRAM_ADDR_HI/LO` (0x252/0x253), `DRV_DRAM_ADDR_HI/LO` (0x250/0x251) и
+`LoadUcodes` (0x254) с маской 0x47e; `soft_regs_start` = SRAM[0x20030] = `0x3fa24`,
+`UcodeLoadStatus` по `+0x6c`. Итог: `UcodeLoadStatus` = `0x5fe` (все блоки маски
+плюс JT1/JT2) — «ALL loaded». **Системная апертура MC была нулевой** (`LOW/HIGH/
+DEFAULT` = 0): после POST прошивка её не задаёт, поэтому `amd ucode` пишет её как
+`mc_program` (LOW = `vram_start>>12`, HIGH = `vram_end>>12`); без этого SMC образы
+из VRAM не видит. После загрузки: `RLC_CNTL` = 1 (RLC запущен), CP (CE/PFP/ME) и оба
+SDMA **остановлены** (`CP_ME_CNTL` `0x15000000`, `SDMAx_F32_CNTL` бит 0) — их снимает
+с останова драйвер при старте колец (`gfx_v8_0_cp_gfx_enable`, `sdma_v3_0_start`), то
+есть дальше (P4): golden registers, `gfx_v8_0_constants_init`, `rlc_resume`, кольцо GFX
+(`CP_RB0_*`) с тестом пакетом `WRITE_DATA`/`NOP` + fence, затем SDMA, IH, VM (GMC v8).
+Автоцепочка на флешке: `FOSSAI_AMD_SMC_START=1` (`START.TXT`) и
+`FOSSAI_AMD_UCODE=1` (`UCODE.TXT`); без маркеров в карту ничего не пишется.
+
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
 `drmGetDevices2`, ioctl для `vulkaninfo` и для рендера, поля
