@@ -83,8 +83,20 @@ enum {
     ID_DISPLAY = 1, ID_REGISTRY, ID_SYNC, ID_COMPOSITOR, ID_SHM, ID_WM, ID_SEAT,
     ID_SURFACE, ID_XDG, ID_TOPLEVEL, ID_POOL, ID_BUFFER, ID_FRAME, ID_POINTER, ID_SYNC2, ID_KEYBOARD, ID_BUFFER2,
     ID_POOL_FULL, ID_BUFFER_FULL, ID_FRAME2, ID_BUFFER_MON, ID_VIEWPORTER, ID_VIEWPORT, ID_FRAME3,
-    ID_DMABUF, ID_PARAMS1, ID_DBUF1, ID_PARAMS2, ID_DBUF2, ID_FRAME4
+    ID_DMABUF, ID_PARAMS1, ID_DBUF1, ID_PARAMS2, ID_DBUF2, ID_FRAME4,
+    /* G3 (21.11): mouse for games, activation, fractional scale. */
+    ID_RELMGR, ID_REL, ID_CONSTR, ID_LOCK, ID_REGION, ID_CONFINE, ID_ACT, ID_TOKEN, ID_FRACMGR, ID_FRAC, ID_SYNC3,
+    ID_OUTPUT
 };
+/* `wl_output.mode` (bench): the monitor size. */
+static uint32_t global_output;
+static int out_w, out_h;
+
+/* G3: globals and what they said. */
+static uint32_t global_relative, global_constraints, global_activation, global_fractional;
+static int frac_scale, token_done, synced3;
+static int locked, unlocked, lock_on, confined, confine_on, rel_seen, motion_locked;
+static int rel_dx, rel_dy, confine_max_x = -1, confine_max_y = -1, confine_moved;
 
 static uint32_t global_compositor, global_shm, global_wm, global_seat, global_viewporter;
 /* `done` кадра с буфером через `wp_viewport` (D4, 20.11). */
@@ -113,6 +125,45 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         if (!strcmp(interface, "wl_seat")) global_seat = name;
         if (!strcmp(interface, "wp_viewporter")) global_viewporter = name;
         if (!strcmp(interface, "zwp_linux_dmabuf_v1")) global_dmabuf = name;
+        if (!strcmp(interface, "zwp_relative_pointer_manager_v1")) global_relative = name;
+        if (!strcmp(interface, "zwp_pointer_constraints_v1")) global_constraints = name;
+        if (!strcmp(interface, "xdg_activation_v1")) global_activation = name;
+        if (!strcmp(interface, "wp_fractional_scale_manager_v1")) global_fractional = name;
+        if (!strcmp(interface, "wl_output")) global_output = name;
+    } else if (id == ID_OUTPUT && opcode == 1) {
+        out_w = (int)args[1];
+        out_h = (int)args[2];
+    } else if (id == ID_SYNC3 && opcode == 0) {
+        synced3 = 1;
+    } else if (id == ID_FRAC && opcode == 0) {
+        frac_scale = (int)args[0];
+    } else if (id == ID_TOKEN && opcode == 0) {
+        token_done = 1;
+    } else if (id == ID_LOCK && opcode == 0) {
+        locked = 1;
+        lock_on = 1;
+    } else if (id == ID_LOCK && opcode == 1) {
+        unlocked = 1;
+        lock_on = 0;
+    } else if (id == ID_CONFINE && opcode == 0) {
+        confined = 1;
+        confine_on = 1;
+    } else if (id == ID_CONFINE && opcode == 1) {
+        confine_on = 0;
+    } else if (id == ID_REL && opcode == 0) {
+        /* relative_motion(utime_hi, utime_lo, dx, dy, dx_unaccel, dy_unaccel) */
+        rel_seen = 1;
+        rel_dx += (int32_t)args[4] / 256;
+        rel_dy += (int32_t)args[5] / 256;
+    } else if (id == ID_POINTER && opcode == 2) {
+        /* motion(time, x, y) */
+        int x = (int32_t)args[1] / 256, y = (int32_t)args[2] / 256;
+        if (lock_on) motion_locked++;
+        if (confine_on) {
+            if (x > confine_max_x) confine_max_x = x;
+            if (y > confine_max_y) confine_max_y = y;
+            if (x > 0 || y > 0) confine_moved = 1;
+        }
     } else if (id == ID_SYNC && opcode == 0) {
         synced = 1;
     } else if (id == ID_SYNC2 && opcode == 0) {
@@ -218,7 +269,138 @@ static void bind_global(uint32_t name, const char *interface, uint32_t version, 
     end();
 }
 
-int main(void) {
+static long now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* `waylandcheck bench [frames]` (G3, 21.11): a fullscreen window shows
+ * monitor-sized dma-bufs of the DRM node in turn (like a game's swapchain),
+ * one per frame callback, no interaction - for perf-diag's present cost with
+ * `wldirect on` / `off`. Needs `nvk soft on` (or the GPU) in QEMU. */
+static int bench(int frames) {
+    begin(ID_DISPLAY, 1);
+    put(ID_REGISTRY);
+    end();
+    begin(ID_DISPLAY, 0);
+    put(ID_SYNC);
+    end();
+    wait_for(&synced, 5000);
+    int drm = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    if (!synced || !global_compositor || !global_wm || !global_dmabuf || !global_output || drm < 0) {
+        printf("waylandcheck: bench FAILED - no compositor, output, dma-buf or /dev/dri/renderD128\n");
+        return 1;
+    }
+    bind_global(global_compositor, "wl_compositor", 4, ID_COMPOSITOR);
+    bind_global(global_wm, "xdg_wm_base", 2, ID_WM);
+    bind_global(global_dmabuf, "zwp_linux_dmabuf_v1", 3, ID_DMABUF);
+    bind_global(global_output, "wl_output", 2, ID_OUTPUT);
+    begin(ID_DISPLAY, 0);
+    put(ID_SYNC2);
+    end();
+    wait_for(&synced2, 5000);
+    begin(ID_COMPOSITOR, 0);
+    put(ID_SURFACE);
+    end();
+    begin(ID_WM, 2);
+    put(ID_XDG);
+    put(ID_SURFACE);
+    end();
+    begin(ID_XDG, 1);
+    put(ID_TOPLEVEL);
+    end();
+    begin(ID_TOPLEVEL, 2);
+    put_str("waylandcheck bench");
+    end();
+    begin(ID_TOPLEVEL, 11); /* set_fullscreen before the first buffer */
+    put(0);
+    end();
+    begin(ID_SURFACE, 6);
+    end();
+    wait_for(&configured, 5000);
+    begin(ID_XDG, 4);
+    put((uint32_t)configure_serial);
+    end();
+    /* Monitor-sized frameless window: the desktop makes it fullscreen. */
+    int w = out_w, h = out_h;
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) {
+        printf("waylandcheck: bench FAILED - output mode %dx%d\n", w, h);
+        return 1;
+    }
+    size_t bytes = (size_t)w * (size_t)h * 4;
+    uint32_t bufs[2] = {ID_DBUF1, ID_DBUF2}, params[2] = {ID_PARAMS1, ID_PARAMS2};
+    for (int b = 0; b < 2; b++) {
+        struct { uint32_t handle, domain; uint64_t size, offset, map_handle; uint32_t tile_mode, tile_flags, channel_hint, align; } gem = {0};
+        gem.domain = 4 | 8;
+        gem.size = bytes;
+        struct { uint32_t handle, flags; int32_t fd; } prime = {0};
+        if (ioctl(drm, 0xC0306480, &gem) != 0) return 1;
+        uint32_t *px = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, drm, (off_t)gem.map_handle);
+        if (px == MAP_FAILED) return 1;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                px[(size_t)y * w + x] = b ? 0x00204060u + (uint32_t)(x * 128 / w) : 0x00402060u + (uint32_t)((y * 128 / h) << 8);
+        munmap(px, bytes);
+        prime.handle = gem.handle;
+        prime.flags = 02000000;
+        if (ioctl(drm, 0xC00C642D, &prime) != 0) return 1;
+        begin(ID_DMABUF, 1);
+        put(params[b]);
+        end();
+        begin(params[b], 1);
+        put(0);
+        put(0);
+        put((uint32_t)w * 4);
+        put(0);
+        put(0);
+        end_fd(prime.fd);
+        close(prime.fd);
+        begin(params[b], 3);
+        put(bufs[b]);
+        put((uint32_t)w);
+        put((uint32_t)h);
+        put(0x34325258);
+        put(0);
+        end();
+    }
+    printf("waylandcheck: bench start, %d frames of %dx%d\n", frames, w, h);
+    fflush(stdout);
+    long started = now_ms();
+    int shown = 0;
+    for (int i = 0; i < frames && !protocol_error; i++) {
+        begin(ID_SURFACE, 1);
+        put(bufs[i & 1]);
+        put(0);
+        put(0);
+        end();
+        begin(ID_SURFACE, 2);
+        put(0);
+        put(0);
+        put((uint32_t)w);
+        put((uint32_t)h);
+        end();
+        frame4_done = 0;
+        begin(ID_SURFACE, 3);
+        put(ID_FRAME4);
+        end();
+        begin(ID_SURFACE, 6);
+        end();
+        if (wait_for(&frame4_done, 2000)) shown++;
+    }
+    long spent = now_ms() - started;
+    printf("waylandcheck: bench %d of %d frames in %ld ms (%ld fps)\n", shown, frames, spent, spent > 0 ? shown * 1000L / spent : 0);
+    begin(ID_TOPLEVEL, 0);
+    end();
+    begin(ID_XDG, 0);
+    end();
+    begin(ID_SURFACE, 0);
+    end();
+    close(sock);
+    return shown == frames ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
     const char *dir = getenv("XDG_RUNTIME_DIR");
     const char *display = getenv("WAYLAND_DISPLAY");
     struct sockaddr_un addr = {0};
@@ -226,6 +408,8 @@ int main(void) {
     snprintf(addr.sun_path, sizeof addr.sun_path, "%s/%s", dir ? dir : "/run/user/0", display ? display : "wayland-0");
     sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     int connected = sock >= 0 && connect(sock, (struct sockaddr *)&addr, sizeof addr) == 0;
+    if (argc > 1 && !strcmp(argv[1], "bench"))
+        return connected ? bench(argc > 2 ? atoi(argv[2]) : 300) : 1;
     check(connected, "connect to the compositor");
     if (!connected) {
         printf("waylandcheck: %d failed\n", failed);
@@ -607,6 +791,117 @@ int main(void) {
         check(made == 2 && frame4_done && dbuf1_released, "a monitor-sized dma-buf is shown and released once the next one is shown");
     } else {
         printf("waylandcheck: no /dev/dri/renderD128 - dma-buf check skipped\n");
+    }
+
+    /* G3 (21.11): mouse for games. Wine asks for these four globals (hw-log13:
+     * "relative motion won't work", "pointer locking/confining won't work",
+     * xdg_activation_v1, wp_fractional_scale_manager_v1). */
+    check(global_relative && global_constraints && global_activation && global_fractional,
+          "registry lists relative pointer, pointer constraints, xdg_activation and fractional scale");
+    if (global_fractional) {
+        bind_global(global_fractional, "wp_fractional_scale_manager_v1", 1, ID_FRACMGR);
+        begin(ID_FRACMGR, 1); /* get_fractional_scale(id, surface) */
+        put(ID_FRAC);
+        put(ID_SURFACE);
+        end();
+    }
+    if (global_activation) {
+        bind_global(global_activation, "xdg_activation_v1", 1, ID_ACT);
+        begin(ID_ACT, 1); /* get_activation_token */
+        put(ID_TOKEN);
+        end();
+        begin(ID_TOKEN, 2); /* set_surface */
+        put(ID_SURFACE);
+        end();
+        begin(ID_TOKEN, 3); /* commit -> done(token) */
+        end();
+        wait_for(&token_done, 3000);
+        begin(ID_ACT, 2); /* activate(token, surface) */
+        put_str("fossai-check");
+        put(ID_SURFACE);
+        end();
+    }
+    begin(ID_DISPLAY, 0);
+    put(ID_SYNC3);
+    end();
+    wait_for(&synced3, 5000);
+    printf("waylandcheck: preferred scale %d\n", frac_scale);
+    check(frac_scale == 120, "wp_fractional_scale_v1 announces the preferred scale 1.0 (120)");
+    check(token_done && !protocol_error, "xdg_activation_v1 hands out a token and activates the window");
+
+    if (global_relative && global_constraints) {
+        bind_global(global_relative, "zwp_relative_pointer_manager_v1", 1, ID_RELMGR);
+        begin(ID_RELMGR, 1); /* get_relative_pointer(id, pointer) */
+        put(ID_REL);
+        put(ID_POINTER);
+        end();
+        bind_global(global_constraints, "zwp_pointer_constraints_v1", 1, ID_CONSTR);
+        begin(ID_CONSTR, 1); /* lock_pointer(id, surface, pointer, region, lifetime) */
+        put(ID_LOCK);
+        put(ID_SURFACE);
+        put(ID_POINTER);
+        put(0);
+        put(2); /* persistent */
+        end();
+        wait_for(&locked, 5000);
+        check(locked, "lock_pointer gets locked while the window has the focus and the pointer");
+        printf("waylandcheck: waiting for relative motion\n");
+        fflush(stdout);
+        rel_seen = 0;
+        rel_dx = rel_dy = 0;
+        motion_locked = 0;
+        wait_for(&rel_seen, 60000);
+        wait_for(&never, 1000);
+        printf("waylandcheck: relative motion %d,%d, %d absolute motions while locked\n", rel_dx, rel_dy, motion_locked);
+        check(rel_seen && (rel_dx != 0 || rel_dy != 0), "zwp_relative_pointer_v1 gets the mouse motion while the pointer is locked");
+        check(motion_locked == 0, "no wl_pointer.motion while the pointer is locked");
+        /* Win (the Start menu) releases the lock; closing it brings the
+         * persistent lock back. */
+        printf("waylandcheck: waiting for the unlock\n");
+        fflush(stdout);
+        wait_for(&unlocked, 60000);
+        check(unlocked, "the Start menu (Win) unlocks the pointer");
+        locked = 0;
+        printf("waylandcheck: waiting for the lock to come back\n");
+        fflush(stdout);
+        wait_for(&locked, 60000);
+        check(locked, "the persistent lock comes back when the window is in front again");
+        begin(ID_LOCK, 0); /* destroy */
+        end();
+
+        /* Confine to a 64x64 region of the window, oneshot. */
+        begin(ID_COMPOSITOR, 1); /* create_region */
+        put(ID_REGION);
+        end();
+        begin(ID_REGION, 1); /* add(x, y, w, h) */
+        put(0);
+        put(0);
+        put(64);
+        put(64);
+        end();
+        begin(ID_CONSTR, 2); /* confine_pointer(id, surface, pointer, region, lifetime) */
+        put(ID_CONFINE);
+        put(ID_SURFACE);
+        put(ID_POINTER);
+        put(ID_REGION);
+        put(1); /* oneshot */
+        end();
+        begin(ID_REGION, 0); /* destroy: the constraint keeps a copy */
+        end();
+        printf("waylandcheck: waiting for the confinement\n");
+        fflush(stdout);
+        wait_for(&confined, 60000);
+        check(confined, "confine_pointer with a region gets confined when the pointer enters it");
+        printf("waylandcheck: waiting for confined motion\n");
+        fflush(stdout);
+        /* The pointer is pushed far right and down: it must stop at the
+         * region's edge (63, 63). */
+        wait_for(&confine_moved, 60000);
+        wait_for(&never, 1500);
+        printf("waylandcheck: confined pointer reached %d,%d\n", confine_max_x, confine_max_y);
+        check(confine_moved && confine_max_x > 0 && confine_max_x < 64 && confine_max_y < 64, "the confined pointer stays inside the region");
+        begin(ID_CONFINE, 0); /* destroy */
+        end();
     }
 
     struct timespec nap = {2, 0};

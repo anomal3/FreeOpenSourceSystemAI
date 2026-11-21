@@ -1262,6 +1262,9 @@ fn run_builtin(line: &str) -> bool {
         // тоже: `off` — как до них, для сравнения на одном образе.
         // `wlpace on|auto|off|unlimited|<Гц>` (D4, 20.11): темп по монитору.
         "wlpace" => sprintln!("{}", crate::linux::wayland::pace_command(argument)),
+        // G3 (21.11): `wldirect on|off` - fullscreen window straight to the
+        // screen (no compose), for A/B.
+        "wldirect" => sprintln!("{}", crate::ui::direct_command(argument)),
         #[cfg(target_arch = "x86_64")]
         "wlping" | "lxshrwx" | "lxcfr" | "tlbtarget" | "wlopaque" | "wlzerocopy" => {
             use core::sync::atomic::Ordering::Relaxed;

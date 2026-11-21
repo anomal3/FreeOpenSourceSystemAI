@@ -162,7 +162,9 @@ pub fn pace_command(argument: &str) -> String {
         "  wlpace: on, {}.{:03} Hz ({}) for vsync clients (FIFO); vsync-off clients (MAILBOX/IMMEDIATE) are not paced",
         mhz / 1000,
         mhz % 1000,
-        if forced { "forced" } else { "fastest monitor" }
+        // G3: without a forced rate each window is paced by its own monitor;
+        // this number is the fastest one (windows not placed yet).
+        if forced { "forced" } else { "fastest monitor; each window follows its own monitor" }
     )
 }
 
@@ -193,6 +195,27 @@ fn pace_mhz() -> u64 {
 fn frame_us() -> u64 {
     1_000_000_000 / pace_mhz().max(1)
 }
+
+/// G3 (21.11): the enabled monitor under the centre of `rect` (desktop
+/// coordinates of the output registry) and its refresh in mHz.
+fn monitor_of(rect: Rect) -> Option<(Rect, u64)> {
+    let list = crate::display::outputs::list();
+    let lit = || list.iter().filter(|o| o.enabled && o.current.is_some());
+    // The desktop starts at the corner of the box around all monitors; the
+    // registry keeps its own origin (the primary monitor).
+    let left = lit().map(|o| o.x).min()?;
+    let top = lit().map(|o| o.y).min()?;
+    let (cx, cy) = (rect.x + rect.w as i32 / 2 + left, rect.y + rect.h as i32 / 2 + top);
+    lit().find_map(|o| {
+        let (w, h, mhz) = o.current?;
+        let inside = cx >= o.x && cy >= o.y && cx < o.x + w as i32 && cy < o.y + h as i32;
+        (inside && (10_000..=1_000_000).contains(&mhz)).then(|| (Rect::new(o.x - left, o.y - top, w, h), u64::from(mhz)))
+    })
+}
+
+/// How often the monitor of a window is looked up again (it can be dragged
+/// to another monitor).
+const PACE_RECHECK_MS: u64 = 500;
 pub fn set_ping(on: bool) {
     PING.store(on, Ordering::Relaxed);
 }
@@ -332,7 +355,7 @@ impl Args<'_> {
 // ---- объекты --------------------------------------------------------------------
 
 /// Глобальные объекты: номер в реестре, интерфейс, версия.
-const GLOBALS: [(u32, &str, u32); 11] = [
+const GLOBALS: [(u32, &str, u32); 15] = [
     (1, "wl_compositor", 4),
     (2, "wl_subcompositor", 1),
     (3, "wl_shm", 1),
@@ -367,7 +390,42 @@ const GLOBALS: [(u32, &str, u32); 11] = [
     // на `vkWaitForPresentKHR` (DXVK ждёт им кадр в полёте) — без него ждать
     // было нечем, кроме `frame`.
     (11, "wp_presentation", 1),
+    // G3 (21.11): mouse for games. Wine (hw-log13: "relative motion won't
+    // work", "pointer locking/confining won't work") turns cursor clipping
+    // and mouse-look into these: raw device motion, and the pointer locked
+    // (hidden, does not move) or confined to the window.
+    (12, "zwp_relative_pointer_manager_v1", 1),
+    (13, "zwp_pointer_constraints_v1", 1),
+    // Window activation (SetForegroundWindow under Wine) and the preferred
+    // scale of surfaces: our Wayland coordinates are screen pixels
+    // (`wl_output.scale` 1), so the scale announced is 1.0 (120/120).
+    (14, "xdg_activation_v1", 1),
+    (15, "wp_fractional_scale_manager_v1", 1),
 ];
+
+/// `zwp_pointer_constraints_v1.lifetime`: `persistent` - the constraint
+/// comes back each time its conditions hold again (oneshot ends for good).
+const CONSTRAINT_PERSISTENT: u32 = 2;
+/// `wp_fractional_scale_v1.preferred_scale`: 120 = 1.0.
+const FRACTIONAL_ONE: u32 = 120;
+
+/// A pointer constraint of a client (`zwp_locked_pointer_v1` or
+/// `zwp_confined_pointer_v1`), G3.
+struct PointerConstraint {
+    id: u32,
+    surface: u32,
+    lock: bool,
+    /// Region in surface coordinates (bounding box of the `wl_region`).
+    region: Option<Rect>,
+    persistent: bool,
+    /// Asked of the desktop for the window (again after a focus change or a
+    /// new region).
+    asked: bool,
+    /// `locked`/`confined` sent and not yet `unlocked`/`unconfined`.
+    active: bool,
+    /// Oneshot constraint that ended: inert until destroyed.
+    defunct: bool,
+}
 
 /// `wp_tearing_control_v1.presentation_hint`: `async` — можно с разрывом.
 const TEARING_ASYNC: u32 = 1;
@@ -723,6 +781,10 @@ struct Win {
     /// кадры показываются с частотой монитора, последний побеждает.
     presented_us: u64,
     hold_until_us: u64,
+    /// G3: frame of the monitor the window is on (us) and when it was looked
+    /// up (ms): pacing follows the window's own monitor.
+    pace_us: u64,
+    pace_at_ms: u64,
 }
 
 /// Всплывающее окно стола за `xdg_popup`.
@@ -783,6 +845,18 @@ enum Obj {
     Tearing(u32),
     Presentation,
     Feedback,
+    RelativeManager,
+    RelativePointer,
+    ConstraintsManager,
+    /// `zwp_locked_pointer_v1` / `zwp_confined_pointer_v1` (G3).
+    Locked,
+    Confined,
+    Activation,
+    /// `xdg_activation_token_v1`.
+    ActivationToken,
+    FractionalManager,
+    /// `wp_fractional_scale_v1` of this surface.
+    Fractional(u32),
 }
 
 impl Obj {
@@ -821,6 +895,15 @@ impl Obj {
             Self::Tearing(_) => "wp_tearing_control_v1",
             Self::Presentation => "wp_presentation",
             Self::Feedback => "wp_presentation_feedback",
+            Self::RelativeManager => "zwp_relative_pointer_manager_v1",
+            Self::RelativePointer => "zwp_relative_pointer_v1",
+            Self::ConstraintsManager => "zwp_pointer_constraints_v1",
+            Self::Locked => "zwp_locked_pointer_v1",
+            Self::Confined => "zwp_confined_pointer_v1",
+            Self::Activation => "xdg_activation_v1",
+            Self::ActivationToken => "xdg_activation_token_v1",
+            Self::FractionalManager => "wp_fractional_scale_manager_v1",
+            Self::Fractional(_) => "wp_fractional_scale_v1",
         }
     }
 }
@@ -890,6 +973,15 @@ struct Client {
     feedbacks: Vec<(u32, u32, u32)>,
     /// Счётчик показов для `presented` (`seq`).
     present_seq: u64,
+    /// G3: bounding boxes of the client's `wl_region`s (surface coordinates).
+    regions: BTreeMap<u32, Rect>,
+    /// G3: pointer constraints (`zwp_pointer_constraints_v1`).
+    constraints: Vec<PointerConstraint>,
+    /// G3: frame pace of this client (us): the refresh of the monitor its
+    /// paced window is on, not of the fastest monitor; 0 - not known yet.
+    pace_us: u64,
+    /// G3: activation tokens handed out.
+    tokens: u32,
 }
 
 impl Client {
@@ -932,6 +1024,10 @@ impl Client {
             frames_held_since: 0,
             feedbacks: Vec::new(),
             present_seq: 0,
+            regions: BTreeMap::new(),
+            constraints: Vec::new(),
+            pace_us: 0,
+            tokens: 0,
         }
     }
 
@@ -1007,6 +1103,9 @@ impl Client {
             self.serve_owner();
             self.window_events(time);
             self.popup_events(time);
+            if !self.constraints.is_empty() {
+                self.sync_constraints();
+            }
             let now_us = crate::time::uptime_ns() / 1000;
             for index in 0..self.wins.len() {
                 // Отложенный кадр без темпа (D7) — к своему сроку.
@@ -1138,6 +1237,145 @@ impl Client {
                 _ => {}
             },
             Obj::Feedback => {}
+            // G3: `wl_region.add(x, y, w, h)` / `subtract` - kept as the
+            // bounding box of what was added (pointer confinement needs no
+            // more: games confine to one rectangle).
+            Obj::Region if opcode == 1 || opcode == 2 => {
+                let (x, y, w, h) = (args.i32()?, args.i32()?, args.i32()?, args.i32()?);
+                if opcode == 1 && w > 0 && h > 0 {
+                    let rect = Rect::new(x, y, w as u32, h as u32);
+                    let next = self.regions.get(&id).map_or(rect, |old| old.union(&rect));
+                    self.regions.insert(id, next);
+                }
+            }
+            Obj::Region if opcode == 0 => {
+                self.regions.remove(&id);
+                self.delete(id);
+            }
+            // G3: `destroy`, `get_relative_pointer(id, pointer)`.
+            Obj::RelativeManager => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let new = args.u32()?;
+                    self.objects.insert(new, Obj::RelativePointer);
+                }
+                _ => {}
+            },
+            Obj::RelativePointer => {
+                if opcode == 0 {
+                    self.delete(id);
+                }
+            }
+            // G3: `destroy`, `lock_pointer` / `confine_pointer(id, surface,
+            // pointer, region, lifetime)`.
+            Obj::ConstraintsManager => match opcode {
+                0 => self.delete(id),
+                1 | 2 => {
+                    let (new, surface, _pointer, region, lifetime) = (args.u32()?, args.u32()?, args.u32()?, args.u32()?, args.u32()?);
+                    if self.constraints.iter().any(|c| c.surface == surface) {
+                        self.fail(id, 1, "the surface already has a pointer constraint");
+                        return Ok(());
+                    }
+                    let lock = opcode == 1;
+                    self.objects.insert(new, if lock { Obj::Locked } else { Obj::Confined });
+                    let region = (region != 0).then(|| self.regions.get(&region).copied().unwrap_or(Rect::EMPTY));
+                    kprintln!(
+                        "  wayland     : #{} asks to {} the pointer on surface {surface}{}",
+                        self.pid,
+                        if lock { "lock" } else { "confine" },
+                        if lifetime == CONSTRAINT_PERSISTENT { " (persistent)" } else { "" }
+                    );
+                    self.constraints.push(PointerConstraint {
+                        id: new,
+                        surface,
+                        lock,
+                        region,
+                        persistent: lifetime == CONSTRAINT_PERSISTENT,
+                        asked: false,
+                        active: false,
+                        defunct: false,
+                    });
+                    self.sync_constraints();
+                }
+                _ => {}
+            },
+            // `zwp_locked_pointer_v1`: `destroy`, `set_cursor_position_hint(x,
+            // y)`, `set_region(region)`; `zwp_confined_pointer_v1`:
+            // `destroy`, `set_region(region)`.
+            Obj::Locked | Obj::Confined => {
+                let lock = matches!(object, Obj::Locked);
+                match (lock, opcode) {
+                    (_, 0) => {
+                        self.drop_constraint(id);
+                        self.delete(id);
+                    }
+                    (true, 1) => {
+                        let (x, y) = (args.i32()? >> 8, args.i32()? >> 8);
+                        if let Some((slot, (gx, gy))) = self.constraint_window(id) {
+                            crate::ui::constraint_hint(self.pid, slot, x - gx, y - gy);
+                        }
+                    }
+                    (true, 2) | (false, 1) => {
+                        let region = args.u32()?;
+                        let region = (region != 0).then(|| self.regions.get(&region).copied().unwrap_or(Rect::EMPTY));
+                        if let Some(c) = self.constraints.iter_mut().find(|c| c.id == id) {
+                            c.region = region;
+                            c.asked = false;
+                        }
+                        self.sync_constraints();
+                    }
+                    _ => {}
+                }
+            }
+            // G3: `destroy`, `get_activation_token(id)`, `activate(token,
+            // surface)`.
+            Obj::Activation => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let new = args.u32()?;
+                    self.objects.insert(new, Obj::ActivationToken);
+                }
+                2 => {
+                    let _token = args.string()?;
+                    let surface = args.u32()?;
+                    let root = self.root_of(surface);
+                    if let Some(slot) = self.wins.iter().find(|win| win.surface == root && win.open.is_some()).map(|win| win.slot) {
+                        let _ = crate::ui::activate_window(self.pid, slot);
+                    }
+                }
+                _ => {}
+            },
+            // `set_serial`, `set_app_id`, `set_surface`, `commit` (-> `done`
+            // with the token), `destroy`.
+            Obj::ActivationToken => match opcode {
+                3 => {
+                    self.tokens = self.tokens.wrapping_add(1);
+                    let token = alloc::format!("fossai-{}-{}", self.pid, self.tokens);
+                    self.send(Msg::new(id, 0).str(&token));
+                }
+                4 => self.delete(id),
+                _ => {}
+            },
+            // G3: `destroy`, `get_fractional_scale(id, surface)`: the scale is
+            // 1.0 - surface coordinates are screen pixels here.
+            Obj::FractionalManager => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let (new, surface) = (args.u32()?, args.u32()?);
+                    if self.objects.values().any(|obj| matches!(obj, Obj::Fractional(of) if *of == surface)) {
+                        self.fail(id, 0, "the surface already has a fractional scale");
+                        return Ok(());
+                    }
+                    self.objects.insert(new, Obj::Fractional(surface));
+                    self.send(Msg::new(new, 0).u32(FRACTIONAL_ONE));
+                }
+                _ => {}
+            },
+            Obj::Fractional(_) => {
+                if opcode == 0 {
+                    self.delete(id);
+                }
+            }
             Obj::Callback | Obj::Region | Obj::Output | Obj::Keyboard => {
                 // `destroy`/`release` у тех, у кого он есть, — нулевой.
                 let destroys = match object {
@@ -1578,6 +1816,10 @@ impl Client {
             9 => Obj::Dmabuf,
             10 => Obj::TearingManager,
             11 => Obj::Presentation,
+            12 => Obj::RelativeManager,
+            13 => Obj::ConstraintsManager,
+            14 => Obj::Activation,
+            15 => Obj::FractionalManager,
             _ => Obj::Output,
         };
         self.objects.insert(new, object);
@@ -1715,6 +1957,8 @@ impl Client {
                     stash: None,
                     presented_us: 0,
                     hold_until_us: 0,
+                    pace_us: 0,
+                    pace_at_ms: 0,
                 });
             }
             2 => {
@@ -1883,19 +2127,14 @@ impl Client {
                     // 60 Гц, второй — 180 Гц; темп FIFO — по самому быстрому
                     // монитору, показ — с частотой монитора окна).
                     if let Some(win) = self.wins.iter().find(|win| win.surface == id) {
-                        let mhz = pace_mhz();
                         let rect = crate::ui::window_rect(self.pid, win.slot);
-                        let monitor = rect.and_then(|r| {
-                            let (cx, cy) = (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2);
-                            crate::display::outputs::list().iter().filter(|o| o.enabled).find_map(|o| {
-                                let (w, h, hz) = o.current?;
-                                let inside = cx >= o.x && cy >= o.y && cx < o.x + w as i32 && cy < o.y + h as i32;
-                                inside.then(|| (Rect::new(o.x, o.y, w, h), u64::from(hz)))
-                            })
-                        });
+                        let monitor = rect.and_then(monitor_of);
+                        // G3: the pace is the window's own monitor (forced
+                        // `wlpace <Hz>` wins).
+                        let mhz = if PACE_FORCED_MHZ.load(Ordering::Relaxed) != 0 { pace_mhz() } else { monitor.map_or_else(pace_mhz, |m| m.1) };
                         match monitor {
                             Some((o, hz_mhz)) => kprintln!(
-                                "  wayland     : #{} surface {id}: window on the monitor at {},{} ({}.{:03} Hz), FIFO pace {}.{:03} Hz",
+                                "  wayland     : #{} surface {id}: window on the monitor at {},{} ({}.{:03} Hz), pace {}.{:03} Hz (the window's monitor)",
                                 self.pid, o.x, o.y, hz_mhz / 1000, hz_mhz % 1000, mhz / 1000, mhz % 1000
                             ),
                             None => kprintln!(
@@ -1984,9 +2223,15 @@ impl Client {
         // Кадр без темпа пришёл раньше кадра монитора после прошлого показа
         // — показать его (или более новый) к сроку; прежний буфер уже
         // вернулся клиенту выше, и рисовать ему есть во что (D7).
+        // G3: pace by the monitor this window is on (a 60 Hz and a 180 Hz
+        // monitor side by side, hw-log13), not by the fastest one.
+        let win_us = self.win_frame_us(index);
+        if paced {
+            self.pace_us = win_us;
+        }
         if unpaced && PACE.load(Ordering::Relaxed) && self.wins[index].open.is_some() {
             let now_us = crate::time::uptime_ns() / 1000;
-            let due = self.wins[index].presented_us.saturating_add(frame_us());
+            let due = self.wins[index].presented_us.saturating_add(win_us);
             if now_us < due {
                 let win = &mut self.wins[index];
                 win.dirty = true;
@@ -2007,7 +2252,7 @@ impl Client {
         match presented {
             Some((ns, flags)) => {
                 let secs = ns / 1_000_000_000;
-                let refresh = (frame_us() * 1000).min(u64::from(u32::MAX)) as u32;
+                let refresh = (self.client_frame_us() * 1000).min(u64::from(u32::MAX)) as u32;
                 let seq = self.present_seq;
                 self.send(
                     Msg::new(callback, 1)
@@ -2094,6 +2339,77 @@ impl Client {
         }
     }
 
+    /// G3: the desktop window of a pointer constraint and the offset of its
+    /// surface coordinates (`set_window_geometry`).
+    fn constraint_window(&self, id: u32) -> Option<(u32, (i32, i32))> {
+        let c = self.constraints.iter().find(|c| c.id == id)?;
+        let root = self.root_of(c.surface);
+        let win = self.wins.iter().find(|win| win.surface == root && win.open.is_some())?;
+        Some((win.slot, win.geometry.map_or((0, 0), |(x, y, _, _)| (x, y))))
+    }
+
+    /// G3: ask the desktop for the constraints and tell the client when they
+    /// start (`locked`/`confined`) and end (`unlocked`/`unconfined`; a
+    /// oneshot one is then over). The desktop decides: focus, menus,
+    /// Alt+Tab, Win, the pointer over the window.
+    fn sync_constraints(&mut self) {
+        for index in 0..self.constraints.len() {
+            let (id, lock, region, asked, active, defunct) = {
+                let c = &self.constraints[index];
+                (c.id, c.lock, c.region, c.asked, c.active, c.defunct)
+            };
+            if defunct {
+                continue;
+            }
+            let Some((slot, (gx, gy))) = self.constraint_window(id) else {
+                if active {
+                    self.end_constraint(index, None);
+                }
+                continue;
+            };
+            if !asked {
+                crate::ui::constrain_pointer(self.pid, slot, Some((lock, region.map(|r| r.translate(-gx, -gy)))));
+                self.constraints[index].asked = true;
+            }
+            match crate::ui::pointer_constrained(self.pid, slot) {
+                Some(true) if !active => {
+                    self.constraints[index].active = true;
+                    kprintln!("  wayland     : #{} pointer {}", self.pid, if lock { "locked" } else { "confined" });
+                    self.send(Msg::new(id, 0));
+                }
+                Some(false) if active => self.end_constraint(index, Some(slot)),
+                _ => {}
+            }
+        }
+    }
+
+    /// G3: `unlocked`/`unconfined`; a oneshot constraint is over for good.
+    fn end_constraint(&mut self, index: usize, slot: Option<u32>) {
+        let c = &mut self.constraints[index];
+        c.active = false;
+        let (id, lock) = (c.id, c.lock);
+        if !c.persistent {
+            c.defunct = true;
+            if let Some(slot) = slot {
+                crate::ui::constrain_pointer(self.pid, slot, None);
+            }
+        }
+        kprintln!("  wayland     : #{} pointer {}", self.pid, if lock { "unlocked" } else { "unconfined" });
+        self.send(Msg::new(id, 1));
+    }
+
+    /// G3: the client destroyed a constraint - the desktop forgets it.
+    fn drop_constraint(&mut self, id: u32) {
+        let window = self.constraint_window(id);
+        let Some(index) = self.constraints.iter().position(|c| c.id == id) else {
+            return;
+        };
+        let c = self.constraints.remove(index);
+        if let (Some((slot, _)), true) = (window, c.asked && !c.defunct) {
+            crate::ui::constrain_pointer(self.pid, slot, None);
+        }
+    }
+
     /// `wl_buffer.release`, если буфер ещё жив.
     fn release(&mut self, buffer: u32) {
         if self.released.contains(&buffer) {
@@ -2127,7 +2443,8 @@ impl Client {
         // Срок — в микросекундах: кадр 144 Гц — 6,94 мс, миллисекундами
         // темп сбивался бы на целую.
         let now_us = crate::time::uptime_ns() / 1000;
-        let early = now_us < self.frame_answered_us.saturating_add(frame_us());
+        let frame = self.client_frame_us();
+        let early = now_us < self.frame_answered_us.saturating_add(frame);
         if PACE.load(Ordering::Relaxed) && held < FRAME_HOLD_MAX_MS && (unshown || early) {
             return;
         }
@@ -2143,15 +2460,44 @@ impl Client {
         // сервера (очередь готовых в QEMU) не копится, и FIFO держит частоту
         // монитора, а не 52-56 к/с при 60 Гц. Опоздание больше кадра —
         // сетка заново от «сейчас».
-        let ideal = self.frame_answered_us.saturating_add(frame_us());
-        self.frame_answered_us = if now_us >= ideal && now_us - ideal < frame_us() { ideal } else { now_us };
+        let ideal = self.frame_answered_us.saturating_add(frame);
+        self.frame_answered_us = if now_us >= ideal && now_us - ideal < frame { ideal } else { now_us };
         self.frames_held_since = 0;
+    }
+
+    /// G3: frame of this client's pace (us): its paced window's monitor;
+    /// a forced `wlpace <Hz>` or no window yet - the global pace.
+    fn client_frame_us(&self) -> u64 {
+        if self.pace_us == 0 || PACE_FORCED_MHZ.load(Ordering::Relaxed) != 0 {
+            frame_us()
+        } else {
+            self.pace_us
+        }
+    }
+
+    /// G3: frame (us) of the monitor window `index` is on, looked up again
+    /// every [`PACE_RECHECK_MS`] (windows move between monitors).
+    fn win_frame_us(&mut self, index: usize) -> u64 {
+        if PACE_FORCED_MHZ.load(Ordering::Relaxed) != 0 {
+            return frame_us();
+        }
+        let now = crate::time::uptime_ms();
+        let pid = self.pid;
+        let Some(win) = self.wins.get_mut(index) else {
+            return frame_us();
+        };
+        if win.pace_us == 0 || now.saturating_sub(win.pace_at_ms) >= PACE_RECHECK_MS {
+            win.pace_at_ms = now;
+            let mhz = crate::ui::window_rect(pid, win.slot).and_then(monitor_of).map(|(_, mhz)| mhz);
+            win.pace_us = mhz.map_or_else(frame_us, |mhz| 1_000_000_000 / mhz.max(1));
+        }
+        win.pace_us
     }
 
     /// Когда этому клиенту пора ответить на отложенные `frame` (мс, вверх) —
     /// чтобы задача сервера проснулась к сроку, а не на следующем опросе.
     fn frames_due_at(&self) -> Option<u64> {
-        let frames = (!self.frames_due.is_empty()).then(|| self.frame_answered_us.saturating_add(frame_us()).div_ceil(1000));
+        let frames = (!self.frames_due.is_empty()).then(|| self.frame_answered_us.saturating_add(self.client_frame_us()).div_ceil(1000));
         // И к сроку отложенного показа кадра без темпа (D7).
         let held = self.wins.iter().filter(|win| win.dirty && win.hold_until_us != 0).map(|win| win.hold_until_us.div_ceil(1000)).min();
         match (frames, held) {
@@ -2225,7 +2571,8 @@ impl Client {
         // Отложенный показ — по сетке кадров (опоздание задачи не копится).
         let now_us = crate::time::uptime_ns() / 1000;
         let due = win.hold_until_us;
-        win.presented_us = if due != 0 && now_us >= due && now_us - due < frame_us() { due } else { now_us };
+        let frame = if win.pace_us != 0 { win.pace_us } else { frame_us() };
+        win.presented_us = if due != 0 && now_us >= due && now_us - due < frame { due } else { now_us };
         win.hold_until_us = 0;
         // `ZERO_COPY` (8): окно показывает буфер клиента без копии.
         let (root, flags) = (win.surface, if win.adopted.is_some() { 8 } else { 0 });
@@ -2324,17 +2671,24 @@ impl Client {
             // буфер до `release`, а он уходит только после смены пикселей.
             if let Some(pixels) = unsafe { Surface::from_raw(ptr, gw, gh) } {
                 let started = crate::time::uptime_ns();
-                let (desk, flush) = (crate::ui::timing(), crate::ui::flush_ns());
-                match crate::ui::swap_window_pixels(pid, win.slot, pixels, area) {
+                let (desk, flush, direct) = (crate::ui::timing(), crate::ui::flush_ns(), crate::ui::direct_stats().1);
+                // G3: the buffer is contiguous frames of the direct map - its
+                // physical address lets a display scan it out directly.
+                let phys = (ptr as u64).checked_sub(crate::mm::PHYS_MAP_BASE as u64);
+                match crate::ui::swap_window_pixels(pid, win.slot, pixels, area, phys) {
                     Ok(old) => {
                         // Сборка, вывод полос и сброс кадра стола внутри
                         // показа (21.11): журнал 13 видел 3,3-4 мс на показ
                         // без копии — это и есть они (кадр 2560x1440 стол
                         // собирает и выводит целиком), у пути с копией та же
-                        // цена не входила в `copy ms/paint`.
-                        let (desk2, flush2) = (crate::ui::timing(), crate::ui::flush_ns());
+                        // цена не входила в `copy ms/paint`. G3: plus the
+                        // direct copy of a fullscreen window (no compose).
+                        let (desk2, flush2, direct2) = (crate::ui::timing(), crate::ui::flush_ns(), crate::ui::direct_stats().1);
                         super::perfdiag::WL_ZERO_COPY_PRESENT_NS.fetch_add(
-                            desk2.2.saturating_sub(desk.2) + desk2.3.saturating_sub(desk.3) + flush2.saturating_sub(flush),
+                            desk2.2.saturating_sub(desk.2)
+                                + desk2.3.saturating_sub(desk.3)
+                                + flush2.saturating_sub(flush)
+                                + direct2.saturating_sub(direct),
                             Ordering::Relaxed,
                         );
                         if win.adopted.is_none() {
@@ -2371,7 +2725,7 @@ impl Client {
                 Some(own) if (own.width(), own.height()) == (gw, gh) => Some(own),
                 _ => Surface::new(gw, gh, theme::window_bg()),
             };
-            match own.map(|own| crate::ui::swap_window_pixels(pid, win.slot, own, Rect::EMPTY)) {
+            match own.map(|own| crate::ui::swap_window_pixels(pid, win.slot, own, Rect::EMPTY, None)) {
                 Some(Ok(_borrowed)) => {
                     whole = true;
                     self.release_unless_shown(surface, old);
@@ -2399,7 +2753,7 @@ impl Client {
         // Копия буфера клиента в окно стола — отдельно от сборки и вывода,
         // которые `paint_window` делает тут же (P1: `perf-diag`).
         let mut copy_ns = 0u64;
-        let (desk, flush) = (crate::ui::timing(), crate::ui::flush_ns());
+        let (desk, flush, direct) = (crate::ui::timing(), crate::ui::flush_ns(), crate::ui::direct_stats().1);
         let painted = crate::ui::paint_window(pid, win.slot, area, |target| {
             let started = crate::time::uptime_ns();
             clear = paint(target, &layers, swap, area, alpha);
@@ -2407,10 +2761,13 @@ impl Client {
         });
         if painted.is_ok() {
             // Показ после копии (сборка + вывод + сброс), 21.11 — для честного
-            // сравнения с показом без копии.
-            let (desk2, flush2) = (crate::ui::timing(), crate::ui::flush_ns());
+            // сравнения с показом без копии (G3: и прямой вывод).
+            let (desk2, flush2, direct2) = (crate::ui::timing(), crate::ui::flush_ns(), crate::ui::direct_stats().1);
             super::perfdiag::WL_PAINT_PRESENT_NS.fetch_add(
-                desk2.2.saturating_sub(desk.2) + desk2.3.saturating_sub(desk.3) + flush2.saturating_sub(flush),
+                desk2.2.saturating_sub(desk.2)
+                    + desk2.3.saturating_sub(desk.3)
+                    + flush2.saturating_sub(flush)
+                    + direct2.saturating_sub(direct),
                 Ordering::Relaxed,
             );
             super::perfdiag::WL_PAINTS.fetch_add(1, Ordering::Relaxed);
@@ -2648,6 +3005,11 @@ impl Client {
     }
 
     fn close_all(&mut self) {
+        // G3: the pointer comes back if a lock of this client was active.
+        let ids: Vec<u32> = self.constraints.iter().map(|c| c.id).collect();
+        for id in ids {
+            self.drop_constraint(id);
+        }
         while !self.pops.is_empty() {
             self.close_popup(0);
         }
@@ -2807,6 +3169,19 @@ impl Client {
                         }
                     }
                     user_abi::WIN_RESIZE => self.configure(index, event.x, event.y),
+                    // G3: raw mouse motion (device delta, no acceleration) to
+                    // every `zwp_relative_pointer_v1` of the client.
+                    crate::ui::WIN_RELMOTION => {
+                        let (dx, dy) = (event.x, event.y);
+                        let us = crate::time::uptime_ns() / 1000;
+                        let relatives: Vec<u32> =
+                            self.objects.iter().filter(|(_, obj)| matches!(obj, Obj::RelativePointer)).map(|(id, _)| *id).collect();
+                        for relative in relatives {
+                            self.send(
+                                Msg::new(relative, 0).u32((us >> 32) as u32).u32(us as u32).fixed(dx).fixed(dy).fixed(dx).fixed(dy),
+                            );
+                        }
+                    }
                     user_abi::WIN_FOCUS => {
                         // Рамка Chromium у неактивного окна бледнее — ему
                         // нужно знать о фокусе.
@@ -2817,6 +3192,14 @@ impl Client {
                         let (w, h) = self.current_size(index);
                         self.configure(index, w, h);
                         if event.code != 0 {
+                            // G3: back in front - ask for its pointer
+                            // constraints again (another window may have
+                            // taken the desktop's one meanwhile).
+                            for index in 0..self.constraints.len() {
+                                if self.root_of(self.constraints[index].surface) == surface {
+                                    self.constraints[index].asked = false;
+                                }
+                            }
                             self.keyboard_enter(surface);
                         } else if self.keyboard_on == Some(surface) {
                             self.keyboard_on = None;

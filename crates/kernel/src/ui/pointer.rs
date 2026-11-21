@@ -261,10 +261,21 @@ impl Pointer {
     /// `dy` — сдвиг координат экрана к координатам полосы. Картинка
     /// обрезается сама: поверхность отбрасывает то, что вышло за её края.
     pub fn draw(&self, surface: &mut mini_ui::Surface, dy: i32) {
+        self.draw_at(surface, 0, dy);
+    }
+
+    /// Hide the pointer (G3: locked by a game). `true` - it was visible.
+    pub fn hide(&mut self) -> bool {
+        core::mem::replace(&mut self.visible, false)
+    }
+
+    /// [`Self::draw`] into a small surface placed at `(-dx, -dy)` of the
+    /// screen (G3: cursor patch over a directly shown fullscreen window).
+    pub fn draw_at(&self, surface: &mut mini_ui::Surface, dx: i32, dy: i32) {
         if !self.visible {
             return;
         }
-        let (x, y) = (self.x, self.y + dy);
+        let (x, y) = (self.x + dx, self.y + dy);
         with_image(self.large, self.index(crate::time::uptime_ms()), |image, (hx, hy)| {
             image.draw(surface, Rect::new(x - hx as i32, y - hy as i32, image.width, image.height));
         });

@@ -91,6 +91,9 @@ const SHADOW_DROP: u32 = 10;
 /// прямоугольники лежит в самом столе (см. [`Compositor::out_rects`]).
 pub const MAX_OUTPUTS: usize = 8;
 
+/// G3 (21.11): fullscreen fast path on/off (`ui direct on|off`, for A/B).
+pub static DIRECT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
 /// Куда прилипает окно, брошенное у края экрана (20.11, как Snap в Windows).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Snap {
@@ -370,6 +373,31 @@ pub struct Compositor {
     /// Изменения при этом не теряются — они копятся в прямоугольниках окон и в
     /// [`Self::damage`] и уходят на экран ближайшим несложенным кадром.
     deferred: bool,
+    /// G3 (21.11): per output, the fullscreen program window shown straight
+    /// from its pixels in the last frame (no compose, no back buffer).
+    direct: [Option<App>; MAX_OUTPUTS],
+    /// G3: per output, the client buffer (physical address) the display
+    /// scans out instead of the output's frame buffer (NVIDIA page flip).
+    flipped: [Option<u64>; MAX_OUTPUTS],
+    /// G3: pointer lock/confinement asked by a program window
+    /// (`zwp_pointer_constraints_v1`).
+    constraint: Option<Constraint>,
+    /// G3: last tablet position (absolute pointing devices: QEMU, VirtualBox)
+    /// - relative motion while the pointer is locked is counted from it.
+    tablet_last: Option<(i32, i32)>,
+}
+
+/// G3: a pointer constraint of a program window.
+#[derive(Clone, Copy)]
+struct Constraint {
+    app: App,
+    /// Lock (the pointer stays and hides) or confine (stays inside).
+    lock: bool,
+    /// Confinement region in program-local coordinates; `None` - the window.
+    region: Option<Rect>,
+    /// Where to put the pointer when the lock ends (program-local).
+    hint: Option<(i32, i32)>,
+    active: bool,
 }
 
 /// Сколько раз картинка под окнами сбрасывалась — для разбора по журналу.
@@ -529,6 +557,10 @@ impl Compositor {
             hw_cursor: false,
             cursor_sent: (0, 0),
             cursor_key: usize::MAX,
+            direct: [None; MAX_OUTPUTS],
+            flipped: [None; MAX_OUTPUTS],
+            constraint: None,
+            tablet_last: None,
         };
         compositor.panel = Panel::new(compositor.primary, scale);
         compositor.build_side_panels();
@@ -4950,6 +4982,12 @@ impl Compositor {
             self.flight.is_some() || trail || spinning || shade_moving || taskbar_moving || peek_moving || snap_waiting || splash_moving || super::icon_holding() || super::gesture_holding(),
         );
         self.collect();
+        // G3: outputs fully covered by a fullscreen program window go to the
+        // screen straight from its pixels; entering and leaving that mode
+        // repaints the output once.
+        let plan = self.direct_plan();
+        self.apply_direct_plan(&plan);
+        let flips = self.flip_plan(&plan);
         if !self.damage_overflow && self.damage_count == 0 {
             return;
         }
@@ -4962,7 +5000,8 @@ impl Compositor {
         if self.damage_overflow {
             let all = self.union;
             super::note_full_frame();
-            self.compose(all);
+            self.compose_planned(all, &plan, &flips);
+            self.finish_flips(&plan, &flips);
             self.rects += 1;
             self.damage_overflow = false;
             self.damage_count = 0;
@@ -4979,10 +5018,11 @@ impl Compositor {
             if !rect.is_empty() {
                 super::note_rect(u64::from(rect.w) * u64::from(rect.h));
                 points += u64::from(rect.w) * u64::from(rect.h);
-                self.compose(rect);
+                self.compose_planned(rect, &plan, &flips);
                 self.rects += 1;
             }
         }
+        self.finish_flips(&plan, &flips);
         self.damage_count = 0;
         let spent = crate::time::uptime_ns().wrapping_sub(started);
         super::note_frame_ns(spent);
@@ -4990,6 +5030,421 @@ impl Compositor {
         // ними не показываются и в честную долю кадра не входят.
         let screen: u64 = self.output_rects().iter().map(|r| u64::from(r.w) * u64::from(r.h)).sum();
         super::note_screen_cost(spent, points, screen);
+    }
+
+    // -----------------------------------------------------------------------
+    // G3 (21.11): fullscreen fast path
+    // -----------------------------------------------------------------------
+
+    /// Which output shows a program window straight from its pixels this
+    /// frame: the topmost window on it is fullscreen, opaque, exactly the
+    /// output, and nothing of the desktop lies over it (menus, toasts, the
+    /// launch card, panels, thumbnails, snap, peek, flight, lock...). Only the
+    /// pointer may be over it - it is patched in ([`Self::blit_direct`]).
+    /// The answer is a window index per output.
+    fn direct_plan(&self) -> [Option<usize>; MAX_OUTPUTS] {
+        let mut plan = [None; MAX_OUTPUTS];
+        if !DIRECT.load(core::sync::atomic::Ordering::Relaxed)
+            || theme::is_mobile()
+            || self.lock.is_some()
+            || self.flight.is_some()
+            || self.scene.is_some()
+            || self.peek.is_some()
+            || self.peek_fade.is_some()
+            || self.outline.is_some()
+            || self.snap.is_some()
+            || self.start.is_some()
+            || self.tray.is_some()
+            || self.power.is_some()
+            || self.thumbs.is_some()
+            || self.tray_pop.is_some()
+            || self.snap_pop.is_some()
+            || self.menu_open()
+            || self.context.as_ref().is_some_and(|menu| menu.is_open())
+            || self.keyboard.as_ref().is_some_and(|keyboard| keyboard.is_visible())
+            || self.shade.as_ref().is_some_and(|shade| shade.is_visible())
+            || super::look::depth() != 32
+        {
+            return plan;
+        }
+        let halo = ((SHADOW_SPREAD + SHADOW_DROP) * self.scale) as i32;
+        let grow = |r: Rect| Rect::new(r.x - halo, r.y - halo, r.w + halo as u32 * 2, r.h + halo as u32 * 2);
+        let full = self.fullscreen_front();
+        for (index, out) in self.outputs.iter().enumerate().take(MAX_OUTPUTS) {
+            let o = out.rect;
+            if self.toast.as_ref().is_some_and(|toast| !grow(toast.rect).intersect(&o).is_empty())
+                || self.splash.layer().is_some_and(|(_, rect)| !grow(rect).intersect(&o).is_empty())
+            {
+                continue;
+            }
+            if self.panel.as_ref().is_some_and(|panel| !full && !panel.rect.intersect(&panel.area()).intersect(&o).is_empty()) {
+                continue;
+            }
+            if self.side_panels.iter().any(|(_, panel)| !panel.rect.intersect(&o).is_empty() && !self.fullscreen_over(panel.rect)) {
+                continue;
+            }
+            // The topmost window touching this output (with its shadow).
+            let top = self
+                .windows
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, window)| !window.minimized)
+                .find(|(_, window)| !grow(window.rect).intersect(&o).is_empty());
+            let Some((at, window)) = top else {
+                continue;
+            };
+            if window.fullscreen && window.rect == o && !dims(window.app) && window.direct_pixels().is_some() {
+                plan[index] = Some(at);
+            }
+        }
+        plan
+    }
+
+    /// Switch outputs into and out of the direct mode: a window leaving it
+    /// gets its surface refreshed from the pixels, and the output is
+    /// repainted whole once either way.
+    fn apply_direct_plan(&mut self, plan: &[Option<usize>; MAX_OUTPUTS]) {
+        for index in 0..self.outputs.len().min(MAX_OUTPUTS) {
+            let now = plan[index].and_then(|at| self.windows.get(at)).map(|window| window.app);
+            let was = self.direct[index];
+            if now == was {
+                continue;
+            }
+            if let Some(app) = was {
+                if let Some(window) = self.find(app) {
+                    window.refresh_stale();
+                    window.damage = Rect::EMPTY;
+                }
+            }
+            crate::kprintln!(
+                "  desktop     : output {index} {} (window '{}')",
+                if now.is_some() { "shows a fullscreen window directly" } else { "composes again" },
+                now.or(was).map_or_else(|| alloc::string::String::from("-"), |app| self.label(app))
+            );
+            self.direct[index] = now;
+            let rect = self.outputs[index].rect;
+            self.mark(rect);
+        }
+    }
+
+    /// [`Self::compose`] with the direct outputs of `plan` taken out: their
+    /// part of `rect` is copied from the window pixels.
+    fn compose_planned(&mut self, rect: Rect, plan: &[Option<usize>; MAX_OUTPUTS], flips: &[Option<(u32, u64, u32)>; MAX_OUTPUTS]) {
+        if plan.iter().all(Option::is_none) {
+            self.compose(rect);
+            return;
+        }
+        for index in 0..self.outputs.len().min(MAX_OUTPUTS) {
+            let part = rect.intersect(&self.outputs[index].rect);
+            if part.is_empty() {
+                continue;
+            }
+            match plan[index] {
+                // The display shows the client buffer itself: nothing to copy.
+                Some(_) if flips[index].is_some() => {}
+                Some(window) => self.blit_direct(index, window, part),
+                None => self.compose(part),
+            }
+        }
+    }
+
+    /// Outputs whose display scans the client buffer out directly (NVIDIA
+    /// page flip, opt-in `scanout flip on`): a direct output of a display
+    /// that can, a contiguous client buffer, and no pointer over it (the
+    /// pointer is only drawn into our frame buffer). `(output id, physical
+    /// address, pitch)`. An output that stops flipping gets its frame buffer
+    /// repainted whole first ([`Self::finish_flips`] switches back after).
+    fn flip_plan(&mut self, plan: &[Option<usize>; MAX_OUTPUTS]) -> [Option<(u32, u64, u32)>; MAX_OUTPUTS] {
+        let mut flips = [None; MAX_OUTPUTS];
+        let on = crate::display::nvidia_disp::FLIP.load(core::sync::atomic::Ordering::Relaxed);
+        for index in 0..self.outputs.len().min(MAX_OUTPUTS) {
+            let out = &self.outputs[index];
+            let crate::display::outputs::Backend::Nvidia(id) = out.backend else {
+                continue;
+            };
+            let pointer_over = self.pointer.is_visible() && !self.pointer.rect().intersect(&out.rect).is_empty();
+            if !on || pointer_over {
+                continue;
+            }
+            if let Some((phys, pitch)) = plan[index].and_then(|at| self.windows.get(at)).and_then(Window::scanout_source) {
+                flips[index] = Some((id, phys, pitch));
+            }
+        }
+        for index in 0..self.outputs.len().min(MAX_OUTPUTS) {
+            if self.flipped[index].is_some() && flips[index].is_none() {
+                let rect = self.outputs[index].rect;
+                self.mark(rect);
+            }
+        }
+        flips
+    }
+
+    /// Point the displays at the planned buffers (or back at their frame
+    /// buffers, already repainted this frame). A flip the display refuses
+    /// (channel busy) falls back to the copy.
+    fn finish_flips(&mut self, plan: &[Option<usize>; MAX_OUTPUTS], flips: &[Option<(u32, u64, u32)>; MAX_OUTPUTS]) {
+        for index in 0..self.outputs.len().min(MAX_OUTPUTS) {
+            let want = flips[index].map(|(_, phys, _)| phys);
+            if want == self.flipped[index] {
+                if want.is_some() {
+                    super::note_flip();
+                }
+                continue;
+            }
+            let id = match (flips[index], self.outputs[index].backend) {
+                (Some((id, _, _)), _) | (None, crate::display::outputs::Backend::Nvidia(id)) => id,
+                _ => {
+                    self.flipped[index] = None;
+                    continue;
+                }
+            };
+            let pitch = flips[index].map_or(0, |(_, _, pitch)| pitch);
+            match crate::display::nvidia_disp::scanout(id, want, pitch) {
+                Ok(()) => {
+                    if want.is_some() != self.flipped[index].is_some() {
+                        crate::kprintln!(
+                            "  desktop     : output {index} {}",
+                            if want.is_some() { "scans the fullscreen window's buffer out directly (no copy)" } else { "scans its frame buffer out again" }
+                        );
+                    }
+                    self.flipped[index] = want;
+                    if want.is_some() {
+                        super::note_flip();
+                    }
+                }
+                Err(why) => {
+                    if want.is_some() {
+                        // Copy instead; the display keeps what it showed.
+                        if let Some(at) = plan[index] {
+                            let rect = self.outputs[index].rect;
+                            self.blit_direct(index, at, rect);
+                        }
+                    } else {
+                        crate::kprintln!("  desktop     : output {index} could not scan its frame buffer out again: {why}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// One copy from the window pixels into the output, the pointer patched
+    /// over it through a small buffer (the only layer allowed above).
+    fn blit_direct(&mut self, index: usize, at: usize, part: Rect) {
+        let started = crate::time::uptime_ns();
+        let (Some(out), Some(window)) = (self.outputs.get(index), self.windows.get(at)) else {
+            return;
+        };
+        let Some(pixels) = window.direct_pixels() else {
+            return;
+        };
+        let o = out.rect;
+        let w = window.rect;
+        out.screen.blit(pixels, (part.x - o.x, part.y - o.y), Rect::new(part.x - w.x, part.y - w.y, part.w, part.h));
+        if !self.hw_cursor && self.pointer.is_visible() {
+            let spot = self.pointer.rect().intersect(&part);
+            if !spot.is_empty() {
+                if let Some(mut patch) = Surface::new(spot.w, spot.h, Color::rgb(0, 0, 0)) {
+                    patch.blit_from(pixels, (0, 0), Rect::new(spot.x - w.x, spot.y - w.y, spot.w, spot.h));
+                    self.pointer.draw_at(&mut patch, -spot.x, -spot.y);
+                    out.screen.blit(&patch, (spot.x - o.x, spot.y - o.y), patch.bounds());
+                }
+            }
+        }
+        // The flush is counted in the direct time (not in `note_flush`).
+        crate::display::flush_output(out.backend, out.primary, part.x - o.x, part.y - o.y, part.w, part.h);
+        super::note_direct(crate::time::uptime_ns().wrapping_sub(started), u64::from(part.w) * u64::from(part.h));
+    }
+
+    /// Window name for the log (G3).
+    fn label(&self, app: App) -> alloc::string::String {
+        self.caption_of(app).unwrap_or_else(|| alloc::string::String::from(app.title()))
+    }
+
+    /// The program changed `area` of its pixels (`None` - all): copy into
+    /// the window surface, or - while the window is shown directly - only
+    /// note the damage (G3).
+    pub fn commit_program(&mut self, app: App, area: Option<Rect>) {
+        let direct = self.direct.contains(&Some(app));
+        let Some(window) = self.find(app) else {
+            return;
+        };
+        if direct && window.direct_pixels().is_some() {
+            window.defer_commit(area);
+        } else if window.stale {
+            window.refresh_stale();
+        } else {
+            window.commit(area);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // G3: pointer constraints (`zwp_pointer_constraints_v1`)
+    // -----------------------------------------------------------------------
+
+    /// Ask (or with `None` drop) a lock/confinement of the pointer for a
+    /// program window. It becomes active when the window has the focus, no
+    /// desktop menu is open and the pointer is over it (see
+    /// [`Self::update_constraint`]).
+    pub fn set_constraint(&mut self, app: App, wanted: Option<(bool, Option<Rect>)>) {
+        let same = self.constraint.is_some_and(|c| c.app == app);
+        match wanted {
+            Some((lock, region)) => {
+                if let Some(c) = self.constraint.as_mut().filter(|_| same) {
+                    if c.lock == lock {
+                        c.region = region;
+                        return;
+                    }
+                }
+                self.end_constraint();
+                self.constraint = Some(Constraint { app, lock, region, hint: None, active: false });
+            }
+            None if same => {
+                self.end_constraint();
+                self.constraint = None;
+            }
+            None => {}
+        }
+        self.update_constraint();
+    }
+
+    /// Where the pointer goes when the lock ends (program-local).
+    pub fn set_constraint_hint(&mut self, app: App, x: i32, y: i32) {
+        if let Some(c) = self.constraint.as_mut().filter(|c| c.app == app) {
+            c.hint = Some((x, y));
+        }
+    }
+
+    /// Is the constraint of `app` active (`None` - none asked)?
+    #[must_use]
+    pub fn constraint_active(&self, app: App) -> Option<bool> {
+        self.constraint.filter(|c| c.app == app).map(|c| c.active)
+    }
+
+    /// The active constraint: the window and whether it locks.
+    #[must_use]
+    pub fn active_constraint(&self) -> Option<(App, bool)> {
+        self.constraint.filter(|c| c.active).map(|c| (c.app, c.lock))
+    }
+
+    /// Where the pointer may be while the confinement is active (screen).
+    fn confine_rect(&self) -> Option<Rect> {
+        let c = self.constraint.filter(|c| c.active && !c.lock)?;
+        let window = self.windows.iter().find(|window| window.app == c.app)?;
+        let (ox, oy) = window.content_origin();
+        let body = Rect::new(ox, oy, window.rect.w.saturating_sub((ox - window.rect.x) as u32), window.rect.h.saturating_sub((oy - window.rect.y) as u32));
+        let area = match c.region {
+            Some(region) => region.translate(ox, oy).intersect(&body),
+            None => body,
+        };
+        (!area.is_empty()).then_some(area)
+    }
+
+    /// Activate or end the constraint: active only while its window is
+    /// focused and in front of the desktop menus (Alt+Tab, Win, Start, a
+    /// context menu or the lock screen end it); it starts when the pointer is
+    /// over the window (inside the confinement region).
+    pub fn update_constraint(&mut self) {
+        let Some(c) = self.constraint else {
+            return;
+        };
+        let window = self.windows.iter().find(|window| window.app == c.app && !window.minimized);
+        let eligible = window.is_some()
+            && self.focused_app() == Some(c.app)
+            && self.lock.is_none()
+            && self.start.is_none()
+            && !self.menu_open()
+            && !self.context.as_ref().is_some_and(|menu| menu.is_open())
+            && self.thumbs.is_none()
+            && self.tray_pop.is_none()
+            && self.drag.is_none();
+        if c.active && !eligible {
+            self.end_constraint();
+            return;
+        }
+        if c.active || !eligible {
+            return;
+        }
+        let Some(window) = window else {
+            return;
+        };
+        let (px, py) = self.pointer.position();
+        let (ox, oy) = window.content_origin();
+        let inside = window.rect.contains(px, py)
+            && c.region.is_none_or(|region| region.contains(px - ox, py - oy));
+        if !inside {
+            return;
+        }
+        if let Some(active) = self.constraint.as_mut() {
+            active.active = true;
+        }
+        crate::kprintln!("  desktop     : pointer {} by '{}'", if c.lock { "locked" } else { "confined" }, self.label(c.app));
+        if c.lock {
+            let rect = self.pointer.rect();
+            if self.pointer.hide() {
+                if self.hw_cursor {
+                    crate::display::cursor_visible(false, px, py);
+                }
+                self.mark(rect);
+            }
+        }
+    }
+
+    /// The constraint stops being active: the pointer comes back (at the
+    /// hint of a lock, if the program gave one).
+    fn end_constraint(&mut self) {
+        let Some(c) = self.constraint.filter(|c| c.active) else {
+            return;
+        };
+        if let Some(active) = self.constraint.as_mut() {
+            active.active = false;
+        }
+        crate::kprintln!("  desktop     : pointer {} by '{}'", if c.lock { "unlocked" } else { "unconfined" }, self.label(c.app));
+        if !c.lock {
+            return;
+        }
+        if let (Some((hx, hy)), Some(window)) = (c.hint, self.windows.iter().find(|window| window.app == c.app)) {
+            let (ox, oy) = window.content_origin();
+            let outs = self.out_rects;
+            let before = self.pointer.rect();
+            if self.pointer.move_to(ox + hx, oy + hy, &outs[..self.outputs.len().min(MAX_OUTPUTS)]) {
+                self.mark(before);
+            }
+        }
+        self.pointer.show();
+        let (x, y) = self.pointer.position();
+        if self.hw_cursor {
+            crate::display::cursor_visible(true, x, y);
+            self.cursor_sent = (x, y);
+        }
+        let rect = self.pointer.rect();
+        self.mark(rect);
+    }
+
+    /// Mouse motion under a constraint (G3). `Some(delta)` - what the desktop
+    /// pointer should move by instead of the device delta: zero while locked,
+    /// cut to the region while confined. `None` - no active constraint.
+    pub fn constrain_motion(&mut self, dx: i32, dy: i32) -> Option<(i32, i32)> {
+        self.update_constraint();
+        let c = self.constraint.filter(|c| c.active)?;
+        if c.lock {
+            return Some((0, 0));
+        }
+        let area = self.confine_rect()?;
+        let (x, y) = self.pointer.position();
+        let tx = (x + dx).clamp(area.x, area.right() - 1);
+        let ty = (y + dy).clamp(area.y, area.bottom() - 1);
+        Some((tx - x, ty - y))
+    }
+
+    /// Absolute pointing device (tablet): the step from its last position,
+    /// in desktop pixels, and remember the new one.
+    pub fn tablet_step(&mut self, x_fraction: u16, y_fraction: u16) -> (i32, i32) {
+        let p = self.primary;
+        let at = (p.x + scale_fraction(x_fraction, p.w), p.y + scale_fraction(y_fraction, p.h));
+        let step = self.tablet_last.map_or((0, 0), |last| (at.0 - last.0, at.1 - last.1));
+        self.tablet_last = Some(at);
+        step
     }
 
     /// Собрать сцену под летящим окном, если она нужна и её ещё нет (фаза 64).

@@ -47,10 +47,17 @@ const H_CORE: u32 = 0xc67d_0000;
 const H_SYNC: u32 = 0xf000_0000;
 const H_VRAM: u32 = 0xf000_0001;
 const H_FB: u32 = 0xfb00_0000;
+/// G3: system memory for direct scanout of a client buffer.
+const H_SYS: u32 = 0xf000_0002;
 /// Объекты ctxdma в памяти экземпляров.
 const OBJ_SYNC: u32 = 0x2000;
 const OBJ_VRAM: u32 = 0x2020;
 const OBJ_FB: u32 = 0x2040;
+const OBJ_SYS: u32 = 0x2060;
+
+/// G3: direct scanout of fullscreen client buffers (`scanout flip on`).
+/// Off by default until checked on the RTX 3060.
+pub static FLIP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 // --- видеопамять через BAR1 ---------------------------------------------------
 
@@ -93,6 +100,11 @@ struct Disp {
     heads: Vec<(u32, u32, edid::Mode)>,
     /// Основной монитор: тот, что зажгла прошивка (на нём был стол).
     primary: u32,
+    /// G3: BAR0 for the window channel flips outside a modeset.
+    bar: Bar0,
+    /// G3: per head, the system memory address scanned out instead of its
+    /// frame buffer (`None` - the frame buffer).
+    flipped: [Option<u64>; 4],
 }
 
 // SAFETY: только адреса окна BAR1 и память буферов команд — владелец один.
@@ -424,6 +436,10 @@ fn bring_up(rm: &mut Rm, log: &mut Log, internal: (u32, u32), device: crate::pci
     ctxdma(vram, OBJ_SYNC, 0x45, SYNC, SYNC + 0xfff);
     ctxdma(vram, OBJ_VRAM, 0x45, 0, VRAM_MAP_END - 1);
     ctxdma(vram, OBJ_FB, 0x45, 0, VRAM_MAP_END - 1);
+    // G3 (21.11): system memory (PCI, coherent: target 2 as in nouveau's
+    // `gv100_dmaobj_new`) for scanning out a game's buffer directly
+    // (`scanout`, opt-in `scanout flip on`). Untested on hardware.
+    ctxdma(vram, OBJ_SYS, 0x46, 0, (1u64 << 40) - 1);
 
     // Ручной DisplayPort: линию тренируем мы (через RM), а не RM сам.
     rm.disp(0x0073_1365, &u32s(&[0]))?;
@@ -460,13 +476,27 @@ fn bring_up(rm: &mut Rm, log: &mut Log, internal: (u32, u32), device: crate::pci
                 ramht_insert(vram, H_SYNC, chn, OBJ_SYNC);
                 ramht_insert(vram, H_VRAM, chn, OBJ_VRAM);
                 ramht_insert(vram, H_FB, chn, OBJ_FB);
+                ramht_insert(vram, H_SYS, chn, OBJ_SYS);
                 windows[w as usize] = Some(channel);
             }
             Err(why) => log.push(format!("window {w}: {why}")),
         }
     }
     log.push(format!("window channels up: {:?}", windows.iter().enumerate().filter(|(_, c)| c.is_some()).map(|(i, _)| i).collect::<Vec<_>>()));
-    Ok(Disp { vram, core, windows, window_mask, owners_sent: false, used_sors: 0, gpu_max_rate, increased_wm, heads: Vec::new(), primary: 0 })
+    Ok(Disp {
+        vram,
+        core,
+        windows,
+        window_mask,
+        owners_sent: false,
+        used_sors: 0,
+        gpu_max_rate,
+        increased_wm,
+        heads: Vec::new(),
+        primary: 0,
+        bar,
+        flipped: [None; 4],
+    })
 }
 
 fn new_channel(rm: &mut Rm, internal: (u32, u32), class: u32, instance: u32, user: usize, chn: u32) -> Res<Channel> {
@@ -784,6 +814,9 @@ fn set_head(rm: &mut Rm, log: &mut Log, disp: &mut Disp, head: u32, id: u32, lin
     let window = *window;
     core_update(disp, bar, 1 << w)?;
     window.idle(bar)?;
+    if let Some(slot) = disp.flipped.get_mut(head as usize) {
+        *slot = None;
+    }
     log.push(format!("C3: head {head} shows {}x{} from VRAM {:#x} (pitch {pitch})", mode.width, mode.height, fb(head)));
     Ok(())
 }
@@ -900,6 +933,44 @@ pub fn set_primary(width: u32, height: u32, refresh_mhz: u32) -> Result<boot_inf
         stride: pitch / 4,
         format: boot_info::PixelFormat::Bgr,
     })
+}
+
+/// G3 (21.11): scan out `phys` (physically contiguous system memory,
+/// `pitch` bytes per row, the head's size and format) on the head of output
+/// `id` instead of its frame buffer - a page flip of the window channel, no
+/// copy; `None` - back to the frame buffer. Never waits: a channel that has
+/// not taken the previous flip yet answers `Err` and the caller copies.
+pub fn scanout(id: u32, phys: Option<u64>, pitch: u32) -> Result<(), &'static str> {
+    let mut guard = DISP.try_lock().ok_or("display busy")?;
+    let disp = guard.as_mut().ok_or("display not set up")?;
+    let (head, _, mode) = disp.heads.iter().find(|(_, o, _)| *o == id).copied().ok_or("output not lit")?;
+    let slot = head as usize;
+    if disp.flipped.get(slot).copied().flatten() == phys {
+        return Ok(());
+    }
+    let fb_pitch = (mode.width * 4).div_ceil(64) * 64;
+    if phys.is_some() && (pitch != fb_pitch || pitch % 64 != 0) {
+        return Err("pitch differs from the head's");
+    }
+    let bar = disp.bar;
+    let window = disp.windows.get_mut(2 * slot).and_then(Option::as_mut).ok_or("no window channel")?;
+    // The previous flip must have been read (GET == PUT), else skip.
+    if bar.rd(window.user + 4) != window.cur * 4 {
+        return Err("window channel busy");
+    }
+    let (ctx, at) = match phys {
+        Some(addr) => (H_SYS, addr),
+        None => (H_FB, fb(head)),
+    };
+    window.push(0x0240, &[ctx]);
+    window.push(0x0260, &[(at >> 8) as u32]);
+    // No interlock with core: a plain flip (the modeset left core
+    // interlock flags set - an UPDATE would wait for a core update).
+    window.push(0x0370, &[0, 0]);
+    window.push(0x0200, &[1]);
+    window.kick(bar);
+    disp.flipped[slot] = phys;
+    Ok(())
 }
 
 /// Размер картинки основного монитора, если он зажжён.

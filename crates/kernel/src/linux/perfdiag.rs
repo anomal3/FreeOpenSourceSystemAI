@@ -116,6 +116,8 @@ struct Mark {
     wayland: [u64; 11],
     desktop: (u64, u64, u64, u64, u64),
     flush_ns: u64,
+    /// G3: fullscreen fast path `(pieces, ns, points, flipped frames)`.
+    direct: (u64, u64, u64, u64),
     outputs: [(u64, u64); crate::ui::OUTPUT_STATS],
     /// G2: `(wait-queue sleeps, wakes by key, idle rounds without the lock,
     /// zeroed frames from the caches, cache refills)`.
@@ -156,6 +158,7 @@ impl Mark {
             ],
             desktop: crate::ui::timing(),
             flush_ns: crate::ui::flush_ns(),
+            direct: crate::ui::direct_stats(),
             outputs: core::array::from_fn(crate::ui::output_blit),
             g2: {
                 let (sleeps, wakes) = crate::sched::wait_queue_stats();
@@ -407,6 +410,26 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
         // размера и между железом и QEMU.
         let mpx_s = if ns == 0 { 0 } else { px * 1000 / ns };
         let _ = write!(line, "; out{index} {} ms/frame ({mpx_s} Mpx/s)", ms(ns / per_frame));
+    }
+    // G3: fullscreen windows shown straight from their pixels (no compose):
+    // microseconds per copy - the target is < 500 us at 2560x1440.
+    let direct = (
+        new.direct.0.saturating_sub(old.direct.0),
+        new.direct.1.saturating_sub(old.direct.1),
+        new.direct.2.saturating_sub(old.direct.2),
+        new.direct.3.saturating_sub(old.direct.3),
+    );
+    if direct.0 > 0 || direct.3 > 0 {
+        let _ = write!(
+            line,
+            "; direct {} copies ({} us each, {} Kpx each, {} MB/s), {} frames scanned out of the client buffer, {} us per zero-copy show",
+            direct.0,
+            direct.1 / direct.0.max(1) / 1000,
+            direct.2 / direct.0.max(1) / 1000,
+            if direct.1 == 0 { 0 } else { direct.2 * 4 * 1000 / direct.1 },
+            direct.3,
+            wl[8] / wl[7].max(1) / 1000,
+        );
     }
     kprintln!("  perf-diag   : {line}");
 }

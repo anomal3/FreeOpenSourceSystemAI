@@ -486,6 +486,14 @@ pub struct Window {
     /// Маленький диалог программы (20.11, `user_abi::WIN_STYLE_DIALOG`,
     /// «Выполнить»): в заголовке только крестик.
     pub dialog: bool,
+    /// G3 (21.11): the window is shown straight from the program pixels
+    /// (fullscreen fast path, `Compositor::direct_plan`) and its own surface
+    /// was not updated since - copy everything before composing it again.
+    pub stale: bool,
+    /// G3: the program pixels are a client buffer in physically contiguous
+    /// memory - `(address of the pixels, physical address)`; a display that
+    /// can scan out of system memory shows it without any copy.
+    pub direct_phys: Option<(usize, u64)>,
 }
 
 /// Учёт обводки окна (20.11).
@@ -794,6 +802,8 @@ impl Window {
             full_size: (0, 0),
             self_sized: false,
             dialog: false,
+            stale: false,
+            direct_phys: None,
         }
     }
 
@@ -3036,6 +3046,58 @@ impl Window {
         }
     }
 
+    /// G3 (21.11): the program pixels when they can go to the screen as they
+    /// are - an opaque frameless program window whose pixels are exactly its
+    /// surface (no frame, title, `fit` offset or alpha). `None` otherwise.
+    #[must_use]
+    pub fn direct_pixels(&self) -> Option<&Surface> {
+        if self.popup || !self.frameless || self.fit || self.translucent || self.shaped || self.minimized {
+            return None;
+        }
+        match &self.content {
+            Content::Program(view)
+                if (view.pixels.width(), view.pixels.height()) == (self.surface.width(), self.surface.height())
+                    && (self.rect.w, self.rect.h) == (self.surface.width(), self.surface.height())
+                    && self.pixels_at() == (0, 0) =>
+            {
+                Some(&view.pixels)
+            }
+            _ => None,
+        }
+    }
+
+    /// G3: physical address and pitch of the pixels shown directly, when they
+    /// are a contiguous client buffer (see [`Self::direct_phys`]).
+    #[must_use]
+    pub fn scanout_source(&self) -> Option<(u64, u32)> {
+        let pixels = self.direct_pixels()?;
+        let (at, phys) = self.direct_phys?;
+        (pixels.row(0).as_ptr() as usize == at).then(|| (phys, pixels.width() * 4))
+    }
+
+    /// G3: the program changed `area` of its pixels while the window is shown
+    /// directly - remember the damage (screen gets it from the pixels), do not
+    /// copy into the surface.
+    pub fn defer_commit(&mut self, area: Option<Rect>) {
+        let Content::Program(view) = &self.content else {
+            return;
+        };
+        let whole = view.pixels.bounds();
+        let src = area.unwrap_or(whole).intersect(&whole);
+        if src.is_empty() {
+            return;
+        }
+        self.stale = true;
+        self.damage = self.damage.union(&src);
+    }
+
+    /// G3: the window leaves the direct path - bring its surface up to date.
+    pub fn refresh_stale(&mut self) {
+        if core::mem::take(&mut self.stale) {
+            self.commit(None);
+        }
+    }
+
     /// Лежит ли в очереди непрочитанная просьба закрыться.
     #[must_use]
     pub fn close_pending(&self) -> bool {
@@ -3085,8 +3147,39 @@ impl Window {
                     return true;
                 }
             }
+            // G3: a relative motion after the last move - replace the move
+            // before it (relative and absolute motion do not depend on order).
+            let len = view.events.len();
+            if len >= 2 && view.events[len - 1].kind == super::WIN_RELMOTION && view.events[len - 2].kind == user_abi::WIN_MOVE {
+                view.events[len - 2] = event;
+                return true;
+            }
         }
         self.push_event(event)
+    }
+
+    /// G3: raw mouse motion for `zwp_relative_pointer_v1` - added to the last
+    /// queued relative motion, so a burst of reports costs one queue slot and
+    /// loses nothing (unlike [`Self::push_move`], deltas must add up).
+    pub fn push_relative(&mut self, dx: i32, dy: i32) -> bool {
+        if let Content::Program(view) = &mut self.content {
+            // The last relative motion among the last two events (a pointer
+            // move may sit between them: their order does not matter).
+            let len = view.events.len();
+            for at in (len.saturating_sub(2)..len).rev() {
+                let kind = view.events[at].kind;
+                if kind == super::WIN_RELMOTION {
+                    let last = &mut view.events[at];
+                    last.x = last.x.saturating_add(dx);
+                    last.y = last.y.saturating_add(dy);
+                    return true;
+                }
+                if kind != user_abi::WIN_MOVE {
+                    break;
+                }
+            }
+        }
+        self.push_event(WinEvent { kind: super::WIN_RELMOTION, code: 0, x: dx, y: dy })
     }
 
     /// Забрать самое старое событие. `None` — очередь пуста.

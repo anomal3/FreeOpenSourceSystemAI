@@ -1893,6 +1893,39 @@ pub fn take_worst_frame_ns() -> u64 {
     WORST_FRAME_NS.swap(0, Ordering::Relaxed)
 }
 
+/// G3 (21.11): outputs filled straight from a fullscreen window's pixels -
+/// pieces, nanoseconds (copy + pointer patch + flush) and points.
+static DIRECT_PIECES: AtomicU64 = AtomicU64::new(0);
+static DIRECT_NS: AtomicU64 = AtomicU64::new(0);
+static DIRECT_POINTS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one direct copy (compositor).
+pub fn note_direct(ns: u64, points: u64) {
+    DIRECT_PIECES.fetch_add(1, Ordering::Relaxed);
+    DIRECT_NS.fetch_add(ns, Ordering::Relaxed);
+    DIRECT_POINTS.fetch_add(points, Ordering::Relaxed);
+}
+
+/// G3: frames the display showed straight from a client buffer (flip).
+static FLIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a frame scanned out of a client buffer.
+pub fn note_flip() {
+    FLIPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Direct copies since boot: `(pieces, ns, points, flipped frames)`
+/// (`perf-diag`).
+#[must_use]
+pub fn direct_stats() -> (u64, u64, u64, u64) {
+    (
+        DIRECT_PIECES.load(Ordering::Relaxed),
+        DIRECT_NS.load(Ordering::Relaxed),
+        DIRECT_POINTS.load(Ordering::Relaxed),
+        FLIPS.load(Ordering::Relaxed),
+    )
+}
+
 /// Записать, во что обошлась одна полоса кадра. Зовётся из композитора.
 pub fn note_band(draw_ns: u64, blit_ns: u64, points: u64) {
     BANDS.fetch_add(1, Ordering::Relaxed);
@@ -2652,6 +2685,26 @@ pub fn dispatch_pointer(event: PointerEvent) {
     }
 }
 
+/// G3: raw mouse motion to the Wayland window that has the pointer: the
+/// window of the active constraint, else the window holding the capture
+/// (a button is down), else the one under the pointer. Only Wayland windows
+/// ([`Window::raw_keys`]) understand [`WIN_RELMOTION`].
+fn send_relative(desktop: &mut Compositor, (dx, dy): (i32, i32)) {
+    let target = match desktop.active_constraint() {
+        Some((app, _)) => Some(app),
+        None => match desktop.captured() {
+            Some((app, _)) => Some(app),
+            None => {
+                let (x, y) = desktop.pointer_position();
+                desktop.program_under(x, y).map(|(app, _, _)| app)
+            }
+        },
+    };
+    if let Some(window) = target.and_then(|app| desktop.find(app)).filter(|window| window.raw_keys) {
+        window.push_relative(dx, dy);
+    }
+}
+
 /// Код средней кнопки в [`WIN_POINTER`] и [`WIN_RELEASE`] (20.11) — третий
 /// бит маски кнопок, как у [`WIN_MOVE`]: 1 левая, 2 правая, 4 средняя.
 const MIDDLE_BUTTON: u32 = 4;
@@ -2935,14 +2988,36 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     // На сколько сдвинулся курсор. У мыши это приехало в отчёте, у планшета
     // приходится вычесть одно положение из другого: устройство сообщило точку,
     // а окно можно тащить только на разницу.
+    // G3 (21.11): a game may lock the pointer (it stays and hides) or confine
+    // it to its window; the raw motion goes to it as relative motion either
+    // way (`zwp_relative_pointer_v1`), without our pointer acceleration.
+    let mut relative = (0, 0);
     let (dx, dy) = match event.absolute {
-        Some((x, y)) => desktop.move_pointer_to(x, y),
+        Some((x, y)) => {
+            relative = desktop.tablet_step(x, y);
+            match desktop.constrain_motion(relative.0, relative.1) {
+                None => desktop.move_pointer_to(x, y),
+                Some((mx, my)) => {
+                    if mx != 0 || my != 0 {
+                        desktop.move_pointer(mx, my);
+                    }
+                    (mx, my)
+                }
+            }
+        }
         None if event.dx != 0 || event.dy != 0 => {
-            desktop.move_pointer(event.dx, event.dy);
-            (event.dx, event.dy)
+            relative = (event.dx, event.dy);
+            let (mx, my) = desktop.constrain_motion(event.dx, event.dy).unwrap_or((event.dx, event.dy));
+            if mx != 0 || my != 0 {
+                desktop.move_pointer(mx, my);
+            }
+            (mx, my)
         }
         None => (0, 0),
     };
+    if relative != (0, 0) {
+        send_relative(desktop, relative);
+    }
 
     if dx != 0 || dy != 0 {
         // Перетаскивание — это движение окна вслед за указателем на то же
@@ -6490,6 +6565,82 @@ pub fn shell_status(status: Option<&str>) {
 /// в ядре (фаза 71i); родным программам он не приходит.
 pub const WIN_RAWKEY: u32 = 0x100;
 
+/// G3 (21.11): raw mouse motion (`x`, `y` - device delta, summed while
+/// queued), only to Wayland windows ([`raw_keys_window`]).
+pub const WIN_RELMOTION: u32 = 0x101;
+
+/// G3: lock (`lock`) or confine the pointer for a program window, `region`
+/// in its pixels (`None` - the whole window); `wanted == None` drops it.
+pub fn constrain_pointer(task: u32, slot: u32, wanted: Option<(bool, Option<Rect>)>) {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        desktop.set_constraint(app, wanted);
+        desktop.present();
+    });
+}
+
+/// G3: is the constraint of the window active now (`false` also when the
+/// desktop holds none for it)? `None` - the desktop is busy, ask again.
+#[must_use]
+pub fn pointer_constrained(task: u32, slot: u32) -> Option<bool> {
+    with_desktop(|desktop| {
+        desktop.update_constraint();
+        let state = desktop.constraint_active(App::Program(task, slot)).unwrap_or(false);
+        desktop.present();
+        state
+    })
+}
+
+/// G3: where to put the pointer when the lock of this window ends.
+pub fn constraint_hint(task: u32, slot: u32, x: i32, y: i32) {
+    with_desktop(|desktop| desktop.set_constraint_hint(App::Program(task, slot), x, y));
+}
+
+/// G3: `ui direct on|off` - fullscreen fast path for A/B measurements.
+pub fn direct_command(argument: &str) -> String {
+    match argument.trim() {
+        "on" => compositor::DIRECT.store(true, Ordering::Relaxed),
+        "off" => compositor::DIRECT.store(false, Ordering::Relaxed),
+        // NVIDIA: scan the game's buffer out directly (page flip, no copy).
+        "flip on" => crate::display::nvidia_disp::FLIP.store(true, Ordering::Relaxed),
+        "flip off" => crate::display::nvidia_disp::FLIP.store(false, Ordering::Relaxed),
+        "" => {}
+        _ => return String::from("  wldirect: usage `wldirect [on|off|flip on|flip off]`"),
+    }
+    with_desktop(|desktop| {
+        desktop.repaint_all();
+        desktop.present();
+    });
+    let (pieces, ns, points, flips) = direct_stats();
+    alloc::format!(
+        "  wldirect: {} ({pieces} direct copies, {} us each, {} Kpx each; {flips} frames scanned out of client buffers since boot; scanout flip {})",
+        if compositor::DIRECT.load(Ordering::Relaxed) { "on" } else { "off" },
+        ns / pieces.max(1) / 1000,
+        points / pieces.max(1) / 1000,
+        if crate::display::nvidia_disp::FLIP.load(Ordering::Relaxed) { "on" } else { "off (`wldirect flip on` to try)" }
+    )
+}
+
+/// G3: raise and focus a program window (`xdg_activation_v1.activate`).
+pub fn activate_window(task: u32, slot: u32) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        desktop.index_of(app).ok_or(WindowError::NoWindow)?;
+        if desktop.find(app).is_some_and(|window| window.minimized) {
+            desktop.restore(app);
+        }
+        if let Some(index) = desktop.index_of(app) {
+            desktop.raise(index);
+        }
+        kprintln!("  desktop     : '{}' activated", name_of(desktop, app));
+        log_focus(desktop);
+        desktop.refresh_panel(&status_now());
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
 /// Окну программы — коды клавиш вместо символов (фаза 71i).
 pub fn raw_keys_window(task: u32, slot: u32) -> Result<(), WindowError> {
     with_desktop(|desktop| {
@@ -6528,7 +6679,8 @@ pub fn paint_window(task: u32, slot: u32, area: Rect, paint: impl FnOnce(&mut Su
             return Err(WindowError::NoWindow);
         };
         paint(pixels);
-        window.commit(Some(area));
+        // G3: shown directly - no copy into the window surface.
+        desktop.commit_program(app, Some(area));
         desktop.present();
         Ok(())
     })
@@ -6540,7 +6692,11 @@ pub fn paint_window(task: u32, slot: u32, area: Rect, paint: impl FnOnce(&mut Su
 /// клиента — кадр игры во весь экран больше не копируется в окно отдельно.
 /// Ответ — прежняя поверхность; `Err` — вернуть переданную (стол занят, окна
 /// нет, размер другой).
-pub fn swap_window_pixels(task: u32, slot: u32, pixels: Surface, area: Rect) -> Result<Surface, Surface> {
+///
+/// `phys` (G3): the physical address of `pixels` when they are a physically
+/// contiguous client buffer - a display that scans out of system memory
+/// shows them with no copy at all; `None` - ordinary memory.
+pub fn swap_window_pixels(task: u32, slot: u32, pixels: Surface, area: Rect, phys: Option<u64>) -> Result<Surface, Surface> {
     let app = App::Program(task, slot);
     let mut pixels = Some(pixels);
     let swapped = with_desktop(|desktop| {
@@ -6551,8 +6707,12 @@ pub fn swap_window_pixels(task: u32, slot: u32, pixels: Surface, area: Rect) -> 
             pixels = Some(next);
             return None;
         }
+        let at = next.row(0).as_ptr() as usize;
         let old = core::mem::replace(current, next);
-        window.commit(Some(area));
+        window.direct_phys = phys.map(|phys| (at, phys));
+        // G3: a fullscreen window shown directly goes to the screen from
+        // these pixels - no copy into the window surface, no compose.
+        desktop.commit_program(app, Some(area));
         desktop.present();
         Some(old)
     })
