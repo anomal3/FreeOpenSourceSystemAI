@@ -2067,7 +2067,7 @@ fn help() {
     sprintln!("  panic now     stop this machine with a kernel panic (to test the snapshot)");
     sprintln!("  pci           every device on the bus, with its identifiers");
     sprintln!("  acpidump SIG  an ACPI table (DSDT, FACP, APIC...) in hex to the kernel log");
-    sprintln!("  amd [vbios|smc [start]|ucode|ring]  AMD graphics card: PCI, IP discovery or Polaris registers; vbios reads the ROM, smc the power controller");
+    sprintln!("  amd [vbios|smc [start]|ucode|ring|gart]  AMD graphics card: PCI, IP discovery or Polaris registers; vbios reads the ROM, smc the power controller");
     sprintln!("  ui [reset]    compositor state and frame timing; reset zeroes it");
     sprintln!("  tasks         scheduler state");
     sprintln!("  ls [path]     list a directory of the mounted filesystem");
@@ -2468,6 +2468,14 @@ fn amd(argument: &str) {
     // видеопамять и просит SMC загрузить блоки; нужна работающая SMC).
     // `amd ring` — запустить CP и проверить кольцо GFX (ПИШЕТ в регистры CP и
     // видеопамять; нужны SMC, микрокод и апертура MC: `amd smc start`, `amd ucode`).
+    // `amd gart` — включить GART для VMID0 и проверить доступ GPU к системной
+    // памяти (ПИШЕТ в регистры MC/VM и видеопамять; нужно работающее кольцо).
+    if argument.trim() == "gart" {
+        for line in crate::display::amd::polaris_gart() {
+            sprintln!("  amd: {line}");
+        }
+        return;
+    }
     if argument.trim() == "ring" {
         for line in crate::display::amd::polaris_ring() {
             sprintln!("  amd: {line}");

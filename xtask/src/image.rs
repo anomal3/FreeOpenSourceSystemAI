@@ -325,6 +325,14 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // The second marker (FOSSAI_AMD_UCODE=1) also loads the CP/RLC/SDMA
             // microcode through the started SMC (P3).
             // The third marker (FOSSAI_AMD_RING=1) also starts the CP and tests the GFX ring (P4).
+            // The fourth marker (FOSSAI_AMD_GART=1) also enables the GART of VMID0 and tests it (P5).
+            if std::env::var("FOSSAI_AMD_GART").is_ok_and(|v| v == "1") {
+                payload.push(Payload {
+                    path: String::from("FREEOS/AMD/GART.TXT"),
+                    data: b"gart\n".to_vec(),
+                    source: PathBuf::from("(FOSSAI_AMD_GART=1)"),
+                });
+            }
             if std::env::var("FOSSAI_AMD_RING").is_ok_and(|v| v == "1") {
                 payload.push(Payload {
                     path: String::from("FREEOS/AMD/RING.TXT"),
