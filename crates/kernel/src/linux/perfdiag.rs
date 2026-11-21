@@ -350,8 +350,9 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     }
     let _ = write!(
         line,
-        ", {slow_total} slow (>0.5 ms) since boot; wait queues {} sleeps {} woken by key; idle rounds without the lock {}; zeroed frames {} from cpu caches, {} refills",
-        g2[0], g2[1], g2[2], g2[3], g2[4]
+        ", {slow_total} slow (>0.5 ms) since boot; wait queues {} sleeps {} woken by key; idle rounds without the lock {}; zeroed frames {} from cpu caches, {} refills; yields without the lock {} since boot",
+        g2[0], g2[1], g2[2], g2[3], g2[4],
+        crate::sched::fast_yields(),
     );
     kprintln!("  perf-diag   : {line}");
 

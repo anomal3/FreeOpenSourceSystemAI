@@ -522,7 +522,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::UMASK => 0o022,
             nr::GETTIMEOFDAY => gettimeofday(a0),
             nr::TIME => time(a0),
-            nr::GETRUSAGE => zero_out(a1, 144),
+            nr::GETRUSAGE => getrusage(a0 as i32, a1),
             nr::SYSINFO => sysinfo(a0),
             nr::TIMES => times(a0),
             // Группы процессов и сеансы: процесс один и сам себе группа.
@@ -1655,10 +1655,43 @@ fn sysinfo(out: usize) -> i64 {
 /// `times`: процессорного времени по процессу ядро не считает — нули; ответ —
 /// время работы в тиках по 10 мс (`AT_CLKTCK` = 100).
 fn times(out: usize) -> i64 {
-    if out != 0 && zero_out(out, 32) != 0 {
-        return -e::EFAULT;
+    if out != 0 {
+        if !space::user_can(out, 32, PageFlags::WRITE) {
+            return -e::EFAULT;
+        }
+        // `tms_utime` in clock ticks (100 Hz); the rest zero. The kernel does
+        // not split user and system time.
+        let ticks = crate::sched::process_cpu_ns() / 10_000_000;
+        // SAFETY: checked one line above.
+        unsafe { core::ptr::write_unaligned(out as *mut [u64; 4], [ticks, 0, 0, 0]) };
     }
     (crate::time::uptime_ms() / 10) as i64
+}
+
+/// `getrusage(who, usage)` (hw-log14): CPU time from the scheduler's
+/// lock-free counters - `RUSAGE_SELF` (0) the process (threads sharing the
+/// address space), `RUSAGE_THREAD` (1) the calling thread, `RUSAGE_CHILDREN`
+/// (-1) zeros. All of it is reported as user time (the kernel does not split
+/// user and system). It used to be zeros: D2R/Wine spun on it ~0.9 M times a
+/// second waiting for the time to move.
+fn getrusage(who: i32, out: usize) -> i64 {
+    const SIZE: usize = 144;
+    let ns = match who {
+        0 => crate::sched::process_cpu_ns(),
+        1 => crate::sched::thread_cpu_ns(),
+        -1 => 0,
+        _ => return -e::EINVAL,
+    };
+    if !space::user_can(out, SIZE, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    let mut usage = [0u64; SIZE / 8];
+    // `ru_utime` - a `timeval`: seconds and microseconds.
+    usage[0] = ns / 1_000_000_000;
+    usage[1] = ns / 1000 % 1_000_000;
+    // SAFETY: checked above.
+    unsafe { core::ptr::write_unaligned(out as *mut [u64; SIZE / 8], usage) };
+    0
 }
 
 /// `writev` — по куску родным `write`.
@@ -2218,9 +2251,11 @@ unsafe fn clock_gettime(clock: usize, out: usize) -> i64 {
             if !space::user_can(out, 16, PageFlags::WRITE) {
                 return -e::EFAULT;
             }
-            let ms = crate::sched::cpu_ms(crate::sched::current()).unwrap_or(0);
+            // Nanoseconds without the scheduler lock (hw-log14); the process
+            // clock sums its threads.
+            let ns = if other == 2 { crate::sched::process_cpu_ns() } else { crate::sched::thread_cpu_ns() };
             // SAFETY: проверено строкой выше.
-            unsafe { core::ptr::write_unaligned(out as *mut [u64; 2], [ms / 1000, (ms % 1000) * 1_000_000]) };
+            unsafe { core::ptr::write_unaligned(out as *mut [u64; 2], [ns / 1_000_000_000, ns % 1_000_000_000]) };
             return 0;
         }
         _ => return -e::EINVAL,

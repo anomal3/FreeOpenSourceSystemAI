@@ -473,6 +473,78 @@ pub fn running_slot_on(cpu: usize) -> Option<usize> {
     (!is_idle_slot(slot)).then_some(slot)
 }
 
+// --- CPU time without the scheduler lock (hw-log14) --------------------------
+//
+// D2R called getrusage ~0.9 M times a second next to sched_yield (2:1) and got
+// zeros: its spin-with-a-CPU-time-budget never saw time move. `cpu_ms` takes
+// the scheduler lock and walks the table - not something to call a million
+// times a second. These per-slot atomics are written at the switch (under the
+// lock, which serializes writers) and read lock-free: nanoseconds run so far,
+// the start of the running stretch (0 - not running) and the address space
+// of the task (threads of one process share it).
+static CPU_NS: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+static RUN_START_NS: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+static SLOT_SPACE: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+/// The largest process time a thread has been told (keeps RUSAGE_SELF
+/// monotonic for each caller when a dead sibling's slot is reused).
+static SELF_SEEN_NS: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+
+fn cputime_switch_out(slot: usize, now_ns: u64) {
+    let start = RUN_START_NS[slot].swap(0, Ordering::Relaxed);
+    if start != 0 {
+        CPU_NS[slot].fetch_add(now_ns.saturating_sub(start), Ordering::Relaxed);
+    }
+}
+
+fn cputime_switch_in(slot: usize, now_ns: u64, space: u64) {
+    if space != 0 {
+        SLOT_SPACE[slot].store(space, Ordering::Relaxed);
+    }
+    RUN_START_NS[slot].store(now_ns.max(1), Ordering::Relaxed);
+}
+
+/// A new task in `slot`: its time starts from zero.
+fn cputime_reset(slot: usize) {
+    CPU_NS[slot].store(0, Ordering::Relaxed);
+    RUN_START_NS[slot].store(0, Ordering::Relaxed);
+    SLOT_SPACE[slot].store(0, Ordering::Relaxed);
+    SELF_SEEN_NS[slot].store(0, Ordering::Relaxed);
+}
+
+fn slot_cpu_ns(slot: usize, now_ns: u64) -> u64 {
+    let start = RUN_START_NS[slot].load(Ordering::Relaxed);
+    let done = CPU_NS[slot].load(Ordering::Relaxed);
+    done + if start != 0 { now_ns.saturating_sub(start) } else { 0 }
+}
+
+/// CPU time of the running task, ns (`RUSAGE_THREAD`,
+/// `CLOCK_THREAD_CPUTIME_ID`). No lock.
+#[must_use]
+pub fn thread_cpu_ns() -> u64 {
+    // Interrupts off so the task is not switched out between the two reads.
+    arch::interrupts::without_interrupts(|| slot_cpu_ns(running_slot(), crate::time::uptime_ns()))
+}
+
+/// CPU time of the running task's process - the tasks that share its address
+/// space - ns (`RUSAGE_SELF`, `CLOCK_PROCESS_CPUTIME_ID`). Threads that have
+/// exited count until their slot is reused; the answer never goes back for
+/// one caller. No lock: a walk over the used slots.
+#[must_use]
+pub fn process_cpu_ns() -> u64 {
+    let (me, now) = arch::interrupts::without_interrupts(|| (running_slot(), crate::time::uptime_ns()));
+    let space = SLOT_SPACE[me].load(Ordering::Relaxed);
+    let total = if space == 0 {
+        slot_cpu_ns(me, now)
+    } else {
+        let high = HIGH.load(Ordering::Acquire).min(MAX_TASKS);
+        (MAX_CPUS..high)
+            .filter(|&slot| SLOT_SPACE[slot].load(Ordering::Relaxed) == space)
+            .map(|slot| slot_cpu_ns(slot, now))
+            .sum()
+    };
+    SELF_SEEN_NS[me].fetch_max(total, Ordering::Relaxed).max(total)
+}
+
 /// Сторож замков (фаза 74): раз в 5 с ищет задачи, спящие на мьютексе
 /// дольше 15 с, и печатает цепочку «кто ждёт — кто держит — чего ждёт
 /// держатель». Только по таблице планировщика: имя программы спрашивается у
@@ -906,6 +978,7 @@ pub fn spawn_raw(
     let boxed = box_task(task).ok_or(SpawnError::OutOfMemory)?;
 
     sched.next_id += 1;
+    cputime_reset(slot);
     sched.tasks[slot] = Some(boxed);
     sched.high = sched.high.max(slot + 1);
     HIGH.store(sched.high, Ordering::Release);
@@ -1138,6 +1211,10 @@ pub fn set_current_space(root: Option<crate::mm::PhysAddr>) {
     let current = sched.current();
     if let Some(task) = sched.tasks[current].as_mut() {
         task.user.space_root = root;
+    }
+    // An exiting thread drops its space but its time stays with the process.
+    if let Some(root) = root {
+        SLOT_SPACE[current].store(root.as_u64(), Ordering::Relaxed);
     }
 }
 
@@ -1841,7 +1918,43 @@ pub fn yield_now() {
     if RUNNING.load(Ordering::Relaxed) && !has_work() {
         return;
     }
+    // Work is there, but another CPU idles (hw-log14: D2R yielded ~0.4 M
+    // times a second with 70-88 % idle CPUs and 2-7 tasks ready, and every
+    // yield took the scheduler lock - 2.5 s of lock waits per 30 s). The
+    // ready task is that CPU's to take: kick it and go on, without the lock.
+    // A busy machine (no idle CPU, or one CPU) still switches here, and the
+    // timer still preempts a spinner at the end of its slice.
+    if RUNNING.load(Ordering::Relaxed)
+        && FAST_YIELD.load(Ordering::Relaxed)
+        && KICKS.load(Ordering::Relaxed)
+        && idle_cpu_elsewhere()
+    {
+        kick_idle(1);
+        YIELD_FAST.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     schedule();
+}
+
+/// `sched_yield` without the lock when another CPU idles (`yieldfast off` -
+/// always through the scheduler, as before).
+pub static FAST_YIELD: AtomicBool = AtomicBool::new(true);
+/// Yields that kicked an idle CPU instead of switching (perf-diag).
+static YIELD_FAST: AtomicU64 = AtomicU64::new(0);
+
+/// Yields answered without the scheduler lock since boot.
+#[must_use]
+pub fn fast_yields() -> u64 {
+    YIELD_FAST.load(Ordering::Relaxed)
+}
+
+/// Is some other online CPU in its idle loop right now?
+fn idle_cpu_elsewhere() -> bool {
+    if smp::online() <= 1 {
+        return false;
+    }
+    let me = arch::interrupts::without_interrupts(smp::cpu);
+    (0..MAX_CPUS).any(|cpu| cpu != me && smp::is_online(cpu) && ON_IDLE[cpu].load(Ordering::Relaxed))
 }
 
 /// Единственная точка переключения контекста в ядре.
@@ -2014,6 +2127,7 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
                         // это был бы второй лок под локом планировщика при
                         // запрещённых прерываниях.
                         let now = crate::time::uptime_ms();
+                        let now_ns = crate::time::uptime_ns();
                         if let Some(task) = sched.tasks[current].as_mut() {
                             if task.state == TaskState::Running {
                                 task.state = TaskState::Ready;
@@ -2030,6 +2144,7 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
                                 task.cpu_ms += now.saturating_sub(task.ran_since_ms);
                                 task.ran_since_ms = 0;
                             }
+                            cputime_switch_out(current, now_ns);
                             // Счётчик снятий висит на **покидаемой** задаче:
                             // вопрос, на который он отвечает, — уступает ли она
                             // сама. Метка процессора с неё не снимается: её
@@ -2064,6 +2179,7 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
                             task.switches += 1;
                             task.boost = false;
                             task.ran_since_ms = now;
+                            cputime_switch_in(next, now_ns, task.user.space_root.map_or(0, |root| root.as_u64()));
                             if task.woken_by_irq_ms != 0 {
                                 let waited = now.saturating_sub(task.woken_by_irq_ms);
                                 task.longest_irq_wait_ms = task.longest_irq_wait_ms.max(waited);
