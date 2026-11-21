@@ -103,6 +103,7 @@
 #![allow(dead_code)]
 
 mod task;
+mod waitq;
 
 pub use task::{
     SpawnError, TaskId, TaskState, UserMachine, Wait, STACK_GUARD_SIZE, TASK_STACK_SIZE,
@@ -270,8 +271,109 @@ static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 static NEXT_DUE: AtomicU64 = AtomicU64::new(0);
 
 /// Задача встала в ожидание со сроком `at` (мс); звать под замком `SCHED`.
-fn note_deadline(at: u64) {
+fn note_deadline(slot: usize, at: u64) {
+    TIMED.set(slot);
     NEXT_DUE.fetch_min(at, Ordering::Relaxed);
+}
+
+/// Slot sets (G2, 21.11.2026): one bit per task slot, so that the hot paths
+/// stop walking every slot (and dereferencing every `Box<Task>`) under the
+/// scheduler lock. Each set is a *superset*: a bit is set (under `SCHED`)
+/// whenever a task enters the state, and cleared lazily (also under `SCHED`)
+/// by whoever finds the task no longer in it. Readable without the lock as a
+/// hint ("maybe there is work").
+const SLOT_WORDS: usize = MAX_TASKS.div_ceil(64);
+
+struct SlotBits([AtomicU64; SLOT_WORDS]);
+
+impl SlotBits {
+    const fn new() -> Self {
+        Self([const { AtomicU64::new(0) }; SLOT_WORDS])
+    }
+
+    fn set(&self, slot: usize) {
+        self.0[slot / 64].fetch_or(1 << (slot % 64), Ordering::SeqCst);
+    }
+
+    fn clear(&self, slot: usize) {
+        self.0[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::Relaxed);
+    }
+
+    fn any(&self) -> bool {
+        self.0.iter().any(|word| word.load(Ordering::SeqCst) != 0)
+    }
+
+    /// Visit set slots of `[from, to)`; `visit` returns `true` to stop.
+    fn scan(&self, from: usize, to: usize, visit: &mut impl FnMut(usize) -> bool) -> bool {
+        let mut word = from / 64;
+        while word * 64 < to {
+            let mut bits = self.0[word].load(Ordering::Relaxed);
+            let base = word * 64;
+            if base < from {
+                bits &= !0u64 << (from - base);
+            }
+            if to - base < 64 {
+                bits &= (1u64 << (to - base)) - 1;
+            }
+            while bits != 0 {
+                let slot = base + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if visit(slot) {
+                    return true;
+                }
+            }
+            word += 1;
+        }
+        false
+    }
+
+    /// Visit set slots below `high` round-robin, starting at `start`.
+    fn scan_from(&self, start: usize, high: usize, mut visit: impl FnMut(usize) -> bool) {
+        let start = start.min(high);
+        if !self.scan(start, high, &mut visit) {
+            self.scan(0, start, &mut visit);
+        }
+    }
+}
+
+/// Tasks in state `Ready` (pick_next looks only here).
+static READY: SlotBits = SlotBits::new();
+/// Tasks blocked with a deadline (wake_expired looks only here).
+static TIMED: SlotBits = SlotBits::new();
+/// Tasks blocked on an interrupt source (wake_irq) and on input (wake_input).
+static IRQ_WAITERS: SlotBits = SlotBits::new();
+static INPUT_WAITERS: SlotBits = SlotBits::new();
+
+/// Task id per slot (0 - empty or idle): `wake(id)` and `current()` without
+/// walking the table. Written under `SCHED` when a task takes the slot.
+static SLOT_ID: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+/// `Scheduler::high`, readable without the lock.
+static HIGH: AtomicUsize = AtomicUsize::new(MAX_CPUS);
+/// Bumped by `wake(id)` before it looks at the task: a task that checked its
+/// condition and is about to block (wait queues) does not block if it moved.
+static WAKE_SEQ: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+/// Non-daemon tasks that have not finished (`alive()` without the lock).
+static ALIVE: AtomicUsize = AtomicUsize::new(0);
+/// A task finished and its stack may wait for `reap`.
+static REAP_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Slot of a live task with this id (lock-free hint, verify under `SCHED`).
+fn slot_of(id: TaskId) -> Option<usize> {
+    let raw = id.as_u32();
+    if raw == 0 {
+        return None;
+    }
+    let high = HIGH.load(Ordering::Acquire).min(MAX_TASKS);
+    (MAX_CPUS..high).find(|&slot| SLOT_ID[slot].load(Ordering::Relaxed) == raw)
+}
+
+/// Is there anything for an idle CPU (or a yield) to do? Lock-free, may say
+/// "yes" spuriously, never "no" when a task became ready before the call.
+fn has_work() -> bool {
+    READY.any()
+        || DEFERRED_WAKES_ANY.load(Ordering::Acquire)
+        || REAP_PENDING.load(Ordering::Relaxed)
+        || crate::time::uptime_ms() >= NEXT_DUE.load(Ordering::Relaxed)
 }
 
 /// Ожидание замка планировщика (20.11, `perf-diag`): сколько раз замок
@@ -506,68 +608,71 @@ impl Scheduler {
     /// ничьей — и её было видно в `tasks` вместо «исполняется».
     fn pick_next(&self, cpu: usize) -> Option<usize> {
         let current = self.cpus[cpu].current;
-        // Сначала разбуженные вводом: указатель и стол не должны ждать в
-        // общей очереди за десятками потоков Chromium (24.10: мышь замирала на
-        // секунды, пока он запускался).
-        for step in 1..self.high {
-            let slot = (current + step) % self.high;
+        // One walk over the ready set (G2, 21.11.2026) instead of three walks
+        // over every slot: round-robin from the slot after the current one,
+        // the first boosted task wins at once, otherwise remember the first
+        // driver, the first desktop task and the first task of any kind -
+        // the same order of preference as the three walks had.
+        let high = self.high;
+        let (mut boosted, mut driver, mut desktop, mut any) = (None, None, None, None);
+        READY.scan_from(current + 1, high, |slot| {
             if is_idle_slot(slot) {
-                continue;
+                READY.clear(slot);
+                return false;
             }
-            if let Some(task) = &self.tasks[slot] {
-                if task.boost && task.state == TaskState::Ready && off_cpu(task) {
-                    return Some(slot);
-                }
+            if slot == current {
+                return false;
             }
+            let Some(task) = self.tasks[slot].as_ref() else {
+                READY.clear(slot);
+                return false;
+            };
+            if task.state != TaskState::Ready {
+                READY.clear(slot);
+                return false;
+            }
+            if !off_cpu(task) {
+                return false;
+            }
+            if task.boost {
+                boosted = Some(slot);
+                return true;
+            }
+            match rank_of(task.name) {
+                Some(Rank::Driver) if driver.is_none() => driver = Some(slot),
+                Some(Rank::Desktop) if desktop.is_none() => desktop = Some(slot),
+                _ => {}
+            }
+            if any.is_none() {
+                any = Some(slot);
+            }
+            false
+        });
+        if let Some(slot) = boosted.or(driver) {
+            return Some(slot);
         }
-        // Затем — задачи, которые обслуживают человека, не только сразу после
-        // прерывания: стол, ждущий сам себя через `sleep_ms`, и Wayland,
-        // держащий стол, иначе стояли в общей очереди за десятками потоков
-        // Chromium или Rider — по кванту на каждый, и стол «замирал» (30.10).
-        // Драйверы ввода — всегда (они крошечные); стол и Wayland — пока
-        // человек ждёт ответа (ввод в очереди или ждёт стола): всё время
-        // впереди программ они отнимали процессор у игры, чьи кадры собирают
-        // (`sopwith` на одном процессоре слышал 0,16 с звука вместо секунды).
-        // Драйверы — раньше стола: стол, обрабатывающий набранную команду,
-        // не должен задерживать сеть (сценарий `net` видел её «готовой»
-        // вместо «ждёт устройство»).
-        let waiting = crate::input::has_events_now() || crate::ui::input_waiting();
-        for rank in [Rank::Driver, Rank::Desktop] {
-            if rank == Rank::Desktop && !waiting {
-                break;
-            }
-            for step in 1..self.high {
-                let slot = (current + step) % self.high;
-                if is_idle_slot(slot) {
-                    continue;
-                }
-                if let Some(task) = &self.tasks[slot] {
-                    if task.state == TaskState::Ready && off_cpu(task) && rank_of(task.name) == Some(rank) {
-                        return Some(slot);
-                    }
-                }
-            }
+        if desktop.is_some() && (crate::input::has_events_now() || crate::ui::input_waiting()) {
+            return desktop;
         }
-        for step in 1..self.high {
-            let slot = (current + step) % self.high;
-            if is_idle_slot(slot) {
-                continue;
-            }
-            if let Some(task) = &self.tasks[slot] {
-                if task.state == TaskState::Ready && off_cpu(task) {
-                    return Some(slot);
-                }
-            }
+        if any.is_some() {
+            return any;
         }
         if is_idle_slot(current) {
             return None;
         }
-        // Готова ли текущая задача продолжать: `Ready` здесь означает, что её
-        // разбудили между «иду спать» и «уступаю процессор», — и уходить с него
-        // ради того, чтобы тут же вернуться, незачем.
         match self.tasks[current].as_ref().map(|task| task.state) {
             Some(TaskState::Running | TaskState::Ready) => None,
             _ => Some(cpu),
+        }
+    }
+
+    /// Make the task in `slot` ready (and visible to `pick_next`).
+    fn set_ready(&mut self, slot: usize) {
+        if let Some(task) = self.tasks[slot].as_mut() {
+            task.state = TaskState::Ready;
+            if !is_idle_slot(slot) {
+                READY.set(slot);
+            }
         }
     }
 
@@ -576,33 +681,51 @@ impl Scheduler {
     /// Проход по всей таблице на каждом переключении — это сорок сравнений, то
     /// есть заметно дешевле одного обращения к памяти мимо кеша.
     ///
-    /// Возвращает `true`, если кто-то проснулся.
-    fn wake_expired(&mut self, now: u64) -> bool {
+    /// Возвращает, сколько задач проснулось.
+    fn wake_expired(&mut self, now: u64) -> usize {
         // Ближайший срок известен (20.11): до него таблицу не обходить. На
         // игре это ~30 тыс. переключений в секунду по 100-200 задач Wine под
         // общим замком.
         if now < NEXT_DUE.load(Ordering::Relaxed) {
-            return false;
+            return 0;
         }
-        let mut woke = false;
+        // Only the tasks that went to sleep with a deadline (G2).
+        let mut woke = 0;
         let mut next = u64::MAX;
-        for task in self.slots_mut().iter_mut().flatten() {
-            let tick = match task.state {
-                TaskState::Blocked(
+        let mut expired = [0u16; 64];
+        let mut count = 0;
+        let high = self.high;
+        TIMED.scan_from(0, high, |slot| {
+            let tick = match self.tasks[slot].as_ref().map(|task| task.state) {
+                Some(TaskState::Blocked(
                     Wait::Until(tick)
                     | Wait::Input(tick)
                     | Wait::IrqUntil(_, tick)
                     | Wait::FutexUntil(_, tick)
                     | Wait::FutexMany(tick),
-                ) => tick,
-                _ => continue,
+                )) => tick,
+                _ => {
+                    TIMED.clear(slot);
+                    return false;
+                }
             };
             if now >= tick {
-                task.state = TaskState::Ready;
-                woke = true;
+                if count == expired.len() {
+                    // More next time: `next` stays "now".
+                    next = now;
+                    return true;
+                }
+                expired[count] = slot as u16;
+                count += 1;
             } else {
                 next = next.min(tick);
             }
+            false
+        });
+        for &slot in &expired[..count] {
+            TIMED.clear(usize::from(slot));
+            self.set_ready(usize::from(slot));
+            woke += 1;
         }
         NEXT_DUE.store(next, Ordering::Relaxed);
         woke
@@ -610,9 +733,9 @@ impl Scheduler {
 
     /// Разбудить тех, кто ждал завершения задачи `id`.
     fn wake_waiters(&mut self, id: TaskId) {
-        for task in self.slots_mut().iter_mut().flatten() {
-            if task.state == TaskState::Blocked(Wait::Task(id)) {
-                task.state = TaskState::Ready;
+        for slot in 0..self.high {
+            if self.tasks[slot].as_ref().is_some_and(|task| task.state == TaskState::Blocked(Wait::Task(id))) {
+                self.set_ready(slot);
             }
         }
     }
@@ -626,19 +749,31 @@ impl Scheduler {
     ///
     /// Возвращает число освобождённых стеков.
     fn reap(&mut self) -> usize {
+        // Only after some task finished (G2): this walk ran on every switch.
+        if !REAP_PENDING.swap(false, Ordering::AcqRel) {
+            return 0;
+        }
         let mut freed = 0;
+        let mut left = false;
         for (slot, entry) in self.slots_mut().iter_mut().enumerate() {
             if is_idle_slot(slot) {
                 continue;
             }
             if let Some(task) = entry {
-                if task.state == TaskState::Finished && off_cpu(task) && task.stack.is_some() {
+                if task.state == TaskState::Finished && task.stack.is_some() {
+                    if !off_cpu(task) {
+                        left = true;
+                        continue;
+                    }
                     // Вот здесь и происходит освобождение: `Drop for Stack`
                     // возвращает блок куче.
                     task.stack = None;
                     freed += 1;
                 }
             }
+        }
+        if left {
+            REAP_PENDING.store(true, Ordering::Release);
         }
         freed
     }
@@ -704,6 +839,9 @@ pub fn spawn_daemon(name: &'static str, entry: fn()) -> Result<TaskId, SpawnErro
 pub fn mark_daemon(id: TaskId) {
     let mut sched = sched_lock();
     if let Some(task) = sched.slots_mut().iter_mut().flatten().find(|task| task.id == id) {
+        if !task.daemon && task.state != TaskState::Finished {
+            ALIVE.fetch_sub(1, Ordering::Relaxed);
+        }
         task.daemon = true;
     }
 }
@@ -762,6 +900,11 @@ pub fn spawn_raw(
     sched.next_id += 1;
     sched.tasks[slot] = Some(boxed);
     sched.high = sched.high.max(slot + 1);
+    HIGH.store(sched.high, Ordering::Release);
+    SLOT_ID[slot].store(id.as_u32(), Ordering::Relaxed);
+    ALIVE.fetch_add(1, Ordering::Relaxed);
+    // A new task is `Ready` from the start.
+    READY.set(slot);
     Ok(id)
 }
 
@@ -1087,7 +1230,7 @@ pub fn sleep_until(at_ms: u64) {
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
             task.state = TaskState::Blocked(Wait::Until(at_ms));
-            note_deadline(at_ms);
+            note_deadline(current, at_ms);
         }
     }
     schedule();
@@ -1111,7 +1254,8 @@ pub fn block_on_input(until: u64, changed: impl FnOnce() -> bool) {
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
             task.state = TaskState::Blocked(Wait::Input(until));
-            note_deadline(until);
+            note_deadline(current, until);
+            INPUT_WAITERS.set(current);
         }
     }
     schedule();
@@ -1126,18 +1270,11 @@ pub fn block_on_input(until: u64, changed: impl FnOnce() -> bool) {
 ///
 /// Срока у ожидания нет намеренно — см. [`Wait::Lock`].
 pub fn block_on_lock(address: usize, free: impl FnOnce() -> bool) {
-    {
-        let mut sched = sched_lock();
-        if !sched.running || free() {
-            return;
-        }
-        let current = sched.current();
-        if let Some(task) = sched.tasks[current].as_mut() {
-            task.state = TaskState::Blocked(Wait::Lock(address));
-        }
-        LOCK_SINCE[current].store(crate::time::uptime_ms().max(1), Ordering::Relaxed);
-    }
-    schedule();
+    // Through the wait queue of the address (G2): `free` is checked after
+    // the waiter is queued, and `wake_lock` takes the queue's bucket after
+    // the lock was released - see `waitq`.
+    LOCK_SINCE[current_slot()].store(crate::time::uptime_ms().max(1), Ordering::Relaxed);
+    let _ = wq_block(waitq::Kind::Lock, &[address], Wait::Lock(address), None, free);
 }
 
 /// Заблокироваться до прерывания от источника `source`, но не дольше чем на
@@ -1168,7 +1305,8 @@ pub fn block_on_irq_until(source: u32, ms: u64, ready: impl FnOnce() -> bool) {
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
             task.state = TaskState::Blocked(Wait::IrqUntil(source, until));
-            note_deadline(until);
+            note_deadline(current, until);
+            IRQ_WAITERS.set(current);
         }
     }
     schedule();
@@ -1189,6 +1327,7 @@ pub fn block_on_irq(source: u32, ready: impl FnOnce() -> bool) {
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
             task.state = TaskState::Blocked(Wait::Irq(source));
+            IRQ_WAITERS.set(current);
         }
     }
     schedule();
@@ -1201,17 +1340,31 @@ pub fn block_on_irq(source: u32, ready: impl FnOnce() -> bool) {
 pub fn wake_irq(source: u32) {
     let mut woken = 0usize;
     let mut sched = sched_lock();
-    for task in sched.slots_mut().iter_mut().flatten() {
+    let high = sched.high;
+    // Only the tasks that wait for some interrupt (G2), not every slot.
+    let mut found = [0u16; 32];
+    let mut count = 0;
+    IRQ_WAITERS.scan_from(0, high, |slot| {
         // Оба вида ожидания прерывания, и это не перечисление ради полноты:
         // обработчик не знает и не должен знать, поставил ли ждущий себе
         // будильник. Пропущенный здесь вариант выглядел бы как «прерывания
         // настроены, а задача просыпается только по сроку».
-        let waiting = matches!(
-            task.state,
-            TaskState::Blocked(Wait::Irq(waited) | Wait::IrqUntil(waited, _)) if waited == source
-        );
-        if waiting {
-            task.state = TaskState::Ready;
+        match sched.tasks[slot].as_ref().map(|task| task.state) {
+            Some(TaskState::Blocked(Wait::Irq(waited) | Wait::IrqUntil(waited, _))) => {
+                if waited == source && count < found.len() {
+                    found[count] = slot as u16;
+                    count += 1;
+                }
+            }
+            _ => IRQ_WAITERS.clear(slot),
+        }
+        false
+    });
+    for &slot in &found[..count] {
+        let slot = usize::from(slot);
+        IRQ_WAITERS.clear(slot);
+        sched.set_ready(slot);
+        if let Some(task) = sched.tasks[slot].as_mut() {
             // Не ноль, даже если часы ещё на нуле: ноль значит «отметки нет».
             task.woken_by_irq_ms = crate::time::uptime_ms().max(1);
             task.boost = true;
@@ -1235,20 +1388,102 @@ pub fn wake_irq(source: u32) {
 /// Будятся **все** ждущие, а не один: проснувшиеся попробуют захватить лок по
 /// очереди, и не сумевшие уснут снова.
 pub fn wake_lock(address: usize) {
-    let mut sched = sched_lock();
-    let mut woke = false;
-    for task in sched.slots_mut().iter_mut().flatten() {
-        if task.state == TaskState::Blocked(Wait::Lock(address)) {
-            task.state = TaskState::Ready;
-            woke = true;
-        }
-    }
-    drop(sched);
+    // From the address's wait queue (G2): no walk over every slot.
+    let woke = waitq::wake(waitq::Kind::Lock, address, 0, make_ready_slots);
     // Пинок одному простаивающему (20.11): лок возьмёт один, остальные
     // уснут снова; без пинка разбуженный ждал тика (10 мс) на холостом ЦП.
-    if woke {
+    if woke > 0 {
         kick_idle(1);
     }
+}
+
+/// Make tasks taken out of a wait queue ready - those that already sleep
+/// on an address; the others will see `waitq::woken` and not block.
+fn make_ready_slots(slots: &[u16]) {
+    let mut sched = sched_lock();
+    for &slot in slots {
+        let slot = usize::from(slot);
+        let sleeping = sched.tasks[slot].as_ref().is_some_and(|task| {
+            matches!(
+                task.state,
+                TaskState::Blocked(Wait::Futex(_) | Wait::FutexUntil(..) | Wait::FutexMany(_) | Wait::Lock(_))
+            )
+        });
+        if sleeping {
+            sched.set_ready(slot);
+        }
+    }
+}
+
+/// What a wait on addresses ended with.
+enum WqEnd {
+    /// `ready` said "do not sleep" (or scheduling has not started).
+    NotSlept,
+    /// Slept and woke: by the key with this index, or by something else
+    /// (deadline, signal, `wake`) - `None`.
+    Woke(Option<usize>),
+}
+
+/// Sleep on `keys` (see `waitq` for the protocol).
+fn wq_block(kind: waitq::Kind, keys: &[usize], wait: Wait, until: Option<u64>, ready: impl FnOnce() -> bool) -> WqEnd {
+    if !RUNNING.load(Ordering::Acquire) {
+        // Before `run` there is nothing to switch to.
+        drop(ready);
+        return WqEnd::NotSlept;
+    }
+    let slot = current_slot();
+    let seq = WAKE_SEQ[slot].load(Ordering::SeqCst);
+    waitq::begin(slot);
+    let mut queued = 0;
+    for (index, &key) in keys.iter().enumerate() {
+        if !waitq::enqueue(kind, key, slot, index) {
+            break;
+        }
+        queued += 1;
+    }
+    let unqueue = |count: usize| {
+        for &key in &keys[..count] {
+            waitq::dequeue(kind, key, slot);
+        }
+    };
+    if queued < keys.len() {
+        // No memory for an entry: return as a spurious wake-up, the caller
+        // re-checks and comes back.
+        unqueue(queued);
+        return WqEnd::Woke(None);
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    if ready() {
+        unqueue(queued);
+        return WqEnd::NotSlept;
+    }
+    WQ_SLEEPS.fetch_add(1, Ordering::Relaxed);
+    schedule_with(Cause::Voluntary, Some(Block { wait, until, seq }));
+    // A single key taken by its waker is already out of the queue.
+    if keys.len() > 1 || waitq::woken(slot).is_none() {
+        unqueue(queued);
+    }
+    WqEnd::Woke(waitq::woken(slot))
+}
+
+/// Sleeps through wait queues (`perf-diag`).
+static WQ_SLEEPS: AtomicU64 = AtomicU64::new(0);
+
+/// Wait-queue counters: `(sleeps, wakes by key)`.
+#[must_use]
+pub fn wait_queue_stats() -> (u64, u64) {
+    (WQ_SLEEPS.load(Ordering::Relaxed), waitq::WAKES.load(Ordering::Relaxed))
+}
+
+/// A request to block the current task inside `schedule_with`, under the
+/// same scheduler lock that picks the next task (G2: one lock round instead
+/// of two per sleep).
+#[derive(Clone, Copy)]
+struct Block {
+    wait: Wait,
+    until: Option<u64>,
+    /// `WAKE_SEQ` of the task when it checked its condition.
+    seq: u32,
 }
 
 /// Заблокироваться на ключе `key`, пока `ready` отвечает `false`.
@@ -1264,24 +1499,19 @@ pub fn wake_lock(address: usize) {
 /// ждать хватит (фаза 57); `None` — без срока. Вышел ли срок, решает
 /// вызывающий, сравнив часы после возврата: пробуждение и срок могли
 /// прийти в один и тот же миг, и перепроверка условия всё равно на нём.
-pub fn block_on_futex(key: usize, until: Option<u64>, ready: impl FnOnce() -> bool) {
-    {
-        let mut sched = sched_lock();
-        if !sched.running || ready() {
-            return;
-        }
-        let current = sched.current();
-        if let Some(task) = sched.tasks[current].as_mut() {
-            task.state = TaskState::Blocked(match until {
-                Some(at) => {
-                    note_deadline(at);
-                    Wait::FutexUntil(key, at)
-                }
-                None => Wait::Futex(key),
-            });
-        }
-    }
-    schedule();
+///
+/// G2 (21.11.2026): the waiter sits in the wait queue of `key` and `ready`
+/// runs with no lock held, after the waiter was queued (see `waitq`): the
+/// waker changes the word before it takes the queue, so the window between
+/// "looked at the word" and "slept" is closed by the queue, not by the
+/// scheduler lock. Returns `true` when a wake on `key` ended the wait - even
+/// if the deadline passed at the same moment (that wake must not be lost).
+pub fn block_on_futex(key: usize, until: Option<u64>, ready: impl FnOnce() -> bool) -> bool {
+    let wait = match until {
+        Some(at) => Wait::FutexUntil(key, at),
+        None => Wait::Futex(key),
+    };
+    matches!(wq_block(waitq::Kind::Futex, &[key], wait, until, ready), WqEnd::Woke(Some(_)))
 }
 
 /// Разбудить ждущих на ключе `key`. `count` в ноль означает «всех».
@@ -1290,25 +1520,8 @@ pub fn block_on_futex(key: usize, until: Option<u64>, ready: impl FnOnce() -> bo
 /// не ждал» от «разбудил» — без этого отпускающий замок не может сказать,
 /// стоило ли вообще звать ядро.
 pub fn wake_futex(key: usize, count: usize) -> usize {
-    let mut sched = sched_lock();
-    let mut woken = 0usize;
-    for task in sched.slots_mut().iter_mut().flatten() {
-        if count != 0 && woken >= count {
-            break;
-        }
-        if matches!(task.state, TaskState::Blocked(Wait::Futex(waited) | Wait::FutexUntil(waited, _)) if waited == key) {
-            task.state = TaskState::Ready;
-            woken += 1;
-        } else if matches!(task.state, TaskState::Blocked(Wait::FutexMany(_))) {
-            let index = task.futex_keys.as_ref().and_then(|keys| keys.iter().position(|&waited| waited == key));
-            if let Some(index) = index {
-                task.futex_woken = Some(index);
-                task.state = TaskState::Ready;
-                woken += 1;
-            }
-        }
-    }
-    drop(sched);
+    // Only the bucket of `key` and one short scheduler-lock round (G2).
+    let woken = waitq::wake(waitq::Kind::Futex, key, count, make_ready_slots);
     // Пинок — только адресному пробуждению (futex программы: передача работы
     // потоку). «Всех» (`count` 0) будит `io_events::notify` на каждое событие
     // ввода-вывода — с пинком это было 10 тыс. IPI в секунду и вдвое больше
@@ -1402,6 +1615,11 @@ pub fn poll_kicks() -> u64 {
 /// остановкой (`arch::wait_for_interrupt_unless`): раньше IPI, пришедший до
 /// `hlt`, оставлял процессор спать до тика (10 мс).
 pub fn idle_wait() {
+    // Zero frames for the next page faults while there is nothing else to
+    // do (G2; returns at once unless faults used this CPU's cache).
+    if RUNNING.load(Ordering::Relaxed) && !KICKED[smp::cpu()].load(Ordering::Relaxed) {
+        crate::mm::frame::refill_idle();
+    }
     let cpu = smp::cpu();
     let budget = IDLE_POLL_US.load(Ordering::Relaxed);
     if budget != 0 && KICKS.load(Ordering::Relaxed) && RUNNING.load(Ordering::Relaxed) && smp::online() > 1 {
@@ -1462,35 +1680,15 @@ pub fn block_on_futexes(
     until: Option<u64>,
     ready: impl FnOnce() -> bool,
 ) -> Option<usize> {
-    let mut keys = Some(keys);
-    {
-        let mut sched = sched_lock();
-        if !sched.running || ready() {
-            drop(sched);
-            drop(keys);
-            return None;
-        }
-        let current = sched.current();
-        if let Some(task) = sched.tasks[current].as_mut() {
-            task.futex_keys = keys.take();
-            task.futex_woken = None;
-            task.state = TaskState::Blocked(Wait::FutexMany(until.unwrap_or(u64::MAX)));
-            note_deadline(until.unwrap_or(u64::MAX));
-        }
-    }
-    schedule();
-    // Коробку — из-под лока и освободить уже без него: куча под локом
-    // планировщика — лишний порядок захвата.
-    let (keys, woken) = {
-        let mut sched = sched_lock();
-        let current = sched.current();
-        match sched.tasks[current].as_mut() {
-            Some(task) => (task.futex_keys.take(), task.futex_woken.take()),
-            None => (None, None),
-        }
-    };
+    // Every key in its own wait queue (G2); the keys are checked after all
+    // of them are queued.
+    let wait = Wait::FutexMany(until.unwrap_or(u64::MAX));
+    let end = wq_block(waitq::Kind::Futex, &keys, wait, until, ready);
     drop(keys);
-    woken
+    match end {
+        WqEnd::Woke(index) => index,
+        WqEnd::NotSlept => None,
+    }
 }
 
 /// Разбудить всех, кто ждёт ввода.
@@ -1505,9 +1703,25 @@ pub fn wake_input() {
         return;
     };
     let mut woke = false;
-    for task in sched.slots_mut().iter_mut().flatten() {
-        if matches!(task.state, TaskState::Blocked(Wait::Input(_))) {
-            task.state = TaskState::Ready;
+    let high = sched.high;
+    let mut found = [0u16; 32];
+    let mut count = 0;
+    INPUT_WAITERS.scan_from(0, high, |slot| {
+        if !matches!(sched.tasks[slot].as_ref().map(|task| task.state), Some(TaskState::Blocked(Wait::Input(_)))) {
+            INPUT_WAITERS.clear(slot);
+            return false;
+        }
+        if count < found.len() {
+            found[count] = slot as u16;
+            count += 1;
+        }
+        false
+    });
+    for &slot in &found[..count] {
+        let slot = usize::from(slot);
+        INPUT_WAITERS.clear(slot);
+        sched.set_ready(slot);
+        if let Some(task) = sched.tasks[slot].as_mut() {
             task.boost = true;
             woke = true;
         }
@@ -1542,22 +1756,22 @@ pub fn wake(id: TaskId) {
     // которую разбирает ближайшее переключение. Раньше `wake` молча
     // возвращался, и задача в `futex` без срока спала до чужого пробуждения
     // (сигнал wineserver клиенту на SMP).
+    // Slot by id without walking the table (G2); the wake sequence moves
+    // first, so a task between "checked its condition" and "blocks" in a
+    // wait queue does not block (see `Block::seq`).
+    let Some(slot) = slot_of(id) else {
+        return;
+    };
+    WAKE_SEQ[slot].fetch_add(1, Ordering::SeqCst);
     let Some(mut sched) = SCHED.try_lock() else {
         defer_wake(id);
         return;
     };
-    let found = sched
-        .tasks
-        .iter_mut()
-        .enumerate()
-        .find(|(slot, entry)| !is_idle_slot(*slot) && entry.as_ref().is_some_and(|t| t.id == id))
-        .and_then(|(_, entry)| entry.as_mut());
-    let mut woke = false;
-    if let Some(task) = found {
-        if matches!(task.state, TaskState::Blocked(_)) {
-            task.state = TaskState::Ready;
-            woke = true;
-        }
+    let woke = sched.tasks[slot]
+        .as_ref()
+        .is_some_and(|task| task.id == id && matches!(task.state, TaskState::Blocked(_)));
+    if woke {
+        sched.set_ready(slot);
     }
     drop(sched);
     if woke {
@@ -1611,16 +1825,22 @@ fn defer_wake(id: TaskId) {
 /// Безопасно вызывать до [`run`] и вне любой задачи: [`schedule`] в этом случае
 /// просто ничего не делает.
 pub fn yield_now() {
+    // Nobody else is ready, no deadline is due: nothing to give the CPU to
+    // (G2: `sched_yield` of Wine spin-waits cost 52-172 us each, all of it
+    // the scheduler lock).
+    if RUNNING.load(Ordering::Relaxed) && !has_work() {
+        return;
+    }
     schedule();
 }
 
 /// Единственная точка переключения контекста в ядре.
 pub fn schedule() {
-    schedule_with(Cause::Voluntary);
+    schedule_with(Cause::Voluntary, None);
 }
 
 /// Переключиться, помня, по чьей воле это происходит.
-fn schedule_with(cause: Cause) {
+fn schedule_with(cause: Cause, block: Option<Block>) {
     // Прерывания запрещаются здесь, а не полагаясь на `SpinLock`, и остаются
     // запрещёнными на всё переключение. Почему именно так — подробно в
     // заголовке модуля («Главная ловушка»).
@@ -1628,6 +1848,26 @@ fn schedule_with(cause: Cause) {
     arch::interrupts::disable();
     // Ни одного спинлока к переключению (20.11.2026, см. `sync::check_switch`).
     crate::sync::check_switch();
+
+    // An idle CPU with nothing to do does not touch the scheduler lock (G2):
+    // every idle loop round (each tick, each kick) took it and walked the
+    // whole table - on 8-16 CPUs the most frequent waiter of the lock. The
+    // kick flag is cleared before the check: a task made ready after the
+    // check sets its bit and then kicks again.
+    if block.is_none() && RUNNING.load(Ordering::Relaxed) {
+        let cpu = smp::cpu();
+        if is_idle_slot(RUNNING_SLOT[cpu].load(Ordering::Relaxed)) {
+            KICKED[cpu].store(false, Ordering::SeqCst);
+            core::sync::atomic::fence(Ordering::SeqCst);
+            if !has_work() {
+                IDLE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                if irq_was_enabled {
+                    arch::interrupts::enable();
+                }
+                return;
+            }
+        }
+    }
 
     let mut from: *mut Context = ptr::null_mut();
     let mut to: *const Context = ptr::null();
@@ -1638,6 +1878,10 @@ fn schedule_with(cause: Cause) {
     let mut to_gs: u64 = 0;
     let mut to_fs_selector: u16 = 0;
     let mut to_tls_entries: [u64; 3] = [0; 3];
+    let mut expired = 0;
+    let mut switch_user: Option<task::UserMachine> = None;
+    let mut save_to = None;
+    let mut load_from = None;
 
     {
         let mut sched = sched_lock();
@@ -1645,17 +1889,29 @@ fn schedule_with(cause: Cause) {
         // перенести эту задачу на другой процессор нечем.
         let cpu = smp::cpu();
         KICKED[cpu].store(false, Ordering::Release);
+        // The task asked to sleep (wait queues, G2): blocked here, under the
+        // lock that also picks the next task, unless a wake already came -
+        // a key took it out of its queue, or `wake(id)` moved its sequence.
+        if let Some(block) = block {
+            let current = sched.cpus[cpu].current;
+            let woken = waitq::woken(current).is_some() || WAKE_SEQ[current].load(Ordering::SeqCst) != block.seq;
+            if !woken && !is_idle_slot(current) {
+                if let Some(task) = sched.tasks[current].as_mut() {
+                    if task.state == TaskState::Running {
+                        task.state = TaskState::Blocked(block.wait);
+                        if let Some(at) = block.until {
+                            note_deadline(current, at);
+                        }
+                    }
+                }
+            }
+        }
         // Пробуждения, отложенные `wake` при занятом замке (13.11).
         if DEFERRED_WAKES_ANY.swap(false, Ordering::AcqRel) {
             if DEFERRED_OVERFLOW.swap(false, Ordering::AcqRel) {
-                for (slot, entry) in sched.tasks.iter_mut().enumerate() {
-                    if is_idle_slot(slot) {
-                        continue;
-                    }
-                    if let Some(task) = entry.as_mut() {
-                        if matches!(task.state, TaskState::Blocked(_)) {
-                            task.state = TaskState::Ready;
-                        }
+                for slot in MAX_CPUS..sched.high {
+                    if sched.tasks[slot].as_ref().is_some_and(|task| matches!(task.state, TaskState::Blocked(_))) {
+                        sched.set_ready(slot);
                     }
                 }
             }
@@ -1665,9 +1921,9 @@ fn schedule_with(cause: Cause) {
                     continue;
                 }
                 let id = TaskId::new(raw);
-                if let Some(task) = sched.tasks.iter_mut().flatten().find(|task| task.id == id) {
-                    if matches!(task.state, TaskState::Blocked(_)) {
-                        task.state = TaskState::Ready;
+                if let Some(slot) = slot_of(id) {
+                    if sched.tasks[slot].as_ref().is_some_and(|task| task.id == id && matches!(task.state, TaskState::Blocked(_))) {
+                        sched.set_ready(slot);
                     }
                 }
             }
@@ -1679,7 +1935,7 @@ fn schedule_with(cause: Cause) {
             // Сроки сравниваются со **временем**, а не с числом тиков:
             // тики теряются, а время идёт по счётчику, который сам себя
             // считает (см. `block_on_irq_until`).
-            sched.wake_expired(crate::time::uptime_ms());
+            expired = sched.wake_expired(crate::time::uptime_ms());
 
             let current = sched.cpus[cpu].current;
             match sched.pick_next(cpu) {
@@ -1717,50 +1973,25 @@ fn schedule_with(cause: Cause) {
                     }
 
                     if !from.is_null() && !to.is_null() {
-                        let next_user = sched.tasks[next].as_ref().map_or_else(
+                        // The trap stack, the address space and the vector
+                        // registers are switched after the lock is released
+                        // (G2): both tasks are pinned to this CPU by their
+                        // labels (`cpu` of the next one, `leaving` of this
+                        // one) until `finish_switch`, so nobody else touches
+                        // their areas, and the scheduler lock is no longer
+                        // held across `CR3` writes and `xsave`/`xrstor`.
+                        switch_user = Some(sched.tasks[next].as_ref().map_or_else(
                             task::UserMachine::default,
                             |task| task.user,
-                        );
-                        // Стек ловушки — тот же адрес, что стек возврата из
-                        // третьего кольца, и лежит он в задаче. Ставится на
-                        // **этом** процессоре: здесь задача и продолжится.
-                        arch::set_trap_stack(next_user.return_stack);
-
-                        // Адресное пространство. У задачи без программы его нет,
-                        // и тогда процессор возвращается на таблицы ядра.
-                        // SAFETY: любой корень программы построен копией
-                        // ядерного и содержит все его отображения, поэтому
-                        // переключение не уводит из-под ног ни код, ни стек.
-                        unsafe {
-                            match next_user.space_root {
-                                Some(root) => arch::activate_space(root),
-                                None => arch::activate_kernel_space(),
-                            }
-                        }
-
-                        // Векторные регистры — здесь же, под тем же локом и с
-                        // теми же запрещёнными прерываниями. Регистры принадлежат
-                        // процессору, а область — задаче, поэтому сохранить своё
-                        // и поставить чужое можно только здесь, до смены стека.
-                        let save_to = sched.tasks[current]
+                        ));
+                        save_to = sched.tasks[current]
                             .as_ref()
                             .and_then(|task| task.fpu.as_ref())
                             .map(task::FpuArea::as_ptr);
-                        let load_from = sched.tasks[next]
+                        load_from = sched.tasks[next]
                             .as_ref()
                             .and_then(|task| task.fpu.as_ref())
                             .map(task::FpuArea::as_ptr);
-                        if let Some(area) = save_to {
-                            // SAFETY: область принадлежит задаче, которая
-                            // исполняется прямо сейчас, выделена с нужным
-                            // размером и выравниванием и жива, пока жива задача.
-                            unsafe { arch::fpu::save(area) };
-                        }
-                        if let Some(area) = load_from {
-                            // SAFETY: область заполнена либо `init_area` при
-                            // создании задачи, либо предыдущим сохранением.
-                            unsafe { arch::fpu::restore(area) };
-                        }
 
                         // Часы спрашиваются один раз на переключение и служат
                         // обоим: концом отрезка уходящей задачи и началом
@@ -1776,6 +2007,9 @@ fn schedule_with(cause: Cause) {
                         if let Some(task) = sched.tasks[current].as_mut() {
                             if task.state == TaskState::Running {
                                 task.state = TaskState::Ready;
+                                if !is_idle_slot(current) {
+                                    READY.set(current);
+                                }
                             }
                             // Отрезок закрывается здесь — в той же точке, где
                             // задача перестаёт исполняться. Отметка в ноль
@@ -1846,6 +2080,41 @@ fn schedule_with(cause: Cause) {
         }
         // Охранник уничтожается здесь — до `switch_context`. Прерывания при
         // этом не включаются: `lock()` застал их уже запрещёнными.
+    }
+    if let Some(next_user) = switch_user {
+        // Стек ловушки — тот же адрес, что стек возврата из третьего кольца,
+        // и лежит он в задаче. Ставится на **этом** процессоре: здесь задача
+        // и продолжится.
+        arch::set_trap_stack(next_user.return_stack);
+        // Адресное пространство. У задачи без программы его нет, и тогда
+        // процессор возвращается на таблицы ядра.
+        // SAFETY: любой корень программы построен копией ядерного и содержит
+        // все его отображения, поэтому переключение не уводит из-под ног ни
+        // код, ни стек.
+        unsafe {
+            match next_user.space_root {
+                Some(root) => arch::activate_space(root),
+                None => arch::activate_kernel_space(),
+            }
+        }
+        // Векторные регистры: сохранить своё и поставить чужое можно только
+        // здесь, до смены стека, с запрещёнными прерываниями.
+        if let Some(area) = save_to {
+            // SAFETY: область принадлежит задаче, которая исполняется прямо
+            // сейчас (её метка `leaving` не даёт её взять никому), выделена с
+            // нужным размером и выравниванием и жива, пока жива задача.
+            unsafe { arch::fpu::save(area) };
+        }
+        if let Some(area) = load_from {
+            // SAFETY: область заполнена либо `init_area` при создании задачи,
+            // либо предыдущим сохранением; задача помечена этим процессором.
+            unsafe { arch::fpu::restore(area) };
+        }
+    }
+    // Tasks whose deadline passed became ready here; idle CPUs take them now
+    // instead of at their next tick (G2: ready tasks waited while CPUs idled).
+    if expired > 1 {
+        kick_idle(expired - 1);
     }
 
     if !from.is_null() && !to.is_null() {
@@ -2155,7 +2424,12 @@ pub fn preempt_point() {
     if !NEED_RESCHED[smp::cpu()].swap(false, Ordering::Relaxed) {
         return;
     }
-    schedule_with(Cause::Preempted);
+    // Nobody waits for a CPU: the slice is renewed without the lock (G2).
+    if !has_work() {
+        SLICE_LEFT[smp::cpu()].store(SLICE_TICKS, Ordering::Relaxed);
+        return;
+    }
+    schedule_with(Cause::Preempted, None);
 }
 
 /// Включено ли вытеснение — то есть идёт ли планирование по-настоящему.
@@ -2248,11 +2522,8 @@ pub fn run() -> ! {
     // так же, как холостой цикл остальных процессоров в `smp::secondary_main`.
     // Отличие одно: только этот цикл решает, что работа кончилась.
     loop {
-        let alive = {
-            let sched = sched_lock();
-            sched.alive()
-        };
-        if alive == 0 {
+        // A counter, not a walk under the lock on every idle round (G2).
+        if ALIVE.load(Ordering::Acquire) == 0 {
             break;
         }
         schedule();
@@ -2285,8 +2556,13 @@ pub fn run() -> ! {
 /// Идентификатор исполняющейся задачи.
 #[must_use]
 pub fn current() -> TaskId {
-    let sched = sched_lock();
-    sched.tasks[sched.current()].as_ref().map_or(TaskId::IDLE, |task| task.id)
+    // Without the lock (G2): the slot's id is written before the task first
+    // runs and does not change while it lives.
+    let slot = current_slot();
+    if is_idle_slot(slot) {
+        return TaskId::IDLE;
+    }
+    TaskId::new(SLOT_ID[slot].load(Ordering::Relaxed))
 }
 
 /// Имя исполняющейся задачи.
@@ -2331,7 +2607,15 @@ pub fn is_running() -> bool {
 /// Сколько задач ещё не завершились, не считая холостых.
 #[must_use]
 pub fn alive() -> usize {
-    sched_lock().alive()
+    ALIVE.load(Ordering::Acquire)
+}
+
+/// Idle rounds that found nothing to do and skipped the lock (`perf-diag`).
+static IDLE_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+#[must_use]
+pub fn idle_skips() -> u64 {
+    IDLE_SKIPS.load(Ordering::Relaxed)
 }
 
 /// Компактный список задач с состояниями.
@@ -2650,6 +2934,10 @@ pub fn exit_current_with(result: i64) -> ! {
         let current = sched.current();
         let mut id = TaskId::IDLE;
         if let Some(task) = sched.tasks[current].as_mut() {
+            if !task.daemon && task.state != TaskState::Finished && !is_idle_slot(current) {
+                ALIVE.fetch_sub(1, Ordering::AcqRel);
+            }
+            REAP_PENDING.store(true, Ordering::Release);
             task.state = TaskState::Finished;
             task.result = result;
             id = task.id;

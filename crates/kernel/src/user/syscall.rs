@@ -2494,7 +2494,7 @@ fn futex_wait(addr: usize, expected: u32, timeout_ms: usize) -> i64 {
     // Чтение из ядра по адресу программы законно: `futex_key` проверил и
     // права, и наличие страницы, а вытеснить её у разрешённых видов области
     // некому.
-    sched::block_on_futex(key, until, || {
+    let woken = sched::block_on_futex(key, until, || {
         // SAFETY: адрес проверен `futex_key`: он принадлежит программе,
         // выровнен и отображён на чтение и запись.
         let now = unsafe { core::ptr::read_volatile(word) };
@@ -2506,6 +2506,11 @@ fn futex_wait(addr: usize, expected: u32, timeout_ms: usize) -> i64 {
     });
     if !slept {
         return user_abi::FUTEX_CHANGED;
+    }
+    // Woken by a wake on this word: success even if the deadline passed at
+    // the same moment - reporting a timeout would lose that wake (G2).
+    if woken {
+        return 0;
     }
     match until {
         Some(at) if time::uptime_ms() >= at => user_abi::FUTEX_TIMED_OUT,
