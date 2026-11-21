@@ -2716,6 +2716,26 @@ static IN_USER: [AtomicBool; sched::MAX_TASKS] =
 static STACKS: [(AtomicUsize, AtomicUsize); sched::MAX_TASKS] =
     [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; sched::MAX_TASKS];
 
+/// Whether the program a task runs is a Linux one (`Program::linux`), by slot
+/// (21.11.2026): the entry of every `syscall` and `int 0x80` asked it under
+/// the process lock, so a thread holding that lock (a long call) stalled every
+/// other thread's next call at the door. Written wherever a slot gets its
+/// program (start, thread, fork, `execve`) and read lock-free.
+static LINUX_TASK: [AtomicBool; sched::MAX_TASKS] = [const { AtomicBool::new(false) }; sched::MAX_TASKS];
+
+fn note_linux(slot: usize, linux: bool) {
+    if let Some(flag) = LINUX_TASK.get(slot) {
+        flag.store(linux, Ordering::Release);
+    }
+}
+
+/// Does the current task run a Linux program - without the process lock.
+/// Meaningful only for a task that came from ring 3 (it has a program).
+#[must_use]
+pub fn current_is_linux() -> bool {
+    LINUX_TASK[sched::current_slot()].load(Ordering::Acquire)
+}
+
 fn set_stack(slot: usize, low: usize, high: usize) {
     STACKS[slot].0.store(low, Ordering::Relaxed);
     STACKS[slot].1.store(high, Ordering::Relaxed);
@@ -4175,6 +4195,7 @@ fn run(
             linux_stack: (layout.stack_top - MAIN_STACK_PAGES * PAGE_SIZE, layout.stack_top),
         })));
     }
+    note_linux(slot, linux);
     // Признак поднимается после того, как процесс попал в таблицу: обработчик
     // отказа читает его без лока и вправе увидеть `true` только тогда, когда
     // программу уже есть где найти.
@@ -4662,13 +4683,17 @@ extern "C" fn linux_thread_entry(arg: usize) -> ! {
         sched::yield_now();
     }
     let slot = sched::current_slot();
-    let root = start.process.lock().space.root();
+    let (root, linux) = {
+        let program = start.process.lock();
+        (program.space.root(), program.linux)
+    };
     {
         let mut table = PROGRAMS.lock();
         if let Some(entry) = table.get_mut(slot) {
             *entry = Some(Arc::clone(&start.process));
         }
     }
+    note_linux(slot, linux);
     LINUX_CLEAR_TID[slot].store(start.clear_tid, Ordering::Relaxed);
     LINUX_ALTSTACK[slot].0.store(0, Ordering::Relaxed);
     LINUX_ALTSTACK[slot].1.store(0, Ordering::Relaxed);
@@ -4992,10 +5017,10 @@ extern "C" fn linux_fork_entry(arg: usize) -> ! {
     let start = unsafe { alloc::boxed::Box::from_raw(arg as *mut ForkStart) };
     let slot = sched::current_slot();
     let pid = sched::current().as_u32();
-    let (root, ppid) = {
+    let (root, ppid, linux) = {
         let mut program = start.process.lock();
         program.linux_pid = pid;
-        (program.space.root(), program.linux_ppid)
+        (program.space.root(), program.linux_ppid, program.linux)
     };
     crate::linux::register_child(ppid, pid);
     {
@@ -5004,6 +5029,7 @@ extern "C" fn linux_fork_entry(arg: usize) -> ! {
             *entry = Some(Arc::clone(&start.process));
         }
     }
+    note_linux(slot, linux);
     LINUX_SIGMASK[slot].store(start.mask, Ordering::Relaxed);
     LINUX_PENDING[slot].store(0, Ordering::Relaxed);
     LINUX_ALTSTACK[slot].0.store(start.altstack.0, Ordering::Relaxed);
@@ -5122,6 +5148,8 @@ pub fn exec(frame: &mut arch::TrapFrame, path: &str, args: &[&str], env: &[&str]
         linux_dirs.retain(|(fd, _)| files.is_open(*fd));
         (old_space, old_mappings)
     };
+    // The other threads were stopped above: only this slot runs the image.
+    note_linux(slot, loaded.linux.is_some());
     // Знание раньше действия — как при запуске: вытеснение между строками
     // вернёт задачу уже на новый корень.
     sched::set_current_space(Some(root));
@@ -5460,7 +5488,10 @@ extern "C" fn thread_entry(arg: usize) -> ! {
     // ровно этой задаче.
     let start = unsafe { alloc::boxed::Box::from_raw(arg as *mut ThreadStart) };
     let slot = sched::current_slot();
-    let root = start.process.lock().space.root();
+    let (root, linux) = {
+        let program = start.process.lock();
+        (program.space.root(), program.linux)
+    };
 
     {
         let mut table = PROGRAMS.lock();
@@ -5468,6 +5499,7 @@ extern "C" fn thread_entry(arg: usize) -> ! {
             *entry = Some(Arc::clone(&start.process));
         }
     }
+    note_linux(slot, linux);
     // Сторожевая страница — нижняя страница области — в границы не входит.
     set_stack(slot, start.region + PAGE_SIZE, start.region + start.region_bytes);
     IN_USER[slot].store(true, Ordering::Release);

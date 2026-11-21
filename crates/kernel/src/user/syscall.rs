@@ -284,6 +284,15 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
                 super::files::Waiting::Read(_) => ERR_PERMISSION,
             };
         }
+        // A regular file: written outside the process lock (21.11.2026),
+        // like `read`.
+        if let Some(Some(file)) = super::with_current(|program| program.files.file_io(fd)) {
+            // SAFETY: the range was checked readable above; no lock is held.
+            return match unsafe { file.write_from_user(ptr, len) } {
+                Ok(written) => written as i64,
+                Err(err) => errno(err),
+            };
+        }
         // В файл уходят байты как есть: это данные, а не текст, и требовать от
         // них UTF-8 значило бы запретить программе сохранить что угодно, кроме
         // строки.
@@ -363,7 +372,7 @@ fn open(ptr: usize, len: usize, flags: usize) -> i64 {
     };
 
     let cred = super::credentials();
-    match super::with_current(|program| program.files.open(cred, path, flags)) {
+    match files::open_in_current(cred, path, flags) {
         Some(Ok(fd)) => fd as i64,
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
@@ -661,6 +670,16 @@ fn read(fd: usize, ptr: usize, len: usize) -> i64 {
 
     // Страницы буфера — до замка процесса (см. `prepare_write`).
     super::prepare_write(ptr, len);
+    // A regular file: read outside the process lock (21.11.2026) - only the
+    // descriptor lookup is under it; the open file's own position lock keeps
+    // `read` on a shared descriptor consistent.
+    if let Some(Some(file)) = super::with_current(|program| program.files.file_io(fd)) {
+        // SAFETY: the range was checked writable above; no lock is held here.
+        return match unsafe { file.read_to_user(ptr, len) } {
+            Ok(read) => read as i64,
+            Err(err) => errno(err),
+        };
+    }
     match super::with_current(|program| program.files.read(fd, buffer)) {
         Some(Ok(read)) => read as i64,
         Some(Err(err)) => errno(err),

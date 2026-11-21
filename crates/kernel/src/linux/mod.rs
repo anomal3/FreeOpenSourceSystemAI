@@ -336,13 +336,17 @@ unsafe fn native(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
 /// Только из обработчика ловушки, пришедшей из третьего кольца: `exit` не
 /// возвращается.
 pub unsafe fn syscall(frame: &mut crate::arch::TrapFrame) {
-    match crate::user::with_current(|program| program.linux) {
-        Some(true) => {}
+    // Without the process lock (21.11.2026): asking `program.linux` under it
+    // queued every call behind any thread holding it.
+    let linux = if crate::user::files::UNLOCKED_IO.load(core::sync::atomic::Ordering::Relaxed) {
+        crate::user::current_is_linux()
+    } else {
+        crate::user::with_current(|program| program.linux).unwrap_or(false)
+    };
+    if !linux {
         // `syscall` из родной программы: таблицы Linux ей не положено.
-        _ => {
-            frame.rax = (-e::ENOSYS) as u64;
-            return;
-        }
+        frame.rax = (-e::ENOSYS) as u64;
+        return;
     }
     let number = frame.rax as usize;
     // `rt_sigreturn` возвращает не ответ, а прерванные регистры целиком.
@@ -887,7 +891,7 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     if flags & O_TRUNC != 0 {
         native_flags |= user_abi::O_TRUNC;
     }
-    let fd = match crate::user::with_current(|program| program.files.open(cred, &path, native_flags)) {
+    let fd = match crate::user::files::open_in_current(cred, &path, native_flags) {
         Some(Ok(fd)) => fd,
         Some(Err(err)) => return file_errno(err),
         None => return -e::ESRCH,

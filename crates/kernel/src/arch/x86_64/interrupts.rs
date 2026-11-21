@@ -498,7 +498,7 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
     // `int 0x80` программы Linux — системный вызов i386 (12.11.2026): Wine в
     // режиме WoW64 так заводит 32-битный `FS` (`set_thread_area`). Родной ABI
     // `int 0x80` ей не положен.
-    if vector == VECTOR_SYSCALL && crate::user::with_current(|program| program.linux).unwrap_or(false) {
+    if vector == VECTOR_SYSCALL && crate::user::current_is_linux() {
         frame.rax = crate::linux::i386_syscall(frame) as i32 as u32 as u64;
         // SAFETY: как у родного системного вызова ниже.
         unsafe { crate::user::check_kill() };
