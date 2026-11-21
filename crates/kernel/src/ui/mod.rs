@@ -73,6 +73,7 @@ pub mod traypop;
 pub mod trash;
 pub mod wallart;
 pub mod window;
+pub mod winapps;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -2780,7 +2781,9 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
     // Автоскрытие панели: край экрана выдвигает её, уход — прячет (20.11).
     desktop.taskbar_pointer(x, y);
     if desktop.menu_open() && !desktop.context_open() {
-        if desktop.menu_mut().is_some_and(|menu| menu.hover(x, y)) {
+        // Строку «Пуска» тащат (21.11) — подсветка цели и подсказка.
+        let dragged = buttons.contains(Buttons::LEFT) && desktop.menu_mut().is_some_and(|menu| menu.drag(x, y));
+        if dragged || desktop.menu_mut().is_some_and(|menu| !menu.dragging() && menu.hover(x, y)) {
             desktop.present();
         }
     }
@@ -3269,6 +3272,33 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
     if event.released(Buttons::MIDDLE) {
         release_pointer(desktop, x, y, MIDDLE_BUTTON, status);
+    }
+    if event.released(Buttons::LEFT) && desktop.menu_open() {
+        // Нажатая строка «Пуска» (21.11): на месте — запуск, перенесённая —
+        // в папку, к закреплённым или ярлыком на стол.
+        match desktop.menu_mut().and_then(|menu| menu.release(x, y)) {
+            Some(panel::MenuClick::Launch(choice)) => {
+                if let Some(menu) = desktop.menu_mut() {
+                    menu.close();
+                }
+                kprintln!("  desktop     : menu closed");
+                desktop.mark_menu_area();
+                run_choice(desktop, choice);
+                desktop.refresh_panel(status);
+            }
+            Some(panel::MenuClick::Close) => {
+                if let Some(menu) = desktop.menu_mut() {
+                    menu.close();
+                }
+                kprintln!("  desktop     : menu closed");
+                desktop.mark_menu_area();
+                desktop.reload_icons();
+                log_icons(desktop);
+                desktop.refresh_panel(status);
+            }
+            Some(panel::MenuClick::Stay) => desktop.refresh_panel(status),
+            None => {}
+        }
     }
     if event.released(Buttons::LEFT) {
         // Жест по полоске и карточка переключателя — раньше прочего: нажатие,
@@ -5406,7 +5436,23 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
             let Some(command) = desktop.icon_path(index) else {
                 return;
             };
+            // Ярлык программы Windows (21.11) — с правами пакета `proton`,
+            // как из «Пуска».
+            if command.contains(panel::PROTON_SCRIPT) {
+                run_choice(desktop, panel::proton_choice(command));
+                return;
+            }
             start(desktop, &command);
+        }
+        // Ярлык или программа Windows в файле на столе (`.lnk`, `.exe`, 21.11)
+        // — через Proton, префикс — где нашлась цель ярлыка.
+        Some(icons::Kind::File) if desktop.icon_path(index).is_some_and(|path| winapps::is_windows_file(&path)) && winapps::proton_present() => {
+            let Some(path) = desktop.icon_path(index) else {
+                return;
+            };
+            if let Some(line) = winapps::open_line(&path) {
+                run_choice(desktop, panel::proton_choice(line));
+            }
         }
         // Корзина — «Файлы» в её каталоге (он заводится, если корзина ещё
         // ни разу не понадобилась: окно на несуществующем пути было бы пустым

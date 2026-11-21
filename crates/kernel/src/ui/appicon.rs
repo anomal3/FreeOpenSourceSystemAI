@@ -143,6 +143,16 @@ pub fn forget() {
     CACHE.lock().clear();
 }
 
+/// Положить в кэш картинку, которой нет на диске, под условным путём
+/// (21.11: значки программ Windows из их `.exe`, `ui::winapps`).
+pub fn remember(path: &str, image: Arc<Image>) {
+    let mut cache = CACHE.lock();
+    match cache.iter_mut().find(|(known, _)| known == path) {
+        Some((_, slot)) => *slot = Some(image),
+        None => cache.push((String::from(path), Some(image))),
+    }
+}
+
 /// Значок по полю `icon` манифеста: путь к FIMG или имя значка набора.
 #[must_use]
 pub fn of_manifest(icon: &str) -> Art {

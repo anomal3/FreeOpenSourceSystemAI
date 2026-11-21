@@ -55,7 +55,12 @@ pub struct Folder {
     pub about: &'static str,
 }
 
-pub static FOLDERS: [Folder; 3] = [
+/// Папка программ Windows (21.11): ярлыки из префиксов Wine/Proton
+/// (`ui::winapps`) встают сюда, пока человек не перенесёт их сам.
+pub const WINDOWS_FOLDER: &str = "folder:windows";
+
+pub static FOLDERS: [Folder; 4] = [
+    Folder { key: WINDOWS_FOLDER, caption: "Программы Windows", about: "поставленные в Wine и Proton" },
     Folder { key: "folder:utils", caption: "Системные утилиты", about: "калькулятор, блокнот и другие" },
     Folder { key: "folder:sdk", caption: "SDK C#", about: "примеры WinForms и .NET" },
     // Как «Инструменты Windows» (20.11): журнал, службы, очистка и оба

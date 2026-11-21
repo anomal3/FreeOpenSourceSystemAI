@@ -302,6 +302,9 @@ fn package_signature() -> String {
             out.push_str(&alloc::format!(":{}/", entry.size));
         }
     }
+    // Ярлыки программ Windows в префиксах Wine (21.11): установщик положил
+    // ярлык на стол префикса — значок появляется сам.
+    out.push_str(&super::winapps::signature());
     out
 }
 
@@ -491,6 +494,20 @@ impl Icons {
             });
         }
 
+        // Ярлыки, которые установщик программы Windows положил на стол
+        // префикса Wine (`C:\users\Public\Desktop\Notepad++.lnk`, 21.11).
+        // Программу удалили — ярлыка или его цели нет, и значка тоже.
+        for app in super::winapps::scan().into_iter().filter(|app| app.desktop && !app.uninstall && !is_hidden(&app.caption)) {
+            let command = super::panel::proton_line(&app.args());
+            let icon = if app.icon.is_empty() { String::from("windows-apps") } else { app.icon };
+            self.items.push(Item {
+                kind: Kind::Program(Icon::Package),
+                label: app.caption,
+                path: Some(command),
+                shortcut: Some(super::appicon::of_manifest(&icon)),
+            });
+        }
+
         let base = super::context::desktop_dir();
         let Some(Ok(entries)) = crate::fs::list(&base) else {
             // Каталога стола может не быть вовсе — его заводят при первой
@@ -518,11 +535,17 @@ impl Icons {
             } else {
                 alloc::format!("{base}/{name}")
             };
+            // Ярлык Windows (`.lnk`) на столе — значок его программы со
+            // стрелкой, как в Проводнике (21.11).
+            let shortcut = (!directory && name.to_ascii_lowercase().ends_with(".lnk")).then(|| {
+                let icon = super::winapps::icon_of_lnk(&path);
+                super::appicon::of_manifest(if icon.is_empty() { "windows-apps" } else { &icon })
+            });
             self.items.push(Item {
                 kind: if directory { Kind::Folder } else { Kind::File },
                 label: name,
                 path: Some(path),
-                shortcut: None,
+                shortcut,
             });
         }
 
@@ -1153,7 +1176,12 @@ impl Icons {
             }
             return;
         }
-        let (first, second) = wrap(ctx, &item.label, room);
+        // У ярлыка Windows расширения `.lnk` не видно, как в Проводнике.
+        let label = match item.kind {
+            Kind::File if item.shortcut.is_some() => item.label.strip_suffix(".lnk").or_else(|| item.label.strip_suffix(".LNK")).unwrap_or(&item.label),
+            _ => item.label.as_str(),
+        };
+        let (first, second) = wrap(ctx, label, room);
         centered(ctx, back, cell, y, room, &first, ink);
         if let Some(second) = second {
             y += step as i32;

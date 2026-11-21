@@ -645,6 +645,9 @@ tmnf_handoff() {
 case "$1" in
     --open=*)
         unpct "${1#--open=}"; f=$U; shift
+        # Файл внутри префикса (`…/.tmnf/drive_c/…`: ярлык «Пуска», программа
+        # Windows из «Программ Windows», 21.11) - в его префиксе, не в общем.
+        case $f in */drive_c/*) p=${f%%/drive_c/*}; [ -f "$p/system.reg" ] && export WINEPREFIX=$p ;; esac
         tmnf_handoff "$f" "$@"
         cd "${f%/*}" 2>/dev/null
         case "${f,,}" in

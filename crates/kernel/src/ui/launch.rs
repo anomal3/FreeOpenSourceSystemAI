@@ -284,6 +284,11 @@ pub fn poll() {
 /// Значок запуска.
 fn find_icon(source: &Source) -> Option<Arc<Image>> {
     match source {
+        // Ярлык Windows — значок его программы (21.11, `ui::winapps`).
+        Source::Exe(path) if path.to_ascii_lowercase().ends_with(".lnk") => {
+            let icon = super::winapps::icon_of_lnk(path);
+            (!icon.is_empty()).then(|| super::appicon::image(&icon)).flatten()
+        }
         Source::Exe(path) => exe_icon(path).map(Arc::new),
         Source::Shortcut(dir, icon) => {
             let fimg = super::panel::shortcut_icon(dir, icon);
@@ -301,6 +306,14 @@ fn find_icon(source: &Source) -> Option<Arc<Image>> {
 /// разбирает: декодера PNG в нём нет, см. `mini_ui::image`). Файл читается
 /// кусками по смещениям — игра весит гигабайты.
 pub fn exe_icon(path: &str) -> Option<Image> {
+    icon_image(path, 0)
+}
+
+/// Значок из файла `path` с номером `index`, как в поле значка ярлыка Windows
+/// (21.11, `ui::winapps`): `.ico` — лучший размер файла; `.exe`/`.dll` —
+/// группа значков номер `index` по порядку (отрицательный — номер ресурса).
+pub fn icon_image(path: &str, index: i32) -> Option<Image> {
+    let ico = path.to_ascii_lowercase().ends_with(".ico");
     crate::fs::with_fs(path, |fs, inner| {
         let node = fs.resolve(inner).ok()?;
         let read = |offset: u64, len: usize| -> Option<Vec<u8>> {
@@ -313,9 +326,43 @@ pub fn exe_icon(path: &str) -> Option<Image> {
             let got = node.read_at(offset, &mut buf).ok()?;
             (got == len).then_some(buf)
         };
-        pe_icon(&read)
+        if ico { ico_icon(&read) } else { pe_icon(&read, index) }
     })
     .flatten()
+}
+
+/// Файл `.ico`: заголовок, записи по 16 байт (сторона, бит на точку, размер,
+/// смещение) — DIB того же вида, что в ресурсах PE.
+fn ico_icon(read: &dyn Fn(u64, usize) -> Option<Vec<u8>>) -> Option<Image> {
+    let head = read(0, 6)?;
+    if u16_at(&head, 0)? != 0 || u16_at(&head, 2)? != 1 {
+        return None;
+    }
+    let count = usize::from(u16_at(&head, 4)?).min(64);
+    let table = read(6, count * 16)?;
+    let mut sizes: Vec<(u32, u16, u32, u32)> = (0..count)
+        .filter_map(|i| {
+            let e = i * 16;
+            let side = match *table.get(e)? {
+                0 => 256,
+                w => u32::from(w),
+            };
+            Some((side, u16_at(&table, e + 6)?, u32_at(&table, e + 8)?, u32_at(&table, e + 12)?))
+        })
+        .collect();
+    sizes.sort_by_key(|(side, bits, _, _)| best_size_key(*side, *bits));
+    sizes.into_iter().find_map(|(_, _, size, offset)| {
+        if size as usize > 1024 * 1024 {
+            return None;
+        }
+        dib_to_image(&read(u64::from(offset), size as usize)?)
+    })
+}
+
+/// Порядок размеров значка: ближе к 48 и глубже цветом — первым, больше 64 —
+/// в конце (PNG 256×256 ядро не разбирает).
+fn best_size_key(side: u32, bits: u16) -> (u32, u32) {
+    ((side as i32 - 48).unsigned_abs() + if side > 64 { 1000 } else { 0 }, u32::from(32 - bits.min(32)))
 }
 
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
@@ -327,7 +374,7 @@ fn u32_at(b: &[u8], at: usize) -> Option<u32> {
 }
 
 /// Разбор PE: заголовки, секции, каталог ресурсов.
-fn pe_icon(read: &dyn Fn(u64, usize) -> Option<Vec<u8>>) -> Option<Image> {
+fn pe_icon(read: &dyn Fn(u64, usize) -> Option<Vec<u8>>, group_index: i32) -> Option<Image> {
     let dos = read(0, 64)?;
     if dos.get(..2)? != b"MZ" {
         return None;
@@ -371,10 +418,11 @@ fn pe_icon(read: &dyn Fn(u64, usize) -> Option<Vec<u8>>) -> Option<Image> {
     };
     // Данные первого языка первого имени ресурса типа `kind` с номером `id`
     // (`None` — любой).
-    let data = |kind: u32, id: Option<u32>| -> Option<Vec<u8>> {
+    // `nth` — номер по порядку среди имён (для группы значков ярлыка).
+    let data_nth = |kind: u32, id: Option<u32>, nth: usize| -> Option<Vec<u8>> {
         let (_, types) = entries(0)?.into_iter().find(|(name, _)| *name == kind)?;
         let names = entries(types & 0x7FFF_FFFF)?;
-        let (_, langs) = names.into_iter().find(|(name, _)| id.is_none_or(|id| *name == id))?;
+        let (_, langs) = names.into_iter().filter(|(name, _)| id.is_none_or(|id| *name == id)).nth(nth)?;
         let mut node = langs;
         // До листа — не глубже трёх уровней.
         for _ in 0..2 {
@@ -390,9 +438,16 @@ fn pe_icon(read: &dyn Fn(u64, usize) -> Option<Vec<u8>>) -> Option<Image> {
         }
         read(to_file(rva)?, size)
     };
+    let data = |kind: u32, id: Option<u32>| data_nth(kind, id, 0);
     const RT_ICON: u32 = 3;
     const RT_GROUP_ICON: u32 = 14;
-    let group = data(RT_GROUP_ICON, None)?;
+    // Номер группы, которого нет (ярлык помнит значок прежней версии), —
+    // первая группа.
+    let group = match group_index {
+        0 => data(RT_GROUP_ICON, None),
+        n if n > 0 => data_nth(RT_GROUP_ICON, None, n as usize).or_else(|| data(RT_GROUP_ICON, None)),
+        n => data(RT_GROUP_ICON, Some(n.unsigned_abs())).or_else(|| data(RT_GROUP_ICON, None)),
+    }?;
     let count = usize::from(u16_at(&group, 4)?).min(64);
     // (сторона, бит на точку, номер значка)
     let mut sizes: Vec<(u32, u16, u16)> = (0..count)
@@ -406,7 +461,7 @@ fn pe_icon(read: &dyn Fn(u64, usize) -> Option<Vec<u8>>) -> Option<Image> {
         })
         .collect();
     // Ближе к 48 и глубже цветом — первым.
-    sizes.sort_by_key(|(side, bits, _)| ((*side as i32 - 48).unsigned_abs() + if *side > 64 { 1000 } else { 0 }, u32::from(32 - (*bits).min(32))));
+    sizes.sort_by_key(|(side, bits, _)| best_size_key(*side, *bits));
     sizes.into_iter().find_map(|(_, _, id)| dib_to_image(&data(RT_ICON, Some(u32::from(id)))?))
 }
 

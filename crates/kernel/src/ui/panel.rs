@@ -2032,27 +2032,18 @@ pub(super) fn list_packages() -> Vec<Launcher> {
 
 // ── Программы Windows из префиксов Proton (P12, 18.11.2026) ─────────────────
 
-/// Ярлык программы Windows: `.desktop`, который `winemenubuilder` установщика
-/// записал в `ПРЕФИКС/drive_c/proton_shortcuts/` (так у Proton: не в
-/// `~/.local/share/applications/wine`). Читает его и запускает сценарий
-/// `fossai-proton --shortcut=…`; здесь — только имя, значок и путь.
-pub(super) struct WinShortcut {
-    pub(super) caption: String,
-    /// Путь файла `.desktop`.
-    pub(super) file: String,
-    /// Префикс Wine — каталог с `drive_c`.
-    pub(super) prefix: String,
-    /// FIMG значка, если он уже сделан из PNG; иначе пусто.
-    pub(super) icon: String,
-    /// Ярлык удаления («Uninstall …» — его кладут Inno Setup, NSIS и подобные).
-    pub(super) uninstall: bool,
-}
+/// Ярлык программы Windows (21.11 — из `.lnk` префикса, см. `ui::winapps`;
+/// до того — только `.desktop` `winemenubuilder` из `proton_shortcuts`).
+pub(super) type WinShortcut = super::winapps::WinApp;
 
 /// Сценарий пакета `proton`.
-const PROTON_SCRIPT: &str = "/opt/proton/bin/fossai-proton";
+pub(super) const PROTON_SCRIPT: &str = "/opt/proton/bin/fossai-proton";
 
-/// Где в префиксе лежат ярлыки.
-const SHORTCUTS: &str = "drive_c/proton_shortcuts";
+/// Запуск строки `fossai-proton` с правами пакета `proton` (стол, 21.11).
+pub(super) fn proton_choice(line: String) -> Choice {
+    let rights = list_packages().into_iter().find(|launcher| launcher.name == "proton").map_or(fpk::Rights::NONE, |launcher| launcher.rights);
+    Choice::Command(line, rights)
+}
 
 /// Командная строка `fossai-proton` с аргументами.
 pub(super) fn proton_line(args: &str) -> String {
@@ -2078,58 +2069,11 @@ fn exists(path: &str) -> bool {
     matches!(crate::fs::read(path, 0), Some(Ok(_)))
 }
 
-/// Ярлыки во всех префиксах дома (`~/.proton`, `~/.tmnf`, … — каталоги с
-/// точкой, в которых есть `drive_c/proton_shortcuts`). Дом — того, кто вошёл,
-/// и `/root` (живая флешка и `run` из оболочки ставят туда). Без пакета
-/// `proton` — пусто: запускать ярлыки нечем.
+/// Ярлыки программ Windows во всех префиксах дома (`~/.proton`, `~/.tmnf`,
+/// …) и `/root`: `.lnk` их «Пуска» и стола, `.desktop` `winemenubuilder`.
+/// Без пакета `proton` — пусто: запускать ярлыки нечем.
 pub(super) fn windows_shortcuts() -> Vec<WinShortcut> {
-    const LIMIT: usize = 16 * 1024;
-    let mut out = Vec::new();
-    if !exists(PROTON_SCRIPT) {
-        return out;
-    }
-    let mut homes = alloc::vec![super::context::home_dir()];
-    if homes[0] != "/root" {
-        homes.push(String::from("/root"));
-    }
-    for home in &homes {
-        let Some(Ok(entries)) = crate::fs::list(home) else {
-            continue;
-        };
-        for entry in entries {
-            if entry.kind != crate::vfs::NodeKind::Directory || !entry.name.starts_with('.') || entry.name.len() < 2 {
-                continue;
-            }
-            let prefix = alloc::format!("{home}/{}", entry.name);
-            let dir = alloc::format!("{prefix}/{SHORTCUTS}");
-            let Some(Ok(files)) = crate::fs::list(&dir) else {
-                continue;
-            };
-            for file in files {
-                if file.kind != crate::vfs::NodeKind::File || !file.name.ends_with(".desktop") {
-                    continue;
-                }
-                let path = alloc::format!("{dir}/{}", file.name);
-                let Some(Ok((bytes, _))) = crate::fs::read(&path, LIMIT) else {
-                    continue;
-                };
-                let text = String::from_utf8_lossy(&bytes);
-                let field = |key: &str| {
-                    text.lines().find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('='))).map(str::trim)
-                };
-                if field("NoDisplay") == Some("true") {
-                    continue;
-                }
-                let caption = String::from(field("Name").unwrap_or_else(|| file.name.trim_end_matches(".desktop")));
-                let lower = caption.to_lowercase();
-                let uninstall = lower.starts_with("uninstall") || lower.starts_with("удалить") || file.name.to_lowercase().starts_with("uninstall");
-                let icon = shortcut_icon(&dir, field("Icon").unwrap_or(""));
-                out.push(WinShortcut { caption, file: path, prefix: prefix.clone(), icon, uninstall });
-            }
-        }
-    }
-    out.sort_by(|a, b| a.caption.cmp(&b.caption));
-    out
+    super::winapps::scan()
 }
 
 /// Префиксы Wine в доме (каталоги с точкой, в которых есть `system.reg`):
@@ -2213,20 +2157,23 @@ fn convert_icon(png: &str, fimg: &str) {
 /// Строки «Пуска» для программ Windows: запуск ярлыка с правами пакета
 /// `proton` (у него `windows files net jit`). Ярлыки удаления — не здесь, а
 /// в «Параметры → Пакеты».
-fn windows_launchers(packages: &[Launcher]) -> Vec<Launcher> {
-    let Some(proton) = packages.iter().find(|launcher| launcher.name == "proton") else {
-        return Vec::new();
+pub(super) fn windows_launchers(packages: &[Launcher]) -> Vec<Launcher> {
+    let rights = match packages.iter().find(|launcher| launcher.name == "proton") {
+        Some(proton) => proton.rights,
+        None if super::winapps::proton_present() => fpk::Rights::NONE,
+        None => return Vec::new(),
     };
     windows_shortcuts()
         .into_iter()
-        .filter(|shortcut| !shortcut.uninstall)
+        // Ярлыки стола префикса — на столе (`Icons::reload`), не в «Пуске».
+        .filter(|shortcut| !shortcut.uninstall && !shortcut.desktop)
         .map(|shortcut| {
             let place = shortcut.prefix.rsplit('/').next().unwrap_or("");
             Launcher {
-                name: alloc::format!("windows:{}", shortcut.file),
-                about: alloc::format!("Windows · {place}"),
-                start: proton_line(&alloc::format!("--shortcut={}", pct(&shortcut.file))),
-                rights: proton.rights,
+                name: shortcut.key(),
+                about: if shortcut.group.is_empty() { alloc::format!("Windows · {place}") } else { alloc::format!("Windows · {place} · {}", shortcut.group) },
+                start: proton_line(&shortcut.args()),
+                rights,
                 desktop: false,
                 icon: if shortcut.icon.is_empty() { String::from("windows-apps") } else { shortcut.icon },
                 opens: String::new(),
@@ -2366,6 +2313,10 @@ enum PopAct {
     PinTask(String),
     UnpinTask(String),
     First(String),
+    /// Перенести строку (номер в `items`) в папку (пусто — наружу), 21.11.
+    MoveTo(usize, &'static str),
+    /// Ярлык программы Windows на рабочий стол.
+    Desk(usize),
     Account,
     Lock,
     Logout,
@@ -2378,6 +2329,29 @@ enum Popup {
     Menu { at: (i32, i32), rows: Vec<(String, PopAct, bool)> },
     User,
     Folder { folder: &'static startapps::Folder, cell: Rect },
+}
+
+/// Нажатая и, может быть, перетаскиваемая строка «Пуска» (21.11).
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    /// Номер в `items`.
+    index: usize,
+    /// Где нажали и где указатель сейчас (экран).
+    from: (i32, i32),
+    at: (i32, i32),
+    dragging: bool,
+}
+
+/// Куда бросили перетаскиваемую строку.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DropAt {
+    /// Мимо «Пуска» — на стол: ярлык программы Windows.
+    Desktop,
+    /// В папку (пусто — из папок наружу).
+    Folder(&'static str),
+    /// К закреплённым — плиткой.
+    Pin,
+    Nothing,
 }
 
 /// Что сделал щелчок по открытому «Пуску».
@@ -2404,6 +2378,13 @@ pub struct Menu {
     /// Множитель геометрии стола.
     scale: mini_ui::Scale,
     items: Vec<Item>,
+    /// Папка каждой строки (ключ из `FOLDERS`, пусто — верхний уровень):
+    /// своя из манифеста, программы Windows — «Программы Windows», или та,
+    /// куда человек перенёс строку (`deskcfg::start_folder`, 21.11).
+    homes: Vec<&'static str>,
+    /// Строка, на которой нажали кнопку (21.11): запуск — при отпускании
+    /// на месте, перенос — если её потащили.
+    held: Option<Held>,
     /// Выбранная строка — номер в `visible`.
     row: usize,
     open: bool,
@@ -2566,6 +2547,8 @@ impl Menu {
             rect,
             scale,
             items,
+            homes: Vec::new(),
+            held: None,
             row: 0,
             open: false,
             damage: Rect::EMPTY,
@@ -2586,6 +2569,7 @@ impl Menu {
             scratch: None,
             edge: cfg.edge,
         };
+        menu.compute_homes();
         menu.load_tiles();
         Some(menu)
     }
@@ -2597,7 +2581,7 @@ impl Menu {
         for key in deskcfg::start_pins() {
             if let Some(folder) = startapps::folder(&key) {
                 // Пустая папка (ни одной программы на диске) не ставится.
-                if self.items.iter().any(|item| item.folder() == folder.key) {
+                if self.homes.iter().any(|home| *home == folder.key) {
                     self.tiles.push(Tile::Folder(folder));
                 }
                 continue;
@@ -2606,6 +2590,157 @@ impl Menu {
                 self.tiles.push(Tile::Item(index));
             }
         }
+    }
+
+    /// Папки строк (21.11): перенос человека, иначе своя.
+    fn compute_homes(&mut self) {
+        let homes = (0..self.items.len())
+            .map(|index| {
+                let item = self.items[index];
+                if item.danger() {
+                    return "";
+                }
+                let key = item.key(&self.packages);
+                if let Some(chosen) = deskcfg::start_folder(&key) {
+                    return startapps::folder(&chosen).map_or("", |folder| folder.key);
+                }
+                match item {
+                    Item::Package(n) if self.packages.get(n).is_some_and(|launcher| launcher.name.starts_with("windows:")) => startapps::WINDOWS_FOLDER,
+                    _ => item.folder(),
+                }
+            })
+            .collect();
+        self.homes = homes;
+    }
+
+    /// Папка строки `index` (пусто — верхний уровень).
+    fn home(&self, index: usize) -> &'static str {
+        self.homes.get(index).copied().unwrap_or("")
+    }
+
+    /// Программа Windows ли строка (у неё есть ярлык, который можно положить
+    /// на стол): путь ярлыка.
+    fn windows_file(&self, index: usize) -> Option<&str> {
+        match self.items.get(index)? {
+            Item::Package(n) => self.packages.get(*n)?.name.strip_prefix("windows:"),
+            _ => None,
+        }
+    }
+
+    /// Перенести строку `index` в папку `folder` (пусто — наружу).
+    fn move_to_folder(&mut self, index: usize, folder: &'static str) {
+        let key = self.items[index].key(&self.packages);
+        deskcfg::set_start_folder(&key, folder);
+        crate::kprintln!("  desktop     : start item '{key}' moved to {}", if folder.is_empty() { "the top level" } else { folder });
+        self.compute_homes();
+        if !folder.is_empty() && !self.expanded.contains(&folder) {
+            self.expanded.push(folder);
+        }
+    }
+
+    /// Положить ярлык программы Windows `index` на стол. `true` — положен.
+    fn shortcut_to_desktop(&self, index: usize) -> bool {
+        let Some(file) = self.windows_file(index) else { return false };
+        let caption = self.items[index].caption(&self.packages);
+        match super::winapps::copy_to_desktop(file, caption) {
+            Ok(path) => {
+                crate::kprintln!("  desktop     : shortcut '{caption}' put on the desktop as {path}");
+                true
+            }
+            Err(err) => {
+                crate::kprintln!("  desktop     : shortcut '{caption}' not put on the desktop: {err}");
+                false
+            }
+        }
+    }
+
+    /// Указатель движется с нажатой левой кнопкой (21.11): строку, на которой
+    /// нажали, потащили дальше 8 точек — начался перенос. `true` —
+    /// перерисовано.
+    pub fn drag(&mut self, x: i32, y: i32) -> bool {
+        let Some(held) = self.held.as_mut() else { return false };
+        let moved = (x - held.from.0).abs() > 8 || (y - held.from.1).abs() > 8;
+        if !held.dragging && !moved {
+            return false;
+        }
+        if !held.dragging {
+            held.dragging = true;
+            self.popup = None;
+            let caption = self.items[held.index].caption(&self.packages);
+            crate::kprintln!("  desktop     : start drag of '{caption}'");
+        }
+        held.at = (x, y);
+        self.hot = self.target_at(x, y).map(|(target, _)| target);
+        self.redraw();
+        true
+    }
+
+    /// Тащат ли сейчас строку «Пуска».
+    #[must_use]
+    pub fn dragging(&self) -> bool {
+        self.held.as_ref().is_some_and(|held| held.dragging)
+    }
+
+    /// Куда упадёт перенос в точке `x, y` и что об этом сказать.
+    fn drop_at(&self, index: usize, x: i32, y: i32) -> (DropAt, &'static str) {
+        if !self.rect.contains(x, y) {
+            return if self.windows_file(index).is_some() { (DropAt::Desktop, "Отпустите — ярлык на рабочем столе") } else { (DropAt::Nothing, "Ярлык на стол — только у программ Windows") };
+        }
+        let layout = self.start_layout();
+        let (lx, ly) = (x - self.rect.x, y - self.rect.y);
+        let target = self.target_at(x, y).map(|(target, _)| target);
+        let in_pins = layout.pins.is_some_and(|pins| pins.contains(lx, ly));
+        let in_list = layout.list.is_some_and(|list| list.contains(lx, ly));
+        match target {
+            Some(Target::FolderRow(number)) => (DropAt::Folder(startapps::FOLDERS[number].key), "Отпустите — переместить в папку"),
+            Some(Target::Tile(n)) => match self.tiles.get(n) {
+                Some(Tile::Folder(folder)) => (DropAt::Folder(folder.key), "Отпустите — переместить в папку"),
+                _ if !deskcfg::start_pinned(&self.items[index].key(&self.packages)) => (DropAt::Pin, "Отпустите — закрепить в «Пуске»"),
+                _ => (DropAt::Nothing, ""),
+            },
+            _ if in_pins && !deskcfg::start_pinned(&self.items[index].key(&self.packages)) => (DropAt::Pin, "Отпустите — закрепить в «Пуске»"),
+            Some(Target::Row(other)) if in_list && !self.home(other).is_empty() && self.home(other) != self.home(index) => (DropAt::Folder(self.home(other)), "Отпустите — переместить в папку"),
+            _ if in_list && !self.home(index).is_empty() => (DropAt::Folder(""), "Отпустите — убрать из папки"),
+            _ => (DropAt::Nothing, ""),
+        }
+    }
+
+    /// Левую кнопку отпустили (21.11). Нажатие без переноса — запуск строки,
+    /// как раньше щелчок; перенос — папка, закрепление или ярлык на столе.
+    /// `None` — «Пуск» нажатия не держал.
+    pub fn release(&mut self, x: i32, y: i32) -> Option<MenuClick> {
+        let held = self.held.take()?;
+        if !held.dragging {
+            return Some(self.launch(held.index));
+        }
+        let (place, _) = self.drop_at(held.index, x, y);
+        self.hot = None;
+        let out = match place {
+            DropAt::Desktop => {
+                // Стол перечитает свой каталог сам (наблюдение за ним).
+                self.shortcut_to_desktop(held.index);
+                MenuClick::Close
+            }
+            DropAt::Folder(folder) => {
+                self.move_to_folder(held.index, folder);
+                MenuClick::Stay
+            }
+            DropAt::Pin => {
+                let key = self.items[held.index].key(&self.packages);
+                deskcfg::toggle_start_pin(&key);
+                crate::kprintln!("  desktop     : start pinned '{key}' (dragged)");
+                MenuClick::Stay
+            }
+            DropAt::Nothing => {
+                crate::kprintln!("  desktop     : start drag dropped on nothing");
+                MenuClick::Stay
+            }
+        };
+        self.load_tiles();
+        self.clamp_scroll();
+        self.redraw();
+        self.log_rows();
+        Some(out)
     }
 
     /// Набрать знак в поле поиска (72f). `true` — запрос изменился.
@@ -2691,6 +2826,7 @@ impl Menu {
     pub fn close(&mut self) {
         self.open = false;
         self.popup = None;
+        self.held = None;
     }
 
     /// Где что стоит в открытом «Пуске», строками `имя at X,Y WxH` в
@@ -2717,6 +2853,8 @@ impl Menu {
                     None => continue,
                 },
                 Target::FolderRow(number) => alloc::format!("row:{}", startapps::FOLDERS[number].key),
+                // Программы Windows (21.11) — по подписи: ключ у них — путь.
+                Target::Row(index) if self.windows_file(index).is_some() => alloc::format!("row:win:{}", self.items[index].caption(&self.packages)),
                 Target::User => String::from("user"),
                 Target::Tool(n) => alloc::format!("tool:{n}"),
                 Target::Power(index) => alloc::format!("power:{}", self.items[index].key(&self.packages)),
@@ -2739,6 +2877,14 @@ impl Menu {
     /// Напечатать места строк всплывающего (стенд целится в них).
     fn log_popup(&self) {
         for spot in self.spots().into_iter().filter(|spot| spot.starts_with("pop:") || spot.starts_with("child:")) {
+            crate::kprintln!("  desktop     : start spot {spot}");
+        }
+    }
+
+    /// Напечатать места строк программ Windows в списке (после раскрытия
+    /// папки и переноса стенд целится в них заново).
+    fn log_rows(&self) {
+        for spot in self.spots().into_iter().filter(|spot| spot.starts_with("row:") || spot.starts_with("tile:pkg:windows:")) {
             crate::kprintln!("  desktop     : start spot {spot}");
         }
     }
@@ -2813,7 +2959,7 @@ impl Menu {
     /// прокручен до неё.
     fn reveal_selection(&mut self) {
         let Some(index) = self.visible.get(self.row).copied() else { return };
-        let folder = self.items[index].folder();
+        let folder = self.home(index);
         if !folder.is_empty() && self.query.is_empty() {
             if let Some(known) = startapps::folder(folder) {
                 if !self.expanded.contains(&known.key) {
@@ -2870,13 +3016,13 @@ impl Menu {
         let mut top: Vec<(String, Target)> = Vec::new();
         for index in 0..self.items.len() {
             let item = self.items[index];
-            if item.danger() || !item.folder().is_empty() {
+            if item.danger() || !self.home(index).is_empty() {
                 continue;
             }
             top.push((item.caption(&self.packages).to_lowercase(), Target::Row(index)));
         }
         for (number, folder) in startapps::FOLDERS.iter().enumerate() {
-            if self.items.iter().any(|item| item.folder() == folder.key) {
+            if self.homes.iter().any(|home| *home == folder.key) {
                 top.push((String::from(folder.caption).to_lowercase(), Target::FolderRow(number)));
             }
         }
@@ -2888,7 +3034,7 @@ impl Menu {
                 let folder = &startapps::FOLDERS[number];
                 if self.expanded.contains(&folder.key) {
                     for index in 0..self.items.len() {
-                        if self.items[index].folder() == folder.key {
+                        if self.home(index) == folder.key {
                             rows.push((Target::Row(index), true));
                         }
                     }
@@ -3083,7 +3229,7 @@ impl Menu {
                 Some((rect, lines))
             }
             Popup::Folder { folder, cell } => {
-                let children: Vec<usize> = (0..self.items.len()).filter(|index| self.items[*index].folder() == folder.key).collect();
+                let children: Vec<usize> = (0..self.items.len()).filter(|index| self.home(*index) == folder.key).collect();
                 let columns = (children.len() as u32).clamp(1, 3);
                 let rows = (children.len() as u32).div_ceil(columns).max(1);
                 let w = px(CELL_W) * columns + px(24);
@@ -3160,6 +3306,7 @@ impl Menu {
             return false;
         }
         crate::kprintln!("  desktop     : start scrolled: list {}, pins {}", self.scroll_list, self.scroll_pins);
+        self.log_rows();
         // Всплывающая папка привязана к плитке — при прокрутке она бы
         // повисла в воздухе.
         if matches!(self.popup, Some(Popup::Folder { .. })) {
@@ -3244,8 +3391,11 @@ impl Menu {
             return MenuClick::Stay;
         };
         match target {
+            // Строка и плитка программы запускаются при отпускании на месте
+            // ([`Self::release`]): нажатую можно утащить в папку, к
+            // закреплённым или на стол (21.11).
             Target::Tile(n) => match self.tiles.get(n).copied() {
-                Some(Tile::Item(index)) => self.launch(index),
+                Some(Tile::Item(index)) => self.hold(index, x, y),
                 Some(Tile::Folder(folder)) => {
                     let again = matches!(&self.popup, Some(Popup::Folder { folder: shown, .. }) if shown.key == folder.key);
                     self.popup = if again { None } else { Some(Popup::Folder { folder, cell: rect }) };
@@ -3254,7 +3404,8 @@ impl Menu {
                 }
                 None => MenuClick::Stay,
             },
-            Target::Row(index) | Target::Child(index) | Target::Power(index) => self.launch(index),
+            Target::Row(index) | Target::Child(index) => self.hold(index, x, y),
+            Target::Power(index) => self.launch(index),
             Target::FolderRow(number) => {
                 let key = startapps::FOLDERS[number].key;
                 match self.expanded.iter().position(|known| *known == key) {
@@ -3269,6 +3420,7 @@ impl Menu {
                 }
                 self.clamp_scroll();
                 self.redraw();
+                self.log_rows();
                 MenuClick::Stay
             }
             Target::Recent(n) => match self.recent.get(n) {
@@ -3313,6 +3465,12 @@ impl Menu {
             Target::Pop(n) => self.popup_pick(n),
             Target::Search => MenuClick::Stay,
         }
+    }
+
+    /// Нажали на строку `index`: запомнить, решит отпускание.
+    fn hold(&mut self, index: usize, x: i32, y: i32) -> MenuClick {
+        self.held = Some(Held { index, from: (x, y), at: (x, y), dragging: false });
+        MenuClick::Stay
     }
 
     /// Запустить строку `index`.
@@ -3381,6 +3539,19 @@ impl Menu {
                 rows.push((String::from("Закрепить на панели задач"), PopAct::PinTask(key.clone()), true));
             }
         }
+        // Папки (21.11): строку списка — в любую папку «Пуска» или наружу.
+        if let Some(index) = item.filter(|_| !in_pins) {
+            let home = self.home(index);
+            for folder in startapps::FOLDERS.iter().filter(|folder| folder.key != home) {
+                rows.push((alloc::format!("Переместить в «{}»", folder.caption), PopAct::MoveTo(index, folder.key), true));
+            }
+            if !home.is_empty() {
+                rows.push((String::from("Убрать из папки"), PopAct::MoveTo(index, ""), true));
+            }
+        }
+        if let Some(index) = item.filter(|index| self.windows_file(*index).is_some()) {
+            rows.push((String::from("Создать ярлык на рабочем столе"), PopAct::Desk(index), true));
+        }
         crate::kprintln!("  desktop     : start context menu for '{key}'");
         self.popup = Some(Popup::Menu { at, rows });
         self.hot = None;
@@ -3434,6 +3605,16 @@ impl Menu {
             PopAct::PinTask(key) | PopAct::UnpinTask(key) => {
                 let pinned = deskcfg::toggle_task_pin(&key);
                 crate::kprintln!("  desktop     : taskbar {} '{key}'", if pinned { "pinned" } else { "unpinned" });
+                stay(self)
+            }
+            PopAct::MoveTo(index, folder) => {
+                self.move_to_folder(index, folder);
+                let out = stay(self);
+                self.log_rows();
+                out
+            }
+            PopAct::Desk(index) => {
+                self.shortcut_to_desktop(index);
                 stay(self)
             }
             PopAct::Account => MenuClick::Launch(Choice::Settings(super::settings::Section::Accounts)),
@@ -3674,6 +3855,21 @@ impl Menu {
         if let Some((rect, lines)) = &layout.popup {
             self.draw_popup(ctx.on(fill), *rect, lines);
         }
+        // Перенос строки (21.11): в поле поиска — что будет при отпускании,
+        // у указателя — значок строки.
+        if let Some(held) = self.held.filter(|held| held.dragging) {
+            let (_, hint) = self.drop_at(held.index, held.at.0, held.at.1);
+            let hint = if hint.is_empty() { "Перетащите в папку, к закреплённым или на рабочий стол" } else { hint };
+            draw::rounded(&mut self.surface, field, px(theme::R_ROW), p.acc, 255);
+            paint::text_clipped(ctx, &mut self.surface, Role::Body, field.x + px(12) as i32, paint::baseline(ctx, Role::Body, field), field.w.saturating_sub(px(24)), hint, p.acc_ink);
+            let (lx, ly) = (held.at.0 - self.rect.x, held.at.1 - self.rect.y);
+            if card.contains(lx, ly) {
+                let side = px(32);
+                let ghost = Rect::new(lx - side as i32 / 2, ly - side as i32 / 2, side, side);
+                draw::rounded(&mut self.surface, Rect::new(ghost.x - px(4) as i32, ghost.y - px(4) as i32, side + px(8), side + px(8)), px(theme::R_ROW), p.btnhov.over(fill), 230);
+                draw_item_icon(ctx, &mut self.surface, ghost, self.items[held.index], &self.packages);
+            }
+        }
         self.damage = self.surface.bounds();
     }
 
@@ -3697,7 +3893,7 @@ impl Menu {
         let radius = (rect.w / 4).max(2);
         draw::rounded(s, rect, radius, p.btn.color, p.btn.alpha.saturating_add(40));
         draw::rounded_stroke(s, rect, radius, p.btnline.color, p.btnline.alpha);
-        let children: Vec<Item> = self.items.iter().copied().filter(|item| item.folder() == folder.key).take(4).collect();
+        let children: Vec<Item> = (0..self.items.len()).filter(|index| self.home(*index) == folder.key).map(|index| self.items[index]).take(4).collect();
         let inner = rect.w.saturating_sub(rect.w / 4);
         let mini = (inner / 2).saturating_sub(1).max(1);
         let x0 = rect.x + (rect.w as i32 - (mini * 2 + 2) as i32) / 2;
@@ -3733,6 +3929,8 @@ impl Menu {
                     let icon = match act {
                         PopAct::Open(_) => Some(Fi::ArrowRight),
                         PopAct::First(_) => Some(Fi::ArrowUp),
+                        PopAct::MoveTo(..) => Some(Fi::Folder),
+                        PopAct::Desk(_) => Some(Fi::Monitor),
                         _ => Some(Fi::Pin),
                     };
                     if let Some(icon) = icon {

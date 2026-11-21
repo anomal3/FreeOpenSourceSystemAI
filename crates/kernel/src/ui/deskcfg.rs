@@ -284,6 +284,7 @@ pub fn adopt(text: &str, path: &str) {
     if let Some(line) = sysconf::value(text, "start_pins") {
         *START_PINS.lock() = Some(parse_list(line));
     }
+    adopt_start_folders(text);
     if let Some(line) = sysconf::value(text, "taskbar_pins") {
         *TASK_PINS.lock() = Some(parse_list(line));
         PIN_GEN.fetch_add(1, Ordering::Relaxed);
@@ -343,6 +344,40 @@ pub fn describe() -> String {
 #[must_use]
 pub fn describe_start() -> String {
     start().format()
+}
+
+/// Папки «Пуска», выбранные человеком (21.11): ключ строки → ключ папки
+/// (`folder:…`, пусто — верхний уровень списка). Строка настроек
+/// `start_folders=ключ=папка|…`; ключ может содержать `=` (путь ярлыка), папка
+/// — нет, поэтому делится по последнему.
+static START_FOLDERS: SpinLock<Vec<(String, String)>> = SpinLock::new(Vec::new());
+
+/// Папка, в которую человек перенёс строку; `None` — не переносил.
+#[must_use]
+pub fn start_folder(key: &str) -> Option<String> {
+    START_FOLDERS.lock().iter().find(|(known, _)| known == key).map(|(_, folder)| folder.clone())
+}
+
+/// Перенести строку `key` в папку `folder` (пусто — из папок наружу).
+pub fn set_start_folder(key: &str, folder: &str) {
+    let line = {
+        let mut list = START_FOLDERS.lock();
+        list.retain(|(known, _)| known != key);
+        list.push((String::from(key), String::from(folder)));
+        list.iter().map(|(key, folder)| alloc::format!("{key}={folder}")).collect::<Vec<_>>().join("|")
+    };
+    if let Err(err) = super::prefs::store_line("start_folders", &line) {
+        crate::kprintln!("  desktop     : start folders not saved: {err}");
+    }
+}
+
+fn adopt_start_folders(text: &str) {
+    if let Some(line) = sysconf::value(text, "start_folders") {
+        *START_FOLDERS.lock() = parse_list(line)
+            .into_iter()
+            .filter_map(|pair| pair.rsplit_once('=').map(|(key, folder)| (String::from(key), String::from(folder))))
+            .collect();
+    }
 }
 
 /// Закрепить или открепить программу в «Пуске». `true` — теперь закреплена.

@@ -504,14 +504,14 @@ impl SettingsView {
     /// реестре префикса, в том числе MSI без ярлыков). Без пакета `proton` и
     /// префиксов — раздела нет.
     fn windows_programs(&self, pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
-        use super::super::panel::{pct, proton_line, windows_prefixes, windows_shortcuts};
+        use super::super::panel::{proton_line, windows_prefixes, windows_shortcuts};
         let prefixes = windows_prefixes();
         if prefixes.is_empty() {
             return y;
         }
         let mut y = pass.group(x, y, w, "Программы Windows");
         for shortcut in windows_shortcuts().into_iter().filter(|shortcut| shortcut.uninstall) {
-            let line = proton_line(&format!("--shortcut={}", pct(&shortcut.file)));
+            let line = proton_line(&shortcut.args());
             y = row(pass, x, y, w, Some(Fi::Package), &shortcut.caption, &shortcut.prefix, Ctl::Button("Удалить", Weight::Normal), Some(Deed::Run(line)));
         }
         for prefix in prefixes {

@@ -1414,6 +1414,47 @@ fn run_builtin(line: &str) -> bool {
             }
             _ => sprintln!("  usage: cp <from> <to>"),
         },
+        // `winapps` (21.11) — программы Windows, найденные в префиксах Wine
+        // (то, что показывают «Пуск» и стол); `winapps assume-proton` —
+        // считать пакет `proton` стоящим (стенд, живая система без `/opt`).
+        "winapps" => {
+            if argument == "assume-proton" {
+                crate::ui::winapps::assume_proton();
+                sprintln!("  winapps: proton assumed");
+            }
+            let apps = crate::ui::winapps::scan();
+            for app in &apps {
+                sprintln!(
+                    "  winapps: '{}' {} -> {}{}{}{}",
+                    app.caption,
+                    app.file,
+                    if app.target.is_empty() { "?" } else { &app.target },
+                    if app.desktop { " [desktop]" } else { "" },
+                    if app.uninstall { " [uninstall]" } else { "" },
+                    if app.icon.is_empty() { "" } else { " [icon]" }
+                );
+            }
+            sprintln!("  winapps: {} shortcut(s) in {} prefix(es)", apps.len(), crate::ui::winapps::prefixes().len());
+        }
+        // `mklnk C:\путь\программа.exe > /путь/Имя.lnk` (21.11) — ярлык
+        // Windows, как его пишет Wine: «Программы Windows» проверяются на
+        // префиксе без установки Proton (сценарий `winapps`).
+        "mklnk" => match argument.split_once('>') {
+            Some((target, path)) if !target.trim().is_empty() => {
+                if let Some(path) = human_path(path.trim()) {
+                    let bytes = crate::ui::winapps::build_lnk(target.trim());
+                    match fs::create_as(user::session::credentials(), &path, 0o644) {
+                        Some(Ok(node)) => match node.write_at(0, &bytes) {
+                            Ok(_) => sprintln!("  mklnk: {} bytes to {path}", bytes.len()),
+                            Err(err) => sprintln!("  mklnk {path}: {err}"),
+                        },
+                        Some(Err(err)) => sprintln!("  mklnk {path}: {err}"),
+                        None => sprintln!("  no filesystem is mounted"),
+                    }
+                }
+            }
+            _ => sprintln!("  usage: mklnk <C:\\target.exe> > <file.lnk>"),
+        },
         "cat" => {
             if argument.is_empty() {
                 sprintln!("  usage: cat <path>");
