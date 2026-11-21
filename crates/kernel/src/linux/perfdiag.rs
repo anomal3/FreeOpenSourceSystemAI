@@ -113,6 +113,9 @@ struct Mark {
     desktop: (u64, u64, u64, u64, u64),
     flush_ns: u64,
     outputs: [(u64, u64); crate::ui::OUTPUT_STATS],
+    /// G2: `(wait-queue sleeps, wakes by key, idle rounds without the lock,
+    /// zeroed frames from the caches, cache refills)`.
+    g2: [u64; 5],
 }
 
 impl Mark {
@@ -150,6 +153,16 @@ impl Mark {
             desktop: crate::ui::timing(),
             flush_ns: crate::ui::flush_ns(),
             outputs: core::array::from_fn(crate::ui::output_blit),
+            g2: {
+                let (sleeps, wakes) = crate::sched::wait_queue_stats();
+                [
+                    sleeps,
+                    wakes,
+                    crate::sched::idle_skips(),
+                    crate::mm::frame::ZEROED_HITS.load(Ordering::Relaxed),
+                    crate::mm::frame::ZEROED_REFILLS.load(Ordering::Relaxed),
+                ]
+            },
         }
     }
 }
@@ -292,6 +305,27 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     for (site, count, ns) in crate::sched::take_lock_wait_sites() {
         let _ = write!(line, "; {site} {count}x {} ms", ms(ns));
     }
+    kprintln!("  perf-diag   : {line}");
+    // G2: the worst shootdown - who asked, which CPU answered late and the
+    // spin lock that kept it deaf; wait queues, idle rounds, zeroed frames.
+    let (asked_at, slow_cpu, deaf_at, slow_total) = crate::arch::smp::shootdown_worst();
+    let g2: [u64; 5] = core::array::from_fn(|i| new.g2[i].saturating_sub(old.g2[i]));
+    let mut line = String::new();
+    let _ = write!(line, "{secs} s tlb worst {} us asked at {asked_at}", shoot_worst / 1000);
+    match (slow_cpu, deaf_at) {
+        (Some(cpu), Some(at)) => {
+            let _ = write!(line, ", cpu {cpu} late (interrupts off in a spin lock taken at {at})");
+        }
+        (Some(cpu), None) => {
+            let _ = write!(line, ", cpu {cpu} late (not in a spin lock: interrupt handler or switch)");
+        }
+        _ => {}
+    }
+    let _ = write!(
+        line,
+        ", {slow_total} slow (>0.5 ms) since boot; wait queues {} sleeps {} woken by key; idle rounds without the lock {}; zeroed frames {} from cpu caches, {} refills",
+        g2[0], g2[1], g2[2], g2[3], g2[4]
+    );
     kprintln!("  perf-diag   : {line}");
 
     // 3. Процессоры и очередь.

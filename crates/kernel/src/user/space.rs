@@ -433,6 +433,17 @@ impl Space {
     /// Диапазон обязан принадлежать этой программе и не быть ничем другим:
     /// кадры уезжают в пул, и второй владелец получил бы чужую память.
     pub unsafe fn unmap_range(&mut self, base: VirtAddr, pages: usize, everywhere: bool) -> usize {
+        // One shootdown per call, not per 64 pages (G2, 21.11.2026): D2R
+        // frees hundreds of MB at an area change, and every 64-page portion
+        // sent IPIs to all CPUs of the process and waited for them (16 k
+        // shootdowns per 30 s on hw-log13). Frames wait in a list until the
+        // single flush; without memory for the list - the old way.
+        if everywhere && pages > CHUNK_PAGES {
+            // SAFETY: the caller's contract.
+            if let Some(freed) = unsafe { self.unmap_range_batched(base, pages) } {
+                return freed;
+            }
+        }
         let root = self.root;
         let mut freed = 0;
         let mut done = 0;
@@ -500,6 +511,64 @@ impl Space {
 
         self.owned = self.owned.saturating_sub(freed);
         freed
+    }
+
+    /// [`Space::unmap_range`] with one TLB shootdown per [`BATCH_RUNS`]
+    /// removed runs (normally one per call). `None` - no memory for the list
+    /// of runs, nothing was done.
+    ///
+    /// # Safety
+    ///
+    /// As [`Space::unmap_range`].
+    unsafe fn unmap_range_batched(&mut self, base: VirtAddr, pages: usize) -> Option<usize> {
+        let root = self.root;
+        let mut taken: alloc::vec::Vec<(PhysAddr, usize)> = alloc::vec::Vec::new();
+        taken.try_reserve_exact(pages.min(BATCH_RUNS)).ok()?;
+        let mut freed = 0;
+        let mut at = 0;
+        let flush_and_free = |taken: &mut alloc::vec::Vec<(PhysAddr, usize)>| -> usize {
+            if taken.is_empty() {
+                return 0;
+            }
+            arch::flush_user_translations(Some(root));
+            let mut got = 0;
+            // Back to the pool in portions: the pool lock closes interrupts.
+            for portion in taken.chunks(CHUNK_PAGES) {
+                got += crate::mm::frame::with(|frames| {
+                    let mut got = 0;
+                    for &(phys, count) in portion {
+                        for offset in 0..count {
+                            // SAFETY: the frame came from this tree, no table
+                            // refers to it any more and the translations were
+                            // flushed everywhere just above.
+                            unsafe { frames.free(PhysAddr::new(phys.as_u64() + (offset * PAGE_SIZE) as u64)) };
+                        }
+                        got += count;
+                    }
+                    got
+                })
+                .unwrap_or(0);
+            }
+            taken.clear();
+            got
+        };
+        while at < pages {
+            let virt = VirtAddr::new(base.as_usize() + at * PAGE_SIZE);
+            // SAFETY: as in `unmap_range`.
+            match unsafe { arch::unmap(root, virt) } {
+                Some((phys, count)) => {
+                    taken.push((phys, count));
+                    at += count;
+                    if taken.len() == taken.capacity() {
+                        freed += flush_and_free(&mut taken);
+                    }
+                }
+                None => at += arch::unmapped_run(root, virt).max(1),
+            }
+        }
+        freed += flush_and_free(&mut taken);
+        self.owned = self.owned.saturating_sub(freed);
+        Some(freed)
     }
 
     /// Отобразить программе кадры, которые завёл и которыми владеет **кто-то
@@ -624,6 +693,10 @@ pub enum Dup {
 /// не оставались закрытыми заметное время, и достаточно велика, чтобы захват
 /// замка не стал дороже самой работы.
 const CHUNK_PAGES: usize = 64;
+
+/// Removed runs (a 4 KiB page or a large page each) per TLB shootdown in
+/// [`Space::unmap_range_batched`]: 64 MiB of small pages, 128 KiB of list.
+const BATCH_RUNS: usize = 16 * 1024;
 
 impl Drop for Space {
     fn drop(&mut self) {

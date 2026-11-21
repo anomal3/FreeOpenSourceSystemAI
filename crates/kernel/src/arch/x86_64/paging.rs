@@ -1337,6 +1337,7 @@ pub fn flush_local_translations() {
 /// Зовётся после снятия страниц или смены прав у многопоточного процесса; на
 /// этом процессоре трансляции сброшены уже по ходу (`invlpg`). См.
 /// [`super::smp::shootdown`].
+#[track_caller]
 pub fn flush_user_translations(root: Option<PhysAddr>) {
     super::smp::shootdown(root.map(PhysAddr::as_u64));
 }
