@@ -66,6 +66,18 @@ pub fn shootdown_worst() -> (alloc::string::String, Option<usize>, Option<alloc:
     (alloc::string::String::new(), None, None, 0)
 }
 
+/// See the x86-64 version; no waits here.
+#[must_use]
+pub fn shootdown_worst_syscall() -> Option<(u64, u64, usize)> {
+    None
+}
+
+/// See the x86-64 version; no waits here.
+#[must_use]
+pub fn late_syscalls() -> (alloc::vec::Vec<(u64, u64, u64)>, u64) {
+    (alloc::vec::Vec::new(), 0)
+}
+
 /// Номер текущего процессора — из `TPIDR_EL1`.
 #[inline]
 #[must_use]

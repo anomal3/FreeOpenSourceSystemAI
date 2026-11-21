@@ -36,7 +36,28 @@ pub fn count(number: usize, nanos: u64) {
         CALLS[number].fetch_add(1, Ordering::Relaxed);
         LAST[number].store(crate::sched::running_slot() as u64, Ordering::Relaxed);
         NANOS[number].fetch_add(nanos, Ordering::Relaxed);
+        // The longest call of the perf-diag window (hw-log14), without the
+        // calls that exist to sleep; read first so the common short call does
+        // not write a shared line.
+        if nanos > WORST_NS.load(Ordering::Relaxed)
+            && !matches!(number, 7 | 23 | 34 | 35 | 61 | 202 | 230 | 232 | 247 | 270 | 271 | 281 | 441 | 449 | 130 | 128)
+            && WORST_NS.fetch_max(nanos, Ordering::Relaxed) < nanos
+        {
+            WORST_NR.store(number as u64, Ordering::Relaxed);
+        }
     }
+}
+
+/// The longest single call since the last [`take_worst`] and its number.
+static WORST_NS: AtomicU64 = AtomicU64::new(0);
+static WORST_NR: AtomicU64 = AtomicU64::new(0);
+
+/// `(number, ns)` of the longest single call since the last question (sleeps
+/// included, like the totals) - and forget it.
+#[must_use]
+pub fn take_worst() -> Option<(usize, u64)> {
+    let ns = WORST_NS.swap(0, Ordering::Relaxed);
+    (ns != 0).then(|| (WORST_NR.load(Ordering::Relaxed) as usize, ns))
 }
 
 /// Вызовы, которые были, — `(номер, сколько раз, наносекунд)`, по убыванию
@@ -118,6 +139,7 @@ pub fn name(number: usize) -> &'static str {
         87 => "unlink",
         89 => "readlink",
         96 => "gettimeofday",
+        98 => "getrusage",
         186 => "gettid",
         202 => "futex",
         217 => "getdents64",

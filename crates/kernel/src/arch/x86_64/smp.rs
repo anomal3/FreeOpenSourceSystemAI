@@ -587,7 +587,7 @@ pub fn shootdown(root: Option<u64>) {
         let start = super::tsc::counter();
         // Сколько ждали ответов — в `perf-diag` (P1): число сбросов без цены
         // не говорит, тормозят ли они.
-        let mut spent = Spent { start, caller, slow: None };
+        let mut spent = Spent { start, caller, slow: None, syscall: None };
         let patience = super::tsc::frequency() / 1000 * FLUSH_PATIENCE_MS;
         // After this long the CPU still behind is "slow": remember who it is
         // and which spin lock keeps its interrupts off (G2 diagnostics).
@@ -604,6 +604,9 @@ pub fn shootdown(root: Option<u64>) {
                 && spent.slow.is_none_or(|(was, _)| was != cpu)
             {
                 spent.slow = Some((cpu, crate::sync::irq_off_site(cpu)));
+                // Which Linux call keeps it busy, if any (hw-log14: the late
+                // CPU had no spin lock / without_interrupts site).
+                spent.syscall = crate::linux::recent::on_cpu(cpu);
             }
             if patience != 0 && super::tsc::counter().wrapping_sub(start) > patience {
                 crate::kprintln!(
@@ -662,6 +665,9 @@ struct Spent {
     /// The last CPU found slow to answer and the spin lock it was holding
     /// with interrupts off at that moment.
     slow: Option<(usize, Option<&'static core::panic::Location<'static>>)>,
+    /// The Linux call that slow CPU was in when it was found slow: `(number,
+    /// ns since entered, task slot)`.
+    syscall: Option<(u64, u64, usize)>,
 }
 
 impl Drop for Spent {
@@ -673,11 +679,83 @@ impl Drop for Spent {
             WORST_CALLER.store(core::ptr::from_ref(self.caller) as usize, Ordering::Relaxed);
             WORST_CPU.store(cpu, Ordering::Relaxed);
             WORST_SITE.store(site.map_or(0, |site| core::ptr::from_ref(site) as usize), Ordering::Relaxed);
+            let (number, ns, slot) = self.syscall.unwrap_or((u64::MAX, 0, 0));
+            WORST_SYSCALL.store(number, Ordering::Relaxed);
+            WORST_SYSCALL_NS.store(ns, Ordering::Relaxed);
+            WORST_SYSCALL_SLOT.store(slot, Ordering::Relaxed);
+        }
+        if let Some((number, ns, _)) = self.syscall {
+            // Every slow shootdown, not only the worst: which calls the late
+            // CPUs were in and for how long (the worst one per number).
+            note_late_syscall(number, ns);
         }
         if self.slow.is_some() {
             FLUSH_SLOW.fetch_add(1, Ordering::Relaxed);
+            if self.syscall.is_none() {
+                LATE_OUTSIDE.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
+}
+
+/// The Linux call of the late CPU in the worst shootdown (`u64::MAX` - none),
+/// how long it had been running then, and the task slot.
+static WORST_SYSCALL: AtomicU64 = AtomicU64::new(u64::MAX);
+static WORST_SYSCALL_NS: AtomicU64 = AtomicU64::new(0);
+static WORST_SYSCALL_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Slow shootdowns by the Linux call the late CPU was in: number + 1 (0 -
+/// free cell), count and the longest time in that call, since the last
+/// [`late_syscalls`]. Eight cells are plenty: a handful of calls take long.
+const LATE_CELLS: usize = 8;
+static LATE_NR: [AtomicU64; LATE_CELLS] = [const { AtomicU64::new(0) }; LATE_CELLS];
+static LATE_COUNT: [AtomicU64; LATE_CELLS] = [const { AtomicU64::new(0) }; LATE_CELLS];
+static LATE_WORST_NS: [AtomicU64; LATE_CELLS] = [const { AtomicU64::new(0) }; LATE_CELLS];
+/// Slow shootdowns whose late CPU was not in a Linux call.
+static LATE_OUTSIDE: AtomicU64 = AtomicU64::new(0);
+
+fn note_late_syscall(number: u64, ns: u64) {
+    let key = number.wrapping_add(1);
+    for cell in 0..LATE_CELLS {
+        let now = LATE_NR[cell].load(Ordering::Relaxed);
+        let mine = now == key
+            || (now == 0 && LATE_NR[cell].compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed).is_ok())
+            || LATE_NR[cell].load(Ordering::Relaxed) == key;
+        if mine {
+            LATE_COUNT[cell].fetch_add(1, Ordering::Relaxed);
+            LATE_WORST_NS[cell].fetch_max(ns, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Slow shootdowns since the last call grouped by the Linux call the late
+/// CPU was in: `(number, count, longest ns in it)`, and how many had their
+/// late CPU outside any Linux call. Forgets what it returns.
+#[must_use]
+pub fn late_syscalls() -> (alloc::vec::Vec<(u64, u64, u64)>, u64) {
+    let mut rows = alloc::vec::Vec::new();
+    for cell in 0..LATE_CELLS {
+        let key = LATE_NR[cell].swap(0, Ordering::AcqRel);
+        let count = LATE_COUNT[cell].swap(0, Ordering::Relaxed);
+        let worst = LATE_WORST_NS[cell].swap(0, Ordering::Relaxed);
+        if key != 0 && count != 0 {
+            rows.push((key - 1, count, worst));
+        }
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    (rows, LATE_OUTSIDE.swap(0, Ordering::Relaxed))
+}
+
+/// The Linux call of the late CPU in the worst shootdown since the last
+/// call: `(number, ns it had been running, task slot)`. Read right after
+/// [`shootdown_worst`].
+#[must_use]
+pub fn shootdown_worst_syscall() -> Option<(u64, u64, usize)> {
+    let number = WORST_SYSCALL.swap(u64::MAX, Ordering::Relaxed);
+    let ns = WORST_SYSCALL_NS.swap(0, Ordering::Relaxed);
+    let slot = WORST_SYSCALL_SLOT.swap(0, Ordering::Relaxed);
+    (number != u64::MAX).then_some((number, ns, slot))
 }
 
 /// The worst wait since the last question: who asked, which CPU was slow

@@ -465,6 +465,14 @@ pub fn running_slot() -> usize {
     RUNNING_SLOT[smp::cpu()].load(Ordering::Relaxed)
 }
 
+/// Slot of the task running on another CPU right now (`None` - its idle
+/// task or no such CPU). A racy snapshot, for diagnostics only.
+#[must_use]
+pub fn running_slot_on(cpu: usize) -> Option<usize> {
+    let slot = RUNNING_SLOT.get(cpu)?.load(Ordering::Relaxed);
+    (!is_idle_slot(slot)).then_some(slot)
+}
+
 /// Сторож замков (фаза 74): раз в 5 с ищет задачи, спящие на мьютексе
 /// дольше 15 с, и печатает цепочку «кто ждёт — кто держит — чего ждёт
 /// держатель». Только по таблице планировщика: имя программы спрашивается у

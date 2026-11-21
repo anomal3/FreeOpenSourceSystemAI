@@ -319,14 +319,34 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     let g2: [u64; 5] = core::array::from_fn(|i| new.g2[i].saturating_sub(old.g2[i]));
     let mut line = String::new();
     let _ = write!(line, "{secs} s tlb worst {} us asked at {asked_at}", shoot_worst / 1000);
-    match (slow_cpu, deaf_at) {
-        (Some(cpu), Some(at)) => {
-            let _ = write!(line, ", cpu {cpu} late (interrupts off since {at})");
+    // hw-log14: which Linux call the late CPU was in, and for how long.
+    let in_call = crate::arch::smp::shootdown_worst_syscall().map(|(number, ns, slot)| {
+        let task = crate::sched::id_of_slot(slot).map_or_else(|| alloc::format!("slot {slot}"), |id| alloc::format!("task {id}"));
+        alloc::format!("in syscall #{number} {} since {} us, {task}", super::profile::name(number as usize), ns / 1000)
+    });
+    match (slow_cpu, deaf_at, in_call) {
+        (Some(cpu), Some(at), call) => {
+            let _ = write!(line, ", cpu {cpu} late (interrupts off since {at}");
+            if let Some(call) = call {
+                let _ = write!(line, "; {call}");
+            }
+            line.push(')');
         }
-        (Some(cpu), None) => {
-            let _ = write!(line, ", cpu {cpu} late (interrupts off in an interrupt handler or the task switch)");
+        (Some(cpu), None, Some(call)) => {
+            let _ = write!(line, ", cpu {cpu} late ({call})");
+        }
+        (Some(cpu), None, None) => {
+            let _ = write!(line, ", cpu {cpu} late (interrupts off in an interrupt handler or the task switch, not in a Linux call)");
         }
         _ => {}
+    }
+    let (late, outside) = crate::arch::smp::late_syscalls();
+    if !late.is_empty() || outside != 0 {
+        let _ = write!(line, "; slow ones by the late cpu's call:");
+        for (number, count, worst) in late.iter().take(6) {
+            let _ = write!(line, " #{number} {} {count}x (up to {} us)", super::profile::name(*number as usize), worst / 1000);
+        }
+        let _ = write!(line, ", outside calls {outside}x");
     }
     let _ = write!(
         line,
@@ -348,8 +368,13 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
         Some((micros, at)) => alloc::format!("{}.{:03} ms at {}:{}", micros / 1000, micros % 1000, at.file(), at.line()),
         None => String::from("not measured"),
     };
+    // The longest single Linux call that is not a sleep by design (hw-log14).
+    let longest = match super::profile::take_worst() {
+        Some((number, ns)) => alloc::format!("#{number} {} {}.{:03} ms", super::profile::name(number), ns / 1_000_000, ns / 1000 % 1000),
+        None => String::from("none"),
+    };
     kprintln!(
-        "  perf-diag   : {secs} s cpu: idle {idle_pct}% of {cpus} cpus, run queue {} ready on average (worst {}), {} running; {} switches; irq-off worst {irq_off}; serial queue {} bytes, {} dropped since boot",
+        "  perf-diag   : {secs} s cpu: idle {idle_pct}% of {cpus} cpus, run queue {} ready on average (worst {}), {} running; {} switches; irq-off worst {irq_off}; longest syscall {longest}; serial queue {} bytes, {} dropped since boot",
         avg(queue.ready),
         queue.worst,
         avg(queue.running),
