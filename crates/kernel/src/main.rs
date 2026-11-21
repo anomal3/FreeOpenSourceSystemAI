@@ -897,6 +897,12 @@ fn run_session(have_input: bool) -> ! {
                 kprintln!("  spawn nvidia failed: {err}");
             }
         }
+        // AMD Polaris (21.11): the SMC start by the marker on the stick.
+        if display::amd::probed() {
+            if let Err(err) = sched::spawn_daemon("amd", display::amd::auto_task) {
+                kprintln!("  spawn amd failed: {err}");
+            }
+        }
         // Журнал на живую флешку (15.11): снимает кольцо с самого начала, пишет,
         // когда найдётся `\FREEOS\LOG.TXT`.
         if let Err(err) = sched::spawn_daemon("sticklog", usb::stick_log::task) {

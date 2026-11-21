@@ -308,6 +308,15 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     payload.push(read_payload(esp, &source)?);
                 }
             }
+            // Marker for the SMC auto start of the AMD card (21.11): only a build
+            // with FOSSAI_AMD_SMC_START=1 asks the kernel to start the SMC by itself.
+            if std::env::var("FOSSAI_AMD_SMC_START").is_ok_and(|v| v == "1") {
+                payload.push(Payload {
+                    path: String::from("FREEOS/AMD/START.TXT"),
+                    data: b"start\n".to_vec(),
+                    source: PathBuf::from("(FOSSAI_AMD_SMC_START=1)"),
+                });
+            }
             // Браузер OBSOS (16.11, Роман: «в образ ещё браузер обсос запиши,
             // хочу на ПК проверить на живом»). Корень живой системы только на
             // чтение, поэтому пакет едет файлом `\FREEOS\PKG\OBSOS.FPK`, а ядро,

@@ -1069,3 +1069,43 @@ pub fn polaris_smc_start() -> Vec<String> {
     ));
     lines
 }
+
+// --- Auto start of the SMC (no keyboard needed) -----------------------------
+//
+// The USB keyboard of the live stick is not always recognised at boot (19-21.11),
+// so `amd smc start` can not always be typed. A stick built with
+// FOSSAI_AMD_SMC_START=1 carries the marker FREEOS/AMD/START.TXT: this task waits
+// for the stick, and only if the marker is there runs the same start as the
+// command. Without the marker nothing is written to the card.
+
+/// True if a Polaris card was found and its register window is mapped.
+#[must_use]
+pub fn probed() -> bool {
+    POLARIS_MMIO.lock().is_some()
+}
+
+/// Background task: start the SMC if the stick carries the marker.
+pub fn auto_task() {
+    if super::firmware_only() {
+        crate::kprintln!("  amdgpu     : auto start skipped - firmware display asked in the boot menu");
+        return;
+    }
+    // The stick appears some seconds after the kernel starts.
+    let deadline = crate::time::uptime_ms() + 90_000;
+    while firmware_file("SMC.BIN").is_err() {
+        if crate::time::uptime_ms() > deadline {
+            crate::kprintln!("  amdgpu      : auto start: no FREEOS/AMD/SMC.BIN found in 90 s");
+            return;
+        }
+        crate::sched::sleep_ms(1000);
+    }
+    if firmware_file("START.TXT").is_err() {
+        crate::kprintln!("  amdgpu     : auto start is off (no FREEOS/AMD/START.TXT on the stick); 'amd smc start' by hand");
+        return;
+    }
+    crate::kprintln!("  amdgpu     : auto start: marker found, starting the SMC");
+    let _ = polaris_smc_start();
+    for line in polaris_smc() {
+        crate::kprintln!("  amdgpu     : auto start: smc: {line}");
+    }
+}
