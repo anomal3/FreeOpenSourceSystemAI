@@ -1762,6 +1762,14 @@ impl Program {
         let executable = flags.contains(PageFlags::EXEC);
         let first = self.mappings.partition_point(|region| region.end() <= addr);
         let mut failed = false;
+        // Did some present page lose a right (hw-log14)? Only then the other
+        // CPUs must drop their translations now. A widening (RO -> RW,
+        // NONE -> RW, + exec: Wine/vkd3d heap commits) leaves a stale, too
+        // strict entry at worst: the access faults, the fault finds the page
+        // already allowed ([`page_allows`]) and the instruction is retried -
+        // a #PF drops that translation on x86.
+        let mut narrowed = false;
+        let rights = PageFlags::READ | PageFlags::WRITE | PageFlags::EXEC | PageFlags::USER;
         for index in first..self.mappings.len() {
             let (base, pages) = (self.mappings[index].base, self.mappings[index].pages);
             if base >= end {
@@ -1800,9 +1808,10 @@ impl Program {
             };
             for page in 0..pages {
                 let virt = VirtAddr::new(base + page * PAGE_SIZE);
-                let Some((phys, _)) = arch::translate(root, virt) else {
+                let Some((phys, old)) = arch::translate(root, virt) else {
                     continue;
                 };
+                let old_rights = old.bits() & rights.bits();
                 if executable {
                     arch::sync_instructions(phys);
                 }
@@ -1820,13 +1829,18 @@ impl Program {
                 } else {
                     page_flags
                 };
+                if old_rights & !page_flags.bits() != 0 {
+                    narrowed = true;
+                }
                 if unsafe { self.space.map(virt, phys, page_flags) }.is_err() {
                     failed = true;
                 }
             }
         }
-        if shared {
+        if shared && (narrowed || !LAZY_WIDEN.load(Ordering::Relaxed)) {
             arch::flush_user_translations(Some(self.space.root()));
+        } else if shared {
+            MPROTECT_NO_FLUSH.fetch_add(1, Ordering::Relaxed);
         }
         // Отказ построителя здесь возможен только на исчерпании кадров под
         // промежуточные таблицы — а они у присутствующей страницы уже есть.
@@ -2188,32 +2202,76 @@ impl Program {
             // SAFETY: тот же кадр под тем же адресом, право записи даёт область.
             return unsafe { self.space.remap(virt, phys, flags) }.is_ok();
         }
-        let Some(fresh) = take_frame_reserved() else {
+        // The faulting page and, in a multi-thread program, up to
+        // `COW_BATCH - 1` following pages of the same region that are shared
+        // with a fork too (hw-log14: one shootdown per page; after a fork the
+        // parent's threads write their way through such pages one by one).
+        // Each gets its copy, all lose their old entries, then ONE flush.
+        let region_end = self.mappings[index].base + self.mappings[index].pages * PAGE_SIZE;
+        let root = self.space.root();
+        let mut batch: [(VirtAddr, PhysAddr, PageFlags, PhysAddr); COW_BATCH] =
+            [(VirtAddr::new(0), PhysAddr::new(0), PageFlags::NONE, PhysAddr::new(0)); COW_BATCH];
+        let mut count = 0;
+        let limit = if shared && !code { COW_BATCH } else { 1 };
+        while count < limit {
+            let at = VirtAddr::new(page_addr + count * PAGE_SIZE);
+            let (old, was) = if count == 0 {
+                (phys, now)
+            } else {
+                if at.as_usize() >= region_end {
+                    break;
+                }
+                match arch::translate(root, at) {
+                    Some((old, was))
+                        if !was.contains(PageFlags::WRITE)
+                            && crate::mm::frame::with(|frames| frames.is_shared(old)).unwrap_or(false) =>
+                    {
+                        (old, was)
+                    }
+                    _ => break,
+                }
+            };
+            let Some(fresh) = take_frame_reserved() else {
+                break;
+            };
+            // SAFETY: оба кадра видны через прямое отображение; старый жив — его
+            // держит и эта страница, и другие владельцы.
+            unsafe { core::ptr::copy_nonoverlapping(frame_bytes(old), frame_bytes(fresh), PAGE_SIZE) };
+            batch[count] = (at, old, was, fresh);
+            count += 1;
+        }
+        if count == 0 {
             return false;
-        };
-        // SAFETY: оба кадра видны через прямое отображение; старый жив — его
-        // держит и эта страница, и другие владельцы.
-        unsafe { core::ptr::copy_nonoverlapping(frame_bytes(phys), frame_bytes(fresh), PAGE_SIZE) };
-        // Снять старую запись без возврата кадра, сбросить трансляции, затем
-        // поставить свой кадр и отдать старому одного владельца.
-        // SAFETY: страница принадлежит области этой программы.
-        unsafe { self.space.unmap_range_keep(virt, 1) };
+        }
+        // Снять старые записи без возврата кадров, сбросить трансляции, затем
+        // поставить свои кадры и отдать старым по одному владельцу.
+        for &(at, ..) in &batch[..count] {
+            // SAFETY: страница принадлежит области этой программы.
+            unsafe { self.space.unmap_range_keep(at, 1) };
+        }
         if shared {
-            arch::flush_user_translations(Some(self.space.root()));
+            arch::flush_user_translations(Some(root));
+            if count > 1 {
+                COW_BATCHED.fetch_add(count as u64 - 1, Ordering::Relaxed);
+            }
         }
-        // SAFETY: адрес свободен (снят строкой выше), кадр наш.
-        if unsafe { self.space.remap(virt, fresh, flags) }.is_err() {
-            // SAFETY: возвращаем старую страницу как была.
-            let _ = unsafe { self.space.remap(virt, phys, now) };
-            return_frame(fresh);
-            return false;
+        let mut ok = true;
+        for &(at, old, was, fresh) in &batch[..count] {
+            // SAFETY: адрес свободен (снят выше), кадр наш.
+            if unsafe { self.space.remap(at, fresh, flags) }.is_err() {
+                // SAFETY: возвращаем старую страницу как была.
+                let _ = unsafe { self.space.remap(at, old, was) };
+                return_frame(fresh);
+                ok &= at.as_usize() != page_addr;
+                continue;
+            }
+            crate::mm::frame::with(|frames| {
+                // SAFETY: кадр разделён (`is_shared`) — `free` снимет с него
+                // одного владельца, нас, и в пул его не вернёт.
+                unsafe { frames.free(old) };
+            });
         }
-        crate::mm::frame::with(|frames| {
-            // SAFETY: кадр разделён (`is_shared`) — `free` снимет с него одного
-            // владельца, нас, и в пул его не вернёт.
-            unsafe { frames.free(phys) };
-        });
-        true
+        ok
     }
 
     /// Вслед за отказом в ленивой безымянной памяти — до `count - 1` следующих
@@ -5923,6 +5981,38 @@ pub fn describe_fault(addr: usize) -> alloc::string::String {
 /// burst of 90 k faults becomes half as many trips through the trap.
 const ANON_FAULT_AROUND: usize = 16;
 
+/// Pages one copy-on-write fault breaks at most, with one TLB shootdown.
+const COW_BATCH: usize = 16;
+/// Shootdowns saved by breaking neighbours in the same fault (perf-diag).
+pub static COW_BATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// `mprotect` that only widens rights sends no TLB shootdown (hw-log14);
+/// `mprotlazy off` - always, as before (A/B).
+pub static LAZY_WIDEN: AtomicBool = AtomicBool::new(true);
+/// `mprotect` calls of multi-thread programs that skipped the shootdown,
+/// and faults that found the page already allowed (stale translation) -
+/// since boot, for perf-diag.
+pub static MPROTECT_NO_FLUSH: AtomicU64 = AtomicU64::new(0);
+pub static SPURIOUS_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// Does the page table of the current program already allow `access` at
+/// `page_addr`? Then a fault there came from a stale, stricter translation
+/// (another CPU widened the rights without a shootdown, or a racing fault
+/// already resolved it) and retrying the instruction is the whole fix.
+fn page_allows(page_addr: usize, access: Touch) -> bool {
+    let Some(Some((_, flags))) =
+        with_current_shared(|program, _| arch::translate(program.space.root(), VirtAddr::new(page_addr)))
+    else {
+        return false;
+    };
+    let need = match access {
+        Touch::Read => PageFlags::READ,
+        Touch::Write => PageFlags::WRITE,
+        Touch::Execute => PageFlags::EXEC,
+    };
+    flags.contains(need | PageFlags::USER)
+}
+
 fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
     let page_addr = addr & !(PAGE_SIZE - 1);
     note_why(FaultWhy::Resolved);
@@ -5930,6 +6020,11 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
     // подкачка тут ни при чём. Кроме памяти кода (фаза 59): у неё «не те
     // права» — обычное состояние, и отказ означает «переключи».
     if present {
+        // Already allowed: a stale translation (lazy widening, hw-log14).
+        if page_allows(page_addr, access) {
+            SPURIOUS_FAULTS.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         // Запись в страницу, разделённую `fork` (фаза 71g).
         if access == Touch::Write
             && with_current_shared(|program, shared| program.cow_break(page_addr, shared)) == Some(true)
