@@ -335,6 +335,10 @@ impl Target {
     }
 }
 
+/// How long the frame rate must stay below a quarter of
+/// [`BUSY_COMMITS_PER_S`] before the log goes back to 2 s flushes (hw-log14).
+const IDLE_BEFORE_2S_MS: u64 = 20_000;
+
 /// Сколько кадров показал сервер Wayland с загрузки (есть только на x86_64).
 fn wayland_commits() -> u64 {
     #[cfg(target_arch = "x86_64")]
@@ -354,6 +358,8 @@ pub fn task() {
     let mut commits = wayland_commits();
     let mut commits_at = crate::time::uptime_ms();
     let mut busy = false;
+    // Since when the frame rate has been low while still `busy`.
+    let mut quiet_since: Option<u64> = None;
     let mut chunk = alloc::vec![0u8; 4096];
     loop {
         // Снять новое с кольца.
@@ -375,7 +381,19 @@ pub fn task() {
             let total = wayland_commits();
             let rate = total.saturating_sub(commits) * 1000 / now.saturating_sub(commits_at).max(1);
             let was = busy;
-            busy = rate > BUSY_COMMITS_PER_S;
+            // Hysteresis (hw-log14): D2R at 17-21 frames/s flipped the mode
+            // 7 times in a few minutes - exactly when the game was weakest,
+            // flushes got more frequent. In at once above the threshold; out
+            // only after `IDLE_BEFORE_2S_MS` well below it (a quarter).
+            if rate > BUSY_COMMITS_PER_S {
+                busy = true;
+                quiet_since = None;
+            } else if busy && rate * 4 > BUSY_COMMITS_PER_S {
+                quiet_since = None;
+            } else if busy {
+                let since = *quiet_since.get_or_insert(now);
+                busy = now.saturating_sub(since) < IDLE_BEFORE_2S_MS;
+            }
             if busy != was {
                 kprintln!(
                     "  stick-log   : {} ({rate} Wayland frames/s)",
