@@ -231,13 +231,13 @@ pub use aarch64::paging::map_active;
 /// | [`sync_instructions`]    | сделать записанное в кадр видимым как код       |
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::{
-    activate_kernel_space, activate_space, flush_user_translations, free_user_space, kernel_root,
-    new_user_space, space_at, sync_instructions, translate, unmap, unmapped_run,
+    activate_kernel_space, activate_space, flush_user_translations, free_user_space, free_user_space_part,
+    kernel_root, new_user_space, space_at, sync_instructions, translate, unmap, unmapped_run,
 };
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::paging::{
-    activate_kernel_space, activate_space, flush_user_translations, free_user_space, kernel_root,
-    new_user_space, space_at, sync_instructions, translate, unmap, unmapped_run,
+    activate_kernel_space, activate_space, flush_user_translations, free_user_space, free_user_space_part,
+    kernel_root, new_user_space, space_at, sync_instructions, translate, unmap, unmapped_run,
 };
 
 /// Прерывания и исключения. Обе реализации выставляют один набор имён:

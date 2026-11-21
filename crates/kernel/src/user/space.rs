@@ -703,9 +703,25 @@ impl Drop for Space {
         // SAFETY: пространство больше не активно — `run` возвращает процессор
         // на таблицы ядра сразу после выхода из программы, на обоих путях; сам
         // корень выдан `new_user_space` и никем не разделяется.
+        //
+        // Piece by piece first, the pool lock (interrupts off) per 2 MiB of
+        // the space (hw-log14: one lock for a ~5 GB D2R space was 10.7 ms of
+        // a deaf CPU at the game's exit); then the remaining upper tables and
+        // the root in one go, as before.
+        let root = self.root;
+        let mut cursor = 0;
+        let (mut part_tables, mut part_pages) = (0, 0);
+        // SAFETY: as below - the space is active nowhere and owned by us.
+        while let Some(Some((tables, pages))) =
+            crate::mm::frame::with(|frames| unsafe { arch::free_user_space_part(root, &mut cursor, frames) })
+        {
+            part_tables += tables;
+            part_pages += pages;
+        }
         let freed = crate::mm::frame::with(|frames| unsafe {
             arch::free_user_space(self.root, WINDOW_SLOT, frames)
-        });
+        })
+        .map(|(tables, pages)| (tables + part_tables, pages + part_pages));
 
         match freed {
             Some((tables, pages)) => kprintln!(

@@ -1174,6 +1174,68 @@ pub unsafe fn free_user_space(
     (tables, pages)
 }
 
+/// Free one 2 MiB piece of a program's space - the next present page-table
+/// (or large page) under the lower half of `root` at or after `cursor` - and
+/// move `cursor` past it: `Some((tables, pages))` freed, `None` - nothing left
+/// below the page-directory level. [`free_user_space`] then frees the few
+/// upper tables and the root.
+///
+/// hw-log14: freeing a ~5 GB D2R space in one `free_user_space` kept the pool
+/// lock (interrupts off) for 10.7 ms; the caller takes the lock per piece.
+///
+/// `cursor` counts 2 MiB pieces of the lower half: `(pml4 * 512 + pdpt) *
+/// 512 + pd`; start with 0.
+///
+/// # Safety
+///
+/// As [`free_user_space`]: `root` is a program space active on no CPU.
+pub unsafe fn free_user_space_part(
+    root: PhysAddr,
+    cursor: &mut usize,
+    alloc: &mut impl FrameAllocator,
+) -> Option<(usize, usize)> {
+    const N: usize = ENTRIES_PER_TABLE;
+    while *cursor < N / 2 * N * N {
+        let (pml4, pdpt, pd) = (*cursor / (N * N), *cursor / N % N, *cursor % N);
+        // SAFETY: the root is a whole frame in the direct map.
+        let top = unsafe { ptr::read_volatile(table_entry(root, pml4)) };
+        if !top.is_present() || top.is_huge() {
+            *cursor = (pml4 + 1) * N * N;
+            continue;
+        }
+        // SAFETY: a lower-half root entry of a program space points at its PDPT.
+        let mid = unsafe { ptr::read_volatile(table_entry(top.addr(), pdpt)) };
+        if !mid.is_present() || mid.is_huge() {
+            *cursor = (pml4 * N + pdpt + 1) * N;
+            continue;
+        }
+        let slot = table_entry(mid.addr(), pd);
+        // SAFETY: the PDPT entry points at a page directory of this tree.
+        let entry = unsafe { ptr::read_volatile(slot) };
+        *cursor += 1;
+        if !entry.is_present() {
+            continue;
+        }
+        let (mut tables, mut pages) = (0, 0);
+        if entry.is_huge() {
+            let base = entry.huge_addr().as_u64();
+            for offset in 0..HUGE_PAGE_FRAMES {
+                // SAFETY: the frames of one large page of this space, used
+                // nowhere else (as in `free_subtree`).
+                unsafe { alloc.free(PhysAddr::new(base + (offset * PAGE_SIZE) as u64)) };
+            }
+            pages = HUGE_PAGE_FRAMES;
+        } else {
+            // SAFETY: the entry points at a page table of this tree.
+            unsafe { free_subtree(entry.addr(), LEVEL_PT, alloc, &mut tables, &mut pages) };
+        }
+        // SAFETY: the same slot; its table/frames are gone.
+        unsafe { ptr::write_volatile(slot, Entry(0)) };
+        return Some((tables, pages));
+    }
+    None
+}
+
 /// Рекурсивно освободить таблицу уровня `level` и всё, что под ней.
 ///
 /// # Safety
