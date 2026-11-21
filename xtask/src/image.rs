@@ -302,7 +302,19 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // положенная в `build/amd-fw`. Её нет — образ собирается без неё,
             // и `amd smc start` скажет, что прошивки нет.
             let amd_firmware = crate::paths::work_dir().join("amd-fw");
-            for (name, esp) in [("polaris10_k_smc.bin", "FREEOS/AMD/SMC.BIN")] {
+            // Микрокод CP/RLC/SDMA (P3, 21.11): `*_2.bin` — их Linux 6.12 пробует
+            // первыми (при их отсутствии откатывается на `*.bin`).
+            for (name, esp) in [
+                ("polaris10_k_smc.bin", "FREEOS/AMD/SMC.BIN"),
+                ("polaris10_ce_2.bin", "FREEOS/AMD/CE.BIN"),
+                ("polaris10_pfp_2.bin", "FREEOS/AMD/PFP.BIN"),
+                ("polaris10_me_2.bin", "FREEOS/AMD/ME.BIN"),
+                ("polaris10_mec_2.bin", "FREEOS/AMD/MEC.BIN"),
+                ("polaris10_mec2_2.bin", "FREEOS/AMD/MEC2.BIN"),
+                ("polaris10_rlc.bin", "FREEOS/AMD/RLC.BIN"),
+                ("polaris10_sdma.bin", "FREEOS/AMD/SDMA0.BIN"),
+                ("polaris10_sdma1.bin", "FREEOS/AMD/SDMA1.BIN"),
+            ] {
                 let source = amd_firmware.join(name);
                 if source.is_file() {
                     payload.push(read_payload(esp, &source)?);
@@ -310,6 +322,15 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             }
             // Marker for the SMC auto start of the AMD card (21.11): only a build
             // with FOSSAI_AMD_SMC_START=1 asks the kernel to start the SMC by itself.
+            // The second marker (FOSSAI_AMD_UCODE=1) also loads the CP/RLC/SDMA
+            // microcode through the started SMC (P3).
+            if std::env::var("FOSSAI_AMD_UCODE").is_ok_and(|v| v == "1") {
+                payload.push(Payload {
+                    path: String::from("FREEOS/AMD/UCODE.TXT"),
+                    data: b"ucode\n".to_vec(),
+                    source: PathBuf::from("(FOSSAI_AMD_UCODE=1)"),
+                });
+            }
             if std::env::var("FOSSAI_AMD_SMC_START").is_ok_and(|v| v == "1") {
                 payload.push(Payload {
                     path: String::from("FREEOS/AMD/START.TXT"),

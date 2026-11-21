@@ -2067,7 +2067,7 @@ fn help() {
     sprintln!("  panic now     stop this machine with a kernel panic (to test the snapshot)");
     sprintln!("  pci           every device on the bus, with its identifiers");
     sprintln!("  acpidump SIG  an ACPI table (DSDT, FACP, APIC...) in hex to the kernel log");
-    sprintln!("  amd [vbios|smc [start]]  AMD graphics card: PCI, IP discovery or Polaris registers; vbios reads the ROM, smc the power controller");
+    sprintln!("  amd [vbios|smc [start]|ucode]  AMD graphics card: PCI, IP discovery or Polaris registers; vbios reads the ROM, smc the power controller");
     sprintln!("  ui [reset]    compositor state and frame timing; reset zeroes it");
     sprintln!("  tasks         scheduler state");
     sprintln!("  ls [path]     list a directory of the mounted filesystem");
@@ -2464,6 +2464,14 @@ fn amd(argument: &str) {
     // пишет лишь индекс косвенного доступа).
     // `amd smc start` — залить образ в SMC и запустить (ПИШЕТ в карту; только
     // по команде, образ берётся с флешки `FREEOS/AMD/SMC.BIN`).
+    // `amd ucode` — загрузить микрокод RLC/CP/SDMA через SMC (ПИШЕТ в
+    // видеопамять и просит SMC загрузить блоки; нужна работающая SMC).
+    if argument.trim() == "ucode" {
+        for line in crate::display::amd::polaris_ucode() {
+            sprintln!("  amd: {line}");
+        }
+        return;
+    }
     if argument.trim() == "smc start" {
         for line in crate::display::amd::polaris_smc_start() {
             sprintln!("  amd: {line}");
