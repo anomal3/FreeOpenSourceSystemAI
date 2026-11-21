@@ -11167,6 +11167,27 @@ SDMA **остановлены** (`CP_ME_CNTL` `0x15000000`, `SDMAx_F32_CNTL` б�
 Автоцепочка на флешке: `FOSSAI_AMD_SMC_START=1` (`START.TXT`) и
 `FOSSAI_AMD_UCODE=1` (`UCODE.TXT`); без маркеров в карту ничего не пишется.
 
+**Polaris, P4: КОЛЬЦО GFX РАБОТАЕТ (22.11, образ 0.8.9, проверено на железе).**
+`amd ring` (`display/amd.rs`, `polaris_ring`) по `gfx_v8_0_cp_gfx_resume/start`:
+кольцо 8 КиБ (`CP_RB0_CNTL` `0x41880a`) и writeback-слоты — в видеопамяти (область
+`UCODE_AREA`+2 МиБ, GPU `0xf40c200000`), без GART и таблиц страниц GPU (VMID0 при
+выключенном `VM_CONTEXT0` пропускает адреса из системной апертуры), CP снят с
+останова (`CP_ME_CNTL` `0x15000000` → 0). **Тест 1:** пакет `SET_UCONFIG_REG` записал
+`0xDEADBEEF` в `SCRATCH_REG0` — пройден. **Тест 2:** пакет `WRITE_DATA`
+(DST_SEL 5, WR_CONFIRM) записал `0xBEEFCAFE` в видеопамять (GPU `0xf40c202080`),
+хост прочитал его через BAR0 (после `HDP_DEBUG0`=1) — пройден. Нюансы: `RB0_RPTR`
+дошёл до `0xa0`/`0x1a0` (CP считает по-своему, не равен wptr 256/512);
+writeback-слот rptr остался 0 (CP его не обновляет при нашей настройке —
+для проверок читаем регистр); в `GRBM_STATUS` после тестов `0xa0003028` (GUI_ACTIVE +
+CP_BUSY: CP доедает хвост NOP `PACKET3(NOP,0x3FFF)`, как и у Linux). Цепочка на
+флешке: `FOSSAI_AMD_SMC_START=1`, `FOSSAI_AMD_UCODE=1`, `FOSSAI_AMD_RING=1`
+(маркеры `START.TXT`/`UCODE.TXT`/`RING.TXT`). **Не сделано до рабочего драйвера:**
+golden registers и `gfx_v8_0_constants_init` (тайлинг, SH_MEM) и clear-state
+(нужны для 3D), SDMA-кольцо, IH (прерывания; пока опрос), GMC v8: GART и VM-контексты
+(нужны для GEM_VA у программ), IB и fence (`EVENT_WRITE_EOP`), compute-очереди
+(KIQ/HQD), затем DRM-слой Linux (A4: `/dev/dri/renderD128`, `AMDGPU_INFO`, `CS`),
+пакет RADV и DXVK. Заготовки DRM уже есть в `main` (`linux/drm/`, nouveau).
+
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
 `drmGetDevices2`, ioctl для `vulkaninfo` и для рендера, поля
