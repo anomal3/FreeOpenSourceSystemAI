@@ -1229,6 +1229,22 @@ fn run_builtin(line: &str) -> bool {
                 if crate::linux::drm::trace() { "on" } else { "off" }
             );
         }
+        // Узел DRM для Mesa RADV (22.11.2026): `amdnode soft on` — программный
+        // узел AMD (QEMU, пробы `amdprobe`); пока он включён, `renderD128` его.
+        #[cfg(target_arch = "x86_64")]
+        "amdnode" => {
+            let mut words = argument.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("soft"), Some(on @ ("on" | "off"))) => crate::linux::drm::amdgpu::set_soft(on == "on"),
+                (None, None) => {}
+                _ => sprintln!("  amdnode: usage `amdnode soft on|off`"),
+            }
+            sprintln!(
+                "  amdnode: /dev/dri/renderD128 {} ({})",
+                if crate::linux::drm::node_visible() { "present" } else { "absent" },
+                crate::linux::drm::amdgpu::status()
+            );
+        }
         // Способ `memcpy`/`memset` ядра (19.11.2026): без аргумента — замер
         // всех и выбор лучшего, с именем — задать руками для сравнения.
         "copybench" => match argument.trim() {

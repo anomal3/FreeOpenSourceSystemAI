@@ -11240,6 +11240,23 @@ golden `0x07180000`, `SPI_RESOURCE_RESERVE_EN_CU_0` `0x00ff7fbf`. Образ 0.8
 cs), менеджеры VMID, памяти и fence; DRM-слой Linux на основе `linux/drm/` из `main`;
 RADV; DXVK.
 
+**A4, шаг 1 (22.11): узел DRM amdgpu на программной карте — РАБОТАЕТ В QEMU.**
+`crates/kernel/src/linux/drm/amdgpu.rs` (новый) + правки `drm/mod.rs`, `drm/sysfs.rs`:
+отдельный тип файла `AmdFile` рядом с `DrmFile` (nouveau не тронут: `nvk-soft` зелёный до
+и после), общий `Ident` для sysfs (`DRIVER=amdgpu`, PCI `1002:6fdf` rev `e7`, слот
+`03:00.0`), команда оболочки `amdnode soft on|off` (пока включена — `renderD128` отдан
+AMD). Отвечает на `VERSION` (amdgpu 3.59.0), `GET_UNIQUE`, `GET_CAP`, `SET_CLIENT_CAP`,
+`AMDGPU_INFO`: `ACCEL_WORKING`, `DEV_INFO` (440 байт, `family` 130 VI, `external_rev`
+0x50, 4 SE × 9 CU — **часть чисел взята из драйвера Linux, RADV не проверялась**),
+`READ_MMR_REG` 0x263e (= `GB_ADDR_CONFIG` 0x22011003 с настоящей карты), `HW_IP_INFO/COUNT`
+(GFX 8.0, одно кольцо; compute и SDMA — 0), `FW_VERSION`, `MEMORY`, `VRAM_GTT`,
+`TIMESTAMP`. Проба `libc/linux/amdprobe.c` (+ строка в `LINUX_PROGRAMS`) и сценарий
+`amd-soft` (`cargo xtask test -a x86_64 -s amd-soft`): 0 failed. **На ПК для QEMU
+поставлены** QEMU 11.1.0 и LLVM 23.1.6 (winget) — без `clang` пробы Linux не собираются.
+Дальше по `docs/AMD_DRM_PLAN.md`: GEM (GEM_CREATE/MMAP/CLOSE, PRIME), `GEM_VA`, `CTX`, `CS`
+(+fence, syncobj), RADV в пакет Proton (`mesa.rs`/`proton.rs`), бэкенд на железе поверх
+`display::amd`.
+
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
 `drmGetDevices2`, ioctl для `vulkaninfo` и для рендера, поля

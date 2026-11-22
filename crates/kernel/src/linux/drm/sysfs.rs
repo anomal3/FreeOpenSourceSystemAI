@@ -43,7 +43,7 @@ pub fn directory(path: &str) -> Option<Vec<(String, NodeKind)>> {
     if !path.starts_with("/dev/dri") && !path.starts_with("/sys/") {
         return None;
     }
-    super::backend()?;
+    super::node_visible().then_some(())?;
     let file = |name: &str| (String::from(name), NodeKind::File);
     let dir = |name: &str| (String::from(name), NodeKind::Directory);
     match path {
@@ -73,31 +73,30 @@ pub fn text(path: &str) -> Option<String> {
         return None;
     }
     let rest = in_minor(path)?;
-    let gpu = super::backend()?;
-    let info = gpu.info();
-    let slot = info.pci_slot;
-    let slot_name = format!("{:04x}:{:02x}:{:02x}.{:x}", slot.domain, slot.bus, slot.dev, slot.func);
+    let info = super::node_ident()?;
+    let slot_name = info.slot_name.clone();
     let minor_uevent = || format!("MAJOR={}\nMINOR={}\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n", super::DRM_MAJOR, super::RENDER_MINOR);
     Some(match rest {
         "dev" | "device/drm/renderD128/dev" => format!("{}:{}\n", super::DRM_MAJOR, super::RENDER_MINOR),
         "uevent" | "device/drm/renderD128/uevent" => minor_uevent(),
         "device/uevent" => format!(
-            "DRIVER=nouveau\nPCI_CLASS=30000\nPCI_ID={:04X}:{:04X}\nPCI_SUBSYS_ID={:04X}:{:04X}\nPCI_SLOT_NAME={slot_name}\n\
+            "DRIVER={}\nPCI_CLASS=30000\nPCI_ID={:04X}:{:04X}\nPCI_SUBSYS_ID={:04X}:{:04X}\nPCI_SLOT_NAME={slot_name}\n\
              MODALIAS=pci:v{:08X}d{:08X}sv{:08X}sd{:08X}bc03sc00i00\n",
-            info.pci_vendor,
-            info.pci_device,
+            info.driver,
+            info.vendor,
+            info.device,
             info.subsys_vendor,
             info.subsys_device,
-            info.pci_vendor,
-            info.pci_device,
+            info.vendor,
+            info.device,
             info.subsys_vendor,
             info.subsys_device
         ),
-        "device/vendor" => format!("0x{:04x}\n", info.pci_vendor),
-        "device/device" => format!("0x{:04x}\n", info.pci_device),
+        "device/vendor" => format!("0x{:04x}\n", info.vendor),
+        "device/device" => format!("0x{:04x}\n", info.device),
         "device/subsystem_vendor" => format!("0x{:04x}\n", info.subsys_vendor),
         "device/subsystem_device" => format!("0x{:04x}\n", info.subsys_device),
-        "device/revision" => format!("0x{:02x}\n", info.pci_revision),
+        "device/revision" => format!("0x{:02x}\n", info.revision),
         "device/class" => String::from("0x030000\n"),
         _ => return None,
     })
@@ -107,7 +106,7 @@ pub fn text(path: &str) -> Option<String> {
 /// узел рендера.
 #[must_use]
 pub fn exists(path: &str) -> bool {
-    (path == super::RENDER_NODE && super::backend().is_some()) || text(path).is_some() || link(path).is_some()
+    (path == super::RENDER_NODE && super::node_visible()) || text(path).is_some() || link(path).is_some()
 }
 
 /// Цель символической ссылки sysfs: `subsystem` — шина (`get_subsystem_type`
@@ -122,6 +121,6 @@ pub fn link(path: &str) -> Option<&'static str> {
         "subsystem" => "../../../../class/drm",
         _ => return None,
     };
-    super::backend()?;
+    super::node_visible().then_some(())?;
     Some(target)
 }

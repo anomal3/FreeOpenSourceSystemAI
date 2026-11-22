@@ -32,6 +32,7 @@
 //! * [`nouveau`] — ioctl nouveau, [`nvif`] — крошечная эмуляция NVIF,
 //!   [`vm`] — учёт VA (`VM_BIND`), [`sysfs`] — файлы для libdrm.
 
+pub mod amdgpu;
 mod gem;
 mod nouveau;
 mod nvif;
@@ -146,10 +147,40 @@ pub(crate) fn backend() -> Option<Arc<dyn GpuBackend>> {
     b.soft.clone()
 }
 
-/// Есть ли сейчас `/dev/dri/renderD128`.
+/// Есть ли сейчас `/dev/dri/renderD128`: узел AMD (`amdnode soft on`) или NVIDIA.
 #[must_use]
 pub fn node_visible() -> bool {
-    backend().is_some()
+    amdgpu::active() || backend().is_some()
+}
+
+/// Что про карту узла знает sysfs: драйвер, идентификаторы PCI, слот.
+pub(crate) struct Ident {
+    pub driver: &'static str,
+    pub vendor: u16,
+    pub device: u16,
+    pub revision: u8,
+    pub subsys_vendor: u16,
+    pub subsys_device: u16,
+    pub slot_name: alloc::string::String,
+}
+
+/// Описание карты узла: AMD, если он включён, иначе NVIDIA.
+pub(crate) fn node_ident() -> Option<Ident> {
+    if let Some(ident) = amdgpu::ident() {
+        return Some(ident);
+    }
+    let gpu = backend()?;
+    let info = gpu.info();
+    let slot = info.pci_slot;
+    Some(Ident {
+        driver: "nouveau",
+        vendor: info.pci_vendor,
+        device: info.pci_device,
+        revision: info.pci_revision,
+        subsys_vendor: info.subsys_vendor,
+        subsys_device: info.subsys_device,
+        slot_name: alloc::format!("{:04x}:{:02x}:{:02x}.{:x}", slot.domain, slot.bus, slot.dev, slot.func),
+    })
 }
 
 /// `nvk trace on|off`.
@@ -306,6 +337,9 @@ pub fn open(linux: &str, flags: usize) -> Option<i64> {
     if linux != RENDER_NODE {
         return None;
     }
+    if amdgpu::active() {
+        return Some(amdgpu::open(flags));
+    }
     let gpu = backend()?;
     let pid = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
     crate::kprintln!("nvgpu: drm open pid {pid}");
@@ -316,14 +350,15 @@ pub fn open(linux: &str, flags: usize) -> Option<i64> {
 /// `st_rdev` для `stat` по пути: узел рендера, если он есть.
 #[must_use]
 pub fn rdev(linux: &str) -> Option<u64> {
-    (linux == RENDER_NODE && backend().is_some()).then(render_rdev)
+    (linux == RENDER_NODE && node_visible()).then(render_rdev)
 }
 
 /// `st_rdev` для `fstat` открытого: `drmGetDevice2` libdrm узнаёт устройство
 /// по нему.
 #[must_use]
 pub fn object_rdev(object: &dyn Object) -> Option<u64> {
-    object.as_any().downcast_ref::<DrmFile>().map(|_| render_rdev())
+    (object.as_any().downcast_ref::<DrmFile>().is_some() || object.as_any().downcast_ref::<amdgpu::AmdFile>().is_some())
+        .then(render_rdev)
 }
 
 /// `readlink` ссылок sysfs (`…/device/subsystem` → `…/bus/pci`).
@@ -365,6 +400,13 @@ pub fn dmabuf_memory(object: &dyn Object) -> Option<(Arc<crate::user::shm::Share
 pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
     let object = object_of(fd)?;
     let request = request as u32;
+    if let Some(file) = object.as_any().downcast_ref::<amdgpu::AmdFile>() {
+        let answer = amdgpu::ioctl(file, canonical(request), arg);
+        if trace() || (answer < 0 && answer != -e::EAGAIN && answer != -ETIME) {
+            log_ioctl(request, answer);
+        }
+        return Some(answer);
+    }
     if let Some(file) = object.as_any().downcast_ref::<DrmFile>() {
         let answer = file_ioctl(file, canonical(request), arg);
         if trace() || (answer < 0 && answer != -e::EAGAIN && answer != -ETIME) {
