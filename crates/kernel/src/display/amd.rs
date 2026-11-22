@@ -1128,6 +1128,11 @@ pub fn auto_task() {
                 crate::kprintln!("  amdgpu     : auto start: CS.TXT found, testing fence, IB and the user VM");
                 let _ = polaris_cs();
             }
+            // The sixth marker (FOSSAI_AMD_SHADER=1) asks for P6: golden registers and the first compute shader.
+            if firmware_file("SHADER.TXT").is_ok() {
+                crate::kprintln!("  amdgpu     : auto start: SHADER.TXT found, running the first shader");
+                let _ = polaris_shader();
+            }
         }
     } else {
         crate::kprintln!("  amdgpu     : auto start: no FREEOS/AMD/UCODE.TXT, microcode not loaded ('amd ucode' by hand)");
@@ -2136,6 +2141,196 @@ pub fn polaris_cs() -> Vec<String> {
         window.wr(MM_VM_CONTEXT1_CNTL * 4, control & !0x1);
         window.wr(MM_VM_INVALIDATE_REQUEST * 4, 1 << 1);
         note(String::from("context 1 disabled again"));
+    }
+    lines
+}
+
+// --- Настройка GFX и первый compute-шейдер (`amd shader`) -------------------
+//
+// Этап P6. Источники — `gfx_v8_0.c` (`gfx_v8_0_init_golden_registers`,
+// `gfx_v8_0_constants_init`), `amdgpu_device.c`
+// (`amdgpu_device_program_register_sequence`), тест `amdgpu_sync_dependency_test`
+// из libdrm 2.4.124 (`tests/amdgpu/basic_tests.c`, строки про `shader_bin` для
+// GFX8) и `vid.h`/`gfx_8_0_d.h` (Linux 6.12).
+//
+// Шаг 1 — настройка, которую Linux делает до первых шейдеров: golden registers
+// Polaris10 и `SH_MEM_*` VMID 0. Шаг 2 — dispatch на кольце GFX: шейдер из libdrm
+// (проверен на GFX8) записывает 42 по адресу из `COMPUTE_USER_DATA_0/1` через
+// `buffer_store_dword`, затем `WRITE_DATA` после `CS_PARTIAL_FLUSH` пишет флаг 99.
+// Если шейдер не стартовал, а флаг пришёл, вторая попытка — с битом «шейдер
+// compute» (`PACKET3_COMPUTE`) в заголовках `SET_SH_REG` и `DISPATCH_DIRECT`.
+
+/// `golden_settings_polaris10_a11` и `polaris10_golden_common_all`: (регистр, маска, значение).
+/// Правило `amdgpu_device_program_register_sequence`: при маске `0xffffffff` — просто значение,
+/// иначе `(старое & !маска) | значение`.
+const GOLDEN_POLARIS10: [(usize, u32, u32); 25] = [
+    (0xcd4, 0x000c_0fc0, 0x000c_0200),  // ATC_MISC_CG
+    (0x2684, 0x0001_f3cf, 0x0000_7208), // CB_HW_CONTROL
+    (0x2686, 0x0f00_0000, 0x0f00_0000), // CB_HW_CONTROL_2
+    (0x2683, 0x0000_01ff, 0x0000_0040), // CB_HW_CONTROL_3
+    (0x260d, 0xf00f_ffff, 0x0000_0400), // DB_DEBUG2
+    (0x22fc, 0xffff_ffff, 0x2000_0001), // PA_SC_ENHANCE
+    (0xc281, 0x0000_ff0f, 0x0000_0000), // PA_SC_LINE_STIPPLE_STATE
+    (0xa0d4, 0x3f3f_ffff, 0x1600_0012), // PA_SC_RASTER_CONFIG
+    (0xa0d5, 0x0000_003f, 0x0000_002a), // PA_SC_RASTER_CONFIG_1
+    (0xec49, 0x0000_0003, 0x0001_003c), // RLC_CGCG_CGLS_CTRL
+    (0xec9d, 0xffff_ffff, 0x0001_003c), // RLC_CGCG_CGLS_CTRL_3D
+    (0x2300, 0x07f8_0000, 0x0718_0000), // SQ_CONFIG
+    (0x2542, 0x000f_000f, 0x000b_0000), // TA_CNTL_AUX
+    (0x2b80, 0x0010_0000, 0xf31f_ff7f), // TCC_CTRL
+    (0x2b05, 0x0000_03ff, 0x0000_00f7), // TCP_ADDR_CONFIG
+    (0x2b04, 0xffff_ffff, 0x0000_0000), // TCP_CHAN_STEER_HI
+    (0x2232, 0x0000_0004, 0x0000_0004), // VGT_RESET_DEBUG
+    (0xc200, 0xffff_ffff, 0xe000_0000), // GRBM_GFX_INDEX (все SE/SH/экземпляры)
+    (0xa0d4, 0xffff_ffff, 0x1600_0012), // PA_SC_RASTER_CONFIG
+    (0xa0d5, 0xffff_ffff, 0x0000_002a), // PA_SC_RASTER_CONFIG_1
+    (0x263e, 0xffff_ffff, 0x2201_1003), // GB_ADDR_CONFIG
+    (0x31dc, 0xffff_ffff, 0x0000_0800), // SPI_RESOURCE_RESERVE_CU_0
+    (0x31dd, 0xffff_ffff, 0x0000_0800), // SPI_RESOURCE_RESERVE_CU_1
+    (0x31e6, 0xffff_ffff, 0x00ff_7fbf), // SPI_RESOURCE_RESERVE_EN_CU_0
+    (0x31e7, 0xffff_ffff, 0x00ff_7faf), // SPI_RESOURCE_RESERVE_EN_CU_1
+];
+const MM_SH_MEM_BASES: usize = 0x230a;
+const MM_SH_MEM_APE1_BASE: usize = 0x230b;
+const MM_SH_MEM_APE1_LIMIT: usize = 0x230c;
+const MM_SH_MEM_CONFIG: usize = 0x230d;
+const MM_SPI_SLAVE_DEBUG_BUSY: usize = 0x24d3;
+/// `SH_MEM_CONFIG` VMID 0: DEFAULT_MTYPE = UC (3), APE1_MTYPE = UC (3), ALIGNMENT_MODE = UNALIGNED (3).
+const SH_MEM_CONFIG_VMID0: u32 = (3 << 5) | (3 << 8) | (3 << 3);
+const PM4_SET_SH_REG_START: usize = 0x2c00;
+const PM4_CONTEXT_CONTROL_1: u32 = 0xc001_2800;
+const PM4_EVENT_WRITE_0: u32 = 0xc000_4600;
+/// `PACKET3(SET_SH_REG, n)` и `PACKET3(DISPATCH_DIRECT, 3)`; бит 1 — «шейдер compute».
+const fn set_sh_reg(count: u32, compute: bool) -> u32 {
+    0xc000_7600 | (count << 16) | if compute { 2 } else { 0 }
+}
+const fn dispatch_direct(compute: bool) -> u32 {
+    0xc003_1500 | if compute { 2 } else { 0 }
+}
+/// Шейдер из libdrm (`shader_bin` для GFX8): задержка циклом, затем `buffer_store_dword` значения 42
+/// по V# `s[0:3]` (`s[0:1]` — адрес из `COMPUTE_USER_DATA_0/1`, `s2` = -1, `s3` = 0xf000), `s_endpgm`.
+const SHADER_GFX8: [u32; 15] = [
+    0xbe82_0080, // s_mov_b32 s2, 0
+    0xbf08_ff02, 0x0098_967f, // s_cmp_gt_u32 s2, 9999999
+    0xbf85_0004, // s_cbranch_scc1 +4
+    0x8102_8102, // s_add_i32 s2, s2, 1
+    0xbf08_ff02, 0x0098_967f, // s_cmp_gt_u32 s2, 9999999
+    0xbf84_fffc, // s_cbranch_scc0 -4
+    0xbe83_00ff, 0x0000_f000, // s_mov_b32 s3, 0xf000
+    0xbe82_00c1, // s_mov_b32 s2, -1
+    0x7e00_02aa, // v_mov_b32 v0, 42
+    0xe070_0000, 0x8000_0000, // buffer_store_dword v0, off, s[0:3], 0
+    0xbf81_0000, // s_endpgm
+];
+const SHADER_OFFSET: usize = 0x1_f000;
+const SHADER_DATA_SLOT: usize = 0x1_f800;
+const SHADER_FLAG_SLOT: usize = 0x1_f840;
+
+/// Golden registers Polaris10 и `SH_MEM_*` VMID 0.
+fn gfx_init(window: &Window) -> String {
+    for (register, mask, value) in GOLDEN_POLARIS10 {
+        let new = if mask == 0xffff_ffff { value } else { (window.rd(register * 4) & !mask) | value };
+        window.wr(register * 4, new);
+    }
+    // VMID 0 в SRBM, как `vi_srbm_select(adev, 0, 0, 0, 0)`.
+    window.wr(MM_SRBM_GFX_CNTL * 4, 0);
+    window.wr(MM_SH_MEM_CONFIG * 4, SH_MEM_CONFIG_VMID0);
+    window.wr(MM_SH_MEM_BASES * 4, 0);
+    window.wr(MM_SH_MEM_APE1_BASE * 4, 1);
+    window.wr(MM_SH_MEM_APE1_LIMIT * 4, 0);
+    format!(
+        "golden registers ({} entries) and SH_MEM (VMID 0) applied; SQ_CONFIG {:#x}, SPI_RESOURCE_RESERVE_EN_CU_0 {:#x}, SH_MEM_CONFIG {:#x}",
+        GOLDEN_POLARIS10.len(),
+        window.rd(0x2300 * 4),
+        window.rd(0x31e6 * 4),
+        window.rd(MM_SH_MEM_CONFIG * 4)
+    )
+}
+
+/// `amd shader`: настройка GFX и запуск compute-шейдера на кольце GFX.
+#[must_use]
+pub fn polaris_shader() -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut note = |text: String| {
+        crate::kprintln!("  amdgpu      : shader: {text}");
+        lines.push(text);
+    };
+    let Some((base, _, _)) = *POLARIS_MMIO.lock() else {
+        note(String::from("no Polaris card was probed"));
+        return lines;
+    };
+    let window = Window(base);
+    let Some((vram, vram_start)) = RING_STATE.lock().as_ref().map(|state| (state.vram, state.vram_start)) else {
+        note(String::from("the ring is not running: run 'amd ring' first"));
+        return lines;
+    };
+    let gpu = |offset: usize| vram_start + RING_AREA + offset as u64;
+    note(gfx_init(&window));
+    // Шейдер в видеопамяти (адрес кратен 256: `COMPUTE_PGM` хранит адрес >> 8).
+    for (index, word) in SHADER_GFX8.iter().enumerate() {
+        vram_put(vram, SHADER_OFFSET + index * 4, *word);
+    }
+    for attempt in 0..2 {
+        let compute = attempt == 1;
+        vram_put(vram, SHADER_DATA_SLOT, 0);
+        vram_put(vram, SHADER_FLAG_SLOT, 0);
+        let program = gpu(SHADER_OFFSET) >> 8;
+        let data = gpu(SHADER_DATA_SLOT);
+        let flag = gpu(SHADER_FLAG_SLOT);
+        let sh = |count: u32| set_sh_reg(count, compute);
+        let reg = |register: usize| (register - PM4_SET_SH_REG_START) as u32;
+        let ib: Vec<u32> = alloc::vec![
+            PM4_CONTEXT_CONTROL_1, 0x8000_0000, 0x8000_0000,
+            sh(2), reg(0x2e0c), program as u32, (program >> 32) as u32, // COMPUTE_PGM_LO/HI
+            sh(2), reg(0x2e12), 0x002c_0040, 0x0000_0010, // COMPUTE_PGM_RSRC1/2
+            sh(3), reg(0x2e16), 0xffff_ffff, 0xffff_ffff, 0x0000_0100, // STATIC_THREAD_MGMT_SE0/1, TMPRING_SIZE
+            sh(2), reg(0x2e19), 0xffff_ffff, 0xffff_ffff, // STATIC_THREAD_MGMT_SE2/3
+            sh(2), reg(0x2e40), data as u32, (data >> 32) as u32, // COMPUTE_USER_DATA_0/1
+            sh(1), reg(0x2e15), 0, // COMPUTE_RESOURCE_LIMITS
+            sh(3), reg(0x2e07), 1, 1, 1, // COMPUTE_NUM_THREAD_X/Y/Z
+            dispatch_direct(compute), 1, 1, 1, 0x0000_0045, // DISPATCH_DIRECT 1x1x1
+            PM4_EVENT_WRITE_0, 0x0000_0407, // CS_PARTIAL_FLUSH
+            PM4_WRITE_DATA_3, WRITE_DATA_MEMORY_CONFIRM, flag as u32, (flag >> 32) as u32, 99,
+        ];
+        for (index, word) in ib.iter().enumerate() {
+            vram_put(vram, IB0_OFFSET + index * 4, *word);
+        }
+        let ib_address = gpu(IB0_OFFSET);
+        let packets = [PM4_INDIRECT_BUFFER_2, ib_address as u32 & !3, (ib_address >> 32) as u32 & 0xffff, ib.len() as u32];
+        if let Err(why) = ring_submit(&window, &packets) {
+            note(why);
+            return lines;
+        }
+        // Шейдер крутит цикл на 10 млн шагов, поэтому ждём до 3 с.
+        let mut data_word = 0;
+        let mut flag_word = 0;
+        for _ in 0..3000 {
+            data_word = vram_word(&window, vram, SHADER_DATA_SLOT);
+            flag_word = vram_word(&window, vram, SHADER_FLAG_SLOT);
+            if data_word == 42 && flag_word == 99 {
+                break;
+            }
+            super::nvidia::spin_us(1000);
+        }
+        let variant = if compute { "with the compute bit" } else { "plain headers" };
+        if data_word == 42 && flag_word == 99 {
+            note(format!("SHADER PASSED ({variant}): the shader wrote 42 and the CP wrote the flag 99 after CS_PARTIAL_FLUSH"));
+            return lines;
+        }
+        note(format!(
+            "attempt {} ({variant}): data {data_word:#x} (want 0x2a), flag {flag_word:#x} (want 0x63); GRBM_STATUS {:#010x}, GRBM_STATUS2 {:#010x}, CP_STAT {:#010x}, SPI_SLAVE_DEBUG_BUSY {:#x}, RB0_RPTR {:#x}",
+            attempt + 1,
+            window.rd(MM_GRBM_STATUS * 4),
+            window.rd(0x2002 * 4),
+            window.rd(MM_CP_STAT * 4),
+            window.rd(MM_SPI_SLAVE_DEBUG_BUSY * 4),
+            window.rd(MM_CP_RB0_RPTR * 4)
+        ));
+        // Флаг не пришёл — CP застрял на шейдере: вторая попытка бессмысленна.
+        if flag_word != 99 {
+            note(String::from("the flag did not arrive: the CP is stuck, no second attempt"));
+            return lines;
+        }
     }
     lines
 }

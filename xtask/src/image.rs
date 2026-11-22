@@ -327,6 +327,14 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // The third marker (FOSSAI_AMD_RING=1) also starts the CP and tests the GFX ring (P4).
             // The fourth marker (FOSSAI_AMD_GART=1) also enables the GART of VMID0 and tests it (P5).
             // The fifth marker (FOSSAI_AMD_CS=1): fence, IB and the user VM (VMID 1) test (P5 step 2).
+            // The sixth marker (FOSSAI_AMD_SHADER=1): golden registers and the first compute shader (P6).
+            if std::env::var("FOSSAI_AMD_SHADER").is_ok_and(|v| v == "1") {
+                payload.push(Payload {
+                    path: String::from("FREEOS/AMD/SHADER.TXT"),
+                    data: b"shader\n".to_vec(),
+                    source: PathBuf::from("(FOSSAI_AMD_SHADER=1)"),
+                });
+            }
             if std::env::var("FOSSAI_AMD_CS").is_ok_and(|v| v == "1") {
                 payload.push(Payload {
                     path: String::from("FREEOS/AMD/CS.TXT"),

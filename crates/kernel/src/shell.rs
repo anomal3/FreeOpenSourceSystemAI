@@ -2067,7 +2067,7 @@ fn help() {
     sprintln!("  panic now     stop this machine with a kernel panic (to test the snapshot)");
     sprintln!("  pci           every device on the bus, with its identifiers");
     sprintln!("  acpidump SIG  an ACPI table (DSDT, FACP, APIC...) in hex to the kernel log");
-    sprintln!("  amd [vbios|smc [start]|ucode|ring|gart|cs]  AMD graphics card: PCI, IP discovery or Polaris registers; vbios reads the ROM, smc the power controller");
+    sprintln!("  amd [vbios|smc [start]|ucode|ring|gart|cs|shader]  AMD graphics card: PCI, IP discovery or Polaris registers; vbios reads the ROM, smc the power controller");
     sprintln!("  ui [reset]    compositor state and frame timing; reset zeroes it");
     sprintln!("  tasks         scheduler state");
     sprintln!("  ls [path]     list a directory of the mounted filesystem");
@@ -2472,6 +2472,14 @@ fn amd(argument: &str) {
     // памяти (ПИШЕТ в регистры MC/VM и видеопамять; нужно работающее кольцо).
     // `amd cs` — fence, IB и пользовательское адресное пространство GPU (VMID 1);
     // нужно работающее кольцо (`amd ring`).
+    // `amd shader` — golden registers и первый compute-шейдер на кольце GFX;
+    // нужно работающее кольцо (`amd ring`).
+    if argument.trim() == "shader" {
+        for line in crate::display::amd::polaris_shader() {
+            sprintln!("  amd: {line}");
+        }
+        return;
+    }
     if argument.trim() == "cs" {
         for line in crate::display::amd::polaris_cs() {
             sprintln!("  amd: {line}");
