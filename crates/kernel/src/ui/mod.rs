@@ -196,20 +196,20 @@ fn hover_button(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
     };
     if let Some(app) = due {
         *HOVER_BUTTON.lock() = None;
-        open_thumbs_for(desktop, app, status, true);
+        open_thumbs_for(desktop, app, status, true, (x, y));
     }
 }
 
 /// Миниатюры окон программы над её кнопкой (72e, макет 04). `hovered` —
 /// открыты наведением и закроются, когда указатель уйдёт.
-fn open_thumbs_for(desktop: &mut Compositor, app: App, status: &Status, hovered: bool) {
+/// `at` — указатель: полоса встаёт над кнопкой панели под ним (22.11).
+fn open_thumbs_for(desktop: &mut Compositor, app: App, status: &Status, hovered: bool, at: (i32, i32)) {
     let mut members = if panel::labels() { alloc::vec::Vec::new() } else { desktop.group_members(app) };
     if members.is_empty() {
         members.push(app);
     }
-    let anchor = members[0];
-    if let Some(rect) = desktop.open_thumbs(members, anchor) {
-        *HOVER_LIST.lock() = hovered.then(|| desktop.button_of(anchor).unwrap_or(rect));
+    if let Some(rect) = desktop.open_thumbs_at(members, app, Some(at)) {
+        *HOVER_LIST.lock() = hovered.then(|| desktop.thumbs_area().map_or(rect, |(_, button)| button));
         kprintln!(
             "  desktop     : thumbnails at {},{} {}x{}{}",
             rect.x,
@@ -248,11 +248,13 @@ fn press_thumbs(desktop: &mut Compositor, x: i32, y: i32, status: &Status) -> bo
         // Крестик: окно закрывается, полоса остаётся с оставшимися.
         Some((app, true)) => {
             let rest: alloc::vec::Vec<App> = desktop.thumbs_apps().into_iter().filter(|other| *other != app).collect();
+            // Над той же кнопкой, над которой полоса стояла (22.11).
+            let at = desktop.thumbs_area().map(|(_, button)| (button.x + button.w as i32 / 2, button.y + button.h as i32 / 2));
             close_from_panel(desktop, app);
             let rest: alloc::vec::Vec<App> = rest.into_iter().filter(|other| desktop.index_of(*other).is_some()).collect();
             match rest.first().copied() {
                 Some(anchor) => {
-                    desktop.open_thumbs(rest, anchor);
+                    desktop.open_thumbs_at(rest, anchor, at);
                 }
                 None => {
                     *HOVER_LIST.lock() = None;
@@ -3931,7 +3933,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                     // Над кнопкой — список окон этой программы, щелчок
                     // выбирает нужное (как в Windows 11; 24.10: перебор по
                     // очереди не давал выбрать конкретное окно).
-                    open_thumbs_for(desktop, app, status, false);
+                    open_thumbs_for(desktop, app, status, false, (x, y));
                     return;
                 }
                 // Щелчок по кнопке активного окна сворачивает его — так ведёт

@@ -4159,6 +4159,23 @@ pub const ALL: &[Scenario] = &[
             Step::ShotHead("20-own-head1", 1),
             Step::Line("ui taskbar everywhere"),
             Step::Await("buttons:all", 15_000),
+            Step::Wait(1_500),
+            // Миниатюры (22.11, Роман: у терминала и окон Wine всплывали на
+            // другом мониторе): наведение на кнопку «Терминала» левой панели
+            // — полоса на левом мониторе, правой — на правом, хотя окно на
+            // правом.
+            Step::Aim(Aim::Point(60, 782)),
+            Step::Await("desktop     : thumbnails at ", 15_000),
+            Step::Wait(1_000),
+            Step::ShotHead("22-thumbs-head0", 0),
+            Step::Aim(Aim::Point(640, 300)),
+            Step::Await("desktop     : thumbnails closed", 15_000),
+            Step::Aim(Aim::Point(1280 + 60, 782)),
+            Step::Await("desktop     : thumbnails at ", 15_000),
+            Step::Wait(1_000),
+            Step::ShotHead("23-thumbs-head1", 1),
+            Step::Aim(Aim::Point(1900, 300)),
+            Step::Await("desktop     : thumbnails closed", 15_000),
             Step::Line("ui taskbar settings"),
             Step::Await("desktop     : settings opened on Dock", 15_000),
             Step::Wait(1_500),

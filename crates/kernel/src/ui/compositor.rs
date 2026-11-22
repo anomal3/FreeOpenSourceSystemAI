@@ -4416,7 +4416,25 @@ impl Compositor {
     /// Открыть миниатюры окон `apps` над кнопкой окна `anchor` (72e).
     /// Возвращает место полосы.
     pub fn open_thumbs(&mut self, apps: Vec<App>, anchor: App) -> Option<Rect> {
-        let button = self.button_of(anchor)?;
+        self.open_thumbs_at(apps, anchor, None)
+    }
+
+    /// То же, но над кнопкой той панели, на которой стоит точка `at` —
+    /// указатель (22.11, Роман: у терминала и окон Wine миниатюры
+    /// всплывали на другом мониторе). Кнопка окна ищется по монитору, где
+    /// лежит окно, а наводят на неё на панели своего монитора: у окна
+    /// Wayland/терминала первое окно группы стоит не там (или вне экрана),
+    /// и полоса уезжала к чужой панели. Панель под указателем знает кнопку
+    /// наверняка — сначала спрашивается она.
+    pub fn open_thumbs_at(&mut self, apps: Vec<App>, anchor: App, at: Option<(i32, i32)>) -> Option<Rect> {
+        let hovered = at.and_then(|(x, y)| {
+            let panel = self.all_panels().find(|panel| panel.rect.contains(x, y))?;
+            core::iter::once(anchor).chain(apps.iter().copied()).find_map(|app| panel.anchor(app))
+        });
+        let button = match hovered {
+            Some(button) => button,
+            None => self.button_of(anchor)?,
+        };
         // Монитор кнопки и его панель (20.11, панели на всех мониторах).
         let output = self.output_near(button.x + button.w as i32 / 2, button.y + button.h as i32 / 2);
         let (area, panel_top) = match self.panel_on(output) {
