@@ -217,69 +217,14 @@ impl Row {
     }
 }
 
-/// Значки файлов, папок и мест из макета Романа (72g, FIMG 64) — те же, что
-/// у стола (`crates/kernel/src/ui/appicon.rs`).
-static FILE_ICONS: [(&str, &[u8]); 39] = [
-    ("doc-archive", include_bytes!("../../../../assets/icons/file/doc-archive.fimg").as_slice()),
-    ("doc-audio", include_bytes!("../../../../assets/icons/file/doc-audio.fimg").as_slice()),
-    ("doc-code", include_bytes!("../../../../assets/icons/file/doc-code.fimg").as_slice()),
-    ("doc-disk-image", include_bytes!("../../../../assets/icons/file/doc-disk-image.fimg").as_slice()),
-    ("doc-document", include_bytes!("../../../../assets/icons/file/doc-document.fimg").as_slice()),
-    ("doc-executable", include_bytes!("../../../../assets/icons/file/doc-executable.fimg").as_slice()),
-    ("doc-font", include_bytes!("../../../../assets/icons/file/doc-font.fimg").as_slice()),
-    ("doc-fpk", include_bytes!("../../../../assets/icons/file/doc-fpk.fimg").as_slice()),
-    ("doc-image", include_bytes!("../../../../assets/icons/file/doc-image.fimg").as_slice()),
-    ("doc-pdf", include_bytes!("../../../../assets/icons/file/doc-pdf.fimg").as_slice()),
-    ("doc-presentation", include_bytes!("../../../../assets/icons/file/doc-presentation.fimg").as_slice()),
-    ("doc-spreadsheet", include_bytes!("../../../../assets/icons/file/doc-spreadsheet.fimg").as_slice()),
-    ("doc-text", include_bytes!("../../../../assets/icons/file/doc-text.fimg").as_slice()),
-    ("doc-unknown", include_bytes!("../../../../assets/icons/file/doc-unknown.fimg").as_slice()),
-    ("doc-video", include_bytes!("../../../../assets/icons/file/doc-video.fimg").as_slice()),
-    ("folder", include_bytes!("../../../../assets/icons/file/folder.fimg").as_slice()),
-    ("folder-desktop", include_bytes!("../../../../assets/icons/file/folder-desktop.fimg").as_slice()),
-    ("folder-documents", include_bytes!("../../../../assets/icons/file/folder-documents.fimg").as_slice()),
-    ("folder-downloads", include_bytes!("../../../../assets/icons/file/folder-downloads.fimg").as_slice()),
-    ("folder-empty", include_bytes!("../../../../assets/icons/file/folder-empty.fimg").as_slice()),
-    ("folder-full", include_bytes!("../../../../assets/icons/file/folder-full.fimg").as_slice()),
-    ("folder-music", include_bytes!("../../../../assets/icons/file/folder-music.fimg").as_slice()),
-    ("folder-open", include_bytes!("../../../../assets/icons/file/folder-open.fimg").as_slice()),
-    ("folder-pictures", include_bytes!("../../../../assets/icons/file/folder-pictures.fimg").as_slice()),
-    ("folder-videos", include_bytes!("../../../../assets/icons/file/folder-videos.fimg").as_slice()),
-    ("overlay-error", include_bytes!("../../../../assets/icons/file/overlay-error.fimg").as_slice()),
-    ("overlay-lock", include_bytes!("../../../../assets/icons/file/overlay-lock.fimg").as_slice()),
-    ("overlay-shared", include_bytes!("../../../../assets/icons/file/overlay-shared.fimg").as_slice()),
-    ("overlay-shortcut-arrow", include_bytes!("../../../../assets/icons/file/overlay-shortcut-arrow.fimg").as_slice()),
-    ("overlay-sync", include_bytes!("../../../../assets/icons/file/overlay-sync.fimg").as_slice()),
-    ("place-external-drive", include_bytes!("../../../../assets/icons/file/place-external-drive.fimg").as_slice()),
-    ("place-local-disk", include_bytes!("../../../../assets/icons/file/place-local-disk.fimg").as_slice()),
-    ("place-network-folder", include_bytes!("../../../../assets/icons/file/place-network-folder.fimg").as_slice()),
-    ("place-optical", include_bytes!("../../../../assets/icons/file/place-optical.fimg").as_slice()),
-    ("place-system-disk", include_bytes!("../../../../assets/icons/file/place-system-disk.fimg").as_slice()),
-    ("place-this-pc", include_bytes!("../../../../assets/icons/file/place-this-pc.fimg").as_slice()),
-    ("place-trash-empty", include_bytes!("../../../../assets/icons/file/place-trash-empty.fimg").as_slice()),
-    ("place-trash-full", include_bytes!("../../../../assets/icons/file/place-trash-full.fimg").as_slice()),
-    ("place-usb-stick", include_bytes!("../../../../assets/icons/file/place-usb-stick.fimg").as_slice()),
-];
-
 /// Разобранные значки: имя и картинка. Разбираются при первом показе.
 type IconCache = core::cell::RefCell<Vec<(&'static str, Option<mini_ui::image::Image>)>>;
 
 /// Нарисовать значок макета `name` в `rect`. `false` — такого нет.
 fn draw_design_icon(cache: &IconCache, s: &mut Surface, rect: Rect, name: &str) -> bool {
-    let mut cache = cache.borrow_mut();
-    if !cache.iter().any(|(known, _)| *known == name) {
-        let Some((known, bytes)) = FILE_ICONS.iter().find(|(known, _)| *known == name) else {
-            return false;
-        };
-        cache.push((known, mini_ui::image::Image::parse(bytes)));
-    }
-    match cache.iter().find(|(known, _)| *known == name) {
-        Some((_, Some(image))) => {
-            image.draw(s, rect);
-            true
-        }
-        _ => false,
-    }
+    // Значки темы (22.11): одни на систему, `/usr/share/icons/<тема>.pak`.
+    let _ = cache;
+    user_progs::icons::draw(s, rect, name)
 }
 
 /// Значок и тип файла по имени, как в Проводнике (таблица — общая со
@@ -3481,8 +3426,17 @@ impl Files {
                 side,
                 side,
             );
-            let (icon, tone, filled) = row.icon();
-            paint::icon_tile(ctx, s, tile, icon, tone, filled);
+            // Картинка темы без плитки (22.11, Роман: «синий квадрат с синей
+            // папкой» не нужен); плитка — только если картинки нет.
+            let kind_icon = if row.is_volume() {
+                if row.name == "/" { "place-system-disk" } else if row.name.starts_with("/usb") { "place-usb-stick" } else { "place-local-disk" }
+            } else {
+                file_kind(&row.name, row.directory).0
+            };
+            if !draw_design_icon(&self.icons, s, tile, kind_icon) {
+                let (icon, tone, filled) = row.icon();
+                paint::icon_tile(ctx, s, tile, icon, tone, filled);
+            }
             let label = Rect::new(
                 cell.x + ctx.px(4) as i32,
                 tile.bottom() + ctx.px(theme::ICON_LABEL_GAP) as i32,

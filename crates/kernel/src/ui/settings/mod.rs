@@ -383,6 +383,8 @@ enum Deed {
     Start(super::deskcfg::StartDeed),
     /// «Оформление» и глубина цвета (20.11, `look`).
     Look(LookDeed),
+    /// Тема значков (22.11, номер в `mini_ui::image::ICON_THEMES`).
+    IconTheme(u8),
     Layout(crate::input::keymap::Layout),
     Timezone(i32),
     NetDhcp,
@@ -1309,6 +1311,18 @@ impl SettingsView {
                     self.title_changed = true;
                 }
                     Ok(()) => Report::ok(text),
+                    Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
+                });
+            }
+            Deed::IconTheme(index) => {
+                super::appicon::set_theme(index);
+                let result = super::appicon::store();
+                // Перерисовать всё: стол, «Пуск», панель, окна программ.
+                self.theme_changed = true;
+                let title = mini_ui::image::ICON_THEMES.get(usize::from(index)).map_or("", |theme| theme.1);
+                kprintln!("  settings    : icon theme {}", mini_ui::image::icon_theme_id());
+                self.report = Some(match result {
+                    Ok(()) => Report::ok(format!("значки «{title}» применены и запомнены")),
                     Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
                 });
             }

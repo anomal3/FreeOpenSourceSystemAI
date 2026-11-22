@@ -378,8 +378,9 @@ pub fn art(entry: &Entry) -> super::appicon::Art {
             return art;
         }
     }
+    // По имени, а не картинкой (22.11): тема значков меняется на ходу.
     match super::appicon::design(entry.art) {
-        Some(image) => super::appicon::Art::Image(image),
+        Some(_) => super::appicon::Art::Named(entry.art, entry.icon, mini_ui::paint::Tone::Accent),
         None => super::appicon::Art::glyph(entry.icon),
     }
 }

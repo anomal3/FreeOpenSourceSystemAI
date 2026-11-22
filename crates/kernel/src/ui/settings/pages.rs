@@ -1500,6 +1500,7 @@ fn appearance(pass: &mut Pass, x: i32, y: i32, w: u32) {
     if current == Preset::Custom {
         y = row(pass, x, y, w, Some(Fi::Sliders), "Своё", "Переключатели ниже отличаются от обоих наборов", Ctl::Radio(true), None);
     }
+    y = icon_themes(pass, x, y, w);
     y = pass.group(x, y + ctx.px(8) as i32, w, "Эффекты");
     for (flag, icon, title, hint) in [
         (Flag::MinMax, Fi::Monitor, "Анимация сворачивания и разворачивания", "Окно летит в кнопку панели и обратно, плавный разворот"),
@@ -1514,6 +1515,36 @@ fn appearance(pass: &mut Pass, x: i32, y: i32, w: u32) {
     }
     y = pass.note(x, y + ctx.px(4) as i32, w, "Плавной прокрутки в системе нет — прокрутка и так идёт строками, без анимации.");
     row(pass, x, y, w, Some(Fi::Monitor), "Глубина цвета", "", Ctl::NavValue(look::depth_title(look::depth())), Some(Deed::Open(Section::Display)));
+}
+
+/// «Стиль значков» (22.11): темы значков с образцами — стол, «Пуск», панель,
+/// «Файлы» и окна выбора файла меняются сразу (`appicon::set_theme`).
+fn icon_themes(pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
+    let ctx = pass.ctx;
+    let mut y = pass.group(x, y + ctx.px(8) as i32, w, "Стиль значков");
+    let current = mini_ui::image::icon_theme();
+    for (index, (_, title, hint)) in mini_ui::image::ICON_THEMES.iter().enumerate() {
+        let theme = index as u8;
+        let top = y;
+        y = row(pass, x, y, w, Some(Fi::Image), title, hint, Ctl::Radio(current == theme), Some(Deed::IconTheme(theme)));
+        // Образцы — справа, перед кружком выбора.
+        let h = (y - top) as u32 - ctx.px(4);
+        let side = ctx.px(32);
+        let gap = ctx.px(6) as i32;
+        let names = crate::ui::appicon::PREVIEW;
+        let mut sx = x + w as i32 - ctx.px(70) as i32 - names.len() as i32 * (side as i32 + gap);
+        let sy = top + (h as i32 - side as i32) / 2;
+        if !pass.visible(Rect::new(sx, top, side, h)) || sx < x + w as i32 / 2 {
+            continue;
+        }
+        for name in names {
+            if let Some(image) = crate::ui::appicon::theme_design(theme, name) {
+                pass.on(|s| image.draw(s, Rect::new(sx, sy, side, side)));
+            }
+            sx += side as i32 + gap;
+        }
+    }
+    y
 }
 
 /// «Глубина цвета» на странице «Дисплей».

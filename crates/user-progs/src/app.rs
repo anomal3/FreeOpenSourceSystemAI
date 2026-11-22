@@ -237,6 +237,7 @@ pub fn start(spec: &Spec) -> SysInfo {
     };
     mini_ui::use_raw_format(info.pixel_format);
     theme::set_dark(info.flags & SYSINFO_DARK != 0);
+    crate::icons::set_theme(user_abi::sysinfo_icon_theme(info.flags));
     theme::set_classic(info.flags & user_abi::SYSINFO_CLASSIC != 0);
     info
 }
@@ -489,6 +490,11 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
                         spec.name,
                         if theme::is_classic() { "classic" } else { "modern" }
                     ));
+                    dirty = true;
+                }
+                // Тема значков (22.11) — тоже на ходу.
+                if crate::icons::set_theme(user_abi::sysinfo_icon_theme(fresh.flags)) {
+                    println(&format!("{}: repainted for the {} icons", spec.name, mini_ui::image::icon_theme_id()));
                     dirty = true;
                 }
                 // Масштаб стола сменился на ходу (20.11): ядро отдаёт его

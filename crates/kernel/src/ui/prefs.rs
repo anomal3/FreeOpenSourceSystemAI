@@ -119,6 +119,8 @@ pub fn adopt() {
     // «Оформление» и глубина цвета (20.11, см. `look`) — после `animations=`:
     // строка `look=` новее и главнее.
     super::look::adopt(text, &path);
+    // Тема значков (22.11, `appicon`).
+    super::appicon::adopt(text, &path);
     // Панель задач и «Пуск» одним набором (20.11, см. `deskcfg`).
     super::deskcfg::adopt(text, &path);
     if let Some(height) = sysconf::title_bar(text) {

@@ -244,6 +244,17 @@ pub fn probe() -> Result<Payload, Error> {
         }
     }
 
+    // Темы значков (22.11). Без них стол рисует вшитую тему по умолчанию.
+    for (source, target) in ICONS {
+        match stat(&mut root, source, What::Defaults) {
+            Ok(size) => {
+                logln!("[payload] icon theme {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Defaults, size });
+            }
+            Err(_) => logln!("[payload] {source} is missing; only the built-in icon theme will be there"),
+        }
+    }
+
     // Сайт по умолчанию. Его отсутствие установку не срывает: сервер без
     // страницы отвечает `404`, и это честнее несостоявшейся установки.
     for (source, target) in SITE {
@@ -569,6 +580,15 @@ const SYSTEM_FONTS: [(&CStr16, &str); 24] = [
 /// второй не для красоты: страница со ссылкой на таблицу стилей — это проверка
 /// того, что сервер отдаёт больше одного файла и берёт тип содержимого из
 /// расширения имени.
+/// Пачки тем значков (22.11). Список обязан совпадать с `PAYLOAD_ICONS` в
+/// `xtask/src/arch.rs`.
+const ICONS: [(&CStr16, &str); 4] = [
+    (cstr16!("\\FREEOS\\ICONS\\GLOSSY.PAK"), "usr/share/icons/glossy.pak"),
+    (cstr16!("\\FREEOS\\ICONS\\CRISP.PAK"), "usr/share/icons/crisp.pak"),
+    (cstr16!("\\FREEOS\\ICONS\\SOFT.PAK"), "usr/share/icons/soft.pak"),
+    (cstr16!("\\FREEOS\\ICONS\\VIVID.PAK"), "usr/share/icons/vivid.pak"),
+];
+
 const SITE: [(&CStr16, &str); 2] = [
     (cstr16!("\\FREEOS\\WWW\\INDEX.HTM"), "usr/share/httpd/index.html"),
     (cstr16!("\\FREEOS\\WWW\\STYLE.CSS"), "usr/share/httpd/style.css"),

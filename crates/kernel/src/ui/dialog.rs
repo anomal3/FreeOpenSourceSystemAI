@@ -294,9 +294,20 @@ impl DialogView {
         };
         let tile = Rect::new(area.x + pad, area.y + pad, ctx.px(TILE), ctx.px(TILE));
         // «О системе» — логотип FossAi на плитке (фаза 72a).
+        // Значки диалогов — из темы значков (22.11), плитка — если нет.
+        let themed = match self.dialog {
+            Dialog::About(_) | Dialog::OpenWith(_) => "dlg-info",
+            Dialog::Power { .. } => "power",
+            Dialog::NotResponding { .. } => "dlg-warning",
+            Dialog::Delete { forever: false, .. } => "dlg-question",
+            Dialog::Delete { forever: true, .. } => "dlg-warning",
+        };
         match super::appicon::logo_tile().filter(|_| matches!(self.dialog, Dialog::About(_))) {
             Some(logo) => logo.draw(s, tile),
-            None => paint::icon_tile(ctx, s, tile, icon, tone, true),
+            None => match super::appicon::design(themed) {
+                Some(image) => image.draw(s, tile),
+                None => paint::icon_tile(ctx, s, tile, icon, tone, true),
+            },
         }
 
         let x = tile.right() + ctx.px(16) as i32;
@@ -402,7 +413,10 @@ fn draw_open_with(ctx: Ctx, s: &mut Surface, area: Rect, choice: &OpenWith) {
         }
         let tile = Rect::new(row.x + ctx.px(12) as i32, row.y + (row.h as i32 - ctx.px(28) as i32) / 2, ctx.px(28), ctx.px(28));
         let glyph = if label == "Блокнот" { Icon::File } else { Icon::Package };
-        paint::icon_tile(ctx, s, tile, glyph, Tone::Accent, false);
+        match super::appicon::design(if label == "Блокнот" { "notepad" } else { "generic" }) {
+            Some(image) => image.draw(s, tile),
+            None => paint::icon_tile(ctx, s, tile, glyph, Tone::Accent, false),
+        }
         let text_x = tile.right() + ctx.px(14) as i32;
         let radio = ctx.px(8);
         let text_w = (row.right() - text_x - ctx.px(40) as i32).max(0) as u32;

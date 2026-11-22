@@ -29,7 +29,12 @@ pub enum Art {
     /// Залитая цветом плитка со знаком набора — всегда, без замены картинкой
     /// макета (20.11, системные утилиты: у `Icon::Log` картинка макета —
     /// редактор кода, а журналу нужен свой значок).
+    #[allow(dead_code)]
     Tile(Icon, Tone),
+    /// Значок темы по имени (22.11) — берётся при каждом рисовании: тему
+    /// значков меняют на ходу, и кнопка панели не должна держать старую
+    /// картинку. Нет такого значка — плитка со знаком.
+    Named(&'static str, Icon, Tone),
 }
 
 impl Art {
@@ -49,6 +54,10 @@ impl Art {
             },
             Self::Image(image) => image.draw(surface, rect),
             Self::Tile(icon, tone) => paint::icon_tile(ctx, surface, rect, *icon, *tone, true),
+            Self::Named(name, icon, tone) => match design(name) {
+                Some(image) => image.draw(surface, rect),
+                None => paint::icon_tile(ctx, surface, rect, *icon, *tone, true),
+            },
         }
     }
 
@@ -59,6 +68,7 @@ impl Art {
             Self::Image(_) => true,
             Self::Glyph(icon, ..) => design_for(*icon).is_some(),
             Self::Tile(..) => false,
+            Self::Named(name, ..) => design(name).is_some(),
         }
     }
 }
@@ -67,6 +77,21 @@ impl Art {
 /// же в «Пуске», на панели задач и в заголовке окна. `None` — не утилита.
 #[must_use]
 pub fn tool_art(program: &str) -> Option<Art> {
+    // Имя значка темы — то же, что имя программы.
+    let program: &'static str = match program {
+        "run" => "run",
+        "charmap" => "charmap",
+        "sysinfo" => "sysinfo",
+        "eventlog" => "eventlog",
+        "services" => "services",
+        "cleanmgr" => "cleanmgr",
+        "admin" => "admin",
+        "compmgmt" => "compmgmt",
+        "resmon" => "resmon",
+        "startup" => "startup",
+        "cfgedit" => "cfgedit",
+        _ => return None,
+    };
     let (icon, tone) = match program {
         "run" => (Icon::Prompt, Tone::Accent),
         "charmap" => (Icon::Keyboard, Tone::Ok),
@@ -82,7 +107,8 @@ pub fn tool_art(program: &str) -> Option<Art> {
         "cfgedit" => (Icon::File, Tone::Accent),
         _ => return None,
     };
-    Some(Art::Tile(icon, tone))
+    // Картинка темы значков (22.11), плитка — если в теме такой нет.
+    Some(Art::Named(program, icon, tone))
 }
 
 /// Прочитанные картинки: путь и то, что вышло (`None` — файла нет или он не
@@ -237,90 +263,133 @@ pub fn of_task(task: u32, title: &str) -> (Art, String) {
     }
 }
 
-// ── Значки макета (фаза 72d) ────────────────────────────────────────────────
+// ── Значки макета (фаза 72d) и темы значков (22.11) ─────────────────────────
 
-/// Значки программ из макета Романа (`assets/icons/app`, FIMG 64): цветная
-/// плитка с градиентом и знаком. Рисуются вместо значка набора на плитке.
-static APP_ICONS: [(&str, &[u8]); 20] = [
-    ("about", include_bytes!("../../../../assets/icons/app/about.fimg").as_slice()),
-    ("archiver", include_bytes!("../../../../assets/icons/app/archiver.fimg").as_slice()),
-    ("browser", include_bytes!("../../../../assets/icons/app/browser.fimg").as_slice()),
-    ("calculator", include_bytes!("../../../../assets/icons/app/calculator.fimg").as_slice()),
-    ("code-editor", include_bytes!("../../../../assets/icons/app/code-editor.fimg").as_slice()),
-    ("device-manager", include_bytes!("../../../../assets/icons/app/device-manager.fimg").as_slice()),
-    ("files", include_bytes!("../../../../assets/icons/app/files.fimg").as_slice()),
-    ("generic", include_bytes!("../../../../assets/icons/app/generic.fimg").as_slice()),
-    ("help", include_bytes!("../../../../assets/icons/app/help.fimg").as_slice()),
-    ("image-viewer", include_bytes!("../../../../assets/icons/app/image-viewer.fimg").as_slice()),
-    ("linux-apps", include_bytes!("../../../../assets/icons/app/linux-apps.fimg").as_slice()),
-    ("media-player", include_bytes!("../../../../assets/icons/app/media-player.fimg").as_slice()),
-    ("notepad", include_bytes!("../../../../assets/icons/app/notepad.fimg").as_slice()),
-    ("packages", include_bytes!("../../../../assets/icons/app/packages.fimg").as_slice()),
-    ("settings", include_bytes!("../../../../assets/icons/app/settings.fimg").as_slice()),
-    ("system-monitor", include_bytes!("../../../../assets/icons/app/system-monitor.fimg").as_slice()),
-    ("system-update", include_bytes!("../../../../assets/icons/app/system-update.fimg").as_slice()),
-    ("task-manager", include_bytes!("../../../../assets/icons/app/task-manager.fimg").as_slice()),
-    ("terminal", include_bytes!("../../../../assets/icons/app/terminal.fimg").as_slice()),
-    ("windows-apps", include_bytes!("../../../../assets/icons/app/windows-apps.fimg").as_slice()),
-];
+/// Пачка темы по умолчанию (`mini_ui::image::ICON_THEMES[0]`) — вшита: стол
+/// рисует значки и тогда, когда корень ещё не прочитан или пачки на нём нет.
+/// Остальные темы читаются с диска, `/usr/share/icons/<тема>.pak`.
+static BUILTIN: &[u8] = include_bytes!("../../../../initrd/usr/share/icons/glossy.pak");
 
-/// Значки файлов, папок и мест (`assets/icons/file`, FIMG 64).
-static FILE_ICONS: [(&str, &[u8]); 39] = [
-    ("doc-archive", include_bytes!("../../../../assets/icons/file/doc-archive.fimg").as_slice()),
-    ("doc-audio", include_bytes!("../../../../assets/icons/file/doc-audio.fimg").as_slice()),
-    ("doc-code", include_bytes!("../../../../assets/icons/file/doc-code.fimg").as_slice()),
-    ("doc-disk-image", include_bytes!("../../../../assets/icons/file/doc-disk-image.fimg").as_slice()),
-    ("doc-document", include_bytes!("../../../../assets/icons/file/doc-document.fimg").as_slice()),
-    ("doc-executable", include_bytes!("../../../../assets/icons/file/doc-executable.fimg").as_slice()),
-    ("doc-font", include_bytes!("../../../../assets/icons/file/doc-font.fimg").as_slice()),
-    ("doc-fpk", include_bytes!("../../../../assets/icons/file/doc-fpk.fimg").as_slice()),
-    ("doc-image", include_bytes!("../../../../assets/icons/file/doc-image.fimg").as_slice()),
-    ("doc-pdf", include_bytes!("../../../../assets/icons/file/doc-pdf.fimg").as_slice()),
-    ("doc-presentation", include_bytes!("../../../../assets/icons/file/doc-presentation.fimg").as_slice()),
-    ("doc-spreadsheet", include_bytes!("../../../../assets/icons/file/doc-spreadsheet.fimg").as_slice()),
-    ("doc-text", include_bytes!("../../../../assets/icons/file/doc-text.fimg").as_slice()),
-    ("doc-unknown", include_bytes!("../../../../assets/icons/file/doc-unknown.fimg").as_slice()),
-    ("doc-video", include_bytes!("../../../../assets/icons/file/doc-video.fimg").as_slice()),
-    ("folder", include_bytes!("../../../../assets/icons/file/folder.fimg").as_slice()),
-    ("folder-desktop", include_bytes!("../../../../assets/icons/file/folder-desktop.fimg").as_slice()),
-    ("folder-documents", include_bytes!("../../../../assets/icons/file/folder-documents.fimg").as_slice()),
-    ("folder-downloads", include_bytes!("../../../../assets/icons/file/folder-downloads.fimg").as_slice()),
-    ("folder-empty", include_bytes!("../../../../assets/icons/file/folder-empty.fimg").as_slice()),
-    ("folder-full", include_bytes!("../../../../assets/icons/file/folder-full.fimg").as_slice()),
-    ("folder-music", include_bytes!("../../../../assets/icons/file/folder-music.fimg").as_slice()),
-    ("folder-open", include_bytes!("../../../../assets/icons/file/folder-open.fimg").as_slice()),
-    ("folder-pictures", include_bytes!("../../../../assets/icons/file/folder-pictures.fimg").as_slice()),
-    ("folder-videos", include_bytes!("../../../../assets/icons/file/folder-videos.fimg").as_slice()),
-    ("overlay-error", include_bytes!("../../../../assets/icons/file/overlay-error.fimg").as_slice()),
-    ("overlay-lock", include_bytes!("../../../../assets/icons/file/overlay-lock.fimg").as_slice()),
-    ("overlay-shared", include_bytes!("../../../../assets/icons/file/overlay-shared.fimg").as_slice()),
-    ("overlay-shortcut-arrow", include_bytes!("../../../../assets/icons/file/overlay-shortcut-arrow.fimg").as_slice()),
-    ("overlay-sync", include_bytes!("../../../../assets/icons/file/overlay-sync.fimg").as_slice()),
-    ("place-external-drive", include_bytes!("../../../../assets/icons/file/place-external-drive.fimg").as_slice()),
-    ("place-local-disk", include_bytes!("../../../../assets/icons/file/place-local-disk.fimg").as_slice()),
-    ("place-network-folder", include_bytes!("../../../../assets/icons/file/place-network-folder.fimg").as_slice()),
-    ("place-optical", include_bytes!("../../../../assets/icons/file/place-optical.fimg").as_slice()),
-    ("place-system-disk", include_bytes!("../../../../assets/icons/file/place-system-disk.fimg").as_slice()),
-    ("place-this-pc", include_bytes!("../../../../assets/icons/file/place-this-pc.fimg").as_slice()),
-    ("place-trash-empty", include_bytes!("../../../../assets/icons/file/place-trash-empty.fimg").as_slice()),
-    ("place-trash-full", include_bytes!("../../../../assets/icons/file/place-trash-full.fimg").as_slice()),
-    ("place-usb-stick", include_bytes!("../../../../assets/icons/file/place-usb-stick.fimg").as_slice()),
-];
+/// Самая большая пачка темы, которую стоит читать.
+const PACK_LIMIT: usize = 16 * 1024 * 1024;
 
-/// Разобранные значки макета: имя и картинка. Разбирается по требованию.
-static DESIGN: SpinLock<Vec<(&'static str, Option<Arc<Image>>)>> = SpinLock::new(Vec::new());
+/// Прочитанные с диска пачки: номер темы и байты (`None` — файла нет).
+static PACKS: SpinLock<Vec<(u8, Option<Arc<Vec<u8>>>)>> = SpinLock::new(Vec::new());
 
-/// Значок макета по имени (`files`, `doc-text`, `place-trash-empty`…).
+/// Разобранные значки: тема, имя и картинка. Разбираются по требованию.
+static DESIGN: SpinLock<Vec<(u8, String, Option<Arc<Image>>)>> = SpinLock::new(Vec::new());
+
+/// Байты значка `name` темы `theme`.
+fn pack_bytes(theme: u8, name: &str) -> Option<Vec<u8>> {
+    if theme == 0 {
+        return mini_ui::image::pack_entry(BUILTIN, name).map(<[u8]>::to_vec);
+    }
+    let known = PACKS.lock().iter().find(|(t, _)| *t == theme).map(|(_, pack)| pack.clone());
+    let pack = match known {
+        Some(pack) => pack,
+        None => {
+            let id = mini_ui::image::ICON_THEMES.get(usize::from(theme))?.0;
+            let path = mini_ui::image::icon_pack_path(id);
+            // Читается без замка: чтение файла может ждать диска.
+            let pack = match crate::fs::read(&path, PACK_LIMIT) {
+                Some(Ok((bytes, _))) if mini_ui::image::pack_index_end(&bytes).is_some() => Some(Arc::new(bytes)),
+                _ => {
+                    crate::kprintln!("  desktop     : icon theme '{id}': no pack at {path}, built-in icons instead");
+                    None
+                }
+            };
+            PACKS.lock().push((theme, pack.clone()));
+            pack
+        }
+    };
+    mini_ui::image::pack_entry(pack.as_ref()?, name).map(<[u8]>::to_vec)
+}
+
+/// Образцы темы на странице «Оформление» (`settings::pages`).
+pub const PREVIEW: [&str; 6] = ["folder", "files", "doc-text", "terminal", "settings", "place-this-pc"];
+
+/// Значок `name` темы `theme` (и для образцов в «Параметрах»).
 #[must_use]
-pub fn design(name: &str) -> Option<Arc<Image>> {
-    let mut cache = DESIGN.lock();
-    if let Some((_, image)) = cache.iter().find(|(known, _)| *known == name) {
+pub fn theme_design(theme: u8, name: &str) -> Option<Arc<Image>> {
+    if let Some((.., image)) = DESIGN.lock().iter().find(|(t, known, _)| *t == theme && known == name) {
         return image.clone();
     }
-    let (known, bytes) = APP_ICONS.iter().chain(FILE_ICONS.iter()).find(|(known, _)| *known == name)?;
-    let image = Image::parse(bytes).map(Arc::new);
-    cache.push((known, image.clone()));
+    let image = pack_bytes(theme, name).and_then(|bytes| Image::parse(&bytes)).map(Arc::new);
+    let mut cache = DESIGN.lock();
+    if !cache.iter().any(|(t, known, _)| *t == theme && known == name) {
+        cache.push((theme, String::from(name), image.clone()));
+    }
     image
+}
+
+/// Значок макета по имени (`files`, `doc-text`, `place-trash-empty`…) в
+/// текущей теме; нет в ней — из темы по умолчанию.
+#[must_use]
+pub fn design(name: &str) -> Option<Arc<Image>> {
+    if name.is_empty() {
+        return None;
+    }
+    let theme = mini_ui::image::icon_theme();
+    theme_design(theme, name).or_else(|| if theme == 0 { None } else { theme_design(0, name) })
+}
+
+/// Сменить тему значков (номер в `ICON_THEMES`). `true` — сменилась.
+pub fn set_theme(theme: u8) -> bool {
+    let changed = mini_ui::image::set_icon_theme(theme);
+    if changed {
+        // Разобранный значок со всеми размерами — под сто килобайт: значки
+        // прежних тем не держать (кроме образцов страницы «Оформление»).
+        let current = mini_ui::image::icon_theme();
+        DESIGN.lock().retain(|(t, name, _)| *t == current || PREVIEW.contains(&name.as_str()));
+        crate::kprintln!("  desktop     : icon theme {}", mini_ui::image::icon_theme_id());
+    }
+    changed
+}
+
+/// Прочитать `icon_theme=` из `desktop.cfg` (зовёт `prefs::adopt`).
+pub fn adopt(text: &str, path: &str) {
+    if let Some(id) = sysconf::value(text, "icon_theme") {
+        match mini_ui::image::icon_theme_index(id.trim()) {
+            Some(theme) => {
+                set_theme(theme);
+                crate::kprintln!("  desktop     : icon theme {} from {path}", id.trim());
+            }
+            None => crate::kprintln!("  desktop     : unknown icon theme '{}' in {path}", id.trim()),
+        }
+    }
+}
+
+/// Запомнить тему значков.
+pub fn store() -> Result<(), crate::vfs::VfsError> {
+    super::prefs::store_line("icon_theme", mini_ui::image::icon_theme_id())
+}
+
+/// `ui icons glossy|crisp` — то же, что «Параметры → Оформление → Стиль
+/// значков», для стенда; без слова — какая сейчас.
+pub fn command(words: &str) {
+    let word = words.trim();
+    if !word.is_empty() {
+        let Some(theme) = mini_ui::image::icon_theme_index(word) else {
+            let ids: Vec<&str> = mini_ui::image::ICON_THEMES.iter().map(|(id, ..)| *id).collect();
+            crate::kprintln!("  desktop     : ui icons: {}", ids.join(", "));
+            return;
+        };
+        set_theme(theme);
+        if let Err(err) = store() {
+            crate::kprintln!("  desktop     : icon theme not saved: {err}");
+        }
+        let status = super::status_now();
+        super::with_desktop(|desktop| {
+            desktop.restyle(&status);
+            desktop.present();
+        });
+    }
+    let theme = mini_ui::image::icon_theme();
+    let missing = ["folder", "files", "terminal", "doc-text", "place-this-pc", "dlg-warning"]
+        .iter()
+        .filter(|name| theme_design(theme, name).is_none())
+        .count();
+    crate::kprintln!("  desktop     : icon theme now {} ({missing} of 6 probes missing)", mini_ui::image::icon_theme_id());
 }
 
 /// Значок программы из макета для значка набора — того, которым программа
@@ -341,43 +410,23 @@ pub fn design_for(icon: Icon) -> Option<Arc<Image>> {
         Icon::Network => "browser",
         Icon::Display => "image-viewer",
         Icon::Log => "code-editor",
+        Icon::Computer => "place-this-pc",
+        Icon::Disk => "place-local-disk",
+        Icon::Keyboard => "keyboard",
+        Icon::Clock => "clock",
+        Icon::User => "user",
+        Icon::Power => "power",
+        Icon::Shield => "dlg-shield",
+        Icon::Search => "search",
+        Icon::Service => "services",
         _ => return None,
     };
     design(name)
 }
 
-/// Значок файла по имени: папка или тип по расширению, как в Проводнике.
+/// Значок файла по имени: папка или тип по расширению, как в Проводнике
+/// (таблица — общая с «Файлами», `sysconf::filetypes`).
 #[must_use]
 pub fn file_icon(name: &str, directory: bool) -> Option<Arc<Image>> {
-    if directory {
-        let kind = match name {
-            "Desktop" | "Рабочий стол" => "folder-desktop",
-            "Documents" | "Документы" => "folder-documents",
-            "Downloads" | "Загрузки" => "folder-downloads",
-            "Music" | "Музыка" => "folder-music",
-            "Pictures" | "Изображения" => "folder-pictures",
-            "Videos" | "Видео" => "folder-videos",
-            _ => "folder",
-        };
-        return design(kind);
-    }
-    let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
-    let kind = match ext.as_str() {
-        "txt" | "log" | "md" | "cfg" | "conf" | "ini" => "doc-text",
-        "doc" | "docx" | "odt" | "rtf" => "doc-document",
-        "xls" | "xlsx" | "ods" | "csv" => "doc-spreadsheet",
-        "ppt" | "pptx" | "odp" => "doc-presentation",
-        "pdf" => "doc-pdf",
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "fimg" | "qoi" => "doc-image",
-        "mp4" | "mkv" | "avi" | "webm" | "mov" => "doc-video",
-        "mp3" | "wav" | "ogg" | "flac" => "doc-audio",
-        "zip" | "tar" | "gz" | "xz" | "7z" | "rar" | "deb" => "doc-archive",
-        "rs" | "c" | "h" | "cpp" | "py" | "js" | "lua" | "cs" | "sh" | "html" | "css" | "json" => "doc-code",
-        "exe" | "dll" | "elf" => "doc-executable",
-        "fpk" => "doc-fpk",
-        "img" | "iso" | "vdi" => "doc-disk-image",
-        "ttf" | "otf" => "doc-font",
-        _ => "doc-unknown",
-    };
-    design(kind)
+    design(sysconf::filetypes::kind_of(name, directory).icon)
 }

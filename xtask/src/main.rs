@@ -50,6 +50,7 @@ mod ruststd;
 mod statefs;
 mod debian;
 mod fimg;
+mod iconpack;
 mod util;
 mod wallpaper;
 mod version;
@@ -738,15 +739,9 @@ fn real_main() -> Result<()> {
                 std::fs::write(logo.join(out), &fimg)?;
                 println!("логотип: {png} → {out} ({} КиБ)", fimg.len() / 1024);
             }
-            // Курсоры — FIMG того же размера, что PNG (32 и 48); значки
-            // программ и файлов (72d) — 64.
+            // Курсоры — FIMG того же размера, что PNG (32 и 48).
             let assets = paths::workspace_root().join("assets");
-            for (dir, side) in [
-                (assets.join("cursors").join("32"), 32u32),
-                (assets.join("cursors").join("48"), 48),
-                (assets.join("icons").join("app"), 64),
-                (assets.join("icons").join("file"), 64),
-            ] {
+            for (dir, side) in [(assets.join("cursors").join("32"), 32u32), (assets.join("cursors").join("48"), 48)] {
                 let mut count = 0;
                 for entry in std::fs::read_dir(&dir)? {
                     let path = entry?.path();
@@ -757,6 +752,20 @@ fn real_main() -> Result<()> {
                     }
                 }
                 println!("{}: {count}", dir.display());
+            }
+            // Темы значков (22.11): каталог темы → пачка FIPK в образе
+            // (`/usr/share/icons/<тема>.pak`); первую тему ядро ещё и вшивает.
+            let themes = assets.join("icons").join("themes");
+            let mut ids: Vec<_> = std::fs::read_dir(&themes)?
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.is_dir())
+                .collect();
+            ids.sort();
+            for dir in ids {
+                let id = dir.file_name().and_then(|name| name.to_str()).unwrap_or("").to_string();
+                let out = paths::workspace_root().join("initrd").join("usr").join("share").join("icons").join(format!("{id}.pak"));
+                let (count, size) = iconpack::build(&dir, &out)?;
+                println!("значки «{id}»: {count} → {} ({} КиБ)", out.display(), size / 1024);
             }
             // Линейные значки (72i) — маски прозрачности 32×32, по байту на
             // точку, одним файлом в порядке `mini_ui::glyphicon::LINE`.

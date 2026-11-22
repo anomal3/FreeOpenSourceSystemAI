@@ -398,6 +398,8 @@ pub fn run(
     // Своя среда .NET — рядом, тем же шагом (см. `payload::DOTNET`).
     fs.create_dir_path(&mut dev, "usr/share/dotnet", 0o755, 0, 0)?;
     fs.create_dir_path(&mut dev, "usr/share/dotnet/samples", 0o755, 0, 0)?;
+    // Темы значков (22.11, `payload::ICONS`).
+    fs.create_dir_path(&mut dev, "usr/share/icons", 0o755, 0, 0)?;
     for index in 0..payload.items.len() {
         if payload.items[index].what != payload::What::Defaults {
             continue;

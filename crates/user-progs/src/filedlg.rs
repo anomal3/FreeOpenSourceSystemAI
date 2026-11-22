@@ -29,11 +29,9 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 pub use mini_ui::filedlg::{COMPUTER, FileDialog, Filter, Host, Item, Mode, Options, Outcome, Volume, join, parent_of};
 use mini_ui::filedlg as dlg;
-use mini_ui::image::Image;
 use mini_ui::{Rect, Surface};
 use user_abi::{Dirent, KIND_DIRECTORY, Stat};
 
@@ -57,28 +55,6 @@ const _: () = {
     assert!(dlg::MOD_ALT == user_abi::WIN_MOD_ALT);
 };
 
-/// Значки макета (FIMG 64), которые окно показывает: папки, документы, тома.
-/// Те же файлы, что у «Файлов» и стола (`assets/icons/file`).
-static ICONS: [(&str, &[u8]); 17] = [
-    ("folder", include_bytes!("../../../assets/icons/file/folder.fimg").as_slice()),
-    ("folder-desktop", include_bytes!("../../../assets/icons/file/folder-desktop.fimg").as_slice()),
-    ("folder-documents", include_bytes!("../../../assets/icons/file/folder-documents.fimg").as_slice()),
-    ("folder-downloads", include_bytes!("../../../assets/icons/file/folder-downloads.fimg").as_slice()),
-    ("folder-music", include_bytes!("../../../assets/icons/file/folder-music.fimg").as_slice()),
-    ("folder-pictures", include_bytes!("../../../assets/icons/file/folder-pictures.fimg").as_slice()),
-    ("folder-videos", include_bytes!("../../../assets/icons/file/folder-videos.fimg").as_slice()),
-    ("doc-text", include_bytes!("../../../assets/icons/file/doc-text.fimg").as_slice()),
-    ("doc-code", include_bytes!("../../../assets/icons/file/doc-code.fimg").as_slice()),
-    ("doc-image", include_bytes!("../../../assets/icons/file/doc-image.fimg").as_slice()),
-    ("doc-archive", include_bytes!("../../../assets/icons/file/doc-archive.fimg").as_slice()),
-    ("doc-unknown", include_bytes!("../../../assets/icons/file/doc-unknown.fimg").as_slice()),
-    ("place-this-pc", include_bytes!("../../../assets/icons/file/place-this-pc.fimg").as_slice()),
-    ("place-system-disk", include_bytes!("../../../assets/icons/file/place-system-disk.fimg").as_slice()),
-    ("place-local-disk", include_bytes!("../../../assets/icons/file/place-local-disk.fimg").as_slice()),
-    ("place-usb-stick", include_bytes!("../../../assets/icons/file/place-usb-stick.fimg").as_slice()),
-    ("place-external-drive", include_bytes!("../../../assets/icons/file/place-external-drive.fimg").as_slice()),
-];
-
 /// Самое большее записей одной папки.
 const MAX_ENTRIES: usize = 4096;
 /// Буфер ответа `mounts`.
@@ -93,15 +69,13 @@ pub struct SysHost {
     home: String,
     /// Смещение местного времени, минуты.
     offset: i32,
-    /// Разобранные значки по имени (разбираются при первом показе).
-    icons: RefCell<Vec<(String, Option<Image>)>>,
 }
 
 impl SysHost {
     /// `tag` — имя программы в журнале.
     #[must_use]
     pub fn new(tag: &'static str) -> Self {
-        Self { tag, home: home_dir(), offset: local_offset(), icons: RefCell::new(Vec::new()) }
+        Self { tag, home: home_dir(), offset: local_offset() }
     }
 }
 
@@ -215,24 +189,10 @@ impl Host for SysHost {
     }
 
     fn draw_icon(&self, s: &mut Surface, rect: Rect, name: &str) -> bool {
-        let mut cache = self.icons.borrow_mut();
-        let at = match cache.iter().position(|(known, _)| known == name) {
-            Some(at) => at,
-            None => {
-                // Нет в наборе окна — та же папка или «неизвестный документ».
-                let fallback = if name.starts_with("folder") { "folder" } else { "doc-unknown" };
-                let bytes = ICONS.iter().find(|(known, _)| *known == name).or_else(|| ICONS.iter().find(|(known, _)| *known == fallback)).map(|(_, bytes)| *bytes);
-                cache.push((name.to_string(), bytes.and_then(Image::parse)));
-                cache.len() - 1
-            }
-        };
-        match &cache[at].1 {
-            Some(image) => {
-                image.draw(s, rect);
-                true
-            }
-            None => false,
-        }
+        // Значки темы (22.11, `crate::icons`); нет такого — та же папка или
+        // «неизвестный документ».
+        let fallback = if name.starts_with("folder") { "folder" } else { "doc-unknown" };
+        crate::icons::draw(s, rect, name) || crate::icons::draw(s, rect, fallback)
     }
 
     fn last_dir(&self) -> Option<String> {

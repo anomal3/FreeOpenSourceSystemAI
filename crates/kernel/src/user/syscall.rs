@@ -2283,6 +2283,8 @@ fn sysinfo(out: usize) -> i64 {
         // Масштаб — тот, которым рисует стол сейчас (один источник правды,
         // 20.11): он меняется на ходу, и программы перерисовываются в нём.
         flags: (if mini_ui::theme::is_dark() { SYSINFO_DARK } else { 0 })
+            // Тема значков (22.11) — программы меняют значки на ходу.
+            | ((u32::from(mini_ui::image::icon_theme()) << user_abi::SYSINFO_ICONS_SHIFT) & user_abi::SYSINFO_ICONS_MASK)
             // Классика (22.11) — программы рисуют как Windows 98.
             | (if mini_ui::theme::is_classic() { user_abi::SYSINFO_CLASSIC } else { 0 })
             // Тема значков (22.11) — программы меняют значки на ходу.

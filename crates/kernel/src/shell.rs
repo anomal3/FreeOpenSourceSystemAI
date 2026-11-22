@@ -2381,6 +2381,11 @@ fn ui_status(argument: &str) {
         ui::look::command(words);
         return;
     }
+    // Тема значков (22.11): `ui icons glossy|crisp`.
+    if let Some(words) = argument.trim().strip_prefix("icons") {
+        ui::appicon::command(words);
+        return;
+    }
     if let Some(words) = argument.trim().strip_prefix("start") {
         ui::start_command(words);
         return;
