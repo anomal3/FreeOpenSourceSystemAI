@@ -11218,6 +11218,28 @@ DRM-слой Linux по `docs/AMD_A4_CALLS.md` (`/dev/dri/renderD128`, `AMDGPU_I
 основе `linux/drm/` из `main`; RADV в пакет Proton; потом DXVK. Код `amd.rs` сейчас —
 линейные проверки; для драйвера его надо разложить на модули (smc, gfx/ring, gmc/vm).
 
+**Polaris, P6: ПЕРВЫЙ COMPUTE-ШЕЙДЕР ВЫПОЛНЕН (22.11, образ 0.8.12, проверено на железе).**
+`amd shader` (`display/amd.rs`, `polaris_shader`): (1) настройка GFX как у Linux —
+`golden_settings_polaris10_a11` + `polaris10_golden_common_all` (25 записей по правилу
+`(old & ~mask) | value`, при маске `0xffffffff` — просто значение) и `SH_MEM_CONFIG`
+(`0x378`)/`BASES`/`APE1` для VMID 0; (2) dispatch на **кольце GFX** — шейдер из libdrm
+(`amdgpu_sync_dependency_test`, массив `shader_bin` для GFX8: цикл на 10 млн шагов, затем
+`buffer_store_dword` значения 42 по V# `s[0:3]`, `s[0:1]` = адрес из
+`COMPUTE_USER_DATA_0/1`, `s2` = -1, `s3` = `0xf000`) в видеопамяти; IB:
+`CONTEXT_CONTROL`, `COMPUTE_PGM_LO/HI` (адрес >> 8), `RSRC1` `0x002c0040`, `RSRC2`
+`0x10`, `STATIC_THREAD_MGMT_SE0..3` = `0xffffffff`, `TMPRING_SIZE` `0x100`,
+`RESOURCE_LIMITS` 0, `NUM_THREAD` 1x1x1, `DISPATCH_DIRECT` 1x1x1 (initiator `0x45`),
+`EVENT_WRITE` `CS_PARTIAL_FLUSH` (`0x407`), `WRITE_DATA` флаг 99. **Обычные заголовки
+пакетов (без бита compute) сработали с первой попытки:** шейдер записал 42, CP после
+`CS_PARTIAL_FLUSH` записал флаг 99. Значит, SPI/SQ/CU работают, `SQ_CONFIG` после
+golden `0x07180000`, `SPI_RESOURCE_RESERVE_EN_CU_0` `0x00ff7fbf`. Образ 0.8.12 — полная
+цепочка `START/UCODE/RING/GART/CS/SHADER.TXT` (переменные `FOSSAI_AMD_*` = 1).
+**Итог по железу:** запуск карты, CP, кольцо, GART, VMID 1 с пользовательскими
+таблицами страниц, IB, fence, шейдеры — всё работает на RX 590 из нашего ядра.
+**Дальше (программная часть, A4):** разложить `amd.rs` на модули (smc, gfx/ring, gmc/vm,
+cs), менеджеры VMID, памяти и fence; DRM-слой Linux на основе `linux/drm/` из `main`;
+RADV; DXVK.
+
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
 `drmGetDevices2`, ioctl для `vulkaninfo` и для рендера, поля
