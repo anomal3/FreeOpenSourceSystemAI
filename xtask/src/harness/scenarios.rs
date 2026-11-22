@@ -9044,8 +9044,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("pkg: installed debian 12, ", 300_000),
             Step::Await("pkg: installed chromium 150, ", 1_800_000),
             // Значок Chromium на столе появляется сам — пятый, первый после
-            // системных.
-            Step::Await("desktop     : packages changed, 6 icons", 30_000),
+            // четырёх системных.
+            Step::Await("desktop     : packages changed, 5 icons", 30_000),
             Step::Line("run -b /opt/debian/bin/bash /opt/chromium/bin/chromium --enable-logging=stderr --log-level=0 http://10.0.2.2:{site}/page.html"),
             Step::Await("wayland     : client #", 300_000),
             Step::Await("wayland     : #", 300_000),
@@ -9107,7 +9107,7 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(5_000),
             Step::Line("run /bin/pkg remove chromium"),
             Step::Await("pkg: removed chromium", 300_000),
-            Step::Await("desktop     : packages changed, 5 icons", 30_000),
+            Step::Await("desktop     : packages changed, 4 icons", 30_000),
             Step::Line("run /bin/pkg remove debian"),
             Step::Await("pkg: removed debian", 120_000),
             Step::Absent("protocol error on object"),
@@ -10648,8 +10648,8 @@ pub const ALL: &[Scenario] = &[
             Step::AwaitAny("pkg: installed obsos 0.1, ", 300_000),
             Step::AwaitAny("dhcp: lease ", 60_000),
             // Ярлык «Браузер» на столе появляется сам, когда пакет встал
-            // (пятеро системных + он).
-            Step::AwaitAny("desktop     : packages changed, 6 icons", 30_000),
+            // (четверо системных + он).
+            Step::AwaitAny("desktop     : packages changed, 5 icons", 30_000),
             Step::Wait(3_000),
             Step::Shot("obsos-dl-desktop"),
             Step::Line("run /opt/obsos/bin/obsos http://10.0.2.2:{site}/dl/"),
