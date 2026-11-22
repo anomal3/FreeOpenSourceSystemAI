@@ -125,6 +125,8 @@ pub fn adopt() {
     super::appicon::adopt(text, &path);
     // Панель задач и «Пуск» одним набором (20.11, см. `deskcfg`).
     super::deskcfg::adopt(text, &path);
+    // Заставка (22.11, `saver`).
+    super::saver::adopt(text, &path);
     if let Some(height) = sysconf::title_bar(text) {
         if mini_ui::theme::set_title_h(height) {
             crate::kprintln!("  desktop     : title bar {height} px from {path}");

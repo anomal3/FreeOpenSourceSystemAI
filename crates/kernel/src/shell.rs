@@ -612,7 +612,13 @@ fn run(primary: bool) {
 /// пути к одной настройке пишут в один и тот же файл.
 fn power_settings(argument: &str) {
     let argument = argument.trim();
+    // Заставка (22.11): `power saver …`.
+    if let Some(rest) = argument.strip_prefix("saver") {
+        ui::saver::command(rest);
+        return;
+    }
     if argument.is_empty() {
+        sprintln!("  saver     : {}", ui::saver::describe());
         let after = crate::power::screen_off_after();
         if after == 0 {
             sprintln!("  screen off: never");

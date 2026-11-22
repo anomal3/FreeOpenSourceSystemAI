@@ -164,6 +164,30 @@ pub fn flush_output(backend: outputs::Backend, primary: bool, x: i32, y: i32, w:
     }
 }
 
+/// Screen off (22.11, DPMS-like): monitors to standby (`false`) or lit
+/// again (`true`). NVIDIA: DisplayPort sink to D3 and the head/SOR released
+/// (no signal), wake = D0, link training and the head again, a full modeset
+/// of that head if the quick way fails ([`nvidia_disp::set_power`]);
+/// virtio-gpu: scanouts disabled. Firmware frame buffers (GOP, stdvga,
+/// VMSVGA, Intel) cannot - the desktop paints them black. Returns what
+/// happened, for the log.
+pub fn set_power(on: bool) -> alloc::string::String {
+    let mut parts: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let virtio = crate::virtio::gpu::set_power(on);
+    if virtio > 0 {
+        parts.push(alloc::format!("virtio-gpu {virtio} output(s) {}", if on { "on" } else { "off" }));
+    }
+    if nvidia_gsp::running() {
+        if let Some(text) = nvidia_disp::set_power(on) {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        return alloc::string::String::from(if on { "firmware display" } else { "firmware display: black only, no DPMS" });
+    }
+    parts.join("; ")
+}
+
 /// G3: what a page flip of an output to a client buffer answered.
 #[derive(Debug)]
 pub enum FlipError {

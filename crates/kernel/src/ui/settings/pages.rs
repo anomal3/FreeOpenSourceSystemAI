@@ -707,7 +707,8 @@ fn power(pass: &mut Pass, x: i32, y: i32, w: u32) {
         let label = if seconds == 0 { String::from("Никогда") } else { format!("Через {}", screen_off_text(seconds)) };
         y = row(pass, x, y, w, None, &label, "", Ctl::Radio(limit == seconds), Some(Deed::ScreenOff(seconds)));
     }
-    y = pass.note(x, y + ctx.px(4) as i32, w, "Любая клавиша, мышь или касание зажигают экран обратно.");
+    y = pass.note(x, y + ctx.px(4) as i32, w, "Мониторы уходят в режим ожидания; любая клавиша, мышь или касание зажигают их обратно.");
+    y = saver_rows(pass, x, y, w);
     y = pass.group(x, y, w, "Действия");
     if crate::power::can_power_off() {
         y = row(pass, x, y, w, Some(Fi::Power), "Завершение работы", "Счётчики сбрасываются на диск, том помечается чистым", Ctl::Button("Выключить", Weight::Primary), Some(Deed::Shutdown));
@@ -715,7 +716,44 @@ fn power(pass: &mut Pass, x: i32, y: i32, w: u32) {
         y = row(pass, x, y, w, Some(Fi::Power), "Завершение работы", "Эта машина не умеет снять с себя питание", Ctl::Value("Недоступно"), None);
     }
     y = row(pass, x, y, w, Some(Fi::Restart), "Перезагрузка", "Загрузчик снова выберет активный слот", Ctl::Button("Перезагрузить", Weight::Normal), Some(Deed::Restart));
-    pass.note(x, y + ctx.px(4) as i32, w, "Настоящего сна (ACPI S3) здесь нет — машина не засыпает, а перестаёт рисовать.");
+    pass.note(x, y + ctx.px(4) as i32, w, "Настоящего сна (ACPI S3) здесь нет — машина не засыпает, а гасит мониторы и перестаёт рисовать.");
+}
+
+/// «Заставка» на странице «Питание» (22.11, `saver`).
+fn saver_rows(pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
+    use super::super::saver::{self, Deed as Sd, Fit, Kind};
+    let ctx = pass.ctx;
+    let s = saver::settings();
+    let mut y = pass.group(x, y, w, "Заставка");
+    y = row(pass, x, y, w, Some(Fi::Image), "Заставка", "Фото или цвет с часами, пока за машиной никого нет", Ctl::Toggle(s.enabled), Some(Deed::Saver(Sd::Enable(!s.enabled))));
+    if s.enabled {
+        let labels: Vec<String> = saver::AFTER_OPTIONS.iter().map(|&sec| saver::after_text(sec)).collect();
+        let opts: Vec<(&str, Deed, bool)> = saver::AFTER_OPTIONS.iter().zip(&labels).map(|(&sec, label)| (label.as_str(), Deed::Saver(Sd::After(sec)), s.after == sec)).collect();
+        let desc = format!("Без ввода {}; экран гаснет по сроку выше", saver::after_text(s.after));
+        y = seg_row(pass, x, y, w, Fi::Clock, "Появляется через", &desc, &opts);
+        let kinds = [("Фото", Deed::Saver(Sd::Kind(Kind::Photo)), s.kind == Kind::Photo), ("Цвет", Deed::Saver(Sd::Kind(Kind::Color)), s.kind == Kind::Color)];
+        y = seg_row(pass, x, y, w, Fi::Palette, "Фон", "Фото по очереди или ровный цвет", &kinds);
+        if s.kind == Kind::Photo {
+            y = row(pass, x, y, w, Some(Fi::Folder), "Фото", &s.source, Ctl::Button("Сменить", Weight::Normal), Some(Deed::Saver(Sd::NextSource)));
+            let fits: Vec<(&str, Deed, bool)> = Fit::ALL.iter().map(|&fit| (fit.title(), Deed::Saver(Sd::Fit(fit)), s.fit == fit)).collect();
+            y = seg_row(pass, x, y, w, Fi::Monitor, "Размещение", "Как фото ложится на экран", &fits);
+            let every_labels: Vec<String> = saver::EVERY_OPTIONS.iter().map(|&sec| saver::after_text(sec)).collect();
+            let every: Vec<(&str, Deed, bool)> = saver::EVERY_OPTIONS.iter().zip(&every_labels).map(|(&sec, label)| (label.as_str(), Deed::Saver(Sd::Every(sec)), s.every == sec)).collect();
+            y = seg_row(pass, x, y, w, Fi::Refresh, "Сменять фото", "Если в папке их несколько", &every);
+        } else {
+            let colors: Vec<(&str, Deed, bool)> = saver::COLORS.iter().map(|&(name, rgb)| (name, Deed::Saver(Sd::Color(rgb)), s.color == rgb)).collect();
+            y = seg_row(pass, x, y, w, Fi::Palette, "Цвет", "", &colors);
+        }
+        y = row(pass, x, y, w, Some(Fi::Clock), "Часы и дата", "Крупно, медленно плывут по экрану, чтобы ничего не выжигалось", Ctl::Toggle(s.clock), Some(Deed::Saver(Sd::Clock(!s.clock))));
+        y = row(pass, x, y, w, Some(Fi::Activity), "Сведения о системе", "Загрузка процессора и память", Ctl::Toggle(s.info), Some(Deed::Saver(Sd::Info(!s.info))));
+        y = row(pass, x, y, w, Some(Fi::Lock), "Показывать экран блокировки при выходе", "Первое нажатие убирает заставку, дальше — вход", Ctl::Toggle(s.lock), Some(Deed::Saver(Sd::Lock(!s.lock))));
+    }
+    y = row(pass, x, y, w, Some(Fi::Eye), "Просмотр", "Показать заставку сейчас; любое движение её уберёт", Ctl::Button("Просмотр", Weight::Normal), Some(Deed::Saver(Sd::Preview)));
+    let off = crate::power::screen_off_after();
+    if s.enabled && off != 0 && off <= s.after {
+        y = pass.note(x, y + ctx.px(4) as i32, w, "Экран гаснет раньше, чем появится заставка: увеличьте срок гашения.");
+    }
+    y
 }
 
 fn keyboard(pass: &mut Pass, x: i32, y: i32, w: u32) {

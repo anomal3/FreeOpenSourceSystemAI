@@ -226,6 +226,41 @@ pub fn release_scanout(scanout: usize) {
     }
 }
 
+/// Screen off (22.11): `false` - every lit output shows nothing
+/// (`SET_SCANOUT` with resource 0, the virtio way to disable a scanout: the
+/// host window says "Display output is not active"); `true` - the desktop
+/// resource (or the flipped client buffer) back, transferred whole. Returns
+/// how many outputs changed.
+pub fn set_power(on: bool) -> usize {
+    let mut guard = GPU.lock();
+    let Some(gpu) = guard.as_mut() else {
+        return 0;
+    };
+    let mut done = 0;
+    for scanout in 0..MAX_SCANOUTS {
+        let Some(scan) = gpu.scans[scanout] else {
+            continue;
+        };
+        let (w, h) = (scan.screen.width, scan.screen.height);
+        let result = if on {
+            let id = gpu.flips[scanout].map_or(scan.resource, |(resource, _)| resource);
+            gpu.set_scanout(scanout, id, w, h)
+                .and_then(|()| gpu.transfer(id, (0, 0, w, h), w))
+                .and_then(|()| gpu.resource_flush((0, 0, w, h), id))
+        } else {
+            gpu.set_scanout(scanout, 0, 0, 0)
+        };
+        match result {
+            Ok(()) => {
+                done += 1;
+                kprintln!("  virtio-gpu  : output {scanout} scanout {}", if on { "enabled again" } else { "disabled (display off)" });
+            }
+            Err(err) => kprintln!("  virtio-gpu  : output {scanout} scanout {} failed: {err}", if on { "enable" } else { "disable" }),
+        }
+    }
+    done
+}
+
 /// Показать изменившийся прямоугольник выхода `scanout` (свои координаты).
 pub fn flush_scanout(scanout: usize, x: i32, y: i32, w: u32, h: u32) {
     let mut guard = GPU.lock();

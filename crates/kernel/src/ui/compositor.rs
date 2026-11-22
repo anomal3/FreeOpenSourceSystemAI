@@ -330,6 +330,8 @@ pub struct Compositor {
     tray_pop: Option<super::traypop::TrayPop>,
     /// Экран блокировки (72h-4) и его готовая картинка во весь экран.
     lock: Option<(super::lock::Lock, Surface)>,
+    /// Screensaver (22.11, `saver`): over everything, the lock screen too.
+    saver: Option<super::saver::Shown>,
     /// Уведомление (72h-2) и пакеты, о которых стол уже знает.
     toast: Option<super::toast::Toast>,
     /// Заставка запуска программы Windows (21.11, `ui::launch`).
@@ -557,6 +559,7 @@ impl Compositor {
             splash: super::launch::Splash::default(),
             known_packages: None,
             lock: None,
+            saver: None,
             reported_focus: None,
             held_keys: [None; 8],
             captured: None,
@@ -2366,6 +2369,32 @@ impl Compositor {
             _ => {}
         }
         outcome
+    }
+
+    /// Screensaver (22.11, `saver`): show `shown` (`None` - take it away);
+    /// the pointer hides while it is up. Returns the one shown before.
+    pub fn saver_set(&mut self, shown: Option<super::saver::Shown>) -> Option<super::saver::Shown> {
+        let old = core::mem::replace(&mut self.saver, shown);
+        if self.hw_cursor && !self.blanked {
+            let (x, y) = self.pointer.position();
+            crate::display::cursor_visible(self.saver.is_none(), x, y);
+        }
+        self.repaint_all();
+        old
+    }
+
+    pub fn saver_mut(&mut self) -> Option<&mut super::saver::Shown> {
+        self.saver.as_mut()
+    }
+
+    #[must_use]
+    pub const fn saver_showing(&self) -> bool {
+        self.saver.is_some()
+    }
+
+    /// The screensaver changed `rect` (its clock moved).
+    pub fn saver_damage(&mut self, rect: Rect) {
+        self.mark(rect);
     }
 
     /// Убрать уведомление; вернуть, что оно запускало бы.
@@ -5816,6 +5845,11 @@ impl Compositor {
     /// тень окна ложится на всё, что ниже него, и не задевает то, что выше.
     fn compose_band(&self, back: &mut Surface, band: Rect) {
         let dy = -band.y;
+        // The screensaver (22.11) closes everything, the pointer too.
+        if let Some(saver) = self.saver.as_ref() {
+            saver.compose(back, band, dy);
+            return;
+        }
         // Экран блокировки закрывает всё; поверх — только указатель.
         if let Some((_, picture)) = self.lock.as_ref() {
             // Картинка — размером с основной монитор; остальные мониторы на

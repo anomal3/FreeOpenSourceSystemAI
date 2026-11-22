@@ -365,7 +365,7 @@ impl Args<'_> {
 // ---- объекты --------------------------------------------------------------------
 
 /// Глобальные объекты: номер в реестре, интерфейс, версия.
-const GLOBALS: [(u32, &str, u32); 15] = [
+const GLOBALS: [(u32, &str, u32); 16] = [
     (1, "wl_compositor", 4),
     (2, "wl_subcompositor", 1),
     (3, "wl_shm", 1),
@@ -411,6 +411,9 @@ const GLOBALS: [(u32, &str, u32); 15] = [
     // (`wl_output.scale` 1), so the scale announced is 1.0 (120/120).
     (14, "xdg_activation_v1", 1),
     (15, "wp_fractional_scale_manager_v1", 1),
+    // 22.11: video players and games keep the screensaver and screen off
+    // away while an inhibitor lives (`power::inhibit`).
+    (16, "zwp_idle_inhibit_manager_v1", 1),
 ];
 
 /// `zwp_pointer_constraints_v1.lifetime`: `persistent` - the constraint
@@ -871,6 +874,9 @@ enum Obj {
     FractionalManager,
     /// `wp_fractional_scale_v1` of this surface.
     Fractional(u32),
+    IdleInhibitManager,
+    /// `zwp_idle_inhibitor_v1` (22.11).
+    IdleInhibitor,
 }
 
 impl Obj {
@@ -918,6 +924,8 @@ impl Obj {
             Self::ActivationToken => "xdg_activation_token_v1",
             Self::FractionalManager => "wp_fractional_scale_manager_v1",
             Self::Fractional(_) => "wp_fractional_scale_v1",
+            Self::IdleInhibitManager => "zwp_idle_inhibit_manager_v1",
+            Self::IdleInhibitor => "zwp_idle_inhibitor_v1",
         }
     }
 }
@@ -1001,6 +1009,15 @@ struct Client {
     /// G3: buffers replaced on screen that a display may still scan out (a
     /// page flip not on screen yet): `wl_buffer.release` waits for it.
     scan_held: Vec<(u32, Buffer)>,
+}
+
+/// A client gone with idle inhibitors alive: they end with it (22.11).
+impl Drop for Client {
+    fn drop(&mut self) {
+        for _ in self.objects.values().filter(|obj| matches!(obj, Obj::IdleInhibitor)) {
+            crate::power::inhibit(false);
+        }
+    }
 }
 
 impl Client {
@@ -1396,6 +1413,24 @@ impl Client {
             Obj::Fractional(_) => {
                 if opcode == 0 {
                     self.delete(id);
+                }
+            }
+            // 22.11: `destroy`, `create_inhibitor(id, surface)`; the
+            // inhibitor's only request is `destroy`.
+            Obj::IdleInhibitManager => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let (new, _surface) = (args.u32()?, args.u32()?);
+                    self.objects.insert(new, Obj::IdleInhibitor);
+                    crate::power::inhibit(true);
+                    kprintln!("  wayland     : client #{} inhibits the screensaver", self.pid);
+                }
+                _ => {}
+            },
+            Obj::IdleInhibitor => {
+                if opcode == 0 {
+                    self.delete(id);
+                    crate::power::inhibit(false);
                 }
             }
             Obj::Callback | Obj::Region | Obj::Output | Obj::Keyboard => {
@@ -1853,6 +1888,7 @@ impl Client {
             13 => Obj::ConstraintsManager,
             14 => Obj::Activation,
             15 => Obj::FractionalManager,
+            16 => Obj::IdleInhibitManager,
             _ => Obj::Output,
         };
         self.objects.insert(new, object);

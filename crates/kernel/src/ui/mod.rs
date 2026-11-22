@@ -54,6 +54,7 @@ pub mod panel;
 pub mod powersheet;
 pub mod pointer;
 pub mod prefs;
+pub mod saver;
 pub mod settings;
 pub mod flight;
 pub mod gesture;
@@ -2472,6 +2473,15 @@ const INPUT_TRIES: u32 = 250;
 const INPUT_PAUSE_MS: u64 = 2;
 
 fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
+    // The key that ends the screensaver or wakes the dark screen (22.11) is
+    // not delivered, nor its release.
+    let saver_up = desktop.saver_showing();
+    if saver::swallow_key(desktop.blanked() || saver_up, event) {
+        if saver_up {
+            saver::end_on(desktop);
+        }
+        return None;
+    }
     // Поле поиска «Пуска» телефона забирает клавиши раньше всех: пока оно в
     // фокусе, набранное — это запрос, а не команда оболочке под листом.
     if desktop.start_focused() {
@@ -3024,7 +3034,13 @@ pub fn swallow_wake_touch() {
 }
 
 fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
-    if desktop.blanked() {
+    // The screensaver (22.11) ends on the first motion or click, which goes
+    // no further.
+    let saver_up = desktop.saver_showing();
+    if saver_up {
+        saver::end_on(desktop);
+    }
+    if desktop.blanked() || saver_up {
         WAKE_TOUCH.store(true, core::sync::atomic::Ordering::Relaxed);
     }
     if WAKE_TOUCH.load(core::sync::atomic::Ordering::Relaxed) {

@@ -834,11 +834,14 @@ fn set_head(rm: &mut Rm, log: &mut Log, disp: &mut Disp, head: u32, id: u32, lin
     load_lut(disp.vram, ilut(head), true);
     disp.core.push(0x2280 + hb, &[0x0004_0509, u32::MAX, H_VRAM, (olut(head) >> 8) as u32]);
     let pitch = (mode.width * 4).div_ceil(64) * 64;
-    // Картинка — тёмно-синяя до первого кадра стола.
-    for y in 0..mode.height {
-        let row = fb(head) + u64::from(y) * u64::from(pitch);
-        for x in (0..mode.width).step_by(1) {
-            disp.vram.w32(row + u64::from(x) * 4, 0x0010_1828);
+    // Картинка — тёмно-синяя до первого кадра стола. Wake from screen off
+    // (22.11) keeps it: the desktop repaints it, a blue flash would flicker.
+    if !KEEP_FB.load(Ordering::Relaxed) {
+        for y in 0..mode.height {
+            let row = fb(head) + u64::from(y) * u64::from(pitch);
+            for x in (0..mode.width).step_by(1) {
+                disp.vram.w32(row + u64::from(x) * 4, 0x0010_1828);
+            }
         }
     }
     let window = disp.windows[w as usize].as_mut().ok_or("window channel gone")?;
@@ -942,6 +945,136 @@ fn watermark(mode: edid::Mode, lanes: u32, rate_khz: u32, ef: bool, increased: b
     };
     let v = if surface < 40 { 0 } else { ((surface - 40) * min_rate / pclk) as i64 - 1 - vtail };
     Some((wm as u32, h.max(0) as u32, v.max(0) as u32))
+}
+
+// --- screen off (22.11, DPMS-like) ----------------------------------------------
+
+/// Heads put to standby by [`set_power`]: (head, output, mode) to light again.
+static ASLEEP: crate::sync::SpinLock<Vec<(u32, u32, edid::Mode)>> = crate::sync::SpinLock::new(Vec::new());
+/// [`set_head`] keeps the frame buffer (wake: no dark-blue flash).
+static KEEP_FB: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Monitors off (`false`) or on again (`true`), the way nouveau disables and
+/// enables a DP output (`nv50_sor_atomic_disable` / `_enable`):
+///
+/// * off - DPCD `SET_POWER` (0x600) = D3 over AUX, so the sink powers its
+///   receiver down instead of hunting for a lost signal; then the head is
+///   taken off its SOR (core `HEAD_SET_CONTROL_OUTPUT_RESOURCE` and
+///   `SOR_SET_CONTROL` owner 0, UPDATE) and the link released (`DP_CTRL`) -
+///   exactly step C1 of a modeset. The monitor sees no signal and sleeps
+///   (backlight off), the frame buffer stays in VRAM.
+/// * on - D0 (retried: a sleeping sink may NAK the first AUX transfers), then
+///   [`set_head`] of the saved mode: SOR, link training, raster, window -
+///   without repainting the frame buffer. If that fails - the same with C1
+///   first (full modeset of that head).
+///
+/// `None` - the display is not ours (GSP-RM not running or not set up).
+pub fn set_power(on: bool) -> Option<String> {
+    let mut session = SESSION.lock();
+    let session = session.as_mut()?;
+    let bar = session.bar;
+    let mut rm = Rm { queues: &mut session.queues, bar, log: Vec::new() };
+    let mut log = Log::new();
+    let mut guard = DISP.lock();
+    let disp = guard.as_mut()?;
+    let text = if on { wake(&mut rm, &mut log, disp) } else { sleep(&mut rm, &mut log, disp) };
+    drop(guard);
+    log.extend(core::mem::take(&mut rm.log));
+    for line in &log {
+        crate::kprintln!("  nvidia-disp : {line}");
+    }
+    Some(text)
+}
+
+fn sleep(rm: &mut Rm, log: &mut Log, disp: &mut Disp) -> String {
+    if !ASLEEP.lock().is_empty() {
+        return String::from("nvidia already off");
+    }
+    let mut asleep = Vec::new();
+    let heads = disp.heads.clone();
+    for &(head, id, mode) in &heads {
+        match sleep_head(rm, disp, head, id) {
+            Ok(or) => {
+                log.push(format!("power: head {head} output {id:#x} off (DP D3, SOR {or} released)"));
+                asleep.push((head, id, mode));
+            }
+            Err(why) => log.push(format!("power: head {head} output {id:#x} stays lit: {why}")),
+        }
+    }
+    let text = format!("nvidia {} of {} monitor(s) in standby", asleep.len(), heads.len());
+    *ASLEEP.lock() = asleep;
+    text
+}
+
+fn sleep_head(rm: &mut Rm, disp: &mut Disp, head: u32, id: u32) -> Res<u32> {
+    let bar = rm.bar;
+    let hb = head * 0x400;
+    // MAX_LANE_COUNT: bit 7 - enhanced framing (the link release repeats it).
+    let ef = aux(rm, id, 9, 0x0002, &[], 1)?.first().is_some_and(|b| b & 0x80 != 0);
+    let or = old_sor(rm, id)?;
+    let power = aux(rm, id, 9, 0x600, &[], 1)?;
+    let _ = aux(rm, id, 8, 0x600, &[(power[0] & !7) | 2], 1);
+    disp.core.push(0x2020 + hb, &[0]);
+    disp.core.push(0x0300 + or * 0x20, &[0]);
+    core_update(disp, bar, 0)?;
+    let mut p = u32s(&[0, id, 0x1 | 0x2 | (1 << 13) | if ef { 0x80 } else { 0 }, 0x14 << 8, 0, 0, 0]);
+    p.resize(0x1c, 0);
+    let _ = rm.disp(0x0073_1343, &p);
+    disp.used_sors &= !(1 << or);
+    Ok(or)
+}
+
+fn wake(rm: &mut Rm, log: &mut Log, disp: &mut Disp) -> String {
+    let asleep = core::mem::take(&mut *ASLEEP.lock());
+    if asleep.is_empty() {
+        return String::from("nvidia: nothing was off");
+    }
+    let mut lit = 0;
+    for &(head, id, mode) in &asleep {
+        let mut answered = false;
+        for _ in 0..5 {
+            if let Ok(power) = aux(rm, id, 9, 0x600, &[], 1) {
+                if aux(rm, id, 8, 0x600, &[(power[0] & !7) | 1], 1).is_ok() {
+                    answered = true;
+                    break;
+                }
+            }
+            crate::sched::sleep_ms(10);
+        }
+        // DP: the sink may take up to 1 ms to leave D3 (drm_dp_link_power_up).
+        crate::sched::sleep_ms(2);
+        let link = link_of(rm, id);
+        KEEP_FB.store(true, Ordering::Relaxed);
+        let result = match set_head(rm, log, disp, head, id, link, mode, false) {
+            Ok(()) => Ok(()),
+            Err(why) => {
+                log.push(format!("power: head {head} quick wake failed ({why}), full modeset of the head"));
+                set_head(rm, log, disp, head, id, link, mode, true)
+            }
+        };
+        KEEP_FB.store(false, Ordering::Relaxed);
+        match result {
+            Ok(()) => {
+                lit += 1;
+                log.push(format!(
+                    "power: head {head} output {id:#x} on again{}",
+                    if answered { "" } else { " (the sink did not answer D0 over AUX)" }
+                ));
+            }
+            Err(why) => log.push(format!("power: head {head} output {id:#x} did not come back: {why}")),
+        }
+    }
+    format!("nvidia {lit} of {} monitor(s) back", asleep.len())
+}
+
+/// Sublink of a DP output (`OR_GET_INFO` protocol: 9 - DP B).
+fn link_of(rm: &mut Rm, id: u32) -> u32 {
+    let mut info = u32s(&[0, id]);
+    info.resize(0x38, 0);
+    match rm.disp(0x0073_028b, &info).ok().and_then(|r| le32(&r, 16).ok()) {
+        Some(9) => 2,
+        _ => 1,
+    }
 }
 
 /// Для журнала «Параметров».

@@ -379,6 +379,8 @@ enum Deed {
     Background(super::wallpaper::WallDeed),
     TitleBar(u32),
     ScreenOff(u32),
+    /// Заставка (22.11, `saver`).
+    Saver(super::saver::Deed),
     Panel(PanelPref, bool),
     /// Панель задач и Dock (20.11, `deskcfg`).
     Taskbar(super::deskcfg::TaskbarDeed),
@@ -1270,6 +1272,12 @@ impl SettingsView {
                         }
                     }
                     Err(err) => Report::bad(format!("срок применён, но не запомнен: {err}")),
+                });
+            }
+            Deed::Saver(deed) => {
+                self.report = Some(match super::saver::apply(deed) {
+                    Ok(said) => Report::ok(said),
+                    Err(said) => Report::bad(said),
                 });
             }
             Deed::Panel(pref, on) => {

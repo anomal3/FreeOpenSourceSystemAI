@@ -272,17 +272,62 @@ pub fn power_button() {
     if SCREEN_OFF.load(Ordering::Relaxed) {
         SCREEN_OFF.store(false, Ordering::Relaxed);
         note_input();
+        crate::display::set_power(true);
         crate::ui::set_screen_off(false);
         crate::kprintln!("  power       : screen on by the power button");
         return;
+    }
+    if crate::ui::saver::is_up() {
+        crate::ui::saver::stop();
     }
     crate::ui::lock_now();
     if crate::ui::set_screen_off(true) {
         let last = LAST_INPUT_MS.load(Ordering::Relaxed);
         SCREEN_OFF.store(true, Ordering::Relaxed);
         BLANKED_AT.store(last, Ordering::Relaxed);
+        crate::display::set_power(false);
         crate::kprintln!("  power       : screen off and locked by the power button");
     }
+}
+
+// --- Заставка и «не гасить» (22.11) ---------------------------------------
+
+/// Значение [`LAST_INPUT_MS`] на момент появления заставки (`ui::saver`):
+/// сменилось — ввод был.
+static SAVER_AT: AtomicU64 = AtomicU64::new(0);
+/// Показ заставки по кнопке «Просмотр»: когда (мс с загрузки), 0 — не просили.
+static PREVIEW_AT: AtomicU64 = AtomicU64::new(0);
+/// Живые `zwp_idle_inhibitor_v1` клиентов Wayland (видео, игры).
+static INHIBITORS: AtomicU32 = AtomicU32::new(0);
+/// О том, что заставку и гашение держат, в этот простой уже сказано.
+static HELD_TOLD: AtomicBool = AtomicBool::new(false);
+
+/// Показать заставку через мгновение («Просмотр»): щелчок, который её
+/// попросил, успеет отпуститься и не уберёт её сразу.
+pub fn request_saver_preview() {
+    PREVIEW_AT.store(crate::time::uptime_ms() + 800, Ordering::Relaxed);
+}
+
+/// Клиент Wayland завёл (`true`) или убрал ингибитор простоя.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn inhibit(on: bool) {
+    if on {
+        INHIBITORS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        let mut n = INHIBITORS.load(Ordering::Relaxed);
+        while n > 0 {
+            match INHIBITORS.compare_exchange_weak(n, n - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
+    }
+}
+
+/// Сколько ингибиторов простоя живо.
+#[must_use]
+pub fn inhibitors() -> u32 {
+    INHIBITORS.load(Ordering::Relaxed)
 }
 
 /// Через сколько секунд бездействия гаснет экран; ноль — никогда.
@@ -328,21 +373,74 @@ pub fn idle_tick() -> bool {
         if last == BLANKED_AT.load(Ordering::Relaxed) {
             return false;
         }
-        // Ввод был — значит человек вернулся.
+        // Ввод был — значит человек вернулся. Мониторы — раньше кадра (22.11):
+        // зажжённый монитор показывает чёрное, пока стол не соберёт кадр.
         let slept = last.saturating_sub(BLANKED_AT.load(Ordering::Relaxed)) / 1000;
         SCREEN_OFF.store(false, Ordering::Relaxed);
+        let started = crate::time::uptime_ms();
+        let lit = crate::display::set_power(true);
         crate::ui::swallow_wake_touch();
         crate::ui::set_screen_off(false);
-        crate::kprintln!("  power       : awake, the screen was off for {slept} s");
+        crate::kprintln!(
+            "  power       : awake, the screen was off for {slept} s ({lit}, {} ms)",
+            crate::time::uptime_ms().saturating_sub(started)
+        );
         return true;
     }
 
+    let now = crate::time::uptime_ms();
+    // Заставка (22.11): любой ввод её убирает (клавиши и мышь стола — сразу,
+    // сами; здесь — серийная линия и остальное); иначе — её виток.
+    let saver_up = crate::ui::saver::is_up();
+    if saver_up {
+        if last != SAVER_AT.load(Ordering::Relaxed) {
+            crate::ui::saver::stop();
+            return true;
+        }
+        crate::ui::saver::tick();
+    }
+    let preview = PREVIEW_AT.load(Ordering::Relaxed);
+    if preview != 0 && now >= preview {
+        PREVIEW_AT.store(0, Ordering::Relaxed);
+        if !saver_up {
+            SAVER_AT.store(LAST_INPUT_MS.load(Ordering::Relaxed), Ordering::Relaxed);
+            crate::ui::saver::start(true);
+        }
+        return true;
+    }
+
+    let idle_ms = now.saturating_sub(last);
+    if idle_ms < 1000 {
+        HELD_TOLD.store(false, Ordering::Relaxed);
+    }
     let limit = SCREEN_OFF_SECONDS.load(Ordering::Relaxed);
-    if limit == 0 {
+    let off_due = limit != 0 && idle_ms >= u64::from(limit) * 1000;
+    let saver_after = crate::ui::saver::after();
+    let saver_due = !off_due && !saver_up && saver_after != 0 && idle_ms >= u64::from(saver_after) * 1000;
+    if !off_due && !saver_due {
         return false;
     }
-    let idle_ms = crate::time::uptime_ms().saturating_sub(last);
-    if idle_ms < u64::from(limit) * 1000 {
+    // Игра или видео во весь экран, ингибитор Wayland — не мешать (22.11).
+    // Заставку, показанную по «Просмотру», это не касается.
+    if !saver_up {
+        match crate::ui::saver::inhibited() {
+            None => return false,
+            Some(Some(why)) => {
+                if !HELD_TOLD.swap(true, Ordering::Relaxed) {
+                    crate::kprintln!("  power       : screensaver and screen off held back: {why}");
+                }
+                return false;
+            }
+            Some(None) => {}
+        }
+    }
+    if saver_due {
+        SAVER_AT.store(last, Ordering::Relaxed);
+        return crate::ui::saver::start(false);
+    }
+    // Срок отключения: заставка уходит (с экраном блокировки, если выбран),
+    // мониторы гаснут.
+    if saver_up && !crate::ui::saver::stop() {
         return false;
     }
     // Гасить нечего, если рисовать некуда: на машине в серийной консоли стол не
@@ -352,6 +450,10 @@ pub fn idle_tick() -> bool {
     }
     SCREEN_OFF.store(true, Ordering::Relaxed);
     BLANKED_AT.store(last, Ordering::Relaxed);
-    crate::kprintln!("  power       : screen off after {limit} s without input");
+    // Настоящее отключение (22.11): DisplayPort-мониторы NVIDIA — в D3 и без
+    // сигнала, у virtio-gpu — выходы без картинки; у экрана прошивки — только
+    // чёрное, как раньше.
+    let dark = crate::display::set_power(false);
+    crate::kprintln!("  power       : screen off after {limit} s without input ({dark})");
     true
 }
