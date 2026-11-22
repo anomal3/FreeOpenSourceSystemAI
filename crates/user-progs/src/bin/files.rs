@@ -289,6 +289,9 @@ struct Preview {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuItem {
     Open,
+    /// «Открыть с помощью» (22.11): программы для файла, и программы Windows
+    /// из префиксов Wine (Notepad++ для `.txt`), и «Выбрать другую…».
+    OpenWith,
     /// Папку — в новой вкладке (20.11); средняя кнопка делает то же.
     OpenTab,
     /// Папку — в новом окне.
@@ -312,8 +315,9 @@ enum MenuItem {
 
 impl MenuItem {
     /// Пункты на записи каталога.
-    const ON_ENTRY: [MenuItem; 5] = [
+    const ON_ENTRY: [MenuItem; 6] = [
         MenuItem::Open,
+        MenuItem::OpenWith,
         MenuItem::Rename,
         MenuItem::Delete,
         MenuItem::CopyPath,
@@ -347,6 +351,7 @@ impl MenuItem {
     fn title(self) -> &'static str {
         match self {
             MenuItem::Open => "Открыть",
+            MenuItem::OpenWith => "Открыть с помощью…",
             MenuItem::OpenTab => "Открыть в новой вкладке",
             MenuItem::OpenWindow => "Открыть в новом окне",
             MenuItem::Rename => "Переименовать",
@@ -365,7 +370,7 @@ impl MenuItem {
     fn icon(self) -> Option<Icon> {
         match self {
             MenuItem::Open => Some(Icon::ChevronRight),
-            MenuItem::OpenTab | MenuItem::OpenWindow => None,
+            MenuItem::OpenTab | MenuItem::OpenWindow | MenuItem::OpenWith => None,
             MenuItem::Rename | MenuItem::CopyPath => None,
             MenuItem::Delete => Some(Icon::Close),
             MenuItem::Properties => Some(Icon::Info),
@@ -382,6 +387,7 @@ impl MenuItem {
     const fn group(self) -> u8 {
         match self {
             MenuItem::Open
+            | MenuItem::OpenWith
             | MenuItem::OpenTab
             | MenuItem::OpenWindow
             | MenuItem::Rename
@@ -416,7 +422,186 @@ enum MenuMode {
     /// Спрашивает, удалять ли, — вопросом посреди окна (`kit::draw_ask`,
     /// 21.11); число — кнопка под Enter: 0 — «Удалить», 1 — «Отмена».
     Confirm(usize),
+    /// «Открыть с помощью» (22.11): все программы для файла (`SYS_OPEN_WITH`)
+    /// и выбранная строка; карточка показывает подходящие и последней строкой
+    /// «Выбрать другую программу…».
+    OpenWith(Vec<Prog>, usize),
+    /// «Выбрать другую программу…» — окно посреди «Файлов».
+    Choose(Chooser),
 }
+
+/// Программа из «Открыть с помощью» (22.11).
+struct Prog {
+    caption: String,
+    /// Командная строка без файла (файл допишет [`with_line`]).
+    command: String,
+    icon: Option<mini_ui::image::Image>,
+    /// `d` — выбрана человеком, `f` — подходит к типу, `o` — прочие.
+    mark: u8,
+}
+
+impl Prog {
+    fn fits(&self) -> bool {
+        self.mark == b'd' || self.mark == b'f'
+    }
+
+    fn windows(&self) -> bool {
+        self.command.contains("fossai-proton")
+    }
+}
+
+/// Окно «Выбрать другую программу…».
+struct Chooser {
+    progs: Vec<Prog>,
+    selected: usize,
+    /// Первая показанная строка (список длиннее окна).
+    first: usize,
+    /// «Всегда использовать эту программу для файлов .ext».
+    always: bool,
+}
+
+/// Программы для файла `path` — у ядра (`SYS_OPEN_WITH`), со значками.
+fn load_progs(path: &str) -> Vec<Prog> {
+    let text = user_progs::open_with_list(path);
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let mark = parts.next()?.bytes().next()?;
+            let caption = String::from(parts.next()?);
+            let command = String::from(parts.next()?);
+            let icon = user_progs::open_with_icon(parts.next().unwrap_or("")).and_then(|bytes| mini_ui::image::Image::parse(&bytes));
+            (!command.is_empty()).then_some(Prog { caption, command, icon, mark })
+        })
+        .collect()
+}
+
+/// Строка запуска `command` с файлом `path`: `fossai-proton` получает путь с
+/// `%20` вместо пробела (ядро делит строку по пробелам).
+fn with_line(command: &str, path: &str) -> String {
+    if command.contains("fossai-proton") {
+        let mut encoded = String::with_capacity(path.len());
+        for ch in path.chars() {
+            match ch {
+                ' ' => encoded.push_str("%20"),
+                '%' => encoded.push_str("%25"),
+                _ => encoded.push(ch),
+            }
+        }
+        format!("{command} {encoded}")
+    } else {
+        format!("{command} {path}")
+    }
+}
+
+/// Строк в карточке «Открыть с помощью»: подходящие и «Выбрать другую…».
+fn openwith_rows(progs: &[Prog]) -> usize {
+    progs.iter().filter(|prog| prog.fits()).count() + 1
+}
+
+/// Высота строки карточки и окна выбора.
+const PROG_ROW_H: u32 = 34;
+const CHOOSER_ROW_H: u32 = 44;
+const CHOOSER_ROWS: usize = 7;
+
+/// Раскладка окна выбора программы: карточка, строки, флажок, кнопки.
+struct ChooserPlan {
+    card: Rect,
+    rows: Vec<Rect>,
+    check: Rect,
+    ok: Rect,
+    cancel: Rect,
+}
+
+fn chooser_plan(ctx: Ctx, area: Rect, count: usize) -> ChooserPlan {
+    let pad = ctx.px(20);
+    let w = ctx.px(520).min(area.w.saturating_sub(ctx.px(24)));
+    let shown = count.min(CHOOSER_ROWS).max(1) as u32;
+    let head = ctx.px(58);
+    let h = pad + head + shown * ctx.px(CHOOSER_ROW_H + 2) + ctx.px(12) + ctx.px(28) + ctx.px(20) + ctx.px(32) + pad;
+    let h = h.min(area.h.saturating_sub(ctx.px(16)));
+    let card = Rect::new(area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 2, w, h);
+    let x = card.x + pad as i32;
+    let inner_w = w.saturating_sub(pad * 2);
+    let mut y = card.y + (pad + head) as i32;
+    let mut rows = Vec::new();
+    for _ in 0..shown {
+        rows.push(Rect::new(x, y, inner_w, ctx.px(CHOOSER_ROW_H)));
+        y += ctx.px(CHOOSER_ROW_H + 2) as i32;
+    }
+    y += ctx.px(12) as i32;
+    let check = Rect::new(x, y, inner_w, ctx.px(28));
+    let face = ctx.face(Role::Label);
+    let bw = |label: &str| (face.width(label) + ctx.px(36)).max(ctx.px(104));
+    let by = card.bottom() - (pad + ctx.px(32)) as i32;
+    let cancel = Rect::new(card.right() - (pad + bw("Отмена")) as i32, by, bw("Отмена"), ctx.px(32));
+    let ok = Rect::new(cancel.x - (ctx.px(8) + bw("Открыть")) as i32, by, bw("Открыть"), ctx.px(32));
+    ChooserPlan { card, rows, check, ok, cancel }
+}
+
+/// Последняя строка карточки «Открыть с помощью».
+const OTHER_PROGRAM: &str = "Выбрать другую программу…";
+
+impl Chooser {
+    /// Держать выбранную строку в окне.
+    fn follow(&mut self) {
+        if self.selected < self.first {
+            self.first = self.selected;
+        } else if self.selected >= self.first + CHOOSER_ROWS {
+            self.first = self.selected + 1 - CHOOSER_ROWS;
+        }
+    }
+}
+
+/// Строка `row` карточки «Открыть с помощью» (`fits` подходящих; строка
+/// `fits` — «Выбрать другую…», за чертой).
+fn openwith_row_rect(ctx: Ctx, card: Rect, row: usize, fits: usize) -> Rect {
+    let pad = ctx.px(6);
+    let mut y = card.y + pad as i32 + (row as u32 * ctx.px(PROG_ROW_H)) as i32;
+    if row == fits && fits > 0 {
+        y += ctx.px(9) as i32;
+    }
+    Rect::new(card.x + pad as i32, y, card.w.saturating_sub(pad * 2), ctx.px(PROG_ROW_H))
+}
+
+/// Карточка «Открыть с помощью»: подходящие программы со значками и
+/// «Выбрать другую программу…».
+fn draw_openwith(ctx: Ctx, s: &mut Surface, card: Rect, progs: &[Prog], selected: usize) {
+    let inner = kit::card(ctx, s, card);
+    let p = inner.palette;
+    let fits: Vec<&Prog> = progs.iter().filter(|prog| prog.fits()).collect();
+    for row in 0..=fits.len() {
+        let rect = openwith_row_rect(ctx, card, row, fits.len());
+        if row == fits.len() && row > 0 {
+            paint::separator(inner, s, card.x + ctx.px(12) as i32, rect.y - ctx.px(5) as i32, card.w.saturating_sub(ctx.px(24)));
+        }
+        let on = row == selected;
+        paint::row(inner, s, rect, if on { RowState::Selected } else { RowState::Idle });
+        let side = ctx.px(20);
+        let icon = Rect::new(rect.x + ctx.px(10) as i32, rect.y + (rect.h as i32 - side as i32) / 2, side, side);
+        let tx = icon.right() + ctx.px(10) as i32;
+        let tw = (rect.right() - tx - ctx.px(8) as i32).max(0) as u32;
+        let ink = if on { p.ink } else { p.ink2 };
+        match fits.get(row) {
+            Some(prog) => {
+                draw_prog_icon(inner, s, icon, prog);
+                let label = if prog.mark == b'd' { format!("{} (по умолчанию)", prog.caption) } else { prog.caption.clone() };
+                paint::text_clipped(inner, s, Role::Body, tx, paint::baseline(inner, Role::Body, rect), tw, &label, ink);
+            }
+            None => {
+                paint::text_clipped(inner, s, Role::Body, tx, paint::baseline(inner, Role::Body, rect), tw, OTHER_PROGRAM, ink);
+            }
+        }
+    }
+}
+
+/// Значок программы в квадрат `rect`: её картинка или общий знак.
+fn draw_prog_icon(ctx: Ctx, s: &mut Surface, rect: Rect, prog: &Prog) {
+    match prog.icon.as_ref() {
+        Some(image) => image.draw(s, rect),
+        None => paint::icon_tile(ctx, s, rect, if prog.windows() { Icon::Package } else { Icon::File }, Tone::Accent, false),
+    }
+}
+
 
 /// Вопрос об удалении словами — для `kit::Ask` (21.11).
 struct Question {
@@ -1650,7 +1835,7 @@ impl Files {
         }
         // Выбор человека («Всегда открывать этой программой») — первым.
         if let Some(command) = chosen_program(&name) {
-            let line = format!("{command} {target}");
+            let line = with_line(&command, &target);
             let id = spawn(&line);
             if id >= 0 {
                 println(&format!("files: started '{line}' as #{id}"));
@@ -1789,6 +1974,59 @@ impl Files {
                 }
                 _ => false,
             },
+            MenuMode::OpenWith(progs, selected) => {
+                let rows = openwith_rows(progs);
+                match code {
+                    WIN_KEY_UP => {
+                        *selected = selected.saturating_sub(1);
+                        true
+                    }
+                    WIN_KEY_DOWN => {
+                        if *selected + 1 < rows {
+                            *selected += 1;
+                        }
+                        true
+                    }
+                    ENTER => {
+                        let row = *selected;
+                        self.pick_open_with(row);
+                        true
+                    }
+                    ESCAPE | WIN_KEY_MENU | MENU => {
+                        self.close_menu();
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            // Окно выбора — модальное: стрелки, пробел (флажок), Enter, Esc.
+            MenuMode::Choose(chooser) => match code {
+                WIN_KEY_UP => {
+                    chooser.selected = chooser.selected.saturating_sub(1);
+                    chooser.follow();
+                    true
+                }
+                WIN_KEY_DOWN => {
+                    if chooser.selected + 1 < chooser.progs.len() {
+                        chooser.selected += 1;
+                    }
+                    chooser.follow();
+                    true
+                }
+                0x20 => {
+                    chooser.always = !chooser.always;
+                    true
+                }
+                ENTER => {
+                    self.finish_choose();
+                    true
+                }
+                ESCAPE => {
+                    self.close_menu();
+                    true
+                }
+                _ => true,
+            },
             // Как у окон-вопросов ядра: Enter — выбранная кнопка, Tab и
             // стрелки переводят выбор, Esc — отмена; `y`/`n` остались.
             MenuMode::Confirm(focus) => match code {
@@ -1823,6 +2061,28 @@ impl Files {
                 if let Some(index) = target {
                     self.selected = index;
                     self.open_selected();
+                }
+            }
+            MenuItem::OpenWith => {
+                let path = target.and_then(|index| self.rows.get(index)).filter(|row| !row.directory && !row.is_volume()).map(|row| join(&self.path, &row.name));
+                let Some(path) = path else {
+                    self.close_menu();
+                    return;
+                };
+                let progs = load_progs(&path);
+                println(&format!(
+                    "files: open with for '{path}': {} program(s), {} fit: {}",
+                    progs.len(),
+                    progs.iter().filter(|prog| prog.fits()).count(),
+                    progs.iter().filter(|prog| prog.fits()).map(|prog| prog.caption.as_str()).collect::<Vec<_>>().join(", ")
+                ));
+                if let Some(menu) = self.menu.as_mut() {
+                    // Ничего не подходит — сразу окно выбора.
+                    menu.mode = if progs.iter().any(Prog::fits) {
+                        MenuMode::OpenWith(progs, 0)
+                    } else {
+                        MenuMode::Choose(Chooser { progs, selected: 0, first: 0, always: false })
+                    };
                 }
             }
             MenuItem::OpenTab | MenuItem::OpenWindow => {
@@ -1893,6 +2153,71 @@ impl Files {
                     menu.mode = MenuMode::Confirm(0);
                 }
             }
+        }
+    }
+
+    /// Файл, для которого открыто меню: путь и имя.
+    fn menu_target_file(&self) -> Option<(String, String)> {
+        let index = self.menu.as_ref()?.target?;
+        let row = self.rows.get(index)?;
+        (!row.directory && !row.is_volume()).then(|| (join(&self.path, &row.name), row.name.clone()))
+    }
+
+    /// Строка `row` карточки «Открыть с помощью»: программа или (последняя)
+    /// «Выбрать другую программу…».
+    fn pick_open_with(&mut self, row: usize) {
+        let Some(menu) = self.menu.as_mut() else { return };
+        let MenuMode::OpenWith(progs, _) = &mut menu.mode else { return };
+        let fits: Vec<usize> = (0..progs.len()).filter(|index| progs[*index].fits()).collect();
+        match fits.get(row) {
+            Some(&index) => {
+                let (command, caption) = (progs[index].command.clone(), progs[index].caption.clone());
+                self.launch_with(&command, &caption);
+            }
+            None => {
+                let progs = core::mem::take(progs);
+                println(&format!("files: choose another program ({} listed)", progs.len()));
+                menu.mode = MenuMode::Choose(Chooser { progs, selected: 0, first: 0, always: false });
+            }
+        }
+    }
+
+    /// «Открыть» в окне выбора: запомнить, если отмечено «всегда», и открыть.
+    fn finish_choose(&mut self) {
+        let Some(MenuMode::Choose(chooser)) = self.menu.as_ref().map(|menu| &menu.mode) else { return };
+        let Some(prog) = chooser.progs.get(chooser.selected) else {
+            self.close_menu();
+            return;
+        };
+        let (command, caption, always) = (prog.command.clone(), prog.caption.clone(), chooser.always);
+        if always {
+            if let Some((_, name)) = self.menu_target_file() {
+                let ext = sysconf::filetypes::extension(&name);
+                if !ext.is_empty() {
+                    if user_progs::open_with_remember(&ext, &command) {
+                        println(&format!("files: .{ext} files open with '{command}'"));
+                    } else {
+                        println(&format!("files: cannot remember the program for .{ext}"));
+                    }
+                }
+            }
+        }
+        self.launch_with(&command, &caption);
+    }
+
+    /// Открыть файл меню программой `command` (22.11).
+    fn launch_with(&mut self, command: &str, caption: &str) {
+        let target = self.menu_target_file();
+        self.close_menu();
+        let Some((path, name)) = target else { return };
+        let line = with_line(command, &path);
+        let id = spawn(&line);
+        if id < 0 {
+            println(&format!("files: cannot start '{line}': error {id}"));
+            self.note = Some(format!("Не удалось открыть «{name}» программой «{caption}»: {}", error_text(id)));
+        } else {
+            println(&format!("files: started '{line}' as #{id}"));
+            self.note = Some(format!("«{name}» открыт программой «{caption}»"));
         }
     }
 
@@ -2360,6 +2685,51 @@ impl Files {
     fn on_click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = layout(ctx, area);
 
+        // Окно выбора программы — модальное (22.11).
+        if let Some(MenuMode::Choose(chooser)) = self.menu.as_ref().map(|menu| &menu.mode) {
+            let cp = chooser_plan(ctx, area, chooser.progs.len());
+            enum Act {
+                Open,
+                Cancel,
+                Toggle,
+                Pick(usize),
+                Nothing,
+            }
+            let act = if cp.ok.contains(x, y) {
+                Act::Open
+            } else if cp.cancel.contains(x, y) {
+                Act::Cancel
+            } else if cp.check.contains(x, y) {
+                Act::Toggle
+            } else if let Some(at) = cp.rows.iter().position(|row| row.contains(x, y)) {
+                let index = chooser.first + at;
+                if index >= chooser.progs.len() {
+                    Act::Nothing
+                } else if index == chooser.selected {
+                    Act::Open
+                } else {
+                    Act::Pick(index)
+                }
+            } else {
+                Act::Nothing
+            };
+            match act {
+                Act::Open => self.finish_choose(),
+                Act::Cancel => self.close_menu(),
+                Act::Toggle | Act::Pick(_) => {
+                    if let Some(MenuMode::Choose(chooser)) = self.menu.as_mut().map(|menu| &mut menu.mode) {
+                        match act {
+                            Act::Toggle => chooser.always = !chooser.always,
+                            Act::Pick(index) => chooser.selected = index,
+                            _ => {}
+                        }
+                    }
+                }
+                Act::Nothing => {}
+            }
+            return true;
+        }
+
         // Вопрос об удалении — модальный (21.11): отвечают его кнопками,
         // щелчок мимо них ничего не делает.
         if let Some(MenuMode::Confirm(_)) = self.menu.as_ref().map(|menu| &menu.mode) {
@@ -2464,6 +2834,15 @@ impl Files {
         // меню, которое человек видел.
         if let Some(menu) = self.menu.as_ref() {
             if let Some(card) = self.menu_rect(ctx, area) {
+                if let MenuMode::OpenWith(progs, _) = &menu.mode {
+                    if card.contains(x, y) {
+                        let fits = openwith_rows(progs) - 1;
+                        if let Some(row) = (0..=fits).find(|row| openwith_row_rect(ctx, card, *row, fits).contains(x, y)) {
+                            self.pick_open_with(row);
+                        }
+                        return true;
+                    }
+                }
                 if matches!(menu.mode, MenuMode::Items) && card.contains(x, y) {
                     // Та же геометрия пунктов, что у отрисовки: считает её `kit`.
                     let hit = kit::menu_hit(ctx, card, &entries(&menu.items), x, y).map(|index| menu.items[index]);
@@ -3038,6 +3417,22 @@ impl Files {
         let pad = ctx.px(6);
         match &menu.mode {
             MenuMode::Items => kit::menu_size(ctx, &entries(&menu.items)),
+            MenuMode::OpenWith(progs, _) => {
+                let face = ctx.face(Role::Body);
+                let widest = progs
+                    .iter()
+                    .filter(|prog| prog.fits())
+                    .map(|prog| face.width(&prog.caption) + if prog.mark == b'd' { face.width(" (по умолчанию)") } else { 0 })
+                    .chain(core::iter::once(face.width(OTHER_PROGRAM)))
+                    .max()
+                    .unwrap_or(0);
+                let fits = openwith_rows(progs) as u32 - 1;
+                (
+                    (widest + ctx.px(10 + 20 + 10 + 16) + pad * 2).max(ctx.px(240)),
+                    pad * 2 + ctx.px(PROG_ROW_H) * (fits + 1) + if fits > 0 { ctx.px(9) } else { 0 },
+                )
+            }
+            MenuMode::Choose(_) => (ctx.px(10), ctx.px(10)),
             MenuMode::Rename(_) | MenuMode::Confirm(_) => {
                 let hint = ctx.face(Role::Caption).width(RENAME_HINT);
                 (hint.max(ctx.px(320)) + ctx.px(28), ctx.px(40) + ctx.px(32) + ctx.px(28) + pad * 2)
@@ -3537,6 +3932,14 @@ impl Files {
             kit::draw_ask(ctx, s, area, &self.ask().as_ask(), focus);
             return;
         }
+        if let MenuMode::Choose(chooser) = &menu.mode {
+            self.draw_chooser(s, ctx, area, chooser);
+            return;
+        }
+        if let MenuMode::OpenWith(progs, selected) = &menu.mode {
+            draw_openwith(ctx, s, card, progs, *selected);
+            return;
+        }
         let inner = kit::card(ctx, s, card);
         let p = inner.palette;
         match &menu.mode {
@@ -3563,8 +3966,66 @@ impl Files {
                 y += field.h as i32 + ctx.px(10) as i32;
                 paint::text_clipped(inner, s, Role::Caption, x, y, room, RENAME_HINT, p.ink4);
             }
-            MenuMode::Confirm(_) => {}
+            MenuMode::Confirm(_) | MenuMode::OpenWith(..) | MenuMode::Choose(_) => {}
         }
+    }
+
+    /// Окно «Выбрать другую программу…» посреди «Файлов» (22.11).
+    fn draw_chooser(&self, s: &mut Surface, ctx: Ctx, area: Rect, chooser: &Chooser) {
+        let cp = chooser_plan(ctx, area, chooser.progs.len());
+        draw::blend_rect(s, area, mini_ui::Color::rgb(0, 0, 0), 70);
+        let inner = kit::card(ctx, s, cp.card);
+        let p = inner.palette;
+        let pad = ctx.px(20) as i32;
+        let x = cp.card.x + pad;
+        let width = cp.card.w.saturating_sub(ctx.px(40));
+        let name = self.menu_target_file().map(|(_, name)| name).unwrap_or_default();
+        paint::text_clipped(inner, s, Role::Heading, x, cp.card.y + pad, width, "Выбрать другую программу", p.ink);
+        let what = format!("Чем открыть «{name}»?");
+        paint::text_clipped(inner, s, Role::Caption, x, cp.card.y + pad + i32::from(ctx.face(Role::Heading).line) + ctx.px(6) as i32, width, &what, p.ink3);
+        for (slot, row) in cp.rows.iter().enumerate() {
+            let index = chooser.first + slot;
+            let Some(prog) = chooser.progs.get(index) else { break };
+            let on = index == chooser.selected;
+            paint::row(inner, s, *row, if on { RowState::Selected } else { RowState::Idle });
+            let side = ctx.px(28);
+            let icon = Rect::new(row.x + ctx.px(10) as i32, row.y + (row.h as i32 - side as i32) / 2, side, side);
+            draw_prog_icon(inner, s, icon, prog);
+            let tx = icon.right() + ctx.px(12) as i32;
+            let tw = (row.right() - tx - ctx.px(10) as i32).max(0) as u32;
+            let note = match (prog.mark, prog.windows()) {
+                (b'd', _) => "выбрана для этого типа",
+                (b'f', true) => "рекомендуется · программа Windows",
+                (b'f', false) => "рекомендуется",
+                (_, true) => "программа Windows",
+                _ => "программа FossAi",
+            };
+            let top = row.y + (row.h as i32 - i32::from(ctx.face(Role::Body).line) - i32::from(ctx.face(Role::Caption).line)) / 2;
+            paint::text_clipped(inner, s, Role::Body, tx, top, tw, &prog.caption, if on { p.ink } else { p.ink2 });
+            paint::text_clipped(inner, s, Role::Caption, tx, top + i32::from(ctx.face(Role::Body).line), tw, note, p.ink4);
+        }
+        // Список длиннее окна — сколько ещё ниже и выше.
+        if chooser.progs.len() > cp.rows.len() {
+            let more = format!("{}–{} из {}", chooser.first + 1, (chooser.first + cp.rows.len()).min(chooser.progs.len()), chooser.progs.len());
+            if let Some(last) = cp.rows.last() {
+                paint::text_right(inner, s, Role::Caption, last.right(), cp.check.y + ctx.px(6) as i32, &more, p.ink4);
+            }
+        }
+        let side = ctx.px(16);
+        let bx = Rect::new(cp.check.x, cp.check.y + (cp.check.h as i32 - side as i32) / 2, side, side);
+        if chooser.always {
+            draw::rounded(s, bx, ctx.px(3), p.acc, 255);
+            glyphicon::draw(s, Icon::Check, bx.x, bx.y, bx.w, p.acc_ink, 255);
+        } else {
+            draw::rounded_stroke(s, bx, ctx.px(3), p.ink4, 255);
+        }
+        let ext = sysconf::filetypes::extension(&name);
+        let label = if ext.is_empty() { String::from("Всегда использовать эту программу") } else { format!("Всегда использовать для файлов .{ext}") };
+        let lx = bx.right() + ctx.px(10) as i32;
+        paint::text_clipped(inner, s, Role::Body, lx, paint::baseline(inner, Role::Body, cp.check), (cp.check.right() - lx - ctx.px(90) as i32).max(0) as u32, &label, p.ink2);
+        paint::separator(inner, s, cp.card.x, cp.ok.y - ctx.px(14) as i32, cp.card.w);
+        paint::button(inner, s, cp.ok, Weight::Primary, "Открыть", false);
+        paint::button(inner, s, cp.cancel, Weight::Normal, "Отмена", false);
     }
 
     /// Панель инструментов: три стрелки и строка пути.
@@ -5270,6 +5731,13 @@ impl App for Files {
     /// выделение прыгает по папкам»). В просмотре листает текст; в открытом
     /// меню и в поле переименования ничего не делает.
     fn wheel_at(&mut self, area: Rect, ctx: Ctx, clicks: i32) -> bool {
+        // Окно выбора программы листает свой список (22.11).
+        if let Some(MenuMode::Choose(chooser)) = self.menu.as_mut().map(|menu| &mut menu.mode) {
+            let last = chooser.progs.len().saturating_sub(CHOOSER_ROWS);
+            let step = clicks.unsigned_abs() as usize;
+            chooser.first = if clicks > 0 { chooser.first.saturating_sub(step) } else { (chooser.first + step).min(last) };
+            return true;
+        }
         if self.menu.is_some() || self.tab_menu.is_some() || clicks == 0 {
             return false;
         }

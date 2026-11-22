@@ -1481,6 +1481,22 @@ fn run_builtin(line: &str) -> bool {
             }
             sprintln!("  winapps: {} shortcut(s) in {} prefix(es)", apps.len(), crate::ui::winapps::prefixes().len());
         }
+        // `openwith <путь>` (22.11) — что «Открыть с помощью» предложит для
+        // файла: `d` выбрана, `f` подходит, `o` прочие (то же, что видят
+        // «Файлы» и стол).
+        "openwith" => {
+            if argument.is_empty() {
+                sprintln!("  usage: openwith <file>");
+            } else if let Some(path) = human_path(argument) {
+                let text = crate::ui::openwith::list_text(&path);
+                for line in text.lines() {
+                    let mut parts = line.split('\t');
+                    let (mark, caption, command) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                    sprintln!("  openwith: {mark} '{caption}' {command}");
+                }
+                sprintln!("  openwith: {} program(s) for {path}", text.lines().count());
+            }
+        }
         // `mklnk C:\путь\программа.exe > /путь/Имя.lnk` (21.11) — ярлык
         // Windows, как его пишет Wine: «Программы Windows» проверяются на
         // префиксе без установки Proton (сценарий `winapps`).

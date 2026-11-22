@@ -14,6 +14,16 @@ use crate::user::space;
 /// для этого не годится: он смотрит, есть ли сам путь, а его ещё нет.
 pub(super) fn place(linux: &str) -> String {
     let cred = crate::user::credentials();
+    // Путь уже есть — там, где он есть (22.11, hw-log15): `mkdir -p
+    // /root/.proton` делает и `mkdir /root`, родитель `/` есть в корне Debian,
+    // и вместо EEXIST появлялся пустой двойник `/opt/debian/root`. С ним
+    // `resolve` уводил весь дом в корень Debian: префикс Wine лёг в
+    // `/opt/debian/root/.proton`, а стол искал его в `/root` и не видел
+    // программ Windows («Пуск», ярлык на столе).
+    let existing = crate::linux_path::resolve(linux, cred);
+    if matches!(crate::fs::resolve_as(cred, &existing, crate::vfs::perm::Access::NONE), Some(Ok(_))) {
+        return existing;
+    }
     let (parent, name) = match linux.rsplit_once('/') {
         Some(("", name)) => ("/", name),
         Some((parent, name)) => (parent, name),

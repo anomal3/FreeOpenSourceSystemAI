@@ -93,11 +93,22 @@ fn list(path: &str) -> Vec<crate::vfs::DirEntry> {
 }
 
 /// Дома, в которых ищутся префиксы: того, кто вошёл, и `/root` (живая флешка
-/// и `run` из оболочки ставят туда).
-fn homes() -> Vec<String> {
+/// и `run` из оболочки ставят туда) — и их двойники в корне Debian
+/// (`/opt/debian/root`, `/opt/debian/home/<имя>`). До 22.11 `mkdir -p` Wine
+/// заводил такой двойник (`linux::fsops::place`), и программа Linux видела
+/// свой дом там: префикс `~/.proton` лежал в `/opt/debian/root/.proton`
+/// (hw-log15: Notepad++ не появлялся ни в «Пуске», ни на столе). На
+/// установленной системе двойник с префиксом остаётся на диске — ищем и там.
+pub(super) fn homes() -> Vec<String> {
     let mut homes = alloc::vec![super::context::home_dir()];
     if homes[0] != "/root" {
         homes.push(String::from("/root"));
+    }
+    for index in 0..homes.len() {
+        let shadow = alloc::format!("{}{}", crate::linux_path::LINUX_ROOT, homes[index]);
+        if matches!(crate::fs::list(&shadow), Some(Ok(_))) {
+            homes.push(shadow);
+        }
     }
     homes
 }
@@ -411,6 +422,13 @@ pub fn remember_icon(path: &str, index: i32) -> String {
     }
 }
 
+/// Картинка значка по его условному пути `/winicon/…` — из своего списка
+/// (кэш стола забывают при смене пакетов; «Открыть с помощью», 22.11).
+#[must_use]
+pub fn icon_by_name(name: &str) -> Option<Arc<Image>> {
+    ICONS.lock().iter().find_map(|(_, found)| found.as_ref().filter(|(known, _)| known == name).map(|(_, image)| image.clone()))
+}
+
 /// Значок ярлыка: поле значка, иначе цель.
 fn lnk_icon(prefix: &str, lnk: &Lnk, target: &str) -> String {
     if !lnk.icon.is_empty() {
@@ -654,8 +672,29 @@ pub fn scan() -> Vec<WinApp> {
         }
     }
     out.sort_by(|a, b| a.caption.to_lowercase().cmp(&b.caption.to_lowercase()));
+    // Итог — в журнал, когда он меняется (hw-log15: обход молчал, и по
+    // журналу нельзя было понять, нашёл ли он префикс).
+    let found = prefixes();
+    let summary = alloc::format!(
+        "{} prefix(es) [{}], {} app(s): {} in Start, {} on the desktop, {} uninstall",
+        found.len(),
+        found.join(", "),
+        out.len(),
+        out.iter().filter(|app| !app.desktop && !app.uninstall).count(),
+        out.iter().filter(|app| app.desktop).count(),
+        out.iter().filter(|app| app.uninstall).count()
+    );
+    let mut last = LAST_SCAN.lock();
+    if *last != summary {
+        crate::kprintln!("  winapps     : {summary}");
+        *last = summary;
+    }
+    drop(last);
     out
 }
+
+/// Итог последнего обхода (для журнала — только перемены).
+static LAST_SCAN: crate::sync::SpinLock<String> = crate::sync::SpinLock::new(String::new());
 
 /// Подпись «что поставлено» для стола: имена и размеры записей каталогов
 /// «Пуска» и столов префиксов (верхний уровень). Сменилась — значки стола и

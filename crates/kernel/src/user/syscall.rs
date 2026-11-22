@@ -221,6 +221,8 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_LIVE_KEYS => live_keys(a0, a1),
         user_abi::SYS_KERNEL_COMMAND => kernel_command(a0, a1, a2),
         user_abi::SYS_CLIPBOARD => clipboard(a0, a1, a2),
+        // 22.11: «Открыть с помощью» для «Файлов» (программы Windows из Wine).
+        user_abi::SYS_OPEN_WITH => open_with(a0, a1, a2),
         // 05.11.2026: время из сети (SNTP службы `dhcp`).
         user_abi::SYS_SETCLOCK => setclock(a0, a1, a2),
         user_abi::SYS_MODEM => modem(a0, a1, a2),
@@ -1392,6 +1394,50 @@ fn clipboard(action: usize, ptr: usize, len: usize) -> i64 {
         }
         _ => ERR_UNSUPPORTED,
     }
+}
+
+/// `SYS_OPEN_WITH` (22.11): программы для файла, их значки, выбор «всегда».
+fn open_with(action: usize, ptr: usize, len: usize) -> i64 {
+    let input_len = action >> 32;
+    let action = action & 0xFFFF_FFFF;
+    if len > (8 << 20) || input_len > len || input_len > 4096 || (len > 0 && !space::user_can(ptr, len, PageFlags::WRITE)) {
+        return ERR_BAD_ADDRESS;
+    }
+    // Вход — копией: страница программы может прийти по касанию.
+    let input = if input_len == 0 { alloc::string::String::new() } else {
+        // SAFETY: диапазон проверен по таблицам программы на чтение.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, input_len) };
+        match core::str::from_utf8(bytes) {
+            Ok(text) => alloc::string::String::from(text),
+            Err(_) => return ERR_BAD_PATH,
+        }
+    };
+    let output: alloc::vec::Vec<u8> = match action {
+        user_abi::OPENWITH_LIST => crate::ui::openwith::list_text(&input).into_bytes(),
+        user_abi::OPENWITH_ICON => match crate::ui::openwith::icon_fimg(&input) {
+            Some(bytes) => bytes,
+            None => return ERR_NOT_FOUND,
+        },
+        user_abi::OPENWITH_REMEMBER => {
+            let Some((ext, command)) = input.split_once('\t') else {
+                return ERR_BAD_PATH;
+            };
+            return match crate::ui::prefs::store_open_with(ext.trim(), command.trim()) {
+                Ok(()) => {
+                    crate::kprintln!("  openwith    : .{} files open with '{}'", ext.trim(), command.trim());
+                    0
+                }
+                Err(_) => ERR_PERMISSION,
+            };
+        }
+        _ => return ERR_UNSUPPORTED,
+    };
+    let count = output.len().min(len);
+    if count > 0 {
+        // SAFETY: диапазон проверен по таблицам программы на запись.
+        unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, count) }.copy_from_slice(&output[..count]);
+    }
+    output.len() as i64
 }
 
 /// `SYS_KERNEL_COMMAND`: исполнить команду оболочки ядра и отдать вывод.

@@ -2180,10 +2180,8 @@ pub(super) fn windows_prefixes() -> Vec<String> {
     if !exists(PROTON_SCRIPT) {
         return out;
     }
-    let mut homes = alloc::vec![super::context::home_dir()];
-    if homes[0] != "/root" {
-        homes.push(String::from("/root"));
-    }
+    // Те же дома, что у «Программ Windows» (с двойниками в корне Debian).
+    let homes = super::winapps::homes();
     for home in &homes {
         let Some(Ok(entries)) = crate::fs::list(home) else {
             continue;

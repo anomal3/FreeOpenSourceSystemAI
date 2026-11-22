@@ -1712,6 +1712,49 @@ pub fn clipboard_get() -> alloc::string::String {
     }
 }
 
+/// «Открыть с помощью» (22.11, [`user_abi::SYS_OPEN_WITH`]): действие и вход
+/// — ответ целиком (буфер растёт, пока ответ не поместится); `None` — отказ.
+fn open_with_call(action: usize, input: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let mut buffer = alloc::vec![0u8; input.len().max(16 * 1024)];
+    loop {
+        buffer[..input.len()].copy_from_slice(input);
+        // SAFETY: буфер живёт в памяти программы, длина — его собственная.
+        let result = unsafe { syscall(user_abi::SYS_OPEN_WITH, action | (input.len() << 32), buffer.as_mut_ptr() as usize, buffer.len()) };
+        if result < 0 {
+            return None;
+        }
+        let total = result as usize;
+        if total <= buffer.len() {
+            buffer.truncate(total);
+            return Some(buffer);
+        }
+        if total > (8 << 20) {
+            return None;
+        }
+        buffer.resize(total, 0);
+    }
+}
+
+/// Программы для файла `path`: строки `признак\tподпись\tкоманда\tзначок`.
+#[must_use]
+pub fn open_with_list(path: &str) -> alloc::string::String {
+    open_with_call(user_abi::OPENWITH_LIST, path.as_bytes()).map(|bytes| alloc::string::String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default()
+}
+
+/// Значок программы из [`open_with_list`] — картинка FIMG.
+#[must_use]
+pub fn open_with_icon(key: &str) -> Option<alloc::vec::Vec<u8>> {
+    if key.is_empty() {
+        return None;
+    }
+    open_with_call(user_abi::OPENWITH_ICON, key.as_bytes())
+}
+
+/// Запомнить программу для расширения («всегда открывать этой программой»).
+pub fn open_with_remember(ext: &str, command: &str) -> bool {
+    open_with_call(user_abi::OPENWITH_REMEMBER, alloc::format!("{ext}\t{command}").as_bytes()).is_some()
+}
+
 /// Исполнить команду оболочки ядра (фаза 68o). `out` — не короче
 /// [`user_abi::KERNEL_COMMAND_OUT`]; ответ — сколько байт вывода или ошибка.
 pub fn kernel_command(line: &str, out: &mut [u8]) -> i64 {

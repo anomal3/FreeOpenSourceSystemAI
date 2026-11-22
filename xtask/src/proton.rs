@@ -662,6 +662,42 @@ case "$1" in
         r=Wine; [ -e /dev/dri/renderD128 ] || r="Wine (no GPU node: wined3d on the CPU)"; [ "$1" = --dxvk ] && r="DXVK/vkd3d-proton (GPU node present)"
         case "$1" in --d2r=*) r="D2R launcher" ;; esac
         klog "fossai-proton: open $f via $r" ;;
+    # `--with=ПРОГРАММА.exe ФАЙЛ…` (22.11) - «Открыть с помощью»: программа
+    # Windows из префикса (префикс - по её пути) открывает файлы; их пути
+    # (с `%20`) - путями Windows: буква тома из ПРЕФИКС/dosdevices (`D:\…`),
+    # иначе `Z:\…` (у Wine `Z:` - корень).
+    --with=*)
+        unpct "${1#--with=}"; f=$U; shift
+        t=; case "$1" in --args=*) unpct "${1#--args=}"; t=$U; shift ;; esac
+        case $f in */drive_c/*) p=${f%%/drive_c/*}; [ -f "$p/system.reg" ] && export WINEPREFIX=$p ;; esac
+        a=()
+        for x in "$@"; do
+            unpct "$x"; u=$U; w=
+            for l in "$WINEPREFIX"/dosdevices/[d-y]:; do
+                [ -L "$l" ] || continue
+                k=$(LD_LIBRARY_PATH= readlink "$l" 2>/dev/null); k=${k%/}
+                case $k in ''|/) continue ;; esac
+                case $u in "$k"/*) w=${l##*/}; w=${w^^}${u#"$k"}; break ;; esac
+            done
+            [ -z "$w" ] && w=Z:$u
+            a+=("${w//\//\\}")
+        done
+        # `--args=КЛЮЧИ` - ключи команды из реестра (`open "%1"`): `%1`/`%L` -
+        # путь файла; без `%1` пути - в конце.
+        if [ -n "$t" ]; then
+            b=(); n=; set -f
+            for x in $t; do
+                x=${x//\"/}
+                case $x in *%[1Ll]*) for y in "${a[@]}"; do b+=("${x//%[1Ll]/$y}"); done; n=1 ;; %*) ;; *) b+=("$x") ;; esac
+            done
+            set +f
+            [ -z "$n" ] && b+=("${a[@]}")
+            a=("${b[@]}")
+        fi
+        cd "${f%/*}" 2>/dev/null
+        klog "fossai-proton: open ${a[*]} with $f (prefix $WINEPREFIX)"
+        set -- "$f" "${a[@]}"
+        [ -e /dev/dri/renderD128 ] && set -- --dxvk "$@" ;;
     --shortcut=*)
         unpct "${1#--shortcut=}"; f=$U; shift
         export WINEPREFIX=${f%/drive_c/proton_shortcuts/*}
@@ -975,6 +1011,9 @@ $W "$@" 2>&1 | {
     // Проба DirectX 9/11 (`tools/d3dprobe`, программа Windows) - для сценариев
     // wined3d и DXVK (12.11).
     files.push((String::from("share/fossai/d3dprobe.exe"), d3dprobe()?, 0o755));
+    // Установщик-проба (`tools/wininst`, 22.11): ярлыки «Пуска»/стола через
+    // IShellLink и сопоставление .txt — сценарий `winapps-real`.
+    files.push((String::from("share/fossai/wininst.exe"), windows_tool("wininst")?, 0o755));
     // Шаблоны префикса (17.11): их снимает сценарий `proton-prefix` (настоящий
     // `wineboot` в QEMU) в `build/proton-prefix/`. Нет снимка — пакет без
     // шаблона, префикс создаёт `wineboot` при первом запуске (минуты).
@@ -1172,7 +1211,13 @@ echo "bench: done"
 /// Собирает `tools/d3dprobe` (Rust, x86_64-pc-windows-msvc, статический CRT)
 /// и отдаёт `d3dprobe.exe`.
 fn d3dprobe() -> Result<Vec<u8>> {
-    let dir = crate::paths::workspace_root().join("tools/d3dprobe");
+    windows_tool("d3dprobe")
+}
+
+/// Собирает программу Windows `tools/<name>` (Rust, x86_64-pc-windows-msvc) и
+/// отдаёт `<name>.exe`.
+fn windows_tool(name: &str) -> Result<Vec<u8>> {
+    let dir = crate::paths::workspace_root().join("tools").join(name);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = std::process::Command::new(cargo)
         .args(["build", "--release", "--target", "x86_64-pc-windows-msvc"])
@@ -1180,8 +1225,8 @@ fn d3dprobe() -> Result<Vec<u8>> {
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .status()?;
-    anyhow::ensure!(status.success(), "d3dprobe не собрался");
-    Ok(fs::read(dir.join("target/x86_64-pc-windows-msvc/release/d3dprobe.exe"))?)
+    anyhow::ensure!(status.success(), "{name} не собрался");
+    Ok(fs::read(dir.join(format!("target/x86_64-pc-windows-msvc/release/{name}.exe")))?)
 }
 
 fn normalize(path: &str) -> String {

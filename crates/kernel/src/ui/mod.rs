@@ -76,6 +76,7 @@ pub mod wallart;
 pub mod wallpaper;
 pub mod window;
 pub mod winapps;
+pub mod openwith;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -429,6 +430,11 @@ fn open_file(desktop: &mut Compositor, command: &str, path: &str) {
             recent.insert(0, (String::from(command), String::from(path)));
             recent.truncate(30);
         }
+    }
+    // Программа Windows (22.11) — с правами пакета `proton`, путь с `%20`.
+    if command.contains(panel::PROTON_SCRIPT) {
+        run_choice(desktop, panel::proton_choice(openwith::line(command, path)));
+        return;
     }
     start(desktop, &alloc::format!("{command} {path}"));
 }
@@ -4357,7 +4363,9 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
 /// Окно «Как открыть этот файл?» для `path` (макет 18). Программ нет — сказать
 /// об этом и открыть в «Файлах», как раньше.
 fn choose_program(desktop: &mut Compositor, path: &str) {
-    let choices = file_handlers(path);
+    // Все программы (22.11): подходящие первыми, затем «Программы Windows» и
+    // свои программы — как «Выбрать другое приложение» Windows.
+    let choices: alloc::vec::Vec<(String, String)> = openwith::handlers(path, true).into_iter().map(|handler| (handler.caption, handler.command)).collect();
     if choices.is_empty() {
         kprintln!("  desktop     : no program opens '{path}'");
         start(desktop, &alloc::format!("/bin/files {path}"));
@@ -5564,29 +5572,10 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
 /// допишется). Свои — «Блокнот» для текста; пакетные — по `opens=` их
 /// манифеста (поставили Notepad++ — он появится здесь).
 fn file_handlers(path: &str) -> alloc::vec::Vec<(String, String)> {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let extension = sysconf::filetypes::extension(name);
-    let mut out = alloc::vec::Vec::new();
-    if sysconf::filetypes::is_text(name) || extension.is_empty() {
-        out.push((String::from("Блокнот"), String::from("/bin/notepad")));
-    }
-    if !extension.is_empty() {
-        for launcher in panel::list_packages() {
-            if launcher.opens.split(',').any(|ext| ext.trim().eq_ignore_ascii_case(&extension)) {
-                out.push((launcher.caption.clone(), launcher.start.clone()));
-            }
-        }
-    }
-    // Выбранная человеком — первой («по умолчанию»), даже если её нет в списке
-    // (пакет переустановили без `opens=`).
-    if let Some(command) = prefs::open_with(&extension) {
-        let entry = match out.iter().position(|(_, start)| *start == command) {
-            Some(at) => out.remove(at),
-            None => (String::from(command.rsplit('/').next().unwrap_or(&command)), command),
-        };
-        out.insert(0, entry);
-    }
-    out
+    // С 22.11 — общий список с «Файлами» (`openwith`): выбранная человеком
+    // первой, «Блокнот», пакеты с `opens=` и программы Windows из реестра
+    // префиксов Wine (Notepad++ для `.txt`).
+    openwith::handlers(path, false).into_iter().map(|handler| (handler.caption, handler.command)).collect()
 }
 
 /// Запустить программу третьего кольца по готовой командной строке.

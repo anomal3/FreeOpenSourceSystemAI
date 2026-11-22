@@ -15507,6 +15507,50 @@ Proton — тремя прогонами выше.
   сценарием проверен только для программ Windows. Пакет `proton` с правкой
   `--open` (префикс из пути) — нужна пересборка образа.
 
+### 22.11: почему на железе не появилось ничего (hw-log15) и «Открыть с помощью»
+
+- **Причина** (воспроизведено на образе 0.8.1024 в QEMU как живая флешка):
+  `/opt/debian/root` существовал, в нём `.cache` и `.proton`, а `/root` был
+  пуст. `mkdir -p /root/.proton` (сценарий `fossai-proton`, Debian `mkdir`)
+  делает и `mkdir /root`; `linux::fsops::place` клал новый путь в корень
+  Debian, если там есть родитель, — у `/root` родитель `/`, он «есть» в
+  `/opt/debian`, и вместо EEXIST появлялся пустой двойник
+  `/opt/debian/root`. После этого `linux_path::resolve` уводил весь дом
+  программ Linux туда: префикс Wine жил в `/opt/debian/root/.proton`, а
+  стол искал префиксы в `/root` — `winapps: 0 shortcut(s) in 0 prefix(es)`.
+  Синтетический сценарий `winapps` префикс строил оболочкой ядра (мимо слоя
+  Linux) и этого не видел.
+- **Исправлено**: `place` — путь уже есть (там, где его находит `resolve`) —
+  возвращается он (mkdir даёт EEXIST, двойника нет); `winapps::homes`
+  (и «Установка и удаление программ») смотрят и двойники `/opt/debian<дом>`
+  (на установленных дисках они остались с префиксами). Обход пишет в журнал
+  итог при каждой перемене: `winapps     : N prefix(es) [...], M app(s) ...`.
+  Оболочка: `openwith <файл>` — что предложит «Открыть с помощью».
+- **«Открыть с помощью»** (`ui/openwith.rs`, вызов `SYS_OPEN_WITH` для
+  «Файлов»): «Блокнот», пакеты с `opens=`, программы Windows из реестра
+  префиксов (`system.reg`/`user.reg`, `Software\Classes`: `.ext` → ProgID и
+  `OpenWithProgids` → `shell\<глагол>\command`; `.ext\OpenWithList`;
+  `Applications\x.exe` с `SupportedTypes`, без него — для текстовых файлов,
+  так регистрируется Notepad++); программы самого Wine (Блокнот Wine,
+  WordPad, IE, winebrowser) не предлагаются. Значки — из `.exe` (как в
+  «Пуске»), «Файлам» отдаются FIMG до 64×64. «Файлы»: пункт «Открыть с
+  помощью…» у файла → карточка подходящих программ со значками и «Выбрать
+  другую программу…» → окно со всеми «Программами Windows» и своими
+  программами, флажок «Всегда использовать для файлов .ext» (`open_with=` в
+  `desktop.cfg`, тот же, что у стола; Enter/Esc/стрелки/пробел, колесо).
+  Стол: подменю файла и «Как открыть этот файл?» — тот же список.
+- Запуск: `fossai-proton --with=ПРОГРАММА.exe [--args=КЛЮЧИ] ФАЙЛ` — префикс из
+  пути программы, путь файла → путь Windows (буква тома из `dosdevices`,
+  иначе `Z:`), `%1` в ключах реестра заменяется им.
+- Проба: `tools/wininst` (`share/fossai/wininst.exe` в пакете proton) —
+  установщик: копирует себя в `C:\Program Files\FossDemo\fossdemo.exe`,
+  ярлыки IShellLinkW + IPersistFile::Save в «Пуск» и на общий стол (Wine зовёт
+  winemenubuilder), `reg add` сопоставления `.txt`; `fossdemo.exe open ФАЙЛ`
+  — окно `FossDemo - ПУТЬ`. Сценарий `winapps-real` (установленная система
+  с Proton), на живой флешке — те же строки в терминале:
+  `run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton /opt/proton/share/fossai/wininst.exe install`,
+  `winapps`, `openwith /root/x.txt`.
+
 ## Печать ядра без глухоты, сценарии start/files-tabs/mouse (21.11, G4) — **сделано, проверить на железе**
 
 Повод — замер G2: `irq-off worst 27-55 ms at print.rs:52` на 16 ЦП в QEMU.
