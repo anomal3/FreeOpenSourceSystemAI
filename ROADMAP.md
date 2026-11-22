@@ -11188,6 +11188,36 @@ golden registers и `gfx_v8_0_constants_init` (тайлинг, SH_MEM) и clear-
 (KIQ/HQD), затем DRM-слой Linux (A4: `/dev/dri/renderD128`, `AMDGPU_INFO`, `CS`),
 пакет RADV и DXVK. Заготовки DRM уже есть в `main` (`linux/drm/`, nouveau).
 
+**Polaris, P5: GART, FENCE, IB И ПОЛЬЗОВАТЕЛЬСКОЕ АДРЕСНОЕ ПРОСТРАНСТВО РАБОТАЮТ (22.11,
+образ 0.8.11, проверено на железе — все тесты прошли с первого запуска).**
+- **GART (`amd gart`, VMID 0):** 16 МиБ по GPU-адресу `0xff00000000`, таблица 32 КиБ в
+  VRAM, PTE `0x77` (VALID|SYSTEM|SNOOPED|EXEC|READ|WRITE) на системную страницу;
+  регистры менялись «прочитать-изменить-записать» (до: `L1_TLB` `0x503`, `L2_CNTL`
+  `0x0c0b8602`, `L2_CNTL3` `0x80100004`, `CONTEXT0_CNTL` `0x00fffed8`; после: `0x55b`,
+  `0x0c0b8e03`, `0x80148009`, `0x00fffed9`). CP через GART записал слово в системную
+  страницу, ядро его прочитало.
+- **Fence:** `EVENT_WRITE_EOP` (`0xc0044700`, control `0x38514`, `DATA_SEL(1)`) записал
+  число в VRAM.
+- **IB:** `INDIRECT_BUFFER` (`0xc0023f00`, control = длина | VMID<<24) исполнил буфер из
+  5 dword с `WRITE_DATA`.
+- **VMID 1 (`amd cs`):** PD (4 КиБ) + PT (8 КиБ) в VRAM, 1 ГиБ VA (`END` = 2^18-1,
+  `PAGE_TABLE_DEPTH` 1, блок 10 бит), PDE1 → PT (MC-адрес), PTE: системная страница
+  `0x77`, VRAM-страницы `0x71`. IB исполнился с VMID 1 по пользовательскому VA
+  (`0x403000`) и записал в три страницы: системную и две VRAM — **обе формы адреса VRAM в
+  PTE сработали** (смещение от начала VRAM и MC-адрес с `vram_start`: железо, видимо,
+  отбрасывает старшие разряды); канонична форма Linux — **смещение от начала VRAM**
+  (`vram_base_offset` = 0 у dGPU). `CONTEXT1_CNTL` `0x00fffed8` → `0x01fffedb`.
+- Цепочка на флешке: `START/UCODE/RING/GART/CS.TXT` (переменные `FOSSAI_AMD_SMC_START`,
+  `_UCODE`, `_RING`, `_GART`, `_CS` = 1 при сборке образа).
+**Что осталось до рабочего драйвера (A4+):** golden registers, `constants_init`
+(тайлинг, SH_MEM_CONFIG/BASES по VMID), clear-state — для 3D; менеджер VMID и
+пользовательских таблиц страниц (PD/PT на процесс, фрагменты, TLB flush через кольцо);
+менеджер памяти GPU (VRAM/GTT, `GEM_CREATE`/`GEM_MMAP`/`GEM_VA`); `CS`-ioctl поверх
+`ring_submit` + fence-таблица; IH/MSI (пока опрос); SDMA и compute-очереди (KIQ/HQD);
+DRM-слой Linux по `docs/AMD_A4_CALLS.md` (`/dev/dri/renderD128`, `AMDGPU_INFO`...) на
+основе `linux/drm/` из `main`; RADV в пакет Proton; потом DXVK. Код `amd.rs` сейчас —
+линейные проверки; для драйвера его надо разложить на модули (smc, gfx/ring, gmc/vm).
+
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
 `drmGetDevices2`, ioctl для `vulkaninfo` и для рендера, поля
