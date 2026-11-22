@@ -734,7 +734,16 @@ fn saver_rows(pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
         let kinds = [("Фото", Deed::Saver(Sd::Kind(Kind::Photo)), s.kind == Kind::Photo), ("Цвет", Deed::Saver(Sd::Kind(Kind::Color)), s.kind == Kind::Color)];
         y = seg_row(pass, x, y, w, Fi::Palette, "Фон", "Фото по очереди или ровный цвет", &kinds);
         if s.kind == Kind::Photo {
-            y = row(pass, x, y, w, Some(Fi::Folder), "Фото", &s.source, Ctl::Button("Сменить", Weight::Normal), Some(Deed::Saver(Sd::NextSource)));
+            let from = match &s.preparing {
+                Some(note) => format!("{} — {note}", s.source),
+                None => s.source.clone(),
+            };
+            let sources = [
+                ("Галерея обоев", Deed::Saver(Sd::Gallery), s.gallery),
+                ("Папка…", Deed::Saver(Sd::PickFolder), !s.gallery && s.folder),
+                ("Картинка…", Deed::Saver(Sd::PickPicture), !s.gallery && !s.folder),
+            ];
+            y = seg_row(pass, x, y, w, Fi::Folder, "Фото", &from, &sources);
             let fits: Vec<(&str, Deed, bool)> = Fit::ALL.iter().map(|&fit| (fit.title(), Deed::Saver(Sd::Fit(fit)), s.fit == fit)).collect();
             y = seg_row(pass, x, y, w, Fi::Monitor, "Размещение", "Как фото ложится на экран", &fits);
             let every_labels: Vec<String> = saver::EVERY_OPTIONS.iter().map(|&sec| saver::after_text(sec)).collect();

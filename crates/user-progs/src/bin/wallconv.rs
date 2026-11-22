@@ -11,6 +11,9 @@
 //!   картинками, выбранное — в `ПАПКА/<ключ>-<Ш>x<В>.qoi`, путь к нему —
 //!   строкой в `ПАПКА/picked.txt`. Ключ — FNV-1a пути (как у ядра,
 //!   `ui::wallpaper`).
+//! - `wallconv choose file|folder ЗАПИСКА [НАЧАЛО]` — только выбор (папка с
+//!   фото или картинка для заставки): путь — строкой в ЗАПИСКУ; переводит
+//!   потом `conv`, заранее, под каждый монитор (`ui::saver`).
 //!
 //! Понимает JPEG (базовый и прогрессивный, `zune-jpeg`), PNG (8/16 бит,
 //! палитра, серый, альфа; без черезстрочности), BMP (24/32 бита, палитра 8
@@ -88,13 +91,69 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
             let cover = cover_arg(args.get(3), args.get(4));
             exit(pick(&dir, cover));
         }
+        Some("choose") => {
+            let (Some(what), Some(note)) = (args.get(2), args.get(3).map(unpct)) else {
+                usage();
+            };
+            exit(choose(what == "folder", &note, args.get(4).map(unpct).as_deref()));
+        }
         _ => usage(),
     }
 }
 
 fn usage() -> ! {
-    println("usage: wallconv conv IN OUT.qoi [W H] | wallconv pick DIR [W H] (paths with %20 for spaces)");
+    println("usage: wallconv conv IN OUT.qoi [W H] | wallconv pick DIR [W H] | wallconv choose file|folder NOTE [START] (paths with %20 for spaces)");
     exit(2);
+}
+
+/// Заставка (22.11): окно «Открыть» — папка с фото или одна картинка;
+/// выбранный путь — строкой в `note`. Переводит выбранное потом ядро, заранее
+/// и под каждый монитор (`ui::saver`).
+fn choose(folder: bool, note: &str, start: Option<&str>) -> i64 {
+    let mut options = if folder { Options::folder() } else { Options::open() };
+    options.title = Some(String::from(if folder { "Папка с фото для заставки" } else { "Фото для заставки" }));
+    let home = user_progs::filedlg::home_dir();
+    let pictures = format!("{home}/Pictures");
+    for dir in [start.unwrap_or(""), pictures.as_str()] {
+        if dir.is_empty() {
+            continue;
+        }
+        let fd = open(dir);
+        if fd >= 0 {
+            close(fd);
+            options.dir = Some(String::from(dir));
+            break;
+        }
+    }
+    if !folder {
+        options.filters = alloc::vec![
+            Filter::new("Изображения", &["jpg", "jpeg", "png", "bmp", "qoi"]),
+            Filter::all(),
+        ];
+    }
+    let dialog = match Dialog::start_owned(&options, 0, "wallconv") {
+        Ok(dialog) => dialog,
+        Err(why) => {
+            println(&format!("wallconv: file dialog: {why}"));
+            return 1;
+        }
+    };
+    let path = match dialog.wait() {
+        Outcome::Chosen(path) => path,
+        _ => {
+            println("wallconv: nothing chosen");
+            return 3;
+        }
+    };
+    let fd = open_write(note, true, true);
+    if fd < 0 {
+        println(&format!("wallconv: cannot write {note}"));
+        return 1;
+    }
+    write(fd, path.as_bytes());
+    close(fd);
+    println(&format!("wallconv: chosen {path}"));
+    0
 }
 
 /// Что картинка обязана закрыть: размер монитора от ядра, не больше 4K.

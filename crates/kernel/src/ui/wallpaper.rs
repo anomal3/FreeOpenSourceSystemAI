@@ -309,7 +309,7 @@ pub fn apply(deed: WallDeed) -> (String, Result<(), crate::vfs::VfsError>) {
 /// Каталог кэша переведённых картинок: `/var/cache/wallpaper`, а где `/var`
 /// нет (запуск стендом без установки) — `/tmp/wallpaper`. Писать туда должна
 /// программа сеанса, поэтому каталог открыт всем на запись, как `/tmp`.
-fn cache_dir() -> &'static str {
+pub(super) fn cache_dir() -> &'static str {
     if let Some(dir) = STATE.lock().cache {
         return dir;
     }
@@ -329,7 +329,7 @@ fn cache_dir() -> &'static str {
 }
 
 /// FNV-1a, 64 бита (тот же счёт у `wallconv pick`).
-fn fnv1a64(data: &[u8]) -> u64 {
+pub(super) fn fnv1a64(data: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in data {
         hash ^= u64::from(byte);

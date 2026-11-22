@@ -389,6 +389,8 @@ pub fn idle_tick() -> bool {
     }
 
     let now = crate::time::uptime_ms();
+    // Фото заставки переводятся заранее, в фоне (`ui::saver::prepare_tick`).
+    crate::ui::saver::prepare_tick(now.saturating_sub(last));
     // Заставка (22.11): любой ввод её убирает (клавиши и мышь стола — сразу,
     // сами; здесь — серийная линия и остальное); иначе — её виток.
     let saver_up = crate::ui::saver::is_up();

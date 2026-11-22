@@ -15,9 +15,18 @@
 //! выжигалось. Первая клавиша или щелчок только убирают заставку: до программ
 //! они не доходят ([`swallow_key`], для мыши — `WAKE_TOUCH` стола).
 //!
-//! Фото — QOI (`.qoi`): других распаковщиков картинок в ядре нет (JPEG/PNG —
-//! TODO в ROADMAP). Без своей папки — [`GALLERY`], а если там пусто — обои
-//! FossAi из ядра.
+//! # Фото
+//!
+//! Любые JPEG/PNG/BMP/QOI: ядро само читает только QOI, остальное переводит
+//! та же программа, что и обои (`/bin/wallconv conv`), в тот же кэш
+//! (`ui::wallpaper::cache_dir`, подкаталог `saver/`) — под размер каждого
+//! монитора. Переводит заранее, в фоне ([`prepare_tick`]): сразу после смены
+//! настроек, иначе — когда за машиной [`AHEAD_IDLE_MS`] никого нет, и пока
+//! заставка на экране (следующие фото показа). Кэш ограничен окном
+//! [`WINDOW`] фото от текущего: лишнее удаляется. Не переведённое ещё фото
+//! заменяет уже готовое из списка, а нет ни одного — обои FossAi из ядра.
+//! Без своего выбора — галерея обоев [`GALLERY`]. Смена фото — плавная
+//! ([`FADE_MS`]).
 
 use alloc::format;
 use alloc::string::String;
@@ -46,6 +55,12 @@ const INK: u32 = 225;
 const DRIFT_MS: u64 = 250;
 /// Самый большой файл фото, который стоит читать.
 const MAX_PHOTO: usize = 96 << 20;
+/// Сколько фото показа (от текущего) держать переведёнными.
+const WINDOW: usize = 8;
+/// Без срочности переводить, только когда никого нет столько (мс).
+const AHEAD_IDLE_MS: u64 = 5_000;
+/// Сколько длится смена фото (мс).
+const FADE_MS: u64 = 900;
 
 // ---------------------------------------------------------------------------
 // Настройки (desktop.cfg)
@@ -116,7 +131,7 @@ static COLOR: AtomicU32 = AtomicU32::new(0x0B_12_20);
 static CLOCK: AtomicBool = AtomicBool::new(true);
 static INFO: AtomicBool = AtomicBool::new(false);
 static LOCK: AtomicBool = AtomicBool::new(false);
-/// Папка или один файл `.qoi`; пусто — [`GALLERY`] или обои FossAi.
+/// Папка или один файл картинки; пусто — [`GALLERY`] или обои FossAi.
 static SOURCE: SpinLock<String> = SpinLock::new(String::new());
 
 /// Всё сразу — для страницы «Параметров».
@@ -133,6 +148,12 @@ pub struct Settings {
     pub lock: bool,
     /// Откуда фото — словами.
     pub source: String,
+    /// Выбрана галерея обоев (своего выбора нет).
+    pub gallery: bool,
+    /// Своё — папка (`false` — одна картинка).
+    pub folder: bool,
+    /// Что с переводом фото — словами; `None` — всё готово.
+    pub preparing: Option<String>,
 }
 
 #[must_use]
@@ -148,6 +169,15 @@ pub fn settings() -> Settings {
         info: INFO.load(Ordering::Relaxed),
         lock: LOCK.load(Ordering::Relaxed),
         source: playlist().1,
+        gallery: {
+            let source = SOURCE.lock();
+            source.is_empty() || source.trim_end_matches('/') == GALLERY
+        },
+        folder: {
+            let source = SOURCE.lock().clone();
+            !source.is_empty() && matches!(crate::fs::list(&source), Some(Ok(_)))
+        },
+        preparing: preparing(),
     }
 }
 
@@ -202,6 +232,8 @@ pub fn adopt(text: &str, path: &str) {
     if let Some(source) = sysconf::value(text, "saver_source") {
         *SOURCE.lock() = String::from(source.trim());
     }
+    // Фото переведутся заранее, при первом простое.
+    mark(false);
     if seen {
         kprintln!("  saver       : {} from {path}", describe());
     }
@@ -241,8 +273,12 @@ pub enum Deed {
     Enable(bool),
     After(u32),
     Kind(Kind),
-    /// Следующая папка с фото (по кругу).
-    NextSource,
+    /// Фото — галерея обоев.
+    Gallery,
+    /// Выбрать папку с фото в окне «Открыть» (`/bin/filedlg`).
+    PickFolder,
+    /// Выбрать одну картинку в окне «Открыть».
+    PickPicture,
     Fit(Fit),
     Every(u32),
     Color(u32),
@@ -257,6 +293,7 @@ pub fn apply(deed: Deed) -> Result<String, String> {
     let (saved, said) = match deed {
         Deed::Enable(on) => {
             ENABLED.store(on, Ordering::Relaxed);
+            mark(true);
             (store("saver", on_off(on)), String::from(if on { "заставка включена" } else { "заставка выключена" }))
         }
         Deed::After(seconds) => {
@@ -265,12 +302,19 @@ pub fn apply(deed: Deed) -> Result<String, String> {
         }
         Deed::Kind(kind) => {
             PHOTO.store(kind == Kind::Photo, Ordering::Relaxed);
+            mark(true);
             (store("saver_kind", if kind == Kind::Photo { "photo" } else { "color" }), String::from("вид заставки запомнен"))
         }
-        Deed::NextSource => {
-            let next = next_source();
-            *SOURCE.lock() = next.clone();
-            (store("saver_source", &next), format!("фото: {}", playlist().1))
+        Deed::Gallery => {
+            SOURCE.lock().clear();
+            mark(true);
+            (store("saver_source", ""), format!("фото: {}", playlist().1.to_lowercase()))
+        }
+        Deed::PickFolder | Deed::PickPicture => {
+            let folder = deed == Deed::PickFolder;
+            return start_choose(folder).map(|()| {
+                String::from(if folder { "выберите папку с фото в окне «Открыть»" } else { "выберите фото в окне «Открыть»" })
+            });
         }
         Deed::Fit(fit) => {
             FIT.store(Fit::ALL.iter().position(|f| *f == fit).unwrap_or(0) as u8, Ordering::Relaxed);
@@ -320,7 +364,7 @@ pub fn command(words: &str) {
     let result = match word {
         "" => {
             kprintln!("  saver       : {}", describe());
-            kprintln!("  usage: power saver on [s]|off|after <s>|photo [path]|color [rrggbb]|fit fill|fit|stretch|center|every <s>|clock on|off|info on|off|lock on|off|preview");
+            kprintln!("  usage: power saver on [s]|off|after <s>|photo [path|gallery]|choose folder|file|cache|color [rrggbb]|fit fill|fit|stretch|center|every <s>|clock on|off|info on|off|lock on|off|preview");
             return;
         }
         "on" => {
@@ -336,10 +380,18 @@ pub fn command(words: &str) {
         },
         "photo" => {
             if let Some(path) = arg {
-                *SOURCE.lock() = String::from(if path == "default" { "" } else { path });
+                *SOURCE.lock() = String::from(if path == "default" || path == "gallery" { "" } else { path });
                 let _ = store("saver_source", &SOURCE.lock().clone());
             }
             apply(Deed::Kind(Kind::Photo))
+        }
+        "choose" => apply(if arg == Some("file") { Deed::PickPicture } else { Deed::PickFolder }),
+        "cache" => {
+            kprintln!("  saver       : cache {} ({})", saver_dir(), preparing().unwrap_or_else(|| String::from("all photos ready")));
+            for (name, bytes) in cache_files() {
+                kprintln!("  saver       :   {name} {} KiB", bytes / 1024);
+            }
+            return;
         }
         "color" => {
             if let Some(rgb) = arg.and_then(|a| u32::from_str_radix(a.trim_start_matches('#'), 16).ok()) {
@@ -371,14 +423,15 @@ pub fn command(words: &str) {
 // Откуда фото
 // ---------------------------------------------------------------------------
 
-/// Фото, которое ядро распакует: `.qoi`, но не уменьшенная копия галереи
-/// (`*.thumb.qoi` рядом с JPEG — для значков выбора обоев).
+/// Фото, которое переведёт `wallconv`: JPEG, PNG, BMP, QOI — но не
+/// уменьшенная копия галереи (`*.thumb.qoi` рядом с JPEG — для значков
+/// выбора обоев).
 fn is_picture(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".qoi") && !lower.ends_with(".thumb.qoi")
+    [".jpg", ".jpeg", ".png", ".bmp", ".qoi"].iter().any(|ext| lower.ends_with(ext)) && !lower.ends_with(".thumb.qoi")
 }
 
-/// Файлы `.qoi` каталога по имени; не каталог — пусто.
+/// Фото каталога по имени; не каталог — пусто.
 fn pictures_in(dir: &str) -> Vec<String> {
     let Some(Ok(entries)) = crate::fs::list(dir) else {
         return Vec::new();
@@ -397,7 +450,7 @@ fn playlist() -> (Vec<String>, String) {
     let source = SOURCE.lock().clone();
     if source.is_empty() {
         let list = pictures_in(GALLERY);
-        return if list.is_empty() { (list, String::from("обои FossAi")) } else { (list, String::from(GALLERY)) };
+        return if list.is_empty() { (list, String::from("Обои FossAi")) } else { (list, String::from("Галерея обоев")) };
     }
     if is_picture(&source) && crate::fs::list(&source).is_none_or(|r| r.is_err()) {
         return (alloc::vec![source.clone()], source);
@@ -406,28 +459,332 @@ fn playlist() -> (Vec<String>, String) {
     if list.is_empty() { (list, format!("{source} (пусто — обои FossAi)")) } else { (list, source) }
 }
 
-/// Папки, которые предлагает кнопка «Сменить»: по умолчанию, галерея,
-/// «Изображения» дома, стол — те, где есть фото, — и выбранная командой.
-fn next_source() -> String {
-    let home = super::context::home_dir();
-    let mut options: Vec<String> = alloc::vec![String::new()];
-    for dir in [
-        String::from(GALLERY),
-        format!("{home}/Изображения"),
-        format!("{home}/Pictures"),
-        super::context::desktop_dir(),
-        format!("{home}/Загрузки"),
-    ] {
-        if !pictures_in(&dir).is_empty() && !options.contains(&dir) {
-            options.push(dir);
+// ---------------------------------------------------------------------------
+// Перевод фото заранее (`/bin/wallconv`, кэш обоев)
+// ---------------------------------------------------------------------------
+
+/// Что делает запущенная программа.
+#[derive(Clone)]
+enum Work {
+    /// Перевод `source` в `output` (размер монитора).
+    Convert { source: String, output: String },
+    /// Окно выбора: путь окажется в записке.
+    Choose { note: String },
+}
+
+struct Prep {
+    job: Option<(crate::sched::TaskId, Work, u64)>,
+    /// Что перевести: источник, файл кэша, размер.
+    queue: Vec<(String, String, u32, u32)>,
+    /// Пересобрать очередь; `urgent` — не ждать простоя (настройки сменили).
+    dirty: bool,
+    urgent: bool,
+    /// Файлы кэша, которые в эту загрузку не получились: не пытаться снова.
+    failed: Vec<String>,
+    /// Размеры мониторов, под которые собрана очередь.
+    sizes: Vec<(u32, u32)>,
+    checked_ms: u64,
+    /// Каталог кэша, когда уже создан.
+    dir: Option<String>,
+}
+
+static PREP: SpinLock<Prep> = SpinLock::new(Prep {
+    job: None,
+    queue: Vec::new(),
+    dirty: false,
+    urgent: false,
+    failed: Vec::new(),
+    sizes: Vec::new(),
+    checked_ms: 0,
+    dir: None,
+});
+
+/// Пересобрать очередь перевода: `urgent` — сразу, иначе при простое.
+fn mark(urgent: bool) {
+    let mut prep = PREP.lock();
+    prep.dirty = true;
+    prep.urgent |= urgent;
+}
+
+/// Каталог переведённых фото заставки — подкаталог кэша обоев, открытый
+/// программе сеанса на запись, как и он.
+fn saver_dir() -> String {
+    if let Some(dir) = PREP.lock().dir.clone() {
+        return dir;
+    }
+    let dir = format!("{}/saver", super::wallpaper::cache_dir());
+    let root = crate::vfs::perm::Credentials::ROOT;
+    let _ = crate::fs::mkdir_as(root, &dir, 0o1777);
+    let _ = crate::fs::chmod_as(root, &dir, 0o1777);
+    PREP.lock().dir = Some(dir.clone());
+    dir
+}
+
+/// Размер, под который переводится фото монитора (`wallconv` больше 4K не
+/// делает).
+fn size_key(w: u32, h: u32) -> (u32, u32) {
+    (w.min(3840), h.min(2160))
+}
+
+fn cache_file(source: &str, w: u32, h: u32) -> String {
+    let (w, h) = size_key(w, h);
+    format!("{}/{:016x}-{w}x{h}.qoi", saver_dir(), super::wallpaper::fnv1a64(source.as_bytes()))
+}
+
+fn exists(path: &str) -> bool {
+    matches!(crate::fs::read(path, 16), Some(Ok(_)))
+}
+
+/// Готовый QOI фото `source` под монитор `w`×`h`: свой кэш, обои того же
+/// размера или сам файл, если он уже QOI.
+fn ready_file(source: &str, w: u32, h: u32) -> Option<String> {
+    let own = cache_file(source, w, h);
+    if exists(&own) {
+        return Some(own);
+    }
+    let (kw, kh) = size_key(w, h);
+    let wall = format!("{}/{:016x}-{kw}x{kh}.qoi", super::wallpaper::cache_dir(), super::wallpaper::fnv1a64(source.as_bytes()));
+    if exists(&wall) {
+        return Some(wall);
+    }
+    source.to_ascii_lowercase().ends_with(".qoi").then(|| String::from(source))
+}
+
+/// Файлы кэша заставки и их размер.
+fn cache_files() -> Vec<(String, usize)> {
+    let dir = saver_dir();
+    let Some(Ok(entries)) = crate::fs::list(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind == crate::vfs::NodeKind::File)
+        .map(|entry| {
+            let size = entry.size as usize;
+            (format!("{dir}/{}", entry.name), size)
+        })
+        .collect()
+}
+
+/// Сколько фото ещё переводится — словами; `None` — всё готово.
+fn preparing() -> Option<String> {
+    let prep = PREP.lock();
+    let converting = matches!(prep.job, Some((_, Work::Convert { .. }, _)));
+    let left = prep.queue.len() + usize::from(converting);
+    (left > 0).then(|| format!("готовится фото: осталось {left}"))
+}
+
+/// Размеры мониторов стола; `None` — стол занят или его нет.
+fn monitor_sizes() -> Option<Vec<(u32, u32)>> {
+    let rects = super::with_desktop(|desktop| desktop.output_rects().to_vec())?;
+    let mut sizes: Vec<(u32, u32)> = rects.iter().filter(|r| r.w > 0 && r.h > 0).map(|r| size_key(r.w, r.h)).collect();
+    sizes.sort_unstable();
+    sizes.dedup();
+    (!sizes.is_empty()).then_some(sizes)
+}
+
+/// Собрать очередь: [`WINDOW`] фото от текущего под каждый размер монитора;
+/// всё остальное в кэше заставки — удалить (кэш ограничен окном).
+fn plan() {
+    let (list, _) = playlist();
+    let sizes = PREP.lock().sizes.clone();
+    if sizes.is_empty() {
+        return;
+    }
+    let index = INDEX.load(Ordering::Relaxed);
+    let count = list.len().min(WINDOW);
+    let mut wanted: Vec<String> = Vec::new();
+    let mut queue = Vec::new();
+    let failed = PREP.lock().failed.clone();
+    for i in 0..count {
+        let source = &list[(index + i) % list.len()];
+        for &(w, h) in &sizes {
+            let output = cache_file(source, w, h);
+            wanted.push(output.clone());
+            if ready_file(source, w, h).is_none() && !failed.contains(&output) {
+                queue.push((source.clone(), output, w, h));
+            }
         }
     }
-    let current = SOURCE.lock().clone();
-    if !options.contains(&current) {
-        options.push(current.clone());
+    let busy = match &PREP.lock().job {
+        Some((_, Work::Convert { output, .. }, _)) => Some(output.clone()),
+        _ => None,
+    };
+    let mut removed = 0;
+    for (path, _) in cache_files() {
+        // Недописанные файлы программы и то, что она пишет сейчас, — её.
+        if wanted.contains(&path) || busy.as_deref().is_some_and(|b| path.starts_with(b)) || !path.ends_with(".qoi") {
+            continue;
+        }
+        if crate::fs::remove_as(crate::vfs::perm::Credentials::ROOT, &path).is_some_and(|r| r.is_ok()) {
+            removed += 1;
+        }
     }
-    let at = options.iter().position(|o| *o == current).unwrap_or(0);
-    options[(at + 1) % options.len()].clone()
+    queue.retain(|(_, output, _, _)| busy.as_deref() != Some(output.as_str()));
+    let mut prep = PREP.lock();
+    if !queue.is_empty() || removed > 0 {
+        kprintln!("  saver       : {} photo(s) to prepare for {:?}, {removed} stale removed from the cache", queue.len(), sizes);
+    }
+    if queue.is_empty() && prep.job.is_none() {
+        prep.urgent = false;
+    }
+    prep.queue = queue;
+    prep.dirty = false;
+}
+
+/// Перерисовать «Параметры», если открыты (сменился выбор или ход перевода).
+fn refresh_settings() {
+    super::with_desktop(|desktop| {
+        if let Some(window) = desktop.find(super::App::Settings) {
+            window.refresh_settings();
+            desktop.present();
+        }
+    });
+}
+
+fn start_choose(folder: bool) -> Result<(), String> {
+    if matches!(PREP.lock().job, Some((_, Work::Choose { .. }, _))) {
+        return Err(String::from("окно выбора уже открыто"));
+    }
+    let note = format!("{}/chosen.txt", saver_dir());
+    let _ = crate::fs::remove_as(crate::vfs::perm::Credentials::ROOT, &note);
+    let current = SOURCE.lock().clone();
+    // Начать там, откуда фото сейчас: папка — она, картинка — её папка.
+    let start = if current.is_empty() {
+        String::from(GALLERY)
+    } else if matches!(crate::fs::list(&current), Some(Ok(_))) {
+        current
+    } else {
+        current.rsplit_once('/').map_or(current.clone(), |(dir, _)| String::from(dir))
+    };
+    let line = format!("/bin/wallconv choose {} {} {}", if folder { "folder" } else { "file" }, super::panel::pct(&note), super::panel::pct(&start));
+    match crate::user::spawn(&line, crate::user::session::credentials()) {
+        Ok(task) => {
+            kprintln!("  saver       : started '{line}' as {task}");
+            let mut prep = PREP.lock();
+            // Перевод, если шёл, доведёт свою программу сам; очередь подождёт.
+            if let Some((old, Work::Convert { source, .. }, _)) = prep.job.take() {
+                kprintln!("  saver       : conversion of {source} ({old}) left running in the background");
+                prep.dirty = true;
+            }
+            prep.job = Some((task, Work::Choose { note }, crate::time::uptime_ms()));
+            Ok(())
+        }
+        Err(err) => {
+            kprintln!("  saver       : cannot start '{line}': {err}");
+            Err(format!("окно выбора не открылось: {err}"))
+        }
+    }
+}
+
+/// Перевод фото, пока за машиной никого нет (зовёт `power::idle_tick`, вне
+/// замка стола): запустить следующую программу, дождаться её, принять выбор
+/// из окна «Открыть».
+pub fn prepare_tick(idle_ms: u64) {
+    let now = crate::time::uptime_ms();
+    let job = PREP.lock().job.clone();
+    if let Some((task, work, started)) = job {
+        let running = matches!(crate::sched::lookup(task), Some((_, state)) if state != crate::sched::TaskState::Finished);
+        if running {
+            return;
+        }
+        PREP.lock().job = None;
+        finish(work, now.saturating_sub(started));
+    }
+    if !ENABLED.load(Ordering::Relaxed) || !PHOTO.load(Ordering::Relaxed) {
+        return;
+    }
+    let up = is_up();
+    let (check, urgent) = {
+        let prep = PREP.lock();
+        (now >= prep.checked_ms + 3000 || prep.sizes.is_empty(), prep.urgent)
+    };
+    if check {
+        PREP.lock().checked_ms = now;
+        if let Some(sizes) = monitor_sizes() {
+            let mut prep = PREP.lock();
+            if prep.sizes != sizes {
+                prep.sizes = sizes;
+                prep.dirty = true;
+            }
+        }
+    }
+    if !(urgent || up || idle_ms >= AHEAD_IDLE_MS) {
+        return;
+    }
+    if PREP.lock().dirty {
+        plan();
+    }
+    // Обои переводятся — их программа первая (обе держат по сотне мегабайт).
+    if PREP.lock().job.is_some() || super::wallpaper::busy() {
+        return;
+    }
+    let next = {
+        let mut prep = PREP.lock();
+        if prep.queue.is_empty() { None } else { Some(prep.queue.remove(0)) }
+    };
+    let Some((source, output, w, h)) = next else {
+        return;
+    };
+    let line = format!("/bin/wallconv conv {} {} {w} {h}", super::panel::pct(&source), super::panel::pct(&output));
+    match crate::user::spawn(&line, crate::user::session::credentials()) {
+        Ok(task) => {
+            kprintln!("  saver       : started '{line}' as {task}");
+            PREP.lock().job = Some((task, Work::Convert { source, output }, now));
+        }
+        Err(err) => {
+            kprintln!("  saver       : cannot start '{line}': {err}");
+            PREP.lock().failed.push(output);
+        }
+    }
+}
+
+/// Программа закончила.
+fn finish(work: Work, took: u64) {
+    match work {
+        Work::Convert { source, output } => {
+            if exists(&output) {
+                kprintln!("  saver       : photo {source} prepared in {took} ms");
+                // Заставка показывает замену — поставить настоящее фото.
+                if is_up() && FALLBACK.load(Ordering::Relaxed) {
+                    REBUILD.store(true, Ordering::Relaxed);
+                }
+            } else {
+                kprintln!("  saver       : photo {source} did not convert");
+                PREP.lock().failed.push(output);
+            }
+            let mut prep = PREP.lock();
+            if prep.queue.is_empty() && !prep.dirty {
+                prep.urgent = false;
+                drop(prep);
+                kprintln!("  saver       : all photos prepared");
+            }
+            refresh_settings();
+        }
+        Work::Choose { note } => {
+            let chosen = match crate::fs::read(&note, 4096) {
+                Some(Ok((bytes, _))) => String::from_utf8(bytes).ok().map(|text| String::from(text.trim())).filter(|text| !text.is_empty()),
+                _ => None,
+            };
+            let _ = crate::fs::remove_as(crate::vfs::perm::Credentials::ROOT, &note);
+            match chosen {
+                Some(path) => {
+                    kprintln!("  saver       : photos from {path} (chosen in {took} ms)");
+                    *SOURCE.lock() = path.clone();
+                    INDEX.store(0, Ordering::Relaxed);
+                    PREP.lock().failed.clear();
+                    if let Err(err) = store("saver_source", &path) {
+                        kprintln!("  saver       : not saved: {err}");
+                    }
+                    PHOTO.store(true, Ordering::Relaxed);
+                    let _ = store("saver_kind", "photo");
+                }
+                None => kprintln!("  saver       : choice cancelled"),
+            }
+            mark(true);
+            refresh_settings();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +901,9 @@ pub struct Shown {
     pos: (i32, i32),
     vel: (i32, i32),
     preview: bool,
+    /// Прежние фоны, пока идёт смена фото, и сколько нового видно (из 255).
+    old: Option<Vec<Out>>,
+    fade: u32,
 }
 
 /// Смещение тени надписи.
@@ -614,6 +974,24 @@ impl Shown {
             match &out.base {
                 Some(base) => back.blit_from(base, (part.x, part.y + dy), part.translate(-out.rect.x, -out.rect.y)),
                 None => back.fill(Rect::new(part.x, part.y + dy, part.w, part.h), out.color),
+            }
+            // Смена фото: прежний фон поверх, всё прозрачнее.
+            if let Some(old) = self.old.as_ref().and_then(|old| old.iter().find(|o| o.rect == out.rect)) {
+                let alpha = 255 - self.fade.min(255);
+                if alpha > 0 {
+                    let color = old.color.pixel();
+                    for y in part.y..part.bottom() {
+                        let from = old.base.as_ref().map(|base| &base.row((y - out.rect.y) as u32)[(part.x - out.rect.x) as usize..]);
+                        let row = back.row_mut((y + dy) as u32);
+                        let Some(line) = row.get_mut(part.x as usize..part.right() as usize) else {
+                            continue;
+                        };
+                        for (i, pixel) in line.iter_mut().enumerate() {
+                            let was = from.and_then(|f| f.get(i).copied()).unwrap_or(color);
+                            *pixel = blend(*pixel, was, alpha);
+                        }
+                    }
+                }
             }
             if self.mask.w == 0 {
                 continue;
@@ -742,17 +1120,27 @@ fn build_outs(rects: &[Rect], index: usize) -> (Vec<Out>, Option<String>) {
     let color = Color::rgb((settings.color >> 16) as u8, (settings.color >> 8) as u8, settings.color as u8);
     let list = if settings.kind == Kind::Photo { Some(playlist().0) } else { None };
     let mut first = None;
+    let mut fallback = false;
     let outs = rects
         .iter()
         .enumerate()
         .map(|(n, rect)| {
             let base = list.as_ref().and_then(|list| {
                 let mut surface = Surface::new(rect.w, rect.h, BLACK)?;
-                let path = (!list.is_empty()).then(|| list[(index + n) % list.len()].as_str());
-                if n == 0 {
-                    first = path.map(String::from);
+                // Своё фото монитора, а не переведено ещё — любое готовое из
+                // списка (по порядку от него).
+                let len = list.len();
+                let ready = (0..len.min(WINDOW)).find_map(|k| {
+                    let source = &list[(index + n + k) % len];
+                    ready_file(source, rect.w, rect.h).map(|file| (source.clone(), file, k))
+                });
+                if len > 0 && ready.as_ref().is_none_or(|(_, _, k)| *k > 0) {
+                    fallback = true;
                 }
-                let painted = path.is_some_and(|path| paint_file(path, &mut surface, settings.fit)) || super::wallart::paint(&mut surface);
+                if n == 0 {
+                    first = ready.as_ref().map(|(source, _, _)| source.clone());
+                }
+                let painted = ready.is_some_and(|(_, file, _)| paint_file(&file, &mut surface, settings.fit)) || super::wallart::paint(&mut surface);
                 if !painted {
                     return None;
                 }
@@ -763,6 +1151,7 @@ fn build_outs(rects: &[Rect], index: usize) -> (Vec<Out>, Option<String>) {
             Out { rect: *rect, base, color: if list.is_some() { Color::rgb(0x10, 0x18, 0x28) } else { color } }
         })
         .collect();
+    FALLBACK.store(fallback, Ordering::Relaxed);
     (outs, first)
 }
 
@@ -851,6 +1240,11 @@ static INDEX: AtomicUsize = AtomicUsize::new(0);
 static NEXT_PHOTO_MS: AtomicU64 = AtomicU64::new(0);
 static MOVED_MS: AtomicU64 = AtomicU64::new(0);
 static CHECKED_MS: AtomicU64 = AtomicU64::new(0);
+/// На экране замена (фото ещё не переведено): готово — пересобрать фоны.
+static FALLBACK: AtomicBool = AtomicBool::new(false);
+static REBUILD: AtomicBool = AtomicBool::new(false);
+/// Когда началась смена фото (мс), 0 — не идёт.
+static FADE_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Показать заставку. `false` — не вышло (стола нет или он занят): срок
 /// проверится снова на следующем витке.
@@ -866,7 +1260,9 @@ pub fn start(preview: bool) -> bool {
     let index = INDEX.load(Ordering::Relaxed);
     let (outs, first) = build_outs(&rects, index);
     let (mask, key) = build_mask(height);
-    let shown = Shown { outs, mask, pos: (120, 700), vel: (1, -1), preview };
+    let shown = Shown { outs, mask, pos: (120, 700), vel: (1, -1), preview, old: None, fade: 255 };
+    FADE_AT.store(0, Ordering::Relaxed);
+    REBUILD.store(false, Ordering::Relaxed);
     let count = rects.len();
     let installed = super::with_desktop(move |desktop| {
         desktop.saver_set(Some(shown));
@@ -877,6 +1273,7 @@ pub fn start(preview: bool) -> bool {
         return false;
     }
     UP.store(true, Ordering::Relaxed);
+    mark(false);
     *RECTS.lock() = rects;
     *KEY.lock() = key;
     let now = crate::time::uptime_ms();
@@ -930,25 +1327,54 @@ pub fn end_on(desktop: &mut super::compositor::Compositor) {
 pub fn tick() {
     let now = crate::time::uptime_ms();
     // Слайд-шоу: фоны собираются вне замка стола (распаковка — десятки мс).
-    if PHOTO.load(Ordering::Relaxed) && now >= NEXT_PHOTO_MS.load(Ordering::Relaxed) {
+    let next = PHOTO.load(Ordering::Relaxed) && now >= NEXT_PHOTO_MS.load(Ordering::Relaxed);
+    // Фото перевелось, а на экране замена — поставить его, не дожидаясь срока.
+    let rebuild = PHOTO.load(Ordering::Relaxed) && REBUILD.swap(false, Ordering::Relaxed);
+    if next || rebuild {
         NEXT_PHOTO_MS.store(now + u64::from(EVERY.load(Ordering::Relaxed)) * 1000, Ordering::Relaxed);
         let rects = RECTS.lock().clone();
-        if playlist().0.len() > 1 && !rects.is_empty() {
-            let index = INDEX.fetch_add(rects.len(), Ordering::Relaxed) + rects.len();
+        let count = playlist().0.len();
+        if (rebuild || count > 1) && !rects.is_empty() {
+            let index = if rebuild { INDEX.load(Ordering::Relaxed) } else { INDEX.fetch_add(rects.len(), Ordering::Relaxed) + rects.len() };
+            // Окно переведённых фото сдвинулось: следующие — заранее.
+            mark(false);
             let (outs, first) = build_outs(&rects, index);
             let swapped = super::with_desktop(move |desktop| {
                 let Some(shown) = desktop.saver_mut() else {
                     return false;
                 };
-                shown.outs = outs;
+                // Прежний фон уходит плавно (FADE_MS); идущая смена — сразу.
+                shown.old = Some(core::mem::replace(&mut shown.outs, outs));
+                shown.fade = 0;
                 desktop.repaint_all();
                 desktop.present();
                 true
             });
             if swapped == Some(true) {
-                kprintln!("  saver       : next picture {}", first.unwrap_or_default());
+                FADE_AT.store(now.max(1), Ordering::Relaxed);
+                kprintln!("  saver       : {} picture {}", if rebuild { "prepared" } else { "next" }, first.unwrap_or_default());
             }
         }
+    }
+    // Смена фото: шаг затухания прежнего на каждом витке.
+    let fade_at = FADE_AT.load(Ordering::Relaxed);
+    if fade_at != 0 {
+        let elapsed = now.saturating_sub(fade_at);
+        let fade = if elapsed >= FADE_MS { 255 } else { (elapsed * 255 / FADE_MS) as u32 };
+        if fade >= 255 {
+            FADE_AT.store(0, Ordering::Relaxed);
+        }
+        super::with_desktop(move |desktop| {
+            let Some(shown) = desktop.saver_mut() else {
+                return;
+            };
+            shown.fade = fade;
+            if fade >= 255 {
+                shown.old = None;
+            }
+            desktop.repaint_all();
+            desktop.present();
+        });
     }
     let mut mask = None;
     if now >= CHECKED_MS.load(Ordering::Relaxed) + 1000 {
