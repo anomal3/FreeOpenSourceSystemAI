@@ -326,6 +326,14 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // microcode through the started SMC (P3).
             // The third marker (FOSSAI_AMD_RING=1) also starts the CP and tests the GFX ring (P4).
             // The fourth marker (FOSSAI_AMD_GART=1) also enables the GART of VMID0 and tests it (P5).
+            // The fifth marker (FOSSAI_AMD_CS=1): fence, IB and the user VM (VMID 1) test (P5 step 2).
+            if std::env::var("FOSSAI_AMD_CS").is_ok_and(|v| v == "1") {
+                payload.push(Payload {
+                    path: String::from("FREEOS/AMD/CS.TXT"),
+                    data: b"cs\n".to_vec(),
+                    source: PathBuf::from("(FOSSAI_AMD_CS=1)"),
+                });
+            }
             if std::env::var("FOSSAI_AMD_GART").is_ok_and(|v| v == "1") {
                 payload.push(Payload {
                     path: String::from("FREEOS/AMD/GART.TXT"),

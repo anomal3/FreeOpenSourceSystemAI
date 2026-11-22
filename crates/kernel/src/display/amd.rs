@@ -1123,6 +1123,11 @@ pub fn auto_task() {
                 crate::kprintln!("  amdgpu     : auto start: GART.TXT found, testing the GART");
                 let _ = polaris_gart();
             }
+            // The fifth marker (FOSSAI_AMD_CS=1) asks for P5 step 2: fence, IB, user VM (VMID 1).
+            if firmware_file("CS.TXT").is_ok() {
+                crate::kprintln!("  amdgpu     : auto start: CS.TXT found, testing fence, IB and the user VM");
+                let _ = polaris_cs();
+            }
         }
     } else {
         crate::kprintln!("  amdgpu     : auto start: no FREEOS/AMD/UCODE.TXT, microcode not loaded ('amd ucode' by hand)");
@@ -1505,7 +1510,7 @@ const PM4_WRITE_DATA_3: u32 = 0xc003_3700;
 const WRITE_DATA_MEMORY_CONFIRM: u32 = 0x0010_0500;
 /// Область под кольцо — сразу за областью микрокода (2 МиБ + 2 МиБ), 64 КиБ.
 const RING_AREA: u64 = UCODE_AREA + UCODE_AREA_LEN as u64;
-const RING_AREA_LEN: usize = 128 * 1024;
+const RING_AREA_LEN: usize = 256 * 1024;
 const RING_BYTES: usize = 8192;
 const RING_DWORDS: u32 = (RING_BYTES / 4) as u32;
 /// Writeback: слоты rptr и wptr-poll, затем слово для проверки записью в память.
@@ -1902,6 +1907,235 @@ pub fn polaris_gart() -> Vec<String> {
         modify(MM_VM_CONTEXT0_CNTL, 0x1, 0);
         window.wr(MM_VM_INVALIDATE_REQUEST * 4, 1);
         note(String::from("context 0 disabled again"));
+    }
+    lines
+}
+
+// --- Fence, IB и пользовательское адресное пространство (`amd cs`) -----------
+//
+// Этап P5, шаг 2. Источники — `gfx_v8_0.c` (`ring_emit_fence_gfx`,
+// `ring_emit_ib_gfx`, `ring_test_ib`), `gmc_v8_0.c` (`gmc_v8_0_gart_enable`:
+// контексты 1..15, `emit_flush_gpu_tlb`), `amdgpu_vm.c`/`amdgpu_vm_pt.c`
+// (раскладка PD/PT), `amdgpu_vm.h` (`AMDGPU_PTE_*`) (Linux 6.12).
+//
+// Три проверки на уже работающем кольце:
+// 1. fence: `EVENT_WRITE_EOP` пишет число в видеопамять (так драйвер узнаёт, что
+//    GPU закончил);
+// 2. IB: пакет `INDIRECT_BUFFER` (VMID 0) гонит CP по буферу, где `WRITE_DATA`;
+// 3. VMID 1: корень PD и таблица PT в видеопамяти, три страницы: системная и две
+//    видеопамяти (в PTE адрес VRAM — смещением от начала VRAM и MC-адресом с
+//    `vram_start`: в какую сторону трактует железо, по коду Linux однозначно не
+//    выводится); IB исполняется с VMID 1 и пишет по пользовательским адресам.
+// При неудаче контекст 1 снова выключается.
+
+const MM_VM_CONTEXT1_CNTL: usize = 0x505;
+const MM_VM_CONTEXT1_CNTL2: usize = 0x50d;
+const MM_VM_CONTEXT1_PAGE_TABLE_BASE_ADDR: usize = 0x550;
+const MM_VM_CONTEXT1_PAGE_TABLE_START_ADDR: usize = 0x558;
+const MM_VM_CONTEXT1_PAGE_TABLE_END_ADDR: usize = 0x560;
+const MM_VM_CONTEXT1_PROTECTION_FAULT_DEFAULT_ADDR: usize = 0x547;
+const MM_VM_CONTEXT1_PROTECTION_FAULT_STATUS: usize = 0x537;
+const MM_VM_CONTEXT1_PROTECTION_FAULT_MCCLIENT: usize = 0x539;
+const MM_VM_CONTEXT1_PROTECTION_FAULT_ADDR: usize = 0x53f;
+/// `PACKET3(EVENT_WRITE_EOP, 4)`, `PACKET3(INDIRECT_BUFFER, 2)`.
+const PM4_EVENT_WRITE_EOP_4: u32 = 0xc004_4700;
+const PM4_INDIRECT_BUFFER_2: u32 = 0xc002_3f00;
+/// EOP_TCL1_ACTION_EN | EOP_TC_ACTION_EN | EOP_TC_WB_ACTION_EN | EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT = 0x14) | EVENT_INDEX(5).
+const EOP_CONTROL: u32 = (1 << 16) | (1 << 17) | (1 << 15) | 0x14 | (5 << 8);
+/// DATA_SEL(1): записать младшие 32 бита значения; INT_SEL(0): без прерывания.
+const EOP_DATA_SEL_LOW32: u32 = 1 << 29;
+/// Размещение в окне VRAM кольца (после таблицы GART, 0x10000..0x18000).
+const VM_PD_OFFSET: usize = 0x1_8000;
+const VM_PT_OFFSET: usize = 0x1_9000;
+const IB0_OFFSET: usize = 0x1_b000;
+const VM_IB_OFFSET: usize = 0x1_c000;
+const VM_PAGE_A_OFFSET: usize = 0x1_d000;
+const VM_PAGE_B_OFFSET: usize = 0x1_e000;
+const FENCE_SLOT: usize = RING_BYTES + 0x100;
+const IB0_RESULT_SLOT: usize = RING_BYTES + 0x140;
+/// Пользовательский VA: PDE 1, PTE 0..3 (0x400000 + n * 4096); 1 ГиБ (`max_pfn` = 2^18), блок 10 бит.
+const VM_VA: u64 = 0x40_0000;
+const VM_MAX_PFN: u32 = 1 << 18;
+const PTE_VRAM_FLAGS: u64 = PTE_VALID | PTE_READABLE | PTE_WRITEABLE | PTE_EXECUTABLE;
+
+/// Прочитать слово видеопамяти, сбросив перед этим кэш чтения HDP.
+fn vram_word(window: &Window, vram: usize, offset: usize) -> u32 {
+    window.hdp_invalidate();
+    // SAFETY: слово внутри окна VRAM кольца, выровнено.
+    unsafe { core::ptr::read_volatile((vram + offset) as *const u32) }
+}
+
+fn vram_put(vram: usize, offset: usize, value: u32) {
+    // SAFETY: слово внутри окна VRAM кольца, выровнено.
+    unsafe { core::ptr::write_volatile((vram + offset) as *mut u32, value) };
+}
+
+/// Ждать, пока `read()` вернёт `want` (до 100 мс).
+fn wait_for(want: u32, mut read: impl FnMut() -> u32) -> u32 {
+    let mut value = 0;
+    for _ in 0..100_000 {
+        value = read();
+        if value == want {
+            break;
+        }
+        super::nvidia::spin_us(1);
+    }
+    value
+}
+
+/// `amd cs`: fence, IB и пользовательское адресное пространство GPU (VMID 1).
+#[must_use]
+pub fn polaris_cs() -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut note = |text: String| {
+        crate::kprintln!("  amdgpu      : cs: {text}");
+        lines.push(text);
+    };
+    let Some((base, _, _)) = *POLARIS_MMIO.lock() else {
+        note(String::from("no Polaris card was probed"));
+        return lines;
+    };
+    let window = Window(base);
+    let Some((vram, vram_start)) = RING_STATE.lock().as_ref().map(|state| (state.vram, state.vram_start)) else {
+        note(String::from("the ring is not running: run 'amd ring' first"));
+        return lines;
+    };
+    let gpu = |offset: usize| vram_start + RING_AREA + offset as u64;
+    let write_data = |address: u64, value: u32| [PM4_WRITE_DATA_3, WRITE_DATA_MEMORY_CONFIRM, address as u32, (address >> 32) as u32, value];
+
+    // 1. fence: EVENT_WRITE_EOP пишет 0x1234abcd в видеопамять.
+    vram_put(vram, FENCE_SLOT, 0);
+    let fence_address = gpu(FENCE_SLOT);
+    let packets = [
+        PM4_EVENT_WRITE_EOP_4,
+        EOP_CONTROL,
+        fence_address as u32 & !3,
+        ((fence_address >> 32) as u32 & 0xffff) | EOP_DATA_SEL_LOW32,
+        0x1234_abcd,
+        0,
+    ];
+    if let Err(why) = ring_submit(&window, &packets) {
+        note(why);
+        return lines;
+    }
+    let value = wait_for(0x1234_abcd, || vram_word(&window, vram, FENCE_SLOT));
+    if value != 0x1234_abcd {
+        note(format!("FENCE FAILED: VRAM word {value:#x} (expected 0x1234abcd), GRBM_STATUS {:#x}", window.rd(MM_GRBM_STATUS * 4)));
+        return lines;
+    }
+    note(format!("FENCE PASSED: EVENT_WRITE_EOP wrote 0x1234abcd at GPU {fence_address:#x}"));
+
+    // 2. IB (VMID 0): INDIRECT_BUFFER → буфер с WRITE_DATA.
+    vram_put(vram, IB0_RESULT_SLOT, 0);
+    let ib = write_data(gpu(IB0_RESULT_SLOT), 0xa1b2_c3d4);
+    for (index, word) in ib.iter().enumerate() {
+        vram_put(vram, IB0_OFFSET + index * 4, *word);
+    }
+    let ib_address = gpu(IB0_OFFSET);
+    // control: длина в dword | VMID << 24 (VMID 0 — ядро).
+    let packets = [PM4_INDIRECT_BUFFER_2, ib_address as u32 & !3, (ib_address >> 32) as u32 & 0xffff, ib.len() as u32];
+    if let Err(why) = ring_submit(&window, &packets) {
+        note(why);
+        return lines;
+    }
+    let value = wait_for(0xa1b2_c3d4, || vram_word(&window, vram, IB0_RESULT_SLOT));
+    if value != 0xa1b2_c3d4 {
+        note(format!("IB FAILED: VRAM word {value:#x} (expected 0xa1b2c3d4), GRBM_STATUS {:#x}", window.rd(MM_GRBM_STATUS * 4)));
+        return lines;
+    }
+    note(format!("IB PASSED: the CP ran an indirect buffer of {} dwords at GPU {ib_address:#x}", ib.len()));
+
+    // 3. Пользовательское адресное пространство: VMID 1.
+    let (dummy_phys, _) = match system_page(0) {
+        Ok(page) => page,
+        Err(why) => {
+            note(why);
+            return lines;
+        }
+    };
+    let (sys_phys, sys_virt) = match system_page(0x2222_2222) {
+        Ok(page) => page,
+        Err(why) => {
+            note(why);
+            return lines;
+        }
+    };
+    // PD (4 КиБ) и PT (8 КиБ) нулями; PDE 1 → PT; PTE 0..3.
+    for index in 0..(0x1000 + 0x2000) / 4 {
+        vram_put(vram, VM_PD_OFFSET + index * 4, 0);
+    }
+    for (index, word) in [VM_PAGE_A_OFFSET, VM_PAGE_B_OFFSET].iter().enumerate() {
+        vram_put(vram, *word, 0x3333_3333 + index as u32);
+    }
+    let put64 = |offset: usize, value: u64| {
+        vram_put(vram, offset, value as u32);
+        vram_put(vram, offset + 4, (value >> 32) as u32);
+    };
+    let pt_mc = gpu(VM_PT_OFFSET);
+    let pd_mc = gpu(VM_PD_OFFSET);
+    put64(VM_PD_OFFSET + 8, pt_mc | PTE_VALID); // PDE 1 (блок 10 бит: 4 МиБ на запись)
+    let system_flags = PTE_VALID | PTE_SYSTEM | PTE_SNOOPED | PTE_READABLE | PTE_WRITEABLE | PTE_EXECUTABLE;
+    put64(VM_PT_OFFSET, (sys_phys & 0x0000_ffff_ffff_f000) | system_flags); // VA +0x0000: системная страница
+    put64(VM_PT_OFFSET + 8, (((RING_AREA + VM_PAGE_A_OFFSET as u64) & !0xfff) & 0x0000_ffff_ffff_f000) | PTE_VRAM_FLAGS); // +0x1000: VRAM, смещение от начала VRAM
+    put64(VM_PT_OFFSET + 16, (gpu(VM_PAGE_B_OFFSET) & 0x0000_ffff_ffff_f000) | PTE_VRAM_FLAGS); // +0x2000: VRAM, MC-адрес с vram_start
+    put64(VM_PT_OFFSET + 24, (gpu(VM_IB_OFFSET) & 0x0000_ffff_ffff_f000) | PTE_VRAM_FLAGS); // +0x3000: буфер команд (MC-адрес)
+    // Буфер команд: три WRITE_DATA по пользовательским VA.
+    let user_ib: Vec<u32> = [(VM_VA, 0x11aa_22bb), (VM_VA + 0x1000, 0x33cc_44dd), (VM_VA + 0x2000, 0x55ee_66ff)]
+        .iter()
+        .flat_map(|(address, value)| write_data(*address, *value))
+        .collect();
+    for (index, word) in user_ib.iter().enumerate() {
+        vram_put(vram, VM_IB_OFFSET + index * 4, *word);
+    }
+    note(format!(
+        "VM tables: PD at GPU {pd_mc:#x}, PT {pt_mc:#x}, VA {VM_VA:#x}: system page {sys_phys:#x}, VRAM A (offset form), VRAM B (MC form), IB page"
+    ));
+    // Контекст 1: диапазон, корень PD, страница для ошибок, управление (как `gmc_v8_0_gart_enable`).
+    window.wr(MM_VM_CONTEXT1_PAGE_TABLE_START_ADDR * 4, 0);
+    window.wr(MM_VM_CONTEXT1_PAGE_TABLE_END_ADDR * 4, VM_MAX_PFN - 1);
+    window.wr(MM_VM_CONTEXT1_PAGE_TABLE_BASE_ADDR * 4, (pd_mc >> 12) as u32);
+    window.wr(MM_VM_CONTEXT1_PROTECTION_FAULT_DEFAULT_ADDR * 4, (dummy_phys >> 12) as u32);
+    window.wr(MM_VM_CONTEXT1_CNTL2 * 4, 4);
+    // ENABLE_CONTEXT, PAGE_TABLE_DEPTH = 1, *_PROTECTION_FAULT_ENABLE_DEFAULT (диапазон, заглушка, PDE0, VALID,
+    // READ, WRITE, EXECUTE), PAGE_TABLE_BLOCK_SIZE = 10 - 9.
+    let fault_bits: u32 = 0x10 | 0x80 | 0x400 | 0x2000 | 0x1_0000 | 0x8_0000 | 0x40_0000;
+    let control_clear: u32 = 0x1 | 0x6 | fault_bits | 0xf00_0000;
+    let control = window.rd(MM_VM_CONTEXT1_CNTL * 4);
+    window.wr(MM_VM_CONTEXT1_CNTL * 4, (control & !control_clear) | 0x1 | (1 << 1) | fault_bits | (1 << 24));
+    window.hdp_flush();
+    window.wr(MM_VM_INVALIDATE_REQUEST * 4, 1 << 1);
+    super::nvidia::spin_us(100);
+    note(format!("context 1 enabled: CONTEXT1_CNTL {control:#x} -> {:#x}", window.rd(MM_VM_CONTEXT1_CNTL * 4)));
+    // IB исполняется с VMID 1: адрес IB — пользовательский VA.
+    let ib_va = VM_VA + 0x3000;
+    let packets = [PM4_INDIRECT_BUFFER_2, ib_va as u32 & !3, (ib_va >> 32) as u32 & 0xffff, user_ib.len() as u32 | (1 << 24)];
+    if let Err(why) = ring_submit(&window, &packets) {
+        note(why);
+        return lines;
+    }
+    let system = wait_for(0x11aa_22bb, || {
+        // SAFETY: страница выделена выше, прямое отображение.
+        unsafe { core::ptr::read_volatile(sys_virt as *const u32) }
+    });
+    let a = vram_word(&window, vram, VM_PAGE_A_OFFSET);
+    let b = vram_word(&window, vram, VM_PAGE_B_OFFSET);
+    note(format!(
+        "VM RESULT: system page {} ({system:#x}), VRAM A (offset form) {} ({a:#x}), VRAM B (MC form) {} ({b:#x})",
+        if system == 0x11aa_22bb { "PASSED" } else { "FAILED" },
+        if a == 0x33cc_44dd { "PASSED" } else { "no" },
+        if b == 0x55ee_66ff { "PASSED" } else { "no" }
+    ));
+    if system != 0x11aa_22bb && a != 0x33cc_44dd && b != 0x55ee_66ff {
+        note(format!(
+            "fault status {:#x}, address {:#x}, client {:#x}, GRBM_STATUS {:#x}",
+            window.rd(MM_VM_CONTEXT1_PROTECTION_FAULT_STATUS * 4),
+            window.rd(MM_VM_CONTEXT1_PROTECTION_FAULT_ADDR * 4),
+            window.rd(MM_VM_CONTEXT1_PROTECTION_FAULT_MCCLIENT * 4),
+            window.rd(MM_GRBM_STATUS * 4)
+        ));
+        window.wr(MM_VM_CONTEXT1_CNTL * 4, control & !0x1);
+        window.wr(MM_VM_INVALIDATE_REQUEST * 4, 1 << 1);
+        note(String::from("context 1 disabled again"));
     }
     lines
 }
