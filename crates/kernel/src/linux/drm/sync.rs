@@ -26,7 +26,7 @@ use nvgpu::Errno;
 use nvgpu::syncobj::{WaitPoll, wait_poll};
 
 use super::nouveau::ChanCore;
-use super::{DrmFile, EOPNOTSUPP, ETIME, get, get_array, put};
+use super::{EOPNOTSUPP, ETIME, get, get_array, put};
 use crate::linux::e;
 use crate::sync::SpinLock;
 use crate::user::files::Object;
@@ -244,8 +244,16 @@ use nvgpu::uapi::{
 /// разумный.
 const MAX_HANDLES: usize = 4096;
 
+/// Файл узла, у которого есть таблица syncobj (`DrmFile` у NVIDIA, `AmdFile` у AMD):
+/// ioctl syncobj ниже одинаковы для любого драйвера DRM.
+pub trait SyncHost {
+    fn syncobj_get(&self, handle: u32) -> Option<Arc<Syncobj>>;
+    fn syncobj_add(&self, obj: Arc<Syncobj>) -> u32;
+    fn syncobj_remove(&self, handle: u32) -> bool;
+}
+
 /// ioctl syncobj; `None` — номер не отсюда.
-pub fn ioctl(file: &DrmFile, request: u32, arg: usize) -> Option<i64> {
+pub fn ioctl(file: &dyn SyncHost, request: u32, arg: usize) -> Option<i64> {
     Some(match request {
         CREATE => create(file, arg),
         DESTROY => destroy(file, arg),
@@ -264,37 +272,36 @@ pub fn ioctl(file: &DrmFile, request: u32, arg: usize) -> Option<i64> {
 }
 
 /// Объект по ручке файла.
-pub fn lookup(file: &DrmFile, handle: u32) -> Result<Arc<Syncobj>, i64> {
-    file.st.lock().syncobjs.get(&handle).cloned().ok_or(-e::ENOENT)
+pub fn lookup(file: &dyn SyncHost, handle: u32) -> Result<Arc<Syncobj>, i64> {
+    file.syncobj_get(handle).ok_or(-e::ENOENT)
 }
 
-fn lookup_all(file: &DrmFile, handles: &[u32]) -> Result<Vec<Arc<Syncobj>>, i64> {
-    let st = file.st.lock();
-    handles.iter().map(|h| st.syncobjs.get(h).cloned().ok_or(-e::ENOENT)).collect()
+fn lookup_all(file: &dyn SyncHost, handles: &[u32]) -> Result<Vec<Arc<Syncobj>>, i64> {
+    handles.iter().map(|&h| file.syncobj_get(h).ok_or(-e::ENOENT)).collect()
 }
 
-fn create(file: &DrmFile, arg: usize) -> i64 {
+fn create(file: &dyn SyncHost, arg: usize) -> i64 {
     let Ok(DrmSyncobjCreate { flags, .. }) = get::<DrmSyncobjCreate>(arg) else { return -e::EFAULT };
     if flags & !CREATE_SIGNALED != 0 {
         return -e::EINVAL;
     }
-    let handle = file.st.lock().add_syncobj(Syncobj::new(flags & CREATE_SIGNALED != 0));
+    let handle = file.syncobj_add(Syncobj::new(flags & CREATE_SIGNALED != 0));
     if put(arg, handle).is_err() {
-        file.st.lock().syncobjs.remove(&handle);
+        file.syncobj_remove(handle);
         return -e::EFAULT;
     }
     0
 }
 
-fn destroy(file: &DrmFile, arg: usize) -> i64 {
+fn destroy(file: &dyn SyncHost, arg: usize) -> i64 {
     let Ok(DrmSyncobjDestroy { handle, pad }) = get::<DrmSyncobjDestroy>(arg) else { return -e::EFAULT };
     if pad != 0 {
         return -e::EINVAL;
     }
-    if file.st.lock().syncobjs.remove(&handle).is_some() { 0 } else { -e::EINVAL }
+    if file.syncobj_remove(handle) { 0 } else { -e::EINVAL }
 }
 
-fn handle_to_fd(file: &DrmFile, arg: usize) -> i64 {
+fn handle_to_fd(file: &dyn SyncHost, arg: usize) -> i64 {
     let Ok(mut args) = get::<HandleArgs>(arg) else { return -e::EFAULT };
     if args.pad != 0 || args.flags & !EXPORT_SYNC_FILE != 0 {
         return -e::EINVAL;
@@ -319,7 +326,7 @@ fn handle_to_fd(file: &DrmFile, arg: usize) -> i64 {
     if put(arg, args).is_err() { -e::EFAULT } else { 0 }
 }
 
-fn fd_to_handle(file: &DrmFile, arg: usize) -> i64 {
+fn fd_to_handle(file: &dyn SyncHost, arg: usize) -> i64 {
     let Ok(mut args) = get::<HandleArgs>(arg) else { return -e::EFAULT };
     if args.pad != 0 || args.flags & !IMPORT_SYNC_FILE != 0 {
         return -e::EINVAL;
@@ -336,10 +343,10 @@ fn fd_to_handle(file: &DrmFile, arg: usize) -> i64 {
         };
     }
     let Some(shared) = object.as_any().downcast_ref::<SyncobjFile>() else { return -e::EINVAL };
-    let handle = file.st.lock().add_syncobj(Arc::clone(&shared.0));
+    let handle = file.syncobj_add(Arc::clone(&shared.0));
     args.handle = handle;
     if put(arg, args).is_err() {
-        file.st.lock().syncobjs.remove(&handle);
+        file.syncobj_remove(handle);
         return -e::EFAULT;
     }
     0
@@ -347,7 +354,7 @@ fn fd_to_handle(file: &DrmFile, arg: usize) -> i64 {
 
 /// `struct drm_syncobj_wait` (40 байт) и `drm_syncobj_timeline_wait` (48):
 /// у второго после `handles` — `points`.
-fn wait(file: &DrmFile, arg: usize, timeline: bool) -> i64 {
+fn wait(file: &dyn SyncHost, arg: usize, timeline: bool) -> i64 {
     let (handles_ptr, points_ptr, timeout, count, flags, at_first) = if timeline {
         let Ok(w) = get::<TimelineWaitArgs>(arg) else { return -e::EFAULT };
         (w.handles, w.points, w.timeout_nsec, w.count_handles, w.flags, 32)
@@ -406,7 +413,7 @@ fn wait(file: &DrmFile, arg: usize, timeline: bool) -> i64 {
 }
 
 /// `RESET`/`SIGNAL`.
-fn reset_signal(file: &DrmFile, arg: usize, signal: bool) -> i64 {
+fn reset_signal(file: &dyn SyncHost, arg: usize, signal: bool) -> i64 {
     let Ok(ArrayArgs { handles: ptr, count_handles: count, pad }) = get::<ArrayArgs>(arg) else { return -e::EFAULT };
     if pad != 0 {
         return -e::EINVAL;
@@ -433,7 +440,7 @@ fn reset_signal(file: &DrmFile, arg: usize, signal: bool) -> i64 {
 }
 
 /// Ручки, точки, флаги и адрес точек `drm_syncobj_timeline_array`.
-fn timeline_args(file: &DrmFile, arg: usize) -> Result<(Vec<Arc<Syncobj>>, Vec<u64>, u32, u64), i64> {
+fn timeline_args(file: &dyn SyncHost, arg: usize) -> Result<(Vec<Arc<Syncobj>>, Vec<u64>, u32, u64), i64> {
     let TimelineArrayArgs { handles: handles_ptr, points: points_ptr, count_handles: count, flags } = get::<TimelineArrayArgs>(arg).map_err(|_| -e::EFAULT)?;
     if count == 0 || count as usize > MAX_HANDLES {
         return Err(-e::EINVAL);
@@ -443,7 +450,7 @@ fn timeline_args(file: &DrmFile, arg: usize) -> Result<(Vec<Arc<Syncobj>>, Vec<u
     Ok((lookup_all(file, &handles)?, points, flags, points_ptr))
 }
 
-fn timeline_signal(file: &DrmFile, arg: usize) -> i64 {
+fn timeline_signal(file: &dyn SyncHost, arg: usize) -> i64 {
     let (objs, points, flags, _) = match timeline_args(file, arg) {
         Ok(args) => args,
         Err(err) => return err,
@@ -457,7 +464,7 @@ fn timeline_signal(file: &DrmFile, arg: usize) -> i64 {
     0
 }
 
-fn query(file: &DrmFile, arg: usize) -> i64 {
+fn query(file: &dyn SyncHost, arg: usize) -> i64 {
     let (objs, _, flags, points_ptr) = match timeline_args(file, arg) {
         Ok(args) => args,
         Err(err) => return err,
@@ -472,7 +479,7 @@ fn query(file: &DrmFile, arg: usize) -> i64 {
     }
 }
 
-fn transfer(file: &DrmFile, arg: usize) -> i64 {
+fn transfer(file: &dyn SyncHost, arg: usize) -> i64 {
     let Ok(TransferArgs { src_handle: src, dst_handle: dst, src_point, dst_point, flags, pad }) = get::<TransferArgs>(arg) else { return -e::EFAULT };
     if pad != 0 || flags & !WAIT_FOR_SUBMIT != 0 {
         return -e::EINVAL;

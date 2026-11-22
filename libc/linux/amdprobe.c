@@ -13,7 +13,10 @@
  *      MEMORY, VRAM_GTT, неизвестный запрос — EINVAL;
  *   6. буферы: GEM_CREATE, GEM_MMAP + mmap по смещению (запись/чтение), GEM_METADATA,
  *      GEM_OP, GEM_WAIT_IDLE, GEM_CLOSE; адреса: GEM_VA MAP/UNMAP/REPLACE/CLEAR и их
- *      ошибки; контексты: CTX ALLOC/QUERY_STATE2/FREE.
+ *      ошибки; контексты: CTX ALLOC/QUERY_STATE2/FREE;
+ *   7. CS: буфер команд (WRITE_DATA, EVENT_WRITE_EOP, вложенный INDIRECT_BUFFER, DMA_DATA
+ *      заливка и копия) исполняется на программной карте, пользовательский забор,
+ *      syncobj-выход, timeline-сигнал, WAIT_CS, ошибки (чужой VA, неизвестный чанк, ctx).
  *
  * Запуск: `amdprobe [soft|hw]` (режим только печатается). Общие обёртки и
  * вывод — `drmprobe.h` (структуры nouveau в нём этой пробе не нужны).
@@ -393,6 +396,157 @@ static void test_gem(void) {
     check_v(r == -ENOENT, "GEM_MMAP of a closed handle is ENOENT", r);
 }
 
+/* ---- CS ---- */
+
+#define DRM_IOCTL_AMDGPU_CS 0xC0186444u
+#define DRM_IOCTL_AMDGPU_WAIT_CS 0xC0206449u
+#define DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL_ 0xC01864CDu
+
+struct amd_cs { u32 ctx_id, bo_list_handle, num_chunks, flags; u64 chunks; };
+_Static_assert(sizeof(struct amd_cs) == 24, "drm_amdgpu_cs");
+struct amd_chunk { u32 id, length_dw; u64 data; };
+_Static_assert(sizeof(struct amd_chunk) == 16, "drm_amdgpu_cs_chunk");
+struct amd_chunk_ib { u32 pad, flags; u64 va_start; u32 ib_bytes, ip_type, ip_instance, ring; };
+_Static_assert(sizeof(struct amd_chunk_ib) == 32, "drm_amdgpu_cs_chunk_ib");
+struct amd_chunk_fence { u32 handle, offset; };
+struct amd_chunk_tl { u32 handle, flags; u64 point; };
+struct amd_wait_cs { u64 handle, timeout; u32 ip_type, ip_instance, ring, ctx_id; };
+_Static_assert(sizeof(struct amd_wait_cs) == 32, "drm_amdgpu_wait_cs");
+
+enum { CHUNK_IB = 1, CHUNK_FENCE = 2, CHUNK_SYNCOBJ_IN = 4, CHUNK_SYNCOBJ_OUT = 5, CHUNK_BO_HANDLES = 6, CHUNK_TL_SIGNAL = 9 };
+
+/* Подать CS: `ib_va`/`ib_bytes` — буфер команд; необязательно fence (BO, смещение), syncobj-выход, timeline-сигнал. */
+static i64 submit(u32 ctx, u64 ib_va, u32 ib_bytes, u32 fence_bo, u32 fence_off, u32 out_syncobj, u32 tl_handle, u64 tl_point, u64 *seq) {
+    struct amd_chunk_ib ib = {0, 0, ib_va, ib_bytes, 0, 0, 0};
+    struct amd_chunk_fence fence = {fence_bo, fence_off};
+    u32 out = out_syncobj;
+    struct amd_chunk_tl tl = {tl_handle, 0, tl_point};
+    struct amd_chunk chunks[4];
+    u64 pointers[4];
+    u32 n = 0;
+    chunks[n] = (struct amd_chunk){CHUNK_IB, 8, (u64)&ib};
+    n++;
+    if (fence_bo) {
+        chunks[n] = (struct amd_chunk){CHUNK_FENCE, 2, (u64)&fence};
+        n++;
+    }
+    if (out_syncobj) {
+        chunks[n] = (struct amd_chunk){CHUNK_SYNCOBJ_OUT, 1, (u64)&out};
+        n++;
+    }
+    if (tl_handle) {
+        chunks[n] = (struct amd_chunk){CHUNK_TL_SIGNAL, 4, (u64)&tl};
+        n++;
+    }
+    for (u32 i = 0; i < n; i++) pointers[i] = (u64)&chunks[i];
+    struct amd_cs cs = {ctx, 0, n, 0, (u64)pointers};
+    i64 r = io(DRM_IOCTL_AMDGPU_CS, &cs);
+    if (seq) *seq = r == 0 ? *(u64 *)&cs : 0;
+    return r;
+}
+static i64 submit_bad_chunk(u32 ctx, u32 id) {
+    struct amd_chunk c = {id, 0, 0};
+    u64 pointer = (u64)&c;
+    struct amd_cs cs = {ctx, 0, 1, 0, (u64)&pointer};
+    return io(DRM_IOCTL_AMDGPU_CS, &cs);
+}
+static i64 wait_cs(u32 ctx, u64 seq, u64 *status) {
+    struct amd_wait_cs w = {seq, 1000000000ull, 0, 0, 0, ctx};
+    i64 r = io(DRM_IOCTL_AMDGPU_WAIT_CS, &w);
+    *status = *(u64 *)&w; /* out.status — первые 8 байт union */
+    return r;
+}
+
+static void test_cs(void) {
+    u32 ib_bo = 0, data_bo = 0, ctx = 0, so = 0, tl = 0;
+    gem_create(1 << 16, 2, &ib_bo);
+    gem_create(1 << 16, 2, &data_bo);
+    u64 ib_off = ib_bo, data_off = data_bo;
+    io(DRM_IOCTL_AMDGPU_GEM_MMAP, &ib_off);
+    io(DRM_IOCTL_AMDGPU_GEM_MMAP, &data_off);
+    u32 *ib = (u32 *)sys6(SYS_mmap, 0, 1 << 16, PROT_READ | PROT_WRITE, MAP_SHARED, drm, (i64)ib_off);
+    u32 *data = (u32 *)sys6(SYS_mmap, 0, 1 << 16, PROT_READ | PROT_WRITE, MAP_SHARED, drm, (i64)data_off);
+    check((u64)ib < (u64)-4096 && (u64)data < (u64)-4096, "CS: both buffers mapped into the program");
+    if ((u64)ib >= (u64)-4096 || (u64)data >= (u64)-4096) return;
+    /* Далеко от адресов test_gem (0x100000..0x400000): их отображения остаются. */
+    const u64 IB_VA = 0x4000000, DATA_VA = 0x5000000;
+    check_v(gem_va(ib_bo, VA_OP_MAP, IB_VA, 0, 1 << 16, VM_RW) == 0 && gem_va(data_bo, VA_OP_MAP, DATA_VA, 0, 1 << 16, VM_RW) == 0, "CS: GEM_VA MAP of the IB and data buffers", 0);
+    check_v(ctx_op(1, 0, &ctx) == 0 && ctx != 0, "CS: CTX ALLOC", ctx);
+    check_v(syncobj_create(0, &so) == 0, "CS: SYNCOBJ_CREATE (not signaled)", 0);
+
+    /* вложенный буфер (на 0x100800): WRITE_DATA 0xbeef по DATA_VA + 0x30 */
+    u32 *nested = ib + 0x800 / 4;
+    nested[0] = 0xC0033700u; nested[1] = 0x00100500u; nested[2] = (u32)(DATA_VA + 0x30); nested[3] = 0; nested[4] = 0xbeef;
+
+    u32 n = 0;
+    /* WRITE_DATA одно слово */
+    ib[n++] = 0xC0033700u; ib[n++] = 0x00100500u; ib[n++] = (u32)DATA_VA; ib[n++] = 0; ib[n++] = 0xa5a5a5a5u;
+    /* WRITE_DATA три слова подряд */
+    ib[n++] = 0xC0053700u; ib[n++] = 0x00100500u; ib[n++] = (u32)(DATA_VA + 0x10); ib[n++] = 0; ib[n++] = 1; ib[n++] = 2; ib[n++] = 3;
+    /* EVENT_WRITE_EOP: 32 бита 0x1234 (DATA_SEL 1) */
+    ib[n++] = 0xC0044700u; ib[n++] = 0x38514u; ib[n++] = (u32)(DATA_VA + 0x20); ib[n++] = 1u << 29; ib[n++] = 0x1234; ib[n++] = 0;
+    /* вложенный INDIRECT_BUFFER, 5 слов */
+    ib[n++] = 0xC0023F00u; ib[n++] = (u32)(IB_VA + 0x800); ib[n++] = 0; ib[n++] = 5;
+    /* DMA_DATA: залить 16 байт значением 0x77777777 по DATA_VA + 0x40 */
+    ib[n++] = 0xC0055000u; ib[n++] = 2u << 29; ib[n++] = 0x77777777u; ib[n++] = 0; ib[n++] = (u32)(DATA_VA + 0x40); ib[n++] = 0; ib[n++] = 16;
+    /* DMA_DATA: скопировать эти 16 байт на DATA_VA + 0x50 */
+    ib[n++] = 0xC0055000u; ib[n++] = 0; ib[n++] = (u32)(DATA_VA + 0x40); ib[n++] = 0; ib[n++] = (u32)(DATA_VA + 0x50); ib[n++] = 0; ib[n++] = 16;
+    /* пропускаемые пакеты: SET_SH_REG и тип 2 */
+    ib[n++] = 0xC0017600u; ib[n++] = 0x20c; ib[n++] = 0; ib[n++] = 0x80000000u;
+
+    u64 seq = 0;
+    i64 r = submit(ctx, IB_VA, n * 4, data_bo, 0x8000, so, 0, 0, &seq);
+    check_v(r == 0 && seq == 1, "CS: first submission gets sequence number 1", r ? r : (i64)seq);
+    check_v(data[0] == 0xa5a5a5a5u, "CS: WRITE_DATA wrote one dword at the mapped VA", data[0]);
+    check_v(data[4] == 1 && data[5] == 2 && data[6] == 3, "CS: WRITE_DATA wrote three consecutive dwords", data[4]);
+    check_v(data[8] == 0x1234, "CS: EVENT_WRITE_EOP wrote the 32-bit fence value", data[8]);
+    check_v(data[12] == 0xbeef, "CS: a nested INDIRECT_BUFFER ran", data[12]);
+    check_v(data[16] == 0x77777777u && data[19] == 0x77777777u, "CS: DMA_DATA fill wrote exactly 16 bytes", data[16]);
+    check_v(data[20] == 0x77777777u && data[23] == 0x77777777u && data[24] == 0, "CS: DMA_DATA copy wrote exactly 16 bytes", data[20]);
+    u64 status = 9;
+    r = wait_cs(ctx, seq, &status);
+    check_v(r == 0 && status == 0, "CS: WAIT_CS of the first submission says done (status 0)", r ? r : (i64)status);
+    check_v(data[0x8000 / 4] == 1, "CS: the user fence chunk stored the sequence number in the buffer", data[0x8000 / 4]);
+    check_v(syncobj_wait(so, 0, 100) == 0, "CS: the SYNCOBJ_OUT syncobj is signaled after the submission", 0);
+
+    /* второй CS: номер растёт, ожидание будущего номера — ошибка */
+    r = submit(ctx, IB_VA, n * 4, 0, 0, 0, 0, 0, &seq);
+    check_v(r == 0 && seq == 2, "CS: the second submission gets number 2", r ? r : (i64)seq);
+    r = wait_cs(ctx, 3, &status);
+    check_v(r == -EINVAL, "CS: WAIT_CS of a sequence number not submitted yet is EINVAL", r);
+
+    /* timeline: сигнал точки 5 через чанк */
+    check_v(syncobj_create(0, &tl) == 0, "CS: SYNCOBJ_CREATE for the timeline", 0);
+    r = submit(ctx, IB_VA, n * 4, 0, 0, 0, tl, 5, &seq);
+    u64 point = 0;
+    i64 q = timeline_query(tl, &point);
+    check_v(r == 0 && q == 0 && point == 5, "CS: SYNCOBJ_TIMELINE_SIGNAL chunk puts point 5 on the timeline", r ? r : q ? q : (i64)point);
+
+    /* ошибки */
+    r = submit(ctx, 0x900000, 16, 0, 0, 0, 0, 0, 0);
+    check_v(r == -EINVAL, "CS: an IB at an unmapped VA is EINVAL", r);
+    r = submit(ctx + 100, IB_VA, n * 4, 0, 0, 0, 0, 0, 0);
+    check_v(r == -EINVAL, "CS: an unknown context is EINVAL", r);
+    r = submit_bad_chunk(ctx, 0x77);
+    check_v(r == -EINVAL, "CS: an unknown chunk id is EINVAL", r);
+    u32 fresh = 0;
+    syncobj_create(0, &fresh);
+    struct amd_chunk_ib ibc = {0, 0, IB_VA, 16, 0, 0, 0};
+    u32 wait_handle = fresh;
+    struct amd_chunk cc[2] = {{CHUNK_IB, 8, (u64)&ibc}, {CHUNK_SYNCOBJ_IN, 1, (u64)&wait_handle}};
+    u64 cps[2] = {(u64)&cc[0], (u64)&cc[1]};
+    struct amd_cs bad = {ctx, 0, 2, 0, (u64)cps};
+    r = io(DRM_IOCTL_AMDGPU_CS, &bad);
+    check_v(r == -EINVAL, "CS: waiting on a syncobj that has no fence is EINVAL", r);
+
+    /* шлюз контекста: после FREE подать нельзя */
+    ctx_op(2, ctx, 0);
+    r = submit(ctx, IB_VA, n * 4, 0, 0, 0, 0, 0, 0);
+    check_v(r == -EINVAL, "CS: a submission to a freed context is EINVAL", r);
+    io(DRM_IOCTL_GEM_CLOSE_, &ib_bo);
+    io(DRM_IOCTL_GEM_CLOSE_, &data_bo);
+}
+
 __attribute__((used)) void start_c(u64 *sp) {
     int argc = (int)sp[0];
     char **argv = (char **)(sp + 1);
@@ -414,6 +568,7 @@ __attribute__((used)) void start_c(u64 *sp) {
     cap(DRM_CAP_TIMESTAMP_MONOTONIC, 1, "GET_CAP TIMESTAMP_MONOTONIC is 1");
     test_info(sysfs_device, sysfs_rev);
     test_gem();
+    test_cs();
     i64 r = sys3(SYS_close, drm, 0, 0);
     check_v(r == 0, "close the render node", r);
     say("done");

@@ -33,7 +33,13 @@
 //! * контексты: `CTX` (`ALLOC`/`FREE`/`QUERY_STATE`/`QUERY_STATE2`, стабильное
 //!   p-state).
 //!
-//! `CS`, заборы, syncobj и PRIME — следующие шаги плана.
+//! * `CS` (чанки IB, FENCE, SYNCOBJ_IN/OUT, SYNCOBJ_TIMELINE_WAIT/SIGNAL, BO_HANDLES,
+//!   зависимости), `WAIT_CS` и все ioctl syncobj (общий код `drm::sync`).
+//!   Исполнение синхронное: [`exec_ib`] — мини-интерпретатор PM4 на CPU
+//!   (`WRITE_DATA`, `EVENT_WRITE_EOP`, `INDIRECT_BUFFER`, `DMA_DATA`; остальное
+//!   пропускается по счётчику), поэтому заборы выполнены сразу.
+//!
+//! PRIME и настоящее железо (кольцо `display::amd`) — следующие шаги плана.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -50,7 +56,8 @@ use nvgpu::uapi::{
     DrmVersion,
 };
 
-use super::{get, put, EOPNOTSUPP};
+use super::sync::{Fence, SyncHost, Syncobj};
+use super::{get, get_array, put, EOPNOTSUPP};
 use crate::linux::e;
 use crate::mm::{FrameAllocator, PhysAddr};
 use crate::sync::{Mutex, SpinLock};
@@ -387,11 +394,40 @@ struct AmdState {
     next_ctx: u32,
     bos: BTreeMap<u32, Arc<AmdBo>>,
     next_bo: u32,
+    syncobjs: BTreeMap<u32, Arc<Syncobj>>,
+    next_sync: u32,
 }
 
 impl AmdState {
     fn new() -> Self {
-        Self { va: BTreeMap::new(), ctxs: BTreeMap::new(), next_ctx: 1, bos: BTreeMap::new(), next_bo: 1 }
+        Self {
+            va: BTreeMap::new(),
+            ctxs: BTreeMap::new(),
+            next_ctx: 1,
+            bos: BTreeMap::new(),
+            next_bo: 1,
+            syncobjs: BTreeMap::new(),
+            next_sync: 1,
+        }
+    }
+}
+
+impl SyncHost for AmdFile {
+    fn syncobj_get(&self, handle: u32) -> Option<Arc<Syncobj>> {
+        self.st.lock().syncobjs.get(&handle).cloned()
+    }
+    fn syncobj_add(&self, obj: Arc<Syncobj>) -> u32 {
+        let mut st = self.st.lock();
+        while st.next_sync == 0 || st.syncobjs.contains_key(&st.next_sync) {
+            st.next_sync = st.next_sync.wrapping_add(1);
+        }
+        let handle = st.next_sync;
+        st.next_sync = st.next_sync.wrapping_add(1);
+        st.syncobjs.insert(handle, obj);
+        handle
+    }
+    fn syncobj_remove(&self, handle: u32) -> bool {
+        self.st.lock().syncobjs.remove(&handle).is_some()
     }
 }
 
@@ -407,6 +443,9 @@ struct Ctx {
     #[allow(dead_code)]
     priority: i32,
     stable_pstate: u32,
+    /// Номер последнего `CS` контекста (первый — 1): так `WAIT_CS` отличает
+    /// выполненный номер от ещё не поданного.
+    last_seq: u64,
 }
 
 /// Отображение `GEM_VA`: буфер, смещение в нём, длина, флаги PTE.
@@ -500,6 +539,42 @@ impl AmdBo {
             mem: SpinLock::new(Weak::new()),
             metadata: SpinLock::new(BoMetadata { flags: 0, tiling_info: 0, size_bytes: 0, data: [0; 64] }),
         }))
+    }
+
+    /// Читать байты буфера со смещения `offset`; `false` — вышли за границу.
+    fn read(&self, offset: u64, out: &mut [u8]) -> bool {
+        if offset.checked_add(out.len() as u64).is_none_or(|end| end > self.size) {
+            return false;
+        }
+        let mut done = 0usize;
+        while done < out.len() {
+            let at = offset + done as u64;
+            let (page, inside) = ((at / PAGE) as usize, (at % PAGE) as usize);
+            let n = (out.len() - done).min(PAGE as usize - inside);
+            let src = PhysAddr(self.frames[page]).to_direct_map().as_mut_ptr::<u8>();
+            // SAFETY: кадр принадлежит буферу и жив; внутри одной страницы.
+            unsafe { core::ptr::copy_nonoverlapping(src.add(inside), out.as_mut_ptr().add(done), n) };
+            done += n;
+        }
+        true
+    }
+
+    /// Писать байты в буфер со смещения `offset`; `false` — вышли за границу.
+    fn write(&self, offset: u64, data: &[u8]) -> bool {
+        if offset.checked_add(data.len() as u64).is_none_or(|end| end > self.size) {
+            return false;
+        }
+        let mut done = 0usize;
+        while done < data.len() {
+            let at = offset + done as u64;
+            let (page, inside) = ((at / PAGE) as usize, (at % PAGE) as usize);
+            let n = (data.len() - done).min(PAGE as usize - inside);
+            let dst = PhysAddr(self.frames[page]).to_direct_map().as_mut_ptr::<u8>();
+            // SAFETY: см. `read`.
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(done), dst.add(inside), n) };
+            done += n;
+        }
+        true
     }
 
     /// Память для `mmap` (одна на буфер).
@@ -917,7 +992,7 @@ fn ctx_ioctl(file: &AmdFile, arg: usize) -> i64 {
             }
             let id = st.next_ctx;
             st.next_ctx = st.next_ctx.wrapping_add(1);
-            st.ctxs.insert(id, Ctx { priority: args.priority, stable_pstate: 0 });
+            st.ctxs.insert(id, Ctx { priority: args.priority, stable_pstate: 0, last_seq: 0 });
             out[..4].copy_from_slice(&id.to_le_bytes());
         }
         CTX_OP_FREE => {
@@ -1006,6 +1081,375 @@ fn gem_wait_idle(file: &AmdFile, arg: usize) -> i64 {
     if crate::linux::ipc::write_user(arg, &out).is_err() { -e::EFAULT } else { 0 }
 }
 
+
+// ---- CS: чанки, исполнение PM4 на CPU, WAIT_CS -----------------------------------
+
+const DRM_AMDGPU_CS: u32 = 0x04;
+const DRM_AMDGPU_WAIT_CS: u32 = 0x09;
+
+const CHUNK_IB: u32 = 0x01;
+const CHUNK_FENCE: u32 = 0x02;
+const CHUNK_DEPENDENCIES: u32 = 0x03;
+const CHUNK_SYNCOBJ_IN: u32 = 0x04;
+const CHUNK_SYNCOBJ_OUT: u32 = 0x05;
+const CHUNK_BO_HANDLES: u32 = 0x06;
+const CHUNK_SCHEDULED_DEPENDENCIES: u32 = 0x07;
+const CHUNK_SYNCOBJ_TIMELINE_WAIT: u32 = 0x08;
+const CHUNK_SYNCOBJ_TIMELINE_SIGNAL: u32 = 0x09;
+const CHUNK_CP_GFX_SHADOW: u32 = 0x0a;
+
+/// Больше чанков и IB, чем это, нормальная программа не подаёт.
+const MAX_CHUNKS: u32 = 64;
+const MAX_IB_DWORDS: usize = 1 << 20;
+/// Глубина вложенных `INDIRECT_BUFFER`.
+const MAX_IB_DEPTH: u32 = 3;
+
+/// `union drm_amdgpu_cs`: вход 24 байта, выход — номер в первых 8.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CsIn {
+    ctx_id: u32,
+    bo_list_handle: u32,
+    num_chunks: u32,
+    flags: u32,
+    chunks: u64,
+}
+const _: () = assert!(core::mem::size_of::<CsIn>() == 24);
+
+/// `struct drm_amdgpu_cs_chunk`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CsChunk {
+    chunk_id: u32,
+    length_dw: u32,
+    chunk_data: u64,
+}
+const _: () = assert!(core::mem::size_of::<CsChunk>() == 16);
+
+/// `struct drm_amdgpu_cs_chunk_ib`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CsChunkIb {
+    pad: u32,
+    flags: u32,
+    va_start: u64,
+    ib_bytes: u32,
+    ip_type: u32,
+    ip_instance: u32,
+    ring: u32,
+}
+const _: () = assert!(core::mem::size_of::<CsChunkIb>() == 32);
+
+/// `struct drm_amdgpu_cs_chunk_fence`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CsChunkFence {
+    handle: u32,
+    offset: u32,
+}
+
+/// `struct drm_amdgpu_cs_chunk_syncobj` (timeline).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CsChunkSyncobj {
+    handle: u32,
+    flags: u32,
+    point: u64,
+}
+const _: () = assert!(core::mem::size_of::<CsChunkSyncobj>() == 16);
+
+/// `struct drm_amdgpu_wait_cs_in` — 32 байта; выход (`status`) — первые 8.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WaitCsIn {
+    handle: u64,
+    timeout: u64,
+    ip_type: u32,
+    ip_instance: u32,
+    ring: u32,
+    ctx_id: u32,
+}
+const _: () = assert!(core::mem::size_of::<WaitCsIn>() == 32);
+
+/// Снимок отображений `GEM_VA` на время исполнения: адрес GPU → буфер.
+struct VaView {
+    /// `(начало, длина, буфер, смещение в нём)`.
+    maps: Vec<(u64, u64, Arc<AmdBo>, u64)>,
+}
+
+impl VaView {
+    fn of(st: &AmdState) -> Self {
+        Self { maps: st.va.iter().map(|(&start, m)| (start, m.size, Arc::clone(&m.bo), m.offset)).collect() }
+    }
+
+    /// Буфер и смещение в нём для `[addr, addr + len)`, если он целиком в одном отображении.
+    fn locate(&self, addr: u64, len: u64) -> Option<(&Arc<AmdBo>, u64)> {
+        let end = addr.checked_add(len)?;
+        self.maps
+            .iter()
+            .find(|(start, size, _, _)| addr >= *start && end <= start + size)
+            .map(|(start, _, bo, offset)| (bo, offset + (addr - start)))
+    }
+
+    fn read(&self, addr: u64, out: &mut [u8]) -> bool {
+        self.locate(addr, out.len() as u64).is_some_and(|(bo, at)| bo.read(at, out))
+    }
+
+    fn write(&self, addr: u64, data: &[u8]) -> bool {
+        self.locate(addr, data.len() as u64).is_some_and(|(bo, at)| bo.write(at, data))
+    }
+}
+
+// Коды PM4 (`vid.h`).
+const PM4_NOP: u32 = 0x10;
+const PM4_INDIRECT_BUFFER_CONST: u32 = 0x33;
+const PM4_WRITE_DATA: u32 = 0x37;
+const PM4_INDIRECT_BUFFER: u32 = 0x3f;
+const PM4_EVENT_WRITE_EOP: u32 = 0x47;
+const PM4_DMA_DATA: u32 = 0x50;
+
+/// Исполнить буфер команд на CPU: `dwords` слов по адресу GPU `addr`. Что
+/// осмысленно для проверки (запись в память, барьер, вложенный IB, DMA) —
+/// выполняется, остальное (регистры, состояние, dispatch и draw) пропускается
+/// по счётчику. Ошибка — неверный буфер (за границей, битый пакет), не отказ
+/// отдельной записи: запись мимо отображения у настоящей карты — ошибка
+/// страницы, здесь — строка в журнале.
+fn exec_ib(view: &VaView, addr: u64, dwords: usize, depth: u32) -> Result<(), i64> {
+    if depth > MAX_IB_DEPTH || dwords > MAX_IB_DWORDS {
+        return Err(-e::EINVAL);
+    }
+    let mut raw = alloc::vec![0u8; dwords * 4];
+    if !view.read(addr, &mut raw) {
+        return Err(-e::EINVAL);
+    }
+    let ib: Vec<u32> = raw.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+    let store = |address: u64, data: &[u8]| {
+        if !view.write(address, data) {
+            crate::kprintln!("amdgpu: soft GPU page fault: write of {} bytes at {address:#x}", data.len());
+        }
+    };
+    let mut at = 0usize;
+    while at < ib.len() {
+        let header = ib[at];
+        match header >> 30 {
+            // Тип 2 — заполнитель в одно слово.
+            2 => {
+                at += 1;
+                continue;
+            }
+            3 => {}
+            // Типы 0 и 1 (запись регистров): тело `count + 1` слов.
+            _ => {
+                at += 2 + ((header >> 16) & 0x3fff) as usize;
+                continue;
+            }
+        }
+        let opcode = (header >> 8) & 0xff;
+        let count = ((header >> 16) & 0x3fff) as usize + 1;
+        let end = at + 1 + count;
+        if end > ib.len() {
+            // `PACKET3(NOP, 0x3FFF)` в хвосте буфера — выравнивание: дальше ничего нет.
+            if opcode == PM4_NOP {
+                break;
+            }
+            return Err(-e::EINVAL);
+        }
+        let body = &ib[at + 1..end];
+        match opcode {
+            PM4_WRITE_DATA if body.len() >= 3 => {
+                let dst_sel = (body[0] >> 8) & 0xf;
+                let one_address = (body[0] >> 16) & 1 != 0;
+                // 1 — память (через GRBM), 2 — через L2, 5 — память (async); 0 — регистр.
+                if matches!(dst_sel, 1 | 2 | 5) {
+                    let address = u64::from(body[1]) | (u64::from(body[2]) << 32);
+                    for (index, word) in body[3..].iter().enumerate() {
+                        let target = if one_address { address } else { address + index as u64 * 4 };
+                        store(target, &word.to_le_bytes());
+                    }
+                }
+            }
+            PM4_EVENT_WRITE_EOP if body.len() >= 5 => {
+                let address = u64::from(body[1]) | (u64::from(body[2] & 0xffff) << 32);
+                let value = u64::from(body[3]) | (u64::from(body[4]) << 32);
+                match (body[2] >> 29) & 7 {
+                    1 => store(address, &(value as u32).to_le_bytes()),
+                    2 => store(address, &value.to_le_bytes()),
+                    // 3 и 4 — счётчики GPU: время.
+                    3 | 4 => store(address, &crate::time::uptime_ns().to_le_bytes()),
+                    _ => {}
+                }
+            }
+            PM4_INDIRECT_BUFFER | PM4_INDIRECT_BUFFER_CONST if body.len() >= 3 => {
+                let address = u64::from(body[0] & !3) | (u64::from(body[1] & 0xffff) << 32);
+                exec_ib(view, address, (body[2] & 0xf_ffff) as usize, depth + 1)?;
+            }
+            PM4_DMA_DATA if body.len() >= 6 => {
+                // `src_sel` 2 — значение из тела (заливка), иначе — адрес источника.
+                let src_sel = (body[0] >> 29) & 3;
+                let dst = u64::from(body[3]) | (u64::from(body[4] & 0xffff) << 32);
+                let bytes = (body[5] & 0x03ff_ffff) as usize;
+                if bytes <= 16 << 20 {
+                    if src_sel == 2 {
+                        let pattern = body[1].to_le_bytes();
+                        let fill: Vec<u8> = (0..bytes).map(|i| pattern[i % 4]).collect();
+                        store(dst, &fill);
+                    } else {
+                        let src = u64::from(body[1]) | (u64::from(body[2] & 0xffff) << 32);
+                        let mut data = alloc::vec![0u8; bytes];
+                        if view.read(src, &mut data) {
+                            store(dst, &data);
+                        } else {
+                            crate::kprintln!("amdgpu: soft GPU page fault: DMA read of {bytes} bytes at {src:#x}");
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        at = end;
+    }
+    Ok(())
+}
+
+/// Разобранный `CS`: всё проверено до первого исполнения.
+struct CsPlan {
+    ibs: Vec<(u64, usize)>,
+    fence: Option<(u32, u32)>,
+    waits: Vec<(Arc<Syncobj>, u64)>,
+    signals: Vec<(Arc<Syncobj>, u64)>,
+}
+
+/// `DRM_IOCTL_AMDGPU_CS`.
+fn cs_ioctl(file: &AmdFile, arg: usize) -> i64 {
+    let Ok(args) = get::<CsIn>(arg) else { return -e::EFAULT };
+    if args.flags != 0 || args.num_chunks == 0 || args.num_chunks > MAX_CHUNKS {
+        return -e::EINVAL;
+    }
+    if !file.st.lock().ctxs.contains_key(&args.ctx_id) {
+        return -e::EINVAL;
+    }
+    let Ok(pointers) = get_array::<u64>(args.chunks, args.num_chunks as usize) else { return -e::EFAULT };
+    let view = VaView::of(&file.st.lock());
+    let mut plan = CsPlan { ibs: Vec::new(), fence: None, waits: Vec::new(), signals: Vec::new() };
+    for pointer in pointers {
+        let Ok(chunk) = get::<CsChunk>(pointer as usize) else { return -e::EFAULT };
+        let data = chunk.chunk_data;
+        match chunk.chunk_id {
+            CHUNK_IB => {
+                if chunk.length_dw as usize * 4 != core::mem::size_of::<CsChunkIb>() {
+                    return -e::EINVAL;
+                }
+                let Ok(ib) = get::<CsChunkIb>(data as usize) else { return -e::EFAULT };
+                // Только кольцо GFX 0; длина — слова, адрес — внутри одного отображения.
+                if ib.ip_type != 0 || ib.ip_instance != 0 || ib.ring != 0 || ib.ib_bytes == 0 || ib.ib_bytes % 4 != 0 {
+                    return -e::EINVAL;
+                }
+                if view.locate(ib.va_start, u64::from(ib.ib_bytes)).is_none() {
+                    return -e::EINVAL;
+                }
+                plan.ibs.push((ib.va_start, (ib.ib_bytes / 4) as usize));
+            }
+            CHUNK_FENCE => {
+                if chunk.length_dw as usize * 4 != core::mem::size_of::<CsChunkFence>() {
+                    return -e::EINVAL;
+                }
+                let Ok(fence) = get::<CsChunkFence>(data as usize) else { return -e::EFAULT };
+                let st = file.st.lock();
+                let Some(bo) = st.bos.get(&fence.handle) else { return -e::ENOENT };
+                if u64::from(fence.offset) + 8 > bo.size {
+                    return -e::EINVAL;
+                }
+                plan.fence = Some((fence.handle, fence.offset));
+            }
+            CHUNK_SYNCOBJ_IN | CHUNK_SYNCOBJ_OUT => {
+                let Ok(handles) = get_array::<u32>(data, chunk.length_dw as usize) else { return -e::EFAULT };
+                for handle in handles {
+                    let Some(obj) = file.syncobj_get(handle) else { return -e::ENOENT };
+                    if chunk.chunk_id == CHUNK_SYNCOBJ_IN {
+                        // Ждать нечего, если забора нет (Linux: EINVAL у несигнального без забора).
+                        if obj.fence(0).is_none() {
+                            return -e::EINVAL;
+                        }
+                        plan.waits.push((obj, 0));
+                    } else {
+                        plan.signals.push((obj, 0));
+                    }
+                }
+            }
+            CHUNK_SYNCOBJ_TIMELINE_WAIT | CHUNK_SYNCOBJ_TIMELINE_SIGNAL => {
+                let words = chunk.length_dw as usize;
+                if words % 4 != 0 {
+                    return -e::EINVAL;
+                }
+                let Ok(entries) = get_array::<CsChunkSyncobj>(data, words / 4) else { return -e::EFAULT };
+                for entry in entries {
+                    let Some(obj) = file.syncobj_get(entry.handle) else { return -e::ENOENT };
+                    if chunk.chunk_id == CHUNK_SYNCOBJ_TIMELINE_WAIT {
+                        // Точка, которую ещё никто не подал, ждать некому (WAIT_FOR_SUBMIT здесь не нужен).
+                        if obj.fence(entry.point).is_none() {
+                            return -e::EINVAL;
+                        }
+                        plan.waits.push((obj, entry.point));
+                    } else {
+                        plan.signals.push((obj, entry.point));
+                    }
+                }
+            }
+            // Зависимости между контекстами и теневая область: исполнение последовательное.
+            CHUNK_DEPENDENCIES | CHUNK_SCHEDULED_DEPENDENCIES | CHUNK_BO_HANDLES | CHUNK_CP_GFX_SHADOW => {}
+            _ => return -e::EINVAL,
+        }
+    }
+    if plan.ibs.is_empty() {
+        return -e::EINVAL;
+    }
+    // Исполнение: заборы ожидания уже выполнены (всё синхронно), буфера — по порядку.
+    for &(va, dwords) in &plan.ibs {
+        if let Err(err) = exec_ib(&view, va, dwords, 0) {
+            return err;
+        }
+    }
+    let seq = {
+        let mut st = file.st.lock();
+        let ctx = st.ctxs.get_mut(&args.ctx_id).map(|ctx| {
+            ctx.last_seq += 1;
+            ctx.last_seq
+        });
+        let Some(seq) = ctx else { return -e::EINVAL };
+        // Пользовательский забор: номер — в буфер.
+        if let Some((handle, offset)) = plan.fence {
+            if let Some(bo) = st.bos.get(&handle) {
+                let _ = bo.write(u64::from(offset), &seq.to_le_bytes());
+            }
+        }
+        seq
+    };
+    for (obj, point) in plan.signals {
+        if point == 0 {
+            obj.replace(Some(Fence::signaled()));
+        } else {
+            obj.add_point(point, Fence::signaled());
+        }
+    }
+    if put(arg, seq).is_err() { -e::EFAULT } else { 0 }
+}
+
+/// `DRM_IOCTL_AMDGPU_WAIT_CS`: `status` 0 — выполнено, 1 — не успело (как у Linux).
+fn wait_cs(file: &AmdFile, arg: usize) -> i64 {
+    let Ok(args) = get::<WaitCsIn>(arg) else { return -e::EFAULT };
+    if args.ip_type != 0 || args.ip_instance != 0 || args.ring != 0 {
+        return -e::EINVAL;
+    }
+    let st = file.st.lock();
+    let Some(ctx) = st.ctxs.get(&args.ctx_id) else { return -e::EINVAL };
+    // Номер, которого ещё не было, ждать нельзя.
+    if args.handle == 0 || args.handle > ctx.last_seq {
+        return -e::EINVAL;
+    }
+    drop(st);
+    if put::<u64>(arg, 0).is_err() { -e::EFAULT } else { 0 }
+}
+
 /// ioctl на открытом узле AMD (`request` уже приведён `canonical`).
 pub fn ioctl(file: &AmdFile, request: u32, arg: usize) -> i64 {
     match request {
@@ -1021,8 +1465,12 @@ pub fn ioctl(file: &AmdFile, request: u32, arg: usize) -> i64 {
         GET_MAGIC | AUTH_MAGIC | SET_MASTER | DROP_MASTER => -e::EACCES,
         GEM_CLOSE => gem_close(file, arg),
         _ if (request >> 8) & 0xff != DRM_TYPE => -e::ENOTTY,
+        // Объекты синхронизации — общий код DRM.
+        _ if let Some(answer) = super::sync::ioctl(file, request, arg) => answer,
         // Драйверные ioctl: номер от `DRM_COMMAND_BASE`.
         _ => match (request & 0xff).wrapping_sub(DRM_COMMAND_BASE) {
+            DRM_AMDGPU_CS => cs_ioctl(file, arg),
+            DRM_AMDGPU_WAIT_CS => wait_cs(file, arg),
             DRM_AMDGPU_GEM_CREATE => gem_create(file, arg),
             DRM_AMDGPU_GEM_MMAP => gem_mmap(file, arg),
             DRM_AMDGPU_CTX => ctx_ioctl(file, arg),

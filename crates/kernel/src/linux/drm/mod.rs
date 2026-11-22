@@ -36,7 +36,7 @@ pub mod amdgpu;
 mod gem;
 mod nouveau;
 mod nvif;
-mod sync;
+pub(crate) mod sync;
 pub mod sysfs;
 mod vm;
 
@@ -275,6 +275,18 @@ impl Drop for FileState {
         drop(self.vm.take());
         self.bos.clear();
         self.syncobjs.clear();
+    }
+}
+
+impl sync::SyncHost for DrmFile {
+    fn syncobj_get(&self, handle: u32) -> Option<Arc<sync::Syncobj>> {
+        self.st.lock().syncobjs.get(&handle).cloned()
+    }
+    fn syncobj_add(&self, obj: Arc<sync::Syncobj>) -> u32 {
+        self.st.lock().add_syncobj(obj)
+    }
+    fn syncobj_remove(&self, handle: u32) -> bool {
+        self.st.lock().syncobjs.remove(&handle).is_some()
     }
 }
 

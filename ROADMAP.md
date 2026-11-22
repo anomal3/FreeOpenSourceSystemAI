@@ -11272,6 +11272,16 @@ p-state). Проба `amdprobe` расширена (≈45 проверок), `am
 Дальше: `CS` с мини-интерпретатором PM4 на программной карте, syncobj/заборы, RADV в
 пакет Proton, бэкенд на железе поверх `display::amd`.
 
+**A4, шаг 3 (22.11): `CS`/`WAIT_CS`/syncobj на программной карте — РАБОТАЮТ В QEMU.**
+`AMDGPU_CS` разбирает чанки (IB, FENCE, DEPENDENCIES, SYNCOBJ_IN/OUT, BO_HANDLES,
+TIMELINE_WAIT/SIGNAL, CP_GFX_SHADOW) и исполняет буфер команд мини-интерпретатором PM4 по
+VA контекста: `WRITE_DATA`, `EVENT_WRITE_EOP` (пользовательский fence), вложенный
+`INDIRECT_BUFFER`, `DMA_DATA` (fill/copy). `WAIT_CS` по номеру последней отправки;
+неотображённый VA, закрытый контекст, неверный номер — EINVAL. Syncobj/timeline общие с
+nouveau: `sync.rs` обобщён трейтом `SyncHost`. Проба `amdprobe` (`test_cs`), `amd-soft`
+0 failed, `nvk-soft` зелёный. **Не сделано:** диспатч шейдеров на программной карте,
+sync_file MERGE, PRIME; настоящее исполнение на железе — через бэкенд поверх `display::amd`.
+
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
 `drmGetDevices2`, ioctl для `vulkaninfo` и для рендера, поля
