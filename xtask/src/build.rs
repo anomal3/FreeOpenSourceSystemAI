@@ -339,12 +339,14 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 60] = [
+pub const USER_PROGRAMS: [&str; 61] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sockfd", "sshd",
     "cat", "sysupdate", "fetch", "memtest", "filemap", "posix", "winshow", "sysmon", "files",
     "taskmgr", "devmgr", "dotnet", "sftp-server", "big", "smash", "httpd", "threads", "drvd",
     "notepad", "calc", "stuck", "bigfile", "phone", "png2fimg",
+    // Картинка в обои стола: JPEG/PNG/BMP/QOI -> QOI (22.11).
+    "wallconv",
     // Системные инструменты (фаза П1/П2, 20.11).
     "run", "charmap", "sysinfo", "eventlog", "services", "cleanmgr",
     // Окно «Открыть» / «Сохранить как» / «Выбор папки» для всех программ (20.11).

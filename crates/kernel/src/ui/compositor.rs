@@ -6416,15 +6416,17 @@ impl Compositor {
             dark: theme::is_dark(),
             top: p.wall_top.pixel(),
             bottom: p.wall_bottom.pixel(),
+            pic: super::wallpaper::generation(),
         };
         {
             let mut walls = self.wall.borrow_mut();
             if !walls.iter().any(|(_, made)| *made == key) {
                 // Картинки прежней темы и обоев больше не понадобятся; других
                 // размеров — нужны другим мониторам.
-                walls.retain(|(_, made)| made.dark == key.dark && made.top == key.top && made.bottom == key.bottom);
+                walls.retain(|(_, made)| made.dark == key.dark && made.top == key.top && made.bottom == key.bottom && made.pic == key.pic);
                 if let Some(mut picture) = Surface::new(key.width, key.height, p.wall_top) {
-                    let drawn = theme::wallpaper() == theme::Wallpaper::Fossai && super::wallart::paint(&mut picture);
+                    // Фон (22.11): картинка, цвет или FossAi — `wallpaper`.
+                    let drawn = super::wallpaper::paint(&mut picture);
                     if !drawn {
                         let whole = Rect::new(0, 0, key.width, key.height);
                         self.draw_wallpaper(&mut picture, whole, 0, 0, (key.width, key.height));
@@ -6647,6 +6649,8 @@ struct WallKey {
     dark: bool,
     top: u32,
     bottom: u32,
+    /// Выбор фона (`wallpaper::generation`).
+    pic: u32,
 }
 
 /// Доля точки, накрытая скруглённым углом.

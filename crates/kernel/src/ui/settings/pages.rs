@@ -52,7 +52,7 @@ impl SettingsView {
                     y = nav_row(pass, x, y, w, section);
                 }
             }
-            Section::Wallpaper => wallpaper(pass, x, y, w),
+            Section::Wallpaper => super::background::page(pass, x, y, w),
             Section::Colors => colors(pass, x, y, w),
             Section::Appearance => appearance(pass, x, y, w),
             Section::Dock => dock(pass, x, y, w),
@@ -736,29 +736,6 @@ fn keyboard(pass: &mut Pass, x: i32, y: i32, w: u32) {
     ] {
         y = row(pass, x, y, w, Some(Fi::Keyboard), title, desc, Ctl::Mono(keys), None);
     }
-}
-
-fn wallpaper(pass: &mut Pass, x: i32, y: i32, w: u32) {
-    let ctx = pass.ctx;
-    let p = ctx.palette;
-    let gap = ctx.px(12);
-    let count = theme::Wallpaper::ALL.len() as u32;
-    let tile_w = (w.saturating_sub(gap * (count - 1)) / count).min(ctx.px(200));
-    let tile_h = tile_w * 10 / 16;
-    let label_h = line_h(ctx, Role::Caption) as u32 + ctx.px(6);
-    for (index, wall) in theme::Wallpaper::ALL.into_iter().enumerate() {
-        let rect = Rect::new(x + (index as u32 * (tile_w + gap)) as i32, y, tile_w, tile_h);
-        let focused = pass.deed(rect, Deed::Wallpaper(wall));
-        let current = theme::wallpaper() == wall;
-        if pass.visible(Rect::new(rect.x, rect.y, rect.w, rect.h + label_h)) {
-            let (top, bottom) = theme::wallpaper_colors(wall);
-            color_swatch(pass, rect, top, Some(bottom), current, focused);
-            let ink = if current { p.ink } else { p.ink3 };
-            pass.text(Role::Caption, rect.x, rect.bottom() + ctx.px(6) as i32, rect.w, wall.title(), ink);
-        }
-    }
-    let y = y + (tile_h + label_h) as i32 + ctx.px(8) as i32;
-    pass.note(x, y, w, "FossAi — картинка из макета, растягивается под экран; остальные — градиент с разметкой точками.");
 }
 
 fn colors(pass: &mut Pass, x: i32, y: i32, w: u32) {

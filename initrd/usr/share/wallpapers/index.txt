@@ -1,0 +1,7 @@
+# Галерея обоев «Параметры → Персонализация → Фон»: файл и подпись.
+# Миниатюра — <имя>.thumb.qoi рядом (cargo xtask wallpaper).
+valley.jpg Долина
+galaxy.jpg Галактика
+orbit.jpg Орбита
+waves.jpg Волны
+crystal.jpg Кристалл

@@ -255,6 +255,17 @@ pub fn probe() -> Result<Payload, Error> {
         }
     }
 
+    // Галерея обоев (22.11). Без неё в «Фоне» — только вшитые обои FossAi.
+    for (source, target) in WALLS {
+        match stat(&mut root, source, What::Defaults) {
+            Ok(size) => {
+                logln!("[payload] wallpaper {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Defaults, size });
+            }
+            Err(_) => logln!("[payload] {source} is missing; the wallpaper gallery will be shorter"),
+        }
+    }
+
     // Сайт по умолчанию. Его отсутствие установку не срывает: сервер без
     // страницы отвечает `404`, и это честнее несостоявшейся установки.
     for (source, target) in SITE {
@@ -304,7 +315,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 65] = [
+const PROGRAMS: [(&CStr16, &str); 66] = [
     // vDSO программ Linux (01.11.2026): время без входа в ядро. Не программа,
     // но едет тем же путём — так он есть и на установленной системе.
     (cstr16!("\\FREEOS\\BIN\\VDSO"), "vdso"),
@@ -373,6 +384,8 @@ const PROGRAMS: [(&CStr16, &str); 65] = [
     (cstr16!("\\FREEOS\\BIN\\PHONE"), "phone"),
     // Значки программ Windows из префиксов Proton: PNG -> FIMG (18.11, P12).
     (cstr16!("\\FREEOS\\BIN\\PNG2FIMG"), "png2fimg"),
+    // Картинка в обои стола (22.11): JPEG/PNG/BMP/QOI -> QOI.
+    (cstr16!("\\FREEOS\\BIN\\WALLCONV"), "wallconv"),
     // Окно «Открыть» / «Сохранить как» / «Выбор папки» для всех программ (20.11).
     (cstr16!("\\FREEOS\\BIN\\FILEDLG"), "filedlg"),
     // Своя среда .NET (веха v0.7c, фаза N2).
@@ -587,6 +600,22 @@ const ICONS: [(&CStr16, &str); 4] = [
     (cstr16!("\\FREEOS\\ICONS\\CRISP.PAK"), "usr/share/icons/crisp.pak"),
     (cstr16!("\\FREEOS\\ICONS\\SOFT.PAK"), "usr/share/icons/soft.pak"),
     (cstr16!("\\FREEOS\\ICONS\\VIVID.PAK"), "usr/share/icons/vivid.pak"),
+];
+
+/// Галерея обоев (22.11): картинки, миниатюры и подписи. Список обязан
+/// совпадать с `PAYLOAD_WALLS` в `xtask/src/arch.rs`.
+const WALLS: [(&CStr16, &str); 11] = [
+    (cstr16!("\\FREEOS\\WALLS\\INDEX.TXT"), "usr/share/wallpapers/index.txt"),
+    (cstr16!("\\FREEOS\\WALLS\\VALLEY.JPG"), "usr/share/wallpapers/valley.jpg"),
+    (cstr16!("\\FREEOS\\WALLS\\VALLEY.TQI"), "usr/share/wallpapers/valley.thumb.qoi"),
+    (cstr16!("\\FREEOS\\WALLS\\GALAXY.JPG"), "usr/share/wallpapers/galaxy.jpg"),
+    (cstr16!("\\FREEOS\\WALLS\\GALAXY.TQI"), "usr/share/wallpapers/galaxy.thumb.qoi"),
+    (cstr16!("\\FREEOS\\WALLS\\ORBIT.JPG"), "usr/share/wallpapers/orbit.jpg"),
+    (cstr16!("\\FREEOS\\WALLS\\ORBIT.TQI"), "usr/share/wallpapers/orbit.thumb.qoi"),
+    (cstr16!("\\FREEOS\\WALLS\\WAVES.JPG"), "usr/share/wallpapers/waves.jpg"),
+    (cstr16!("\\FREEOS\\WALLS\\WAVES.TQI"), "usr/share/wallpapers/waves.thumb.qoi"),
+    (cstr16!("\\FREEOS\\WALLS\\CRYSTAL.JPG"), "usr/share/wallpapers/crystal.jpg"),
+    (cstr16!("\\FREEOS\\WALLS\\CRYSTAL.TQI"), "usr/share/wallpapers/crystal.thumb.qoi"),
 ];
 
 const SITE: [(&CStr16, &str); 2] = [

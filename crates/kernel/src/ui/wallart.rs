@@ -14,6 +14,11 @@ use crate::kprintln;
 /// Обои 1920×1080 (`assets/wallpaper/fossai-1920x1080.qoi`).
 static FOSSAI: &[u8] = include_bytes!("../../../../assets/wallpaper/fossai-1920x1080.qoi");
 
+/// Распакованная картинка FossAi — для миниатюры в «Фоне» (22.11).
+pub(super) fn picture() -> Option<Picture> {
+    Picture::decode(FOSSAI)
+}
+
 /// Залить `surface` обоями FossAi с обрезкой по краям. `false` — картинку не
 /// распаковать (нет памяти): стол нарисует обои по точкам.
 pub fn paint(surface: &mut Surface) -> bool {

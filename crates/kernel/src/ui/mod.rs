@@ -72,6 +72,7 @@ pub mod launch;
 pub mod traypop;
 pub mod trash;
 pub mod wallart;
+pub mod wallpaper;
 pub mod window;
 pub mod winapps;
 
@@ -2311,6 +2312,13 @@ pub fn tick() {
             let (total, entries) = desktop.icon_counts();
             kprintln!("  desktop     : desktop folder changed, icons {total}, {entries} from {}", context::desktop_dir());
             desktop.repaint_all();
+        }
+        // Фон (22.11, `wallpaper`): картинка перевелась — стол и «Фон» заново.
+        if wallpaper::poll() {
+            desktop.repaint_all();
+            if let Some(window) = desktop.find(App::Settings) {
+                window.refresh_settings();
+            }
         }
         desktop.expire_toast();
         desktop.refresh_lock_clock();
@@ -5629,7 +5637,8 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         | context::Action::Copy => {}
         context::Action::Personalize => {
             desktop.close_context();
-            open_settings(desktop, Section::Personal, status);
+            // Как в Windows: «Персонализация» открывается на «Фоне» (22.11).
+            open_settings(desktop, Section::Wallpaper, status);
         }
         context::Action::OpenNewWindow => {
             desktop.close_context();

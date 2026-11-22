@@ -62,6 +62,8 @@ pub fn adopt() {
         mini_ui::theme::set_wallpaper(wall);
         crate::kprintln!("  desktop     : wallpaper {} from {}", wall.tag(), path);
     }
+    // Фон: картинка, цвет, расположение (22.11, `wallpaper`).
+    super::wallpaper::adopt(text, &path);
     // Электропитание: через сколько гаснет экран. Здесь же, а не в своём файле,
     // потому что это настройка того же рода — её выбирают потом и меняют часто,
     // а установщик о ней ничего не знает.

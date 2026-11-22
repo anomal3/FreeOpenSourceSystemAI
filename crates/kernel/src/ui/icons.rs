@@ -1143,7 +1143,7 @@ impl Icons {
         let room = cell.w.saturating_sub(pad * 2);
         // На картинке FossAi подпись белая при любой теме — картинка тёмная и
         // одна на обе темы (как подписи на обоях Windows).
-        let ink = if theme::wallpaper() == theme::Wallpaper::Fossai {
+        let ink = if super::wallpaper::white_labels() {
             mini_ui::Color::rgb(0xFF, 0xFF, 0xFF)
         } else if selected {
             p.ink
@@ -1234,7 +1234,7 @@ fn centered(
     let width = ctx.face(Role::Label).width(line).min(room);
     let x = cell.x + (cell.w as i32 - width as i32) / 2;
     // Тень под подписью на картинке: светлые места обоев иначе съедают буквы.
-    if theme::wallpaper() == theme::Wallpaper::Fossai {
+    if super::wallpaper::white_labels() {
         let shift = ctx.px(1) as i32;
         mini_ui::typeface::draw_clipped(s, ctx.face(Role::Label), x + shift, y + shift, line, room, mini_ui::Color::rgb(0, 0, 0), 150);
     }

@@ -732,6 +732,8 @@ fn real_main() -> Result<()> {
             for (png, qoi) in WALLPAPERS {
                 wallpaper::generate(&dir.join(png), &dir.join(qoi))?;
             }
+            // Галерея «Фона» (22.11): миниатюры QOI рядом с картинками.
+            wallpaper::gallery_thumbs(&paths::initrd_source_dir().join("usr").join("share").join("wallpapers"))?;
             // Логотип — FIMG 128×128: «Пуск», «О системе».
             let logo = paths::workspace_root().join("assets").join("logo");
             for (png, out) in [("fossai-logo-128.png", "fossai-logo.fimg"), ("fossai-logo-tile-128.png", "fossai-logo-tile.fimg")] {

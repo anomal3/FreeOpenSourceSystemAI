@@ -27,6 +27,7 @@
 //! ([`kit::Pass`]), и проход этот либо рисует, либо только запоминает, куда
 //! можно нажать и в каком порядке по пунктам ходит клавиатура.
 
+mod background;
 mod displays;
 mod kit;
 mod pages;
@@ -262,7 +263,7 @@ impl Section {
             Section::Usb => "Подключённые устройства и контроллеры",
             Section::Network => "Адрес: по DHCP или постоянный",
             Section::Personal => "Фон, цвета, тема, оформление",
-            Section::Wallpaper => "Градиент рабочего стола",
+            Section::Wallpaper => "Картинка, цвет и расположение",
             Section::Colors => "Тема, акцентный цвет, заголовок окна",
             Section::Appearance => "Современный или простой вид, эффекты, контур окна",
             Section::Dock => "Вид, сторона экрана, автоскрытие, значки",
@@ -294,7 +295,7 @@ impl Section {
             Section::Usb => "usb xhci ehci ohci контроллер мышь планшет",
             Section::Network => "сеть адрес dhcp шлюз ip mac dns",
             Section::Personal => "персонализация оформление",
-            Section::Wallpaper => "фон обои градиент",
+            Section::Wallpaper => "фон обои градиент картинка цвет",
             Section::Colors => "цвета тема тёмная светлая акцент заголовок",
             Section::Appearance => "оформление интерфейс вид эффекты анимация сворачивание открытие тени прозрачность размытие подсмотр контур перетаскивание простой классический современный быстродействие",
             Section::Dock => "панель задач dock аптайм дата часы расположение скрывать автоскрытие сверху слева справа значки мониторы дисплеи кнопки окон",
@@ -374,6 +375,8 @@ enum Deed {
     Theme(bool),
     Accent(theme::Accent),
     Wallpaper(theme::Wallpaper),
+    /// Фон: картинка, «Обзор…», цвет, расположение (22.11, `wallpaper`).
+    Background(super::wallpaper::WallDeed),
     TitleBar(u32),
     ScreenOff(u32),
     Panel(PanelPref, bool),
@@ -1221,7 +1224,8 @@ impl SettingsView {
                 });
             }
             Deed::Wallpaper(wall) => {
-                if theme::set_wallpaper(wall) {
+                // Картинка и цвет фона уступают обоям темы (22.11).
+                if super::wallpaper::use_preset() | theme::set_wallpaper(wall) {
                     self.theme_changed = true;
                 }
                 self.report = Some(match super::prefs::store_wallpaper(wall) {
@@ -1230,6 +1234,15 @@ impl SettingsView {
                         Report::ok(format!("обои «{}» запомнены", wall.title()))
                     }
                     Err(err) => Report::bad(format!("обои применены, но не запомнены: {err}")),
+                });
+            }
+            Deed::Background(deed) => {
+                let (text, result) = super::wallpaper::apply(deed);
+                // Стол целиком: другой фон — другие подписи значков.
+                self.theme_changed = true;
+                self.report = Some(match result {
+                    Ok(()) => Report::ok(text),
+                    Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
                 });
             }
             Deed::TitleBar(height) => {
