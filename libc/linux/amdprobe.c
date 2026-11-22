@@ -10,7 +10,10 @@
  *   4. `GET_CAP` (SYNCOBJ, SYNCOBJ_TIMELINE, PRIME, TIMESTAMP_MONOTONIC);
  *   5. `AMDGPU_INFO`: ACCEL_WORKING, DEV_INFO (семейство VI, согласие с sysfs),
  *      READ_MMR_REG 0x263e (GB_ADDR_CONFIG), HW_IP_COUNT/INFO, FW_VERSION ME/PFP/MEC,
- *      MEMORY, VRAM_GTT, неизвестный запрос — EINVAL.
+ *      MEMORY, VRAM_GTT, неизвестный запрос — EINVAL;
+ *   6. буферы: GEM_CREATE, GEM_MMAP + mmap по смещению (запись/чтение), GEM_METADATA,
+ *      GEM_OP, GEM_WAIT_IDLE, GEM_CLOSE; адреса: GEM_VA MAP/UNMAP/REPLACE/CLEAR и их
+ *      ошибки; контексты: CTX ALLOC/QUERY_STATE2/FREE.
  *
  * Запуск: `amdprobe [soft|hw]` (режим только печатается). Общие обёртки и
  * вывод — `drmprobe.h` (структуры nouveau в нём этой пробе не нужны).
@@ -235,6 +238,161 @@ static void test_info(u32 sysfs_device, u32 sysfs_rev) {
     check_v(r == -EINVAL, "an unknown INFO query is EINVAL", r);
 }
 
+/* ---- буферы, адреса, контексты (uAPI amdgpu_drm.h) ---- */
+
+#define DRM_IOCTL_AMDGPU_GEM_CREATE 0xC0206440u
+#define DRM_IOCTL_AMDGPU_GEM_MMAP 0xC0086441u
+#define DRM_IOCTL_AMDGPU_CTX 0xC0106442u
+#define DRM_IOCTL_AMDGPU_GEM_METADATA 0xC1206446u
+#define DRM_IOCTL_AMDGPU_GEM_WAIT_IDLE 0xC0106447u
+#define DRM_IOCTL_AMDGPU_GEM_VA 0x40286448u
+#define DRM_IOCTL_AMDGPU_GEM_OP 0xC0106450u
+#define DRM_IOCTL_GEM_CLOSE_ 0x40086409u
+
+struct amd_gem_create { u64 bo_size, alignment, domains, domain_flags; };
+_Static_assert(sizeof(struct amd_gem_create) == 32, "drm_amdgpu_gem_create");
+struct amd_gem_va { u32 handle, pad, operation, flags; u64 va_address, offset_in_bo, map_size; };
+_Static_assert(sizeof(struct amd_gem_va) == 40, "drm_amdgpu_gem_va");
+struct amd_ctx { u32 op, flags, ctx_id; i32 priority; };
+_Static_assert(sizeof(struct amd_ctx) == 16, "drm_amdgpu_ctx");
+struct amd_meta { u32 handle, op; u64 flags, tiling_info; u32 data_size_bytes, data[64]; };
+_Static_assert(sizeof(struct amd_meta) == 288, "drm_amdgpu_gem_metadata");
+struct amd_gem_op { u32 handle, op; u64 value; };
+struct amd_wait_idle { u32 handle, flags; u64 timeout; };
+
+static i64 gem_create(u64 size, u64 domains, u32 *handle) {
+    struct amd_gem_create c = {size, 4096, domains, 0};
+    i64 r = io(DRM_IOCTL_AMDGPU_GEM_CREATE, &c);
+    *handle = r == 0 ? (u32)c.bo_size : 0; /* выход — handle в первых 4 байтах union */
+    return r;
+}
+static i64 gem_va(u32 handle, u32 op, u64 va, u64 off, u64 size, u32 flags) {
+    struct amd_gem_va v = {handle, 0, op, flags, va, off, size};
+    return io(DRM_IOCTL_AMDGPU_GEM_VA, &v);
+}
+static i64 ctx_op(u32 op, u32 id, u32 *out_id) {
+    struct amd_ctx c = {op, 0, id, 0};
+    i64 r = io(DRM_IOCTL_AMDGPU_CTX, &c);
+    if (out_id) *out_id = c.op; /* alloc.ctx_id — первые 4 байта union */
+    return r;
+}
+
+enum { VA_OP_MAP = 1, VA_OP_UNMAP = 2, VA_OP_CLEAR = 3, VA_OP_REPLACE = 4 };
+enum { VM_RW = (1 << 1) | (1 << 2) | (1 << 3) };
+
+static void test_gem(void) {
+    u32 bo = 0;
+    i64 r = gem_create(1 << 20, 2 /* GTT */, &bo);
+    check_v(r == 0 && bo != 0, "GEM_CREATE 1 MiB in GTT gives a handle", r);
+    u32 junk;
+    check_v(gem_create(0, 2, &junk) == -EINVAL, "GEM_CREATE of size 0 is EINVAL", 0);
+    check_v(gem_create(4096, 0, &junk) == -EINVAL, "GEM_CREATE with no domain is EINVAL", 0);
+    check_v(gem_create(4096, 0x8 /* GDS */, &junk) == -EINVAL, "GEM_CREATE in GDS is EINVAL (no GDS here)", 0);
+
+    /* mmap по смещению из GEM_MMAP: запись и чтение через отображение */
+    u64 map_offset = bo; /* вход: handle; выход: addr_ptr (u64) */
+    r = io(DRM_IOCTL_AMDGPU_GEM_MMAP, &map_offset);
+    note_hex("mmap offset", map_offset);
+    check_v(r == 0 && map_offset >= 0x100000000ull, "GEM_MMAP gives a fake mmap offset (>= 0x100000000)", r);
+    u32 *p = (u32 *)sys6(SYS_mmap, 0, 1 << 20, PROT_READ | PROT_WRITE, MAP_SHARED, drm, (i64)map_offset);
+    check_v((i64)p > 0 || (u64)p < (u64)-4096, "mmap of the render node at the buffer offset", (i64)p);
+    if ((u64)p < (u64)-4096) {
+        int bad = 0;
+        for (u32 i = 0; i < (1 << 20) / 4; i += 1021) p[i] = 0x5a5a0000u + i;
+        for (u32 i = 0; i < (1 << 20) / 4; i += 1021)
+            if (p[i] != 0x5a5a0000u + i) bad++;
+        check_v(bad == 0, "writes through the mapping read back (1 MiB, stride 1021 dwords)", bad);
+        check_v(p[1] == 0, "a fresh buffer is zero-filled", p[1]);
+    }
+    u64 bad_offset = 0x1000;
+    check(sys6(SYS_mmap, 0, 4096, PROT_READ, MAP_SHARED, drm, (i64)bad_offset) < 0, "mmap at an offset that belongs to no buffer fails");
+    u32 other = 0;
+    gem_create(2 << 20, 2, &other);
+
+    /* GEM_VA: MAP, пересечение, UNMAP, REPLACE, CLEAR, ошибки */
+    r = gem_va(bo, VA_OP_MAP, 0x100000, 0, 1 << 20, VM_RW);
+    check_v(r == 0, "GEM_VA MAP 1 MiB at 0x100000", r);
+    r = gem_va(bo, VA_OP_MAP, 0x180000, 0, 4096, VM_RW);
+    check_v(r == -EINVAL, "GEM_VA MAP over an existing mapping is EINVAL", r);
+    r = gem_va(bo, VA_OP_MAP, 0x1000, 0, 4096, VM_RW);
+    check_v(r == -EINVAL, "GEM_VA MAP below the reserved bottom (64 KiB) is EINVAL", r);
+    r = gem_va(bo, VA_OP_MAP, 0x300001, 0, 4096, VM_RW);
+    check_v(r == -EINVAL, "GEM_VA MAP at an unaligned address is EINVAL", r);
+    r = gem_va(bo, VA_OP_MAP, 0x400000, 1 << 20, 4096, VM_RW);
+    check_v(r == -EINVAL, "GEM_VA MAP beyond the end of the buffer is EINVAL", r);
+    r = gem_va(0xdead, VA_OP_MAP, 0x400000, 0, 4096, VM_RW);
+    check_v(r == -ENOENT, "GEM_VA MAP of an unknown handle is ENOENT", r);
+    r = gem_va(bo, VA_OP_MAP, 0x500000, 0, 4096, 0x8000);
+    check_v(r == -EINVAL, "GEM_VA MAP with unknown flags is EINVAL", r);
+    r = gem_va(bo, VA_OP_UNMAP, 0x100000, 0, 1 << 20, 0);
+    check_v(r == 0, "GEM_VA UNMAP of the mapping", r);
+    r = gem_va(bo, VA_OP_UNMAP, 0x100000, 0, 1 << 20, 0);
+    check_v(r == -EINVAL, "a second GEM_VA UNMAP is EINVAL", r);
+    gem_va(bo, VA_OP_MAP, 0x200000, 0, 8192, VM_RW);
+    r = gem_va(other, VA_OP_REPLACE, 0x200000, 0, 8192, VM_RW);
+    check_v(r == 0, "GEM_VA REPLACE over an existing mapping", r);
+    r = gem_va(other, VA_OP_MAP, 0x200000, 0, 4096, VM_RW);
+    check_v(r == -EINVAL, "after REPLACE the range is taken (MAP is EINVAL)", r);
+    r = gem_va(0, VA_OP_CLEAR, 0x200000, 0, 8192, 0);
+    check_v(r == 0, "GEM_VA CLEAR of the range", r);
+    r = gem_va(other, VA_OP_MAP, 0x200000, 0, 8192, VM_RW);
+    check_v(r == 0, "after CLEAR the range is free again", r);
+
+    /* метаданные, GEM_OP, WAIT_IDLE */
+    struct amd_meta m;
+    memset(&m, 0, sizeof m);
+    m.handle = bo;
+    m.op = 1; /* SET */
+    m.flags = 7;
+    m.tiling_info = 0x1234abcdull;
+    m.data_size_bytes = 8;
+    m.data[0] = 0xdeadbeef;
+    m.data[1] = 0xcafef00d;
+    r = io(DRM_IOCTL_AMDGPU_GEM_METADATA, &m);
+    check_v(r == 0, "GEM_METADATA SET", r);
+    struct amd_meta g;
+    memset(&g, 0, sizeof g);
+    g.handle = bo;
+    g.op = 2; /* GET */
+    r = io(DRM_IOCTL_AMDGPU_GEM_METADATA, &g);
+    check_v(r == 0 && g.flags == 7 && g.tiling_info == 0x1234abcdull && g.data_size_bytes == 8 && g.data[0] == 0xdeadbeef && g.data[1] == 0xcafef00d,
+            "GEM_METADATA GET returns what SET stored", r);
+    m.data_size_bytes = 300;
+    r = io(DRM_IOCTL_AMDGPU_GEM_METADATA, &m);
+    check_v(r == -EINVAL, "GEM_METADATA SET with more than 256 bytes is EINVAL", r);
+
+    struct amd_gem_create info;
+    memset(&info, 0, sizeof info);
+    struct amd_gem_op op = {bo, 0 /* GET_GEM_CREATE_INFO */, (u64)&info};
+    r = io(DRM_IOCTL_AMDGPU_GEM_OP, &op);
+    check_v(r == 0 && info.bo_size == (1 << 20) && (info.domains & 2), "GEM_OP GET_GEM_CREATE_INFO returns size and domains", r);
+    struct amd_wait_idle w = {bo, 0, 1000};
+    r = io(DRM_IOCTL_AMDGPU_GEM_WAIT_IDLE, &w);
+    check_v(r == 0, "GEM_WAIT_IDLE of an idle buffer is 0 (status 0)", r);
+
+    /* контексты */
+    u32 ctx = 0;
+    r = ctx_op(1 /* ALLOC */, 0, &ctx);
+    check_v(r == 0 && ctx != 0, "CTX ALLOC gives an id", r);
+    r = ctx_op(4 /* QUERY_STATE2 */, ctx, 0);
+    check_v(r == 0, "CTX QUERY_STATE2 of a live context is 0", r);
+    r = ctx_op(2 /* FREE */, ctx, 0);
+    check_v(r == 0, "CTX FREE", r);
+    r = ctx_op(2 /* FREE */, ctx, 0);
+    check_v(r == -EINVAL, "a second CTX FREE is EINVAL", r);
+    r = ctx_op(4, ctx, 0);
+    check_v(r == -EINVAL, "CTX QUERY_STATE2 of a freed context is EINVAL", r);
+
+    /* закрытие: ручка уходит, отображение в память программы живёт */
+    r = io(DRM_IOCTL_GEM_CLOSE_, &bo);
+    check_v(r == 0, "GEM_CLOSE", r);
+    r = io(DRM_IOCTL_GEM_CLOSE_, &bo);
+    check_v(r == -EINVAL, "a second GEM_CLOSE is EINVAL", r);
+    if ((u64)p < (u64)-4096) check_v(p[0] == 0x5a5a0000u, "the mapping outlives GEM_CLOSE", p[0]);
+    r = io(DRM_IOCTL_AMDGPU_GEM_MMAP, &map_offset);
+    check_v(r == -ENOENT, "GEM_MMAP of a closed handle is ENOENT", r);
+}
+
 __attribute__((used)) void start_c(u64 *sp) {
     int argc = (int)sp[0];
     char **argv = (char **)(sp + 1);
@@ -255,6 +413,7 @@ __attribute__((used)) void start_c(u64 *sp) {
     cap(DRM_CAP_SYNCOBJ_TIMELINE, 1, "GET_CAP SYNCOBJ_TIMELINE is 1");
     cap(DRM_CAP_TIMESTAMP_MONOTONIC, 1, "GET_CAP TIMESTAMP_MONOTONIC is 1");
     test_info(sysfs_device, sysfs_rev);
+    test_gem();
     i64 r = sys3(SYS_close, drm, 0, 0);
     check_v(r == 0, "close the render node", r);
     say("done");

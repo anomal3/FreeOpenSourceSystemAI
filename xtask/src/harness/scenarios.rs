@@ -7101,6 +7101,13 @@ pub const ALL: &[Scenario] = &[
             Step::Await("amdprobe: ok HW_IP_INFO GFX is 8.0 with one ring", 15_000),
             Step::Await("amdprobe: ok MEMORY has VRAM and GTT", 15_000),
             Step::Await("amdprobe: ok an unknown INFO query is EINVAL", 15_000),
+            Step::Await("amdprobe: ok GEM_CREATE 1 MiB in GTT gives a handle", 15_000),
+            Step::Await("amdprobe: ok writes through the mapping read back (1 MiB, stride 1021 dwords)", 15_000),
+            Step::Await("amdprobe: ok GEM_VA MAP over an existing mapping is EINVAL", 15_000),
+            Step::Await("amdprobe: ok GEM_VA REPLACE over an existing mapping", 15_000),
+            Step::Await("amdprobe: ok GEM_METADATA GET returns what SET stored", 15_000),
+            Step::Await("amdprobe: ok CTX FREE", 15_000),
+            Step::Await("amdprobe: ok the mapping outlives GEM_CLOSE", 15_000),
             Step::Await("amdprobe: 0 failed", 30_000),
             Step::Await("exited with code 0", 15_000),
             // Узел AMD выключен — узел NVIDIA и обычный путь на месте (старый сценарий их не ломает).

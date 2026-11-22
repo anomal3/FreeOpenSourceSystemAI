@@ -378,6 +378,9 @@ pub fn mmap_object(fd: usize, offset: u64, len: usize) -> Option<Result<(Arc<cra
     if let Some(file) = object.as_any().downcast_ref::<DrmFile>() {
         return Some(gem::mmap_file(file, offset, len as u64));
     }
+    if let Some(file) = object.as_any().downcast_ref::<amdgpu::AmdFile>() {
+        return Some(amdgpu::mmap_file(file, offset, len as u64));
+    }
     let buf = object.as_any().downcast_ref::<gem::DmaBuf>()?;
     Some(gem::mmap_bo(&buf.0, offset, len as u64))
 }

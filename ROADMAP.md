@@ -11257,6 +11257,21 @@ AMD). Отвечает на `VERSION` (amdgpu 3.59.0), `GET_UNIQUE`, `GET_CAP`, 
 (+fence, syncobj), RADV в пакет Proton (`mesa.rs`/`proton.rs`), бэкенд на железе поверх
 `display::amd`.
 
+**A4, шаг 2 (22.11): буферы, адреса и контексты на программной карте — РАБОТАЮТ В QEMU.**
+В `linux/drm/amdgpu.rs`: `GEM_CREATE` (домены CPU/GTT/VRAM, GDS/GWS/OA/doorbell — EINVAL;
+все буферы — кадры системной памяти, как у `SoftGpu`), `GEM_MMAP` + `mmap` по
+поддельному смещению (`drm::mmap_object` → `amdgpu::mmap_file`, `SharedMem::from_frames`),
+`GEM_CLOSE` (ручка уходит, отображение живёт), `GEM_METADATA` (SET/GET, до 256 байт),
+`GEM_OP` (`GET_GEM_CREATE_INFO`, `SET_PLACEMENT`), `GEM_WAIT_IDLE`; `GEM_VA`
+(`MAP`/`UNMAP`/`REPLACE`/`CLEAR`) — учёт отображений в `BTreeMap` с проверками Linux
+(выравнивание 4 КиБ, нижний резерв 64 КиБ, верхняя граница = наш 1 ГиБ PD, пересечение при
+`MAP` — EINVAL, неизвестные флаги — EINVAL); `CTX` (`ALLOC`/`FREE`/`QUERY_STATE(2)`/стабильное
+p-state). Проба `amdprobe` расширена (≈45 проверок), `amd-soft` 0 failed, `nvk-soft`
+зелёный. **Не сделано:** PRIME (dma-buf на AMD-буферах: общий `gem::DmaBuf` завязан на
+`nvgpu::Bo`), `CS`/`WAIT_CS`, заборы, syncobj AMD, `GEM_USERPTR`, PRT-отображения.
+Дальше: `CS` с мини-интерпретатором PM4 на программной карте, syncobj/заборы, RADV в
+пакет Proton, бэкенд на железе поверх `display::amd`.
+
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
 `drmGetDevices2`, ioctl для `vulkaninfo` и для рендера, поля
