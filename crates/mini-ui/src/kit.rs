@@ -31,7 +31,7 @@ use crate::glyphicon::{self, Icon};
 use crate::iconset::{self, Fi};
 use crate::paint::{self, Ctx, RowState};
 use crate::typeface::Role;
-use crate::{Rect, Surface, draw, theme};
+use crate::{Rect, Surface, classic, draw, theme};
 
 // ---------------------------------------------------------------------------
 // Панели
@@ -65,7 +65,13 @@ pub fn toolbar(ctx: Ctx, s: &mut Surface, rect: Rect) -> Ctx {
     let p = ctx.palette;
     if !rect.is_empty() {
         s.fill(rect, ctx.flat(p.panel));
-        draw::hline(s, rect.x, rect.bottom() - 1, rect.w, p.line.color, p.line.alpha);
+        if theme::is_classic() {
+            // Панель инструментов Windows 98 — бороздка снизу.
+            let t = classic::unit(ctx.scale);
+            classic::groove_h(s, rect.x, rect.bottom() - 2 * t as i32, rect.w, t);
+        } else {
+            draw::hline(s, rect.x, rect.bottom() - 1, rect.w, p.line.color, p.line.alpha);
+        }
     }
     ctx.on(theme::panel_bg())
 }
@@ -92,7 +98,12 @@ pub fn status_bar(ctx: Ctx, s: &mut Surface, rect: Rect, text: &str) {
         return;
     }
     s.fill(rect, ctx.flat(p.panel));
-    draw::hline(s, rect.x, rect.y, rect.w, p.line2.color, p.line2.alpha);
+    if theme::is_classic() {
+        let t = classic::unit(ctx.scale);
+        classic::shallow(s, Rect::new(rect.x + 2 * t as i32, rect.y + 2 * t as i32, rect.w.saturating_sub(4 * t), rect.h.saturating_sub(3 * t)), t);
+    } else {
+        draw::hline(s, rect.x, rect.y, rect.w, p.line2.color, p.line2.alpha);
+    }
     let bar = ctx.on(theme::panel_bg());
     let pad = ctx.px(14);
     paint::text_clipped(
@@ -145,6 +156,18 @@ impl Tabs {
     /// Нарисовать поверх панели (`bar` — контекст от [`toolbar`]).
     pub fn draw(&self, bar: Ctx, s: &mut Surface, labels: &[&str], active: usize) {
         let p = bar.palette;
+        if theme::is_classic() {
+            // Переключатель — ряд кнопок; выбранная вдавлена (как
+            // кнопки-переключатели панели инструментов Windows 98).
+            let t = classic::unit(bar.scale);
+            for (index, (rect, label)) in self.tabs.iter().zip(labels).enumerate() {
+                let on = index == active;
+                classic::button(s, *rect, t, on);
+                let area = if on { rect.translate(t as i32, t as i32) } else { *rect };
+                paint::text_centered(bar, s, Role::Caption, area, label, p.ink);
+            }
+            return;
+        }
         paint::sunk(bar, s, self.frame, bar.px(theme::R_ROW));
         for (index, (rect, label)) in self.tabs.iter().zip(labels).enumerate() {
             let on = index == active;
@@ -267,6 +290,23 @@ impl Table {
     pub fn draw_header(&self, ctx: Ctx, s: &mut Surface, columns: &[Rect], titles: &[&str]) {
         let p = ctx.palette;
         let y = paint::baseline(ctx, Role::MonoCaps, self.header);
+        if theme::is_classic() {
+            // Шапка списка Windows 98: ряд выпуклых кнопок-столбцов.
+            let t = classic::unit(ctx.scale);
+            let shown: Vec<Rect> = columns.iter().copied().filter(|rect| rect.w > 0).collect();
+            for (index, rect) in shown.iter().enumerate() {
+                let left = if index == 0 { self.header.x } else { rect.x - ctx.px(8) as i32 };
+                let right = shown.get(index + 1).map_or(self.header.right(), |next| next.x - ctx.px(8) as i32);
+                let cell = Rect::new(left, self.header.y, (right - left).max(0) as u32, self.header.h);
+                classic::button(s, cell, t, false);
+            }
+            for (rect, title) in columns.iter().zip(titles) {
+                if rect.w > 0 {
+                    paint::text(ctx, s, Role::Caption, rect.x, paint::baseline(ctx, Role::Caption, self.header), title, p.ink);
+                }
+            }
+            return;
+        }
         for (rect, title) in columns.iter().zip(titles) {
             if rect.w > 0 {
                 paint::caps(ctx, s, rect.x, y, title);
@@ -366,6 +406,10 @@ pub fn place(at: (i32, i32), size: (u32, u32), area: Rect) -> Rect {
 /// поверх карточки — на ней рисуются и пункты меню, и поле переименования.
 pub fn card(ctx: Ctx, s: &mut Surface, rect: Rect) -> Ctx {
     let p = ctx.palette;
+    if theme::is_classic() {
+        classic::panel(s, rect, classic::unit(ctx.scale));
+        return ctx.on(theme::panel_bg());
+    }
     draw::shadow(s, rect, ctx.px(theme::R_CARD), ctx.px(18), crate::Color::rgb(0, 0, 0), 90);
     draw::rounded(s, rect, ctx.px(theme::R_CARD), ctx.flat(p.panel), 255);
     draw::rounded_stroke(s, rect, ctx.px(theme::R_CARD), p.line3.color, p.line3.alpha);
@@ -396,7 +440,11 @@ pub fn draw_menu(ctx: Ctx, s: &mut Surface, rect: Rect, entries: &[Entry<'_>], s
         let row = entry_rect(inner, rect, entries, index);
         if index > 0 && entry.group != entries[index - 1].group {
             let line_y = row.y - ctx.px(MENU_SEPARATOR) as i32 + ctx.px(4) as i32;
-            paint::separator(inner, s, rect.x + ctx.px(12) as i32, line_y, rect.w.saturating_sub(ctx.px(24)));
+            if theme::is_classic() {
+                classic::groove_h(s, rect.x + ctx.px(4) as i32, line_y, rect.w.saturating_sub(ctx.px(8)), classic::unit(ctx.scale));
+            } else {
+                paint::separator(inner, s, rect.x + ctx.px(12) as i32, line_y, rect.w.saturating_sub(ctx.px(24)));
+            }
         }
         let on = index == selected;
         paint::row(inner, s, row, if on { RowState::Selected } else { RowState::Idle });
@@ -408,7 +456,13 @@ pub fn draw_menu(ctx: Ctx, s: &mut Surface, rect: Rect, entries: &[Entry<'_>], s
                 row.x + ctx.px(14) as i32,
                 row.y + (row.h as i32 - side as i32) / 2,
                 side,
-                if entry.danger { p.bad_ink } else { p.ink3 },
+                if on && theme::is_classic() {
+                    crate::Color::rgb(0xFF, 0xFF, 0xFF)
+                } else if entry.danger {
+                    p.bad_ink
+                } else {
+                    p.ink3
+                },
                 255,
             );
         }
@@ -765,6 +819,12 @@ impl ScrollBar {
     /// под указателем и когда тянут — дорожка и бегунок пошире.
     pub fn draw(&self, ctx: Ctx, s: &mut Surface, scroll: &Scroll) {
         let p = ctx.palette;
+        if theme::is_classic() {
+            // Windows 98: дорожка в шахматку, стрелки на концах, выпуклый
+            // бегунок — всегда, а не только под указателем.
+            classic::scrollbar(s, self.track, self.thumb, self.vertical, classic::unit(ctx.scale));
+            return;
+        }
         let hot = scroll.hot();
         if hot {
             draw::rounded(s, self.track, ctx.px(theme::R_ROW), p.line2.color, p.line2.alpha);
@@ -859,7 +919,9 @@ pub fn status_toggles(ctx: Ctx, rect: Rect, count: usize) -> Vec<Rect> {
 /// Переключатель вида в строке состояния: значок, у включённого — подложка.
 pub fn status_toggle(ctx: Ctx, s: &mut Surface, rect: Rect, icon: Icon, on: bool) {
     let p = ctx.palette;
-    if on {
+    if on && theme::is_classic() {
+        classic::pressed(s, rect, classic::unit(ctx.scale));
+    } else if on {
         draw::rounded(s, rect, ctx.px(theme::R_ROW), ctx.flat(p.btn), 255);
         draw::rounded_stroke(s, rect, ctx.px(theme::R_ROW), p.btnline.color, p.btnline.alpha);
     }
@@ -884,7 +946,13 @@ pub fn status_line(ctx: Ctx, s: &mut Surface, rect: Rect, parts: &[&str], right:
         return;
     }
     s.fill(rect, ctx.flat(p.panel));
-    draw::hline(s, rect.x, rect.y, rect.w, p.line2.color, p.line2.alpha);
+    if theme::is_classic() {
+        // Строка состояния Windows 98 — мелкая вдавленность.
+        let t = classic::unit(ctx.scale);
+        classic::shallow(s, Rect::new(rect.x + 2 * t as i32, rect.y + 2 * t as i32, rect.w.saturating_sub(4 * t), rect.h.saturating_sub(3 * t)), t);
+    } else {
+        draw::hline(s, rect.x, rect.y, rect.w, p.line2.color, p.line2.alpha);
+    }
     let bar = ctx.on(theme::panel_bg());
     let pad = ctx.px(PAD) as i32;
     let role = Role::Caption;
@@ -998,6 +1066,10 @@ impl TabStrip {
         if self.rect.is_empty() {
             return;
         }
+        if theme::is_classic() {
+            self.draw_classic(ctx, s, titles, active, icon);
+            return;
+        }
         s.fill(self.rect, theme::window_bg());
         let panel = ctx.flat(p.panel);
         let r = ctx.px(theme::R_CARD);
@@ -1053,6 +1125,46 @@ impl TabStrip {
             draw::rounded(s, self.plus, ctx.px(theme::R_ROW), p.hover1.color, p.hover1.alpha);
         }
         iconset::draw(s, Fi::Plus, self.plus.x + (self.plus.w as i32 - g as i32) / 2, self.plus.y + (self.plus.h as i32 - g as i32) / 2, g, if hover == Some(TabHit::New) { p.ink } else { p.ink3 }, 255);
+    }
+
+    /// Вкладки Windows 98 (22.11, классика): выпуклые «ушки», открытая —
+    /// выше остальных и сливается с панелью под полосой.
+    fn draw_classic(&self, ctx: Ctx, s: &mut Surface, titles: &[&str], active: usize, icon: Option<Icon>) {
+        use crate::theme::win98::{DARK, FACE, LIGHT, SHADE};
+        let p = ctx.palette;
+        let t = classic::unit(ctx.scale);
+        let ti = t as i32;
+        s.fill(self.rect, FACE);
+        let base = self.rect.bottom() - ti;
+        s.fill(Rect::new(self.rect.x, base, self.rect.w, t), LIGHT);
+        for (index, (tab, title)) in self.tabs.iter().zip(titles).enumerate() {
+            let on = index == active;
+            let lift = if on { 0 } else { 2 * ti };
+            let ear = Rect::new(tab.x - if on { 2 * ti } else { 0 }, tab.y + lift, tab.w + if on { 4 * t } else { 0 }, (base - tab.y - lift).max(0) as u32 + if on { t } else { 0 });
+            s.fill(ear, FACE);
+            s.fill(Rect::new(ear.x, ear.y + ti, t, ear.h.saturating_sub(t)), LIGHT);
+            s.fill(Rect::new(ear.x + ti, ear.y, ear.w.saturating_sub(3 * t), t), LIGHT);
+            s.fill(Rect::new(ear.right() - 2 * ti, ear.y + ti, t, ear.h.saturating_sub(t)), SHADE);
+            s.fill(Rect::new(ear.right() - ti, ear.y + 2 * ti, t, ear.h.saturating_sub(2 * t)), DARK);
+            let inner = ctx.on(FACE);
+            let mut x = tab.x + ctx.px(8) as i32;
+            if let Some(icon) = icon {
+                let g = ctx.px(14);
+                glyphicon::draw(s, icon, x, tab.y + lift + ((tab.h as i32 - lift) - g as i32) / 2, g, p.ink, 255);
+                x += (g + ctx.px(6)) as i32;
+            }
+            let close = self.closes[index];
+            let room = (close.x - x - ctx.px(4) as i32).max(0) as u32;
+            let band = Rect::new(tab.x, tab.y + lift, tab.w, (tab.h as i32 - lift).max(0) as u32);
+            paint::text_clipped(inner, s, Role::Body, x, paint::baseline(inner, Role::Body, band), room, title, p.ink);
+            let g = ctx.px(10);
+            iconset::draw(s, Fi::X, close.x + (close.w as i32 - g as i32) / 2, close.y + lift / 2 + (close.h as i32 - g as i32) / 2, g, p.ink, 255);
+        }
+        // «+» — маленькая кнопка.
+        let plus = Rect::new(self.plus.x, self.plus.y + 2 * ti, self.plus.w, self.plus.h.saturating_sub(4 * t));
+        classic::button(s, plus, t, false);
+        let g = ctx.px(12);
+        iconset::draw(s, Fi::Plus, plus.x + (plus.w as i32 - g as i32) / 2, plus.y + (plus.h as i32 - g as i32) / 2, g, p.ink, 255);
     }
 }
 

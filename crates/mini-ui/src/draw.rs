@@ -421,7 +421,8 @@ fn fill_rounded(surface: &mut Surface, rect: Rect, radius: u32, paint: Paint, al
     if visible.is_empty() {
         return;
     }
-    let shape = Round::new(rect, radius);
+    // Классика (22.11): углы прямые у всего, что заливается.
+    let shape = Round::new(rect, crate::theme::radius(radius));
     let corner = shape.corner();
     if corner == 0 {
         // Прямые углы — считать нечего, каждая строка сплошная.
@@ -470,7 +471,7 @@ fn corner_pixel(
 
 /// Скруглённый прямоугольник со сглаженными углами.
 pub fn rounded(surface: &mut Surface, rect: Rect, radius: u32, color: Color, alpha: Alpha) {
-    if radius == 0 {
+    if crate::theme::radius(radius) == 0 {
         // Прямые углы — это просто прямоугольник, и незачем идти через SDF.
         blend_rect(surface, rect, color, alpha);
         return;
@@ -597,7 +598,7 @@ fn stroke_pixel(
 /// него ни на долю точки. Иначе рамка окна оказалась бы на точку шире самого
 /// окна, и соседние окна начали бы задевать друг друга.
 pub fn rounded_stroke(surface: &mut Surface, rect: Rect, radius: u32, color: Color, alpha: Alpha) {
-    ring(surface, rect, radius, HALF, HALF, color, alpha);
+    ring(surface, rect, crate::theme::radius(radius), HALF, HALF, color, alpha);
 }
 
 /// Дуга скруглённого прямоугольника — контур со сглаживанием, толщина в
@@ -624,7 +625,7 @@ pub fn rounded_outline(
 /// красоты: сплошная светлая строка на скруглённом углу торчит усиком, потому
 /// что там фигуры под ней уже нет.
 pub fn crown(surface: &mut Surface, rect: Rect, radius: u32, color: Color, alpha: Alpha) {
-    if alpha == 0 || rect.is_empty() {
+    if alpha == 0 || rect.is_empty() || crate::theme::is_classic() {
         return;
     }
     let visible = clip(surface, rect);
@@ -670,7 +671,8 @@ pub fn shadow(
     color: Color,
     alpha: Alpha,
 ) {
-    if alpha == 0 || spread == 0 || !sane(rect) {
+    // Классика (22.11): теней у Windows 98 нет.
+    if alpha == 0 || spread == 0 || !sane(rect) || crate::theme::is_classic() {
         return;
     }
     let shape = Round::new(rect, radius);

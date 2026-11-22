@@ -21,6 +21,7 @@
 //! ошибок раскладки — это перепутанные местами ширина и высота в списке из
 //! четырёх чисел.
 
+use crate::classic;
 use crate::draw;
 use crate::glyphicon::{self, Icon};
 use crate::theme::{self, Ink, Palette};
@@ -48,6 +49,7 @@ impl Ctx {
     /// множителя, потому что порог у них общий — тот же 2560.
     #[must_use]
     pub fn scaled(scale: Scale) -> Self {
+        forget_selection();
         Self {
             palette: theme::palette(),
             tier: Tier::for_scale(scale, theme::is_mobile()),
@@ -92,11 +94,51 @@ impl Ctx {
     }
 }
 
+// ── Выделение в классике ─────────────────────────────────────────────────────
+//
+// Выделенная строка у Windows 98 — тёмно-синяя, и текст на ней белый. Цвет
+// текста выбирает программа, и многие берут `palette.ink` (чёрный) для всех
+// строк: на синем он пропал бы. Поэтому [`row`] запоминает последнюю
+// выделенную строку, а текст, начатый внутри неё тёмным цветом, пишется
+// белым. Забывается строка с новым кадром ([`Ctx::scaled`]).
+
+use core::sync::atomic::{AtomicI32, Ordering};
+
+static SEL: [AtomicI32; 4] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+
+/// Отметить `area` выделенной строкой: тёмный текст, начатый в ней, в
+/// классике пишется белым (для тех, кто заливает выделение сам — «Пуск»).
+pub fn remember_selection(area: Rect) {
+    SEL[0].store(area.x, Ordering::Relaxed);
+    SEL[1].store(area.y, Ordering::Relaxed);
+    SEL[2].store(area.right(), Ordering::Relaxed);
+    SEL[3].store(area.bottom(), Ordering::Relaxed);
+}
+
+/// Забыть выделенную строку (новый кадр).
+pub fn forget_selection() {
+    SEL[2].store(i32::MIN, Ordering::Relaxed);
+}
+
+/// Цвет текста, начатого в точке `x, y`: в классике тёмный текст на
+/// выделенной строке — белый.
+fn ink_at(x: i32, y: i32, color: Color) -> Color {
+    if !theme::is_classic() {
+        return color;
+    }
+    let inside = x >= SEL[0].load(Ordering::Relaxed)
+        && x < SEL[2].load(Ordering::Relaxed)
+        && y >= SEL[1].load(Ordering::Relaxed) - 2
+        && y < SEL[3].load(Ordering::Relaxed);
+    let dark = u32::from(color.r) * 3 + u32::from(color.g) * 6 + u32::from(color.b) < 1000;
+    if inside && dark { Color::rgb(0xFF, 0xFF, 0xFF) } else { color }
+}
+
 // ── Текст ────────────────────────────────────────────────────────────────────
 
 /// Написать строку. Возвращает её ширину.
 pub fn text(ctx: Ctx, s: &mut Surface, role: Role, x: i32, y: i32, t: &str, color: Color) -> u32 {
-    typeface::draw(s, ctx.face(role), x, y, t, color, 255)
+    typeface::draw(s, ctx.face(role), x, y, t, ink_at(x, y, color), 255)
 }
 
 /// Написать строку, обрезав по ширине многоточием.
@@ -115,17 +157,18 @@ pub fn text_clipped(
     t: &str,
     color: Color,
 ) -> u32 {
-    typeface::draw_clipped(s, ctx.face(role), x, y, t, room, color, 255)
+    typeface::draw_clipped(s, ctx.face(role), x, y, t, room, ink_at(x, y, color), 255)
 }
 
 /// Написать строку по центру прямоугольника.
 pub fn text_centered(ctx: Ctx, s: &mut Surface, role: Role, area: Rect, t: &str, color: Color) {
+    let color = ink_at(area.x + area.w as i32 / 2, area.y + area.h as i32 / 2, color);
     typeface::draw_centered(s, ctx.face(role), area, t, color, 255);
 }
 
 /// Написать строку, прижав её к правому краю.
 pub fn text_right(ctx: Ctx, s: &mut Surface, role: Role, right: i32, y: i32, t: &str, color: Color) {
-    typeface::draw_right(s, ctx.face(role), right, y, t, color, 255);
+    typeface::draw_right(s, ctx.face(role), right, y, t, ink_at(right - 1, y, color), 255);
 }
 
 /// Заголовок секции: прописные вразрядку.
@@ -140,7 +183,7 @@ pub fn caps(ctx: Ctx, s: &mut Surface, x: i32, y: i32, t: &str) -> u32 {
         x,
         y,
         t,
-        ctx.palette.ink5,
+        ink_at(x, y, ctx.palette.ink5),
         255,
         theme::CAPS_TRACKING * ctx.scale,
     )
@@ -161,6 +204,13 @@ pub fn baseline(ctx: Ctx, role: Role, area: Rect) -> i32 {
 /// Карточка: слабая заливка и линия по контуру.
 pub fn card(ctx: Ctx, s: &mut Surface, area: Rect) {
     let p = ctx.palette;
+    if theme::is_classic() {
+        // Рамка группы Windows 98: бороздка (серая и белая со сдвигом).
+        let t = classic::unit(ctx.scale);
+        classic::edge(s, area, t, theme::win98::SHADE, theme::win98::LIGHT);
+        classic::edge(s, area.shrink(t), t, theme::win98::LIGHT, theme::win98::SHADE);
+        return;
+    }
     draw::rounded(s, area, ctx.px(theme::R_CARD), ctx.flat(p.card), 255);
     draw::rounded_stroke(s, area, ctx.px(theme::R_CARD), p.line2.color, p.line2.alpha);
 }
@@ -168,6 +218,10 @@ pub fn card(ctx: Ctx, s: &mut Surface, area: Rect) {
 /// Утопленное поле: строка адреса, поиск, дорожка полосы хода.
 pub fn sunk(ctx: Ctx, s: &mut Surface, area: Rect, radius: u32) {
     let p = ctx.palette;
+    if theme::is_classic() {
+        classic::field(s, area, classic::unit(ctx.scale));
+        return;
+    }
     draw::rounded(s, area, radius, ctx.flat(p.sunk), 255);
     draw::rounded_stroke(s, area, radius, p.line2.color, p.line2.alpha);
 }
@@ -199,6 +253,14 @@ pub enum RowState {
 pub fn row(ctx: Ctx, s: &mut Surface, area: Rect, state: RowState) {
     let p = ctx.palette;
     let r = ctx.px(theme::R_ROW);
+    if theme::is_classic() {
+        // Windows 98: подсветки под указателем нет, выбранная — синяя.
+        if state == RowState::Selected {
+            classic::selection(s, area);
+            remember_selection(area);
+        }
+        return;
+    }
     match state {
         RowState::Idle => {}
         RowState::Hover => {
@@ -221,6 +283,9 @@ pub fn row(ctx: Ctx, s: &mut Surface, area: Rect, state: RowState) {
 /// Цвет текста строки списка в этом состоянии.
 #[must_use]
 pub fn row_ink(ctx: Ctx, state: RowState) -> Color {
+    if theme::is_classic() {
+        return if state == RowState::Selected { Color::rgb(0xFF, 0xFF, 0xFF) } else { ctx.palette.ink };
+    }
     match state {
         RowState::Selected => ctx.palette.ink,
         RowState::Hover => ctx.palette.ink2,
@@ -247,6 +312,34 @@ pub enum Weight {
 pub fn button(ctx: Ctx, s: &mut Surface, area: Rect, weight: Weight, label: &str, hover: bool) {
     let p = ctx.palette;
     let r = ctx.px(theme::R_ROW);
+    if theme::is_classic() {
+        // Выпуклая серая кнопка Windows 98; основная — с чёрной рамкой
+        // «по умолчанию». Наведение у классики не рисуется.
+        let t = classic::unit(ctx.scale);
+        let ink = match weight {
+            Weight::Primary => {
+                classic::default_button(s, area, t);
+                p.ink
+            }
+            Weight::Ghost if !hover => {
+                p.ink
+            }
+            Weight::Ghost => {
+                classic::bump(s, area, t);
+                p.ink
+            }
+            Weight::Normal => {
+                classic::button(s, area, t, false);
+                p.ink
+            }
+            Weight::Danger => {
+                classic::button(s, area, t, false);
+                p.bad_ink
+            }
+        };
+        text_centered(ctx, s, Role::Body, area, label, ink);
+        return;
+    }
     let ink = match weight {
         Weight::Primary => {
             draw::rounded_gradient(s, area, r, p.acc, p.acc2, 255);
@@ -283,7 +376,18 @@ pub fn button(ctx: Ctx, s: &mut Surface, area: Rect, weight: Weight, label: &str
 pub fn icon_button(ctx: Ctx, s: &mut Surface, area: Rect, icon: Icon, weight: Weight, hover: bool) {
     let p = ctx.palette;
     let r = ctx.px(theme::R_CHIP);
-    let ink = match weight {
+    let ink = if theme::is_classic() {
+        // Кнопка панели инструментов Windows 98: плоская, под указателем —
+        // тонкая выпуклость; обычная и основная — выпуклая кнопка.
+        let t = classic::unit(ctx.scale);
+        match weight {
+            Weight::Ghost if hover => classic::bump(s, area, t),
+            Weight::Ghost => {}
+            _ => classic::button(s, area, t, false),
+        }
+        if weight == Weight::Danger { p.bad_ink } else { p.ink }
+    } else {
+        match weight {
         Weight::Primary => {
             draw::rounded_gradient(s, area, r, p.acc, p.acc2, 255);
             draw::rounded_stroke(s, area, r, p.accline.color, p.accline.alpha);
@@ -311,6 +415,7 @@ pub fn icon_button(ctx: Ctx, s: &mut Surface, area: Rect, icon: Icon, weight: We
                 draw::rounded_stroke(s, area, r, p.badline, 255);
                 p.bad_ink
             }
+        }
         }
     };
     // Значок занимает чуть больше половины кнопки: в макете это 11 точек в
@@ -351,6 +456,11 @@ impl Tone {
 pub fn chip(ctx: Ctx, s: &mut Surface, area: Rect, label: &str, tone: Tone) {
     let p = ctx.palette;
     let (fill, edge, ink) = tone.parts(p);
+    if theme::is_classic() {
+        classic::shallow(s, area, classic::unit(ctx.scale));
+        text_centered(ctx, s, Role::MonoCaps, area, label, ink);
+        return;
+    }
     let r = area.h / 2;
     if let Some(fill) = fill {
         draw::rounded(s, area, r, ctx.flat(fill), 255);
@@ -372,6 +482,11 @@ pub fn chip_width(ctx: Ctx, label: &str) -> u32 {
 /// Полоса хода.
 pub fn progress(ctx: Ctx, s: &mut Surface, area: Rect, done: u32, total: u32, tone: Tone) {
     let p = ctx.palette;
+    if theme::is_classic() {
+        classic::progress(s, area, classic::unit(ctx.scale), done, total);
+        let _ = tone;
+        return;
+    }
     let r = area.h / 2;
     draw::rounded(s, area, r, ctx.flat(p.sunk), 255);
     draw::rounded_stroke(s, area, r, p.line2.color, p.line2.alpha);

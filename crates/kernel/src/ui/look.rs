@@ -18,8 +18,11 @@
 //! * [`Flag::Outline`] — «Показывать контур при перетаскивании»: окно не едет
 //!   за указателем, едет штриховая рамка (XOR-инверсия, как в Windows 98);
 //!   окно переносится и меняет размер один раз — при отпускании.
-//! * [`Flag::Classic`] — классические рамки: прямые углы, объёмная кромка в
-//!   две точки, заголовок с горизонтальным градиентом, выпуклые серые кнопки.
+//! * [`Flag::Classic`] — классика Windows 98 (с 22.11 — во всём интерфейсе):
+//!   рамки с объёмной кромкой и синим заголовком с градиентом, кнопки 16×14
+//!   группой, серая грань #C0C0C0 у панели задач, меню, «Параметров» и
+//!   программ (`mini_ui::theme::is_classic`, `SYSINFO_CLASSIC`), прямые углы,
+//!   без теней и прозрачности.
 //!
 //! Набор «Современный» — всё, кроме контура и классики; «Простой» — только
 //! контур и классика. Отличается от обоих — «Своё».
@@ -119,6 +122,14 @@ pub fn set(flag: Flag, enabled: bool) {
     } else {
         FLAGS.fetch_and(!flag.bit(), Ordering::Relaxed);
     }
+    sync_classic();
+}
+
+/// Классика — не только рамки окон (22.11, Роман): палитра Windows 98 и
+/// объёмные элементы во всём интерфейсе — у стола (`mini_ui::theme`) и у
+/// программ (`SYSINFO_CLASSIC`).
+fn sync_classic() {
+    mini_ui::theme::set_classic(on(Flag::Classic));
 }
 
 /// Какой набор сейчас.
@@ -137,6 +148,7 @@ pub fn apply_preset(preset: Preset) {
         Preset::Simple => FLAGS.store(SIMPLE, Ordering::Relaxed),
         Preset::Custom => {}
     }
+    sync_classic();
 }
 
 /// Анимация вида `flag` разрешена (телефону анимация — часть жестов, её не
@@ -213,6 +225,7 @@ pub fn adopt(text: &str, path: &str) {
             }
         }
         FLAGS.store(bits, Ordering::Relaxed);
+        sync_classic();
         kprintln!("  desktop     : look {} ({}) from {}", list.trim(), preset().tag(), path);
     }
     if let Some(bits) = sysconf::value(text, "depth").and_then(|value| value.trim().parse::<u32>().ok()) {
@@ -242,6 +255,7 @@ pub fn describe() -> alloc::string::String {
 /// `ui look settings` — то же, что страница «Оформление», для стенда.
 pub fn command(words: &str) {
     let status = super::status_now();
+    let title_before = super::window::Window::title_height(mini_ui::Scale::ONE);
     let mut words = words.split_whitespace();
     let first = words.next().unwrap_or("");
     match first {
@@ -277,8 +291,14 @@ pub fn command(words: &str) {
         }
     }
     kprintln!("  desktop     : look {}", describe());
+    // Классика меняет высоту заголовка (22.11) — окна пересобираются.
+    let retitle = super::window::Window::title_height(mini_ui::Scale::ONE) != title_before;
     super::with_desktop(|desktop| {
-        desktop.restyle(&status);
+        if retitle {
+            desktop.retitle_all(&status);
+        } else {
+            desktop.restyle(&status);
+        }
         desktop.present();
     });
 }

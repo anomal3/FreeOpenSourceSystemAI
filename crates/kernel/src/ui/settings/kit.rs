@@ -216,7 +216,18 @@ pub(super) fn row(
     let card = ctx.flat(p.card);
     let inner = ctx.on(card);
     let radius = ctx.px(8);
+    let classic = theme::is_classic();
     pass.on(|s| {
+        if classic {
+            // Классика (22.11): строки без карточек, как свойства Windows
+            // 98 — бороздка снизу, у строки с фокусом — пунктир.
+            let t = mini_ui::classic::unit(ctx.scale);
+            mini_ui::classic::groove_h(s, rect.x, rect.bottom() - 2 * t as i32, rect.w, t);
+            if focused {
+                mini_ui::classic::focus_dots(s, rect.shrink(ctx.px(2)));
+            }
+            return;
+        }
         draw::rounded(s, rect, radius, card, 255);
         draw::rounded_stroke(s, rect, radius, p.line2.color, p.line2.alpha);
         if focused {
@@ -268,7 +279,15 @@ pub(super) fn row(
             let cx = right - d as i32 / 2;
             let cy = rect.y + h as i32 / 2;
             pass.on(|s| {
-                if on {
+                if classic {
+                    // Переключатель Windows 98: белый круг в кромке, точка.
+                    draw::circle(s, cx, cy, d / 2, theme::win98::SHADE, 255);
+                    draw::circle(s, cx, cy, d / 2 - ctx.px(1).max(1), theme::win98::DARK, 255);
+                    draw::circle(s, cx, cy, d / 2 - ctx.px(2).max(2), Color::rgb(0xFF, 0xFF, 0xFF), 255);
+                    if on {
+                        draw::circle(s, cx, cy, d / 5, theme::win98::DARK, 255);
+                    }
+                } else if on {
                     draw::circle(s, cx, cy, d / 2, p.acc, 255);
                     draw::circle(s, cx, cy, d / 4, card, 255);
                 } else {
@@ -316,6 +335,13 @@ fn chevron(pass: &mut Pass, rect: Rect, right: i32) -> i32 {
 /// Переключатель макета: пилюля 42×22, у включённого — заливка акцентом.
 pub(super) fn toggle(ctx: Ctx, s: &mut Surface, area: Rect, on: bool) {
     let p = ctx.palette;
+    if theme::is_classic() {
+        // Классика (22.11): флажок Windows 98 у правого края места.
+        let side = ctx.px(14);
+        let at = Rect::new(area.right() - side as i32, area.y + (area.h as i32 - side as i32) / 2, side, side);
+        mini_ui::classic::checkbox(s, at, mini_ui::classic::unit(ctx.scale), on);
+        return;
+    }
     let r = area.h / 2;
     let knob = area.h.saturating_sub(ctx.px(10)) / 2;
     let cy = area.y + area.h as i32 / 2;
@@ -340,6 +366,10 @@ pub(super) fn hero_card(pass: &mut Pass, rect: Rect) -> bool {
     let card = ctx.flat(p.card);
     let radius = ctx.px(10);
     pass.on(|s| {
+        if theme::is_classic() {
+            paint::card(ctx, s, rect);
+            return;
+        }
         draw::rounded(s, rect, radius, card, 255);
         draw::rounded_stroke(s, rect, radius, p.line2.color, p.line2.alpha);
     });

@@ -1495,9 +1495,18 @@ impl Editor {
         let p = ctx.palette;
         let metrics = self.metrics(ctx, plan);
         let gutter = Rect::new(plan.text.x, plan.text.y, metrics.gutter_w, plan.text.h);
+        // Классика (22.11): поле текста белое и вдавленное, как у Блокнота
+        // Windows 98.
+        let classic = theme::is_classic();
+        if classic {
+            s.fill(plan.text, ctx.flat(p.sunk));
+        }
         if self.numbers {
             s.fill(gutter, ctx.flat(p.panel));
             draw::vline(s, gutter.right() - 1, gutter.y, gutter.h, p.line.color, p.line.alpha);
+        }
+        if classic {
+            mini_ui::classic::sunken(s, plan.text, mini_ui::classic::unit(ctx.scale));
         }
         let right = plan.text.right() - ctx.px(10) as i32;
         let clip = Rect::new(metrics.x, plan.text.y, (right - metrics.x).max(0) as u32, plan.text.h);

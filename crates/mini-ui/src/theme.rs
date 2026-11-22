@@ -279,6 +279,122 @@ pub const LIGHT: Palette = Palette {
     shadow: Ink::rgba(0x1F, 0x29, 0x37, 60),
 };
 
+/// Классика (22.11, Роман: «Упрощённый» набор оформления — настоящий
+/// Windows 98 во всём интерфейсе, а не только заголовок окна).
+///
+/// Серая грань #C0C0C0, объёмные кромки (белый, светло-серый, серый,
+/// чёрный), выделение тёмно-синим с белым текстом, никаких полупрозрачных
+/// слоёв — каждый токен непрозрачен. Тёмная/светлая тема и акцент под
+/// классикой не действуют: у Windows 98 одна схема «Стандартная».
+pub const CLASSIC_PALETTE: Palette = Palette {
+    wall_top: Color::rgb(0x00, 0x80, 0x80),
+    wall_bottom: Color::rgb(0x00, 0x80, 0x80),
+    wall_dot: Ink::rgba(0x00, 0x80, 0x80, 0),
+
+    win: Ink::rgb(0xC0, 0xC0, 0xC0),
+    panel: Ink::rgb(0xC0, 0xC0, 0xC0),
+    sunk: Ink::rgb(0xFF, 0xFF, 0xFF),
+    card: Ink::rgba(0xC0, 0xC0, 0xC0, 0),
+
+    line: Ink::rgb(0x80, 0x80, 0x80),
+    line2: Ink::rgb(0x80, 0x80, 0x80),
+    line3: Ink::rgb(0x00, 0x00, 0x00),
+
+    tb1: Ink::rgb(0xC0, 0xC0, 0xC0),
+    tb2: Ink::rgb(0xC0, 0xC0, 0xC0),
+    tbline: Ink::rgb(0x80, 0x80, 0x80),
+    crown: Ink::rgba(0xFF, 0xFF, 0xFF, 0),
+
+    ink: Color::rgb(0x00, 0x00, 0x00),
+    ink2: Color::rgb(0x00, 0x00, 0x00),
+    ink3: Color::rgb(0x00, 0x00, 0x00),
+    ink4: Color::rgb(0x40, 0x40, 0x40),
+    ink5: Color::rgb(0x40, 0x40, 0x40),
+    ink6: Color::rgb(0x80, 0x80, 0x80),
+
+    btn: Ink::rgb(0xC0, 0xC0, 0xC0),
+    btnline: Ink::rgb(0x00, 0x00, 0x00),
+    btnhov: Ink::rgb(0xC0, 0xC0, 0xC0),
+    ghost: Ink::rgba(0xC0, 0xC0, 0xC0, 0),
+
+    acc: Color::rgb(0x00, 0x00, 0x80),
+    acc2: Color::rgb(0x00, 0x00, 0x80),
+    accline: Ink::rgb(0x00, 0x00, 0x80),
+    acctint: Ink::rgba(0x00, 0x00, 0x80, 40),
+    accedge: Color::rgb(0x00, 0x00, 0x80),
+    acc_ink: Color::rgb(0x00, 0x00, 0x80),
+    sel1: Ink::rgb(0x00, 0x00, 0x80),
+    sel2: Ink::rgb(0x00, 0x00, 0x80),
+
+    ok: Color::rgb(0x00, 0x80, 0x00),
+    ok2: Color::rgb(0x00, 0x60, 0x00),
+    okbg: Ink::rgba(0x00, 0x80, 0x00, 30),
+    okline: Color::rgb(0x00, 0x80, 0x00),
+    ok_ink: Color::rgb(0x00, 0x60, 0x00),
+
+    bad: Color::rgb(0xC0, 0x00, 0x00),
+    bad_ink: Color::rgb(0x80, 0x00, 0x00),
+    badbg: Ink::rgba(0x80, 0x00, 0x00, 30),
+    badline: Color::rgb(0x80, 0x00, 0x00),
+
+    warn: Color::rgb(0x80, 0x80, 0x00),
+    warnbg: Ink::rgba(0x80, 0x80, 0x00, 30),
+    warnline: Color::rgb(0x80, 0x80, 0x00),
+
+    glass: Ink::rgb(0xC0, 0xC0, 0xC0),
+    hover1: Ink::rgba(0x00, 0x00, 0x00, 0),
+    hover2: Ink::rgba(0x00, 0x00, 0x00, 0),
+    shadow: Ink::rgba(0x00, 0x00, 0x00, 0),
+};
+
+/// Цвета классики по именам Windows 98 — для объёмных кромок
+/// ([`crate::classic`]).
+pub mod win98 {
+    use crate::Color;
+    /// Грань кнопок и окон (`COLOR_3DFACE`).
+    pub const FACE: Color = Color::rgb(0xC0, 0xC0, 0xC0);
+    /// Блик (`COLOR_3DHILIGHT`).
+    pub const LIGHT: Color = Color::rgb(0xFF, 0xFF, 0xFF);
+    /// Светлая кромка внутри (`COLOR_3DLIGHT`).
+    pub const HI: Color = Color::rgb(0xDF, 0xDF, 0xDF);
+    /// Тень (`COLOR_3DSHADOW`).
+    pub const SHADE: Color = Color::rgb(0x80, 0x80, 0x80);
+    /// Тёмная тень (`COLOR_3DDKSHADOW`).
+    pub const DARK: Color = Color::rgb(0x00, 0x00, 0x00);
+    /// Выделение и активный заголовок.
+    pub const NAVY: Color = Color::rgb(0x00, 0x00, 0x80);
+    /// Правый край градиента активного заголовка.
+    pub const CAPTION2: Color = Color::rgb(0x10, 0x84, 0xD0);
+    /// Неактивный заголовок: слева и справа.
+    pub const GREY_CAPTION: Color = Color::rgb(0x80, 0x80, 0x80);
+    pub const GREY_CAPTION2: Color = Color::rgb(0xB5, 0xB5, 0xB5);
+    /// Подпись неактивного заголовка.
+    pub const GREY_TEXT: Color = Color::rgb(0xC0, 0xC0, 0xC0);
+    /// Стол без обоев.
+    pub const DESKTOP: Color = Color::rgb(0x00, 0x80, 0x80);
+}
+
+/// Признак классики (см. [`CLASSIC_PALETTE`]). Как и тема, у каждой стороны
+/// свой: программа узнаёт его из `SysInfo::flags` (`SYSINFO_CLASSIC`).
+static CLASSIC: AtomicBool = AtomicBool::new(false);
+
+/// Включена ли классика (на телефоне — никогда).
+#[must_use]
+pub fn is_classic() -> bool {
+    CLASSIC.load(Ordering::Relaxed) && !is_mobile()
+}
+
+/// Включить или выключить классику. `true` — изменилась.
+pub fn set_classic(on: bool) -> bool {
+    CLASSIC.swap(on, Ordering::Relaxed) != on
+}
+
+/// Скругление с учётом классики: у Windows 98 углы прямые везде.
+#[must_use]
+pub fn radius(r: u32) -> u32 {
+    if is_classic() { 0 } else { r }
+}
+
 /// Какая тема сейчас.
 ///
 /// Признак, а не индекс: тем две, и `bool` не даёт вопросу «а что, если три»
@@ -575,6 +691,9 @@ pub fn set_title_h(height: u32) -> bool {
 /// Текущая палитра: тема, акцент и обои.
 #[must_use]
 pub fn palette() -> &'static Palette {
+    if is_classic() {
+        return &CLASSIC_PALETTE;
+    }
     let theme = if DARK_THEME.load(Ordering::Relaxed) { 0 } else { 1 };
     let accent = (ACCENT.load(Ordering::Relaxed) as usize).min(4);
     let wall = (WALLPAPER.load(Ordering::Relaxed) as usize).min(4);
@@ -584,6 +703,15 @@ pub fn palette() -> &'static Palette {
 /// Тёмная ли тема сейчас.
 #[must_use]
 pub fn is_dark() -> bool {
+    // Классика — светлая схема: значки и оттенки, выбранные «для светлой
+    // темы», ложатся на серую грань правильно.
+    DARK_THEME.load(Ordering::Relaxed) && !is_classic()
+}
+
+/// Тёмная ли тема, выбранная человеком (без поправки на классику): её
+/// запоминают и показывают в «Параметрах».
+#[must_use]
+pub fn chosen_dark() -> bool {
     DARK_THEME.load(Ordering::Relaxed)
 }
 

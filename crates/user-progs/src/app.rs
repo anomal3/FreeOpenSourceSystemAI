@@ -237,6 +237,7 @@ pub fn start(spec: &Spec) -> SysInfo {
     };
     mini_ui::use_raw_format(info.pixel_format);
     theme::set_dark(info.flags & SYSINFO_DARK != 0);
+    theme::set_classic(info.flags & user_abi::SYSINFO_CLASSIC != 0);
     info
 }
 
@@ -478,6 +479,15 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
                         "{}: repainted for the {} theme",
                         spec.name,
                         if dark { "dark" } else { "light" }
+                    ));
+                    dirty = true;
+                }
+                // Классика (22.11) включается и выключается на ходу.
+                if theme::set_classic(fresh.flags & user_abi::SYSINFO_CLASSIC != 0) {
+                    println(&format!(
+                        "{}: repainted for the {} look",
+                        spec.name,
+                        if theme::is_classic() { "classic" } else { "modern" }
                     ));
                     dirty = true;
                 }

@@ -48,7 +48,7 @@ use mini_ui::draw;
 use mini_ui::glyphicon::{self, Icon};
 use mini_ui::iconset::{self, Fi};
 use mini_ui::typeface::Role;
-use mini_ui::{Rect, Surface};
+use mini_ui::{Color, Rect, Surface};
 
 use mini_ui::paint::{self, Ctx, RowState};
 use mini_ui::theme;
@@ -757,8 +757,13 @@ impl ContextMenu {
         let enabled: Vec<bool> = self.sub_items.iter().map(|action| self.is_enabled(*action)).collect();
         let s = &mut self.sub_surface;
         s.fill(Rect::new(0, 0, s.width(), card.h), glass);
-        draw::rounded_stroke(s, card, radius, p.line3.color, p.line3.alpha);
-        draw::crown(s, card, radius, p.crown.color, p.crown.alpha);
+        if theme::is_classic() {
+            // Классика (22.11): меню Windows 98 — серая карточка с кромкой.
+            mini_ui::classic::raised(s, card, mini_ui::classic::unit(ctx.scale));
+        } else {
+            draw::rounded_stroke(s, card, radius, p.line3.color, p.line3.alpha);
+            draw::crown(s, card, radius, p.crown.color, p.crown.alpha);
+        }
         draw_lines(inner, s, card, &layout.lines);
         for (index, slot) in layout.rows.iter().enumerate() {
             draw_row(inner, s, slot, &labels[index], index == self.sub_selected, enabled[index]);
@@ -1074,8 +1079,13 @@ impl ContextMenu {
             // углы срезает композитор, а точки, оставшиеся от прошлой
             // отрисовки, просвечивали бы сквозь его сглаживание.
             s.fill(bounds, glass);
-            draw::rounded_stroke(s, card, radius, p.line3.color, p.line3.alpha);
-            draw::crown(s, card, radius, p.crown.color, p.crown.alpha);
+            if theme::is_classic() {
+                // Классика (22.11): меню Windows 98 — серая карточка с кромкой.
+                mini_ui::classic::raised(s, card, mini_ui::classic::unit(ctx.scale));
+            } else {
+                draw::rounded_stroke(s, card, radius, p.line3.color, p.line3.alpha);
+                draw::crown(s, card, radius, p.crown.color, p.crown.alpha);
+            }
         }
 
         match &self.mode {
@@ -1241,7 +1251,12 @@ fn draw_cross(ctx: Ctx, s: &mut Surface, row: Rect, shown: bool, hot: bool) {
 fn draw_lines(ctx: Ctx, s: &mut Surface, card: Rect, lines: &[i32]) {
     let inset = ctx.px(CARD_PAD + ROW_PAD_L);
     for y in lines {
-        paint::separator(ctx, s, card.x + inset as i32, *y, card.w.saturating_sub(inset * 2));
+        if theme::is_classic() {
+            let t = mini_ui::classic::unit(ctx.scale);
+            mini_ui::classic::groove_h(s, card.x + ctx.px(3) as i32, *y, card.w.saturating_sub(ctx.px(6)), t);
+        } else {
+            paint::separator(ctx, s, card.x + inset as i32, *y, card.w.saturating_sub(inset * 2));
+        }
     }
 }
 
@@ -1251,11 +1266,15 @@ fn draw_lines(ctx: Ctx, s: &mut Surface, card: Rect, lines: &[i32]) {
 fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool, enabled: bool) {
     let p = ctx.palette;
     let lit = selected && enabled;
+    let classic = theme::is_classic();
     if lit {
-        paint::row(ctx, s, slot.rect, RowState::Hover);
+        // Классика (22.11): пункт под указателем — тёмно-синий, белым.
+        paint::row(ctx, s, slot.rect, if classic { RowState::Selected } else { RowState::Hover });
     }
     let ink = if !enabled {
-        p.ink4
+        if classic { theme::win98::SHADE } else { p.ink4 }
+    } else if lit && classic {
+        Color::rgb(0xFF, 0xFF, 0xFF)
     } else if lit {
         p.ink
     } else {

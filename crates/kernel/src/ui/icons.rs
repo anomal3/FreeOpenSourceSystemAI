@@ -81,6 +81,10 @@ const SYSTEM: [App; 2] = [App::Terminal, App::About];
 /// файлы» остаётся первым, что человек видит, открыв систему.
 const FILES_COMMAND: &str = "/bin/files";
 const FILES_LABEL: &str = "Файлы";
+/// Значок стола (22.11, Роман): «Мой компьютер», как у Windows 98, — «Файлы»
+/// сразу на странице «Этот компьютер» (диски и папки дома).
+const COMPUTER_COMMAND: &str = "/bin/files computer:";
+const COMPUTER_LABEL: &str = "Мой компьютер";
 
 /// Что за значок стоит в ячейке.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1112,6 +1116,8 @@ impl Icons {
                     Kind::Folder => super::appicon::file_icon(&item.label, true),
                     Kind::File => super::appicon::file_icon(&item.label, false),
                     Kind::App(app) => super::appicon::design_for(app.icon()),
+                    // «Мой компьютер» — значок «Этот компьютер» из «Файлов».
+                    Kind::Program(_) if item.path.as_deref() == Some(COMPUTER_COMMAND) => super::appicon::design("place-this-pc"),
                     Kind::Program(icon) => item
                         .path
                         .as_deref()
@@ -1268,9 +1274,9 @@ fn system_items() -> Vec<Item> {
     }
     let mut out = Vec::new();
     out.push(Item {
-        kind: Kind::Program(Icon::Folder),
-        label: FILES_LABEL.to_string(),
-        path: Some(FILES_COMMAND.to_string()),
+        kind: Kind::Program(Icon::Disk),
+        label: COMPUTER_LABEL.to_string(),
+        path: Some(COMPUTER_COMMAND.to_string()),
         shortcut: None,
     });
     out.extend(SYSTEM.iter().map(|app| Item {

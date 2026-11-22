@@ -5762,7 +5762,7 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         }
         context::Action::Theme => {
             desktop.close_context();
-            let dark = !theme::is_dark();
+            let dark = !theme::chosen_dark();
             theme::set_dark(dark);
             // Записывается здесь же, а не «когда-нибудь потом»: тема, выбранная
             // из меню и не пережившая перезагрузку, — та же ошибка, что тема,

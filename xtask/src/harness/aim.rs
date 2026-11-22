@@ -216,10 +216,29 @@ const CONTEXT_PAD: i32 = 4;
 /// Поле разделительной черты сверху и снизу.
 const CONTEXT_SEP_PAD: i32 = 4;
 
+/// Классика (22.11, набор «Простой»): по последней строке `look` в журнале
+/// (`desktop     : look simple [outline,classic] depth 32`, «Параметры» и
+/// загрузка из `desktop.cfg` пишут так же).
+fn classic(log: &str) -> bool {
+    log.lines().filter(|line| line.contains(": look ")).last().is_some_and(|line| line.contains("classic"))
+}
+
+/// Высота полосы заголовка: у классики — 24 (`window::CLASSIC_TITLE`).
+fn title_h(log: &str) -> i32 {
+    if classic(log) { 24 } else { TITLE_H }
+}
+
 /// Середина кнопки заголовка, считая справа налево.
 fn title_button(log: &str, title: &str, from_right: i32) -> Result<(i32, i32)> {
     let rect = window(log, title)?;
     let scale = ui_scale(log)?;
+    if classic(log) {
+        // Классика: кнопки 16 группой, закрыть — в 5 от края и на 2 правее
+        // остальных (`Window::title_button`).
+        let right = rect.x + rect.w - 5 * scale;
+        let x = if from_right == 0 { right - 8 * scale } else { right - 16 * scale - 2 * scale - 16 * scale * from_right + 8 * scale };
+        return Ok((x, rect.y + 12 * scale));
+    }
     let step = (TITLE_BTN + TITLE_GAP) * scale;
     let right = rect.x + rect.w - TITLE_MARGIN * scale;
     Ok((
@@ -356,7 +375,7 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         Aim::Title(title) => {
             let rect = window(log, title)?;
             let scale = ui_scale(log)?;
-            (rect.x + rect.w - (3 * TITLE_BTN + 40) * scale, rect.y + TITLE_H * scale / 2)
+            (rect.x + rect.w - (3 * TITLE_BTN + 40) * scale, rect.y + title_h(log) * scale / 2)
         }
         // Кнопки заголовка стоят справа налево вплотную к краю: ширина 46,
         // во всю высоту полосы (72b). Числа те же, что в `theme.rs`, и
@@ -378,7 +397,7 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         Aim::Content(title, dx, dy) => {
             let rect = window(log, title)?;
             let scale = ui_scale(log)?;
-            (rect.x + dx, rect.y + TITLE_H * scale + dy)
+            (rect.x + dx, rect.y + title_h(log) * scale + dy)
         }
         // Пустое место: середина экрана по ширине и треть по высоте — там нет
         // ни значков (они слева), ни панели (она внизу). Окна к этому моменту
@@ -392,7 +411,7 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
             let rect = window(log, "Files")?;
             // Полоса вкладок (38, с 20.11), панель (48), команды (40), шапка
             // столбцов (27), строки по 34.
-            (rect.x + 340, rect.y + TITLE_H + 38 + 48 + 40 + 27 + n * 34 + 16)
+            (rect.x + 340, rect.y + title_h(log) + 38 + 48 + 40 + 27 + n * 34 + 16)
         }
         Aim::FilesBody => {
             let rect = window(log, "Files")?;
@@ -404,11 +423,11 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         Aim::TaskRow(n) => {
             let rect = window(log, "Task Manager")?;
             // Шапка 56 (макет 17), заголовок таблицы 46, секция 36, строка 34.
-            (rect.x + 400, rect.y + TITLE_H + 56 + 46 + 36 + n * 34 + 17)
+            (rect.x + 400, rect.y + title_h(log) + 56 + 46 + 36 + n * 34 + 17)
         }
         Aim::Program(title, x, y) => {
             let rect = window(log, title)?;
-            (rect.x + x, rect.y + TITLE_H + y)
+            (rect.x + x, rect.y + title_h(log) + y)
         }
         // Высота окна из журнала уже включает полосу заголовка, поэтому низ
         // прямоугольника — низ содержимого.

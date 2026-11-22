@@ -61,6 +61,17 @@ const APPS_TITLE: &str = "ПРИЛОЖЕНИЯ";
 /// токен на него завёл бы вопрос «а какой белый в светлой».
 const WHITE: Color = Color::rgb(0xFF, 0xFF, 0xFF);
 
+/// Подсветка строки или плитки «Пуска» под указателем: в классике
+/// (22.11) — тёмно-синяя, и текст на ней белый.
+fn hot_plate(s: &mut Surface, rect: Rect, radius: u32, hover: Color) {
+    if theme::is_classic() {
+        s.fill(rect, theme::win98::NAVY);
+        paint::remember_selection(rect);
+    } else {
+        draw::rounded(s, rect, radius, hover, 255);
+    }
+}
+
 /// Контекст стола: панель и меню лежат на обоях, а не в окне.
 ///
 /// Подложка — стекло поверх обоев: плитка значка и подложка выбранной строки
@@ -73,6 +84,9 @@ fn desk_ctx(scale: mini_ui::Scale) -> Ctx {
 /// Надпись в поле дока. Она же говорит, что поле делает: открывает список
 /// приложений и ищет по нему.
 const SEARCH_HINT: &str = "Поиск";
+
+/// Подпись кнопки «Пуск» в классике (22.11) — как у Windows 98.
+const CLASSIC_START: &str = "Пуск";
 
 /// Подпись кнопки «Пуск» на телефоне. Имя системы, а не слово «Пуск»: кнопка
 /// широкая, места хватает, и человек читает, чем он пользуется.
@@ -191,6 +205,10 @@ impl Metrics {
     /// С логотипом (72b) — квадратная кнопка со знаком, как остальные
     /// кнопки панели; без него — значок и подпись «FossAi».
     fn brand_width(self) -> u32 {
+        // Классика (22.11): кнопка «Пуск» Windows 98 — знак и слово.
+        if theme::is_classic() {
+            return self.ctx.px(6 + 16 + 5 + 8) + self.ctx.face(Role::Title).width(CLASSIC_START);
+        }
         if !theme::is_mobile() && super::appicon::logo().is_some() {
             return self.btn_h + self.ctx.px(4);
         }
@@ -1100,6 +1118,18 @@ impl Panel {
         if theme::is_mobile() {
             draw::rounded_stroke(&mut self.surface, plate, m.round, p.line3.color, p.line3.alpha);
             draw::crown(&mut self.surface, plate, m.round, p.crown.color, p.crown.alpha);
+        } else if theme::is_classic() {
+            // Классика (22.11): панель задач Windows 98 — выпуклая кромка со
+            // стороны стола (светло-серая и белая строки).
+            let t = mini_ui::classic::unit(self.scale);
+            let (first, second) = if self.cfg.edge == deskcfg::Edge::Top {
+                (plate.h as i32 - t as i32, plate.h as i32 - 2 * t as i32)
+            } else {
+                (0, t as i32)
+            };
+            let (outer, inner) = if self.cfg.edge == deskcfg::Edge::Top { (theme::win98::DARK, theme::win98::SHADE) } else { (theme::win98::HI, theme::win98::LIGHT) };
+            self.surface.fill(Rect::new(0, first, plate.w, t), outer);
+            self.surface.fill(Rect::new(0, second, plate.w, t), inner);
         } else {
             // Панель во всю ширину (72b): черта только со стороны стола, как
             // в Windows, — сверху у нижней панели, снизу у верхней.
@@ -1159,7 +1189,24 @@ impl Panel {
         let logo = super::appicon::logo();
         let glyph = m.glyph();
         let ink = if logo.is_some() { p.ink } else { WHITE };
+        let classic = theme::is_classic();
         match &logo {
+            _ if classic => {
+                // «Пуск» Windows 98: выпуклая кнопка (открытое меню —
+                // вдавленная), знак и полужирное слово.
+                let t = mini_ui::classic::unit(self.scale);
+                let button = layout.brand;
+                mini_ui::classic::button(&mut self.surface, button, t, menu_open);
+                let shift = if menu_open { t as i32 } else { 0 };
+                let side = ctx.px(16);
+                let at = Rect::new(button.x + ctx.px(6) as i32 + shift, button.y + (button.h as i32 - side as i32) / 2 + shift, side, side);
+                match &logo {
+                    Some(logo) => logo.draw(&mut self.surface, at),
+                    None => draw_grid(&mut self.surface, at, side, p.acc),
+                }
+                let label = Rect::new(at.right() + ctx.px(5) as i32, button.y + shift, button.w, button.h);
+                paint::text(ctx, &mut self.surface, Role::Title, label.x, paint::baseline(ctx, Role::Title, label), CLASSIC_START, p.ink);
+            }
             Some(logo) => {
                 if menu_open {
                     draw::rounded(&mut self.surface, layout.brand, m.round_row, p.hover2.color, p.hover2.alpha);
@@ -1189,7 +1236,7 @@ impl Panel {
                 );
             }
         }
-        if logo.is_none() {
+        if logo.is_none() && !classic {
             paint::text(
                 ctx,
                 &mut self.surface,
@@ -1201,14 +1248,19 @@ impl Panel {
             );
         }
 
-        draw::vline(
-            &mut self.surface,
-            layout.divider.x,
-            layout.divider.y,
-            layout.divider.h,
-            p.line2.color,
-            p.line2.alpha,
-        );
+        if classic {
+            // Бороздка-разделитель Windows 98.
+            mini_ui::classic::groove_v(&mut self.surface, layout.divider.x, layout.divider.y, layout.divider.h, mini_ui::classic::unit(self.scale));
+        } else {
+            draw::vline(
+                &mut self.surface,
+                layout.divider.x,
+                layout.divider.y,
+                layout.divider.h,
+                p.line2.color,
+                p.line2.alpha,
+            );
+        }
 
         let edge = self.cfg.edge;
         for slot in &layout.slots {
@@ -1219,6 +1271,12 @@ impl Panel {
         if status_w > 0 {
             let half = (step / 2) as i32;
             let mut x = plate.right() - (m.plate_pad() + status_w) as i32;
+            if classic {
+                // Трей Windows 98 — мелкая вдавленность вокруг значков и часов.
+                let t = mini_ui::classic::unit(self.scale);
+                let well = Rect::new(x - half - ctx.px(2) as i32, layout.brand.y, (plate.right() - m.plate_pad() as i32 / 2 - (x - half - ctx.px(2) as i32)).max(0) as u32, layout.brand.h);
+                mini_ui::classic::shallow(&mut self.surface, well, t);
+            }
 
             // Сеть: значок в полную силу, когда адрес есть, и приглушённый,
             // когда карты нет или адрес не получен. Приглушённый, а не другой
@@ -1318,6 +1376,44 @@ impl Panel {
         };
         let active = members.iter().any(|entry| entry.focused && !entry.minimized);
         let all_minimized = members.iter().all(|entry| entry.minimized);
+        if theme::is_classic() {
+            // Кнопка окна Windows 98 (22.11): выпуклая; у активного окна —
+            // вдавленная с серо-белой «шахматкой», как у Windows 98.
+            let t = mini_ui::classic::unit(self.scale);
+            mini_ui::classic::button(&mut self.surface, rect, t, active);
+            if active {
+                let inner = rect.shrink(2 * t);
+                let (a, b) = (theme::win98::LIGHT.pixel(), theme::win98::FACE.pixel());
+                let clip = inner.intersect(&self.surface.bounds());
+                for y in clip.y..clip.bottom() {
+                    let row = self.surface.row_mut(y as u32);
+                    for x in clip.x..clip.right() {
+                        row[x as usize] = if (x + y) & 1 == 0 { a } else { b };
+                    }
+                }
+            }
+            let shift = if active { t as i32 } else { 0 };
+            let side = slot.icon.min(rect.w).min(rect.h).min(ctx.px(20));
+            let labelled = !slot.label.is_empty();
+            let icon_x = if labelled { rect.x + ctx.px(5) as i32 } else { rect.x + (rect.w as i32 - side as i32) / 2 };
+            let icon_rect = Rect::new(icon_x + shift, rect.y + (rect.h as i32 - side as i32) / 2 + shift, side, side);
+            match slot.pin.and_then(|index| self.pins.get(index)) {
+                Some(pin) => pin.art.draw(ctx, &mut self.surface, icon_rect),
+                None => first.art.draw(ctx, &mut self.surface, icon_rect),
+            }
+            if labelled {
+                let role = if active { Role::Title } else { Role::Body };
+                let x = icon_rect.right() + ctx.px(4) as i32;
+                paint::text_clipped(ctx, &mut self.surface, role, x, paint::baseline(ctx, role, rect.translate(0, shift)), (rect.right() - x - ctx.px(4) as i32).max(0) as u32, &slot.label, p.ink);
+            }
+            if members.len() > 1 {
+                // Несколько окон за кнопкой — число в углу.
+                let count = alloc::format!("{}", members.len());
+                paint::text_right(ctx, &mut self.surface, Role::Caption, rect.right() - ctx.px(3) as i32, rect.y + ctx.px(1) as i32, &count, p.ink);
+            }
+            let _ = all_minimized;
+            return;
+        }
         if members.len() > 1 {
             // Стопка: край второй плашки правее (ниже у боковой полосы).
             let shift = ctx.px(3) as i32;
@@ -3635,16 +3731,26 @@ impl Menu {
         let card = layout.card;
         let fill = p.tb1.over(p.tb2.color);
         self.surface.fill(card, fill);
-        draw::rounded_stroke(&mut self.surface, card, px(theme::R_WINDOW), p.line3.color, p.line3.alpha);
+        let classic = theme::is_classic();
+        if classic {
+            // Классика (22.11): серая карточка с выпуклой кромкой.
+            mini_ui::classic::raised(&mut self.surface, card, mini_ui::classic::unit(self.scale));
+        } else {
+            draw::rounded_stroke(&mut self.surface, card, px(theme::R_WINDOW), p.line3.color, p.line3.alpha);
+        }
         let ctx = ctx.on(fill);
         let hover = p.btnhov.over(fill);
         let selected = if self.keys_used { self.visible.get(self.row).copied() } else { None };
 
         // Поиск.
         let field = layout.search;
-        draw::rounded(&mut self.surface, field, px(theme::R_ROW), p.sunk.over(fill), 255);
-        let focus_line = if self.query.is_empty() { p.line3 } else { p.accline };
-        draw::rounded_stroke(&mut self.surface, field, px(theme::R_ROW), focus_line.color, focus_line.alpha);
+        if classic {
+            mini_ui::classic::field(&mut self.surface, field, mini_ui::classic::unit(self.scale));
+        } else {
+            draw::rounded(&mut self.surface, field, px(theme::R_ROW), p.sunk.over(fill), 255);
+            let focus_line = if self.query.is_empty() { p.line3 } else { p.accline };
+            draw::rounded_stroke(&mut self.surface, field, px(theme::R_ROW), focus_line.color, focus_line.alpha);
+        }
         let glyph = px(14);
         glyphicon::draw(&mut self.surface, Icon::Search, field.x + px(12) as i32, field.y + (field.h as i32 - glyph as i32) / 2, glyph, p.ink4, 255);
         let text_x = field.x + px(34) as i32;
@@ -3687,7 +3793,7 @@ impl Menu {
                     let open_folder = matches!((&self.popup, tile), (Some(Popup::Folder { folder, .. }), Tile::Folder(shown)) if folder.key == shown.key);
                     let chosen = matches!(tile, Tile::Item(index) if Some(index) == selected);
                     if self.hot == Some(*target) || open_folder || chosen {
-                        draw::rounded(&mut scratch, local.shrink(px(2)), px(theme::R_ROW + 2), hover, 255);
+                        hot_plate(&mut scratch, local.shrink(px(2)), px(theme::R_ROW + 2), hover);
                     }
                     if chosen {
                         draw::rounded_stroke(&mut scratch, local.shrink(px(2)), px(theme::R_ROW + 2), p.accline.color, p.accline.alpha);
@@ -3725,7 +3831,7 @@ impl Menu {
             for (rect, n) in rows {
                 let Some((_, path)) = self.recent.get(n) else { continue };
                 if self.hot == Some(Target::Recent(n)) {
-                    draw::rounded(&mut self.surface, rect, px(theme::R_ROW), hover, 255);
+                    hot_plate(&mut self.surface, rect, px(theme::R_ROW), hover);
                 }
                 let side = px(28);
                 let icon = Rect::new(rect.x + px(8) as i32, rect.y + (rect.h as i32 - side as i32) / 2, side, side);
@@ -3761,7 +3867,7 @@ impl Menu {
                     }
                     let chosen = matches!(target, Target::Row(index) if Some(*index) == selected);
                     if self.hot == Some(*target) || chosen {
-                        draw::rounded(&mut scratch, local, px(theme::R_ROW), hover, 255);
+                        hot_plate(&mut scratch, local, px(theme::R_ROW), hover);
                     }
                     if chosen {
                         draw::rounded_stroke(&mut scratch, local, px(theme::R_ROW), p.accline.color, p.accline.alpha);
@@ -3799,7 +3905,11 @@ impl Menu {
 
         // Низ: черта, пользователь, инструменты, питание.
         let foot = layout.foot;
-        draw::hline(&mut self.surface, 0, foot.y, card.w, p.line2.color, p.line2.alpha);
+        if classic {
+            mini_ui::classic::groove_h(&mut self.surface, px(4) as i32, foot.y, card.w.saturating_sub(px(8)), mini_ui::classic::unit(self.scale));
+        } else {
+            draw::hline(&mut self.surface, 0, foot.y, card.w, p.line2.color, p.line2.alpha);
+        }
         let mut tip: Option<(&str, i32, bool)> = None;
         let leftmost = layout.cells.iter().filter(|(_, target)| matches!(target, Target::Tool(_) | Target::Power(_))).map(|(rect, _)| rect.x).min().unwrap_or(card.right());
         for (rect, target) in &layout.cells {
@@ -3807,7 +3917,7 @@ impl Menu {
                 Target::User => {
                     let user = user_name();
                     if self.hot == Some(Target::User) || matches!(self.popup, Some(Popup::User)) {
-                        draw::rounded(&mut self.surface, *rect, px(theme::R_ROW), hover, 255);
+                        hot_plate(&mut self.surface, *rect, px(theme::R_ROW), hover);
                     }
                     let avatar = Rect::new(rect.x + px(6) as i32, rect.y + (rect.h as i32 - px(32) as i32) / 2, px(32), px(32));
                     draw_avatar(ctx, &mut self.surface, avatar, &user);
@@ -3817,7 +3927,11 @@ impl Menu {
                 Target::Tool(tool) => {
                     let hot = self.hot == Some(*target);
                     let plate = if hot { hover } else { p.btn.over(fill) };
-                    draw::rounded(&mut self.surface, *rect, px(theme::R_ROW), plate, 255);
+                    if classic {
+                        mini_ui::classic::button(&mut self.surface, *rect, mini_ui::classic::unit(self.scale), false);
+                    } else {
+                        draw::rounded(&mut self.surface, *rect, px(theme::R_ROW), plate, 255);
+                    }
                     let glyph = px(16);
                     iconset::draw(&mut self.surface, TOOLS[tool].1, rect.x + (rect.w as i32 - glyph as i32) / 2, rect.y + (rect.h as i32 - glyph as i32) / 2, glyph, if hot { p.ink } else { p.ink2 }, 255);
                     if hot {
@@ -3833,7 +3947,11 @@ impl Menu {
                     let item = self.items[index];
                     let hot = self.hot == Some(*target) || Some(index) == selected;
                     let plate = if hot { hover } else { p.btn.over(fill) };
-                    draw::rounded(&mut self.surface, *rect, px(theme::R_ROW), plate, 255);
+                    if classic {
+                        mini_ui::classic::button(&mut self.surface, *rect, mini_ui::classic::unit(self.scale), false);
+                    } else {
+                        draw::rounded(&mut self.surface, *rect, px(theme::R_ROW), plate, 255);
+                    }
                     let glyph = px(16);
                     let icon = if matches!(item, Item::App(App::Restart)) { Icon::Update } else { Icon::Power };
                     let ink = if hot { p.bad_ink } else { p.ink2 };

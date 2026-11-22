@@ -173,7 +173,7 @@ impl SettingsView {
 
         // ── Быстрые настройки ───────────────────────────────────────────────
         y = pass.group(x, y + ctx.px(8) as i32, w, "Быстрые настройки");
-        let dark = theme::is_dark();
+        let dark = theme::chosen_dark();
         y = row(pass, x, y, w, Some(Fi::Moon), "Тёмная тема", "", Ctl::Toggle(dark), Some(Deed::Theme(!dark)));
         let uptime = super::super::panel::shows(PanelPref::Uptime);
         y = row(pass, x, y, w, Some(Fi::Clock), "Показывать аптайм на панели", "Время работы рядом с часами", Ctl::Toggle(uptime), Some(Deed::Panel(PanelPref::Uptime, !uptime)));
@@ -771,7 +771,7 @@ fn colors(pass: &mut Pass, x: i32, y: i32, w: u32) {
         let rect = Rect::new(x + (index as u32 * (swatch_w + gap)) as i32, y, swatch_w, swatch_h);
         let focused = pass.deed(rect, Deed::Theme(dark));
         if pass.visible(rect) {
-            swatch(pass, rect, dark, theme::is_dark() == dark, focused);
+            swatch(pass, rect, dark, theme::chosen_dark() == dark, focused);
         }
     }
     y += (swatch_h + ctx.px(6)) as i32;

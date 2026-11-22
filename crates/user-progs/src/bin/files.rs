@@ -3108,6 +3108,10 @@ impl Files {
     fn render(&self, surface: &mut Surface, area: Rect, ctx: Ctx) {
         surface.fill(area, theme::window_bg());
         let plan = layout(ctx, area);
+        // Классика (22.11): область списка белая, как у Проводника Windows 98.
+        if theme::is_classic() {
+            surface.fill(plan.list.union(&plan.header), ctx.flat(ctx.palette.sunk));
+        }
         // Список — первым (20.11). Строки едут по точкам, и край строки,
         // ушедшей под шапку, панель или боковую колонку, закрывают они сами,
         // нарисованные поверх: отсечения у поверхности нет.

@@ -575,61 +575,42 @@ fn edge_points(w: u32, h: u32, radius: u32, mut f: impl FnMut(u32, u32)) {
     }
 }
 
-/// Классический заголовок (20.11, «Простой»): часть `part` полосы `bar`,
-/// залитая горизонтальным градиентом — синим у активного окна, серым у
-/// неактивного. По строке один цвет на столбец: дёшево, без смешивания.
-fn classic_caption(surface: &mut Surface, part: Rect, bar: Rect, focused: bool) {
-    let (from, to) = if focused {
-        (Color::rgb(0x00, 0x00, 0x80), Color::rgb(0x10, 0x84, 0xD0))
-    } else {
-        (Color::rgb(0x80, 0x80, 0x80), Color::rgb(0xB5, 0xB5, 0xB5))
+/// Знак кнопки заголовка Windows 98 (22.11) — по точкам, как в системном
+/// шрифте Marlett: черта «свернуть» 6×2, рамка «развернуть» 9×9 с толстым
+/// верхом, две рамки «восстановить», косой крест «закрыть» 8×7. `u` —
+/// размер «точки» при масштабе.
+fn classic_glyph(surface: &mut Surface, knob: Rect, hit: Hit, restore: bool, u: u32) {
+    let black = Color::rgb(0, 0, 0);
+    let ui = u as i32;
+    // Начало сетки 16×14 — по центру кнопки (у масштаба кнопка больше).
+    let ox = knob.x + (knob.w as i32 - 16 * ui) / 2;
+    let oy = knob.y + (knob.h as i32 - 14 * ui) / 2;
+    let mut dot = |x: i32, y: i32, w: i32, h: i32, color: Color| {
+        surface.fill(Rect::new(ox + x * ui, oy + y * ui, (w * ui) as u32, (h * ui) as u32), color);
     };
-    let part = part.intersect(&bar).intersect(&surface.bounds());
-    if part.is_empty() {
-        return;
+    let frame = |x: i32, y: i32, w: i32, h: i32, dot: &mut dyn FnMut(i32, i32, i32, i32, Color)| {
+        dot(x, y, w, 2, black);
+        dot(x, y, 1, h, black);
+        dot(x + w - 1, y, 1, h, black);
+        dot(x, y + h - 1, w, 1, black);
+    };
+    match hit {
+        Hit::Minimize => dot(4, 9, 6, 2, black),
+        Hit::Maximize if restore => {
+            frame(5, 1, 7, 6, &mut dot);
+            // Передняя рамка закрывает заднюю: внутри неё — грань кнопки.
+            dot(3, 4, 7, 6, theme::win98::FACE);
+            frame(3, 4, 7, 6, &mut dot);
+        }
+        Hit::Maximize => frame(3, 2, 9, 9, &mut dot),
+        Hit::Close => {
+            for i in 0..7 {
+                dot(4 + i, 3 + i, 2, 1, black);
+                dot(10 - i, 3 + i, 2, 1, black);
+            }
+        }
+        _ => {}
     }
-    let span = bar.w.max(2) - 1;
-    let mut line = Vec::new();
-    if line.try_reserve_exact(part.w as usize).is_err() {
-        surface.fill(part, from);
-        return;
-    }
-    for x in part.x..part.right() {
-        let weight = ((x - bar.x).max(0) as u32 * 255 / span).min(255) as u8;
-        line.push(from.mix(to, weight).pixel());
-    }
-    for y in part.y..part.bottom() {
-        let row = surface.row_mut(y as u32);
-        row[part.x as usize..part.right() as usize].copy_from_slice(&line);
-    }
-}
-
-/// Выпуклая (`raised`) или вдавленная кромка в две точки внутри `rect`.
-fn bevel(surface: &mut Surface, rect: Rect, raised: bool) {
-    if rect.w < 4 || rect.h < 4 {
-        return;
-    }
-    let (light, hi, shade, dark) = (
-        Color::rgb(0xFF, 0xFF, 0xFF),
-        Color::rgb(0xD4, 0xD0, 0xC8),
-        Color::rgb(0x80, 0x80, 0x80),
-        Color::rgb(0x40, 0x40, 0x40),
-    );
-    let (tl_out, tl_in, br_in, br_out) = if raised { (hi, light, shade, dark) } else { (shade, dark, light, hi) };
-    let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
-    draw::hline(surface, x, y, w, tl_out, 255);
-    draw::vline(surface, x, y, h, tl_out, 255);
-    draw::hline(surface, x, rect.bottom() - 1, w, br_out, 255);
-    draw::vline(surface, rect.right() - 1, y, h, br_out, 255);
-    draw::hline(surface, x + 1, y + 1, w - 2, tl_in, 255);
-    draw::vline(surface, x + 1, y + 1, h - 2, tl_in, 255);
-    draw::hline(surface, x + 1, rect.bottom() - 2, w - 2, br_in, 255);
-    draw::vline(surface, rect.right() - 2, y + 1, h - 2, br_in, 255);
-}
-
-/// Кромка всего окна: светлая сверху-слева, тёмная снизу-справа.
-fn outer_bevel(surface: &mut Surface, bounds: Rect) {
-    bevel(surface, bounds, true);
 }
 
 /// Счётчик для [`Window::born`].
@@ -647,6 +628,13 @@ const MIN_H: u32 = 120;
 /// Больше прежних шестнадцати: у скруглённого окна сам угол срезан, и попасть
 /// в квадрат, половина которого приходится на срез, мышью нельзя.
 const GRIP: u32 = 20;
+
+/// Высота полосы заголовка классической рамки при 100 %: кромка окна и
+/// поле 3, синий заголовок 20, поле под ним 1 (22.11).
+pub const CLASSIC_TITLE: u32 = 24;
+/// Кнопка заголовка классики: 16×14, как у Windows 98.
+const CLASSIC_BTN_W: u32 = 16;
+const CLASSIC_BTN_H: u32 = 14;
 
 impl Window {
     /// Создать текстовое окно.
@@ -873,7 +861,18 @@ impl Window {
     /// человек в «Параметрах».
     #[must_use]
     pub fn title_height(scale: mini_ui::Scale) -> u32 {
+        // Классика (22.11): рамка 3 + заголовок 20 + 1 — как у Windows 98
+        // (там 18 под шрифт 8 пт), а не полоса современного вида.
+        if Self::classic() {
+            return CLASSIC_TITLE * scale;
+        }
         theme::title_h() * scale
+    }
+
+    /// Вкладки терминала — своей полосой под заголовком, а не в нём: на
+    /// телефоне и в классике (у Windows 98 заголовок — только заголовок).
+    fn separate_strip() -> bool {
+        theme::is_mobile() || Self::classic()
     }
 
     /// Сменить окну программы поверхность: программа попросила другой размер
@@ -1118,6 +1117,20 @@ impl Window {
     /// полосы, шириной [`theme::TITLE_BTN`], вплотную друг к другу и к краю.
     fn title_button(&self, from_right: u32) -> Rect {
         let scale = self.scale;
+        if Self::classic() && !self.has_keyboard_button() {
+            // Windows 98: кнопки 16×14 группой у правого края заголовка —
+            // «свернуть» и «развернуть» вплотную, «закрыть» на 2 точки
+            // правее. Место нажатия — во всю высоту полосы, рисуется кнопка
+            // внутри ([`Self::classic_knob`]).
+            let ctx = self.ctx();
+            let w = ctx.px(CLASSIC_BTN_W) as i32;
+            let right = self.surface.width() as i32 - ctx.px(5) as i32;
+            let x = match from_right {
+                0 => right - w,
+                n => right - w - ctx.px(2) as i32 - w * n as i32,
+            };
+            return Rect::new(x, 0, w as u32, Self::title_height(scale));
+        }
         let width = theme::TITLE_BTN * scale;
         let step = width + theme::TITLE_GAP * scale;
         let right = self.surface.width() as i32;
@@ -1224,7 +1237,7 @@ impl Window {
             return Some(Hit::Close);
         }
         // Вкладки в заголовке (72h, макет 15).
-        if !self.tab_order.is_empty() && !theme::is_mobile() && local.1 < Self::title_height(self.scale) as i32 {
+        if !self.tab_order.is_empty() && !Self::separate_strip() && local.1 < Self::title_height(self.scale) as i32 {
             let (tabs, plus) = self.strip_layout();
             if plus.contains(local.0, local.1) {
                 return Some(Hit::TabNew);
@@ -1374,9 +1387,11 @@ impl Window {
         // неактивного — цвета окна.
         let classic = Self::classic();
         if classic {
-            // Классический заголовок (20.11, «Простой»): горизонтальный
-            // градиент на всю полосу.
-            classic_caption(&mut self.surface, bar, bar, focused);
+            // Классический заголовок (22.11, Windows 98): серая грань рамки,
+            // в ней — синяя полоса с горизонтальным градиентом.
+            self.surface.fill(bar, theme::win98::FACE);
+            let caption = self.caption_rect();
+            mini_ui::classic::caption(&mut self.surface, caption, caption, focused);
         } else {
             let fill = ctx.flat(if focused { p.tb1 } else { p.tb2 });
             self.surface.fill(bar, fill);
@@ -1399,14 +1414,14 @@ impl Window {
         // Вкладки в заголовке (20.11, как Windows Terminal): полоса вкладок и
         // есть заголовок - ни значка, ни имени программы перед ней (они
         // читались как лишняя вкладка «Термин…»).
-        let tabs_here = !self.tab_order.is_empty() && !theme::is_mobile();
+        let tabs_here = !self.tab_order.is_empty() && !Self::separate_strip();
         let badge_side = ctx.px(16);
-        let badge = Rect::new(
-            ctx.px(12) as i32,
-            (title_h as i32 - badge_side as i32) / 2,
-            badge_side,
-            badge_side,
-        );
+        let badge = if classic {
+            let caption = self.caption_rect();
+            Rect::new(caption.x + ctx.px(2) as i32, caption.y + (caption.h as i32 - badge_side as i32) / 2, badge_side, badge_side)
+        } else {
+            Rect::new(ctx.px(12) as i32, (title_h as i32 - badge_side as i32) / 2, badge_side, badge_side)
+        };
         // Значок программы, как на панели задач (24.10: был цветной квадрат
         // без знака — «квадратик цветной»).
         if !tabs_here {
@@ -1426,22 +1441,24 @@ impl Window {
 
         // Заголовок кончается там, где начинаются кнопки: подпись, заехавшая
         // под крестик, читается как ошибка отрисовки.
-        let text_x = badge.right() + ctx.px(8) as i32;
-        let room = (self.leftmost_button().x - ctx.px(12) as i32 - text_x).max(0) as u32;
+        let text_x = badge.right() + ctx.px(if classic { 4 } else { 8 }) as i32;
+        let room = (self.leftmost_button().x - ctx.px(if classic { 4 } else { 12 }) as i32 - text_x).max(0) as u32;
         let ink = match (classic, focused) {
             (true, true) => Color::rgb(0xFF, 0xFF, 0xFF),
-            (true, false) => Color::rgb(0xD4, 0xD0, 0xC8),
+            (true, false) => theme::win98::GREY_TEXT,
             (false, true) => p.ink,
             (false, false) => p.ink4,
         };
         if !tabs_here {
             let label = self.label();
+            // Классика — полужирная белая подпись, как у Windows 98.
+            let (role, band) = if classic { (Role::Title, self.caption_rect()) } else { (Role::Body, bar) };
             paint::text_clipped(
                 ctx,
                 &mut self.surface,
-                Role::Body,
+                role,
                 text_x,
-                paint::baseline(ctx, Role::Body, bar),
+                paint::baseline(ctx, role, band),
                 room,
                 &label,
                 ink,
@@ -1496,29 +1513,17 @@ impl Window {
         let bar = Rect::new(0, 0, self.surface.width(), Self::title_height(self.scale));
         for (button, icon, hit) in keyboard.into_iter().chain(sizing.into_iter().flatten()).chain([(self.close_button(), Icon::Close, Hit::Close)]) {
             let hot = self.hot == Some(hit);
-            if classic {
-                // Выпуклая серая кнопка на градиенте заголовка (20.11).
-                classic_caption(&mut self.surface, button, bar, focused);
-                let side = button.h.saturating_sub(ctx.px(8)).max(ctx.px(12));
-                let knob = Rect::new(
-                    button.x + (button.w as i32 - side as i32 - ctx.px(2) as i32) / 2,
-                    button.y + (button.h as i32 - side as i32) / 2,
-                    side + ctx.px(2),
-                    side,
-                );
-                let face = if hot { Color::rgb(0xE0, 0xDC, 0xD4) } else { Color::rgb(0xD4, 0xD0, 0xC8) };
-                self.surface.fill(knob, face);
-                bevel(&mut self.surface, knob, true);
-                let glyph = ctx.px(8);
-                glyphicon::draw(
-                    &mut self.surface,
-                    icon,
-                    knob.x + (knob.w as i32 - glyph as i32) / 2,
-                    knob.y + (knob.h as i32 - glyph as i32) / 2,
-                    glyph,
-                    Color::rgb(0, 0, 0),
-                    255,
-                );
+            if classic && hit != Hit::Keyboard {
+                // Кнопка Windows 98 16×14 (22.11): выпуклая серая, знак
+                // чёрный; под ней — тот же градиент заголовка.
+                let caption = self.caption_rect();
+                let _ = bar;
+                mini_ui::classic::caption(&mut self.surface, button.intersect(&caption), caption, focused);
+                let knob = self.classic_knob(button);
+                let t = mini_ui::classic::unit(self.scale);
+                mini_ui::classic::button(&mut self.surface, knob, t, false);
+                classic_glyph(&mut self.surface, knob, hit, self.restore.is_some(), ctx.px(1).max(1));
+                let _ = hot;
                 continue;
             }
             // Нажатая кнопка клавиатуры — цветом акцента: видно, что
@@ -1571,6 +1576,7 @@ impl Window {
         let ink = if focused { p.line3 } else { p.line2 };
         let bounds = self.surface.bounds();
         let (w, h) = (bounds.w, bounds.h);
+        let bevel_t = mini_ui::classic::unit(self.scale);
         let Self { surface, edge: book, .. } = &mut *self;
         book.focused = focused;
         if (book.w, book.h, book.radius) != (w, h, radius) {
@@ -1606,8 +1612,9 @@ impl Window {
             i += 1;
         });
         if classic {
-            // Объёмная кромка в две точки, как у окон Windows 98 (20.11).
-            outer_bevel(surface, bounds);
+            // Объёмная кромка в две точки, как у окон Windows 98 (20.11;
+            // 22.11 — цвета Windows 98 и толщина по масштабу).
+            mini_ui::classic::raised(surface, bounds, bevel_t);
         } else {
             draw::rounded_stroke(surface, bounds, radius, ink.color, ink.alpha);
         }
@@ -1641,6 +1648,24 @@ impl Window {
     /// Классические рамки (20.11, «Оформление»; на телефоне — нет).
     fn classic() -> bool {
         super::look::on(super::look::Flag::Classic) && !theme::is_mobile()
+    }
+
+    /// Синяя полоса классического заголовка: в 3 точках от краёв окна (2 —
+    /// кромка, 1 — грань), до последней строки полосы.
+    fn caption_rect(&self) -> Rect {
+        let ctx = self.ctx();
+        let inset = ctx.px(3);
+        let h = Self::title_height(self.scale).saturating_sub(inset + ctx.px(1));
+        Rect::new(inset as i32, inset as i32, self.surface.width().saturating_sub(inset * 2), h)
+    }
+
+    /// Нарисованная кнопка классики внутри места нажатия `button`: 16×14 по
+    /// вертикали посередине синей полосы.
+    fn classic_knob(&self, button: Rect) -> Rect {
+        let ctx = self.ctx();
+        let caption = self.caption_rect();
+        let h = ctx.px(CLASSIC_BTN_H).min(caption.h);
+        Rect::new(button.x, caption.y + (caption.h as i32 - h as i32) / 2, button.w, h)
     }
 
     /// Задевает ли прямоугольник поверхности место обводки (с запасом на
@@ -1922,8 +1947,8 @@ impl Window {
             return false;
         }
         let (lx, ly) = (x - self.rect.x, y - self.rect.y);
-        let top = if theme::is_mobile() { Self::title_height(self.scale) as i32 } else { 0 };
-        let h = if theme::is_mobile() { self.ctx().px(STRIP_H) } else { Self::title_height(self.scale) };
+        let top = if Self::separate_strip() { Self::title_height(self.scale) as i32 } else { 0 };
+        let h = if Self::separate_strip() { self.ctx().px(STRIP_H) } else { Self::title_height(self.scale) };
         ly >= top && ly < top + h as i32 && lx < self.minimize_button().x
     }
 
@@ -2047,7 +2072,7 @@ impl Window {
 
     /// Высота своей полосы вкладок под заголовком: на ПК вкладки в заголовке.
     fn strip_h(&self) -> u32 {
-        if self.tab_order.is_empty() || !theme::is_mobile() { 0 } else { self.ctx().px(STRIP_H) }
+        if self.tab_order.is_empty() || !Self::separate_strip() { 0 } else { self.ctx().px(STRIP_H) }
     }
 
     /// Где на полосе вкладки (сессия, вкладка, крестик) и «+».
@@ -2055,7 +2080,7 @@ impl Window {
         let ctx = self.ctx();
         // ПК (72h, макет 15): вкладки в заголовке — после значка и подписи,
         // до кнопок окна. Телефон — своей полосой под заголовком.
-        let in_title = !theme::is_mobile();
+        let in_title = !Self::separate_strip();
         let (top, h, left, right) = if in_title {
             // С 20.11 полоса и есть заголовок: вкладки от левого края.
             let title = Self::title_height(self.scale);
@@ -2088,7 +2113,7 @@ impl Window {
         }
         let ctx = self.ctx();
         let p = ctx.palette;
-        let strip = if theme::is_mobile() {
+        let strip = if Self::separate_strip() {
             let top = Self::title_height(self.scale) as i32;
             let strip = Rect::new(0, top, self.surface.width(), ctx.px(STRIP_H));
             self.surface.fill(strip, ctx.flat(p.tb2));
@@ -2113,7 +2138,7 @@ impl Window {
                 draw::rounded(&mut self.surface, tab, ctx.px(6), mini_ui::text::TERM_BG, 255);
                 let half = tab.h / 2;
                 self.surface.fill(Rect::new(tab.x, tab.y + half as i32, tab.w, tab.h - half), mini_ui::text::TERM_BG);
-                if !theme::is_mobile() {
+                if !Self::separate_strip() {
                     let bottom = Self::title_height(self.scale) as i32;
                     self.surface.fill(Rect::new(tab.x, bottom - ctx.px(2) as i32, tab.w, ctx.px(2)), mini_ui::text::TERM_BG);
                 }
@@ -3217,7 +3242,7 @@ fn grid_area(surface: &Surface, scale: mini_ui::Scale, strip: bool) -> Rect {
     let ctx = Ctx::scaled(scale);
     // С 72h вкладки ПК — в заголовке (макет 15), своя полоса только у
     // телефона.
-    let top = Window::title_height(scale) + if strip && theme::is_mobile() { ctx.px(STRIP_H) } else { 0 };
+    let top = Window::title_height(scale) + if strip && Window::separate_strip() { ctx.px(STRIP_H) } else { 0 };
     let mut area = content_area(surface, top).shrink(ctx.px(4));
     // Справа — поле под уголок размера (20.11). Сетка прокручивается
     // сдвигом пикселей (`Surface::scroll_up`), и точки уголка, лежавшие в
