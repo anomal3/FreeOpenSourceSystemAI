@@ -74,11 +74,13 @@ const DIR: &str = "usr/lib/x86_64-linux-gnu/";
 /// Чего из этих пакетов не класть: X11 и GLX (Wine на Wayland рисует через
 /// EGL) и драйверы Vulkan видеокарт, кроме lavapipe и NVK (18.11.2026:
 /// `libvulkan_nouveau.so` поверх узла DRM nouveau ядра, nvk-spec.md; его
-/// зависимости — libdrm/zlib/zstd/xcb/wayland/expat/stdc++ — уже в PACKAGES).
+/// зависимости — libdrm/zlib/zstd/xcb/wayland/expat/stdc++ — уже в PACKAGES)
+/// и RADV (22.11.2026: `libvulkan_radeon.so` поверх узла DRM amdgpu ядра,
+/// `docs/AMD_DRM_PLAN.md`; нужны libdrm-amdgpu1, libllvm19, libelf, libsensors).
 fn skipped(name: &str) -> bool {
     name.starts_with("libGLX")
         || name.starts_with("libGL.so")
-        || (name.starts_with("libvulkan_") && !name.starts_with("libvulkan_lvp") && !name.starts_with("libvulkan_nouveau"))
+        || (name.starts_with("libvulkan_") && !name.starts_with("libvulkan_lvp") && !name.starts_with("libvulkan_nouveau") && !name.starts_with("libvulkan_radeon"))
 }
 
 /// Описатель ICD Vulkan (формат загрузчика 1.0.0, api_version — как у
@@ -152,6 +154,11 @@ pub fn add(cache: &Path, files: &mut Vec<(String, Vec<u8>, u32)>, patch: fn(&mut
         put(files, String::from("share/vulkan/icd.d/nouveau_icd.x86_64.json"), icd("libvulkan_nouveau.so").into_bytes(), 0o644);
     } else {
         say!("mesa: в пакетах нет libvulkan_nouveau.so - NVK не будет");
+    }
+    if files.iter().any(|(path, _, _)| path == "lib/libvulkan_radeon.so") {
+        put(files, String::from("share/vulkan/icd.d/radeon_icd.x86_64.json"), icd("libvulkan_radeon.so").into_bytes(), 0o644);
+    } else {
+        say!("mesa: в пакетах нет libvulkan_radeon.so - RADV не будет");
     }
     // Проба Vulkan (веха M6 NVK): своя программа на glibc Debian, загрузчик -
     // как у проб Mesa ниже. Без sysroot/clang пакет собирается и без неё.
