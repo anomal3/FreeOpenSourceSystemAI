@@ -9237,7 +9237,7 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "obs",
-        about: "OBS Studio (23.11): obs-studio Debian 13 через слой Linux (`install` с FOSSAI_WITH_OBS=1) - главное окно Qt6 на сервере Wayland ядра (EGL llvmpipe), источник «Захват экрана FossAi» (/dev/fossai-capture), запись 10 с в MP4 (x264) по F9/F10, ffprobe записи в гостевой системе.",
+        about: "OBS Studio (23.11, 24.11): obs-studio Debian 13 через слой Linux (`install` с FOSSAI_WITH_OBS=1), два монитора 1280x800 - главное окно Qt6 на сервере Wayland ядра (EGL llvmpipe), `fossai-obs` по имени (bin пакетов в поиске оболочки), `--gpu` без видеокарты - откат на llvmpipe, холст и вывод = основной монитор, источник «Захват экрана FossAi» - основной монитор (/dev/fossai-capture), запись 10 с в MP4 (x264) по F9/F10, ffprobe записи в гостевой системе (1280x800).",
         target: Target::Installed,
         usb_only: false,
         tablet: false,
@@ -9261,26 +9261,49 @@ pub const ALL: &[Scenario] = &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // Движение указателя будит стол - он берёт второй монитор.
+            Step::Move(5, 5),
+            Step::AwaitAny("desktop     : 2 outputs, desktop 2560x800", 60_000),
+            Step::Line("power never"),
+            Step::Await("screen off: never", 15_000),
             Step::Line("pkg install obs"),
             Step::AwaitOneOf(&["pkg: installed obs 30, ", "is already installed"], 1_800_000),
             // Уведомление «установлен» съедало набор следующей строки.
             Step::Wait(10_000),
             // EGL Mesa из пакета OBS сам по себе (журнал - для разбора).
-            Step::Line("run /opt/debian/bin/bash /opt/obs/bin/fossai-obs --env=EGL_LOG_LEVEL=info --run=eglinfo -B"),
+            Step::Line("run fossai-obs --env=EGL_LOG_LEVEL=info --run=eglinfo -B"),
             Step::AwaitAny("Wayland platform", 300_000),
             Step::Wait(5_000),
-            Step::Line("run -b /opt/debian/bin/bash /opt/obs/bin/fossai-obs --env=QT_LOGGING_RULES=qt.qpa.*=true --env=EGL_LOG_LEVEL=debug"),
+            // `--gpu` в QEMU (узла nouveau нет) - откат на llvmpipe с
+            // записью; холст - основной монитор.
+            Step::Line("run -b fossai-obs --env=QT_LOGGING_RULES=qt.qpa.*=true --env=EGL_LOG_LEVEL=debug --gpu"),
+            Step::AwaitAny("fossai-obs: no /dev/dri/renderD128 - OpenGL stays on llvmpipe", 120_000),
+            Step::AwaitAny("fossai-obs: profile FossAi: canvas 1280x800 (monitor Virtual-1), output 1280x800", 120_000),
             Step::Await("wayland     : client #", 600_000),
             // Упавший OBS - сразу провал, а не десять минут ожидания.
             Step::AwaitOneOf(&["[fossai-capture] loaded", "/opt/debian/bin/bash: killed by the kernel"], 600_000),
             Step::Absent("/opt/debian/bin/bash: killed by the kernel"),
             Step::AwaitOneOf(&["window 'OBS", "/opt/debian/bin/bash: killed by the kernel"], 900_000),
             Step::Absent("/opt/debian/bin/bash: killed by the kernel"),
-            Step::AwaitAny("[fossai-capture] capturing", 300_000),
+            Step::AwaitAny("[fossai-capture] capturing 1280x800 at 0,0", 300_000),
             Step::Wait(30_000),
             Step::Move(1, 0),
             Step::Wait(2_000),
             Step::Painted("obs-main"),
+            // Свойства источника «Экран» (24.11): список мониторов с именами и
+            // размерами, «Весь рабочий стол». Числа - по снимку obs-main.
+            Step::Aim(aim::Aim::Content("OBS 30.2.3.1-3 - Профиль: FossAi - Сцены: FossAi", 263, 555)),
+            Step::Click,
+            Step::Wait(5_000),
+            Step::Aim(aim::Aim::Content("OBS 30.2.3.1-3 - Профиль: FossAi - Сцены: FossAi", 268, 453)),
+            Step::Click,
+            Step::Wait(30_000),
+            Step::Shot("obs-properties"),
+            Step::Key("esc"),
+            Step::Wait(5_000),
+            Step::Aim(aim::Aim::Title("OBS 30.2.3.1-3 - Профиль: FossAi - Сцены: FossAi")),
+            Step::Click,
+            Step::Wait(3_000),
             // Фокус - окну OBS (горячие клавиши под Wayland - только в фокусе).
             Step::Key("f9"),
             Step::AwaitAny("==== Recording Start", 120_000),
@@ -9294,15 +9317,18 @@ pub const ALL: &[Scenario] = &[
             // Выход (Ctrl+Q): OBS отпускает захват и ЦП - иначе под TCG
             // строка оболочки ждёт минутами. Запись к этому времени уже
             // закрыта («Output ... stopped»). TODO (ROADMAP «OBS Studio через
-            // слой Linux»): иногда на выходе поток кодера AAC падает в free()
-            // (порча кучи), и OBS не доходит до «Freeing OBS context data».
+            // слой Linux»): иногда на выходе поток, закрывающий кодер AAC,
+            // падает в free() (порча кучи), OBS не доходит до «Freeing OBS
+            // context data» и висит (ядро убивает только поток).
             Step::Key("ctrl-q"),
             Step::AwaitAny("==== Shutting down", 300_000),
             Step::AwaitAny("capture     : stopped after", 120_000),
             Step::Wait(30_000),
-            Step::Line("run /opt/debian/bin/bash /opt/obs/bin/fossai-obs --probe-last"),
+            // По имени, без `run` и пути.
+            Step::Line("fossai-obs --probe-last"),
             Step::AwaitAny("fossai-obs: probe ", 300_000),
             Step::AwaitAny("codec_name=h264", 120_000),
+            Step::Expect("width=1280|height=800"),
             Step::AwaitAny("codec_name=aac", 60_000),
             Step::Absent("KERNEL PANIC"),
         ],
@@ -9366,7 +9392,7 @@ pub const ALL: &[Scenario] = &[
         big_file: false,
         ssh_key: false,
         memory: "8G",
-        extra: &["-cpu", "max", "-smp", "4"],
+        extra: &["-cpu", "max", "-smp", "4", "-device", "virtio-gpu-pci,id=gpu0,max_outputs=2,edid=on,xres=1280,yres=800"],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),

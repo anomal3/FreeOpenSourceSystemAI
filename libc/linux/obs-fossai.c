@@ -11,7 +11,10 @@
 // the GPU like any camera frame.
 //
 // Two sources:
-//  * fossai_screen_capture — the whole desktop or one monitor (CAP_INFO);
+//  * fossai_screen_capture — one monitor (by its connector name, `DP-1`; by
+//    default the primary one) or the whole desktop. The monitors come from
+//    `read` of the device (24.11): `x\ty\tw\th\tprimary\tname\tdescription`
+//    lines, the primary first, in capture coordinates;
 //  * fossai_window_capture — the rectangle of a window by its title
 //    (CAP_WINDOWS), followed when the window moves or resizes. It shows what
 //    is on the screen there (windows above it too), like a region capture.
@@ -87,6 +90,79 @@ static bool read_info(struct cap_info *info)
 	return ok;
 }
 
+// ---- monitors ------------------------------------------------------------------
+
+#define MAX_MONITORS 8
+#define MONITOR_PRIMARY "primary"
+#define MONITOR_DESKTOP "desktop"
+
+struct monitor {
+	int x, y, w, h;
+	bool primary;
+	char name[32];
+	char description[96];
+};
+
+// Monitors from the device text, the primary first; their number.
+static int read_monitors(struct monitor *list)
+{
+	int fd = open(CAP_DEVICE, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	char text[4096];
+	size_t len = 0;
+	for (;;) {
+		ssize_t n = read(fd, text + len, sizeof(text) - 1 - len);
+		if (n <= 0)
+			break;
+		len += (size_t)n;
+		if (len == sizeof(text) - 1)
+			break;
+	}
+	close(fd);
+	text[len] = 0;
+	int count = 0;
+	for (char *line = text; line && *line && count < MAX_MONITORS;) {
+		char *end = strchr(line, '\n');
+		if (end)
+			*end = 0;
+		struct monitor *m = &list[count];
+		int primary = 0, used = 0;
+		memset(m, 0, sizeof(*m));
+		if (sscanf(line, "%d\t%d\t%d\t%d\t%d\t%31[^\t]\t%n", &m->x, &m->y, &m->w, &m->h, &primary, m->name,
+			   &used) == 6 &&
+		    m->w > 0 && m->h > 0) {
+			m->primary = primary != 0;
+			if (used > 0)
+				snprintf(m->description, sizeof(m->description), "%s", line + used);
+			// «RHT QEMU Monitor (Virtual-1)»: the name is in the list line already.
+			char suffix[40];
+			snprintf(suffix, sizeof(suffix), " (%s)", m->name);
+			size_t dl = strlen(m->description), sl = strlen(suffix);
+			if (dl > sl && strcmp(m->description + dl - sl, suffix) == 0)
+				m->description[dl - sl] = 0;
+			count++;
+		}
+		line = end ? end + 1 : NULL;
+	}
+	return count;
+}
+
+// The monitor `id` (a connector name, MONITOR_PRIMARY) among `list`; an
+// unknown name (the monitor is off now) falls back to the primary one.
+static const struct monitor *pick_monitor(const struct monitor *list, int count, const char *id)
+{
+	if (count <= 0)
+		return NULL;
+	for (int i = 0; id && i < count; i++)
+		if (strcmp(list[i].name, id) == 0)
+			return &list[i];
+	for (int i = 0; i < count; i++)
+		if (list[i].primary)
+			return &list[i];
+	return &list[0];
+}
+
 // Window lines `x\ty\tw\th\tname\n`, top first; the caller frees.
 static char *read_windows(void)
 {
@@ -141,16 +217,31 @@ struct fossai_capture {
 
 	pthread_mutex_t lock;
 	// Settings (under `lock`).
-	int monitor; // -1 — the whole desktop
+	char *monitor; // a connector name, MONITOR_PRIMARY or MONITOR_DESKTOP
 	char *window;
 	bool cursor;
-	int fps;
+	int fps; // 0 — the rate of OBS video
 	bool changed;
 
-	pthread_t thread;
-	bool thread_running;
-	volatile bool stop;
+	// Under `g_lock` (the shared capture thread).
+	struct cap_spec want;
+	bool want_ok;
+	uint64_t next_check;
+	struct fossai_capture *next;
 };
+
+// One kernel capture for all sources of the process (24.11): the kernel runs
+// one capture at a time, so a second source (monitor 2 next to monitor 1, a
+// window) used to wait forever. The thread captures the box around what all
+// sources want and hands each source its part (a frame pointing into the
+// shared buffer, no copy).
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct fossai_capture *g_sources;
+static pthread_t g_thread;
+static bool g_thread_running;
+// The running thread's own stop flag (a thread being joined keeps its flag;
+// a new one started meanwhile gets a fresh one).
+static volatile bool *g_stop;
 
 static const char *screen_name(void *unused)
 {
@@ -168,32 +259,35 @@ static const char *window_name(void *unused)
 static bool wanted_rect(struct fossai_capture *cap, struct cap_spec *spec)
 {
 	pthread_mutex_lock(&cap->lock);
-	int monitor = cap->monitor;
+	char *monitor = bstrdup(cap->monitor);
 	char *window = cap->window ? bstrdup(cap->window) : NULL;
 	spec->flags = cap->cursor ? CAP_POINTER : 0;
-	spec->fps = (uint32_t)cap->fps;
+	spec->fps = (uint32_t)(cap->fps > 0 ? cap->fps : 30);
 	pthread_mutex_unlock(&cap->lock);
 
 	bool ok = false;
 	if (cap->window_mode) {
 		ok = window && *window && find_window(window, spec);
 	} else {
+		struct monitor list[MAX_MONITORS];
+		int count = strcmp(monitor, MONITOR_DESKTOP) == 0 ? 0 : read_monitors(list);
+		const struct monitor *m = pick_monitor(list, count, monitor);
 		struct cap_info info;
-		if (read_info(&info) && info.desk_w && info.desk_h) {
-			if (monitor >= 0 && (uint32_t)monitor < info.count) {
-				spec->x = info.outputs[monitor][0];
-				spec->y = info.outputs[monitor][1];
-				spec->w = (uint32_t)info.outputs[monitor][2];
-				spec->h = (uint32_t)info.outputs[monitor][3];
-			} else {
-				spec->x = 0;
-				spec->y = 0;
-				spec->w = info.desk_w;
-				spec->h = info.desk_h;
-			}
-			ok = spec->w && spec->h;
+		if (m) {
+			spec->x = m->x;
+			spec->y = m->y;
+			spec->w = (uint32_t)m->w;
+			spec->h = (uint32_t)m->h;
+			ok = true;
+		} else if (read_info(&info) && info.desk_w && info.desk_h) {
+			spec->x = 0;
+			spec->y = 0;
+			spec->w = info.desk_w;
+			spec->h = info.desk_h;
+			ok = true;
 		}
 	}
+	bfree(monitor);
 	bfree(window);
 	return ok;
 }
@@ -206,61 +300,96 @@ static uint32_t pixel_format(void)
 
 static void *capture_thread(void *data)
 {
-	struct fossai_capture *cap = data;
+	volatile bool *stop = data;
 	os_set_thread_name("fossai-capture");
 	int fd = -1;
 	struct cap_spec spec = {0};
 	uint32_t *buffer = NULL;
 	uint64_t have = 0;
-	uint64_t next_check = 0;
 	uint32_t format = pixel_format();
 	bool busy_logged = false;
 
-	while (!cap->stop) {
+	while (!*stop) {
 		uint64_t now = os_gettime_ns();
-		pthread_mutex_lock(&cap->lock);
-		bool changed = cap->changed;
-		cap->changed = false;
-		int fps = cap->fps > 0 ? cap->fps : 30;
-		pthread_mutex_unlock(&cap->lock);
-
-		// Settings changed, a window moved, or not capturing yet: (re)start.
-		if (changed || fd < 0 || (cap->window_mode && now >= next_check)) {
-			struct cap_spec want = {0};
-			bool ok = wanted_rect(cap, &want);
-			next_check = now + 500000000ULL;
-			bool same = fd >= 0 && ok && want.x == spec.x && want.y == spec.y && want.w == spec.w &&
-				    want.h == spec.h && want.flags == spec.flags && !changed;
-			if (!same) {
-				if (fd >= 0) {
-					ioctl(fd, CAP_STOP, 0);
+		pthread_mutex_lock(&g_lock);
+		// What every source wants now (windows are looked up twice a second).
+		int fps = 0;
+		bool any = false;
+		int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+		uint32_t flags = 0;
+		for (struct fossai_capture *cap = g_sources; cap; cap = cap->next) {
+			pthread_mutex_lock(&cap->lock);
+			bool redo = cap->changed;
+			cap->changed = false;
+			int want_fps = cap->fps;
+			pthread_mutex_unlock(&cap->lock);
+			if (redo || (cap->window_mode && now >= cap->next_check) || (!cap->want_ok && now >= cap->next_check)) {
+				struct cap_spec want = {0};
+				bool ok = wanted_rect(cap, &want);
+				cap->want = want;
+				cap->want_ok = ok;
+				cap->next_check = now + 500000000ULL;
+			}
+			if (want_fps <= 0) {
+				// As OBS video (the canvas rate): 30 or 60 without stutter.
+				struct obs_video_info ovi;
+				want_fps = obs_get_video_info(&ovi) && ovi.fps_den
+						   ? (int)((ovi.fps_num + ovi.fps_den - 1) / ovi.fps_den)
+						   : 30;
+			}
+			if (want_fps > fps)
+				fps = want_fps;
+			if (!cap->want_ok)
+				continue;
+			const struct cap_spec *w = &cap->want;
+			if (!any) {
+				x0 = w->x;
+				y0 = w->y;
+				x1 = w->x + (int32_t)w->w;
+				y1 = w->y + (int32_t)w->h;
+			} else {
+				x0 = w->x < x0 ? w->x : x0;
+				y0 = w->y < y0 ? w->y : y0;
+				x1 = w->x + (int32_t)w->w > x1 ? w->x + (int32_t)w->w : x1;
+				y1 = w->y + (int32_t)w->h > y1 ? w->y + (int32_t)w->h : y1;
+			}
+			flags |= w->flags;
+			any = true;
+		}
+		if (fps <= 0 || fps > 240)
+			fps = 30;
+		struct cap_spec box = {x0, y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), flags, (uint32_t)fps};
+		bool same = fd >= 0 && any && box.x == spec.x && box.y == spec.y && box.w == spec.w && box.h == spec.h &&
+			    box.flags == spec.flags;
+		if (!same) {
+			if (fd >= 0) {
+				ioctl(fd, CAP_STOP, 0);
+				close(fd);
+				fd = -1;
+			}
+			if (any) {
+				fd = open(CAP_DEVICE, O_RDWR | O_CLOEXEC);
+				if (fd < 0) {
+					blog(LOG_WARNING, "[fossai-capture] %s: %s", CAP_DEVICE, strerror(errno));
+				} else if (ioctl(fd, CAP_START, &box) != 0) {
+					if (errno == EBUSY) {
+						if (!busy_logged)
+							blog(LOG_INFO, "[fossai-capture] another capture runs, waiting");
+						busy_logged = true;
+					} else {
+						blog(LOG_WARNING, "[fossai-capture] start %ux%u at %d,%d: %s", box.w, box.h,
+						     box.x, box.y, strerror(errno));
+					}
 					close(fd);
 					fd = -1;
-				}
-				if (ok) {
-					fd = open(CAP_DEVICE, O_RDWR | O_CLOEXEC);
-					if (fd < 0) {
-						blog(LOG_WARNING, "[fossai-capture] %s: %s", CAP_DEVICE, strerror(errno));
-					} else if (ioctl(fd, CAP_START, &want) != 0) {
-						if (errno == EBUSY) {
-							if (!busy_logged)
-								blog(LOG_INFO, "[fossai-capture] another capture runs, waiting");
-							busy_logged = true;
-						} else {
-							blog(LOG_WARNING, "[fossai-capture] start %ux%u at %d,%d: %s", want.w,
-							     want.h, want.x, want.y, strerror(errno));
-						}
-						close(fd);
-						fd = -1;
-					} else {
-						busy_logged = false;
-						spec = want;
-						have = 0;
-						bfree(buffer);
-						buffer = bmalloc((size_t)spec.w * spec.h * 4);
-						blog(LOG_INFO, "[fossai-capture] capturing %ux%u at %d,%d, %d fps, pointer %s",
-						     spec.w, spec.h, spec.x, spec.y, fps, (spec.flags & CAP_POINTER) ? "on" : "off");
-					}
+				} else {
+					busy_logged = false;
+					spec = box;
+					have = 0;
+					bfree(buffer);
+					buffer = bmalloc((size_t)spec.w * spec.h * 4);
+					blog(LOG_INFO, "[fossai-capture] capturing %ux%u at %d,%d, %d fps, pointer %s", spec.w,
+					     spec.h, spec.x, spec.y, fps, (spec.flags & CAP_POINTER) ? "on" : "off");
 				}
 			}
 		}
@@ -280,17 +409,28 @@ static void *capture_thread(void *data)
 					for (size_t i = 0; i < n; i++)
 						buffer[i] |= 0xFF000000u;
 				}
-				struct obs_source_frame frame = {0};
-				frame.data[0] = (uint8_t *)buffer;
-				frame.linesize[0] = spec.w * 4;
-				frame.width = spec.w;
-				frame.height = spec.h;
-				frame.format = format == PIXEL_RGB ? VIDEO_FORMAT_RGBA : VIDEO_FORMAT_BGRX;
-				frame.timestamp = now;
-				frame.full_range = true;
-				obs_source_output_video(cap->source, &frame);
+				// Each source gets its rectangle of the box (OBS copies the
+				// frame; the rows are as they are, nothing is scaled).
+				for (struct fossai_capture *cap = g_sources; cap; cap = cap->next) {
+					const struct cap_spec *w = &cap->want;
+					if (!cap->want_ok || w->x < spec.x || w->y < spec.y ||
+					    w->x + (int32_t)w->w > spec.x + (int32_t)spec.w ||
+					    w->y + (int32_t)w->h > spec.y + (int32_t)spec.h)
+						continue;
+					struct obs_source_frame frame = {0};
+					size_t offset = (size_t)(w->y - spec.y) * spec.w + (size_t)(w->x - spec.x);
+					frame.data[0] = (uint8_t *)(buffer + offset);
+					frame.linesize[0] = spec.w * 4;
+					frame.width = w->w;
+					frame.height = w->h;
+					frame.format = format == PIXEL_RGB ? VIDEO_FORMAT_RGBA : VIDEO_FORMAT_BGRX;
+					frame.timestamp = now;
+					frame.full_range = true;
+					obs_source_output_video(cap->source, &frame);
+				}
 			}
 		}
+		pthread_mutex_unlock(&g_lock);
 
 		// Next frame time.
 		uint64_t period = 1000000000ULL / (uint64_t)fps;
@@ -312,13 +452,24 @@ static void *capture_thread(void *data)
 static void apply_settings(struct fossai_capture *cap, obs_data_t *settings)
 {
 	pthread_mutex_lock(&cap->lock);
-	cap->monitor = (int)obs_data_get_int(settings, "monitor");
+	bfree(cap->monitor);
+	const char *id = obs_data_get_string(settings, "monitor_id");
+	// Scenes of 23.11 keep the index `monitor` (-1 — the whole desktop).
+	if (!obs_data_has_user_value(settings, "monitor_id") && obs_data_has_user_value(settings, "monitor")) {
+		long long index = obs_data_get_int(settings, "monitor");
+		struct monitor list[MAX_MONITORS];
+		int count = read_monitors(list);
+		id = index < 0 ? MONITOR_DESKTOP : index < count ? list[index].name : MONITOR_PRIMARY;
+		cap->monitor = bstrdup(id);
+	} else {
+		cap->monitor = bstrdup(id && *id ? id : MONITOR_PRIMARY);
+	}
 	bfree(cap->window);
 	cap->window = bstrdup(obs_data_get_string(settings, "window"));
 	cap->cursor = obs_data_get_bool(settings, "show_cursor");
 	cap->fps = (int)obs_data_get_int(settings, "fps");
-	if (cap->fps <= 0 || cap->fps > 240)
-		cap->fps = 30;
+	if (cap->fps < 0 || cap->fps > 240)
+		cap->fps = 0;
 	cap->changed = true;
 	pthread_mutex_unlock(&cap->lock);
 }
@@ -331,8 +482,18 @@ static void *create_common(obs_data_t *settings, obs_source_t *source, bool wind
 	pthread_mutex_init(&cap->lock, NULL);
 	apply_settings(cap, settings);
 	obs_source_set_async_unbuffered(source, true);
-	if (pthread_create(&cap->thread, NULL, capture_thread, cap) == 0)
-		cap->thread_running = true;
+	pthread_mutex_lock(&g_lock);
+	cap->next = g_sources;
+	g_sources = cap;
+	if (!g_thread_running) {
+		g_stop = bzalloc(sizeof(bool));
+		g_thread_running = pthread_create(&g_thread, NULL, capture_thread, (void *)g_stop) == 0;
+		if (!g_thread_running) {
+			bfree((void *)g_stop);
+			g_stop = NULL;
+		}
+	}
+	pthread_mutex_unlock(&g_lock);
 	return cap;
 }
 
@@ -349,10 +510,29 @@ static void *window_create(obs_data_t *settings, obs_source_t *source)
 static void capture_destroy(void *data)
 {
 	struct fossai_capture *cap = data;
-	cap->stop = true;
-	if (cap->thread_running)
-		pthread_join(cap->thread, NULL);
+	pthread_mutex_lock(&g_lock);
+	for (struct fossai_capture **at = &g_sources; *at; at = &(*at)->next) {
+		if (*at == cap) {
+			*at = cap->next;
+			break;
+		}
+	}
+	bool last = g_sources == NULL && g_thread_running;
+	pthread_t thread = g_thread;
+	volatile bool *stop = g_stop;
+	if (last) {
+		*stop = true;
+		g_stop = NULL;
+		g_thread_running = false;
+	}
+	pthread_mutex_unlock(&g_lock);
+	// The last source: the thread stops the kernel capture and ends.
+	if (last) {
+		pthread_join(thread, NULL);
+		bfree((void *)stop);
+	}
 	pthread_mutex_destroy(&cap->lock);
+	bfree(cap->monitor);
 	bfree(cap->window);
 	bfree(cap);
 }
@@ -364,10 +544,15 @@ static void capture_update(void *data, obs_data_t *settings)
 
 static void capture_defaults(obs_data_t *settings)
 {
+	// The primary monitor by its name (the list shows names); no monitor
+	// list (an old kernel) — the primary anyway.
+	struct monitor list[MAX_MONITORS];
+	const struct monitor *primary = pick_monitor(list, read_monitors(list), NULL);
+	obs_data_set_default_string(settings, "monitor_id", primary ? primary->name : MONITOR_PRIMARY);
 	obs_data_set_default_int(settings, "monitor", -1);
 	obs_data_set_default_string(settings, "window", "");
 	obs_data_set_default_bool(settings, "show_cursor", true);
-	obs_data_set_default_int(settings, "fps", 30);
+	obs_data_set_default_int(settings, "fps", 0);
 }
 
 static obs_properties_t *screen_properties(void *data)
@@ -375,22 +560,26 @@ static obs_properties_t *screen_properties(void *data)
 	UNUSED_PARAMETER(data);
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *list =
-		obs_properties_add_list(props, "monitor", "Монитор", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+		obs_properties_add_list(props, "monitor_id", "Монитор", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	struct monitor monitors[MAX_MONITORS];
+	int count = read_monitors(monitors);
+	char text[192];
+	for (int i = 0; i < count; i++) {
+		const struct monitor *m = &monitors[i];
+		snprintf(text, sizeof(text), "Монитор %d — %s %d×%d%s%s%s", i + 1, m->name, m->w, m->h,
+			 m->primary ? ", основной" : "", *m->description ? " — " : "", m->description);
+		obs_property_list_add_string(list, text, m->name);
+	}
 	struct cap_info info;
-	if (read_info(&info)) {
-		char text[96];
-		snprintf(text, sizeof(text), "Весь рабочий стол (%ux%u)", info.desk_w, info.desk_h);
-		obs_property_list_add_int(list, text, -1);
-		for (uint32_t i = 0; i < info.count && i < 8; i++) {
-			snprintf(text, sizeof(text), "Монитор %u%s (%dx%d в %d,%d)", i + 1, i == 0 ? ", основной" : "",
-				 info.outputs[i][2], info.outputs[i][3], info.outputs[i][0], info.outputs[i][1]);
-			obs_property_list_add_int(list, text, (long long)i);
-		}
+	if (read_info(&info) && info.desk_w && info.desk_h) {
+		snprintf(text, sizeof(text), "Весь рабочий стол — %u×%u", info.desk_w, info.desk_h);
+		obs_property_list_add_string(list, text, MONITOR_DESKTOP);
 	} else {
-		obs_property_list_add_int(list, "Весь рабочий стол", -1);
+		obs_property_list_add_string(list, "Весь рабочий стол", MONITOR_DESKTOP);
 	}
 	obs_properties_add_bool(props, "show_cursor", "Показывать указатель");
-	obs_properties_add_int(props, "fps", "Кадров в секунду", 1, 240, 1);
+	obs_property_t *fps = obs_properties_add_int(props, "fps", "Кадров в секунду (0 — как у видео OBS)", 0, 240, 1);
+	obs_property_set_long_description(fps, "0 — столько же, сколько в Настройки → Видео (30 или 60)");
 	return props;
 }
 
@@ -412,7 +601,7 @@ static obs_properties_t *window_properties(void *data)
 	}
 	bfree(text);
 	obs_properties_add_bool(props, "show_cursor", "Показывать указатель");
-	obs_properties_add_int(props, "fps", "Кадров в секунду", 1, 240, 1);
+	obs_properties_add_int(props, "fps", "Кадров в секунду (0 — как у видео OBS)", 0, 240, 1);
 	return props;
 }
 

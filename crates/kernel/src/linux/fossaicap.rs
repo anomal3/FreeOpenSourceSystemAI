@@ -16,17 +16,25 @@
 //! | `FOSSAI_CAP_STATUS` (`F`,5) | `CapStatus` out                          | 0           |
 //! | `FOSSAI_CAP_WINDOWS` (`F`,6)| `{u64 buf; u64 len}` in — window lines   | bytes       |
 //!
+//! `read` (24.11) hands the monitors as text, one line per monitor, the
+//! primary first: `x\ty\tw\th\tprimary\tname\tdescription` (desktop
+//! coordinates, the `wl_output` connector name) — for OBS's monitor list and
+//! for the launcher (`fossai-obs` sizes the canvas by the primary monitor);
+//! the text is taken at the first `read` of an open, then read to the end.
+//!
 //! Only the request type `'F'` and number are looked at (the size bits of
 //! `_IOWR` are not). A capture started through a descriptor ends when the
 //! last copy of it is closed: OBS removing the source, or the process dying,
 //! must not leave the red indicator on the panel until the orphan timeout.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::e;
 use super::ipc::get;
+use crate::sync::Mutex;
 use crate::user::files::Object;
 
 /// Not in `super::e`: «another capture runs», «no capture».
@@ -47,17 +55,24 @@ const WINDOWS: usize = 6;
 struct Device {
     /// This open started the running capture.
     started: AtomicBool,
+    /// `read`: the monitor text taken at the first read, and how far it is read.
+    text: Mutex<Option<(Vec<u8>, usize)>>,
 }
 
 impl Object for Device {
-    fn read(&self, _buf: &mut [u8]) -> Result<usize, i64> {
-        Err(-e::EINVAL)
+    fn read(&self, buf: &mut [u8]) -> Result<usize, i64> {
+        let mut text = self.text.lock();
+        let (data, at) = text.get_or_insert_with(|| (super::wayland::monitor_lines().into_bytes(), 0));
+        let n = buf.len().min(data.len() - *at);
+        buf[..n].copy_from_slice(&data[*at..*at + n]);
+        *at += n;
+        Ok(n)
     }
     fn write(&self, _data: &[u8]) -> Result<usize, i64> {
         Err(-e::EINVAL)
     }
     fn readiness(&self) -> (bool, bool, bool) {
-        (false, false, false)
+        (true, false, false)
     }
     fn mode(&self) -> u32 {
         0o020_000 // S_IFCHR
@@ -88,7 +103,7 @@ pub fn open(linux: &str, flags: usize) -> Option<i64> {
     if linux != PATH {
         return None;
     }
-    let object: Arc<dyn Object> = Arc::new(Device { started: AtomicBool::new(false) });
+    let object: Arc<dyn Object> = Arc::new(Device { started: AtomicBool::new(false), text: Mutex::new(None) });
     Some(match crate::user::with_current(|program| {
         let fd = program.files.install_object(object, false)?;
         program.files.set_cloexec(fd, flags & O_CLOEXEC != 0);

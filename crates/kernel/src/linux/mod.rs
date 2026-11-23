@@ -1256,7 +1256,8 @@ fn access(dir: usize, ptr: usize, mode: usize) -> i64 {
         Ok(path) => path,
         Err(err) => return err,
     };
-    if special::exists(&linux) {
+    // `/dev/fossai-capture` (24.11): `[ -r … ]` сценария `fossai-obs`.
+    if special::exists(&linux) || fossaicap::exists(&linux) {
         return 0;
     }
     let path = crate::linux_path::resolve(&linux, crate::user::credentials());

@@ -420,11 +420,20 @@ const GLOBAL_INI: &str = "[General]\n\
     SysTrayEnabled=false\n\
     ShowTransitions=true\n";
 
-/// Профиль «FossAi»: простой режим вывода, запись MP4 через x264
-/// (`veryfast`) в `~/Videos` (`@HOME@` подставляет `fossai-obs`), звук 48 кГц
-/// стерео. Горячие клавиши: F9 — начать запись, F10 — остановить (OBS под
-/// Wayland ловит их, когда его окно в фокусе). Размер холста не задан — OBS
-/// берёт размер основного монитора.
+/// Профиль «FossAi»: простой режим вывода, запись MP4 «Высокое качество,
+/// средний размер файла» (`RecQuality=Small`: x264 CRF 23 у 1080p, у меньших
+/// размеров ниже, `veryfast` — простой режим другой предустановки не даёт) в
+/// `~/Videos`, звук 48 кГц стерео. Горячие клавиши: F9 — начать запись, F10 —
+/// остановить (OBS под Wayland ловит их, когда его окно в фокусе).
+///
+/// Видео (24.11, Роман: «два монитора одной картинкой, качество плохое»):
+/// холст — размер **основного** монитора (`@BASECX@`x`@BASECY@`), вывод — он
+/// же до 1920x1080, крупнее — к высоте 1080 с теми же пропорциями
+/// (`@OUTCX@`x`@OUTCY@`; всё подставляет `fossai-obs` по `/dev/fossai-capture`).
+/// Без этих строк OBS берёт экран Qt и уменьшает вывод до 1280x720 и меньше
+/// (`OBSBasic::InitBasicConfigDefaults`) — отсюда было мыло. Уменьшение —
+/// Lanczos, цвет — NV12, BT.709, ограниченный диапазон (как у OBS по
+/// умолчанию, так ждут проигрыватели).
 const PROFILE_INI: &str = "[General]\n\
     Name=FossAi\n\
     \n\
@@ -438,13 +447,20 @@ const PROFILE_INI: &str = "[General]\n\
     RecEncoder=x264\n\
     StreamEncoder=x264\n\
     Preset=veryfast\n\
-    VBitrate=4000\n\
+    VBitrate=6000\n\
     ABitrate=160\n\
     \n\
     [Video]\n\
+    BaseCX=@BASECX@\n\
+    BaseCY=@BASECY@\n\
+    OutputCX=@OUTCX@\n\
+    OutputCY=@OUTCY@\n\
     FPSType=0\n\
     FPSCommon=30\n\
-    ScaleType=bicubic\n\
+    ScaleType=lanczos\n\
+    ColorFormat=NV12\n\
+    ColorSpace=709\n\
+    ColorRange=Partial\n\
     \n\
     [Audio]\n\
     SampleRate=48000\n\
@@ -454,8 +470,9 @@ const PROFILE_INI: &str = "[General]\n\
     OBSBasic.StartRecording={\"bindings\":[{\"key\":\"OBS_KEY_F9\"}]}\n\
     OBSBasic.StopRecording={\"bindings\":[{\"key\":\"OBS_KEY_F10\"}]}\n";
 
-/// Коллекция сцен «FossAi»: одна сцена с захватом экрана FossAi (весь стол,
-/// с указателем) и звуком рабочего стола — ALSA, устройство `default`
+/// Коллекция сцен «FossAi»: одна сцена с захватом экрана FossAi (основной
+/// монитор — `monitor_id` не задан, модуль берёт основной; с указателем;
+/// кадров — как у видео OBS) и звуком рабочего стола — ALSA, устройство `default`
 /// (`share/alsa/fossai.conf`).
 const SCENES_JSON: &str = r#"{
     "name": "FossAi",
@@ -494,7 +511,7 @@ const SCENES_JSON: &str = r#"{
             "versioned_id": "fossai_screen_capture",
             "name": "Экран",
             "uuid": "6f1a1d2e-0b7a-4c1e-9a10-f05a10000002",
-            "settings": {"monitor": -1, "show_cursor": true, "fps": 30}
+            "settings": {"show_cursor": true}
         },
         {
             "id": "alsa_input_capture",
@@ -541,16 +558,46 @@ export ALSA_CONFIG_DIR=$P/share/alsa
 export ALSA_CONFIG_PATH=$P/share/alsa/alsa.conf:$P/share/alsa/fossai.conf
 # `--env=ИМЯ=ЗНАЧЕНИЕ` первыми - своя переменная (у `run` окружения нет).
 while case "$1" in --env=*) true ;; *) false ;; esac; do export "${1#--env=}"; shift; done
-# `--gpu`: OpenGL на видеокарте NVIDIA - zink (OpenGL поверх Vulkan) на NVK
-# через узел nouveau ядра; без узла - llvmpipe, как без ключа.
-if [ "$1" = --gpu ]; then
-    shift
-    if [ -e /dev/dri/renderD128 ]; then
-        export LIBGL_ALWAYS_SOFTWARE=0 GALLIUM_DRIVER=zink MESA_LOADER_DRIVER_OVERRIDE=zink
-        export VK_DRIVER_FILES=$P/share/vulkan/icd.d/nouveau_icd.x86_64.json
-        export VK_ICD_FILENAMES=$VK_DRIVER_FILES
+C=$XDG_CONFIG_HOME/obs-studio
+L=$HOME/.cache/fossai-obs
+LD_LIBRARY_PATH= mkdir -p "$L" "$MESA_SHADER_CACHE_DIR"
+# Строки запуска - в терминал и в ~/.cache/fossai-obs/launch.log (из «Пуска»
+# терминала нет).
+say() { echo "fossai-obs: $*"; echo "$(LD_LIBRARY_PATH= date '+%F %T') $*" >> "$L/launch.log"; }
+# OpenGL: `--cpu` - llvmpipe (по умолчанию), `--gpu` - видеокарта NVIDIA:
+# zink (OpenGL поверх Vulkan) на NVK через узел nouveau ядра. Умолчание можно
+# сменить строкой `gpu=1` в ~/.config/fossai-obs.conf. Видеокарта - всегда с
+# откатом: проба eglinfo до запуска и журнал OBS после него (см. ниже).
+GPU=0
+[ -r "$XDG_CONFIG_HOME/fossai-obs.conf" ] && while IFS='=' read -r k v; do [ "$k" = gpu ] && GPU=$v; done < "$XDG_CONFIG_HOME/fossai-obs.conf"
+case "$1" in --gpu) GPU=1; shift ;; --cpu) GPU=0; shift ;; esac
+cpu_gl() {
+    export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+    unset MESA_LOADER_DRIVER_OVERRIDE VK_DRIVER_FILES VK_ICD_FILENAMES
+}
+gpu_gl() {
+    export LIBGL_ALWAYS_SOFTWARE=0 GALLIUM_DRIVER=zink MESA_LOADER_DRIVER_OVERRIDE=zink
+    export VK_DRIVER_FILES=$P/share/vulkan/icd.d/nouveau_icd.x86_64.json
+    export VK_ICD_FILENAMES=$VK_DRIVER_FILES
+}
+if [ "$GPU" = 1 ]; then
+    if [ ! -e /dev/dri/renderD128 ]; then
+        say "no /dev/dri/renderD128 - OpenGL stays on llvmpipe"
+        GPU=0
     else
-        echo "fossai-obs: no /dev/dri/renderD128 - OpenGL stays on llvmpipe"
+        gpu_gl
+        # Проба: eglinfo на Wayland должен назвать zink (не llvmpipe) и не
+        # зависнуть; иначе - процессор.
+        T=; LD_LIBRARY_PATH= command -v timeout >/dev/null 2>&1 && T="timeout 45"
+        out=$( { export LOCPATH=$P/locale LC_ALL=C.UTF-8; } 2>/dev/null; $T $P/bin/eglinfo 2>&1 )
+        r=$(printf '%s\n' "$out" | while IFS= read -r line; do case "$line" in *renderer*zink*) echo "${line#*: }"; break ;; esac; done)
+        if [ -n "$r" ]; then
+            say "OpenGL on the GPU: $r"
+        else
+            say "GPU probe failed (eglinfo found no zink renderer) - OpenGL on llvmpipe"
+            printf '%s\n' "$out" > "$L/gpu-probe.txt"
+            cpu_gl; GPU=0
+        fi
     fi
 fi
 # `--run=ПРОГРАММА`: своя программа пакета с тем же окружением (eglinfo,
@@ -564,23 +611,56 @@ if [ "$1" = --probe-last ]; then
     [ -z "$f" ] && { echo "fossai-obs: no recording in $HOME/Videos"; exit 1; }
     s=$(LD_LIBRARY_PATH= stat -c %s "$f")
     echo "fossai-obs: probe $f ($s bytes)"
-    exec $P/bin/ffprobe -hide_banner -v error -show_entries format=format_name,duration,size:stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels -of compact "$f"
+    exec $P/bin/ffprobe -hide_banner -v error -show_entries format=format_name,duration,size,bit_rate:stream=codec_type,codec_name,profile,width,height,pix_fmt,color_space,color_range,r_frame_rate,bit_rate,sample_rate,channels -of compact "$f"
 fi
-# Первый запуск: свои настройки (русский, профиль и сцена «FossAi»).
-C=$XDG_CONFIG_HOME/obs-studio
-if [ ! -e "$C/global.ini" ]; then
-    LD_LIBRARY_PATH= mkdir -p "$C" "$HOME/Videos"
+# Основной монитор (первая строка `/dev/fossai-capture`): холст OBS - его
+# размер, вывод - он же до 1920x1080, крупнее - к высоте 1080.
+BW=1920 BH=1080 MON=
+if [ -r /dev/fossai-capture ]; then
+    while IFS=$'\t' read -r x y w h p n d; do
+        case "$w$h" in ''|*[!0-9]*) continue ;; esac
+        BW=$w BH=$h MON=$n; break
+    done < /dev/fossai-capture
+fi
+if [ $((BW * BH)) -le $((1920 * 1080)) ]; then OW=$BW OH=$BH; else OH=1080; OW=$(( (BW * 1080 / BH + 1) / 2 * 2 )); fi
+# Первый запуск: свои настройки (русский, профиль и сцена «FossAi»). Профиль
+# 23.11 (без размеров холста: OBS сжимал вывод до 1280x720) - заменяется.
+f=$C/basic/profiles/FossAi/basic.ini
+if [ ! -e "$C/global.ini" ] || { [ -e "$f" ] && ! LD_LIBRARY_PATH= grep -q '^BaseCX=' "$f"; }; then
+    LD_LIBRARY_PATH= mkdir -p "$C/basic/profiles/FossAi" "$HOME/Videos"
     LD_LIBRARY_PATH= cp -rn $P/share/fossai/obs-studio/. "$C/"
-    f=$C/basic/profiles/FossAi/basic.ini
-    t=$(<"$f"); printf '%s\n' "${t//@HOME@/$HOME}" > "$f"
+    LD_LIBRARY_PATH= cp $P/share/fossai/obs-studio/basic/profiles/FossAi/basic.ini "$f"
+    t=$(<"$f"); t=${t//@HOME@/$HOME}; t=${t//@BASECX@/$BW}; t=${t//@BASECY@/$BH}; t=${t//@OUTCX@/$OW}; t=${t//@OUTCY@/$OH}
+    printf '%s\n' "$t" > "$f"
+    say "profile FossAi: canvas ${BW}x${BH} (monitor ${MON:-?}), output ${OW}x${OH}"
 fi
-LD_LIBRARY_PATH= mkdir -p "$MESA_SHADER_CACHE_DIR"
 cd $P/bin
 # Qt требует UTF-8: локаль C.UTF-8 glibc 2.41 - своя (LOCPATH), только для
 # программ пакета (bash и coreutils Debian 12 выше её не видят; bash сам
 # ругается, что такой локали не знает, - молча).
 { export LOCPATH=$P/locale LC_ALL=C.UTF-8 LANG=C.UTF-8; } 2>/dev/null
 # `--disable-shutdown-check`: «безопасный режим» после аварии не спрашивать.
+[ "$GPU" = 1 ] || exec $P/bin/obs --disable-shutdown-check "$@"
+# Видеокарта: OBS - дочерний; если его журнал не дошёл до «OpenGL loaded
+# successfully» (zink/NVK не поднялся, «Failed to initialize video»), OBS
+# запускается снова на llvmpipe.
+newest() { local m f=; for m in "$C"/logs/*.txt; do [ -e "$m" ] && { [ -z "$f" ] || [ "$m" -nt "$f" ]; } && f=$m; done; echo "$f"; }
+before=$(newest)
+$P/bin/obs --disable-shutdown-check "$@"
+rc=$?
+log=$(newest)
+[ "$log" = "$before" ] && log=
+# Без журнала - по коду выхода (закрыли сами - 0, не откатываться).
+ok=$([ "$rc" = 0 ] && echo 1 || echo 0)
+if [ -n "$log" ]; then
+    ok=0
+    while IFS= read -r line; do
+        case "$line" in *"Failed to initialize video"*) ok=0; break ;; *"OpenGL loaded successfully"*) ok=1 ;; esac
+    done < "$log"
+fi
+[ "$ok" = 1 ] && exit $rc
+say "OBS did not start OpenGL on the GPU (exit $rc, log ${log:-none}) - restarting on llvmpipe"
+cpu_gl
 exec $P/bin/obs --disable-shutdown-check "$@"
 "#;
 
@@ -767,6 +847,11 @@ pub fn build(arch: Arch) -> Result<()> {
     builder.field("about", "OBS Studio: запись и трансляция экрана");
     builder.field("caption", "OBS Studio");
     builder.field("start", "/opt/debian/bin/bash /opt/obs/bin/fossai-obs");
+    // Вторая строка «Пуска» (24.11): OpenGL на видеокарте с откатом на
+    // llvmpipe (`--gpu`); в терминале — `fossai-obs --gpu`.
+    builder.field("start2", "/opt/debian/bin/bash /opt/obs/bin/fossai-obs --gpu");
+    builder.field("caption2", "OBS Studio (видеокарта)");
+    builder.field("about2", "OBS Studio: OpenGL на видеокарте (zink/NVK), при отказе — на процессоре");
     builder.field("desktop", "yes");
     builder.field("icon", icon_field);
     builder.field("permissions", "windows files net jit");

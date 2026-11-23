@@ -2770,8 +2770,16 @@ const BRK_RESERVE: usize = 64 << 30;
 /// `brk(want)` программы Linux: отвечает новым концом или, если сдвинуть
 /// нельзя, прежним (у `brk` Linux ошибки нет — есть старый ответ). Резерв
 /// заводится при первом вызове; `brk(0)` — «где конец сейчас».
+///
+/// Сжатие отдаёт страницы за новым концом (24.11): у Linux они снимаются, и
+/// выросшая снова куча читается нулями. На это рассчитывает `calloc` glibc
+/// (`MORECORE_CLEARS`): память, только что полученная от `sbrk` выше старой
+/// вершины, не обнуляется. Без сброса после `systrim` (free большого куска
+/// в главной арене) и нового роста `calloc` отдавал старое содержимое — мусор
+/// в «обнулённых» структурах, и `free()` падал в `unlink_chunk` (выход OBS:
+/// поток кодера AAC, один прогон из двух).
 pub fn linux_brk(want: usize) -> usize {
-    with_current(|program| {
+    with_current_shared(|program, shared| {
         if program.brk.0 == 0 {
             match program.mmap(BRK_RESERVE, user_abi::MAP_LAZY) {
                 Ok(base) => program.brk = (base, base, base + BRK_RESERVE),
@@ -2780,6 +2788,11 @@ pub fn linux_brk(want: usize) -> usize {
         }
         let (base, now, end) = program.brk;
         if want >= base && want <= end {
+            let keep = want.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            let had = now.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            if keep < had {
+                program.linux_discard(keep, had - keep, shared);
+            }
             program.brk.1 = want;
             want
         } else {

@@ -40,8 +40,8 @@ use super::compositor::Compositor;
 /// A capture without a grab for this long belongs to a program that is gone.
 const ORPHAN_MS: u64 = 4_000;
 
-/// Rows copied per hold of the lock in [`grab`]: the compositor waits for it
-/// at most this many rows (spin lock, interrupts off).
+/// Rows copied per hold of the lock in [`grab`] and [`put`]: the other side
+/// waits for it at most this many rows (spin lock, interrupts off).
 const GRAB_ROWS: u32 = 32;
 
 /// Largest side of a capture.
@@ -123,12 +123,18 @@ pub fn take_repaint() -> Option<Rect> {
 
 /// Compositor hook: `part` (desktop coordinates) now shows the pixels of
 /// `src` at `(sx, sy)`.
+///
+/// The copy goes [`GRAB_ROWS`] rows per hold of the lock (24.11): a whole
+/// 2560x1440 frame of a fullscreen game under one hold kept interrupts off
+/// for 2.4-3.1 ms every frame (log 17 of Roman's PC). Between holds the
+/// capture may have ended or been restarted on another rectangle — then the
+/// rest is dropped.
 pub fn put(part: Rect, src: &Surface, sx: i32, sy: i32) {
-    let mut state = STATE.lock();
-    let Some(capture) = state.as_mut() else {
-        return;
+    let rect = match STATE.lock().as_ref() {
+        Some(capture) => capture.rect,
+        None => return,
     };
-    let clip = part.intersect(&capture.rect);
+    let clip = part.intersect(&rect);
     if clip.is_empty() {
         return;
     }
@@ -137,14 +143,26 @@ pub fn put(part: Rect, src: &Surface, sx: i32, sy: i32) {
     if sx < 0 || sy < 0 || (sx as u32).saturating_add(clip.w) > src.width() || (sy as u32).saturating_add(clip.h) > src.height() {
         return;
     }
-    let width = capture.rect.w as usize;
-    let col = (clip.x - capture.rect.x) as usize;
-    for row in 0..clip.h {
-        let from = &src.row(sy as u32 + row)[sx as usize..sx as usize + clip.w as usize];
-        let at = (clip.y - capture.rect.y) as usize + row as usize;
-        capture.mirror[at * width + col..at * width + col + clip.w as usize].copy_from_slice(from);
+    let width = rect.w as usize;
+    let col = (clip.x - rect.x) as usize;
+    let mut row = 0;
+    while row < clip.h {
+        let rows = GRAB_ROWS.min(clip.h - row);
+        let mut state = STATE.lock();
+        let Some(capture) = state.as_mut().filter(|capture| capture.rect == rect) else {
+            return;
+        };
+        for row in row..row + rows {
+            let from = &src.row(sy as u32 + row)[sx as usize..sx as usize + clip.w as usize];
+            let at = (clip.y - rect.y) as usize + row as usize;
+            capture.mirror[at * width + col..at * width + col + clip.w as usize].copy_from_slice(from);
+        }
+        if row + rows >= clip.h {
+            capture.seq += 1;
+        }
+        drop(state);
+        row += rows;
     }
-    capture.seq += 1;
 }
 
 /// Compositor hook, once per presented frame: where the pointer is and

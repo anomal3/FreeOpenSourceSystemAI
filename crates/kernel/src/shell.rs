@@ -1721,19 +1721,16 @@ fn run_builtin(line: &str) -> bool {
             sprintln!("  finishing the session");
             return true;
         }
-        // Не команда — может быть программой. Оболочка ищет её в `/bin`, как
-        // это делает всякая оболочка со своим `PATH`; списка каталогов у нас
-        // пока нет, и он не нужен — программы лежат в одном месте.
+        // Не команда — может быть программой. Оболочка ищет её в `/bin`, а
+        // потом в `bin` пакетов (`/opt/<pkg>/bin`, 24.11), как это делает
+        // всякая оболочка со своим `PATH` (см. [`find_program`]).
         //
         // Написать `mc` вместо `run /bin/mc` — не удобство ради удобства:
         // человек, знающий имя программы, не обязан знать ещё и путь к ней и
         // слово `run`. Отказ при этом остаётся честным: если файла нет, так и
         // говорится, и говорится про **имя**, а не про придуманный путь.
         other => {
-            let path = alloc::format!("/bin/{other}");
-            if fs::resolve_as(user::session::credentials(), &path, Access::NONE)
-                .is_some_and(|result| result.is_ok())
-            {
+            if let Some(path) = find_program(other) {
                 let line = if argument.is_empty() {
                     path
                 } else {
@@ -1746,6 +1743,46 @@ fn run_builtin(line: &str) -> bool {
         }
     }
     false
+}
+
+/// Программа по имени (24.11): `/bin/<name>`, затем `bin` пакетов —
+/// `/opt/<pkg>/bin/<name>` по алфавиту пакетов (свой `PATH`: `fossai-obs`,
+/// `fossai-proton`, `obs` набираются именем, без `run` и пути). Ответ —
+/// начало командной строки: сценарий с `#!` (`fossai-obs` — сценарий bash)
+/// запускается своим интерпретатором, `/bin/bash` и `/bin/sh` сценариев
+/// Linux — это bash корня Debian (`/opt/debian/bin/bash`): у ядра `#!`
+/// разбирает только `execve` слоя Linux, а не запуск из оболочки.
+fn find_program(name: &str) -> Option<String> {
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        return None;
+    }
+    let cred = user::session::credentials();
+    let exists = |path: &str| fs::resolve_as(cred, path, Access::NONE).is_some_and(|result| result.is_ok());
+    let native = alloc::format!("/bin/{name}");
+    if exists(&native) {
+        return Some(native);
+    }
+    let mut packages: alloc::vec::Vec<String> = match fs::list("/opt") {
+        Some(Ok(entries)) => entries.into_iter().filter(|entry| entry.kind == NodeKind::Directory).map(|entry| entry.name).collect(),
+        _ => return None,
+    };
+    packages.sort();
+    let path = packages.iter().map(|pkg| alloc::format!("/opt/{pkg}/bin/{name}")).find(|path| exists(path))?;
+    let head = match fs::read(&path, 128) {
+        Some(Ok((bytes, _))) => bytes,
+        _ => return Some(path),
+    };
+    let Some(first) = head.strip_prefix(b"#!") else {
+        return Some(path);
+    };
+    let first = core::str::from_utf8(first.split(|&b| b == b'\n').next().unwrap_or(&[])).unwrap_or("").trim();
+    let interp = first.split_whitespace().next().unwrap_or("");
+    let interp = match interp {
+        "/bin/bash" | "/bin/sh" | "/usr/bin/bash" if exists("/opt/debian/bin/bash") => String::from("/opt/debian/bin/bash"),
+        "" => return Some(path),
+        other => String::from(other),
+    };
+    Some(alloc::format!("{interp} {path}"))
 }
 
 /// Канарейка стека ядра: показать состояние и — по отдельному слову —
@@ -3027,6 +3064,18 @@ fn run_pipeline(left: &str, right: &str, background: bool) {
         sprintln!("  usage: run <path> [args] | <path> [args]");
         return;
     }
+    // `run -b fossai-obs --gpu`: имя без пути ищется, как у команды (24.11).
+    let found;
+    let line = match line.split_once(' ').map_or((line, ""), |(name, rest)| (name, rest)) {
+        (name, rest) if !name.contains('/') && !line.contains('|') => match find_program(name) {
+            Some(path) => {
+                found = if rest.is_empty() { path } else { alloc::format!("{path} {rest}") };
+                found.as_str()
+            }
+            None => line,
+        },
+        _ => line,
+    };
 
     let (reader, writer) = match user::pipe::create() {
         Ok(ends) => ends,

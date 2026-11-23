@@ -584,6 +584,35 @@ fn refresh_outputs(now: u64) {
     }
 }
 
+/// Monitors as `read` of `/dev/fossai-capture` hands them (OBS «Захват
+/// экрана FossAi», 24.11): one line per monitor, the primary first,
+/// `x\ty\tw\th\tprimary\tname\tdescription\n` - the place in desktop
+/// (capture) coordinates, `primary` 1/0, the same connector name as
+/// `wl_output.name` (what Qt and OBS call the screen).
+#[must_use]
+pub fn monitor_lines() -> String {
+    refresh_outputs(crate::time::uptime_ms());
+    let table = OUTPUT_TABLE.lock();
+    let left = table.list.iter().map(|o| o.x).min().unwrap_or(0);
+    let top = table.list.iter().map(|o| o.y).min().unwrap_or(0);
+    let mut order: Vec<&OutputInfo> = table.list.iter().collect();
+    order.sort_by_key(|o| (!o.primary, o.x, o.y));
+    let mut text = String::new();
+    for o in order {
+        text.push_str(&alloc::format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            o.x - left,
+            o.y - top,
+            o.w,
+            o.h,
+            u8::from(o.primary),
+            o.name,
+            o.description.replace(['\t', '\n'], " ")
+        ));
+    }
+    text
+}
+
 /// Physical size of a `w`x`h` screen at 96 dots per inch, mm.
 fn mm_at_96dpi(w: u32, h: u32) -> (i32, i32) {
     ((w * 254 / 960) as i32, (h * 254 / 960) as i32)
