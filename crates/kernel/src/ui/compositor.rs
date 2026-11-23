@@ -4231,9 +4231,14 @@ impl Compositor {
 
         if let Some(menu) = self.menu.as_mut() {
             let damage = menu.take_damage();
+            // Подменю классического «Пуска» (22.11) — места на экране.
+            let sub = menu.take_sub_damage();
             if !damage.is_empty() {
                 let rect = damage.translate(menu.rect.x, menu.rect.y);
                 self.mark(rect);
+            }
+            if !sub.is_empty() {
+                self.mark_layer(sub);
             }
         }
 
@@ -4883,6 +4888,12 @@ impl Compositor {
     /// Окно, которому после этого не хватило рабочей области, поджимается к
     /// её низу: заголовок вырос, и нижняя кромка иначе ушла бы под панель.
     pub fn retitle_all(&mut self, status: &Status) {
+        // Классика меняет и толщину панели задач (22.11: 28 точек) —
+        // панель и рабочая область пересобираются до окон.
+        if self.panel.as_ref().is_some_and(Panel::stale) {
+            self.rebuild_taskbar();
+            crate::kprintln!("  desktop     : taskbar rebuilt, panel {} px", self.primary.bottom() - self.work_bottom());
+        }
         let works: Vec<Rect> = self.windows.iter().map(|window| self.work_rect_under(window.rect)).collect();
         for (window, work) in self.windows.iter_mut().zip(works) {
             window.retitle();
@@ -5005,7 +5016,8 @@ impl Compositor {
     /// Пометить область меню как изменившуюся — при закрытии его надо стереть.
     pub fn mark_menu_area(&mut self) {
         if let Some(menu) = self.menu.as_ref() {
-            let rect = menu.rect;
+            // Вместе с подменю классического «Пуска» (22.11).
+            let rect = menu.full_rect();
             self.mark_layer(rect);
         }
     }
@@ -6064,6 +6076,10 @@ impl Compositor {
             if menu.is_open() {
                 self.drop_shadow(back, menu.rect, band, dy, radius);
                 self.stack(back, menu.surface(), menu.rect, band, dy, radius);
+                // Подменю классического «Пуска» (22.11) — без углов и теней.
+                for (surface, rect) in menu.layers() {
+                    self.stack(back, surface, rect, band, dy, 0);
+                }
             }
         }
         if let Some(toast) = self.toast.as_ref() {

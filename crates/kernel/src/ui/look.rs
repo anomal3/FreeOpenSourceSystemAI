@@ -267,6 +267,18 @@ pub fn command(words: &str) {
             });
             return;
         }
+        // Бирюзовый стол классики (22.11) — то же, что переключатель на
+        // странице «Оформление».
+        "teal" => {
+            let on = words.next() != Some("off");
+            let (said, result) = super::wallpaper::apply(super::wallpaper::WallDeed::ClassicTeal(on));
+            kprintln!("  desktop     : {said}{}", if result.is_err() { " (not saved)" } else { "" });
+            super::with_desktop(|desktop| {
+                desktop.restyle(&status);
+                desktop.present();
+            });
+            return;
+        }
         "modern" => apply_preset(Preset::Modern),
         "simple" => apply_preset(Preset::Simple),
         "depth" => {

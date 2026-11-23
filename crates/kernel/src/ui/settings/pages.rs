@@ -1524,6 +1524,12 @@ fn appearance(pass: &mut Pass, x: i32, y: i32, w: u32) {
     if current == Preset::Custom {
         y = row(pass, x, y, w, Some(Fi::Sliders), "Своё", "Переключатели ниже отличаются от обоих наборов", Ctl::Radio(true), None);
     }
+    // Классика (22.11): бирюзовый стол Windows 98 — предложением, не
+    // принудительно; выключение возвращает прежние обои.
+    if look::on(Flag::Classic) {
+        let teal = crate::ui::wallpaper::classic_teal_on();
+        y = row(pass, x, y, w, Some(Fi::Image), "Классический бирюзовый фон", "Сплошной #008080, как у Windows 98; выключите — вернутся прежние обои", Ctl::Toggle(teal), Some(Deed::Background(crate::ui::wallpaper::WallDeed::ClassicTeal(!teal))));
+    }
     y = icon_themes(pass, x, y, w);
     y = pass.group(x, y + ctx.px(8) as i32, w, "Эффекты");
     for (flag, icon, title, hint) in [

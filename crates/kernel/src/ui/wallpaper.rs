@@ -108,7 +108,14 @@ pub enum WallDeed {
     /// Сплошной цвет `0xRRGGBB`.
     Color(u32),
     Fit(Fit),
+    /// «Классический бирюзовый фон» (22.11, «Оформление» в классике):
+    /// включить — сплошной #008080, прежний фон запоминается; выключить —
+    /// вернуть прежний.
+    ClassicTeal(bool),
 }
+
+/// Бирюзовый стол Windows 95/98.
+pub const CLASSIC_TEAL: u32 = 0x008080;
 
 /// Цвета «Сплошного цвета» (и полей у «По размеру» / «По центру»).
 pub const COLORS: [u32; 10] = [
@@ -141,6 +148,9 @@ struct State {
     note: Option<String>,
     /// Каталог кэша, когда уже найден.
     cache: Option<&'static str>,
+    /// Фон до «Классического бирюзового» (строка `background=` и цвет):
+    /// его возвращает выключение (`background_saved=` в `desktop.cfg`).
+    saved: Option<(String, u32)>,
 }
 
 static STATE: SpinLock<State> = SpinLock::new(State {
@@ -153,6 +163,7 @@ static STATE: SpinLock<State> = SpinLock::new(State {
     failed: Vec::new(),
     note: None,
     cache: None,
+    saved: None,
 });
 
 /// Номер выбора: входит в ключ готовых обоев стола.
@@ -227,6 +238,11 @@ pub fn adopt(text: &str, path: &str) {
     if let Some(fit) = sysconf::value(text, "background_fit").and_then(|tag| Fit::from_tag(tag.trim())) {
         state.fit = fit;
     }
+    // `background_saved=<background>;<цвет>` — пусто, когда сохранять нечего.
+    state.saved = sysconf::value(text, "background_saved").and_then(|line| {
+        let (value, hex) = line.trim().rsplit_once(';')?;
+        Some((value.to_string(), u32::from_str_radix(hex.trim(), 16).ok()? & 0xFF_FFFF))
+    });
     if let Some(value) = sysconf::value(text, "background") {
         let value = value.trim();
         state.choice = if let Some(image) = value.strip_prefix("image:") {
@@ -301,7 +317,70 @@ pub fn apply(deed: WallDeed) -> (String, Result<(), crate::vfs::VfsError>) {
             kprintln!("  settings    : background fit {}", fit.tag());
             (format!("расположение «{}» запомнено", fit.title()), super::prefs::store_line("background_fit", fit.tag()))
         }
+        WallDeed::ClassicTeal(on) => classic_teal(on),
     }
+}
+
+/// Стоит ли «Классический бирюзовый фон».
+#[must_use]
+pub fn classic_teal_on() -> bool {
+    let state = STATE.lock();
+    state.choice == Choice::Color && state.color == CLASSIC_TEAL
+}
+
+/// Строка `background=` для выбора.
+fn choice_line(choice: &Choice) -> String {
+    match choice {
+        Choice::Preset => String::from("preset"),
+        Choice::Color => String::from("color"),
+        Choice::Image(path) => format!("image:{path}"),
+    }
+}
+
+/// Включить или выключить бирюзовый стол Windows 98 (22.11): включение
+/// запоминает прежний фон, выключение его возвращает — обои FossAi, свою
+/// картинку или цвет — со всеми строками `desktop.cfg`.
+fn classic_teal(on: bool) -> (String, Result<(), crate::vfs::VfsError>) {
+    if on {
+        let (line, color) = {
+            let mut state = STATE.lock();
+            if state.choice == Choice::Color && state.color == CLASSIC_TEAL {
+                return (String::from("бирюзовый фон уже стоит"), Ok(()));
+            }
+            let saved = (choice_line(&state.choice), state.color);
+            state.saved = Some(saved.clone());
+            state.choice = Choice::Color;
+            state.color = CLASSIC_TEAL;
+            state.note = None;
+            saved
+        };
+        bump();
+        kprintln!("  settings    : background classic teal on (was {line}, #{color:06x})");
+        let result = super::prefs::store_line("background_saved", &format!("{line};{color:06x}"))
+            .and_then(|()| super::prefs::store_line("background_color", &format!("{CLASSIC_TEAL:06x}")))
+            .and_then(|()| super::prefs::store_line("background", "color"));
+        return (String::from("классический бирюзовый фон включён; выключите — вернутся прежние обои"), result);
+    }
+    let saved = STATE.lock().saved.take();
+    let (line, color) = saved.unwrap_or_else(|| (String::from("preset"), COLORS[0]));
+    {
+        let mut state = STATE.lock();
+        state.color = color;
+        state.choice = if let Some(path) = line.strip_prefix("image:") {
+            Choice::Image(path.to_string())
+        } else if line == "color" {
+            Choice::Color
+        } else {
+            Choice::Preset
+        };
+        state.note = None;
+    }
+    bump();
+    kprintln!("  settings    : background classic teal off (back to {line}, #{color:06x})");
+    let result = super::prefs::store_line("background_saved", "")
+        .and_then(|()| super::prefs::store_line("background_color", &format!("{color:06x}")))
+        .and_then(|()| super::prefs::store_line("background", &line));
+    (String::from("прежний фон возвращён"), result)
 }
 
 // ── Кэш и программа перевода ────────────────────────────────────────────────

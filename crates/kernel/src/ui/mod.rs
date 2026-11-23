@@ -5339,6 +5339,33 @@ fn handle_menu(desktop: &mut Compositor, event: KeyEvent, status: &Status) {
 
     let mut launching = None;
     let mut closed = false;
+    // Классика (22.11): каскад Windows 98 ходит стрелками по уровням.
+    if menu.is_classic() {
+        let ch = keymap::char_for(event).filter(|_| !event.mods.contains(Modifiers::CTRL) && !event.mods.contains(Modifiers::ALT));
+        match menu.classic_key(code, ch) {
+            panel::ClassicKey::Ignored => return,
+            panel::ClassicKey::Stay => {}
+            panel::ClassicKey::Launch(choice) => {
+                menu.close();
+                closed = true;
+                launching = Some(choice);
+            }
+            panel::ClassicKey::Close => {
+                menu.close();
+                closed = true;
+            }
+        }
+        if closed {
+            kprintln!("  desktop     : menu closed");
+            desktop.mark_menu_area();
+        }
+        if let Some(choice) = launching {
+            run_choice(desktop, choice);
+        }
+        desktop.refresh_panel(status);
+        desktop.present();
+        return;
+    }
     match code {
         KeyCode::Up | KeyCode::Left => menu.move_selection(false),
         KeyCode::Down | KeyCode::Right => menu.move_selection(true),

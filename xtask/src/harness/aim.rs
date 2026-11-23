@@ -223,6 +223,11 @@ fn classic(log: &str) -> bool {
     log.lines().filter(|line| line.contains(": look ")).last().is_some_and(|line| line.contains("classic"))
 }
 
+/// Высота панели задач: у классики — 28 (`panel::CLASSIC_H`, 22.11).
+fn panel_h(log: &str) -> i32 {
+    if classic(log) { 28 } else { PANEL_H }
+}
+
 /// Высота полосы заголовка: у классики — 24 (`window::CLASSIC_TITLE`).
 fn title_h(log: &str) -> i32 {
     if classic(log) { 24 } else { TITLE_H }
@@ -368,7 +373,7 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         // FossAi у самого левого края панели (поле плашки 4).
         Aim::MenuButton => (
             PANEL_INSET + 4 + 22,
-            height - PANEL_INSET - PANEL_H / 2,
+            height - PANEL_INSET - panel_h(log) / 2,
         ),
         // Пустое место полосы перед кнопками окна: с 72h у терминала слева в
         // заголовке — вкладки и «+», а за них окно не таскают.
@@ -403,10 +408,10 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         // ни значков (они слева), ни панели (она внизу). Окна к этому моменту
         // сценарий обязан убрать сам.
         // Колокол — крайний справа в трее (02.11, макет 05).
-        Aim::TrayBell => (width - PANEL_INSET - 12, height - PANEL_INSET - PANEL_H / 2),
+        Aim::TrayBell => (width - PANEL_INSET - 12, height - PANEL_INSET - panel_h(log) / 2),
         // Часы трея: правее них с 02.11 колокол (значок 14 и шаг 14).
-        Aim::Tray => (width - PANEL_INSET - 30 - 28, height - PANEL_INSET - PANEL_H / 2),
-        Aim::TaskButton(n) => (PANEL_INSET + 79 + n * 48, height - PANEL_INSET - PANEL_H / 2),
+        Aim::Tray => (width - PANEL_INSET - 30 - 28, height - PANEL_INSET - panel_h(log) / 2),
+        Aim::TaskButton(n) => (PANEL_INSET + 79 + n * 48, height - PANEL_INSET - panel_h(log) / 2),
         Aim::FilesRow(n) => {
             let rect = window(log, "Files")?;
             // Полоса вкладок (38, с 20.11), панель (48), команды (40), шапка

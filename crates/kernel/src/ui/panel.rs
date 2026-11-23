@@ -49,6 +49,10 @@ use super::window::App;
 use super::deskcfg;
 use super::startapps;
 
+#[path = "cascade.rs"]
+mod cascade;
+pub use cascade::ClassicKey;
+
 /// Надпись на кнопке меню.
 const BRAND: &str = "FossAi";
 
@@ -184,6 +188,16 @@ impl Metrics {
         self.bar_h = self.ctx.px(SMALL_H);
         self.btn_h = self.ctx.px(SMALL_H - 6);
         self.icon_px = self.ctx.px(18);
+        self
+    }
+
+    /// Классика (22.11): полоса [`CLASSIC_H`], кнопки 22, значки 16.
+    const fn classic(mut self) -> Self {
+        self.bar_h = self.ctx.px(CLASSIC_H);
+        self.btn_h = self.ctx.px(CLASSIC_H - 6);
+        self.icon_px = self.ctx.px(16);
+        self.side = self.ctx.px(6);
+        self.gap = self.ctx.px(4);
         self
     }
 
@@ -450,6 +464,9 @@ const PANEL_V_W: u32 = 56;
 /// Толщина панели с «маленькими значками»: горизонтальной и боковой.
 const SMALL_H: u32 = 34;
 const SMALL_V_W: u32 = 42;
+/// Горизонтальная панель в классике: 28 точек, кнопки 22, значки 16 — как у
+/// Windows 98.
+const CLASSIC_H: u32 = 28;
 /// Поле Dock от края экрана и поле значков внутри плашки.
 const DOCK_INSET: u32 = 8;
 const DOCK_PAD: u32 = 8;
@@ -471,6 +488,8 @@ impl Panel {
         }
         match cfg.mode {
             deskcfg::Mode::Panel if cfg.edge.vertical() => (if cfg.small { SMALL_V_W } else { PANEL_V_W }) * scale,
+            // Классика (22.11): панель задач Windows 98 — 28 точек.
+            deskcfg::Mode::Panel if theme::is_classic() => CLASSIC_H * scale,
             deskcfg::Mode::Panel if cfg.small => (SMALL_H + theme::PANEL_INSET * 2) * scale,
             deskcfg::Mode::Panel => (theme::PANEL_H + theme::PANEL_INSET * 2) * scale,
             deskcfg::Mode::Dock => (cfg.icon + DOCK_PAD * 2 + DOCK_INSET * 2) * scale,
@@ -618,7 +637,25 @@ impl Panel {
     /// Размеры кнопок под настройки панели («маленькие значки»).
     fn metrics(&self) -> Metrics {
         let m = Metrics::new(desk_ctx(self.scale));
-        if self.cfg.small && self.cfg.mode == deskcfg::Mode::Panel && !theme::is_mobile() { m.small() } else { m }
+        let panel = self.cfg.mode == deskcfg::Mode::Panel && !theme::is_mobile();
+        if panel && theme::is_classic() && !self.cfg.edge.vertical() {
+            m.classic()
+        } else if self.cfg.small && panel {
+            m.small()
+        } else {
+            m
+        }
+    }
+
+    /// Собрана ли панель под другую толщину, чем требуют настройки сейчас
+    /// (классику включили или выключили, 22.11): тогда её пересобирают.
+    #[must_use]
+    pub fn stale(&self) -> bool {
+        if theme::is_mobile() || self.cfg.mode != deskcfg::Mode::Panel {
+            return false;
+        }
+        let thick = Self::thickness(self.cfg, self.scale);
+        if self.cfg.edge.vertical() { self.home.w != thick } else { self.home.h != thick }
     }
 
     /// Куда плашка едет (или где стоит): 0 — видна.
@@ -1151,7 +1188,8 @@ impl Panel {
         // открытых окон вытеснил бы часы за край экрана.
         let clock = clock_line(status);
         // Маленькие значки — часы в одну строку, как в Windows.
-        let date = if self.cfg.small { None } else { date_line(status) };
+        // Классика (22.11) — тоже: в полосе 28 точек только время.
+        let date = if self.cfg.small || theme::is_classic() { None } else { date_line(status) };
         // Раскладка — как в трее Windows: «РУС» и «ENG».
         let lang = match crate::input::keymap::layout() {
             crate::input::keymap::Layout::Ru => "РУС",
@@ -1971,7 +2009,7 @@ fn panel_layout(m: Metrics, plate: Rect, windows: &[Entry], status_w: u32, pins:
     // а черта внутри одного блока, и широкие поля вокруг неё превратили бы её в
     // третий столбец панели.
     let rule = m.ctx.px(4);
-    let rule_h = m.ctx.px(24);
+    let rule_h = m.ctx.px(24).min(m.btn_h);
     let divider = Rect::new(
         brand.right() + rule as i32,
         plate.y + (plate.h as i32 - rule_h as i32) / 2,
@@ -2514,6 +2552,8 @@ pub struct Menu {
     scratch: Option<Surface>,
     /// Сторона панели — с неё «Пуск» открывается.
     edge: deskcfg::Edge,
+    /// Каскадное меню Windows 98 — «Пуск» в классике (22.11, `cascade`).
+    cascade: cascade::Cascade,
 }
 
 /// «Пуск» ПК (72f, 20.11): размеры в точках при масштабе 1.
@@ -2605,7 +2645,31 @@ impl Menu {
         items.extend([Item::App(App::Shutdown), Item::App(App::Restart)]);
 
         let start_cfg = deskcfg::start();
-        let (card_w, card_h, width) = if theme::is_mobile() {
+        // Классика (22.11): каскадное меню Windows 98 вплотную к панели.
+        let cascade = if theme::is_classic() && !theme::is_mobile() {
+            let mut work = area;
+            if !panel.is_empty() && !cfg.autohide {
+                match cfg.edge {
+                    deskcfg::Edge::Bottom => work.h = (panel.y - area.y).max(1) as u32,
+                    deskcfg::Edge::Top => {
+                        work.y = panel.bottom();
+                        work.h = (area.bottom() - panel.bottom()).max(1) as u32;
+                    }
+                    deskcfg::Edge::Left => {
+                        work.x = panel.right();
+                        work.w = (area.right() - panel.right()).max(1) as u32;
+                    }
+                    deskcfg::Edge::Right => work.w = (panel.x - area.x).max(1) as u32,
+                }
+            }
+            cascade::Cascade::new(work)
+        } else {
+            cascade::Cascade::off()
+        };
+        let (card_w, card_h, width) = if cascade.on {
+            let (w, h) = cascade.root_size(ctx);
+            (w, h.min(area.h), 0)
+        } else if theme::is_mobile() {
             // На телефоне «Пуск» занимает экран целиком — от строки состояния
             // до дока.
             let inset = ctx.px(theme::M_INSET);
@@ -2632,6 +2696,8 @@ impl Menu {
         let surface = Surface::new(card_w, card_h, glass_bg())?;
         let rect = if theme::is_mobile() {
             Rect::new(area.x + ctx.px(theme::M_INSET) as i32, panel_top - surface.height() as i32, surface.width(), surface.height())
+        } else if cascade.on {
+            menu_place(area, panel, cfg, surface.width(), surface.height(), 0)
         } else {
             menu_place(area, panel, cfg, surface.width(), surface.height(), ctx.px(8))
         };
@@ -2662,6 +2728,7 @@ impl Menu {
             recent: Vec::new(),
             scratch: None,
             edge: cfg.edge,
+            cascade,
         };
         menu.compute_homes();
         menu.load_tiles();
@@ -2912,15 +2979,41 @@ impl Menu {
             self.keys_used = false;
             self.expanded.clear();
             self.recent = super::recent_files();
+            self.cascade.reset();
             self.redraw();
         }
         self.open
     }
 
+    /// Подменю закрытого меню остаются собранными до следующего открытия:
+    /// по ним [`Self::full_rect`] говорит композитору, что стереть.
     pub fn close(&mut self) {
         self.open = false;
         self.popup = None;
         self.held = None;
+    }
+
+    /// Подменю классического «Пуска» поверх его карточки (22.11): поверхность
+    /// и место на экране.
+    pub fn layers(&self) -> impl Iterator<Item = (&Surface, Rect)> {
+        self.cascade.layers()
+    }
+
+    /// Где появились и откуда ушли подменю (экран).
+    pub fn take_sub_damage(&mut self) -> Rect {
+        self.cascade.take_damage()
+    }
+
+    /// Место карточки вместе с открытыми подменю.
+    #[must_use]
+    pub fn full_rect(&self) -> Rect {
+        self.cascade.span(self.rect)
+    }
+
+    /// Собран ли «Пуск» каскадом Windows 98.
+    #[must_use]
+    pub const fn is_classic(&self) -> bool {
+        self.cascade.on
     }
 
     /// Где что стоит в открытом «Пуске», строками `имя at X,Y WxH` в
@@ -2929,6 +3022,9 @@ impl Menu {
     pub fn spots(&self) -> Vec<String> {
         if theme::is_mobile() {
             return Vec::new();
+        }
+        if self.cascade.on {
+            return self.c_spots();
         }
         let layout = self.start_layout();
         let at = |name: &str, rect: Rect| alloc::format!("{name} at {},{} {}x{}", rect.x + self.rect.x, rect.y + self.rect.y, rect.w, rect.h);
@@ -3383,7 +3479,7 @@ impl Menu {
     /// Колесо над «Пуском»: прокрутить колонку под указателем. `true` —
     /// что-то сдвинулось.
     pub fn wheel(&mut self, x: i32, y: i32, clicks: i32) -> bool {
-        if theme::is_mobile() || !self.rect.contains(x, y) {
+        if theme::is_mobile() || self.cascade.on || !self.rect.contains(x, y) {
             return false;
         }
         let (lx, ly) = (x - self.rect.x, y - self.rect.y);
@@ -3416,6 +3512,9 @@ impl Menu {
     pub fn hover(&mut self, x: i32, y: i32) -> bool {
         if theme::is_mobile() || !self.open {
             return false;
+        }
+        if self.cascade.on {
+            return self.c_hover(x, y);
         }
         let found = self.target_at(x, y);
         let hot = found.map(|(target, _)| target);
@@ -3466,6 +3565,9 @@ impl Menu {
                 }
                 None => MenuClick::Close,
             };
+        }
+        if self.cascade.on {
+            return self.c_click(x, y);
         }
         if !self.rect.contains(x, y) {
             return MenuClick::Close;
@@ -3581,6 +3683,11 @@ impl Menu {
     /// Правая кнопка над «Пуском»: меню программы. `false` — точка не над
     /// «Пуском».
     pub fn context(&mut self, x: i32, y: i32) -> bool {
+        if self.cascade.on {
+            // Меню программы в каскаде пока нет — правая кнопка над ним
+            // просто не уходит столу.
+            return self.full_rect().contains(x, y);
+        }
         if theme::is_mobile() || !self.rect.contains(x, y) {
             return false;
         }
@@ -4152,6 +4259,10 @@ impl Menu {
     }
 
     fn redraw(&mut self) {
+        if self.cascade.on {
+            self.c_redraw();
+            return;
+        }
         if !theme::is_mobile() {
             self.redraw_start();
             return;
