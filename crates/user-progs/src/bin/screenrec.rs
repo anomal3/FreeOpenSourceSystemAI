@@ -699,6 +699,7 @@ fn record(settings: &Settings, seconds: Option<u64>) -> i64 {
         unsafe { screencap(CAP_STOP, 0, 0) };
         return 1;
     }
+    make_dirs(&format!("{}/.config", user_progs::filedlg::home_dir()));
     write_text(&last_path_file(), &path);
     // SAFETY: the path lives in this program.
     unsafe { screencap(CAP_STOP, path.as_ptr() as usize, path.len()) };
@@ -1229,6 +1230,29 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         // `last` — the file of the last recording.
         let path = if path == "last" { read_text(&last_path_file(), 4096).map(|t| t.trim().to_string()).unwrap_or(path) } else { path };
         exit(probe(&path));
+    }
+    // Every `.avi` of a folder.
+    if let Some(dir) = value("--probe-dir") {
+        let fd = open(&dir);
+        let mut names = Vec::new();
+        if fd >= 0 {
+            let mut entry = user_progs::Dirent::default();
+            while user_progs::readdir(fd, &mut entry) {
+                let len = (entry.name_len as usize).min(entry.name.len());
+                let name = String::from_utf8_lossy(&entry.name[..len]).to_string();
+                if name.ends_with(".avi") {
+                    names.push(name);
+                }
+            }
+            close(fd);
+        }
+        names.sort();
+        let mut failed = names.is_empty();
+        for name in &names {
+            failed |= probe(&format!("{}/{name}", dir.trim_end_matches('/'))) != 0;
+        }
+        println(&format!("screenrec: probed {} file(s) in {dir}{}", names.len(), if failed { ", FAILED" } else { ", all fine" }));
+        exit(i64::from(failed));
     }
     if flag("--stop") {
         exit(if cap_request_stop() { 0 } else { 1 });

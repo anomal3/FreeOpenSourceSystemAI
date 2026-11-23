@@ -3456,8 +3456,8 @@ pub const ALL: &[Scenario] = &[
             // into the focused window, so the recording starts first and the
             // window opens after it (and takes the focus).
             Step::Line("run -b /bin/screenrec --record --seconds 10 --size 360"),
-            Step::Await("screenrec: recording ", 30_000),
-            Step::Await("capture     : started", 15_000),
+            Step::Await("capture     : started", 30_000),
+            Step::Await("screenrec: recording ", 15_000),
             Step::Line("run -b /bin/screenrec"),
             Step::Await("screenrec: ready", 30_000),
             Step::Await("screenrec: window title 'Screen Recorder | Запись экрана'", 15_000),
@@ -3491,9 +3491,6 @@ pub const ALL: &[Scenario] = &[
             Step::Key("alt-f4"),
             Step::Await("screenrec: closing on request", 15_000),
             Step::Wait(1_000),
-            Step::Line("run /bin/screenrec --probe last"),
-            Step::Await("screenrec: probe ", 180_000),
-            Step::Absent("screenrec: probe FAILED"),
             // ── Win+Alt+R: start, 3 s, stop (full 1280x720).
             Step::Key("meta_l-alt-r"),
             Step::Await("screenrec: recording ", 30_000),
@@ -3502,8 +3499,9 @@ pub const ALL: &[Scenario] = &[
             Step::Key("meta_l-alt-r"),
             Step::Await("capture     : stop requested", 15_000),
             Step::Await("screenrec: saved ", 60_000),
-            Step::Line("run /bin/screenrec --probe last"),
-            Step::Await("screenrec: probe ", 180_000),
+            // All three files: the 10 s one, the window's, the hotkey's.
+            Step::Line("run /bin/screenrec --probe-dir /root/Videos"),
+            Step::Await("screenrec: probed 3 file(s) in /root/Videos, all fine", 240_000),
             Step::Absent("screenrec: probe FAILED"),
             Step::Line("shutdown"),
             Step::Exits(30_000),

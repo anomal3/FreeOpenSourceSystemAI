@@ -477,6 +477,39 @@ mod tests {
         assert_eq!(DC_C_BITS.iter().map(|&b| usize::from(b)).sum::<usize>(), 12);
     }
 
+    /// Speed of one thread on a 2560x1440 desktop-like frame (gradient,
+    /// "text" noise, flat panels): `cargo test -p screencast --release --
+    /// --ignored --nocapture bench`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_1440p() {
+        let (w, h) = (2560u32, 1440u32);
+        let mut pixels = std::vec![0u32; (w * h) as usize];
+        let mut seed = 12345u32;
+        for y in 0..h {
+            for x in 0..w {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                let text = (y / 18) % 3 == 0 && x % 700 < 500 && seed >> 28 < 6;
+                let p = if text { 0x0020_2020 } else if x < 400 { 0x0030_2a28 } else { (x * 255 / w) | ((y * 255 / h) << 8) | (0x60 << 16) };
+                pixels[(y * w + x) as usize] = 0xFF00_0000 | p;
+            }
+        }
+        let src = Source { pixels: &pixels, width: w, height: h, stride: w, bgr: true };
+        let encoder = Encoder::new(80);
+        for (ow, oh) in [(2560u32, 1440u32), (1920, 1080), (1280, 720)] {
+            let mut scratch = Scratch::new(ow);
+            let mut out = std::vec![0u8; max_size(ow, oh)];
+            let runs = 10;
+            let started = std::time::Instant::now();
+            let mut size = 0;
+            for _ in 0..runs {
+                size = encoder.encode(&src, ow, oh, &mut scratch, &mut out).expect("encode");
+            }
+            let ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
+            std::println!("bench: 2560x1440 -> {ow}x{oh}: {ms:.1} ms/frame on one thread, {} KB", size / 1024);
+        }
+    }
+
     #[test]
     fn magnitudes() {
         assert_eq!(magnitude(1), (1, 1));
