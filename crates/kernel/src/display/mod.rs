@@ -40,6 +40,8 @@ pub mod nvidia_gsp;
 pub mod nvidia_rm_chan;
 pub mod nvidia_rm_gr;
 pub mod nvidia_rm_info;
+// GPU fence interrupt (24.11): nonstall interrupt wakes DRM fence waiters.
+pub mod nvidia_rm_intr;
 pub mod nvidia_rm_vmm;
 pub mod nvidia_rm_vram;
 pub mod outputs;

@@ -1365,6 +1365,9 @@ fn run_builtin(line: &str) -> bool {
             }
             sprintln!("  fencestep: {} us", crate::linux::drm::FENCE_STEP_US.load(Relaxed));
         }
+        // hw-log17: the GPU fence interrupt (nonstall -> wakes fence waiters);
+        // `off` - fence waits poll in fine steps as before.
+        "fenceirq" => sprintln!("  {}", crate::display::nvidia_rm_intr::command(argument)),
         // hw-log15: a Linux thread spinning on sched_yield naps N us (0 - off).
         #[cfg(target_arch = "x86_64")]
         "yieldnap" => {

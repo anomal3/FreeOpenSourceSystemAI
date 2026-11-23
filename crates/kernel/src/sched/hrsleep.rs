@@ -20,7 +20,7 @@
 //! task like `sched::wake` does (the wake sequence first, so a sleeper that
 //! is still on its way into the scheduler does not block).
 //!
-//! Event sources ([`SRC_XHCI`]): an interrupt handler calls [`signal`], which
+//! Event sources ([`SRC_XHCI`], [`SRC_GPU`]): an interrupt handler calls [`signal`], which
 //! moves the source's generation and wakes every fine sleeper that waits for
 //! that source. A sleeper reads the generation before it checks its
 //! condition and does not sleep if it moved (see [`generation`]).
@@ -43,7 +43,10 @@ use crate::smp::MAX_CPUS;
 
 /// The xHCI controllers raised an interrupt (USB disk completions).
 pub const SRC_XHCI: u32 = 1 << 0;
-const SOURCES: usize = 1;
+/// The GPU raised a nonstall interrupt: a channel finished a submission
+/// (`display::nvidia_rm_intr`, DRM fence waits).
+pub const SRC_GPU: u32 = 1 << 1;
+const SOURCES: usize = 2;
 
 /// Fine sleeps on (`hrsleep on|off`).
 static ENABLED: AtomicBool = AtomicBool::new(true);

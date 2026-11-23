@@ -161,7 +161,8 @@ struct Bo {
     place: Place,
     size: u64,
     vram: u64,
-    frames: Vec<u64>,
+    /// Shared: `vm_map` writes PTEs from it without the backend lock.
+    frames: Arc<[u64]>,
 }
 
 /// На каком runlist канал.
@@ -208,7 +209,11 @@ struct Chan {
 struct State {
     hw: HwInfo,
     bos: BTreeMap<u32, Bo>,
-    vms: BTreeMap<u32, Vmm>,
+    /// Each space has its own lock (hw-log17): VM_BIND writes page tables
+    /// and waits for the TLB flush under it, not under [`State`], which every
+    /// fence poll (`chan_seq_done`) and EXEC (`chan_submit`) takes. Order:
+    /// `state` before a space, never the other way.
+    vms: BTreeMap<u32, Arc<Mutex<Vmm>>>,
     chans: BTreeMap<u32, Chan>,
     next: u32,
     /// Занятые страницы USERD (chid = 8 × номер).
@@ -357,6 +362,8 @@ pub fn attach(log: &mut Log) -> Res<Arc<RmBackend>> {
         log,
         alloc::format!("nvgpu: backend attached, DRM node {}", if crate::linux::drm::hw() { "/dev/dri/renderD128 present" } else { "hidden ('nvk hw on')" }),
     );
+    // Fence interrupt (24.11): checks itself, falls back to polling.
+    super::nvidia_rm_intr::arm(log);
     Ok(backend)
 }
 
@@ -364,6 +371,7 @@ pub fn attach(log: &mut Log) -> Res<Arc<RmBackend>> {
 /// клиенты RM NVK снимаются, арены и GR забываются.
 pub(crate) fn shutdown(rm: &mut Rm) -> Log {
     let mut log = Log::new();
+    super::nvidia_rm_intr::shutdown();
     DEAD.store(true, Ordering::Release);
     if let Some(mut b) = BACKEND.try_lock() {
         *b = None;
@@ -386,6 +394,11 @@ pub(crate) fn shutdown(rm: &mut Rm) -> Log {
 impl RmBackend {
     fn live(&self) -> Result<(), Errno> {
         if DEAD.load(Ordering::Acquire) { Err(Errno::ENODEV) } else { Ok(()) }
+    }
+
+    /// The space `vm` (its own lock; the backend lock only for the lookup).
+    fn vmm(&self, vm: VmHandle) -> Result<Arc<Mutex<Vmm>>, Errno> {
+        self.state.lock().vms.get(&vm.0).cloned().ok_or(Errno::ENOENT)
     }
 
     /// Сведения RM о карте (для `gpu info`).
@@ -425,7 +438,9 @@ impl RmBackend {
         let page = st.userd_pages.iter().skip(1).position(|u| !u).map(|p| p + 1).ok_or(Errno::EBUSY)?;
         let chid = page as u32 * 8;
         let mthdbuf_size = st.hw.mthdbuf_size;
-        let vmm = st.vms.get_mut(&vm.0).ok_or(Errno::ENOENT)?;
+        let vmm_lock = st.vms.get(&vm.0).cloned().ok_or(Errno::ENOENT)?;
+        let mut vmm_guard = vmm_lock.lock();
+        let vmm = &mut *vmm_guard;
         let made = (|| -> Res<Chan> {
             let inst = vram::cpu_alloc(PAGE, PAGE)?;
             let userd = vram::cpu_alloc(PAGE, PAGE)?;
@@ -581,7 +596,7 @@ impl RmBackend {
             c.killed,
             vram::r64(c.inst + 0x200),
             super::nvidia_gsp::RC_CHIDS.lock().clone(),
-            st.vms.get(&c.vm.0).map_or_else(|| "no vm".into(), Vmm::describe)
+            st.vms.get(&c.vm.0).map_or_else(|| "no vm".into(), |v| v.lock().describe())
         )
     }
 
@@ -649,7 +664,8 @@ impl RmBackend {
 
     /// Как GPU увидит `va` в пространстве `vm` (для журнала).
     pub(crate) fn vm_pte(&self, vm: VmHandle, va: u64) -> String {
-        self.state.lock().vms.get(&vm.0).map_or_else(|| "no vm".into(), |v| v.translate(va))
+        let vmm = self.state.lock().vms.get(&vm.0).cloned();
+        vmm.map_or_else(|| "no vm".into(), |v| v.lock().translate(va))
     }
 }
 
@@ -689,7 +705,7 @@ fn sysmem_pages(place: Place, size: u64) -> Result<Bo, Errno> {
             }
         }
     }
-    Ok(Bo { place, size, vram: 0, frames })
+    Ok(Bo { place, size, vram: 0, frames: frames.into() })
 }
 
 impl GpuBackend for RmBackend {
@@ -706,7 +722,7 @@ impl GpuBackend for RmBackend {
         let bo = match place {
             Place::Vram => {
                 let mem = vram::bulk_alloc(size, 0x1_0000).map_err(|_| Errno::ENOMEM)?;
-                Bo { place, size, vram: mem, frames: Vec::new() }
+                Bo { place, size, vram: mem, frames: Arc::from([]) }
             }
             // Крупный буфер — сначала одним куском (D4, 20.11.2026): кадр
             // WSI (dma-buf) тогда виден ядру подряд, и стол показывает его без
@@ -735,7 +751,7 @@ impl GpuBackend for RmBackend {
     }
 
     fn bo_frames(&self, bo: BoHandle) -> Option<Vec<u64>> {
-        self.state.lock().bos.get(&bo.0).filter(|b| b.place == Place::Sysmem).map(|b| b.frames.clone())
+        self.state.lock().bos.get(&bo.0).filter(|b| b.place == Place::Sysmem).map(|b| b.frames.to_vec())
     }
 
     fn vm_create(&self, kernel_va: (u64, u64)) -> Result<VmHandle, Errno> {
@@ -751,7 +767,7 @@ impl GpuBackend for RmBackend {
         .map_err(|why| errno(&mut log, "vm_create", why))?;
         log.extend(vmm.1);
         let vmm = vmm.0.map_err(|why| errno(&mut log, "vm_create", why))?;
-        st.vms.insert(h, vmm);
+        st.vms.insert(h, Arc::new(Mutex::new(vmm)));
         Ok(VmHandle(h))
     }
 
@@ -764,44 +780,51 @@ impl GpuBackend for RmBackend {
         for c in chans {
             self.chan_destroy(ChanHandle(c));
         }
-        let Some(mut vmm) = self.state.lock().vms.remove(&vm.0) else { return };
+        let Some(vmm) = self.state.lock().vms.remove(&vm.0) else { return };
         if DEAD.load(Ordering::Acquire) {
             return;
         }
+        // A bind still in flight holds the lock; after `destroy` it finds no
+        // tables and fails.
+        let mut vmm = vmm.lock();
         let _ = with_rm(&mut log, |rm, _| vmm.destroy(rm, &mut Log::new()));
     }
 
     fn vm_map(&self, vm: VmHandle, va: u64, bo: BoHandle, bo_off: u64, len: u64, kind: u8) -> Result<(), Errno> {
         self.live()?;
         let kind = nvgpu::gmmu::pte_kind(kind)?;
-        let mut st = self.state.lock();
-        let st = &mut *st;
-        let b = st.bos.get(&bo.0).ok_or(Errno::ENOENT)?;
-        if bo_off % PAGE != 0 || len % PAGE != 0 || bo_off.checked_add(len).is_none_or(|e| e > b.size) {
-            return Err(Errno::EINVAL);
-        }
-        let vmm = st.vms.get_mut(&vm.0).ok_or(Errno::ENOENT)?;
-        let r = match b.place {
+        // Look up under the backend lock, write the tables under the
+        // space's lock only.
+        let (vmm, place, vram, frames) = {
+            let st = self.state.lock();
+            let b = st.bos.get(&bo.0).ok_or(Errno::ENOENT)?;
+            if bo_off % PAGE != 0 || len % PAGE != 0 || bo_off.checked_add(len).is_none_or(|e| e > b.size) {
+                return Err(Errno::EINVAL);
+            }
+            (st.vms.get(&vm.0).cloned().ok_or(Errno::ENOENT)?, b.place, b.vram, Arc::clone(&b.frames))
+        };
+        let mut vmm = lock_vmm(&vmm);
+        let r = match place {
             Place::Sysmem => {
                 let first = (bo_off / PAGE) as usize;
-                vmm.map_sys(va, &b.frames[first..first + (len / PAGE) as usize], false, false, kind)
+                vmm.map_sys(va, &frames[first..first + (len / PAGE) as usize], false, false, kind)
             }
-            Place::Vram => vmm.map_vram(va, b.vram + bo_off, len, false, false, kind),
+            Place::Vram => vmm.map_vram(va, vram + bo_off, len, false, false, kind),
         };
         r.map_err(|why| errno(&mut Log::new(), "vm_map", why))
     }
 
     fn vm_sparse(&self, vm: VmHandle, va: u64, len: u64, on: bool) -> Result<(), Errno> {
         self.live()?;
-        let mut st = self.state.lock();
-        let vmm = st.vms.get_mut(&vm.0).ok_or(Errno::ENOENT)?;
+        let vmm = self.vmm(vm)?;
+        let mut vmm = lock_vmm(&vmm);
         vmm.unmap(va, len, on).map_err(|why| errno(&mut Log::new(), "vm_sparse", why))
     }
 
     fn vm_unmap(&self, vm: VmHandle, va: u64, len: u64, restore_sparse: bool) -> Result<(), Errno> {
         self.live()?;
-        let mut st = self.state.lock();
-        let vmm = st.vms.get_mut(&vm.0).ok_or(Errno::ENOENT)?;
+        let vmm = self.vmm(vm)?;
+        let mut vmm = lock_vmm(&vmm);
         vmm.unmap(va, len, restore_sparse).map_err(|why| errno(&mut Log::new(), "vm_unmap", why))
     }
 
@@ -809,13 +832,13 @@ impl GpuBackend for RmBackend {
         if self.live().is_err() {
             return;
         }
-        let st = self.state.lock();
-        if let Some(vmm) = st.vms.get(&vm.0) {
-            vmm.flush_tlb(&mut Log::new());
+        if let Ok(vmm) = self.vmm(vm) {
+            lock_vmm(&vmm).flush_tlb(&mut Log::new());
         }
     }
 
     fn chan_create(&self, vm: VmHandle) -> Result<ChanHandle, Errno> {
+        pstate_note();
         self.chan_create_on(vm, Runlist::Gr, &mut Log::new())
     }
 
@@ -825,8 +848,11 @@ impl GpuBackend for RmBackend {
         let mut st = self.state.lock();
         let st = &mut *st;
         let h = st.handle();
+        let vm = st.chans.get(&ch.0).ok_or(Errno::ENOENT)?.vm;
+        let vmm_lock = st.vms.get(&vm.0).cloned().ok_or(Errno::ENOENT)?;
+        let mut vmm_guard = vmm_lock.lock();
+        let vmm = &mut *vmm_guard;
         let c = st.chans.get_mut(&ch.0).ok_or(Errno::ENOENT)?;
-        let vmm = st.vms.get_mut(&c.vm.0).ok_or(Errno::ENOENT)?;
         let is_copy = class & 0xff == 0xb5;
         // Объект GR — сперва буферы контекста канала (раз на канал).
         let promote = !is_copy && c.grctx.is_none();
@@ -867,7 +893,7 @@ impl GpuBackend for RmBackend {
         let (_, rm_handle, _) = c.objs.remove(i);
         let Some(vmm) = st.vms.get(&c.vm.0) else { return };
         if !DEAD.load(Ordering::Acquire) {
-            let (client, handle) = (vmm.client, c.handle);
+            let (client, handle) = (vmm.lock().client, c.handle);
             let _ = with_rm(&mut Log::new(), |rm, _| rm.free_in(client, handle, rm_handle));
         }
     }
@@ -880,7 +906,9 @@ impl GpuBackend for RmBackend {
         if let Some(p) = st.userd_pages.get_mut((chan.chid / 8) as usize) {
             *p = false;
         }
-        let Some(vmm) = st.vms.get_mut(&chan.vm.0) else { return };
+        let Some(vmm_lock) = st.vms.get(&chan.vm.0).cloned() else { return };
+        let mut vmm_guard = vmm_lock.lock();
+        let vmm = &mut *vmm_guard;
         if DEAD.load(Ordering::Acquire) {
             return; // RM и память карты уже не наши; кадры не трогаем.
         }
@@ -1000,6 +1028,46 @@ impl GpuBackend for RmBackend {
     fn vram_used(&self) -> u64 {
         vram::used().max(1)
     }
+}
+
+/// Waits for a space lock (another bind or a channel of the same space),
+/// ns; perf-diag's `vm_bind` line takes and zeroes it.
+pub static VMM_LOCK_WAIT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn lock_vmm(vmm: &Mutex<Vmm>) -> crate::sync::MutexGuard<'_, Vmm> {
+    let t = crate::time::uptime_ns();
+    let g = vmm.lock();
+    VMM_LOCK_WAIT_NS.fetch_add(crate::time::uptime_ns() - t, Ordering::Relaxed);
+    g
+}
+
+/// When the p-state was last logged, ms (0 - never).
+static PSTATE_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// hw-log17: D2R flat at 74 fps and Uot at 56 fps with idle CPUs - is the
+/// GPU at a low performance state? A game creates its channels at start:
+/// log `NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE` (0x20802068, `{u32
+/// currPstate}` as a P0 = bit 0 mask) at most once per 30 s.
+fn pstate_note() {
+    let now = crate::time::uptime_ms().max(1);
+    let last = PSTATE_AT.load(Ordering::Relaxed);
+    if last != 0 && now - last < 30_000 {
+        return;
+    }
+    if PSTATE_AT.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let mut log = Log::new();
+    let r = with_rm(&mut log, |rm, internal| rm.control(internal.0, internal.1, 0x2080_2068, &[0u8; 4]));
+    let line = match r {
+        Ok(Ok(r)) => {
+            let mask = super::nvidia_gsp::le32(&r, 0).unwrap_or(0);
+            if mask == 0 { "undefined (0)".into() } else { alloc::format!("P{} (mask {mask:#x})", mask.trailing_zeros()) }
+        }
+        Ok(Err(why)) | Err(why) => alloc::format!("not reported ({why})"),
+    };
+    let pid = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
+    say(&mut log, alloc::format!("nvgpu: gpu pstate {line} at channel create (pid {pid})"));
 }
 
 /// RM объявил канал `chid` убитым.

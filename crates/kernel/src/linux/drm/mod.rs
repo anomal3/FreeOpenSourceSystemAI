@@ -41,6 +41,20 @@ mod vm;
 
 pub use sync::{FENCE_SPIN_US, FENCE_STEP_US, fence_bench, fence_fine_sleeps, fence_wait_stats};
 
+/// perf-diag lines of the GPU layer for the window (hw-log17): where
+/// `VM_BIND` time goes, and the fence interrupt's state.
+#[must_use]
+pub fn perf_lines(secs: u64) -> Vec<alloc::string::String> {
+    let mut lines = Vec::new();
+    if let Some(line) = vm::perf_line(secs) {
+        lines.push(line);
+    }
+    if backend().is_some() && crate::display::nvidia_rm_chan::backend().is_some() {
+        lines.push(alloc::format!("{secs} s {}", crate::display::nvidia_rm_intr::status()));
+    }
+    lines
+}
+
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -207,7 +221,8 @@ pub struct DrmFile {
 pub(super) struct FileState {
     pub chans: BTreeMap<u32, Arc<nouveau::Chan>>,
     pub nvif: BTreeMap<u64, nvif::NvifObj>,
-    pub vm: Option<vm::Vm>,
+    /// Shared: `VM_BIND` works under the space's own lock, not this one.
+    pub vm: Option<Arc<vm::Vm>>,
     /// `CHANNEL_ALLOC` до `VM_INIT` — у Linux это навсегда выключает uvmm
     /// файла; у нас каналов без VM нет, и `VM_INIT` после такого — `ENOSYS`.
     pub vm_disabled: bool,

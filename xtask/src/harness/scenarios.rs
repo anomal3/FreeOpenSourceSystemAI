@@ -9490,6 +9490,12 @@ pub const ALL: &[Scenario] = &[
             // Второй запуск: закрытие узла первым освободило всё (каналы, ВА, BO).
             Step::Line("run /compat/linux/bin/nvkprobe-fixed soft"),
             Step::Await("nvkprobe: 0 failed", 60_000),
+            // hw-log17 (24.11): VM_BIND phase line in perf-diag; the GPU
+            // fence interrupt has no real card here - stays off, polling.
+            Step::Line("perfdiag now"),
+            Step::Wait(3_000),
+            Step::Line("fenceirq"),
+            Step::Await("fenceirq: not set up", 10_000),
             Step::Absent("drmprobe: FAILED"),
             Step::Absent("nvkprobe: FAILED"),
             Step::Absent("KERNEL PANIC"),

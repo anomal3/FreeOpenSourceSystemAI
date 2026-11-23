@@ -443,6 +443,11 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
         );
     }
 
+    // hw-log17: VM_BIND phases and the GPU fence interrupt.
+    for line in super::drm::perf_lines(secs) {
+        kprintln!("  perf-diag   : {line}");
+    }
+
     // hw-log15: game disk reads - exFAT reads served from the cache vs from
     // the disk, and the USB transfers under them.
     {
