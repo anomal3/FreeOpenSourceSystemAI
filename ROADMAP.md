@@ -16962,6 +16962,13 @@ install,obs -j 1` — `pkg install obs` (65 с), eglinfo Wayland, OBS, окно,
   Кодирование всё равно на ЦП: NVENC — только у закрытого драйвера NVIDIA,
   VA-API нет.
 
+**Живая флешка (23.11).** С `FOSSAI_WITH_OBS=1` образ кладёт `\FREEOS\PKG\OBS.FPK`
+(`image.rs`, рядом с Debian/Proton/TMNF), ядро ставит пакеты флешки строго по
+одному в `/opt` в памяти (потолок 16 ГиБ, память — под распакованное) в
+порядке `LIVE_ORDER` (`usb/storage.rs`): debian, proton, **obs**, tmnf, obsos,
+Craft. Образ Роману: `set FOSSAI_WITH_PROTON=1&& set FOSSAI_WITH_OBS=1&& set
+FOSSAI_LIVE_APPS=0&& cargo xtask image -r -a x86_64`.
+
 **TODO, по порядку.**
 1. Выход OBS: в одном прогоне из двух поток кодера AAC (FFmpeg) на
    закрытии падал в `free()` (glibc `unlink_chunk`, порча кучи) — запись уже

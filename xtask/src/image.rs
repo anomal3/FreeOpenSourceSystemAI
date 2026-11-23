@@ -356,6 +356,16 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     }
                 }
             }
+            // OBS Studio (23.11, Роман: «и Proton, и OBS на флешке») — с
+            // `FOSSAI_WITH_OBS=1`; ядро ставит его следом за Proton.
+            if built.release && crate::obs::enabled() {
+                let path = crate::obs::package_path();
+                if path.is_file() {
+                    payload.push(read_payload(&format!("{}/OBS.FPK", arch::PAYLOAD_PKG_DIR), &path)?);
+                } else {
+                    say!("на живую флешку не попал {}: нет файла", path.display());
+                }
+            }
         }
         Kind::Installer => {
             let installer = built.get(Component::Installer).ok_or_else(|| {

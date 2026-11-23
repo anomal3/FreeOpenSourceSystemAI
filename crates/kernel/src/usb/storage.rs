@@ -179,7 +179,11 @@ fn live_packages(mount: &str) {
 
 /// Порядок установки пакетов живой флешки (кого нет в списке — в конце).
 /// Приложения Craft — по 8 знаков имени файла 8.3 (`GRIDCRAF.FPK`).
-const LIVE_ORDER: [&str; 8] = ["obsos", "gridcraf", "wordcraf", "pdfcraft", "mailcraf", "debian", "proton", "tmnf"];
+/// 23.11: сначала Debian, Proton и OBS Studio (`obs`, своя glibc), потом
+/// игра и остальное — пакеты ставятся строго по одному, память `/opt`
+/// растёт только под распакованное.
+const LIVE_ORDER: [&str; 9] =
+    ["debian", "proton", "obs", "tmnf", "obsos", "gridcraf", "wordcraf", "pdfcraft", "mailcraf"];
 
 static LIVE_QUEUE: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
 static LIVE_RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
