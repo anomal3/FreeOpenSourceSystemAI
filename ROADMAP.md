@@ -11293,8 +11293,13 @@ Graphics (RADV POLARIS10)` (discrete, 1002:6fdf), создаёт устройс�
 PT в VRAM за кольцом), страницы системной памяти выше 4 ГиБ, IB из двух `WRITE_DATA` исполнен
 кольцом GFX с VMID 1, fence пришёл. Вся цепочка той же загрузки зелёная: SMC, микрокод, кольцо,
 GART, fence/IB/VM, шейдер, HW. `amdnode hw on` направляет `CS` на карту, `amd hw` — самотест
-(маркер `FOSSAI_AMD_HW=1`). **Дальше:** `SH_MEM_*` VMID 1 и constants_init/clear-state (нужны
-шейдерам RADV), запуск RADV на железе с флешки/установленной системы, fence-ожидание без опроса.
+(маркер `FOSSAI_AMD_HW=1`). **Шейдер в VMID 1 на железе (флешка 0.8.19): `HW SHADER RESULT:
+PASSED`** — `SH_MEM_*` VMID 1..15 как в `gfx_v8_0_constants_init` (SH_MEM_CONFIG 0x378, BASES
+0x2000), шейдер libdrm на странице с VA 12 ГиБ, IB из пользовательского VA, `buffer_store_dword`
+записал 42 по VA 10 ГиБ, флаг 99 после `CS_PARTIAL_FLUSH`: то есть путь `vkCmdFillBuffer`
+RADV (compute на кольце GFX) на карте возможен. **Дальше:** запуск RADV на железе из
+установленной системы с Proton (`amdnode hw on`, `gpu gametest ... vk`), fence-ожидание без опроса,
+clear-state для графики (draw), SDMA/compute-очереди, прерывания (IH).
 
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
