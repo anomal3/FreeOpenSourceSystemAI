@@ -148,6 +148,23 @@ fn set_status(line: String) {
 /// The MSI handler.
 fn on_interrupt() {
     IRQS.fetch_add(1, Ordering::Relaxed);
+    // Storm guard first (also while nothing is armed): interrupts we cannot
+    // clear would come back at once.
+    let now_ms = crate::time::uptime_ms();
+    let window = now_ms / 100;
+    if STORM_WINDOW.swap(window, Ordering::Relaxed) != window {
+        STORM_COUNT.store(0, Ordering::Relaxed);
+    }
+    if STORM_COUNT.fetch_add(1, Ordering::Relaxed) > STORM_PER_100MS {
+        // Leave everything off (TOP stays cleared, no MSI re-arm, MSI-X
+        // masked); the wait path logs and falls back.
+        STORM.store(true, Ordering::Relaxed);
+        if let Some(base) = core::num::NonZeroUsize::new(BAR.swap(0, Ordering::AcqRel)) {
+            Bar0(base.get()).wr(TOP_EN_CLEAR, TOP_MASK.load(Ordering::Relaxed));
+        }
+        mask_msix();
+        return;
+    }
     let base = BAR.load(Ordering::Acquire);
     if base == 0 {
         return;
@@ -172,19 +189,6 @@ fn on_interrupt() {
         if pending & !mask != 0 {
             FOREIGN.fetch_add(1, Ordering::Relaxed);
         }
-    }
-    // Storm guard: interrupts we cannot clear would come back at once.
-    let now_ms = crate::time::uptime_ms();
-    let window = now_ms / 100;
-    if STORM_WINDOW.swap(window, Ordering::Relaxed) != window {
-        STORM_COUNT.store(0, Ordering::Relaxed);
-    }
-    if STORM_COUNT.fetch_add(1, Ordering::Relaxed) > STORM_PER_100MS {
-        // Leave everything off; the wait path logs and falls back.
-        STORM.store(true, Ordering::Relaxed);
-        BAR.store(0, Ordering::Release);
-        mask_msix();
-        return;
     }
     bar.wr(TOP_EN_SET, top);
     if DELIVERY.load(Ordering::Relaxed) == 1 {
