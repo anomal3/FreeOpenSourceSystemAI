@@ -28,6 +28,9 @@ const VENDOR: u16 = 0x1002;
 /// за пределами регистров, которые перечислены ниже.
 const MMIO_LEN: usize = 512 * 1024;
 
+/// Бэкенд DRM на железе: адресное пространство VMID 1 и отправка буферов команд.
+pub mod hw;
+
 /// Индексный доступ к памяти через окно регистров (байтовые смещения;
 /// у драйвера это dword-номера 0, 1 и 6).
 const MM_INDEX: usize = 0x0;
@@ -1132,6 +1135,11 @@ pub fn auto_task() {
             if firmware_file("SHADER.TXT").is_ok() {
                 crate::kprintln!("  amdgpu     : auto start: SHADER.TXT found, running the first shader");
                 let _ = polaris_shader();
+            }
+            // The seventh marker (FOSSAI_AMD_HW=1): the DRM backend on the card - VMID 1 over 64 GiB, an IB above 4 GiB.
+            if firmware_file("HW.TXT").is_ok() {
+                crate::kprintln!("  amdgpu     : auto start: HW.TXT found, testing the hardware DRM backend");
+                let _ = hw::selftest();
             }
         }
     } else {

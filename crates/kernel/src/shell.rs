@@ -1236,8 +1236,13 @@ fn run_builtin(line: &str) -> bool {
             let mut words = argument.split_whitespace();
             match (words.next(), words.next()) {
                 (Some("soft"), Some(on @ ("on" | "off"))) => crate::linux::drm::amdgpu::set_soft(on == "on"),
+                (Some("hw"), Some(on @ ("on" | "off"))) => {
+                    for line in crate::linux::drm::amdgpu::set_hw(on == "on") {
+                        sprintln!("  amdnode: {line}");
+                    }
+                }
                 (None, None) => {}
-                _ => sprintln!("  amdnode: usage `amdnode soft on|off`"),
+                _ => sprintln!("  amdnode: usage `amdnode soft|hw on|off`"),
             }
             sprintln!(
                 "  amdnode: /dev/dri/renderD128 {} ({})",
@@ -2492,6 +2497,12 @@ fn amd(argument: &str) {
     // нужно работающее кольцо (`amd ring`).
     if argument.trim() == "shader" {
         for line in crate::display::amd::polaris_shader() {
+            sprintln!("  amd: {line}");
+        }
+        return;
+    }
+    if argument.trim() == "hw" {
+        for line in crate::display::amd::hw::selftest() {
             sprintln!("  amd: {line}");
         }
         return;

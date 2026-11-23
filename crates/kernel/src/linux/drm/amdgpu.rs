@@ -360,6 +360,35 @@ pub fn set_soft(on: bool) {
     SOFT.store(on, Ordering::Relaxed);
 }
 
+/// Исполнение на настоящей карте (`amdnode hw on`): `CS` уходит в кольцо GFX.
+static HW: AtomicBool = AtomicBool::new(false);
+/// Поколения адресных пространств: у каждого файла своё, меняется при любом `GEM_VA`.
+static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
+/// Поколение, которое сейчас стоит в VMID 1 железа.
+static HW_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// `amdnode hw on|off`: исполнять `CS` на железе (нужны `amd smc start`, `ucode`, `ring`).
+/// Включение поднимает адресное пространство VMID 1; строки - ход этого.
+pub fn set_hw(on: bool) -> alloc::vec::Vec<alloc::string::String> {
+    if !on {
+        HW.store(false, Ordering::Relaxed);
+        return alloc::vec![alloc::string::String::from("amdgpu: hardware execution off")];
+    }
+    let mut lines = crate::display::amd::hw::start();
+    if crate::display::amd::hw::ready() {
+        HW_GEN.store(0, Ordering::Relaxed);
+        SOFT.store(true, Ordering::Relaxed);
+        HW.store(true, Ordering::Relaxed);
+        lines.push(alloc::string::String::from("amdgpu: drm node on, CS runs on the card"));
+        crate::kprintln!("amdgpu: drm node on, CS runs on the card");
+    }
+    lines
+}
+
+fn hw() -> bool {
+    HW.load(Ordering::Relaxed)
+}
+
 /// Что про узел знает sysfs.
 #[must_use]
 pub fn ident() -> Option<super::Ident> {
@@ -392,6 +421,8 @@ struct AmdState {
     va: BTreeMap<u64, Mapping>,
     /// PRT: разреженные области без буфера (начало -> размер), читаются нулями.
     prt: BTreeMap<u64, u64>,
+    /// Поколение адресного пространства (см. `NEXT_GEN`).
+    vm_gen: u64,
     ctxs: BTreeMap<u32, Ctx>,
     next_ctx: u32,
     bos: BTreeMap<u32, Arc<AmdBo>>,
@@ -405,6 +436,7 @@ impl AmdState {
         Self {
             va: BTreeMap::new(),
             prt: BTreeMap::new(),
+            vm_gen: NEXT_GEN.fetch_add(1, Ordering::Relaxed),
             ctxs: BTreeMap::new(),
             next_ctx: 1,
             bos: BTreeMap::new(),
@@ -938,6 +970,7 @@ fn gem_va(file: &AmdFile, arg: usize) -> i64 {
         return -e::EINVAL;
     }
     let mut st = file.st.lock();
+    st.vm_gen = NEXT_GEN.fetch_add(1, Ordering::Relaxed);
     let start = args.va_address;
     let end = start + args.map_size;
     match args.operation {
@@ -1339,6 +1372,28 @@ struct CsPlan {
     signals: Vec<(Arc<Syncobj>, u64)>,
 }
 
+/// Исполнение на железе: поставить адресное пространство файла в VMID 1 (если там чужое или оно
+/// менялось) и отправить буферы по очереди.
+fn hw_run(view: &VaView, generation: u64, ibs: &[(u64, usize)]) -> Result<(), alloc::string::String> {
+    use crate::display::amd::hw;
+    if HW_GEN.load(Ordering::Acquire) != generation {
+        hw::clear();
+        for (start, size, bo, offset) in &view.maps {
+            let first = (offset / PAGE) as usize;
+            let count = (size / PAGE) as usize;
+            let Some(frames) = bo.frames.get(first..first + count) else {
+                return Err(alloc::format!("mapping at {start:#x} is outside of its buffer"));
+            };
+            hw::map(*start, frames)?;
+        }
+        HW_GEN.store(generation, Ordering::Release);
+    }
+    for &(va, dwords) in ibs {
+        hw::submit(va, dwords)?;
+    }
+    Ok(())
+}
+
 /// `DRM_IOCTL_AMDGPU_CS`.
 fn cs_ioctl(file: &AmdFile, arg: usize) -> i64 {
     let Ok(args) = get::<CsIn>(arg) else { return -e::EFAULT };
@@ -1349,7 +1404,10 @@ fn cs_ioctl(file: &AmdFile, arg: usize) -> i64 {
         return -e::EINVAL;
     }
     let Ok(pointers) = get_array::<u64>(args.chunks, args.num_chunks as usize) else { return -e::EFAULT };
-    let view = VaView::of(&file.st.lock());
+    let (view, generation) = {
+        let st = file.st.lock();
+        (VaView::of(&st), st.vm_gen)
+    };
     let mut plan = CsPlan { ibs: Vec::new(), fence: None, waits: Vec::new(), signals: Vec::new() };
     for pointer in pointers {
         let Ok(chunk) = get::<CsChunk>(pointer as usize) else { return -e::EFAULT };
@@ -1424,9 +1482,16 @@ fn cs_ioctl(file: &AmdFile, arg: usize) -> i64 {
         return -e::EINVAL;
     }
     // Исполнение: заборы ожидания уже выполнены (всё синхронно), буфера — по порядку.
-    for &(va, dwords) in &plan.ibs {
-        if let Err(err) = exec_ib(&view, va, dwords, 0) {
-            return err;
+    if hw() {
+        if let Err(why) = hw_run(&view, generation, &plan.ibs) {
+            crate::kprintln!("amdgpu: CS on the card failed: {why}");
+            return -e::EIO;
+        }
+    } else {
+        for &(va, dwords) in &plan.ibs {
+            if let Err(err) = exec_ib(&view, va, dwords, 0) {
+                return err;
+            }
         }
     }
     let seq = {

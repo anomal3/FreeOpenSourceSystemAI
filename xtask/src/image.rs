@@ -328,6 +328,14 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // The fourth marker (FOSSAI_AMD_GART=1) also enables the GART of VMID0 and tests it (P5).
             // The fifth marker (FOSSAI_AMD_CS=1): fence, IB and the user VM (VMID 1) test (P5 step 2).
             // The sixth marker (FOSSAI_AMD_SHADER=1): golden registers and the first compute shader (P6).
+            // The seventh marker (FOSSAI_AMD_HW=1): the hardware DRM backend self-test (VMID 1 over 64 GiB).
+            if std::env::var("FOSSAI_AMD_HW").is_ok_and(|v| v == "1") {
+                payload.push(Payload {
+                    path: String::from("FREEOS/AMD/HW.TXT"),
+                    data: b"hw\n".to_vec(),
+                    source: PathBuf::from("(FOSSAI_AMD_HW=1)"),
+                });
+            }
             if std::env::var("FOSSAI_AMD_SHADER").is_ok_and(|v| v == "1") {
                 payload.push(Payload {
                     path: String::from("FREEOS/AMD/SHADER.TXT"),
