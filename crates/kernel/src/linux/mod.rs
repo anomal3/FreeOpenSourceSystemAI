@@ -42,6 +42,7 @@ mod netdev;
 mod netlink;
 // Узел DRM nouveau для Mesa NVK (18.11.2026, `nvk-spec.md`).
 pub mod drm;
+mod fossaicap;
 pub mod ntsync;
 pub mod perfdiag;
 mod process;
@@ -850,6 +851,10 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     if let Some(answer) = snd::open(&linux, flags) {
         return answer;
     }
+    // Захват экрана для программ Linux (OBS, 23.11.2026).
+    if let Some(answer) = fossaicap::open(&linux, flags) {
+        return answer;
+    }
     // Объекты синхронизации Windows для Wine (16.11.2026); выключенное
     // устройство отсюда не открывается — и дальше по цепочке его нет.
     if let Some(answer) = ntsync::open(&linux, flags) {
@@ -1094,6 +1099,9 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
     }
     if ipc::shm_exists(&linux) {
         return put_stat(out, S_IFREG, 0o600, 0, 0, 0, 0, ino_of(&linux));
+    }
+    if fossaicap::exists(&linux) {
+        return put_stat(out, S_IFCHR, 0o666, 0, 0, 0, 0, ino_of(&linux));
     }
     if snd::exists(&linux) {
         let kind = if linux == "/dev/snd" { S_IFDIR } else { S_IFCHR };
@@ -2159,6 +2167,9 @@ unsafe fn ioctl(fd: usize, request: usize, arg: usize) -> i64 {
     }
     // Звук ALSA (`/dev/snd`, шаг 7 Proton).
     if let Some(answer) = snd::ioctl(fd, request, arg) {
+        return answer;
+    }
+    if let Some(answer) = fossaicap::ioctl(fd, request, arg) {
         return answer;
     }
     // Интерфейсы сети (`SIOCGIF*`) на любом сокете — `nsiproxy.sys` Wine и

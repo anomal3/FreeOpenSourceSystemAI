@@ -3759,9 +3759,15 @@ impl Client {
 
     /// Выделение сменилось — каждому `wl_data_device` клиента новое
     /// предложение (`data_offer`, форматы, `selection`) или «пусто».
+    ///
+    /// Только клиенту с фокусом клавиатуры (как велит протокол: `selection`
+    /// приходит перед `wl_keyboard.enter` и пока фокус у клиента), остальным —
+    /// при входе фокуса ([`Self::keyboard_enter`]). Qt 6 (OBS, 23.11) падал
+    /// на `selection` в первом обмене: его обработчик зовёт буфер обмена
+    /// платформы, которой ещё нет.
     fn sync_selection(&mut self) {
         let generation = SELECTION_GEN.load(Ordering::Acquire);
-        if generation == self.selection_seen {
+        if generation == self.selection_seen || self.keyboard_on.is_none() {
             return;
         }
         self.selection_seen = generation;
@@ -4029,6 +4035,8 @@ impl Client {
             self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 2).u32(serial).u32(old));
         }
         self.keyboard_on = Some(surface);
+        // Выделение — перед `enter` (см. `sync_selection`).
+        self.sync_selection();
         self.mods_down = 0;
         self.keys_down.clear();
         self.group = layout_group();
