@@ -11282,6 +11282,20 @@ nouveau: `sync.rs` обобщён трейтом `SyncHost`. Проба `amdprob
 0 failed, `nvk-soft` зелёный. **Не сделано:** диспатч шейдеров на программной карте,
 sync_file MERGE, PRIME; настоящее исполнение на железе — через бэкенд поверх `display::amd`.
 
+**A4, шаг 4 (23.11): RADV на программном узле и бэкенд DRM на железе.** QEMU: RADV из пакета
+Proton (`libvulkan_radeon.so`, `radeon_icd`) загружается на узле amdgpu, видит `AMD Radeon
+Graphics (RADV POLARIS10)` (discrete, 1002:6fdf), создаёт устройство, отправляет буфер и
+получает забор; `vulkaninfo` проходит (сценарий `radv-soft-vk`; заливка/копия 1 МиБ — compute-шейдер,
+программная карта их не исполняет). Ошибки пути: запускатель определял узел через `grep`
+(в пакете Debian его нет), `gametest` жёстко ставил NVK, `virtual_address_max` 1 ГиБ
+(libdrm_amdgpu выдаёт VA с 4 ГиБ) — теперь 64 ГиБ, плюс PRT-резервы. **Железо (RX 590, флешка
+0.8.18): `HW RESULT: PASSED`** — `display/amd/hw.rs`: VMID 1 на 64 ГиБ (PD 128 КиБ и пул из 1024
+PT в VRAM за кольцом), страницы системной памяти выше 4 ГиБ, IB из двух `WRITE_DATA` исполнен
+кольцом GFX с VMID 1, fence пришёл. Вся цепочка той же загрузки зелёная: SMC, микрокод, кольцо,
+GART, fence/IB/VM, шейдер, HW. `amdnode hw on` направляет `CS` на карту, `amd hw` — самотест
+(маркер `FOSSAI_AMD_HW=1`). **Дальше:** `SH_MEM_*` VMID 1 и constants_init/clear-state (нужны
+шейдерам RADV), запуск RADV на железе с флешки/установленной системы, fence-ожидание без опроса.
+
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
 `drmGetDevices2`, ioctl для `vulkaninfo` и для рендера, поля
