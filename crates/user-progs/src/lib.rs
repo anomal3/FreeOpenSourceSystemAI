@@ -1767,6 +1767,20 @@ pub unsafe fn screencap(action: usize, a1: usize, a2: usize) -> i64 {
     unsafe { syscall(user_abi::SYS_SCREENCAP, action, a1, a2) }
 }
 
+/// System sound loopback (23.11, [`user_abi::SOUND_LOOP_READ`]): frames from
+/// `request.from` (or from now, `u64::MAX`) into `out`, 4 bytes a frame.
+/// Answer — frames read (`request` says from which frame and what is now),
+/// negative — error.
+pub fn sound_loop_read(request: &mut user_abi::SoundLoop, out: &mut [u8]) -> i64 {
+    request.buf = out.as_mut_ptr() as u64;
+    request.cap = (out.len() / 4).min(u32::MAX as usize) as u32;
+    request.got = 0;
+    // SAFETY: the structure and the buffer live in this program; the kernel
+    // writes at most `cap` frames.
+    let r = unsafe { syscall(user_abi::SYS_SOUND, user_abi::SOUND_LOOP_READ, core::ptr::from_mut(request) as usize, 0) };
+    if r < 0 { r } else { i64::from(request.got) }
+}
+
 /// Исполнить команду оболочки ядра (фаза 68o). `out` — не короче
 /// [`user_abi::KERNEL_COMMAND_OUT`]; ответ — сколько байт вывода или ошибка.
 pub fn kernel_command(line: &str, out: &mut [u8]) -> i64 {

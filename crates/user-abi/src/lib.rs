@@ -1542,6 +1542,31 @@ pub const SYS_SOUND: usize = 82;
 pub const SOUND_WRITE: usize = 1;
 /// [`SYS_SOUND`]: доиграть всё отданное и остановить поток.
 pub const SOUND_DRAIN: usize = 2;
+/// [`SYS_SOUND`] (23.11): read the system sound loopback — what the card
+/// plays, for recording. `a1` = [`SoundLoop`] (in/out), `a2` unused. Works
+/// without a sound card too (programs Linux keep their own pace). The first
+/// call arms the tap; it disarms 5 s after the last call.
+///
+/// Frame `F` of the loopback is the sample played at `F / SOUND_RATE`
+/// seconds of `CLOCK_MONOTONIC`. Frames nobody played are silence; frames
+/// newer than now are never returned.
+pub const SOUND_LOOP_READ: usize = 3;
+
+/// Argument of [`SOUND_LOOP_READ`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SoundLoop {
+    /// In: the first wanted frame (`u64::MAX` — start now). Out: the first
+    /// frame read (moved up when older than the ring, ~2 s).
+    pub from: u64,
+    /// In: buffer address for `cap` stereo frames (4 bytes each).
+    pub buf: u64,
+    pub cap: u32,
+    /// Out: frames written into `buf`.
+    pub got: u32,
+    /// Out: the frame playing now.
+    pub now: u64,
+}
 /// Ключи SSH живой системы: `(адрес, длина) -> сколько байт` (фаза 68o).
 ///
 /// `authorized_keys`, который загрузчик нашёл в `\FREEOS\authorized_keys` на

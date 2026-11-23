@@ -3124,6 +3124,9 @@ fn flock(fd: usize, op: usize, arg: usize) -> i64 {
 /// и ждать она может секундами. Память программы перепроверяется на каждом
 /// куске: пока задача ждала, поток той же программы мог её отдать.
 fn sound(op: usize, ptr: usize, len: usize) -> i64 {
+    if op == user_abi::SOUND_LOOP_READ {
+        return sound_loop_read(ptr);
+    }
     if !crate::sound::present() {
         return ERR_UNSUPPORTED;
     }
@@ -3155,6 +3158,41 @@ fn sound(op: usize, ptr: usize, len: usize) -> i64 {
         },
         _ => ERR_UNSUPPORTED,
     }
+}
+
+/// `SOUND_LOOP_READ` (23.11): the system sound loopback for the recorder.
+fn sound_loop_read(arg: usize) -> i64 {
+    let size = core::mem::size_of::<user_abi::SoundLoop>();
+    if !space::user_can(arg, size, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: the range was just checked for reading and writing.
+    let mut request = unsafe { core::ptr::read_unaligned(arg as *const user_abi::SoundLoop) };
+    let cap = (request.cap as usize).min(crate::sound::loopback::RING_FRAMES as usize);
+    let bytes = cap * 4;
+    let buf = request.buf as usize;
+    if bytes > 0 && !space::user_can(buf, bytes, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    let from = if request.from == u64::MAX { crate::sound::loopback::now_frame() } else { request.from };
+    let mut copy = alloc::vec![0u8; bytes];
+    let (first, got) = crate::sound::loopback::read(from, &mut copy);
+    if got > 0 {
+        if !space::user_can(buf, got * 4, PageFlags::WRITE) {
+            return ERR_BAD_ADDRESS;
+        }
+        // SAFETY: checked just above (the thread may have slept on the lock).
+        unsafe { core::ptr::copy_nonoverlapping(copy.as_ptr(), buf as *mut u8, got * 4) };
+    }
+    request.from = first;
+    request.got = got as u32;
+    request.now = crate::sound::loopback::now_frame().max(first + got as u64);
+    if !space::user_can(arg, size, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: checked just above.
+    unsafe { core::ptr::write_unaligned(arg as *mut user_abi::SoundLoop, request) };
+    0
 }
 
 /// Стандартный поток за дескриптором `fd`: `Some(0..=2)` — прежний путь

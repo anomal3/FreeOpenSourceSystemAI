@@ -20,6 +20,16 @@
 //! записанное: недобор — тишина, без XRUN (Wine её переживает молча).
 //! Записанное отдаётся [`crate::sound::feed`] сразу; карты нет — отбрасывается
 //! (темп всё равно держат часы).
+//!
+//! # Захват: «Стерео микшер» (23.11)
+//!
+//! `pcmC0D0c` — устройство захвата той же карты: то, что играет система,
+//! из отвода [`crate::sound::loopback`] (как «Стерео микшер» Windows или
+//! `hw:Loopback` Linux), — им OBS слой Linux пишет звук стола. Режим тот же
+//! (S16_LE, 2 канала, 48 кГц), данные — `READI_FRAMES`. Указатель карты идёт
+//! по часам с `START` (или с первого чтения); программа, отставшая больше
+//! буфера, теряет самое старое без XRUN — так же молча, как воспроизведение.
+//! Микрофона пока нет: вход HDA не поднят (ROADMAP).
 
 use alloc::sync::Arc;
 use alloc::vec;
@@ -39,6 +49,7 @@ const BUFFER_FRAMES: u64 = PERIOD_FRAMES * PERIODS;
 
 pub const CONTROL_PATH: &str = "/dev/snd/controlC0";
 pub const PCM_PATH: &str = "/dev/snd/pcmC0D0p";
+pub const CAPTURE_PATH: &str = "/dev/snd/pcmC0D0c";
 
 // Состояния потока (`snd_pcm_state_t`).
 const STATE_OPEN: i32 = 0;
@@ -54,7 +65,7 @@ const CTL_VERSION: i32 = (2 << 16) | 7;
 /// Есть ли такой путь (для `stat`/`access`).
 #[must_use]
 pub fn exists(linux: &str) -> bool {
-    matches!(linux, CONTROL_PATH | PCM_PATH | "/dev/snd")
+    matches!(linux, CONTROL_PATH | PCM_PATH | CAPTURE_PATH | "/dev/snd")
 }
 
 /// Открыть устройство звука; `None` — путь не наш.
@@ -63,7 +74,11 @@ pub fn open(linux: &str, flags: usize) -> Option<i64> {
     const O_CLOEXEC: usize = 0o2_000_000;
     let object: Arc<dyn Object> = match linux {
         CONTROL_PATH => Arc::new(Control),
-        PCM_PATH => Arc::new(Pcm { state: Mutex::new(Stream::default()) }),
+        PCM_PATH => Arc::new(Pcm { state: Mutex::new(Stream::default()), capture: false }),
+        CAPTURE_PATH => {
+            crate::sound::loopback::arm();
+            Arc::new(Pcm { state: Mutex::new(Stream { capture: true, ..Stream::default() }), capture: true })
+        }
         _ => return None,
     };
     Some(match crate::user::with_current(|program| {
@@ -156,16 +171,17 @@ fn control_ioctl(nr: usize, arg: usize) -> i64 {
             Ok(device) => answer(put(arg, if device < 0 { 0i32 } else { -1 })),
             Err(err) => err,
         },
-        // PCM_INFO: только устройство 0, воспроизведение, подустройство 0.
+        // PCM_INFO: только устройство 0, подустройство 0; воспроизведение и
+        // захват («Стерео микшер», 23.11).
         0x31 => {
             let Ok(head) = read_user(arg, 12) else { return -e::EFAULT };
             let device = u32::from_ne_bytes([head[0], head[1], head[2], head[3]]);
             let subdevice = u32::from_ne_bytes([head[4], head[5], head[6], head[7]]);
             let stream = i32::from_ne_bytes([head[8], head[9], head[10], head[11]]);
-            if device != 0 || stream != 0 || subdevice != 0 {
+            if device != 0 || !(stream == 0 || stream == 1) || subdevice != 0 {
                 return -e::ENOENT;
             }
-            answer(write_user(arg, &pcm_info()))
+            answer(write_user(arg, &pcm_info(stream == 1)))
         }
         // PCM_PREFER_SUBDEVICE
         0x32 => 0,
@@ -173,22 +189,30 @@ fn control_ioctl(nr: usize, arg: usize) -> i64 {
     }
 }
 
-/// struct snd_pcm_info, 288 байт.
-fn pcm_info() -> alloc::vec::Vec<u8> {
+/// struct snd_pcm_info, 288 байт. `capture` — устройство захвата (отвод
+/// того, что играет система).
+fn pcm_info(capture: bool) -> alloc::vec::Vec<u8> {
     let mut info = vec![0u8; 288];
-    put_str(&mut info, 16, 64, "FossAi PCM");
-    put_str(&mut info, 80, 80, "FossAi PCM");
+    info[8..12].copy_from_slice(&i32::from(capture).to_ne_bytes()); // stream
+    if capture {
+        put_str(&mut info, 16, 64, "FossAi Loopback");
+        put_str(&mut info, 80, 80, "Стерео микшер (звук системы)");
+    } else {
+        put_str(&mut info, 16, 64, "FossAi PCM");
+        put_str(&mut info, 80, 80, "FossAi PCM");
+    }
     put_str(&mut info, 160, 32, "subdevice #0");
     info[200..204].copy_from_slice(&1u32.to_ne_bytes()); // subdevices_count
     info[204..208].copy_from_slice(&1u32.to_ne_bytes()); // subdevices_avail
     info
 }
 
-// ---- воспроизведение (pcmC0D0p) -------------------------------------------------
+// ---- воспроизведение (pcmC0D0p) и захват (pcmC0D0c) ----------------------------
 
 struct Stream {
     state: i32,
-    /// Кадры, записанные программой и отданные картой, по модулю `boundary`.
+    /// Воспроизведение: кадры, записанные программой и отданные картой, по
+    /// модулю `boundary`. Захват: прочитанные программой и снятые картой.
     appl: u64,
     hw: u64,
     boundary: u64,
@@ -198,6 +222,12 @@ struct Stream {
     clock: u64,
     /// Доля кадра, не вошедшая в `hw` (нс × частота), — чтобы не терять время.
     rest: u64,
+    /// Захват (23.11): поток отвода, а не карты.
+    capture: bool,
+    /// Захват: кадр отвода, с которого пошёл поток.
+    origin: u64,
+    /// Захват: сколько кадров отдано программе всего, без `boundary`.
+    total: u64,
 }
 
 impl Default for Stream {
@@ -211,6 +241,9 @@ impl Default for Stream {
             start_threshold: 1,
             clock: 0,
             rest: 0,
+            capture: false,
+            origin: 0,
+            total: 0,
         }
     }
 }
@@ -219,17 +252,36 @@ impl Stream {
     fn wrap(&self, value: u64) -> u64 {
         value % self.boundary
     }
-    /// Записано, но не сыграно.
+    /// Воспроизведение: записано, но не сыграно. Захват: снято, но не
+    /// прочитано.
     fn queued(&self) -> u64 {
+        if self.capture {
+            return (self.hw + self.boundary - self.appl) % self.boundary;
+        }
         (self.appl + self.boundary - self.hw) % self.boundary
     }
     fn avail(&self) -> u64 {
+        if self.capture {
+            return self.queued();
+        }
         BUFFER_FRAMES.saturating_sub(self.queued())
     }
     /// Сдвинуть указатель карты по часам.
     fn update(&mut self) {
         let now = crate::time::uptime_ns();
         if self.state != STATE_RUNNING && self.state != STATE_DRAINING {
+            self.clock = now;
+            return;
+        }
+        if self.capture {
+            // Снято всё, что отвод сыграл с начала; отставание больше буфера
+            // теряет самое старое (без XRUN).
+            let produced = crate::sound::loopback::now_frame().saturating_sub(self.origin);
+            if produced.saturating_sub(self.total) > BUFFER_FRAMES {
+                self.total = produced - BUFFER_FRAMES;
+                self.appl = self.wrap(self.total);
+            }
+            self.hw = self.wrap(produced);
             self.clock = now;
             return;
         }
@@ -251,8 +303,15 @@ impl Stream {
         self.state = STATE_RUNNING;
         self.clock = crate::time::uptime_ns();
         self.rest = 0;
+        if self.capture {
+            crate::sound::loopback::arm();
+            self.origin = crate::sound::loopback::now_frame();
+            self.total = 0;
+            self.appl = 0;
+            self.hw = 0;
+        }
     }
-    /// Через сколько мс освободится `need` кадров.
+    /// Через сколько мс освободится (у захвата — наберётся) `need` кадров.
     fn wait_ms(&self, need: u64) -> u64 {
         let missing = need.saturating_sub(self.avail());
         (missing * 1000).div_ceil(RATE).max(1)
@@ -261,6 +320,7 @@ impl Stream {
 
 struct Pcm {
     state: Mutex<Stream>,
+    capture: bool,
 }
 
 impl Object for Pcm {
@@ -273,6 +333,11 @@ impl Object for Pcm {
     fn readiness(&self) -> (bool, bool, bool) {
         let mut stream = self.state.lock();
         stream.update();
+        if self.capture {
+            // Подготовленный поток чтение запустит само.
+            let readable = stream.state != STATE_RUNNING || stream.avail() >= stream.avail_min.max(1);
+            return (readable, false, false);
+        }
         let writable = match stream.state {
             STATE_PREPARED | STATE_RUNNING => stream.avail() >= stream.avail_min.max(1),
             STATE_DRAINING => false,
@@ -407,7 +472,7 @@ impl Pcm {
             // PVERSION
             0x00 => answer(put(arg, PCM_VERSION)),
             // INFO
-            0x01 => answer(write_user(arg, &pcm_info())),
+            0x01 => answer(write_user(arg, &pcm_info(self.capture))),
             // TSTAMP, TTSTAMP, USER_PVERSION
             0x02..=0x04 => 0,
             // HW_REFINE, HW_PARAMS
@@ -418,7 +483,7 @@ impl Pcm {
                 }
                 if nr == 0x11 {
                     let mut stream = self.state.lock();
-                    *stream = Stream { state: STATE_SETUP, ..Stream::default() };
+                    *stream = Stream { state: STATE_SETUP, capture: self.capture, ..Stream::default() };
                 }
                 answer(write_user(arg, &buf))
             }
@@ -520,7 +585,10 @@ impl Pcm {
             // REWIND, FORWARD: назад/вперёд нельзя — 0 кадров.
             0x46 | 0x49 => 0,
             // WRITEI_FRAMES: struct snd_xferi { result, buf, frames }.
-            0x50 => self.writei(arg, nonblock),
+            0x50 if !self.capture => self.writei(arg, nonblock),
+            // READI_FRAMES (захват, 23.11): та же snd_xferi.
+            0x51 if self.capture => self.readi(arg, nonblock),
+            0x50 | 0x51 => -e::EBADFD,
             // LINK, UNLINK
             0x60 | 0x61 => -e::ENOSYS,
             _ => -e::ENOTTY,
@@ -536,7 +604,13 @@ impl Pcm {
         let word = |buf: &[u8], at: usize| u64::from_ne_bytes(buf[at..at + 8].try_into().unwrap_or([0; 8]));
         let mut stream = self.state.lock();
         if flags & APPL == 0 {
-            stream.appl = stream.wrap(word(&buf, 72));
+            let appl = stream.wrap(word(&buf, 72));
+            if stream.capture {
+                // Программа сдвинула указатель сама: столько же прочитано.
+                let moved = (appl + stream.boundary - stream.appl) % stream.boundary;
+                stream.total += moved;
+            }
+            stream.appl = appl;
         }
         if flags & AVAIL_MIN == 0 {
             stream.avail_min = word(&buf, 80).max(1);
@@ -592,6 +666,10 @@ impl Pcm {
         };
         if crate::sound::present() {
             let _ = crate::sound::feed(&bytes);
+        } else {
+            // No card: the clock keeps the pace, and the recording still
+            // hears the program (23.11).
+            crate::sound::loopback::tap(&bytes);
         }
         {
             let mut stream = self.state.lock();
@@ -605,7 +683,79 @@ impl Pcm {
         0
     }
 
+    /// `READI_FRAMES`: отдать программе снятое отводом. Ждёт всех `frames`
+    /// (не больше буфера); без ожидания — сколько есть.
+    fn readi(&self, arg: usize, nonblock: bool) -> i64 {
+        let Ok(head) = read_user(arg, 24) else { return -e::EFAULT };
+        let data = usize::from_ne_bytes(head[8..16].try_into().unwrap_or([0; 8]));
+        let frames = u64::from_ne_bytes(head[16..24].try_into().unwrap_or([0; 8]));
+        {
+            let mut stream = self.state.lock();
+            match stream.state {
+                STATE_PREPARED => stream.start(),
+                STATE_RUNNING => {}
+                STATE_OPEN | STATE_SETUP => return -e::EBADFD,
+                _ => return -e::EPIPE,
+            }
+        }
+        if frames == 0 {
+            let _ = put(arg, 0i64);
+            return 0;
+        }
+        let want = frames.min(BUFFER_FRAMES);
+        let result = wait_io(
+            nonblock,
+            || {
+                let mut stream = self.state.lock();
+                stream.update();
+                Some(crate::time::uptime_ms() + stream.wait_ms(want))
+            },
+            || {
+                let mut stream = self.state.lock();
+                if stream.state != STATE_RUNNING {
+                    return Err(-e::EBADFD);
+                }
+                stream.update();
+                let avail = stream.avail();
+                if avail >= want || (nonblock && avail > 0) {
+                    Ok(avail.min(frames))
+                } else {
+                    Err(-e::EAGAIN)
+                }
+            },
+        );
+        let take = match result {
+            Ok(take) => take,
+            Err(err) => return err,
+        };
+        let (from, origin) = {
+            let stream = self.state.lock();
+            (stream.origin + stream.total, stream.origin)
+        };
+        let mut bytes = vec![0u8; (take * FRAME_BYTES) as usize];
+        let (first, got) = crate::sound::loopback::read(from, &mut bytes);
+        if got > 0 {
+            if let Err(err) = write_user(data, &bytes[..got * FRAME_BYTES as usize]) {
+                return err;
+            }
+        }
+        {
+            let mut stream = self.state.lock();
+            stream.total = (first - origin) + got as u64;
+            stream.appl = stream.wrap(stream.total);
+        }
+        let _ = put(arg, got as i64);
+        0
+    }
+
     fn drain(&self, nonblock: bool) -> i64 {
+        if self.capture {
+            let mut stream = self.state.lock();
+            if stream.state != STATE_OPEN {
+                stream.state = STATE_SETUP;
+            }
+            return 0;
+        }
         {
             let mut stream = self.state.lock();
             match stream.state {
