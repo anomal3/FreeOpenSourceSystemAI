@@ -1500,6 +1500,36 @@ fn run_builtin(line: &str) -> bool {
         }
         // `exfatcache on|off` (21.11) — быстрый путь exFAT (кэш блоков, чтение
         // мимо замка тома, кэш каталогов); `off` — как до 21.11, для замера.
+        // hw-log15: read-ahead after a random miss on exFAT, KiB.
+        "exfatra" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                value => match value.parse::<u64>() {
+                    Ok(kib) => fs::exfatfs::READAHEAD_RANDOM.store(kib.min(1024) * 1024, Relaxed),
+                    Err(_) => sprintln!("  exfatra: usage `exfatra [KIB]`"),
+                },
+            }
+            sprintln!("  exfatra: {} KiB", fs::exfatfs::READAHEAD_RANDOM.load(Relaxed) / 1024);
+        }
+        // hw-log15: USB disk transfers wait for the xHCI interrupt (`irq`) or
+        // poll and yield as before 22.11 (`poll`).
+        "usbwait" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "irq" => crate::usb::xhci::STORAGE_IRQ_WAIT.store(true, Relaxed),
+                "poll" => crate::usb::xhci::STORAGE_IRQ_WAIT.store(false, Relaxed),
+                _ => sprintln!("  usbwait: usage `usbwait [irq|poll]`"),
+            }
+            let (bulks, ns, bytes, sleeps) = crate::usb::xhci::storage_stats();
+            sprintln!(
+                "  usbwait: {}; {bulks} disk transfers, {} us each, {} KiB, {sleeps} sleeps for the interrupt",
+                if crate::usb::xhci::STORAGE_IRQ_WAIT.load(Relaxed) { "irq" } else { "poll" },
+                ns / bulks.max(1) / 1000,
+                bytes / 1024
+            );
+        }
         "exfatcache" => match argument {
             "on" | "off" => {
                 fs::exfatfs::set_fast(argument == "on");

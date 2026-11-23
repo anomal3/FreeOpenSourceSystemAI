@@ -2131,6 +2131,19 @@ pub const ALL: &[Scenario] = &[
             Step::Await("fsbench: /usb/D2RLAN/Data/data.bin open", 180_000),
             Step::Line("fsbench /usb/many/file399.txt"),
             Step::Await("fsbench: /usb/many/file399.txt open", 60_000),
+            // hw-log15: USB disk commands - wait for the xHCI interrupt
+            // (`usbwait irq`, 22.11) against poll+yield; both straight from
+            // the disk (fast path still off), numbers in the log.
+            Step::Line("usbwait poll"),
+            Step::Await("usbwait: poll;", 10_000),
+            Step::Line("fsbench /usb/D2RLAN/Data/data.bin"),
+            Step::Await("fsbench: /usb/D2RLAN/Data/data.bin open", 180_000),
+            Step::Line("usbwait irq"),
+            Step::Await("usbwait: irq;", 10_000),
+            Step::Line("fsbench /usb/D2RLAN/Data/data.bin"),
+            Step::Await("fsbench: /usb/D2RLAN/Data/data.bin open", 180_000),
+            Step::Line("usbwait"),
+            Step::Await("sleeps for the interrupt", 10_000),
             Step::Line("exfatcache on"),
             Step::Await("exfat: fast path on", 10_000),
             Step::Line("fsbench /usb/D2RLAN/Data/data.bin"),

@@ -517,10 +517,19 @@ struct Storage {
     /// разбирал кольцо событий.
     awaited: u64,
     done: Option<(u32, u32)>,
+    /// TRBs of the transfer in flight (address, length) and whether its
+    /// first event came (a short packet mid-TD is followed by one more).
+    td: [(u64, u32); STORAGE_TD_MAX],
+    td_count: usize,
+    td_closed: bool,
 }
 
-/// Размер буфера данных накопителя.
-const STORAGE_BUFFER: usize = 32 * 1024;
+/// Размер буфера данных накопителя (hw-log15: 128 KiB, was 32 KiB - every
+/// command of a USB disk costs a round trip; 32 KiB if 128 do not fit).
+const STORAGE_BUFFER: usize = 128 * 1024;
+const STORAGE_BUFFER_SMALL: usize = 32 * 1024;
+/// Most TRBs in one storage transfer (128 KiB over 64 KiB boundaries: 3).
+const STORAGE_TD_MAX: usize = 4;
 /// Где в странице устройства лежат блоки команды (CBW) и состояния (CSW).
 const STORAGE_CBW_OFFSET: usize = 0;
 const STORAGE_CSW_OFFSET: usize = 512;
@@ -1791,18 +1800,13 @@ impl Controller {
         }?;
         let in_target = (found.bulk_in & 0x0F) * 2 + 1;
         let out_target = (found.bulk_out & 0x0F) * 2;
-        let data = dma::alloc(STORAGE_BUFFER)?;
-        // Окно без границы 64 КиБ внутри: дескриптор передачи не вправе её
-        // пересекать, а цепочка дескрипторов ради одной команды ни к чему.
-        let phys = data.phys().as_u64() as usize;
-        let boundary = (phys | 0xFFFF) + 1;
-        let window = if phys + STORAGE_BUFFER <= boundary {
-            (0, STORAGE_BUFFER)
-        } else if boundary - phys >= phys + STORAGE_BUFFER - boundary {
-            (0, boundary - phys)
-        } else {
-            (boundary - phys, phys + STORAGE_BUFFER - boundary)
+        let data = match dma::alloc(STORAGE_BUFFER) {
+            Ok(data) => data,
+            Err(_) => dma::alloc(STORAGE_BUFFER_SMALL)?,
         };
+        // The whole buffer is the window (hw-log15): a transfer crossing a
+        // 64 KiB boundary is a chain of TRBs (`storage_bulk`).
+        let window = (0, data.len());
         // Состояние ставится до команды: при её отказе буферы вернёт
         // `free_device`.
         device.storage = Some(Storage {
@@ -1815,6 +1819,9 @@ impl Controller {
             window,
             awaited: 0,
             done: None,
+            td: [(0, 0); STORAGE_TD_MAX],
+            td_count: 0,
+            td_closed: true,
         });
         let Some(storage) = device.storage.as_ref() else {
             return Err(XhciError::NoDevice);
@@ -3050,10 +3057,18 @@ impl Controller {
         if let Some(storage) = device.storage.as_mut() {
             // Завершение bulk-передачи накопителя: запоминается для того, кто
             // его ждёт, — ждущий мог и не сам разбирать кольцо.
-            if (endpoint == storage.in_target || endpoint == storage.out_target)
-                && event.parameter == storage.awaited
-            {
-                storage.done = Some((event.completion_code(), event.residual()));
+            if endpoint == storage.in_target || endpoint == storage.out_target {
+                // Any TRB of the transfer: a short packet (or an error) mid-TD
+                // reports that TRB; the residual then counts the rest too. A
+                // second event of the same TD (the last TRB's IOC) is ignored.
+                let count = storage.td_count.min(STORAGE_TD_MAX);
+                if let Some(k) = storage.td[..count].iter().position(|(addr, _)| *addr == event.parameter) {
+                    if !storage.td_closed {
+                        storage.td_closed = true;
+                        let after: u32 = storage.td[k + 1..count].iter().map(|(_, len)| *len).sum();
+                        storage.done = Some((event.completion_code(), event.residual() + after));
+                    }
+                }
             }
             return;
         }
@@ -3980,6 +3995,8 @@ pub fn on_interrupt() {
     }
     EVENT_PENDING.store(true, Ordering::Release);
     crate::sched::wake_irq(IRQ_SOURCE);
+    // USB disk transfers asleep in `storage_bulk` (hw-log15).
+    crate::sched::hrsleep::signal(crate::sched::hrsleep::SRC_XHCI);
 }
 
 /// Разобрать накопившиеся события контроллеров.
@@ -4200,14 +4217,17 @@ pub fn with_storage_buffers<R>(
 /// устройства.
 pub fn storage_bulk(handle: StorageHandle, dir_in: bool, buffer: StorageBuffer, len: usize) -> Result<usize, BulkError> {
     let mut timeout = Timeout::new(STORAGE_TIMEOUT_MS);
+    let started = crate::time::uptime_ns();
     // Поставить дескриптор.
+    let by_irq;
     loop {
         let queued = with_storage(handle, |c, i| {
+            let by_irq = c.delivery() != Delivery::Polled;
             let device = &mut c.devices[i];
             let slot = device.slot;
             let page = device.report.phys().as_u64();
             let Some(storage) = device.storage.as_mut() else {
-                return;
+                return by_irq;
             };
             let phys = match buffer {
                 StorageBuffer::Command => page + STORAGE_CBW_OFFSET as u64,
@@ -4218,25 +4238,51 @@ pub fn storage_bulk(handle: StorageHandle, dir_in: bool, buffer: StorageBuffer, 
                 StorageBuffer::Data => len.min(storage.window.1),
                 _ => len,
             };
+            let packet = u64::from(if dir_in { storage.found.in_packet } else { storage.found.out_packet }.max(1));
             let (ring, target) = if dir_in {
                 (&mut storage.bulk_in, storage.in_target)
             } else {
                 (&mut storage.bulk_out, storage.out_target)
             };
             storage.done = None;
-            storage.awaited = ring.push(Trb {
-                parameter: phys,
-                status: len as u32,
-                // Короткий пакет от устройства — событие (ISP), а не тишина.
-                control: (ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT)
-                    | ring::TRB_IOC
-                    | if dir_in { 1 << 2 } else { 0 },
-            });
+            storage.td_closed = false;
+            // One transfer descriptor, a TRB per 64 KiB-bounded piece (hw-log15:
+            // a 128 KiB window instead of 32 KiB - a quarter of the commands).
+            let (mut at, end) = (phys, phys + len as u64);
+            let mut count = 0;
+            loop {
+                let piece_end = end.min((at | 0xFFFF) + 1);
+                let piece = piece_end - at;
+                let last = piece_end >= end || count + 1 == STORAGE_TD_MAX;
+                let piece = if last { end - at } else { piece };
+                // TD Size: packets left after this TRB (xHCI 4.11.2.4).
+                let td_size = if last { 0 } else { (end - piece_end).div_ceil(packet).min(31) as u32 };
+                let addr = ring.push(Trb {
+                    parameter: at,
+                    status: piece as u32 | (td_size << 17),
+                    // Короткий пакет от устройства — событие (ISP), а не тишина.
+                    control: (ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT)
+                        | if last { ring::TRB_IOC } else { ring::TRB_CHAIN }
+                        | if dir_in { ring::TRB_ISP } else { 0 },
+                });
+                storage.td[count] = (addr, piece as u32);
+                count += 1;
+                if last {
+                    break;
+                }
+                at = piece_end;
+            }
+            storage.td_count = count;
+            storage.awaited = storage.td[count - 1].0;
             // SAFETY: дескриптор записан целиком до звонка.
             unsafe { c.regs.ring_doorbell(slot, target) };
+            by_irq
         });
         match queued {
-            Ok(()) => break,
+            Ok(irq) => {
+                by_irq = irq;
+                break;
+            }
             Err(Reach::Gone) => return Err(BulkError::Gone),
             Err(Reach::Busy) => {}
         }
@@ -4250,10 +4296,29 @@ pub fn storage_bulk(handle: StorageHandle, dir_in: bool, buffer: StorageBuffer, 
     // другим задачам (21.11): ожидание записи на флешку журнала или чтения
     // большого куска не держит процессор и не долбит общий замок
     // контроллеров, нужный диску игры и задаче USB.
+    //
+    // hw-log15: `yield_now` next to D2R's ready threads gave the CPU away
+    // for a whole slice - 2.2-2.8 ms per `pread` on the game disk. Now
+    // (`usbwait irq`, default) after a short poll the waiter sleeps until
+    // the controller's interrupt (hrsleep event `SRC_XHCI`) or 0.5 ms.
     let mut polls = 0u32;
+    let fine = by_irq
+        && STORAGE_IRQ_WAIT.load(Ordering::Relaxed)
+        && crate::arch::interrupts::enabled()
+        && crate::sched::preemption_on()
+        && crate::sched::hrsleep::enabled();
+    let finish = |result: Result<usize, BulkError>| {
+        STORAGE_BULKS.fetch_add(1, Ordering::Relaxed);
+        STORAGE_BULK_NS.fetch_add(crate::time::uptime_ns().saturating_sub(started), Ordering::Relaxed);
+        if let Ok(bytes) = result {
+            STORAGE_BULK_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        result
+    };
     loop {
         polls = polls.saturating_add(1);
-        if polls > 64 && crate::arch::interrupts::enabled() && crate::sched::preemption_on() {
+        let seen = crate::sched::hrsleep::generation(crate::sched::hrsleep::SRC_XHCI);
+        if !fine && polls > 64 && crate::arch::interrupts::enabled() && crate::sched::preemption_on() {
             crate::sched::yield_now();
         }
         let done = with_storage(handle, |c, i| {
@@ -4264,14 +4329,14 @@ pub fn storage_bulk(handle: StorageHandle, dir_in: bool, buffer: StorageBuffer, 
         match done {
             Ok(Some((code, residual))) => {
                 if code == ring::COMPLETION_SUCCESS || code == ring::COMPLETION_SHORT_PACKET {
-                    return Ok(len - (residual as usize).min(len));
+                    return finish(Ok(len - (residual as usize).min(len)));
                 }
                 if code == COMPLETION_STALL {
                     // SAFETY: устройство — накопитель в списке.
                     let _ = with_storage(handle, |c, i| unsafe { c.recover_endpoint(i, dir_in) });
-                    return Err(BulkError::Stalled);
+                    return finish(Err(BulkError::Stalled));
                 }
-                return Err(BulkError::Failed(code));
+                return finish(Err(BulkError::Failed(code)));
             }
             Ok(None) | Err(Reach::Busy) => {}
             Err(Reach::Gone) => return Err(BulkError::Gone),
@@ -4279,8 +4344,45 @@ pub fn storage_bulk(handle: StorageHandle, dir_in: bool, buffer: StorageBuffer, 
         if timeout.expired() {
             return Err(BulkError::Timeout);
         }
+        let now = crate::time::uptime_ns();
+        if fine && now.saturating_sub(started) > STORAGE_SPIN_NS {
+            STORAGE_SLEEPS.fetch_add(1, Ordering::Relaxed);
+            crate::sched::hrsleep::sleep_until_ns(
+                now + STORAGE_SLEEP_NS,
+                crate::sched::hrsleep::SRC_XHCI,
+                seen,
+                || false,
+            );
+            continue;
+        }
         core::hint::spin_loop();
     }
+}
+
+/// `usbwait irq|poll` (hw-log15): a USB disk transfer waits for the
+/// controller's interrupt after a short poll (`irq`), or polls and yields as
+/// before 22.11 (`poll`).
+pub static STORAGE_IRQ_WAIT: AtomicBool = AtomicBool::new(true);
+/// Poll this long before sleeping (short commands end in microseconds).
+const STORAGE_SPIN_NS: u64 = 20_000;
+/// Backstop of one sleep if the interrupt is lost.
+const STORAGE_SLEEP_NS: u64 = 500_000;
+/// USB disk bulk transfers: count, ns from queueing to completion, bytes,
+/// sleeps waiting for the interrupt (perf-diag).
+static STORAGE_BULKS: AtomicU64 = AtomicU64::new(0);
+static STORAGE_BULK_NS: AtomicU64 = AtomicU64::new(0);
+static STORAGE_BULK_BYTES: AtomicU64 = AtomicU64::new(0);
+static STORAGE_SLEEPS: AtomicU64 = AtomicU64::new(0);
+
+/// `(bulk transfers, their ns, bytes, sleeps)` of USB disks since boot.
+#[must_use]
+pub fn storage_stats() -> (u64, u64, u64, u64) {
+    (
+        STORAGE_BULKS.load(Ordering::Relaxed),
+        STORAGE_BULK_NS.load(Ordering::Relaxed),
+        STORAGE_BULK_BYTES.load(Ordering::Relaxed),
+        STORAGE_SLEEPS.load(Ordering::Relaxed),
+    )
 }
 
 /// Сброс Bulk-Only (класс 8, запрос `0xFF`) и снятие остановки с обеих точек —

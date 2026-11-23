@@ -122,6 +122,9 @@ struct Mark {
     /// G2: `(wait-queue sleeps, wakes by key, idle rounds without the lock,
     /// zeroed frames from the caches, cache refills)`.
     g2: [u64; 5],
+    /// hw-log15: exFAT file reads `(reads, ns, misses, miss ns, bytes from
+    /// the disk)` and USB disk transfers `(count, ns, bytes, sleeps)`.
+    disk: [u64; 9],
 }
 
 impl Mark {
@@ -169,6 +172,11 @@ impl Mark {
                     crate::mm::frame::ZEROED_HITS.load(Ordering::Relaxed),
                     crate::mm::frame::ZEROED_REFILLS.load(Ordering::Relaxed),
                 ]
+            },
+            disk: {
+                let (reads, ns, misses, miss_ns, bytes) = crate::fs::exfatfs::read_stats();
+                let (bulks, bulk_ns, bulk_bytes, sleeps) = crate::usb::xhci::storage_stats();
+                [reads, ns, misses, miss_ns, bytes, bulks, bulk_ns, bulk_bytes, sleeps]
             },
         }
     }
@@ -382,6 +390,28 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
             crate::user::SPURIOUS_FAULTS.load(Relaxed),
             crate::user::COW_BATCHED.load(Relaxed),
         );
+    }
+
+    // hw-log15: game disk reads - exFAT reads served from the cache vs from
+    // the disk, and the USB transfers under them.
+    {
+        let disk: [u64; 9] = core::array::from_fn(|i| new.disk[i].saturating_sub(old.disk[i]));
+        if disk[0] != 0 || disk[5] != 0 {
+            kprintln!(
+                "  perf-diag   : {secs} s disk: exfat reads {} ({} us each), {} went to the disk ({} us each, {} KiB read with read-ahead {} KiB); usb disk transfers {} ({} us each, {} KiB each, {} sleeps for the interrupt, usbwait {})",
+                disk[0],
+                disk[1] / disk[0].max(1) / 1000,
+                disk[2],
+                disk[3] / disk[2].max(1) / 1000,
+                disk[4] / 1024,
+                crate::fs::exfatfs::READAHEAD_RANDOM.load(Ordering::Relaxed) / 1024,
+                disk[5],
+                disk[6] / disk[5].max(1) / 1000,
+                disk[7] / disk[5].max(1) / 1024,
+                disk[8],
+                if crate::usb::xhci::STORAGE_IRQ_WAIT.load(Ordering::Relaxed) { "irq" } else { "poll" },
+            );
+        }
     }
 
     // 3. Процессоры и очередь.

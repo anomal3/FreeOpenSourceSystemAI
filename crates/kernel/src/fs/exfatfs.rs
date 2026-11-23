@@ -48,8 +48,31 @@ const BLOCK: u64 = 4096;
 const PIECE: usize = 1 << 20;
 /// Упреждающее чтение при последовательном чтении файла.
 const READAHEAD: u64 = 512 * 1024;
-/// Упреждение после пропуска при чтении вразброс (не подряд).
-const READAHEAD_RANDOM: u64 = 60 * 1024;
+/// Упреждение после пропуска при чтении вразброс (не подряд), байт
+/// (`exfatra KIB`). hw-log15: 124 KiB (was 60): with the 128 KiB USB window
+/// a miss plus its read-ahead is one disk command, and a USB command costs
+/// its round trip whatever its length up to that.
+pub static READAHEAD_RANDOM: AtomicU64 = AtomicU64::new(124 * 1024);
+/// File data reads (pieces): count, ns, those that went to the disk and
+/// the bytes they read (data + read-ahead) - perf-diag.
+static READS: AtomicU64 = AtomicU64::new(0);
+static READ_NS: AtomicU64 = AtomicU64::new(0);
+static MISSES: AtomicU64 = AtomicU64::new(0);
+static MISS_NS: AtomicU64 = AtomicU64::new(0);
+static MISS_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `(reads, ns, reads that went to the disk, their ns, bytes read from the
+/// disk)` of exFAT file data since boot.
+#[must_use]
+pub fn read_stats() -> (u64, u64, u64, u64, u64) {
+    (
+        READS.load(Ordering::Relaxed),
+        READ_NS.load(Ordering::Relaxed),
+        MISSES.load(Ordering::Relaxed),
+        MISS_NS.load(Ordering::Relaxed),
+        MISS_BYTES.load(Ordering::Relaxed),
+    )
+}
 /// Больше стольких узлов во всех запомненных каталогах — кэш сбрасывается
 /// (куча ядра общая и небольшая).
 const DIR_CACHE_NODES: usize = 32 * 1024;
@@ -447,7 +470,7 @@ impl ExfatNode {
             let end_of_read = offset + total;
             if (!wanted.is_empty() || sequential) && end_of_read < node.valid {
                 let mut probe = *self.cursor.lock();
-                let window = if sequential { READAHEAD } else { READAHEAD_RANDOM };
+                let window = if sequential { READAHEAD } else { READAHEAD_RANDOM.load(Ordering::Relaxed) };
                 let want = window.min(node.valid - end_of_read);
                 if let Ok((more, _, _)) = volume.plan_read(&node, end_of_read, want, &mut probe) {
                     let mut seen = 0usize;
@@ -519,6 +542,8 @@ impl ExfatNode {
         data.resize(blocks.len() * BLOCK as usize, 0);
         let mut lane = fs.lane.clone();
         let mut at = 0usize;
+        MISSES.fetch_add(1, Ordering::Relaxed);
+        MISS_BYTES.fetch_add(data.len() as u64, Ordering::Relaxed);
         for &(first, count) in &runs {
             let bytes = count * BLOCK as usize;
             lane.read(base + first * BLOCK / sector, &mut data[at..at + bytes]).map_err(|_| VfsError::Io)?;
@@ -609,7 +634,16 @@ impl Node for ExfatNode {
         let mut done = 0usize;
         while done < buf.len() {
             let take = (buf.len() - done).min(PIECE);
-            let read = self.read_piece(offset + done as u64, &mut buf[done..done + take])?;
+            let started = crate::time::uptime_ns();
+            let misses = MISSES.load(Ordering::Relaxed);
+            let read = self.read_piece(offset + done as u64, &mut buf[done..done + take]);
+            let took = crate::time::uptime_ns().saturating_sub(started);
+            READS.fetch_add(1, Ordering::Relaxed);
+            READ_NS.fetch_add(took, Ordering::Relaxed);
+            if MISSES.load(Ordering::Relaxed) != misses {
+                MISS_NS.fetch_add(took, Ordering::Relaxed);
+            }
+            let read = read?;
             done += read;
             if read < take {
                 break;
