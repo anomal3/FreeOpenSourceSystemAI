@@ -1107,6 +1107,8 @@ pub fn auto_task() {
         crate::kprintln!("  amdgpu     : auto start is off (no FREEOS/AMD/START.TXT on the stick); 'amd smc start' by hand");
         return;
     }
+    crate::kprintln!("==== AMD TEST: started. Stages: SMC, microcode, ring, GART, CS, shader, hw backend, RADV (Proton from the stick). ====");
+    crate::kprintln!("==== AMD TEST: watch the '==== AMD TEST' lines; the last one says when it is safe to power off. Whole run: about 5-15 min. ====");
     crate::kprintln!("  amdgpu     : auto start: marker found, starting the SMC");
     let _ = polaris_smc_start();
     for line in polaris_smc() {
@@ -1139,7 +1141,10 @@ pub fn auto_task() {
             // The seventh marker (FOSSAI_AMD_HW=1): the DRM backend on the card - VMID 1 over 64 GiB, an IB above 4 GiB.
             if firmware_file("HW.TXT").is_ok() {
                 crate::kprintln!("  amdgpu     : auto start: HW.TXT found, testing the hardware DRM backend");
-                let _ = hw::selftest();
+                let lines = hw::selftest();
+                let verdict = |what: &str| lines.iter().find(|l| l.contains(what)).map_or("no result", |l| if l.contains("PASSED") { "PASSED" } else { "FAILED" });
+                crate::kprintln!("==== AMD TEST: hw backend: {}, shader in VMID 1: {} ====", verdict("HW RESULT"), verdict("HW SHADER RESULT"));
+                crate::usb::stick_log::flush_now();
             }
             // The eighth marker (FOSSAI_AMD_RADV=1): RADV on the card. The live stick installs Debian and Proton
             // into RAM (FOSSAI_WITH_PROTON=1); when that is done the whole vkprobe/vulkaninfo check runs on the node.
@@ -1156,26 +1161,47 @@ pub fn auto_task() {
 /// Ждать, пока флешка поставит Debian и Proton в память, и прогнать RADV на настоящей карте:
 /// `gpu gametest hw -- vk` (vkprobe и vulkaninfo). Результат - строки `gametest|` в `LOG.TXT`.
 fn radv_auto() {
-    // До 25 минут: Proton с флешки - больше гигабайта.
-    for waited in 0..750u32 {
-        let installed = matches!(crate::fs::list("/opt/proton/bin"), Some(Ok(_)));
-        if installed && !crate::usb::storage::live_busy() {
+    let present = |path: &str| matches!(crate::fs::list(path), Some(Ok(_)));
+    crate::kprintln!("==== AMD TEST: hardware checks are DONE (see the amdgpu lines above). NEXT: RADV test. ====");
+    crate::kprintln!("==== AMD TEST: Proton is being copied from the stick into RAM - WAIT, do not power off. ====");
+    // До 25 минут: Proton с флешки - больше гигабайта. Строка состояния каждые 10 секунд.
+    let started = crate::time::uptime_ms();
+    let mut last_line = 0u64;
+    loop {
+        let waited = (crate::time::uptime_ms() - started) / 1000;
+        let ready = present("/opt/proton/bin") && !crate::usb::storage::live_busy();
+        if ready || waited > 1500 {
             break;
         }
-        if waited % 30 == 0 {
-            crate::kprintln!("  amdgpu     : radv: waiting for the live packages ({} s)", waited * 2);
+        if waited >= last_line + 10 || last_line == 0 {
+            last_line = waited.max(1);
+            crate::kprintln!(
+                "  amdgpu     : radv: waiting {waited} s of up to 1500: debian {}, proton {}, installer {}  (usually 2-8 min)",
+                if present("/opt/debian") { "in RAM" } else { "not yet" },
+                if present("/opt/proton/bin") { "in RAM" } else { "not yet" },
+                if crate::usb::storage::live_busy() { "still running" } else { "idle" }
+            );
         }
         crate::sched::sleep_ms(2000);
     }
-    if !matches!(crate::fs::list("/opt/proton/bin"), Some(Ok(_))) {
-        crate::kprintln!("  amdgpu     : radv: Proton did not appear in /opt (was the image built with FOSSAI_WITH_PROTON=1?)");
+    if !present("/opt/proton/bin") {
+        crate::kprintln!("==== AMD TEST: STOPPED - Proton did not appear in /opt (image without FOSSAI_WITH_PROTON=1, or the stick is too slow). You can power off; the log is in FREEOS\\LOG.TXT. ====");
+        crate::usb::stick_log::flush_now();
         return;
     }
+    crate::kprintln!("==== AMD TEST: Proton is in RAM. Running RADV (vkprobe, vulkaninfo) on the card - about 1-3 min. ====");
     crate::kprintln!("  amdgpu     : radv: {}", super::nvidia_gametest::start("hw amd -- vk"));
     // Не уходить, пока проверка идёт: лог на флешку сбрасывает сама проверка.
+    let mut ticks = 0u32;
     while super::nvidia_gametest::running() {
         crate::sched::sleep_ms(1000);
+        ticks += 1;
+        if ticks % 15 == 0 {
+            crate::kprintln!("  amdgpu     : radv: the check is still running ({ticks} s)");
+        }
     }
+    crate::usb::stick_log::flush_now();
+    crate::kprintln!("==== AMD TEST: FINISHED. You can power off now. The result is in FREEOS\\LOG.TXT (gametest| lines). ====");
     crate::usb::stick_log::flush_now();
 }
 
