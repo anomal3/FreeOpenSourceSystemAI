@@ -1308,9 +1308,9 @@ impl SettingsView {
             }
             Deed::Look(deed) => {
                 use super::look;
+                let title_before = super::window::Window::title_height(mini_ui::Scale::ONE);
                 let (text, result) = match deed {
                     LookDeed::Preset(preset) => {
-                let title_before = super::window::Window::title_height(mini_ui::Scale::ONE);
                         look::apply_preset(preset);
                         (format!("набор «{}» применён и запомнен", pages::preset_title(preset)), look::store())
                     }
@@ -1325,12 +1325,12 @@ impl SettingsView {
                 };
                 // Перерисовать всё: рамки окон, тени, кадр в новой глубине.
                 self.theme_changed = true;
-                kprintln!("  settings    : look {}", look::describe());
-                self.report = Some(match result {
                 // Классика — другая высота заголовка (22.11): окна пересобрать.
                 if super::window::Window::title_height(mini_ui::Scale::ONE) != title_before {
                     self.title_changed = true;
                 }
+                kprintln!("  settings    : look {}", look::describe());
+                self.report = Some(match result {
                     Ok(()) => Report::ok(text),
                     Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
                 });

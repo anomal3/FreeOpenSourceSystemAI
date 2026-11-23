@@ -2023,6 +2023,11 @@ pub const SYSINFO_SCALE_100: u32 = 2;
 /// [`SysInfo::flags`]: масштаб стола задан человеком — 200 %.
 pub const SYSINFO_SCALE_200: u32 = 4;
 
+/// [`SysInfo::flags`]: классическое оформление (Windows 98, 22.11) —
+/// программа рисует серой гранью с объёмными кромками
+/// (`mini_ui::theme::set_classic`). Бит 16 — выше поля масштаба.
+pub const SYSINFO_CLASSIC: u32 = 1 << 16;
+
 /// [`SysInfo::flags`]: тема значков (22.11) — номер в
 /// `mini_ui::image::ICON_THEMES`, биты 17..20. Программы берут значки из
 /// `/usr/share/icons/<тема>.pak` и меняют их на ходу.
@@ -2035,11 +2040,6 @@ pub const SYSINFO_ICONS_MASK: u32 = 0x7 << SYSINFO_ICONS_SHIFT;
 pub const fn sysinfo_icon_theme(flags: u32) -> u8 {
     ((flags & SYSINFO_ICONS_MASK) >> SYSINFO_ICONS_SHIFT) as u8
 }
-
-/// [`SysInfo::flags`]: классическое оформление (Windows 98, 22.11) —
-/// программа рисует серой гранью с объёмными кромками
-/// (`mini_ui::theme::set_classic`). Бит 16 — выше поля масштаба.
-pub const SYSINFO_CLASSIC: u32 = 1 << 16;
 
 /// [`SysInfo::flags`]: масштаб стола в процентах (100/125/150/175/200) —
 /// биты 8..16 (20.11, дробный масштаб). Ноль — ядро старое, смотреть на
