@@ -6647,6 +6647,30 @@ pub fn fullscreen_window(task: u32, slot: u32, on: bool) -> Result<(), WindowErr
     .unwrap_or_else(|| Err(unavailable()))
 }
 
+/// G5 (22.11): fullscreen on the monitor under the desktop point `at`
+/// (`xdg_toplevel.set_fullscreen(output)`). A window fullscreen on another
+/// monitor moves over.
+pub fn fullscreen_window_at(task: u32, slot: u32, at: (i32, i32)) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let window = desktop.find(app).ok_or(WindowError::NoWindow)?;
+        let (now, rect) = (window.fullscreen, window.rect);
+        if now && rect.contains(at.0, at.1) {
+            return Ok(());
+        }
+        if now {
+            desktop.set_fullscreen(app, false);
+        }
+        if desktop.set_fullscreen_at(app, true, Some(at)) {
+            kprintln!("  desktop     : '{}' entered fullscreen on the monitor at {},{}", name_of(desktop, app), at.0, at.1);
+            log_window(desktop, app, true);
+            desktop.present();
+        }
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
 /// Открыто ли окно программы во весь экран.
 #[must_use]
 pub fn window_fullscreen(task: u32, slot: u32) -> bool {

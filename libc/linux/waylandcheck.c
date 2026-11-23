@@ -88,8 +88,26 @@ enum {
     ID_RELMGR, ID_REL, ID_CONSTR, ID_LOCK, ID_REGION, ID_CONFINE, ID_ACT, ID_TOKEN, ID_FRACMGR, ID_FRAC, ID_SYNC3,
     ID_OUTPUT,
     /* G5 (21.11): popups on the second monitor, minimize, confinement. */
-    ID_POS, ID_PSURF, ID_PXDG, ID_POPUP, ID_PPOOL, ID_PBUF, ID_TOKEN2, ID_CONFINE2, ID_SYNC4
+    ID_POS, ID_PSURF, ID_PXDG, ID_POPUP, ID_PPOOL, ID_PBUF, ID_TOKEN2, ID_CONFINE2, ID_SYNC4,
+    /* G5 (22.11): one wl_output per monitor, xdg_output, enter/leave,
+     * xdg_popup.reposition, outputs switched off and on. */
+    ID_XOMGR, ID_OUT0, ID_OUT1, ID_XOUT0, ID_XOUT1, ID_SYNC5, ID_POS2, ID_PPOOL2, ID_PBUF2, ID_OUT2, ID_SYNC6
 };
+/* G5 outputs: registry names, what each bound one said (index 0/1 = ID_OUT0/1,
+ * 2 = ID_OUT2 bound after the hotplug). */
+#define MAX_OUT 4
+static uint32_t out_names[MAX_OUT];
+static int n_out;
+static uint32_t global_xomgr, removed_name, added_name;
+static int out_removed, out_added;
+struct out_info {
+    int x, y, mm_w, mm_h, w, h, mhz, done, lx, ly, lw, lh, xdone, entered;
+    char make[32], model[64], name[32], desc[96];
+};
+static struct out_info outs[3];
+static int enter_events, leave_events, repositioned_token;
+static uint32_t left_out = ID_OUT0, right_out = ID_OUT1;
+static int on_right_only, on_left_only, synced5, synced6, key_r;
 /* G5: `wm_capabilities`, popup configure, pointer buttons/leave, focus. */
 static int caps_seen, caps_min, caps_full, caps_before_configure;
 static int popup_x = -99999, popup_y = -99999, popup_conf, pxdg_serial, pxdg_conf, popup_done;
@@ -136,7 +154,69 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         if (!strcmp(interface, "zwp_pointer_constraints_v1")) global_constraints = name;
         if (!strcmp(interface, "xdg_activation_v1")) global_activation = name;
         if (!strcmp(interface, "wp_fractional_scale_manager_v1")) global_fractional = name;
-        if (!strcmp(interface, "wl_output")) global_output = name;
+        if (!strcmp(interface, "wl_output")) {
+            if (!global_output) global_output = name;
+            if (n_out < MAX_OUT) out_names[n_out++] = name;
+            if (removed_name) {
+                added_name = name;
+                out_added = 1;
+            }
+        }
+        if (!strcmp(interface, "zxdg_output_manager_v1")) global_xomgr = name;
+    } else if (id == ID_REGISTRY && opcode == 1) {
+        /* global_remove(name) */
+        for (int i = 0; i < n_out; i++)
+            if (out_names[i] == args[0]) {
+                removed_name = args[0];
+                out_removed = 1;
+            }
+    } else if ((id == ID_OUT0 || id == ID_OUT1 || id == ID_OUT2) && opcode <= 5) {
+        struct out_info *o = &outs[id == ID_OUT0 ? 0 : id == ID_OUT1 ? 1 : 2];
+        if (opcode == 0) {
+            /* geometry(x, y, mm_w, mm_h, subpixel, make, model, transform) */
+            o->x = (int32_t)args[0];
+            o->y = (int32_t)args[1];
+            o->mm_w = (int32_t)args[2];
+            o->mm_h = (int32_t)args[3];
+            uint32_t len = args[5];
+            snprintf(o->make, sizeof o->make, "%s", (char *)&args[6]);
+            snprintf(o->model, sizeof o->model, "%s", (char *)&args[6 + (len + 3) / 4 + 1]);
+        } else if (opcode == 1) {
+            o->w = (int)args[1];
+            o->h = (int)args[2];
+            o->mhz = (int)args[3];
+        } else if (opcode == 2) {
+            o->done++;
+        } else if (opcode == 4) {
+            snprintf(o->name, sizeof o->name, "%s", (char *)&args[1]);
+        } else if (opcode == 5) {
+            snprintf(o->desc, sizeof o->desc, "%s", (char *)&args[1]);
+        }
+    } else if ((id == ID_XOUT0 || id == ID_XOUT1) && opcode <= 1) {
+        struct out_info *o = &outs[id == ID_XOUT0 ? 0 : 1];
+        if (opcode == 0) {
+            o->lx = (int32_t)args[0];
+            o->ly = (int32_t)args[1];
+        } else {
+            o->lw = (int32_t)args[0];
+            o->lh = (int32_t)args[1];
+        }
+    } else if (id == ID_SURFACE && (opcode == 0 || opcode == 1)) {
+        /* enter(output) / leave(output) */
+        uint32_t out = args[0];
+        int k = out == ID_OUT0 ? 0 : out == ID_OUT1 ? 1 : out == ID_OUT2 ? 2 : -1;
+        if (k >= 0) outs[k].entered = opcode == 0;
+        if (opcode == 0) enter_events++;
+        else leave_events++;
+        int l = left_out == ID_OUT0 ? 0 : 1, r = 1 - l;
+        on_right_only = outs[r].entered && !outs[l].entered;
+        on_left_only = outs[l].entered && !outs[r].entered;
+    } else if (id == ID_POPUP && opcode == 2) {
+        repositioned_token = (int)args[0];
+    } else if (id == ID_SYNC5 && opcode == 0) {
+        synced5 = 1;
+    } else if (id == ID_SYNC6 && opcode == 0) {
+        synced6 = 1;
     } else if (id == ID_OUTPUT && opcode == 1) {
         out_w = (int)args[1];
         out_h = (int)args[2];
@@ -248,6 +328,7 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         if (args[2] == 25 && args[3] == 0) key_p = 1;
         if (args[2] == 16 && args[3] == 0) key_q = 1;
         if (args[2] == 46 && args[3] == 0) key_c = 1;
+        if (args[2] == 19 && args[3] == 0) key_r = 1;
     } else if (id == ID_TOPLEVEL && opcode == 0) {
         int full = 0;
         conf_w = (int)args[0];
@@ -533,6 +614,44 @@ static int g5(void) {
     end();
     wait_for(&synced2, 5000);
 
+    /* G5 (22.11): Wine builds EnumDisplayMonitors from one wl_output per
+     * monitor and their xdg_output logical positions (the primary at 0,0). */
+    printf("waylandcheck: %d wl_output global(s), xdg_output manager %s\n", n_out, global_xomgr ? "yes" : "no");
+    check(n_out == 2 && global_xomgr, "registry lists one wl_output per monitor (2) and zxdg_output_manager_v1");
+    if (n_out >= 2 && global_xomgr) {
+        bind_global(out_names[0], "wl_output", 4, ID_OUT0);
+        bind_global(out_names[1], "wl_output", 4, ID_OUT1);
+        bind_global(global_xomgr, "zxdg_output_manager_v1", 3, ID_XOMGR);
+        begin(ID_XOMGR, 1); /* get_xdg_output(id, output) */
+        put(ID_XOUT0);
+        put(ID_OUT0);
+        end();
+        begin(ID_XOMGR, 1);
+        put(ID_XOUT1);
+        put(ID_OUT1);
+        end();
+        begin(ID_DISPLAY, 0);
+        put(ID_SYNC5);
+        end();
+        wait_for(&synced5, 5000);
+        for (int i = 0; i < 2; i++)
+            printf("waylandcheck: output %d '%s' '%s' %s %s %dx%d@%d mm %dx%d at %d,%d logical %d,%d %dx%d done %d\n", i, outs[i].name,
+                   outs[i].desc, outs[i].make, outs[i].model, outs[i].w, outs[i].h, outs[i].mhz, outs[i].mm_w, outs[i].mm_h, outs[i].x,
+                   outs[i].y, outs[i].lx, outs[i].ly, outs[i].lw, outs[i].lh, outs[i].done);
+        int l = outs[0].x <= outs[1].x ? 0 : 1, r = 1 - l;
+        left_out = l == 0 ? ID_OUT0 : ID_OUT1;
+        right_out = r == 0 ? ID_OUT0 : ID_OUT1;
+        check(outs[l].x == 0 && outs[l].y == 0 && outs[r].x == 1280 && outs[r].y == 0 && outs[l].w == 1280 && outs[l].h == 800 &&
+                  outs[r].w == 1280 && outs[r].h == 800 && outs[0].mhz > 0 && outs[1].mhz > 0,
+              "wl_output geometry and mode: the primary at 0,0 and the second at 1280,0, both 1280x800");
+        check(outs[0].done >= 2 && outs[1].done >= 2 && outs[0].name[0] && outs[1].name[0] && strcmp(outs[0].name, outs[1].name) &&
+                  outs[0].desc[0] && outs[0].make[0] && outs[0].model[0] && outs[0].mm_w > 0,
+              "wl_output v4 sends distinct names, descriptions, make/model and done");
+        check(outs[l].lx == 0 && outs[l].ly == 0 && outs[r].lx == 1280 && outs[r].ly == 0 && outs[0].lw == 1280 && outs[0].lh == 800 &&
+                  outs[1].lw == 1280 && outs[1].lh == 800,
+              "zxdg_output_v1 logical positions and sizes match the layout");
+    }
+
     const int width = 320, height = 200;
     begin(ID_COMPOSITOR, 0);
     put(ID_SURFACE);
@@ -562,6 +681,8 @@ static int g5(void) {
     end();
     show(ID_SURFACE, ID_BUFFER, width, height);
     wait_for(&frame_done, 5000);
+    wait_for(&on_left_only, 3000);
+    check(on_left_only, "the new window gets wl_surface.enter for the primary (left) monitor only");
 
     /* Drag to the right monitor: a press on the window asks the desktop to
      * move it (`xdg_toplevel.move`, like Wine's caption). */
@@ -572,6 +693,9 @@ static int g5(void) {
     put((uint32_t)button_serial);
     end();
     wait_for(&key_p, 60000);
+    wait_for(&on_right_only, 3000);
+    printf("waylandcheck: enter %d, leave %d\n", enter_events, leave_events);
+    check(on_right_only && leave_events > 0, "dragged to the right monitor, the window enters its output and leaves the left one");
 
     /* A 200x150 menu below-right of the point (300,150) of the window, with
      * flip and slide allowed: it fits on the right monitor, so it opens
@@ -622,6 +746,48 @@ static int g5(void) {
     shm_buffer(ID_PPOOL, ID_PBUF, 200, 150, 0xffc06020u);
     show(ID_PSURF, ID_PBUF, 200, 150);
     say("g5 popup shown");
+    wait_for(&key_r, 60000);
+
+    /* xdg_popup.reposition (v3): a 160x100 menu at the point (20,30) - the
+     * reply is repositioned(token), then configure at the new place. */
+    begin(ID_WM, 1);
+    put(ID_POS2);
+    end();
+    begin(ID_POS2, 1);
+    put(160);
+    put(100);
+    end();
+    begin(ID_POS2, 2);
+    put(20);
+    put(30);
+    put(1);
+    put(1);
+    end();
+    begin(ID_POS2, 3);
+    put(5);
+    end();
+    begin(ID_POS2, 4);
+    put(8);
+    end();
+    begin(ID_POS2, 5);
+    put(1 | 2 | 4 | 8);
+    end();
+    popup_conf = 0;
+    pxdg_conf = 0;
+    begin(ID_POPUP, 2); /* reposition(positioner, token) */
+    put(ID_POS2);
+    put(77);
+    end();
+    wait_for(&pxdg_conf, 5000);
+    printf("waylandcheck: repositioned token %d, configure at %d,%d\n", repositioned_token, popup_x, popup_y);
+    check(repositioned_token == 77 && popup_conf && popup_x == 20 && popup_y == 30,
+          "xdg_popup.reposition answers repositioned(token) and a configure at the new place");
+    begin(ID_PXDG, 4);
+    put((uint32_t)pxdg_serial);
+    end();
+    shm_buffer(ID_PPOOL2, ID_PBUF2, 160, 100, 0xff20a040u);
+    show(ID_PSURF, ID_PBUF2, 160, 100);
+    say("g5 popup repositioned");
     wait_for(&key_q, 60000);
     begin(ID_POPUP, 0);
     end();
@@ -687,6 +853,53 @@ static int g5(void) {
     wait_for(&never, 2500);
     begin(ID_CONFINE2, 0);
     end();
+
+    /* Settings -> Display: the right monitor switched off and on again -
+     * its global goes (the window comes to the left monitor) and a new one
+     * comes with the same place. */
+    if (n_out >= 2) {
+        uint32_t right_name = right_out == ID_OUT0 ? out_names[0] : out_names[1];
+        /* The scenario's command lines go to the focused window: minimized,
+         * the terminal gets them. */
+        keyboard_left = 0;
+        begin(ID_TOPLEVEL, 13); /* set_minimized */
+        end();
+        wait_for(&keyboard_left, 5000);
+        say("g5 switch the right monitor off");
+        wait_for(&out_removed, 30000);
+        printf("waylandcheck: global_remove %u (right output %u)\n", removed_name, right_name);
+        check(out_removed && removed_name == right_name, "switching the right monitor off removes its wl_output global");
+        /* Back from the panel (activation): it is on the left monitor now. */
+        keyboard_in = 0;
+        begin(ID_ACT, 2);
+        put_str("fossai-check");
+        put(ID_SURFACE);
+        end();
+        wait_for(&on_left_only, 5000);
+        check(on_left_only, "the window moved off the switched-off monitor enters the left output");
+        begin(right_out, 0); /* release */
+        end();
+        /* Minimized again once restored (its restore flight is over). */
+        wait_for(&keyboard_in, 5000);
+        wait_for(&never, 1000);
+        keyboard_left = 0;
+        begin(ID_TOPLEVEL, 13);
+        end();
+        wait_for(&keyboard_left, 5000);
+        say("g5 switch the right monitor on");
+        wait_for(&out_added, 30000);
+        check(out_added && added_name != right_name, "switching it on again announces a new wl_output global");
+        if (out_added) {
+            bind_global(added_name, "wl_output", 4, ID_OUT2);
+            begin(ID_DISPLAY, 0);
+            put(ID_SYNC6);
+            end();
+            wait_for(&synced6, 5000);
+            printf("waylandcheck: new output '%s' %dx%d at %d,%d\n", outs[2].name, outs[2].w, outs[2].h, outs[2].x, outs[2].y);
+            check(outs[2].x == 1280 && outs[2].y == 0 && outs[2].w == 1280 && outs[2].h == 800 && outs[2].done > 0,
+                  "the new wl_output has the right monitor's place and mode");
+        }
+    }
     begin(ID_TOPLEVEL, 0);
     end();
     begin(ID_XDG, 0);

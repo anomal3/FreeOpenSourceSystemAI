@@ -3082,13 +3082,21 @@ impl Compositor {
     /// (20.11, `xdg_toplevel.set_fullscreen` — игры под Wine). `true` —
     /// состояние изменилось.
     pub fn set_fullscreen(&mut self, app: App, on: bool) -> bool {
+        self.set_fullscreen_at(app, on, None)
+    }
+
+    /// G5 (22.11): [`Self::set_fullscreen`] on the monitor under the desktop
+    /// point `at` (Wayland `set_fullscreen(output)`: Wine names the monitor
+    /// the game chose); `None` - the monitor under the window.
+    pub fn set_fullscreen_at(&mut self, app: App, on: bool, at: Option<(i32, i32)>) -> bool {
         let Some(index) = self.index_of(app) else {
             return false;
         };
         let Some(rect) = self.windows.get(index).map(|window| window.rect) else {
             return false;
         };
-        let monitor = self.output_near(rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2);
+        let (px, py) = at.unwrap_or((rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2));
+        let monitor = self.output_near(px, py);
         let area = self.output_rects().get(monitor).copied().unwrap_or(self.primary);
         let focused = index == self.focus;
         let Some(window) = self.windows.get_mut(index) else {

@@ -261,6 +261,8 @@ fn run() {
             clients.push(client);
         }
         let now = crate::time::uptime_ms();
+        // G5: monitors switched on/off or moved - clients hear it this round.
+        refresh_outputs(now);
         clients.retain_mut(|client| {
             let alive = client.step(now);
             if !alive {
@@ -377,7 +379,8 @@ const GLOBALS: [(u32, &str, u32); 16] = [
     // запросы (`set_reactive`, `reposition`, `release`) принимаются молча.
     (4, "xdg_wm_base", 6),
     (5, "wl_seat", 5),
-    (6, "wl_output", 4),
+    // `wl_output` (v4) is not here: one global per lit monitor, names from
+    // [`FIRST_OUTPUT_GLOBAL`], added and removed with the layout (G5).
     // Буфер обмена и перетаскивание. Пока — объекты, принимающие запросы, и
     // ни одного предложения данных: Java (AWT на Wayland) без этого глобала не
     // заводит окно вовсе («Can't bind to the wl_data_device_manager»), а
@@ -414,7 +417,214 @@ const GLOBALS: [(u32, &str, u32); 16] = [
     // 22.11: video players and games keep the screensaver and screen off
     // away while an inhibitor lives (`power::inhibit`).
     (16, "zwp_idle_inhibit_manager_v1", 1),
+    // G5 (22.11): logical position and size of each monitor. Wine
+    // (winewayland) places monitors by these - without them all of them sat
+    // at 0,0 and it kept only one.
+    (17, "zxdg_output_manager_v1", 3),
 ];
+
+// ---- мониторы (G5, 22.11) ----------------------------------------------------------
+//
+// One `wl_output` global per lit monitor of the output registry
+// (`display::outputs`), in its coordinates - the primary monitor at 0,0 like
+// Windows: Wine takes the output at 0,0 as the primary one and builds
+// EnumDisplayMonitors from the logical positions (`zxdg_output_v1`). The
+// table is looked up again every [`OUTPUT_RECHECK_MS`]; a monitor switched
+// on or off in Settings -> Display adds or removes its global
+// (`wl_registry.global` / `global_remove`), a moved or re-moded one sends
+// new `geometry`/`mode`/logical position followed by `done`.
+
+/// Registry names of output globals start here (the static ones are below).
+const FIRST_OUTPUT_GLOBAL: u32 = 64;
+const OUTPUT_RECHECK_MS: u64 = 250;
+/// How often surfaces' monitors (`wl_surface.enter`/`leave`) are looked up.
+const ENTER_RECHECK_MS: u64 = 300;
+
+/// One monitor as clients see it.
+#[derive(Clone, PartialEq, Eq)]
+struct OutputInfo {
+    global: u32,
+    /// Driver output and monitor passport: the same monitor keeps its global.
+    key: String,
+    /// Registry coordinates: the primary monitor at 0,0.
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    mhz: u32,
+    mm: (i32, i32),
+    make: String,
+    model: String,
+    /// Connector-like name (`wl_output.name`, v4): `Virtual-1`, `DP-2`.
+    name: String,
+    description: String,
+    primary: bool,
+}
+
+impl OutputInfo {
+    fn rect(&self) -> Rect {
+        Rect::new(self.x, self.y, self.w, self.h)
+    }
+}
+
+struct OutputTable {
+    list: Vec<OutputInfo>,
+    next_global: u32,
+    /// Connector names handed out by key: a monitor switched off and on
+    /// again keeps its name (its global is new).
+    names: Vec<(String, String)>,
+    checked_ms: u64,
+    generation: u32,
+}
+
+static OUTPUT_TABLE: Mutex<OutputTable> =
+    Mutex::new(OutputTable { list: Vec::new(), next_global: FIRST_OUTPUT_GLOBAL, names: Vec::new(), checked_ms: 0, generation: 0 });
+
+/// Look the monitors up again (at most every [`OUTPUT_RECHECK_MS`]).
+fn refresh_outputs(now: u64) {
+    {
+        let table = OUTPUT_TABLE.lock();
+        if table.checked_ms != 0 && now.saturating_sub(table.checked_ms) < OUTPUT_RECHECK_MS {
+            return;
+        }
+    }
+    let registry = crate::display::outputs::list();
+    let lit: Vec<&crate::display::outputs::Output> = registry.iter().filter(|o| o.enabled && o.current.is_some()).collect();
+    // The registry keeps the primary at 0,0; normalised anyway.
+    let origin = lit.iter().find(|o| o.primary).map_or((0, 0), |o| (o.x, o.y));
+    let mut table = OUTPUT_TABLE.lock();
+    table.checked_ms = now.max(1);
+    let mut list: Vec<OutputInfo> = Vec::new();
+    for o in &lit {
+        let Some((w, h, mhz)) = o.current else { continue };
+        let key = match &o.monitor {
+            Some(m) => alloc::format!("{:?}/{}", o.backend, crate::display::outputs::monitor_key(m)),
+            None => alloc::format!("{:?}", o.backend),
+        };
+        let name = match table.names.iter().find(|(k, _)| *k == key) {
+            Some((_, name)) => name.clone(),
+            None => {
+                let (prefix, number) = match o.backend {
+                    crate::display::outputs::Backend::Virtio(n) => ("Virtual", n + 1),
+                    crate::display::outputs::Backend::Nvidia(_) => {
+                        ("DP", table.names.iter().filter(|(_, n)| n.starts_with("DP-")).count() + 1)
+                    }
+                    crate::display::outputs::Backend::Firmware => ("FB", 1),
+                };
+                let mut name = alloc::format!("{prefix}-{number}");
+                while table.names.iter().any(|(_, n)| *n == name) {
+                    name.push('b');
+                }
+                table.names.push((key.clone(), name.clone()));
+                name
+            }
+        };
+        let (make, model, mm) = match &o.monitor {
+            Some(m) => {
+                let model = if m.name.is_empty() { alloc::format!("{:04X}", m.product) } else { m.name.clone() };
+                let mm = if m.width_mm > 0 && m.height_mm > 0 { (m.width_mm as i32, m.height_mm as i32) } else { mm_at_96dpi(w, h) };
+                (String::from(m.maker_str()), model, mm)
+            }
+            None => (String::from("FossAi"), o.name.clone(), mm_at_96dpi(w, h)),
+        };
+        let description = alloc::format!("{} {} ({name})", make, model);
+        let global = table.list.iter().find(|old| old.key == key).map_or(0, |old| old.global);
+        list.push(OutputInfo {
+            global,
+            key,
+            x: o.x - origin.0,
+            y: o.y - origin.1,
+            w,
+            h,
+            mhz: if (10_000..=1_000_000).contains(&mhz) { mhz } else { 60_000 },
+            mm,
+            make,
+            model,
+            name,
+            description,
+            primary: o.primary,
+        });
+    }
+    // No registry (one firmware screen): the primary screen as it is.
+    if list.is_empty() {
+        let (w, h) = crate::ui::screen_size();
+        if w > 0 && h > 0 {
+            let global = table.list.iter().find(|old| old.key == "screen").map_or(0, |old| old.global);
+            list.push(OutputInfo {
+                global,
+                key: String::from("screen"),
+                x: 0,
+                y: 0,
+                w,
+                h,
+                mhz: PACE_OUTPUT_MHZ.load(Ordering::Relaxed) as u32,
+                mm: mm_at_96dpi(w, h),
+                make: String::from("FossAi"),
+                model: String::from("Screen"),
+                name: String::from("FB-1"),
+                description: String::from("FossAi Screen (FB-1)"),
+                primary: true,
+            });
+        }
+    }
+    for info in &mut list {
+        if info.global == 0 {
+            info.global = table.next_global;
+            table.next_global += 1;
+        }
+    }
+    if list != table.list {
+        let lines: Vec<String> = list
+            .iter()
+            .map(|o| alloc::format!("{} '{}' {}x{} at {},{}{}", o.global, o.name, o.w, o.h, o.x, o.y, if o.primary { " primary" } else { "" }))
+            .collect();
+        kprintln!("  wayland     : outputs: {}", lines.join("; "));
+        table.list = list;
+        table.generation = table.generation.wrapping_add(1);
+    }
+}
+
+/// Physical size of a `w`x`h` screen at 96 dots per inch, mm.
+fn mm_at_96dpi(w: u32, h: u32) -> (i32, i32) {
+    ((w * 254 / 960) as i32, (h * 254 / 960) as i32)
+}
+
+/// The middle of the monitor of output global `global`, in desktop
+/// coordinates (they start at the corner of the box around all monitors).
+fn output_point(global: u32) -> Option<(i32, i32)> {
+    let table = OUTPUT_TABLE.lock();
+    let o = table.list.iter().find(|o| o.global == global)?;
+    let left = table.list.iter().map(|o| o.x).min().unwrap_or(0);
+    let top = table.list.iter().map(|o| o.y).min().unwrap_or(0);
+    Some((o.x - left + o.w as i32 / 2, o.y - top + o.h as i32 / 2))
+}
+
+/// A window state request of `xdg_toplevel` (opcode: 9/10 maximize/unset,
+/// 11 fullscreen - on the monitor at `at` if given, 12 unset, 13 minimize)
+/// to the desktop. `true` - the desktop was busy: ask again.
+fn window_op(pid: u32, slot: u32, op: u16, at: Option<(i32, i32)>) -> bool {
+    let done = match op {
+        9 => crate::ui::maximize_window(pid, slot, true),
+        10 => crate::ui::maximize_window(pid, slot, false),
+        11 => match at {
+            Some(at) => crate::ui::fullscreen_window_at(pid, slot, at),
+            None => crate::ui::fullscreen_window(pid, slot, true),
+        },
+        12 => crate::ui::fullscreen_window(pid, slot, false),
+        13 => crate::ui::minimize_window(pid, slot),
+        _ => Ok(()),
+    };
+    if let Err(err) = &done {
+        kprintln!("  wayland     : #{pid} xdg_toplevel request {op}: desktop says {err:?}");
+    }
+    matches!(done, Err(crate::ui::WindowError::Busy))
+}
+
+/// The output table now: generation and monitors.
+fn outputs_now() -> (u32, Vec<OutputInfo>) {
+    let table = OUTPUT_TABLE.lock();
+    (table.generation, table.list.clone())
+}
 
 /// `zwp_pointer_constraints_v1.lifetime`: `persistent` - the constraint
 /// comes back each time its conditions hold again (oneshot ends for good).
@@ -787,6 +997,12 @@ struct Win {
     /// `set_fullscreen` пришёл до того, как окно открылось (20.11): исполнить
     /// при открытии.
     want_full: bool,
+    /// G5: the output global `set_fullscreen` named (Wine: the monitor the
+    /// game is on in its coordinates) - fullscreen goes there.
+    full_output: Option<u32>,
+    /// G5: a state request (maximize, fullscreen, minimize) the busy desktop
+    /// did not take yet: `xdg_toplevel` opcode and fullscreen monitor point.
+    op_due: Option<(u16, Option<(i32, i32)>)>,
     /// Буфер, который окно стола показывает без копии (D4, 20.11.2026):
     /// пиксели окна — прямо память dma-buf клиента. Держит память живой и
     /// возвращается клиенту, когда окно перейдёт на другой.
@@ -814,6 +1030,11 @@ struct Pop {
     owner: u32,
     /// Место от угла окна верхнего уровня.
     at: (i32, i32),
+    /// G5: where the parent (the window or a parent menu) is from that
+    /// corner - `xdg_popup.reposition` places from it again.
+    base: (i32, i32),
+    /// G5: a new place not yet given to the desktop (it was busy).
+    place_due: bool,
     geometry: Option<(i32, i32, u32, u32)>,
     open: Option<(u32, u32)>,
     dirty: bool,
@@ -845,7 +1066,12 @@ enum Obj {
     Seat,
     Pointer,
     Keyboard,
-    Output,
+    /// `wl_output` bound to the global `global` (G5), with its version.
+    Output { global: u32, version: u32 },
+    /// `zxdg_output_manager_v1` and `zxdg_output_v1` of the `wl_output`
+    /// object `output` (G5).
+    XdgOutputManager(u32),
+    XdgOutput { output: u32, version: u32 },
     DataDeviceManager,
     /// Источник данных клиента и форматы, которые он предложил.
     DataSource(Vec<String>),
@@ -902,7 +1128,9 @@ impl Obj {
             Self::Seat => "wl_seat",
             Self::Pointer => "wl_pointer",
             Self::Keyboard => "wl_keyboard",
-            Self::Output => "wl_output",
+            Self::Output { .. } => "wl_output",
+            Self::XdgOutputManager(_) => "zxdg_output_manager_v1",
+            Self::XdgOutput { .. } => "zxdg_output_v1",
             Self::DataDeviceManager => "wl_data_device_manager",
             Self::DataSource(_) => "wl_data_source",
             Self::DataDevice => "wl_data_device",
@@ -1009,6 +1237,14 @@ struct Client {
     /// G3: buffers replaced on screen that a display may still scan out (a
     /// page flip not on screen yet): `wl_buffer.release` waits for it.
     scan_held: Vec<(u32, Buffer)>,
+    /// G5: the monitors as last told to this client (globals announced and
+    /// what the bound `wl_output`s were sent), and the table generation.
+    outputs_told: Vec<OutputInfo>,
+    outputs_gen: u32,
+    /// G5: `wl_surface.enter` sent and not left: (surface, `wl_output`
+    /// object); when the monitors under surfaces were last looked up (ms).
+    entered: Vec<(u32, u32)>,
+    enter_checked_ms: u64,
 }
 
 /// A client gone with idle inhibitors alive: they end with it (22.11).
@@ -1066,6 +1302,10 @@ impl Client {
             pace_us: 0,
             tokens: 0,
             scan_held: Vec::new(),
+            outputs_told: Vec::new(),
+            outputs_gen: 0,
+            entered: Vec::new(),
+            enter_checked_ms: 0,
         }
     }
 
@@ -1104,6 +1344,8 @@ impl Client {
         let time = now as u32;
         self.release_scanned();
         self.answer_frames(now);
+        // G5: before requests, so a registry made now lists what is current.
+        self.sync_outputs();
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             match self.conn.recv(&mut buf) {
@@ -1145,6 +1387,7 @@ impl Client {
             if !self.constraints.is_empty() {
                 self.sync_constraints();
             }
+            self.sync_enter(now);
             let now_us = crate::time::uptime_ns() / 1000;
             for index in 0..self.wins.len() {
                 // Отложенный кадр без темпа (D7) — к своему сроку.
@@ -1152,6 +1395,9 @@ impl Client {
                     self.present(index);
                 }
                 let win = &mut self.wins[index];
+                if let (Some((op, at)), Some(_)) = (win.op_due, win.open) {
+                    win.op_due = window_op(self.pid, win.slot, op, at).then_some((op, at));
+                }
                 if win.title_due && win.open.is_some() {
                     win.title_due = crate::ui::title_window(self.pid, win.slot, &win.title).is_err();
                 }
@@ -1210,6 +1456,10 @@ impl Client {
                     self.objects.insert(registry, Obj::Registry);
                     for (name, interface, version) in GLOBALS {
                         self.send(Msg::new(registry, 0).u32(name).str(interface).u32(version));
+                    }
+                    let outputs: Vec<u32> = self.outputs_told.iter().map(|o| o.global).collect();
+                    for name in outputs {
+                        self.send(Msg::new(registry, 0).u32(name).str("wl_output").u32(4));
                     }
                 }
                 _ => {}
@@ -1433,14 +1683,39 @@ impl Client {
                     crate::power::inhibit(false);
                 }
             }
-            Obj::Callback | Obj::Region | Obj::Output | Obj::Keyboard => {
+            Obj::Callback | Obj::Region | Obj::Output { .. } | Obj::Keyboard => {
                 // `destroy`/`release` у тех, у кого он есть, — нулевой.
                 let destroys = match object {
                     Obj::Region => opcode == 0,
-                    Obj::Output | Obj::Keyboard => opcode == 0,
+                    Obj::Output { .. } | Obj::Keyboard => opcode == 0,
                     _ => false,
                 };
                 if destroys {
+                    self.entered.retain(|&(_, output)| output != id);
+                    self.delete(id);
+                }
+            }
+            // G5: `destroy`, `get_xdg_output(id, output)`.
+            Obj::XdgOutputManager(version) => {
+                let version = *version;
+                match opcode {
+                    0 => self.delete(id),
+                    1 => {
+                        let (new, output) = (args.u32()?, args.u32()?);
+                        self.objects.insert(new, Obj::XdgOutput { output, version });
+                        let info = match self.objects.get(&output) {
+                            Some(Obj::Output { global, .. }) => self.outputs_told.iter().find(|o| o.global == *global).cloned(),
+                            _ => None,
+                        };
+                        if let Some(info) = info {
+                            self.send_xdg_output(new, output, version, &info, true);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Obj::XdgOutput { .. } => {
+                if opcode == 0 {
                     self.delete(id);
                 }
             }
@@ -1776,11 +2051,23 @@ impl Client {
                     // «развернуть», и Wine, не видя состояния, крутил set/unset).
                     // До открытия окна — запомнить.
                     11 | 12 if !self.wins.iter().any(|win| win.toplevel == id && win.open.is_some()) => {
+                        let output = if opcode == 11 { self.output_global(args.u32()?) } else { None };
                         if let Some(win) = self.wins.iter_mut().find(|win| win.toplevel == id) {
                             win.want_full = opcode == 11;
+                            win.full_output = output;
                         }
                     }
-                    5 | 6 | 9 | 10 | 11 | 12 | 13 => {
+                    // G5: `set_fullscreen(output)` - on the monitor asked
+                    // (Wine: the one the game is on in its coordinates).
+                    11 => {
+                        let output = self.output_global(args.u32()?);
+                        let pid = self.pid;
+                        if let Some(win) = self.wins.iter_mut().find(|win| win.toplevel == id && win.open.is_some()) {
+                            let at = output.and_then(output_point);
+                            win.op_due = window_op(pid, win.slot, 11, at).then_some((11, at));
+                        }
+                    }
+                    5 | 6 | 9 | 10 | 12 | 13 => {
                         // `resize(seat, serial, edges)`: у Wayland верх 1, низ 2,
                         // лево 4, право 8 — у стола свои биты.
                         let edges = if opcode == 6 {
@@ -1800,17 +2087,22 @@ impl Client {
                         } else {
                             0
                         };
-                        if let Some(win) = self.wins.iter().find(|win| win.toplevel == id && win.open.is_some()) {
-                            let (pid, slot) = (self.pid, win.slot);
-                            let _ = match opcode {
-                                5 => crate::ui::begin_move(pid, slot),
-                                6 => crate::ui::begin_resize(pid, slot, edges),
-                                9 => crate::ui::maximize_window(pid, slot, true),
-                                10 => crate::ui::maximize_window(pid, slot, false),
-                                11 => crate::ui::fullscreen_window(pid, slot, true),
-                                12 => crate::ui::fullscreen_window(pid, slot, false),
-                                _ => crate::ui::minimize_window(pid, slot),
-                            };
+                        let pid = self.pid;
+                        if let Some(win) = self.wins.iter_mut().find(|win| win.toplevel == id && win.open.is_some()) {
+                            let slot = win.slot;
+                            match opcode {
+                                5 => {
+                                    let _ = crate::ui::begin_move(pid, slot);
+                                }
+                                6 => {
+                                    let _ = crate::ui::begin_resize(pid, slot, edges);
+                                }
+                                // G5 (22.11): the desktop busy (a flight, a
+                                // frame) - asked again on the next rounds, not
+                                // lost (a second set_minimized right after a
+                                // restore was dropped in `wayland-multihead`).
+                                _ => win.op_due = window_op(pid, slot, opcode, None).then_some((opcode, None)),
+                            }
                         }
                     }
                     _ => {}
@@ -1827,6 +2119,10 @@ impl Client {
                     if let Some(pop) = self.pops.iter_mut().find(|pop| pop.popup == id) {
                         pop.grab = true;
                     }
+                }
+                2 => {
+                    let (positioner, token) = (args.u32()?, args.u32()?);
+                    self.reposition_popup(id, positioner, token);
                 }
                 _ => {}
             },
@@ -1864,6 +2160,22 @@ impl Client {
     }
 
     fn bind(&mut self, name: u32, interface: &str, version: u32, new: u32) {
+        // G5: a monitor. One removed meanwhile (its `global_remove` still on
+        // the way) gets an inert object, as the protocol asks.
+        if name >= FIRST_OUTPUT_GLOBAL {
+            if interface != "wl_output" {
+                self.fail(1, 0, "interface does not match the global");
+                return;
+            }
+            let version = version.clamp(1, 4);
+            self.objects.insert(new, Obj::Output { global: name, version });
+            if let Some(info) = self.outputs_told.iter().find(|o| o.global == name).cloned() {
+                self.send_output(new, version, &info, true);
+                // Already on screen: its surfaces are on this monitor too.
+                self.enter_checked_ms = 0;
+            }
+            return;
+        }
         let Some((_, global, ours)) = GLOBALS.iter().find(|(number, _, _)| *number == name) else {
             self.fail(1, 0, "no such global");
             return;
@@ -1889,7 +2201,7 @@ impl Client {
             14 => Obj::Activation,
             15 => Obj::FractionalManager,
             16 => Obj::IdleInhibitManager,
-            _ => Obj::Output,
+            _ => Obj::XdgOutputManager(version),
         };
         self.objects.insert(new, object);
         if name == 4 {
@@ -1920,23 +2232,215 @@ impl Client {
                     self.send(Msg::new(new, 1).str("seat0"));
                 }
             }
-            6 => {
-                let (width, height) = crate::ui::screen_size();
-                // Физический размер — как у экрана 96 точек на дюйм.
-                let (mm_w, mm_h) = ((width * 254 / 960) as i32, (height * 254 / 960) as i32);
-                self.send(Msg::new(new, 0).i32(0).i32(0).i32(mm_w).i32(mm_h).i32(0).str("FossAi").str("Screen").i32(0));
-                // Частота — настоящая (D4, 20.11): Wine и DXVK видят 144 Гц,
-                // а не всегда 60.
-                let _ = pace_mhz();
-                let refresh = PACE_OUTPUT_MHZ.load(Ordering::Relaxed) as i32;
-                self.send(Msg::new(new, 1).u32(3).i32(width as i32).i32(height as i32).i32(refresh));
-                if version >= 2 {
-                    self.send(Msg::new(new, 3).i32(1));
-                    self.send(Msg::new(new, 2));
-                }
-            }
             _ => {}
         }
+    }
+
+    /// G5: `wl_output` events of a monitor - `geometry` (place in the
+    /// registry's desktop, size in mm and make/model from EDID), `mode`
+    /// (current + preferred, the real refresh: Wine and DXVK see 144 Hz),
+    /// `scale` 1, and on bind `name`/`description` (v4); then `done`
+    /// unless an `zxdg_output_v1` update follows.
+    fn send_output(&mut self, id: u32, version: u32, info: &OutputInfo, first: bool) {
+        self.send(
+            Msg::new(id, 0)
+                .i32(info.x)
+                .i32(info.y)
+                .i32(info.mm.0)
+                .i32(info.mm.1)
+                .i32(0)
+                .str(&info.make)
+                .str(&info.model)
+                .i32(0),
+        );
+        self.send(Msg::new(id, 1).u32(3).i32(info.w as i32).i32(info.h as i32).i32(info.mhz as i32));
+        if version >= 2 {
+            self.send(Msg::new(id, 3).i32(1));
+        }
+        if version >= 4 {
+            if first {
+                self.send(Msg::new(id, 4).str(&info.name));
+            }
+            self.send(Msg::new(id, 5).str(&info.description));
+        }
+        if version >= 2 {
+            self.send(Msg::new(id, 2));
+        }
+    }
+
+    /// G5: `zxdg_output_v1` events - logical position and size (scale 1:
+    /// the mode), `name`/`description` (v2), then `done` (v1/v2) or, from
+    /// v3, `wl_output.done` of its output (`done_too`).
+    fn send_xdg_output(&mut self, id: u32, output: u32, version: u32, info: &OutputInfo, done_too: bool) {
+        self.send(Msg::new(id, 0).i32(info.x).i32(info.y));
+        self.send(Msg::new(id, 1).i32(info.w as i32).i32(info.h as i32));
+        if version >= 2 {
+            self.send(Msg::new(id, 3).str(&info.name));
+            self.send(Msg::new(id, 4).str(&info.description));
+        }
+        if version < 3 {
+            self.send(Msg::new(id, 2));
+        } else if done_too && matches!(self.objects.get(&output), Some(Obj::Output { version, .. }) if *version >= 2) {
+            self.send(Msg::new(output, 2));
+        }
+    }
+
+    /// The output global of a `wl_output` object of this client (0 - none).
+    fn output_global(&self, object: u32) -> Option<u32> {
+        match self.objects.get(&object) {
+            Some(Obj::Output { global, .. }) => Some(*global),
+            _ => None,
+        }
+    }
+
+    /// G5: tell the client what changed in the monitors - new globals,
+    /// removed globals, and new geometry/mode/position of bound outputs.
+    fn sync_outputs(&mut self) {
+        let generation = OUTPUT_TABLE.lock().generation;
+        if generation == self.outputs_gen {
+            return;
+        }
+        let (generation, now) = outputs_now();
+        self.outputs_gen = generation;
+        let old = core::mem::replace(&mut self.outputs_told, now.clone());
+        let registries: Vec<u32> = self.objects.iter().filter(|(_, obj)| matches!(obj, Obj::Registry)).map(|(id, _)| *id).collect();
+        for gone in old.iter().filter(|o| !now.iter().any(|n| n.global == o.global)) {
+            for &registry in &registries {
+                self.send(Msg::new(registry, 1).u32(gone.global));
+            }
+        }
+        for added in now.iter().filter(|n| !old.iter().any(|o| o.global == n.global)) {
+            for &registry in &registries {
+                self.send(Msg::new(registry, 0).u32(added.global).str("wl_output").u32(4));
+            }
+        }
+        // Bound outputs whose monitor moved or changed mode.
+        let bound: Vec<(u32, u32, u32)> = self
+            .objects
+            .iter()
+            .filter_map(|(id, obj)| match obj {
+                Obj::Output { global, version } => Some((*id, *global, *version)),
+                _ => None,
+            })
+            .collect();
+        for (id, global, version) in bound {
+            let (Some(before), Some(after)) = (old.iter().find(|o| o.global == global), now.iter().find(|n| n.global == global)) else {
+                continue;
+            };
+            if before == after {
+                continue;
+            }
+            let after = after.clone();
+            let xdg: Vec<(u32, u32)> = self
+                .objects
+                .iter()
+                .filter_map(|(xid, obj)| match obj {
+                    Obj::XdgOutput { output, version } if *output == id => Some((*xid, *version)),
+                    _ => None,
+                })
+                .collect();
+            // `done` once, after the xdg_output events.
+            self.send(
+                Msg::new(id, 0)
+                    .i32(after.x)
+                    .i32(after.y)
+                    .i32(after.mm.0)
+                    .i32(after.mm.1)
+                    .i32(0)
+                    .str(&after.make)
+                    .str(&after.model)
+                    .i32(0),
+            );
+            self.send(Msg::new(id, 1).u32(3).i32(after.w as i32).i32(after.h as i32).i32(after.mhz as i32));
+            if version >= 4 && before.description != after.description {
+                self.send(Msg::new(id, 5).str(&after.description));
+            }
+            for (xid, xversion) in xdg {
+                self.send_xdg_output(xid, id, xversion, &after, false);
+            }
+            if version >= 2 {
+                self.send(Msg::new(id, 2));
+            }
+        }
+        // Surfaces may be on other monitors now.
+        self.enter_checked_ms = 0;
+    }
+
+    /// G5: `wl_surface.enter`/`leave` - every surface of a window (and of a
+    /// menu) is on the monitors its window overlaps, looked up every
+    /// [`ENTER_RECHECK_MS`] (windows are dragged between monitors).
+    fn sync_enter(&mut self, now: u64) {
+        if self.enter_checked_ms != 0 && now.saturating_sub(self.enter_checked_ms) < ENTER_RECHECK_MS {
+            return;
+        }
+        let outputs: Vec<(u32, u32)> = self
+            .objects
+            .iter()
+            .filter_map(|(id, obj)| match obj {
+                Obj::Output { global, .. } => Some((*id, *global)),
+                _ => None,
+            })
+            .collect();
+        if outputs.is_empty() && self.entered.is_empty() {
+            self.enter_checked_ms = now.max(1);
+            return;
+        }
+        // Desktop coordinates start at the corner of the box around all
+        // monitors; the table's at the primary monitor.
+        let left = self.outputs_told.iter().map(|o| o.x).min().unwrap_or(0);
+        let top = self.outputs_told.iter().map(|o| o.y).min().unwrap_or(0);
+        let mut roots: Vec<(u32, u32)> = self.wins.iter().filter(|win| win.open.is_some()).map(|win| (win.surface, win.slot)).collect();
+        roots.extend(self.pops.iter().filter(|pop| pop.open.is_some()).map(|pop| (pop.surface, pop.slot)));
+        let mut want: Vec<(u32, u32)> = Vec::new();
+        let mut root_ids: Vec<u32> = Vec::new();
+        for (root, slot) in roots {
+            root_ids.push(root);
+            let mut tree = vec![root];
+            let mut at = 0;
+            while at < tree.len() && tree.len() < 64 {
+                if let Some(Obj::Surface(state)) = self.objects.get(&tree[at]) {
+                    tree.extend(state.children.iter().copied());
+                }
+                at += 1;
+            }
+            let Some(rect) = crate::ui::window_rect(self.pid, slot) else {
+                // The desktop was busy (or the window not there yet): what
+                // was entered stays until the next look.
+                want.extend(self.entered.iter().copied().filter(|(surface, _)| tree.contains(surface)));
+                continue;
+            };
+            let rect = rect.translate(left, top);
+            let on: Vec<u32> = outputs
+                .iter()
+                .filter(|(_, global)| self.outputs_told.iter().any(|o| o.global == *global && !o.rect().intersect(&rect).is_empty()))
+                .map(|(id, _)| *id)
+                .collect();
+            for surface in tree {
+                for &output in &on {
+                    want.push((surface, output));
+                }
+            }
+        }
+        self.enter_checked_ms = now.max(1);
+        let alive = |objects: &BTreeMap<u32, Obj>, (surface, output): (u32, u32)| {
+            matches!(objects.get(&surface), Some(Obj::Surface(_))) && matches!(objects.get(&output), Some(Obj::Output { .. }))
+        };
+        let entered = core::mem::take(&mut self.entered);
+        for pair in entered.iter().copied() {
+            if alive(&self.objects, pair) && !want.contains(&pair) {
+                self.send(Msg::new(pair.0, 1).u32(pair.1));
+            }
+        }
+        for pair in want.iter().copied() {
+            if !entered.contains(&pair) {
+                self.send(Msg::new(pair.0, 0).u32(pair.1));
+                let global = self.output_global(pair.1).unwrap_or(0);
+                if let Some(o) = self.outputs_told.iter().find(|o| o.global == global).filter(|_| root_ids.contains(&pair.0)) {
+                    kprintln!("  wayland     : #{} surface {} entered output '{}'", self.pid, pair.0, o.name);
+                }
+            }
+        }
+        self.entered = want;
     }
 
     fn surface_request(&mut self, id: u32, opcode: u16, args: &mut Args<'_>) -> Result<(), Bad> {
@@ -1962,6 +2466,7 @@ impl Client {
                     self.feedback_end(feedback, None);
                 }
                 self.feedback_discard(|surface, _| surface == id);
+                self.entered.retain(|&(surface, _)| surface != id);
                 self.delete(id);
             }
             1 => {
@@ -1995,6 +2500,50 @@ impl Client {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Where a popup goes from its parent's corner (`base` from the owner's
+    /// pixels): bounds - the monitor under the anchor rectangle (its middle),
+    /// counted from the owner's pixels like the popup itself
+    /// (`Compositor::popup_rect`; G5).
+    fn popup_place(&self, owner: u32, base: (i32, i32), place: &Positioner) -> (i32, i32) {
+        let (ax, ay, aw, ah) = place.anchor;
+        let point = (base.0 + ax + aw / 2, base.1 + ay + ah / 2);
+        let (origin, area) = crate::ui::popup_bounds(self.pid, owner, point).unwrap_or_else(|| {
+            let (sw, sh) = crate::ui::screen_size();
+            ((0, 0), Rect::new(0, 0, sw, sh))
+        });
+        place.constrain((origin.0 + base.0, origin.1 + base.1), area)
+    }
+
+    /// G5 (22.11): `xdg_popup.reposition(positioner, token)` (xdg_wm_base 3+):
+    /// placed again by the new positioner - `repositioned(token)`, then
+    /// `configure` with the new place and size and `xdg_surface.configure`;
+    /// an open menu moves at once, a new size comes with the client's commit.
+    fn reposition_popup(&mut self, popup: u32, positioner: u32, token: u32) {
+        let Some(index) = self.pops.iter().position(|pop| pop.popup == popup) else {
+            return;
+        };
+        let place = match self.objects.get(&positioner) {
+            Some(Obj::Positioner(place)) => *place,
+            _ => return,
+        };
+        let (owner, base, xdg) = (self.pops[index].owner, self.pops[index].base, self.pops[index].xdg);
+        let (x, y) = self.popup_place(owner, base, &place);
+        let at = (base.0 + x, base.1 + y);
+        let pid = self.pid;
+        let pop = &mut self.pops[index];
+        if pop.at != at {
+            pop.at = at;
+            // The desktop busy - placed with the next paint.
+            pop.place_due = pop.open.is_some() && crate::ui::place_window(pid, pop.slot, at).is_err();
+            pop.dirty |= pop.place_due;
+        }
+        kprintln!("  wayland     : #{pid} popup repositioned to {},{} {}x{}", at.0, at.1, place.width, place.height);
+        self.send(Msg::new(popup, 2).u32(token));
+        self.send(Msg::new(popup, 0).i32(x).i32(y).i32(place.width.max(1)).i32(place.height.max(1)));
+        let serial = self.next_serial();
+        self.send(Msg::new(xdg, 0).u32(serial));
     }
 
     fn xdg_surface_request(&mut self, id: u32, surface: u32, opcode: u16, args: &mut Args<'_>) -> Result<(), Bad> {
@@ -2038,6 +2587,8 @@ impl Client {
                     title_due: false,
                     close_asked: 0,
                     want_full: false,
+                    full_output: None,
+                    op_due: None,
                     adopted: None,
                     stash: None,
                     presented_us: 0,
@@ -2070,16 +2621,7 @@ impl Client {
                     self.send(Msg::new(new, 1));
                     return Ok(());
                 };
-                // G5: bounds - the monitor under the anchor rectangle (its
-                // middle), counted from the owner's pixels like the popup
-                // itself (`Compositor::popup_rect`).
-                let (ax, ay, aw, ah) = place.anchor;
-                let point = (base.0 + ax + aw / 2, base.1 + ay + ah / 2);
-                let (origin, area) = crate::ui::popup_bounds(self.pid, owner, point).unwrap_or_else(|| {
-                    let (sw, sh) = crate::ui::screen_size();
-                    ((0, 0), Rect::new(0, 0, sw, sh))
-                });
-                let (x, y) = place.constrain((origin.0 + base.0, origin.1 + base.1), area);
+                let (x, y) = self.popup_place(owner, base, &place);
                 let slot = self.next_slot;
                 self.next_slot += 1;
                 self.pops.push(Pop {
@@ -2089,6 +2631,8 @@ impl Client {
                     slot,
                     owner,
                     at: (base.0 + x, base.1 + y),
+                    base,
+                    place_due: false,
                     geometry: None,
                     open: None,
                     dirty: false,
@@ -2758,8 +3302,13 @@ impl Client {
                 let _ = crate::ui::raw_keys_window(pid, win.slot);
                 kprintln!("  wayland     : #{pid} window '{}' {gw}x{gh}", win.title);
                 win.open = Some((gw, gh));
+                // G5: `wl_surface.enter` for its monitor right away.
+                self.enter_checked_ms = 0;
                 if core::mem::take(&mut win.want_full) {
-                    let _ = crate::ui::fullscreen_window(pid, win.slot, true);
+                    let _ = match win.full_output.take().and_then(output_point) {
+                        Some(at) => crate::ui::fullscreen_window_at(pid, win.slot, at),
+                        None => crate::ui::fullscreen_window(pid, win.slot, true),
+                    };
                 }
             }
             Some(size) if size != (gw, gh) => {
@@ -3002,6 +3551,7 @@ impl Client {
                 }
                 kprintln!("  wayland     : #{pid} popup {gw}x{gh} at {},{}", pop.at.0, pop.at.1);
                 pop.open = Some((gw, gh));
+                self.enter_checked_ms = 0;
             }
             Some(size) if size != (gw, gh) => {
                 let Some(pixels) = Surface::new(gw, gh, theme::window_bg()) else {
@@ -3013,6 +3563,9 @@ impl Client {
                 pop.open = Some((gw, gh));
             }
             Some(_) => {}
+        }
+        if pop.place_due {
+            pop.place_due = crate::ui::place_window(pid, pop.slot, pop.at).is_err();
         }
         let swap = mini_ui::format_code() == user_abi::PIXEL_RGB;
         let area = Rect::new(0, 0, gw, gh);

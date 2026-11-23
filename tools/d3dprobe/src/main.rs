@@ -1,5 +1,8 @@
 //! Проба DirectX для Proton в FossAi (12.11.2026, шаг 6 плана Proton).
 //!
+//! `d3dprobe.exe monitors` (G5, 22.11) - `EnumDisplayMonitors` and the virtual
+//! screen as Wine sees them (one line per monitor).
+//!
 //! `d3dprobe.exe hold [секунды]` (18.11) - скрытое окно держит `explorer` Wine живым
 //! между замерами `proton-bench`.
 //!
@@ -455,8 +458,72 @@ fn tone(hz: u32, seconds: u32) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// One monitor of `EnumDisplayMonitors` (G5, 22.11).
+unsafe extern "system" fn monitor_line(
+    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+    _dc: windows::Win32::Graphics::Gdi::HDC,
+    _rect: *mut RECT,
+    count: LPARAM,
+) -> windows::core::BOOL {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO, MONITORINFOEXW};
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    let ok = unsafe { GetMonitorInfoW(monitor, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) }.as_bool();
+    let r = info.monitorInfo.rcMonitor;
+    let w = info.monitorInfo.rcWork;
+    let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+    let name = String::from_utf16_lossy(&info.szDevice[..len]);
+    let index = unsafe { &mut *(count.0 as *mut u32) };
+    eprintln!(
+        "d3dprobe: monitor {index} '{name}' {},{} {}x{} work {},{} {}x{}{}{}",
+        r.left,
+        r.top,
+        r.right - r.left,
+        r.bottom - r.top,
+        w.left,
+        w.top,
+        w.right - w.left,
+        w.bottom - w.top,
+        if info.monitorInfo.dwFlags & 1 != 0 { " primary" } else { "" },
+        if ok { "" } else { " (GetMonitorInfo failed)" }
+    );
+    *index += 1;
+    true.into()
+}
+
+/// `d3dprobe.exe monitors`: what Wine says about the monitors -
+/// `EnumDisplayMonitors` with `GetMonitorInfo` and the virtual screen (G5,
+/// 22.11: winewayland builds them from the compositor's wl_outputs).
+fn monitors() {
+    use windows::Win32::Graphics::Gdi::EnumDisplayMonitors;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CMONITORS, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+    let mut count: u32 = 0;
+    let ok = unsafe { EnumDisplayMonitors(None, None, Some(monitor_line), LPARAM(&mut count as *mut u32 as isize)) }.as_bool();
+    let metric = |m| unsafe { GetSystemMetrics(m) };
+    eprintln!(
+        "d3dprobe: monitors {count}{} (SM_CMONITORS {}), primary {}x{}, virtual screen {},{} {}x{}",
+        if ok { "" } else { " (EnumDisplayMonitors failed)" },
+        metric(SM_CMONITORS),
+        metric(SM_CXSCREEN),
+        metric(SM_CYSCREEN),
+        metric(SM_XVIRTUALSCREEN),
+        metric(SM_YVIRTUALSCREEN),
+        metric(SM_CXVIRTUALSCREEN),
+        metric(SM_CYVIRTUALSCREEN)
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("monitors") {
+        eprintln!("d3dprobe: start, monitors");
+        monitors();
+        eprintln!("d3dprobe: done, monitors");
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("hold") {
         let seconds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3600);
         if let Err(err) = hold(seconds) {
