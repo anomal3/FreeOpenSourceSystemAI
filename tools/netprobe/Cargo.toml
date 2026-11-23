@@ -1,0 +1,20 @@
+[package]
+name = "netprobe"
+version = "0.1.0"
+edition = "2021"
+description = "Проба сети для Proton в FossAi: имя машины, DNS, TCP, HTTPS через WinHTTP (schannel) со временем каждого шага"
+
+# Отдельный проект для Windows (x86_64-pc-windows-msvc), не член рабочей области ядра.
+[workspace]
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+    "Win32_Networking_WinSock",
+]
+
+[profile.release]
+opt-level = "s"
+panic = "abort"

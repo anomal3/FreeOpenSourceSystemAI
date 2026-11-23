@@ -16444,3 +16444,63 @@ crystal.jpg с часами), 01b (растворение), 01c (galaxy.jpg), 09
 машины (ACPI S3) — вне задачи. Кэш заставки, как и обоев, на живой флешке в
 памяти: после перезагрузки фото переводятся заново (при первом простое).
 Растворение идёт шагами витка оболочки (100 мс), не кадрами 16 мс.
+
+## Сеть программ Windows под Proton: корни TLS, имя машины, сроки сокетов, журнал (22.11, hw-log15) - **сделано, проверить на железе (Uot)**
+
+hw-log15: Universe of Tanks (`F:\Uot\taot.exe`, Unity 6000.6 IL2CPP) под Proton
+писал «сервер не отвечает», на Windows работает. Клиент ходит по HTTPS
+(UnityWebRequest) на `https://site.blueboxproduction.ru` (`/health` со сроком
+5 с - это и есть «пинг сервера»; цепочка Let's Encrypt до ISRG Root X1). У
+программ Linux не было ни одного корневого сертификата (crypt32 Wine строит
+хранилище ROOT из `/etc/ssl/certs/ca-certificates.crt`), а имя машины не
+разрешалось без DNS (Wine: «Failed to resolve your host name IP», до 6 с).
+Сделано:
+- `linux/net.rs`: файл корней в путях Debian/Fedora/OpenSSL
+  (`/etc/ssl/certs/ca-certificates.crt`, `/etc/ssl/cert.pem`,
+  `/etc/pki/tls/certs/ca-bundle.crt`, `/usr/lib/ssl/cert.pem` ...) = корни
+  Mozilla (`assets/ca/cacert.pem`, 118 корней, в ядре через `include_bytes!`) +
+  свой `/etc/ca.pem` машины (если есть). `/etc/hosts` с `127.0.1.1 fossai`,
+  `/etc/hostname`; `uname` берёт то же имя (`net::HOSTNAME`).
+- Сокеты `AF_INET`: `setsockopt` запоминает значения (`getsockopt` их отдаёт,
+  разумные умолчания для `SO_KEEPALIVE`, `SO_LINGER`, `SO_REUSEADDR`, сроков,
+  `SO_PROTOCOL`, `SO_ACCEPTCONN`); `SO_RCVTIMEO`/`SO_SNDTIMEO` ограничивают
+  ждущие recv/send (`EAGAIN`) и connect (`EINPROGRESS`); `MSG_PEEK` (данные
+  остаются для следующего чтения; poll/FIONREAD их видят).
+- Журнал `linux-net` (не больше 40 строк за 10 с): каждое соединение TCP
+  (`tcp A:P connected in N ms` / `failed after N ms: refused|timed out`),
+  каждый запрос DNS с ответом (`dns A имя: rcode 0, 1 answer(s), first ...
+  in N ms`) и запрос без ответа (`no answer, gave up after N ms`).
+- `fossai-proton`: и без `+fps` вывод Wine идёт через цикл - строки `err:` в
+  журнал ядра (`proton: ИГРА: ...`); после выхода - главное из `Player.log`
+  Unity, изменённого за этот запуск (`proton: Unity log ...`,
+  `proton: Player.log: ...`, не больше 18 строк).
+- `tools/netprobe` (программа Windows, в пакете `share/fossai/netprobe.exe`):
+  шаги `self`, `name ИМЯ`, `tcp УЗЕЛ:ПОРТ`, `get URL` (WinHTTP/schannel, TLS
+  1.2-1.3; отказ TLS - с причиной: untrusted root / name mismatch ...),
+  `get! URL` (обязан не пройти). Итог `netprobe: done, all N as expected`.
+  На Windows (ПК) сверено: API Uot 200, untrusted-root.badssl.com -
+  «untrusted root (CA)».
+- Сценарий `proton-net` (с FOSSAI_WITH_PROTON=1, после `install`): DNS и
+  HTTPS настоящего API Uot из QEMU (23.11: `dns A site.blueboxproduction.ru:
+  rcode 0 ... in 23 ms`, AAAA 0 ответов за 25 мс, `tcp 62.113.100.6:443
+  connected in 99 ms`, `GET .../health -> HTTP 200` за 2,2 с через
+  WinHTTP/schannel с корнями Mozilla), имя машины `fossai -> 127.0.1.1` за
+  2-3 мс, TCP к стенду. Длинные строки `run` (больше ~150 знаков) стенд
+  набирает с потерями - пробы короткими запусками.
+
+Проверка на железе: в терминале
+`run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton /opt/proton/share/fossai/netprobe.exe self name site.blueboxproduction.ru get https://site.blueboxproduction.ru/health`
+(в журнале - `netprobe: ...` и `linux-net`), затем Uot со стола; в журнале
+`linux-net` (куда и как быстро ходила игра) и `proton: Player.log`. Весь
+журнал игры: `~/.proton/drive_c/users/steamuser/AppData/LocalLow/BlueBoxGaming/taot/Player.log`.
+
+**TODO.** HTTPS к стенду (`rustls`, корень стенда в `/etc/ca.pem`, сертификат
+на iPAddress) schannel Wine не проходит: TLS 1.3 WinHTTP Wine не предлагает
+(у серверов `proton-net` включён и 1.2, `start_host_tls12_site`), рукопожатие
+1.2 доходит до FINISHED, затем WinHTTP 12157 без флагов SECURE_FAILURE -
+смотреть `+secur32,+winhttp,+crypt` после рукопожатия (проверка сертификата
+стенда или чтение записи). Настоящие сайты (Let's Encrypt) проходят.
+IPv6 нет (`AF_INET6` - `EAFNOSUPPORT`; у API Uot записи AAAA нет).
+Unity берёт корни через crypt32 Wine - если `Player.log` покажет отказ
+проверки при работающем netprobe, смотреть `--debug=+crypt,+secur32`.
+Срок соединения TCP без ответа - сколько держит родной стек.

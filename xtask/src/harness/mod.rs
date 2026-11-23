@@ -766,6 +766,18 @@ fn execute(
     } else {
         None
     };
+    // Проба сети Proton (`proton-net`, 22.11): те же два HTTPS-сервера (корень
+    // гостя и чужой) на маленьком каталоге - без репозитория обновлений и без
+    // `/etc/update.cfg`, чтобы гость с Proton не начал обновляться.
+    let _netprobe_tls = if scenario.name == "proton-net" {
+        let root = netprobe_site()?;
+        Some((
+            start_host_tls12_site(root.clone(), ports.tls, tlskeys::trusted()?)?,
+            start_host_tls12_site(root, ports.stranger, tlskeys::stranger()?)?,
+        ))
+    } else {
+        None
+    };
 
     let mut extra: Vec<String> = scenario.qemu_args(arch).iter().map(|s| (*s).to_string()).collect();
     // `{wav}` — файл, куда QEMU пишет звук гостя (фаза 67e): свой у каждого
@@ -2241,15 +2253,24 @@ where
 /// половины одной ошибки согласны друг с другом. Расписание ключей, разбор
 /// расширений, порядок сообщений — всё это `rustls` делает по стандарту, а не
 /// так, как поняли его мы.
-fn start_host_tls_repo(
-    root: PathBuf,
-    port: u16,
-    material: tlskeys::Material,
-) -> Result<HostServer> {
+fn start_host_tls_repo(root: PathBuf, port: u16, material: tlskeys::Material) -> Result<HostServer> {
+    start_host_tls(root, port, material, false)
+}
+
+/// То же с TLS 1.2 (22.11): WinHTTP/schannel Wine в `proton-net` 1.3 не
+/// предлагает, а настоящие серверы (API Universe of Tanks) 1.2 принимают.
+fn start_host_tls12_site(root: PathBuf, port: u16, material: tlskeys::Material) -> Result<HostServer> {
+    start_host_tls(root, port, material, true)
+}
+
+fn start_host_tls(root: PathBuf, port: u16, material: tlskeys::Material, tls12: bool) -> Result<HostServer> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::sync::Arc;
 
-    let config = rustls::ServerConfig::builder()
+    // TLS 1.3, как было; 1.2 - только для `proton-net` ([`start_host_tls12_site`]).
+    let versions: &[&rustls::SupportedProtocolVersion] =
+        if tls12 { &[&rustls::version::TLS13, &rustls::version::TLS12] } else { &[&rustls::version::TLS13] };
+    let config = rustls::ServerConfig::builder_with_protocol_versions(versions)
         .with_no_client_auth()
         .with_single_cert(
             vec![CertificateDer::from(material.leaf_der)],
@@ -3178,6 +3199,30 @@ fn place_update_config(disk_path: &std::path::Path, ports: HostPorts) -> Result<
     fs.finish()
 }
 
+/// Каталог, который раздают HTTPS-серверы сценария `proton-net`: `health`
+/// (как у API Universe of Tanks) и `blob` в 256 КиБ (сотни записей TLS).
+fn netprobe_site() -> Result<PathBuf> {
+    let dir = paths::test_dir().join("netprobe-site");
+    std::fs::create_dir_all(&dir).with_context(|| format!("не удалось создать {}", dir.display()))?;
+    std::fs::write(dir.join("health"), b"{\"status\":\"ok\"}\n")?;
+    let blob: Vec<u8> = (0..256 * 1024).map(|index| (index % 251) as u8).collect();
+    std::fs::write(dir.join("blob"), blob)?;
+    Ok(dir)
+}
+
+/// Корень стенда - гостю в `/etc/ca.pem` (без `/etc/update.cfg`): ядро
+/// добавляет его к корням Mozilla в `/etc/ssl/certs/ca-certificates.crt`
+/// программ Linux, и Wine ему доверяет.
+fn place_ca_root(disk_path: &std::path::Path) -> Result<()> {
+    let ca = tlskeys::trusted()?.root_pem;
+    let mut fs = crate::statefs::StateVolume::open(disk_path)?;
+    match fs.write_file_path("etc/ca.pem", ca.as_bytes(), 0o644, 0, 0)? {
+        Some(_) => say!("стенд: гостю положен /etc/ca.pem с корнем стенда"),
+        None => say!("стенд: /etc/ca.pem у гостя уже лежит"),
+    }
+    fs.finish()
+}
+
 /// Стереть пути с раздела состояния гостя — до запуска.
 ///
 /// Файл — `unlink`, каталог — `rmdir` (только пустой: рекурсии нет намеренно,
@@ -3309,6 +3354,9 @@ fn prepare_drives(
             if scenario.host_repo {
                 prepare_repo(built)?;
                 place_update_config(&disk, ports)?;
+            }
+            if scenario.name == "proton-net" {
+                place_ca_root(&disk)?;
             }
             vec![Drive::Image(disk)]
         }

@@ -621,6 +621,29 @@ done
 unpct() { local e=${1//\%/\\x}; printf -v U '%b' "$e"; }
 # Строка и в журнал ядра (21.11): со стола у программы нет терминала.
 klog() { echo "$1"; [ -w /dev/kmsg ] && echo "$1" > /dev/kmsg; }
+# Журнал игры Unity (22.11, Uot «сервер не отвечает»): `Player.log` в
+# `ПРЕФИКС/drive_c/users/*/AppData/LocalLow/КОМПАНИЯ/ИГРА/`, изменённый за этот
+# запуск, - строки о сети, TLS, исключениях и версии движка в журнал ядра (не
+# больше 18: ядро берёт 20 строк /dev/kmsg в секунду). Весь файл - там же.
+unity_log() {
+    local f line k=0 more=0
+    [ -e /dev/kmsg ] || return 0
+    for f in "$WINEPREFIX"/drive_c/users/*/AppData/LocalLow/*/*/Player.log; do
+        [ -f "$f" ] && [ "$f" -nt "$C/run.mark" ] || continue
+        printf 'proton: Unity log %s\n' "${f#"$WINEPREFIX"/}" > /dev/kmsg
+        while IFS= read -r line; do
+            case $line in
+                *'Initialize engine version'*|*'Curl error'*|*SSL*|*TLS*|*ertificate*|*'Cannot connect'*|*'Cannot resolve'*|*'Unable to'*|*'Request timeout'*|*xception*|*'Нет связи'*)
+                    if [ $k -lt 18 ]; then
+                        k=$((k + 1)); printf 'proton: Player.log: %.300s\n' "${line%$'\r'}" > /dev/kmsg
+                    else
+                        more=$((more + 1))
+                    fi ;;
+            esac
+        done < "$f"
+        [ $more -gt 0 ] && printf 'proton: Player.log: %d more such line(s)\n' $more > /dev/kmsg
+    done
+}
 # Установленная TMNF (`ПРЕФИКС/drive_c/TmNationsForever/TmForever.exe`) из
 # «Файлов» или ярлыка «Пуска» (winemenubuilder установщика) - тем же путём,
 # что пункт пакета `tmnf`: его сценарий выбирает видеокарту (DXVK на NVK)
@@ -887,9 +910,13 @@ fi
 # строки Wine `trace:fps:… approx N fps` раз в 5 с сводятся в одну
 # `fps: ПРОГРАММА СРЕДНЕЕ (min, max)` в `/dev/kmsg` - fps игры видно в журнале
 # на флешке, даже при запуске со стола. Остальной вывод - в stderr как был.
+# С 22.11 и без `+fps` (hw-log15: у Uot и Case88 в журнале не было ни
+# строки Wine): строки `err:` - в журнал ядра, после выхода - главное из
+# `Player.log` игры Unity (unity_log).
 if [ -z "$B" ]; then
-    case ,$WINEDEBUG, in *,+fps,*) [ -e /dev/kmsg ] || exec $W "$@" ;; *) exec $W "$@" ;; esac
+    [ -e /dev/kmsg ] || exec $W "$@"
     p=${1##*/}; p=${p##*\\}; [ "$p" = explorer ] && { p=${3##*/}; p=${p##*\\}; }
+    : > "$C/run.mark" 2>/dev/null
     $W "$@" 2>&1 | {
         n=0; sum=0; lo=; hi=0; t=$SECONDS; k=0
         while IFS= read -r line; do
@@ -922,7 +949,9 @@ if [ -z "$B" ]; then
             fi
         done
     }
-    exit ${PIPESTATUS[0]}
+    rc=${PIPESTATUS[0]}
+    unity_log
+    exit $rc
 fi
 # Замер (`--bench`): вывод Wine идёт через этот цикл и дальше в stderr как
 # был; значения кадров - сотыми, арифметика bash целая. Источник один:
@@ -1011,6 +1040,9 @@ $W "$@" 2>&1 | {
     // Проба DirectX 9/11 (`tools/d3dprobe`, программа Windows) - для сценариев
     // wined3d и DXVK (12.11).
     files.push((String::from("share/fossai/d3dprobe.exe"), d3dprobe()?, 0o755));
+    // Проба сети (`tools/netprobe`, 22.11): имя машины, DNS, TCP, HTTPS через
+    // WinHTTP/schannel - сценарий `proton-net`; на железе - руками из терминала.
+    files.push((String::from("share/fossai/netprobe.exe"), windows_tool("netprobe")?, 0o755));
     // Установщик-проба (`tools/wininst`, 22.11): ярлыки «Пуска»/стола через
     // IShellLink и сопоставление .txt — сценарий `winapps-real`.
     files.push((String::from("share/fossai/wininst.exe"), windows_tool("wininst")?, 0o755));

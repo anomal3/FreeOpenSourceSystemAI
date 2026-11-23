@@ -415,8 +415,10 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::GETSOCKOPT => netlink::getsockopt(a0, a1, a2, a3, a4)
                 .or_else(|| net::getsockopt(a0, a1, a2, a3, a4))
                 .unwrap_or_else(|| ipc::getsockopt(a0, a1, a2, a3, a4)),
-            // Netlink принимает и забывает все (`SO_RCVBUF`, `SOL_NETLINK` …).
-            nr::SETSOCKOPT if net::is_inet(a0) || netlink::is_netlink(a0) => 0,
+            // Netlink принимает и забывает все (`SO_RCVBUF`, `SOL_NETLINK` …);
+            // `AF_INET` запоминает (сроки `SO_RCVTIMEO`/`SO_SNDTIMEO`, 22.11).
+            nr::SETSOCKOPT if net::is_inet(a0) => net::setsockopt(a0, a1, a2, a3, a4).unwrap_or(0),
+            nr::SETSOCKOPT if netlink::is_netlink(a0) => 0,
             nr::SETSOCKOPT => ipc::setsockopt(a0, a1, a2, a3, a4),
             nr::SENDMSG => netlink::sendmsg(a0, a1, a2).or_else(|| net::sendmsg(a0, a1, a2)).unwrap_or_else(|| ipc::sendmsg(a0, a1, a2)),
             nr::SENDMMSG => net::sendmmsg(a0, a1, a2, a3),
@@ -2276,7 +2278,7 @@ fn uname(out: usize) -> i64 {
     }
     // Версия ядра — такая, какую glibc примет за достаточно новую: она
     // сверяет её со своим минимумом и иначе отказывается работать.
-    let fields: [&[u8]; 6] = [b"Linux", b"fossai", b"6.1.0-fossai", b"#1 FossAi", b"x86_64", b"(none)"];
+    let fields: [&[u8]; 6] = [b"Linux", net::HOSTNAME.as_bytes(), b"6.1.0-fossai", b"#1 FossAi", b"x86_64", b"(none)"];
     for (index, field) in fields.iter().enumerate() {
         let at = out + index * FIELD;
         // SAFETY: весь буфер проверен на запись выше.
