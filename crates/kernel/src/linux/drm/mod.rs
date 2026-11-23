@@ -415,6 +415,9 @@ pub fn mmap_object(fd: usize, offset: u64, len: usize) -> Option<Result<(Arc<cra
     if let Some(file) = object.as_any().downcast_ref::<amdgpu::AmdFile>() {
         return Some(amdgpu::mmap_file(file, offset, len as u64));
     }
+    if let Some(buf) = object.as_any().downcast_ref::<amdgpu::AmdDmaBuf>() {
+        return Some(amdgpu::mmap_dmabuf(buf, offset, len as u64));
+    }
     let buf = object.as_any().downcast_ref::<gem::DmaBuf>()?;
     Some(gem::mmap_bo(&buf.0, offset, len as u64))
 }
@@ -428,6 +431,9 @@ pub fn mmap_object(fd: usize, offset: u64, len: usize) -> Option<Result<(Arc<cra
 /// пришедшей через `SCM_RIGHTS`. Память держит буфер живым, пока её держат.
 #[must_use]
 pub fn dmabuf_memory(object: &dyn Object) -> Option<(Arc<crate::user::shm::SharedMem>, u64)> {
+    if let Some(buf) = object.as_any().downcast_ref::<amdgpu::AmdDmaBuf>() {
+        return Some(buf.memory());
+    }
     let buf = object.as_any().downcast_ref::<gem::DmaBuf>()?;
     let bo = buf.bo();
     Some((gem::shared_of(bo)?, bo.size))
@@ -451,7 +457,7 @@ pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
         }
         return Some(answer);
     }
-    if object.as_any().downcast_ref::<gem::DmaBuf>().is_some() {
+    if object.as_any().downcast_ref::<gem::DmaBuf>().is_some() || object.as_any().downcast_ref::<amdgpu::AmdDmaBuf>().is_some() {
         return Some(gem::dmabuf_ioctl(&object, request, arg));
     }
     if object.as_any().downcast_ref::<sync::SyncFile>().is_some() || object.as_any().downcast_ref::<sync::SyncobjFile>().is_some() {

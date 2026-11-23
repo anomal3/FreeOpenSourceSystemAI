@@ -457,6 +457,74 @@ static i64 wait_cs(u32 ctx, u64 seq, u64 *status) {
     return r;
 }
 
+/* PRIME: так Mesa отдаёт изображения WSI (dma-buf в Wayland) и принимает чужие. */
+static void test_prime(void) {
+    u32 bo = 0;
+    i64 r = gem_create(1 << 16, 2 /* GTT */, &bo);
+    check_v(r == 0 && bo != 0, "PRIME: GEM_CREATE of the buffer to share", r);
+    u64 map_offset = bo;
+    io(DRM_IOCTL_AMDGPU_GEM_MMAP, &map_offset);
+    u32 *p = (u32 *)sys6(SYS_mmap, 0, 1 << 16, PROT_READ | PROT_WRITE, MAP_SHARED, drm, (i64)map_offset);
+    if ((u64)p < (u64)-4096) p[7] = 0xa5a5c3c3u;
+
+    struct drm_prime_handle ph = {bo, DRM_CLOEXEC | O_RDWR, -1};
+    r = io(DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph);
+    check_v(r == 0 && ph.fd >= 0, "PRIME_HANDLE_TO_FD gives a dma-buf fd", r);
+    struct drm_prime_handle bad = {bo, 0x7000, -1};
+    r = io(DRM_IOCTL_PRIME_HANDLE_TO_FD, &bad);
+    check_v(r == -EINVAL, "PRIME_HANDLE_TO_FD with unknown flags is EINVAL", r);
+    struct drm_prime_handle none = {0xdead, DRM_CLOEXEC, -1};
+    r = io(DRM_IOCTL_PRIME_HANDLE_TO_FD, &none);
+    check_v(r == -ENOENT, "PRIME_HANDLE_TO_FD of an unknown handle is ENOENT", r);
+    if (ph.fd < 0) return;
+
+    /* mmap самого dma-buf: те же страницы, что у узла */
+    u32 *q = (u32 *)sys6(SYS_mmap, 0, 1 << 16, PROT_READ | PROT_WRITE, MAP_SHARED, ph.fd, 0);
+    check_v((u64)q < (u64)-4096, "mmap of the dma-buf fd", (i64)q);
+    if ((u64)q < (u64)-4096) {
+        check_v(q[7] == 0xa5a5c3c3u, "the dma-buf shows what was written through the node mapping", q[7]);
+        q[9] = 0x1badf00du;
+        if ((u64)p < (u64)-4096) check_v(p[9] == 0x1badf00du, "a write through the dma-buf shows in the node mapping", p[9]);
+    }
+    check((i64)sys6(SYS_mmap, 0, 1 << 20, PROT_READ, MAP_SHARED, ph.fd, 0) < 0, "mmap past the end of the dma-buf is refused");
+
+    /* импорт в тот же файл: та же ручка; в другой файл узла: новая ручка и те же данные */
+    struct drm_prime_handle back = {0, 0, ph.fd};
+    r = io(DRM_IOCTL_PRIME_FD_TO_HANDLE, &back);
+    check_v(r == 0 && back.handle == bo, "PRIME_FD_TO_HANDLE in the same file gives the same handle", r);
+    struct drm_prime_handle wrong = {0, 0, drm};
+    r = io(DRM_IOCTL_PRIME_FD_TO_HANDLE, &wrong);
+    check_v(r == -EINVAL, "PRIME_FD_TO_HANDLE of a render node fd (not a dma-buf) is EINVAL", r);
+    struct drm_prime_handle badfd = {0, 0, 999};
+    r = io(DRM_IOCTL_PRIME_FD_TO_HANDLE, &badfd);
+    check_v(r == -EBADF, "PRIME_FD_TO_HANDLE of a closed fd is EBADF", r);
+
+    i64 second = open_render();
+    if (second >= 0) {
+        int first = drm;
+        drm = (int)second;
+        struct drm_prime_handle other = {0, 0, ph.fd};
+        r = io(DRM_IOCTL_PRIME_FD_TO_HANDLE, &other);
+        check_v(r == 0 && other.handle != 0, "PRIME_FD_TO_HANDLE in a second file of the node", r);
+        if (r == 0) {
+            u64 off2 = other.handle;
+            io(DRM_IOCTL_AMDGPU_GEM_MMAP, &off2);
+            u32 *s = (u32 *)sys6(SYS_mmap, 0, 1 << 16, PROT_READ | PROT_WRITE, MAP_SHARED, drm, (i64)off2);
+            if ((u64)s < (u64)-4096) check_v(s[7] == 0xa5a5c3c3u, "the importing file sees the same memory", s[7]);
+            io(DRM_IOCTL_GEM_CLOSE_, &other.handle);
+        }
+        drm = first;
+        sys3(SYS_close, second, 0, 0);
+    }
+    sys3(SYS_close, ph.fd, 0, 0);
+    /* буфер живёт, пока его держит хоть что-то: ручка и отображения остались */
+    struct drm_prime_handle again = {bo, DRM_CLOEXEC | O_RDWR, -1};
+    r = io(DRM_IOCTL_PRIME_HANDLE_TO_FD, &again);
+    check_v(r == 0 && again.fd >= 0, "after closing the dma-buf the handle still exports", r);
+    if (again.fd >= 0) sys3(SYS_close, again.fd, 0, 0);
+    io(DRM_IOCTL_GEM_CLOSE_, &bo);
+}
+
 static void test_cs(void) {
     u32 ib_bo = 0, data_bo = 0, ctx = 0, so = 0, tl = 0;
     gem_create(1 << 16, 2, &ib_bo);
@@ -568,6 +636,7 @@ __attribute__((used)) void start_c(u64 *sp) {
     cap(DRM_CAP_TIMESTAMP_MONOTONIC, 1, "GET_CAP TIMESTAMP_MONOTONIC is 1");
     test_info(sysfs_device, sysfs_rev);
     test_gem();
+    test_prime();
     test_cs();
     i64 r = sys3(SYS_close, drm, 0, 0);
     check_v(r == 0, "close the render node", r);

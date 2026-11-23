@@ -52,8 +52,9 @@ use nvgpu::uapi::{
     DRM_IOCTL_GEM_CLOSE as GEM_CLOSE, DRM_CAP_PRIME, DRM_CAP_SYNCOBJ, DRM_CAP_SYNCOBJ_TIMELINE, DRM_CAP_TIMESTAMP_MONOTONIC, DRM_IOCTL_AUTH_MAGIC as AUTH_MAGIC,
     DRM_IOCTL_BASE as DRM_TYPE, DRM_IOCTL_DROP_MASTER as DROP_MASTER, DRM_IOCTL_GET_CAP as GET_CAP,
     DRM_IOCTL_GET_MAGIC as GET_MAGIC, DRM_IOCTL_GET_UNIQUE as GET_UNIQUE, DRM_IOCTL_SET_CLIENT_CAP as SET_CLIENT_CAP,
+    DRM_IOCTL_PRIME_FD_TO_HANDLE as PRIME_FD_TO_HANDLE, DRM_IOCTL_PRIME_HANDLE_TO_FD as PRIME_HANDLE_TO_FD,
     DRM_IOCTL_SET_MASTER as SET_MASTER, DRM_IOCTL_VERSION as VERSION, DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_IMPORT, DrmGetCap,
-    DrmVersion,
+    DrmPrimeHandle, DrmVersion,
 };
 
 use super::sync::{Fence, SyncHost, Syncobj};
@@ -1549,6 +1550,8 @@ pub fn ioctl(file: &AmdFile, request: u32, arg: usize) -> i64 {
         }
         GET_MAGIC | AUTH_MAGIC | SET_MASTER | DROP_MASTER => -e::EACCES,
         GEM_CLOSE => gem_close(file, arg),
+        PRIME_HANDLE_TO_FD => prime_handle_to_fd(file, arg),
+        PRIME_FD_TO_HANDLE => prime_fd_to_handle(file, arg),
         _ if (request >> 8) & 0xff != DRM_TYPE => -e::ENOTTY,
         // Объекты синхронизации — общий код DRM.
         _ if let Some(answer) = super::sync::ioctl(file, request, arg) => answer,
@@ -1567,6 +1570,80 @@ pub fn ioctl(file: &AmdFile, request: u32, arg: usize) -> i64 {
             _ => -e::ENOTTY,
         },
     }
+}
+
+/// dma-buf fd буфера AMD: так буфер уходит другому процессу или API (Wayland `zwp_linux_dmabuf_v1`).
+pub struct AmdDmaBuf(Arc<AmdBo>);
+
+impl Object for AmdDmaBuf {
+    fn read(&self, _buf: &mut [u8]) -> Result<usize, i64> {
+        Err(-e::EINVAL)
+    }
+    fn write(&self, _data: &[u8]) -> Result<usize, i64> {
+        Err(-e::EINVAL)
+    }
+    fn readiness(&self) -> (bool, bool, bool) {
+        (true, true, false)
+    }
+    fn mode(&self) -> u32 {
+        0
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl AmdDmaBuf {
+    /// Память буфера для `mmap` и для сервера Wayland, и его длина.
+    pub(super) fn memory(&self) -> (Arc<SharedMem>, u64) {
+        (self.0.shared(), self.0.size)
+    }
+}
+
+/// `mmap` dma-buf AMD: тот же разделяемый объект, что у `GEM_MMAP`.
+pub(super) fn mmap_dmabuf(buf: &AmdDmaBuf, offset: u64, len: u64) -> Result<(Arc<SharedMem>, u64), i64> {
+    if offset.checked_add(len).is_none_or(|end| end > buf.0.size) {
+        return Err(-e::EINVAL);
+    }
+    Ok((buf.0.shared(), offset))
+}
+
+/// `DRM_IOCTL_PRIME_HANDLE_TO_FD`: dma-buf fd буфера (`drm_gem_prime_handle_to_fd`: флаги - CLOEXEC и RDWR).
+fn prime_handle_to_fd(file: &AmdFile, arg: usize) -> i64 {
+    const O_RDWR: u32 = 2;
+    const O_CLOEXEC: u32 = 0o2_000_000;
+    let Ok(mut args) = get::<DrmPrimeHandle>(arg) else { return -e::EFAULT };
+    if args.flags & !(O_RDWR | O_CLOEXEC) != 0 {
+        return -e::EINVAL;
+    }
+    let Some(bo) = file.st.lock().bos.get(&args.handle).cloned() else { return -e::ENOENT };
+    let fd = super::install(Arc::new(AmdDmaBuf(bo)), false, args.flags & O_CLOEXEC != 0);
+    if fd < 0 {
+        return fd;
+    }
+    args.fd = fd as i32;
+    if put(arg, args).is_err() { -e::EFAULT } else { 0 }
+}
+
+/// `DRM_IOCTL_PRIME_FD_TO_HANDLE`: ручка для dma-buf; если буфер уже есть у файла - та же ручка.
+fn prime_fd_to_handle(file: &AmdFile, arg: usize) -> i64 {
+    let Ok(mut args) = get::<DrmPrimeHandle>(arg) else { return -e::EFAULT };
+    let Some(object) = super::object_of(args.fd as u32 as usize) else { return -e::EBADF };
+    let Some(buf) = object.as_any().downcast_ref::<AmdDmaBuf>() else { return -e::EINVAL };
+    let handle = {
+        let mut st = file.st.lock();
+        match st.bos.iter().find(|(_, bo)| Arc::ptr_eq(bo, &buf.0)) {
+            Some((handle, _)) => *handle,
+            None => {
+                let handle = st.next_bo;
+                st.next_bo += 1;
+                st.bos.insert(handle, Arc::clone(&buf.0));
+                handle
+            }
+        }
+    };
+    args.handle = handle;
+    if put(arg, args).is_err() { -e::EFAULT } else { 0 }
 }
 
 /// Имя драйвера для строки состояния оболочки.
