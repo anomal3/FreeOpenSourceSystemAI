@@ -57,6 +57,8 @@ miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-a
 # JPEG, а ядро читает только QOI. Без `std` и без SIMD-обнаружения (оно из
 # `std`): разбор скалярный, обои переводятся один раз при выборе.
 zune-jpeg = { version = "0.4", default-features = false }
+# «Запись экрана» (22.11, `screenrec`): кодер JPEG и запись AVI (MJPEG).
+screencast = { path = "../screencast" }
 
 [lints]
 workspace = true

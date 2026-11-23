@@ -2397,6 +2397,22 @@ impl Compositor {
         self.mark(rect);
     }
 
+    /// Where a notification goes (22.11, `capture`): the primary monitor and
+    /// the top of its panel.
+    #[must_use]
+    pub fn toast_place(&self) -> (Rect, i32) {
+        (self.primary, self.panel.as_ref().map_or(self.primary.bottom(), |panel| panel.home().y))
+    }
+
+    /// Show a notification built outside (22.11, «Запись сохранена»).
+    pub fn show_toast(&mut self, mut toast: super::toast::Toast) {
+        let placed = self.beside_panel(toast.rect, toast.rect);
+        toast.move_to(placed);
+        self.close_toast();
+        self.mark_layer(toast.rect);
+        self.toast = Some(toast);
+    }
+
     /// Убрать уведомление; вернуть, что оно запускало бы.
     pub fn close_toast(&mut self) -> Option<(alloc::string::String, fpk::Rights)> {
         let toast = self.toast.take()?;
@@ -5078,6 +5094,12 @@ impl Compositor {
             return;
         }
         self.apply_pending_size();
+        // Screen recorder (22.11): the captured rectangle once, to fill its mirror.
+        if super::capture::active() {
+            if let Some(rect) = super::capture::take_repaint() {
+                self.mark(rect);
+            }
+        }
         // Указатель мог сдвинуться не мышью — смена режима ставит его в
         // середину нового экрана. Курсор адаптера догоняет здесь.
         if self.hw_cursor {
@@ -5133,6 +5155,12 @@ impl Compositor {
         let plan = self.direct_plan();
         self.apply_direct_plan(&plan);
         let flips = self.flip_plan(&plan);
+        // Screen recorder (22.11): the pointer is in the composed frame only
+        // when the compositor draws it and no output shows a window directly.
+        if super::capture::active() {
+            let drawn = !self.hw_cursor && !theme::is_mobile() && plan.iter().all(Option::is_none);
+            super::capture::note_pointer(&self.pointer, drawn);
+        }
         if !self.damage_overflow && self.damage_count == 0 {
             return;
         }
@@ -5291,10 +5319,18 @@ impl Compositor {
             match plan[index] {
                 // The display shows the client buffer itself: nothing to copy
                 // (virtio-gpu transfers the changed part after the flip).
-                Some(_) if flips[index].is_some() => {
+                Some(window) if flips[index].is_some() => {
                     let o = self.outputs[index].rect;
                     let local = Rect::new(part.x - o.x, part.y - o.y, part.w, part.h);
                     self.flip_touched[index] = Some(self.flip_touched[index].map_or(local, |r| r.union(&local)));
+                    // Screen recorder (22.11): the frame is the client buffer.
+                    if super::capture::active() {
+                        if let Some(shown) = self.windows.get(window) {
+                            if let Some(pixels) = shown.direct_pixels() {
+                                super::capture::put(part, pixels, part.x - shown.rect.x, part.y - shown.rect.y);
+                            }
+                        }
+                    }
                 }
                 Some(window) => self.blit_direct(index, window, part),
                 None => self.compose(part),
@@ -5486,6 +5522,11 @@ impl Compositor {
         let o = out.rect;
         let w = window.rect;
         out.screen.blit(pixels, (part.x - o.x, part.y - o.y), Rect::new(part.x - w.x, part.y - w.y, part.w, part.h));
+        // Screen recorder (22.11): without the pointer patch (it is patched
+        // into grabbed frames, see `capture::note_pointer`).
+        if super::capture::active() {
+            super::capture::put(part, pixels, part.x - w.x, part.y - w.y);
+        }
         if !self.hw_cursor && self.pointer.is_visible() {
             let spot = self.pointer.rect().intersect(&part);
             if !spot.is_empty() {
@@ -5810,6 +5851,10 @@ impl Compositor {
                     (part.x - out.rect.x, part.y - out.rect.y),
                     Rect::new(part.x, part.y - band.y, part.w, part.h),
                 );
+                // Screen recorder (22.11): the same band into its mirror.
+                if super::capture::active() {
+                    super::capture::put(part, &back, part.x, part.y - band.y);
+                }
                 // По монитору порознь (P1): сканаут во VRAM и в обычной
                 // памяти стоят по-разному.
                 super::note_output_blit(

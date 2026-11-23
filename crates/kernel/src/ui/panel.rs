@@ -375,6 +375,19 @@ pub enum TrayItem {
     Clock,
     /// Колокол: уведомления и быстрые настройки (02.11, макет 05).
     Bell,
+    /// Screen recording runs (22.11): red dot and elapsed time; a click
+    /// stops it.
+    Recording,
+}
+
+/// Elapsed time of the screen recording for the tray: `0:07`, `12:34`,
+/// `1:02:03`.
+fn recording_text(seconds: u64) -> String {
+    if seconds >= 3600 {
+        alloc::format!("{}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60)
+    } else {
+        alloc::format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
 }
 
 /// Значки трея вместе с их местом на плашке.
@@ -1207,6 +1220,11 @@ impl Panel {
         let _ = mono;
         // Сеть, звук, раскладка, часы, колокол (макет 05).
         let mut status_w = (glyph + step) * 2 + body.width(lang) + step + clock_w + step + glyph;
+        // Screen recording (22.11): red dot and elapsed time before the network.
+        let recording = super::capture::elapsed_s().map(recording_text);
+        let dot = ctx.px(10);
+        let recording_w = recording.as_deref().map_or(0, |text| dot + ctx.px(6) + body.width(text) + step);
+        status_w += recording_w;
         // Совсем узкий экран: показать всё нельзя, и тогда правого края нет
         // вовсе. Обрезанное наполовину число хуже отсутствующего — по нему не
         // понять, что именно обрезано.
@@ -1314,6 +1332,16 @@ impl Panel {
                 let t = mini_ui::classic::unit(self.scale);
                 let well = Rect::new(x - half - ctx.px(2) as i32, layout.brand.y, (plate.right() - m.plate_pad() as i32 / 2 - (x - half - ctx.px(2) as i32)).max(0) as u32, layout.brand.h);
                 mini_ui::classic::shallow(&mut self.surface, well, t);
+            }
+
+            // Screen recording (22.11): red dot and elapsed time.
+            if let Some(text) = recording.as_deref() {
+                let spot = Rect::new(x, plate.y + (plate.h as i32 - dot as i32) / 2, dot, dot);
+                draw::rounded(&mut self.surface, spot, dot / 2, p.bad, 255);
+                let tx = spot.right() + ctx.px(6) as i32;
+                paint::text(ctx, &mut self.surface, Role::Body, tx, paint::baseline(ctx, Role::Body, plate), text, p.ink);
+                self.tray.push((TrayItem::Recording, Rect::new(x - half, plate.y, recording_w, plate.h)));
+                x += recording_w as i32;
             }
 
             // Сеть: значок в полную силу, когда адрес есть, и приглушённый,
@@ -1536,6 +1564,12 @@ impl Panel {
         let lang = lang_tag();
         let (time, date) = short_clock(status);
         let mut out = alloc::vec![(TrayItem::Network, glyph + step), (TrayItem::Volume, glyph + step)];
+        // Screen recording (22.11): a red dot first (the time is in its row
+        // along a horizontal Dock only).
+        if let Some(seconds) = super::capture::elapsed_s() {
+            let len = if vertical { glyph + step } else { ctx.px(16) + caption.width(&recording_text(seconds)) + step };
+            out.insert(0, (TrayItem::Recording, len));
+        }
         if vertical {
             out.push((TrayItem::Layout, u32::from(caption.line) + step));
             let lines = if date.is_empty() { 1 } else { 2 };
@@ -1696,6 +1730,19 @@ impl Panel {
                 }
                 TrayItem::Layout => {
                     paint::text_centered(ctx, &mut self.surface, Role::Caption, rect, lang_tag(), p.ink);
+                }
+                TrayItem::Recording => {
+                    let dot = ctx.px(10);
+                    if vertical {
+                        let (x, y) = center(dot);
+                        draw::rounded(&mut self.surface, Rect::new(x, y, dot, dot), dot / 2, p.bad, 255);
+                    } else {
+                        let spot = Rect::new(rect.x, rect.y + (rect.h as i32 - dot as i32) / 2, dot, dot);
+                        draw::rounded(&mut self.surface, spot, dot / 2, p.bad, 255);
+                        let text = recording_text(super::capture::elapsed_s().unwrap_or(0));
+                        let row = Rect::new(spot.right() + ctx.px(4) as i32, rect.y, rect.w.saturating_sub(dot + ctx.px(4)), rect.h);
+                        paint::text_centered(ctx, &mut self.surface, Role::Caption, row, &text, p.ink);
+                    }
                 }
                 TrayItem::Clock => {
                     let line = i32::from(ctx.face(Role::Caption).line);
@@ -4701,6 +4748,10 @@ impl Fingerprint {
                 }
             }
             None => clock ^= status.uptime_ms / 1000,
+        }
+        // Screen recording (22.11): the indicator counts seconds.
+        if let Some(seconds) = super::capture::elapsed_s() {
+            clock = (clock ^ (seconds + 1)).wrapping_mul(0x1000_0000_01b3) ^ 4;
         }
         // Время работы на панели — с точностью до минуты; дата меняется
         // вместе с часами, её свёртка уже учтена.

@@ -1775,6 +1775,83 @@ pub const OPENWITH_LIST: usize = 0;
 pub const OPENWITH_ICON: usize = 1;
 pub const OPENWITH_REMEMBER: usize = 2;
 
+/// Screen capture for the recorder (22.11, `/bin/screenrec`):
+/// `(action, a1, a2) -> answer`. One capture at a time on the whole system.
+///
+/// The compositor keeps a mirror of the captured rectangle in ordinary
+/// memory, filled at present time from the composed bands (or the client
+/// buffer of a fullscreen window shown directly), so a grab costs one copy
+/// and never reads the scanout memory.
+///
+/// * [`CAP_INFO`] — `a1` = [`CapInfo`]: monitors on the desktop.
+/// * [`CAP_START`] — `a1` = [`CapSpec`]: start; [`ERR_EXISTS`] if another
+///   capture runs.
+/// * [`CAP_GRAB`] — `a1` = buffer of `w * h` points (`u32`, the format of
+///   [`CapInfo::format`]), `a2` = the sequence number of the frame the caller
+///   already has. Answer: sequence number of the frame now in the buffer
+///   (> 0); equal to `a2` — nothing changed and nothing was copied.
+/// * [`CAP_STOP`] — `a1`/`a2` = path of the saved file (UTF-8; empty — no
+///   notification): stop and show «Запись сохранена».
+/// * [`CAP_STATUS`] — `a1` = [`CapStatus`].
+/// * [`CAP_REQUEST_STOP`] — ask the recording program to stop (hotkey,
+///   tray, the recorder window).
+/// * [`CAP_WINDOWS`] — `a1`/`a2` = text buffer: windows top first, lines
+///   `x\ty\tw\th\tname\n`; answer — bytes written.
+pub const SYS_SCREENCAP: usize = 95;
+pub const CAP_INFO: usize = 0;
+pub const CAP_START: usize = 1;
+pub const CAP_GRAB: usize = 2;
+pub const CAP_STOP: usize = 3;
+pub const CAP_STATUS: usize = 4;
+pub const CAP_REQUEST_STOP: usize = 5;
+pub const CAP_WINDOWS: usize = 6;
+
+/// [`CapSpec::flags`]: draw the pointer into the frames.
+pub const CAP_POINTER: u32 = 1;
+
+/// Monitors on the desktop (desktop coordinates, top-left of the union is
+/// 0,0) — answer of [`CAP_INFO`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CapInfo {
+    pub count: u32,
+    /// [`PIXEL_RGB`] or [`PIXEL_BGR`].
+    pub format: u32,
+    pub desk_w: u32,
+    pub desk_h: u32,
+    /// `x, y, w, h` of each monitor, primary first.
+    pub outputs: [[i32; 4]; 8],
+}
+
+/// What to capture — argument of [`CAP_START`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CapSpec {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    /// `CAP_*` flags.
+    pub flags: u32,
+    pub fps: u32,
+}
+
+/// State of the capture — answer of [`CAP_STATUS`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CapStatus {
+    /// 1 — a capture runs.
+    pub active: u32,
+    /// 1 — somebody asked the recorder to stop.
+    pub stop_requested: u32,
+    pub w: u32,
+    pub h: u32,
+    /// Milliseconds since the start.
+    pub elapsed_ms: u64,
+    /// Frames changed so far (sequence number).
+    pub seq: u64,
+}
+
 /// Размер буфера вывода [`SYS_KERNEL_COMMAND`].
 pub const KERNEL_COMMAND_OUT: usize = 64 * 1024;
 
@@ -2898,7 +2975,7 @@ mod tests {
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
             SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK, SYS_MODEM, SYS_FLOCK,
-            SYS_FSWATCH,
+            SYS_FSWATCH, SYS_OPEN_WITH, SYS_SCREENCAP,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(

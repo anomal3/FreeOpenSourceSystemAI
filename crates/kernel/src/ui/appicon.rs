@@ -90,6 +90,7 @@ pub fn tool_art(program: &str) -> Option<Art> {
         "resmon" => "resmon",
         "startup" => "startup",
         "cfgedit" => "cfgedit",
+        "screenrec" => "screenrec",
         _ => return None,
     };
     let (icon, tone) = match program {
@@ -105,6 +106,8 @@ pub fn tool_art(program: &str) -> Option<Art> {
         "resmon" => (Icon::Chart, Tone::Warn),
         "startup" => (Icon::Power, Tone::Ok),
         "cfgedit" => (Icon::File, Tone::Accent),
+        // Запись экрана (22.11).
+        "screenrec" => (Icon::Camera, Tone::Bad),
         _ => return None,
     };
     // Картинка темы значков (22.11), плитка — если в теме такой нет.

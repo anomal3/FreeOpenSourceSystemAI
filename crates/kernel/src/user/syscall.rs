@@ -223,6 +223,8 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_CLIPBOARD => clipboard(a0, a1, a2),
         // 22.11: «Открыть с помощью» для «Файлов» (программы Windows из Wine).
         user_abi::SYS_OPEN_WITH => open_with(a0, a1, a2),
+        // 22.11: screen capture for the recorder (`/bin/screenrec`).
+        user_abi::SYS_SCREENCAP => crate::ui::capture::syscall(a0, a1, a2),
         // 05.11.2026: время из сети (SNTP службы `dhcp`).
         user_abi::SYS_SETCLOCK => setclock(a0, a1, a2),
         user_abi::SYS_MODEM => modem(a0, a1, a2),

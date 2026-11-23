@@ -72,7 +72,7 @@ pub static FOLDERS: [Folder; 4] = [
 /// обхода: первые четыре строки («Терминал», «Параметры», «О системе»,
 /// «Файлы») стоят на своих местах с фазы С3 — на них считают нажатия
 /// сценарии стенда.
-pub static ENTRIES: [Entry; 24] = [
+pub static ENTRIES: [Entry; 25] = [
     Entry {
         key: "terminal",
         caption: "Терминал",
@@ -345,6 +345,19 @@ pub static ENTRIES: [Entry; 24] = [
         launch: Launch::Program("devmgr", ""),
         needs: "",
         group: "/bin/devmgr",
+    },
+    // Запись экрана (22.11) — последней в «Системных утилитах», чтобы не
+    // сдвигать строки, на которые считают нажатия сценарии стенда.
+    Entry {
+        key: "screenrec",
+        caption: "Запись экрана",
+        about: "видео экрана в файл (Win+Alt+R)",
+        folder: "folder:utils",
+        art: "",
+        icon: Icon::Camera,
+        launch: Launch::Program("screenrec", ""),
+        needs: "",
+        group: "/bin/screenrec",
     },
 ];
 

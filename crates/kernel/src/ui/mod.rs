@@ -43,6 +43,7 @@
 // иначе файловый менеджер выглядит на этом столе чужой программой. Зависимостей
 // от ядра у них не было ни одной, так что переезд свёлся к переносу двух файлов.
 pub mod appicon;
+pub mod capture;
 pub mod compositor;
 pub mod context;
 pub mod deskcfg;
@@ -2328,6 +2329,8 @@ pub fn tick() {
             }
         }
         desktop.expire_toast();
+        // Screen recorder (22.11): «Запись сохранена», a capture left behind.
+        capture::tick(desktop);
         desktop.refresh_lock_clock();
         watch_hung(desktop);
         // Wi-Fi включается отдельной задачей: сменилось состояние —
@@ -2631,6 +2634,18 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
         // Ctrl+Shift+Esc — диспетчер задач, как в Windows (20.11).
         KeyCode::Escape if event.mods.contains(Modifiers::CTRL) && event.mods.contains(Modifiers::SHIFT) => {
             run_choice(desktop, panel::Choice::Program("taskmgr", ""));
+            desktop.refresh_panel(status);
+            return None;
+        }
+        // Win+Alt+R — start/stop the screen recording, like the Game Bar
+        // (22.11): a running capture is asked to stop, otherwise
+        // `/bin/screenrec --record` starts with the saved settings.
+        KeyCode::R if event.mods.contains(Modifiers::META) && event.mods.contains(Modifiers::ALT) => {
+            if capture::active() {
+                capture::request_stop();
+            } else {
+                run_choice(desktop, panel::Choice::Program("screenrec", "--record"));
+            }
             desktop.refresh_panel(status);
             return None;
         }
@@ -5966,6 +5981,12 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
         TrayItem::Clock => traypop::Kind::Calendar,
         TrayItem::Volume => traypop::Kind::Volume,
         TrayItem::Bell => traypop::Kind::Quick,
+        // The red recording indicator (22.11): a click stops the recording.
+        TrayItem::Recording => {
+            capture::request_stop();
+            desktop.refresh_panel(status);
+            return;
+        }
     };
     let was = desktop.tray_pop_kind();
     desktop.close_tray_pop();

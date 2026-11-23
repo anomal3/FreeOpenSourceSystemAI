@@ -1755,6 +1755,18 @@ pub fn open_with_remember(ext: &str, command: &str) -> bool {
     open_with_call(user_abi::OPENWITH_REMEMBER, alloc::format!("{ext}\t{command}").as_bytes()).is_some()
 }
 
+/// Screen capture (22.11, [`user_abi::SYS_SCREENCAP`]): `action` is one of
+/// `CAP_*`, the arguments are as the contract says.
+///
+/// # Safety
+///
+/// Pointers in `a1`/`a2` must point at memory of this program of the size the
+/// action expects (a whole frame for `CAP_GRAB`).
+pub unsafe fn screencap(action: usize, a1: usize, a2: usize) -> i64 {
+    // SAFETY: the caller keeps the contract; the kernel checks the pages.
+    unsafe { syscall(user_abi::SYS_SCREENCAP, action, a1, a2) }
+}
+
 /// Исполнить команду оболочки ядра (фаза 68o). `out` — не короче
 /// [`user_abi::KERNEL_COMMAND_OUT`]; ответ — сколько байт вывода или ошибка.
 pub fn kernel_command(line: &str, out: &mut [u8]) -> i64 {

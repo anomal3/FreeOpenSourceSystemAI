@@ -978,6 +978,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "screencast"
+version = "0.8.0"
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1253,6 +1257,7 @@ dependencies = [
  "mini-ui",
  "miniz_oxide",
  "osupdate",
+ "screencast",
  "ssh",
  "sysconf",
  "tls",
