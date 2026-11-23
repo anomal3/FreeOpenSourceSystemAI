@@ -9702,9 +9702,11 @@ pub const ALL: &[Scenario] = &[
             // `mkdir -p` и `cp` Debian, `reg.exe` и IShellLink Wine.
             Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton /opt/proton/share/fossai/wininst.exe install"),
             Step::Await("wininst: installed", 1_800_000),
-            // Стол видит ярлыки сам (подпись префиксов раз в секунду).
-            Step::Await("desktop     : packages changed, ", 120_000),
-            Step::Await("winapps     : 1 prefix(es)", 60_000),
+            // Стол видит ярлыки сам (подпись префиксов раз в секунду). Вывод
+            // wininst.exe приходит через консоль Wine позже, чем стол успевает
+            // пересканировать, - поэтому где угодно в выводе.
+            Step::AwaitAny("desktop     : packages changed, ", 120_000),
+            Step::AwaitAny("winapps     : 1 prefix(es) [/home/roman/.proton], 2 app(s): 1 in Start, 1 on the desktop", 60_000),
             Step::Wait(3_000),
             Step::Line("winapps"),
             Step::Await("winapps: 'FossDemo' ", 30_000),
