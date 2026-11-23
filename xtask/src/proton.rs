@@ -481,6 +481,8 @@ pub fn build(arch: Arch) -> Result<()> {
         # GE-Proton (12.11.2026): программы и игры Windows без Steam, окна —\n\
         # через сервер Wayland ядра, синхронизация — fsync (futex_waitv).\n\
         P=/opt/proton\n\
+        # Как пришли (21.11): для передачи TmForever.exe сценарию `tmnf`.\n\
+        FP_WINEDEBUG=$WINEDEBUG; FP_DLLOV=$WINEDLLOVERRIDES\n\
         # Своя glibc (2.41) первой: модули GE собраны под 2.38+.\n\
         export LD_LIBRARY_PATH=$P/glibc:$P/lib/x86_64-linux-gnu:$P/lib\n\
         export WINEDLLPATH=$P/lib/vkd3d:$P/lib/wine\n\
@@ -525,6 +527,9 @@ pub fn build(arch: Arch) -> Result<()> {
         # NVK (18.11.2026): есть узел nouveau ядра /dev/dri/renderD128 - оба\n\
         # драйвера, NVK первым (DXVK берёт дискретную видеокарту, lavapipe -\n\
         # запасной); FOSSAI_VULKAN=lvp - только lavapipe, =nvk - только NVK, =radv - только RADV (AMD, узел amdgpu).\n\
+        # `--nvk` / `--lvp` / `--radv` первым ключом (20.11) - то же, что FOSSAI_VULKAN=nvk|lvp|radv.\n\
+        case \"$1\" in --nvk) FOSSAI_VULKAN=nvk; shift ;; --lvp) FOSSAI_VULKAN=lvp; shift ;; --radv) FOSSAI_VULKAN=radv; shift ;; esac\n\
+
         V=$P/share/vulkan/icd.d\n\
         case \"${FOSSAI_VULKAN:-auto}\" in\n\
         \tlvp) export VK_DRIVER_FILES=$V/lvp_icd.x86_64.json ;;\n\
@@ -543,6 +548,25 @@ pub fn build(arch: Arch) -> Result<()> {
         # `run` оболочки окружения нет (WAYLAND_DEBUG=client и подобные).\n\
         while case \"$1\" in --env=*) true ;; *) false ;; esac; do export \"${1#--env=}\"; shift; done\n\
         case \"$1\" in --debug=*) export WINEDEBUG=\"${1#--debug=}\"; shift ;; esac\n", r#"
+# `--vsync on|off` (D7, 21.11.2026) - только по просьбе пользователя: без
+# ключа вертикальную синхронизацию решает игра (её настройка), как в Windows.
+# Сервер Wayland держит темп монитора только для VSync (Vulkan FIFO); с
+# выключенной кадры не ждут монитора (MAILBOX/IMMEDIATE), и игра рисует
+# столько, сколько успевает видеокарта. Ключ переопределяет игру: DXVK
+# `dxgi.syncInterval` (Direct3D 10-12, d3d12 vkd3d-proton - через dxgi DXVK)
+# и `d3d9.presentInterval`, Vulkan Mesa `MESA_VK_WSI_PRESENT_MODE`, OpenGL
+# (wined3d через EGL Mesa) - `vblank_mode`. Режим, выбранный DXVK, - строка
+# `Present mode:` его журнала.
+while case "$1" in --vsync|--vsync=*) true ;; *) false ;; esac; do
+    if [ "$1" = --vsync ]; then VS=$2; shift 2; else VS=${1#--vsync=}; shift; fi
+    case $VS in
+        off|0) i=0; export MESA_VK_WSI_PRESENT_MODE=immediate vblank_mode=0 ;;
+        on|1) i=1; export MESA_VK_WSI_PRESENT_MODE=fifo vblank_mode=3 ;;
+        *) echo "fossai-proton: --vsync on|off, not '$VS' - left to the game"; continue ;;
+    esac
+    export DXVK_CONFIG="${DXVK_CONFIG:+$DXVK_CONFIG; }dxgi.syncInterval = $i; d3d9.presentInterval = $i"
+    echo "fossai-proton: vsync $VS (DXVK_CONFIG=$DXVK_CONFIG)"
+done
 # Кеши шейдеров (P3, 18.11): первый запуск игры - чёрное окно, пока LLVM
 # лавапайпа/llvmpipe компилирует шейдеры. Mesa 25.0.7 кладёт готовый машинный
 # код llvmpipe и lavapipe в дисковый кеш (`get_disk_shader_cache`, база
@@ -558,7 +582,9 @@ export MESA_SHADER_CACHE_MAX_SIZE=${MESA_SHADER_CACHE_MAX_SIZE:-1G}
 export DXVK_SHADER_CACHE_PATH=${DXVK_SHADER_CACHE_PATH:-$C/dxvk}
 export DXVK_STATE_CACHE_PATH=${DXVK_STATE_CACHE_PATH:-$C/dxvk}
 export DXVK_LOG_PATH=${DXVK_LOG_PATH:-$C/log}
-LD_LIBRARY_PATH= mkdir -p "$MESA_SHADER_CACHE_DIR" "$DXVK_SHADER_CACHE_PATH" "$DXVK_LOG_PATH"
+# Кеш конвейеров vkd3d-proton (Direct3D 12, 20.11) - туда же.
+export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$C/vkd3d}
+LD_LIBRARY_PATH= mkdir -p "$MESA_SHADER_CACHE_DIR" "$DXVK_SHADER_CACHE_PATH" "$DXVK_LOG_PATH" "$VKD3D_SHADER_CACHE_PATH"
 # Потоки рисования llvmpipe/lavapipe (P3/P9): без переменной Mesa берёт все
 # ЦП (16 на Ryzen 8 ядер/16 потоков), и каждый кадр будит 16 потоков через
 # futex. По умолчанию - физические ядра: `cpu cores` из /proc/cpuinfo, если
@@ -583,17 +609,61 @@ fi
 # `--bench=СЕКУНДЫ[,ПОДПИСЬ]` (P1) - замер: строки кадров Wine (`+fps`:
 # wined3d и Vulkan/DXVK через win32u) или d3dprobe собираются, и через
 # СЕКУНДЫ в журнал уходит `bench: ПОДПИСЬ avg N fps ...`, программа снимается.
-D=; B=; R=wined3d
+# `--drive=F:=/usb1` или `--drive F:=Z7S` (20.11) - своя буква тому, см. drives().
+D=; B=; R=wined3d; DRV=()
 while :; do
     case "$1" in
         --desktop=*) D=${1#--desktop=}; shift ;;
         --bench=*) B=${1#--bench=}; shift ;;
+        --drive=*) DRV+=("${1#--drive=}"); shift ;;
+        --drive) DRV+=("$2"); shift 2 ;;
         *) break ;;
     esac
 done
 # Путь от стола (P12): ядро делит строку запуска по пробелам и кавычек не
 # знает, поэтому путь приходит с `%20` (и `%25` вместо `%`).
 unpct() { local e=${1//\%/\\x}; printf -v U '%b' "$e"; }
+# Строка и в журнал ядра (21.11): со стола у программы нет терминала.
+klog() { echo "$1"; [ -w /dev/kmsg ] && echo "$1" > /dev/kmsg; }
+# Журнал игры Unity (22.11, Uot «сервер не отвечает»): `Player.log` в
+# `ПРЕФИКС/drive_c/users/*/AppData/LocalLow/КОМПАНИЯ/ИГРА/`, изменённый за этот
+# запуск, - строки о сети, TLS, исключениях и версии движка в журнал ядра (не
+# больше 18: ядро берёт 20 строк /dev/kmsg в секунду). Весь файл - там же.
+unity_log() {
+    local f line k=0 more=0
+    [ -e /dev/kmsg ] || return 0
+    for f in "$WINEPREFIX"/drive_c/users/*/AppData/LocalLow/*/*/Player.log; do
+        [ -f "$f" ] && [ "$f" -nt "$C/run.mark" ] || continue
+        printf 'proton: Unity log %s\n' "${f#"$WINEPREFIX"/}" > /dev/kmsg
+        while IFS= read -r line; do
+            case $line in
+                *'Initialize engine version'*|*'Curl error'*|*SSL*|*TLS*|*ertificate*|*'Cannot connect'*|*'Cannot resolve'*|*'Unable to'*|*'Request timeout'*|*xception*|*'Нет связи'*)
+                    if [ $k -lt 18 ]; then
+                        k=$((k + 1)); printf 'proton: Player.log: %.300s\n' "${line%$'\r'}" > /dev/kmsg
+                    else
+                        more=$((more + 1))
+                    fi ;;
+            esac
+        done < "$f"
+        [ $more -gt 0 ] && printf 'proton: Player.log: %d more such line(s)\n' $more > /dev/kmsg
+    done
+}
+# Установленная TMNF (`ПРЕФИКС/drive_c/TmNationsForever/TmForever.exe`) из
+# «Файлов» или ярлыка «Пуска» (winemenubuilder установщика) - тем же путём,
+# что пункт пакета `tmnf`: его сценарий выбирает видеокарту (DXVK на NVK)
+# или процессор. До 21.11 ярлык шёл через `start` на wined3d - на процессоре.
+tmnf_handoff() {
+    local f=$1; shift
+    case "${f,,}" in */drive_c/tmnationsforever/tmforever.exe) ;; *) return 0 ;; esac
+    [ -f /opt/tmnf/bin/tmnf ] || return 0
+    export WINEPREFIX=${f%/drive_c/*}
+    klog "fossai-proton: $f -> /opt/tmnf/bin/tmnf (prefix $WINEPREFIX)"
+    export WINEDEBUG=$FP_WINEDEBUG WINEDLLOVERRIDES=$FP_DLLOV
+    [ -z "$WINEDEBUG" ] && unset WINEDEBUG
+    [ -z "$WINEDLLOVERRIDES" ] && unset WINEDLLOVERRIDES
+    unset VK_DRIVER_FILES VK_ICD_FILENAMES
+    exec /opt/debian/bin/bash /opt/tmnf/bin/tmnf "$@"
+}
 # `--open=ФАЙЛ` - двойной щелчок по .exe/.msi/.lnk/.bat в «Файлах»: в общем
 # префиксе (`$WINEPREFIX`, по умолчанию ~/.proton), из каталога файла.
 # `--shortcut=ФАЙЛ.desktop` - пункт «Пуска» из ярлыка, который
@@ -602,13 +672,59 @@ unpct() { local e=${1//\%/\\x}; printf -v U '%b' "$e"; }
 case "$1" in
     --open=*)
         unpct "${1#--open=}"; f=$U; shift
+        # Файл внутри префикса (`…/.tmnf/drive_c/…`: ярлык «Пуска», программа
+        # Windows из «Программ Windows», 21.11) - в его префиксе, не в общем.
+        case $f in */drive_c/*) p=${f%%/drive_c/*}; [ -f "$p/system.reg" ] && export WINEPREFIX=$p ;; esac
+        tmnf_handoff "$f" "$@"
         cd "${f%/*}" 2>/dev/null
         case "${f,,}" in
             *.msi) set -- msiexec /i "$f" "$@" ;;
             *.lnk|*.bat|*.cmd) set -- start /wait /unix "$f" "$@" ;;
-            *) set -- "$f" "$@" ;;
+            # Diablo II Resurrected - как `--d2r` (20.11).
+            */d2r.exe) set -- --d2r="${f//%/%25}" "$@" ;;
+            # Есть видеокарта (узел NVK) - Direct3D 8-12 через DXVK и
+            # vkd3d-proton, как в Proton (20.11); без неё - wined3d, как было.
+            *) if [ -e /dev/dri/renderD128 ]; then set -- --dxvk "$f" "$@"; else set -- "$f" "$@"; fi ;;
         esac
-        echo "fossai-proton: open $f" ;;
+        r=Wine; [ -e /dev/dri/renderD128 ] || r="Wine (no GPU node: wined3d on the CPU)"; [ "$1" = --dxvk ] && r="DXVK/vkd3d-proton (GPU node present)"
+        case "$1" in --d2r=*) r="D2R launcher" ;; esac
+        klog "fossai-proton: open $f via $r" ;;
+    # `--with=ПРОГРАММА.exe ФАЙЛ…` (22.11) - «Открыть с помощью»: программа
+    # Windows из префикса (префикс - по её пути) открывает файлы; их пути
+    # (с `%20`) - путями Windows: буква тома из ПРЕФИКС/dosdevices (`D:\…`),
+    # иначе `Z:\…` (у Wine `Z:` - корень).
+    --with=*)
+        unpct "${1#--with=}"; f=$U; shift
+        t=; case "$1" in --args=*) unpct "${1#--args=}"; t=$U; shift ;; esac
+        case $f in */drive_c/*) p=${f%%/drive_c/*}; [ -f "$p/system.reg" ] && export WINEPREFIX=$p ;; esac
+        a=()
+        for x in "$@"; do
+            unpct "$x"; u=$U; w=
+            for l in "$WINEPREFIX"/dosdevices/[d-y]:; do
+                [ -L "$l" ] || continue
+                k=$(LD_LIBRARY_PATH= readlink "$l" 2>/dev/null); k=${k%/}
+                case $k in ''|/) continue ;; esac
+                case $u in "$k"/*) w=${l##*/}; w=${w^^}${u#"$k"}; break ;; esac
+            done
+            [ -z "$w" ] && w=Z:$u
+            a+=("${w//\//\\}")
+        done
+        # `--args=КЛЮЧИ` - ключи команды из реестра (`open "%1"`): `%1`/`%L` -
+        # путь файла; без `%1` пути - в конце.
+        if [ -n "$t" ]; then
+            b=(); n=; set -f
+            for x in $t; do
+                x=${x//\"/}
+                case $x in *%[1Ll]*) for y in "${a[@]}"; do b+=("${x//%[1Ll]/$y}"); done; n=1 ;; %*) ;; *) b+=("$x") ;; esac
+            done
+            set +f
+            [ -z "$n" ] && b+=("${a[@]}")
+            a=("${b[@]}")
+        fi
+        cd "${f%/*}" 2>/dev/null
+        klog "fossai-proton: open ${a[*]} with $f (prefix $WINEPREFIX)"
+        set -- "$f" "${a[@]}"
+        [ -e /dev/dri/renderD128 ] && set -- --dxvk "$@" ;;
     --shortcut=*)
         unpct "${1#--shortcut=}"; f=$U; shift
         export WINEPREFIX=${f%/drive_c/proton_shortcuts/*}
@@ -628,8 +744,45 @@ case "$1" in
             else u+=${x:i:1}; i=$((i + 1)); fi
         done
         [ -n "$w" ] && cd "$w" 2>/dev/null
-        echo "fossai-proton: shortcut $f -> $u (prefix $WINEPREFIX)"
-        set -- start /wait /unix "$u" "$@" ;;
+        klog "fossai-proton: shortcut $f -> $u (prefix $WINEPREFIX)"
+        tmnf_handoff "$u" "$@"
+        # Ярлык .exe при узле видеокарты - через DXVK/vkd3d-proton, как `--open`.
+        case "${u,,}" in
+            *.exe) if [ -e /dev/dri/renderD128 ]; then set -- --dxvk start /wait /unix "$u" "$@"; else set -- start /wait /unix "$u" "$@"; fi ;;
+            *) set -- start /wait /unix "$u" "$@" ;;
+        esac ;;
+esac
+# `--d2r[=КАТАЛОГ|=ПУТЬ.exe] [КЛЮЧИ ИГРЫ]` (20.11) - Diablo II Resurrected
+# (Direct3D 12): без пути - первый D2R.exe в /usb../D2RLAN и /usb../*
+# (/usb, /usb1-4), /data/*, ~/*. Из каталога игры, через DXVK (dxgi) и vkd3d-proton (d3d12) на Vulkan
+# (NVK первым, если есть узел видеокарты), fps - в журнал (`+fps`). Без
+# своих ключей игре дан `-launch`: без него D2R.exe отдаёт запуск
+# Battle.net и выходит.
+case "$1" in
+    --d2r|--d2r=*)
+        g=; [ "$1" != --d2r ] && { unpct "${1#--d2r=}"; g=$U; }
+        shift
+        shopt -s nocaseglob
+        if [ -z "$g" ]; then
+            # `[e]`: без знаков шаблона nocaseglob имя не сравнивает. Тома -
+            # списком: точек монтирования в каталоге `/` нет, `/usb*` их не
+            # находил (QEMU, 20.11).
+            for v in /usb /usb1 /usb2 /usb3 /usb4 /data "$HOME"; do
+                for g in "$v"/D2RLA[N]/D2R.ex[e] "$v"/*/D2R.ex[e]; do [ -f "$g" ] && break 2; done
+            done
+        elif [ -d "$g" ]; then
+            for g in "${g%/}"/D2R.ex[e]; do break; done
+        fi
+        shopt -u nocaseglob
+        if [ ! -f "$g" ]; then
+            echo "fossai-proton: D2R.exe not found (${g:-no path}) - give the folder: --d2r=/usb1/D2RLAN"
+            exit 1
+        fi
+        cd "${g%/*}"
+        [ $# -eq 0 ] && set -- -launch
+        case ,$WINEDEBUG, in *,+fps,*) ;; *) export WINEDEBUG="${WINEDEBUG:+$WINEDEBUG,}+fps" ;; esac
+        echo "fossai-proton: D2R $g $* (DXVK + vkd3d-proton, Vulkan ${FOSSAI_VULKAN:-auto})"
+        set -- --dxvk "$g" "$@" ;;
 esac
 "#, "\
         # `--run=ПРОГРАММА` - проба из bin/ пакета (es2gears_wayland, vkcube) с\n\
@@ -669,15 +822,86 @@ esac
                     $P/lib/wine/x86_64-unix/wine wineboot -i\n\
                     $P/bin/wineserver -w\n\
                 fi\n\
-            fi ;; esac\n\
+            fi ;; esac\n", r#"
+# Буквы дисков (20.11): каждый подключённый том (/usb1.., /usb, /data,
+# /mnt/*, /media/*) - своя буква в ПРЕФИКС/dosdevices, чтобы пути вида
+# F:\D2RLAN работали. Тома и метки - из /proc/mounts ядра (устройство
+# `/dev/disk/by-label/МЕТКА`). Буква закрепляется за меткой (без метки - за
+# точкой) в ПРЕФИКС/fossai-drives и в следующий раз та же; новому тому -
+# первая свободная с D: (живая флешка /usb - последней). Свои буквы: файл
+# ~/.config/fossai-proton/drives (строки `F: Z7S` или `F: /usb1`, `#` -
+# заметка) или ключ `--drive=F:=/usb1` (`--drive F:=Z7S`) - запоминаются.
+pin() {
+    local l=${1%%:*}; l=${l,,}
+    case $l in [d-y]) ;; *) echo "fossai-proton: drive letter '$1' ignored (only D: to Y:)"; return ;; esac
+    [ -n "${kl[$l]}" ] && unset "lk[${kl[$l]}]"
+    [ -n "${lk[$2]}" ] && unset "kl[${lk[$2]}]"
+    lk[$2]=$l; kl[$l]=$2
+}
+drives() {
+    local dd=$WINEPREFIX/dosdevices map=$WINEPREFIX/fossai-drives cfg=$HOME/.config/fossai-proton/drives
+    [ -d "$dd" ] || return 0
+    declare -gA lk=() kl=()
+    local -a keys=() points=() order=()
+    local dev mnt t o r k l p i old=
+    if [ -f "$map" ]; then
+        while IFS=$'\t' read -r l k; do [ -n "$k" ] && { pin "$l" "$k"; old+=" $l"; }; done < "$map"
+    fi
+    if [ -f "$cfg" ]; then
+        while read -r l k; do
+            case $l in ''|'#'*) continue ;; *=*) k=${l#*=}; l=${l%%=*} ;; esac
+            [ -n "$k" ] && pin "$l" "$k"
+        done < "$cfg"
+    fi
+    for i in "${DRV[@]}"; do pin "${i%%=*}" "${i#*=}"; done
+    if [ -r /proc/mounts ]; then
+        while read -r dev mnt t o r; do
+            mnt=${mnt//\\040/ }
+            case $mnt in /usb|/usb[0-9]*|/data|/data[0-9]*|/mnt/?*|/media/?*) ;; *) continue ;; esac
+            k=$mnt
+            case $dev in /dev/disk/by-label/?*) k=${dev#/dev/disk/by-label/}; k=${k//\\040/ } ;; esac
+            # Та же метка у второго тома - ключ по точке.
+            for p in "${keys[@]}"; do [ "$p" = "$k" ] && k=$mnt; done
+            keys+=("$k"); points+=("$mnt")
+        done < /proc/mounts
+    else
+        for mnt in /usb1 /usb2 /usb3 /usb4 /usb /data; do [ -d "$mnt" ] && { keys+=("$mnt"); points+=("$mnt"); }; done
+    fi
+    for i in "${!points[@]}"; do [ "${points[i]}" != /usb ] && order+=("$i"); done
+    for i in "${!points[@]}"; do [ "${points[i]}" = /usb ] && order+=("$i"); done
+    for i in "${order[@]}"; do
+        k=${keys[i]}; p=${points[i]}
+        l=${lk[$k]}
+        # Свой файл может назвать том точкой (`F: /usb1`).
+        if [ -z "$l" ] && [ "$k" != "$p" ] && [ -n "${lk[$p]}" ]; then l=${lk[$p]}; pin "$l" "$k"; fi
+        if [ -z "$l" ]; then
+            for l in d e f g h i j k l m n o p q r s t u v w x y; do
+                [ -z "${kl[$l]}" ] && [ ! -e "$dd/$l:" ] && [ ! -L "$dd/$l:" ] && break
+                l=
+            done
+            [ -z "$l" ] && { echo "fossai-proton: no free drive letter for $p"; continue; }
+            pin "$l" "$k"
+        fi
+        LD_LIBRARY_PATH= ln -sfn "$p" "$dd/$l:"
+        if [ "$k" = "$p" ]; then echo "fossai-proton: drive ${l^^}: = $p"; else echo "fossai-proton: drive ${l^^}: = $p ($k)"; fi
+    done
+    # Свои старые буквы, отданные другим (`--drive`, файл), - убрать.
+    for l in $old; do [ -z "${kl[$l]}" ] && [ -L "$dd/$l:" ] && LD_LIBRARY_PATH= rm -f "$dd/$l:"; done
+    : > "$map"
+    for k in "${!lk[@]}"; do printf '%s\t%s\n' "${lk[$k]}" "$k" >> "$map"; done
+}
+case "$1" in --server-debug=*) ;; *) drives ;; esac
+"#, "\
         # `--prefix` - только приготовить префикс (`bin/tmnf`).\n\
         case \"$1\" in --prefix) exit 0 ;; esac\n\
+        # С 20.11 и Direct3D 12 - vkd3d-proton (`d3d12`, `d3d12core`), как в\n\
+        # Proton: его d3d12 показывает кадры через dxgi DXVK.\n\
         case \"$1\" in --dxvk) shift; R=dxvk\n\
             s=\"$WINEPREFIX/drive_c/windows\"\n\
             # `cp` Debian - со своей glibc, без нашего LD_LIBRARY_PATH (2.41).\n\
-            LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/x86_64-windows/*.dll \"$s/system32/\"\n\
-            [ -d \"$s/syswow64\" ] && LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/i386-windows/*.dll \"$s/syswow64/\"\n\
-            export WINEDLLOVERRIDES=\"d3d8,d3d9,d3d10core,d3d11,dxgi=n;$WINEDLLOVERRIDES\" ;; esac\n\
+            LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/x86_64-windows/*.dll $P/lib/wine/vkd3d-proton/x86_64-windows/*.dll \"$s/system32/\"\n\
+            [ -d \"$s/syswow64\" ] && LD_LIBRARY_PATH= cp -f $P/lib/wine/dxvk/i386-windows/*.dll $P/lib/wine/vkd3d-proton/i386-windows/*.dll \"$s/syswow64/\"\n\
+            export WINEDLLOVERRIDES=\"d3d8,d3d9,d3d10core,d3d11,d3d12,d3d12core,dxgi=n;$WINEDLLOVERRIDES\" ;; esac\n\
         [ $# -eq 0 ] && set -- notepad\n\
         # Загрузчик архитектуры напрямую: `bin/wine` GE ищет `ntdll.so` в\n\
         # `lib/wine/`, а не в `lib/wine/x86_64-unix/` (12.11).\n\
@@ -690,11 +914,15 @@ fi
 # строки Wine `trace:fps:… approx N fps` раз в 5 с сводятся в одну
 # `fps: ПРОГРАММА СРЕДНЕЕ (min, max)` в `/dev/kmsg` - fps игры видно в журнале
 # на флешке, даже при запуске со стола. Остальной вывод - в stderr как был.
+# С 22.11 и без `+fps` (hw-log15: у Uot и Case88 в журнале не было ни
+# строки Wine): строки `err:` - в журнал ядра, после выхода - главное из
+# `Player.log` игры Unity (unity_log).
 if [ -z "$B" ]; then
-    case ,$WINEDEBUG, in *,+fps,*) [ -e /dev/kmsg ] || exec $W "$@" ;; *) exec $W "$@" ;; esac
+    [ -e /dev/kmsg ] || exec $W "$@"
     p=${1##*/}; p=${p##*\\}; [ "$p" = explorer ] && { p=${3##*/}; p=${p##*\\}; }
+    : > "$C/run.mark" 2>/dev/null
     $W "$@" 2>&1 | {
-        n=0; sum=0; lo=; hi=0; t=$SECONDS
+        n=0; sum=0; lo=; hi=0; t=$SECONDS; k=0
         while IFS= read -r line; do
             case $line in
                 *'trace:fps:'*'approx '*)
@@ -705,7 +933,17 @@ if [ -z "$B" ]; then
                     n=$((n + 1)); sum=$((sum + c))
                     if [ -z "$lo" ] || [ $c -lt $lo ]; then lo=$c; fi
                     [ $c -gt $hi ] && hi=$c ;;
-                *) printf '%s\n' "$line" >&2 ;;
+                *)
+                    printf '%s\n' "$line" >&2
+                    # Главное из журналов DXVK и vkd3d-proton (21.11) - и в журнал
+                    # ядра (не больше 200 строк за запуск): выбранная видеокарта,
+                    # режим показа, ошибки. Полные журналы - $DXVK_LOG_PATH.
+                    if [ $k -lt 200 ]; then
+                        case $line in
+                            *'DXVK: v'*|*'Found device:'*|*'Present mode:'*|*'Buffer size:'*|*'vkd3d-proton - build'*|err:*|*':err:'*|*'DEVICE_LOST'*|*'DXVK: Failed'*)
+                                k=$((k + 1)); printf 'proton: %s: %.300s\n' "$p" "$line" > /dev/kmsg ;;
+                        esac
+                    fi ;;
             esac
             if [ $n -gt 0 ] && [ $((SECONDS - t)) -ge 5 ]; then
                 a=$((sum / n))
@@ -715,7 +953,9 @@ if [ -z "$B" ]; then
             fi
         done
     }
-    exit ${PIPESTATUS[0]}
+    rc=${PIPESTATUS[0]}
+    unity_log
+    exit $rc
 fi
 # Замер (`--bench`): вывод Wine идёт через этот цикл и дальше в stderr как
 # был; значения кадров - сотыми, арифметика bash целая. Источник один:
@@ -804,6 +1044,12 @@ $W "$@" 2>&1 | {
     // Проба DirectX 9/11 (`tools/d3dprobe`, программа Windows) - для сценариев
     // wined3d и DXVK (12.11).
     files.push((String::from("share/fossai/d3dprobe.exe"), d3dprobe()?, 0o755));
+    // Проба сети (`tools/netprobe`, 22.11): имя машины, DNS, TCP, HTTPS через
+    // WinHTTP/schannel - сценарий `proton-net`; на железе - руками из терминала.
+    files.push((String::from("share/fossai/netprobe.exe"), windows_tool("netprobe")?, 0o755));
+    // Установщик-проба (`tools/wininst`, 22.11): ярлыки «Пуска»/стола через
+    // IShellLink и сопоставление .txt — сценарий `winapps-real`.
+    files.push((String::from("share/fossai/wininst.exe"), windows_tool("wininst")?, 0o755));
     // Шаблоны префикса (17.11): их снимает сценарий `proton-prefix` (настоящий
     // `wineboot` в QEMU) в `build/proton-prefix/`. Нет снимка — пакет без
     // шаблона, префикс создаёт `wineboot` при первом запуске (минуты).
@@ -829,7 +1075,7 @@ $W "$@" 2>&1 | {
     Ok(())
 }
 
-/// `bin/fossai-gametest [vk|d3d|tmnf|all]` (20.11.2026): пользовательская
+/// `bin/fossai-gametest [vk|d3d|d3d12|tmnf|all]` (20.11.2026): пользовательская
 /// часть `gpu gametest` — всё на NVK (видеокарта через GSP-RM), по ступени на
 /// строку `gametest: PASS|FAIL имя за N мс`, в конце `gametest: summary`.
 /// Ядро запускает её с выводом в канал и переписывает строки в свой журнал
@@ -889,6 +1135,27 @@ if [ -n "$VKFAIL" ] && [ "$WHAT" = all ]; then
     say "vkprobe failed - skipping d3d9-dxvk-nvk and tmnf-nvk (the log above has the NVK ioctl trace)"
     WHAT=none
 fi
+case $WHAT in present)
+    # Режимы показа (D7, 21.11.2026; не входит в `all`): vkcube с
+    # --present_mode 0 IMMEDIATE / 1 MAILBOX / 2 FIFO на lavapipe и NVK, затем
+    # d3dprobe (Direct3D 9 через DXVK на NVK) с VSync off и on. Ожидается: без
+    # VSync к/с выше частоты монитора (сколько успевает рисовать), с ней -
+    # около частоты (60 в QEMU). IMMEDIATE есть только при
+    # wp_tearing_control_v1 сервера - не выбрался - FAIL ступени.
+    # Прогрев (первый запуск lavapipe компилирует шейдеры в кеш Mesa) - не в замер.
+    step vkcube-warmup 120 $B $P --lvp --run=vkcube --wsi wayland --c 30
+    for drv in lvp nvk; do
+        for m in 0 1 2; do
+            t=$(now)
+            if step vkcube-$drv-mode$m 180 $B $P --$drv --run=vkcube --wsi wayland --present_mode $m --c 600; then
+                ms=$(( $(now) - t )); [ $ms -gt 0 ] && say "present: vkcube $drv mode $m: 600 frames in $ms ms = $(( 600000 / ms )) fps (with start-up)"
+            fi
+        done
+    done
+    for vs in off on; do
+        step d3d9-vsync-$vs 600 $B $P --vsync $vs --bench=20,d3dprobe9-vsync-$vs --dxvk $X 9 20
+    done ;;
+esac
 case $WHAT in all|d3d)
     # 4. Direct3D 9 (как у TMNF) через DXVK на NVK: 20 с кадров, замер.
     step d3d9-dxvk-nvk 600 $B $P $NVK --bench=20,d3dprobe9-dxvk-nvk --dxvk $X 9 20 ;;
@@ -900,6 +1167,12 @@ case $WHAT in all|tmnf)
     else
         say "tmnf: package not installed - skipped"
     fi ;;
+esac
+case $WHAT in all|d3d12)
+    # 6. Direct3D 12 (как у Diablo II Resurrected) через vkd3d-proton и dxgi
+    # DXVK на NVK: очистка и показ, заборы ID3D12Fence - timeline-семафоры
+    # (SYNCOBJ_TIMELINE_*). Последней: зависание vkd3d не мешает TMNF.
+    step d3d12-vkd3d-nvk 600 $B $P $NVK --bench=20,d3dprobe12-vkd3d-nvk --dxvk $X 12 20 ;;
 esac
 say "summary: $pass passed, $fail failed${names:+ ($names )}"
 "#;
@@ -975,7 +1248,13 @@ echo "bench: done"
 /// Собирает `tools/d3dprobe` (Rust, x86_64-pc-windows-msvc, статический CRT)
 /// и отдаёт `d3dprobe.exe`.
 fn d3dprobe() -> Result<Vec<u8>> {
-    let dir = crate::paths::workspace_root().join("tools/d3dprobe");
+    windows_tool("d3dprobe")
+}
+
+/// Собирает программу Windows `tools/<name>` (Rust, x86_64-pc-windows-msvc) и
+/// отдаёт `<name>.exe`.
+fn windows_tool(name: &str) -> Result<Vec<u8>> {
+    let dir = crate::paths::workspace_root().join("tools").join(name);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = std::process::Command::new(cargo)
         .args(["build", "--release", "--target", "x86_64-pc-windows-msvc"])
@@ -983,8 +1262,8 @@ fn d3dprobe() -> Result<Vec<u8>> {
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .status()?;
-    anyhow::ensure!(status.success(), "d3dprobe не собрался");
-    Ok(fs::read(dir.join("target/x86_64-pc-windows-msvc/release/d3dprobe.exe"))?)
+    anyhow::ensure!(status.success(), "{name} не собрался");
+    Ok(fs::read(dir.join(format!("target/x86_64-pc-windows-msvc/release/{name}.exe")))?)
 }
 
 fn normalize(path: &str) -> String {

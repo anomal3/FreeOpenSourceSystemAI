@@ -1762,6 +1762,14 @@ impl Program {
         let executable = flags.contains(PageFlags::EXEC);
         let first = self.mappings.partition_point(|region| region.end() <= addr);
         let mut failed = false;
+        // Did some present page lose a right (hw-log14)? Only then the other
+        // CPUs must drop their translations now. A widening (RO -> RW,
+        // NONE -> RW, + exec: Wine/vkd3d heap commits) leaves a stale, too
+        // strict entry at worst: the access faults, the fault finds the page
+        // already allowed ([`page_allows`]) and the instruction is retried -
+        // a #PF drops that translation on x86.
+        let mut narrowed = false;
+        let rights = PageFlags::READ | PageFlags::WRITE | PageFlags::EXEC | PageFlags::USER;
         for index in first..self.mappings.len() {
             let (base, pages) = (self.mappings[index].base, self.mappings[index].pages);
             if base >= end {
@@ -1800,9 +1808,10 @@ impl Program {
             };
             for page in 0..pages {
                 let virt = VirtAddr::new(base + page * PAGE_SIZE);
-                let Some((phys, _)) = arch::translate(root, virt) else {
+                let Some((phys, old)) = arch::translate(root, virt) else {
                     continue;
                 };
+                let old_rights = old.bits() & rights.bits();
                 if executable {
                     arch::sync_instructions(phys);
                 }
@@ -1820,13 +1829,18 @@ impl Program {
                 } else {
                     page_flags
                 };
+                if old_rights & !page_flags.bits() != 0 {
+                    narrowed = true;
+                }
                 if unsafe { self.space.map(virt, phys, page_flags) }.is_err() {
                     failed = true;
                 }
             }
         }
-        if shared {
+        if shared && (narrowed || !LAZY_WIDEN.load(Ordering::Relaxed)) {
             arch::flush_user_translations(Some(self.space.root()));
+        } else if shared {
+            MPROTECT_NO_FLUSH.fetch_add(1, Ordering::Relaxed);
         }
         // Отказ построителя здесь возможен только на исчерпании кадров под
         // промежуточные таблицы — а они у присутствующей страницы уже есть.
@@ -2188,32 +2202,76 @@ impl Program {
             // SAFETY: тот же кадр под тем же адресом, право записи даёт область.
             return unsafe { self.space.remap(virt, phys, flags) }.is_ok();
         }
-        let Some(fresh) = take_frame_reserved() else {
+        // The faulting page and, in a multi-thread program, up to
+        // `COW_BATCH - 1` following pages of the same region that are shared
+        // with a fork too (hw-log14: one shootdown per page; after a fork the
+        // parent's threads write their way through such pages one by one).
+        // Each gets its copy, all lose their old entries, then ONE flush.
+        let region_end = self.mappings[index].base + self.mappings[index].pages * PAGE_SIZE;
+        let root = self.space.root();
+        let mut batch: [(VirtAddr, PhysAddr, PageFlags, PhysAddr); COW_BATCH] =
+            [(VirtAddr::new(0), PhysAddr::new(0), PageFlags::NONE, PhysAddr::new(0)); COW_BATCH];
+        let mut count = 0;
+        let limit = if shared && !code { COW_BATCH } else { 1 };
+        while count < limit {
+            let at = VirtAddr::new(page_addr + count * PAGE_SIZE);
+            let (old, was) = if count == 0 {
+                (phys, now)
+            } else {
+                if at.as_usize() >= region_end {
+                    break;
+                }
+                match arch::translate(root, at) {
+                    Some((old, was))
+                        if !was.contains(PageFlags::WRITE)
+                            && crate::mm::frame::with(|frames| frames.is_shared(old)).unwrap_or(false) =>
+                    {
+                        (old, was)
+                    }
+                    _ => break,
+                }
+            };
+            let Some(fresh) = take_frame_reserved() else {
+                break;
+            };
+            // SAFETY: оба кадра видны через прямое отображение; старый жив — его
+            // держит и эта страница, и другие владельцы.
+            unsafe { core::ptr::copy_nonoverlapping(frame_bytes(old), frame_bytes(fresh), PAGE_SIZE) };
+            batch[count] = (at, old, was, fresh);
+            count += 1;
+        }
+        if count == 0 {
             return false;
-        };
-        // SAFETY: оба кадра видны через прямое отображение; старый жив — его
-        // держит и эта страница, и другие владельцы.
-        unsafe { core::ptr::copy_nonoverlapping(frame_bytes(phys), frame_bytes(fresh), PAGE_SIZE) };
-        // Снять старую запись без возврата кадра, сбросить трансляции, затем
-        // поставить свой кадр и отдать старому одного владельца.
-        // SAFETY: страница принадлежит области этой программы.
-        unsafe { self.space.unmap_range_keep(virt, 1) };
+        }
+        // Снять старые записи без возврата кадров, сбросить трансляции, затем
+        // поставить свои кадры и отдать старым по одному владельцу.
+        for &(at, ..) in &batch[..count] {
+            // SAFETY: страница принадлежит области этой программы.
+            unsafe { self.space.unmap_range_keep(at, 1) };
+        }
         if shared {
-            arch::flush_user_translations(Some(self.space.root()));
+            arch::flush_user_translations(Some(root));
+            if count > 1 {
+                COW_BATCHED.fetch_add(count as u64 - 1, Ordering::Relaxed);
+            }
         }
-        // SAFETY: адрес свободен (снят строкой выше), кадр наш.
-        if unsafe { self.space.remap(virt, fresh, flags) }.is_err() {
-            // SAFETY: возвращаем старую страницу как была.
-            let _ = unsafe { self.space.remap(virt, phys, now) };
-            return_frame(fresh);
-            return false;
+        let mut ok = true;
+        for &(at, old, was, fresh) in &batch[..count] {
+            // SAFETY: адрес свободен (снят выше), кадр наш.
+            if unsafe { self.space.remap(at, fresh, flags) }.is_err() {
+                // SAFETY: возвращаем старую страницу как была.
+                let _ = unsafe { self.space.remap(at, old, was) };
+                return_frame(fresh);
+                ok &= at.as_usize() != page_addr;
+                continue;
+            }
+            crate::mm::frame::with(|frames| {
+                // SAFETY: кадр разделён (`is_shared`) — `free` снимет с него
+                // одного владельца, нас, и в пул его не вернёт.
+                unsafe { frames.free(old) };
+            });
         }
-        crate::mm::frame::with(|frames| {
-            // SAFETY: кадр разделён (`is_shared`) — `free` снимет с него одного
-            // владельца, нас, и в пул его не вернёт.
-            unsafe { frames.free(phys) };
-        });
-        true
+        ok
     }
 
     /// Вслед за отказом в ленивой безымянной памяти — до `count - 1` следующих
@@ -2622,13 +2680,9 @@ fn page_cache_tight() -> bool {
 /// на живой системе штатно, и запас существует именно для того, чтобы в этот
 /// момент у ядра ещё оставалось, чем работать.
 fn take_frame_reserved() -> Option<PhysAddr> {
-    crate::mm::frame::with(|frames| {
-        if frames.stats().free <= RESERVE_FRAMES {
-            return None;
-        }
-        frames.allocate()
-    })
-    .flatten()
+    // From this CPU's cache of zeroed frames (G2): no pool lock and no
+    // zeroing on the fault path in the common case.
+    crate::mm::frame::take_zeroed(RESERVE_FRAMES)
 }
 
 /// Программы по слотам задач планировщика.
@@ -2661,6 +2715,26 @@ static IN_USER: [AtomicBool; sched::MAX_TASKS] =
 /// из системного вызова, поэтому хватает `Relaxed`.
 static STACKS: [(AtomicUsize, AtomicUsize); sched::MAX_TASKS] =
     [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; sched::MAX_TASKS];
+
+/// Whether the program a task runs is a Linux one (`Program::linux`), by slot
+/// (21.11.2026): the entry of every `syscall` and `int 0x80` asked it under
+/// the process lock, so a thread holding that lock (a long call) stalled every
+/// other thread's next call at the door. Written wherever a slot gets its
+/// program (start, thread, fork, `execve`) and read lock-free.
+static LINUX_TASK: [AtomicBool; sched::MAX_TASKS] = [const { AtomicBool::new(false) }; sched::MAX_TASKS];
+
+fn note_linux(slot: usize, linux: bool) {
+    if let Some(flag) = LINUX_TASK.get(slot) {
+        flag.store(linux, Ordering::Release);
+    }
+}
+
+/// Does the current task run a Linux program - without the process lock.
+/// Meaningful only for a task that came from ring 3 (it has a program).
+#[must_use]
+pub fn current_is_linux() -> bool {
+    LINUX_TASK[sched::current_slot()].load(Ordering::Acquire)
+}
 
 fn set_stack(slot: usize, low: usize, high: usize) {
     STACKS[slot].0.store(low, Ordering::Relaxed);
@@ -2933,8 +3007,18 @@ pub fn title_window(slot: u32, title: &str) -> Result<(), WindowError> {
 
 /// Назначить окну `slot` текущей программы владельца — её окно `owner`
 /// (фаза 62d).
-pub fn owner_window(slot: u32, owner: Option<u32>, modal: bool) -> Result<(), WindowError> {
-    crate::ui::owner_window(sched::current().as_u32(), slot, owner, modal).map_err(WindowError::Desktop)
+/// Владелец — `(задача, место)`: с 20.11 и окно другой программы.
+pub fn owner_window(slot: u32, owner: Option<(u32, u32)>, modal: bool, center: bool) -> Result<(), WindowError> {
+    crate::ui::owner_window(sched::current().as_u32(), slot, owner, modal, center).map_err(WindowError::Desktop)
+}
+
+/// Чей процесс у задачи `task` (uid). `None` — такой программы нет.
+#[must_use]
+pub fn uid_of_task(task: u32) -> Option<u32> {
+    let (slot, _) = sched::lookup(sched::TaskId::new(task))?;
+    let process = PROGRAMS.lock().get(slot).and_then(Option::as_ref).cloned()?;
+    let uid = process.lock().cred.uid;
+    Some(uid)
 }
 
 /// Забрать событие окна `slot` текущей программы.
@@ -4111,6 +4195,7 @@ fn run(
             linux_stack: (layout.stack_top - MAIN_STACK_PAGES * PAGE_SIZE, layout.stack_top),
         })));
     }
+    note_linux(slot, linux);
     // Признак поднимается после того, как процесс попал в таблицу: обработчик
     // отказа читает его без лока и вправе увидеть `true` только тогда, когда
     // программу уже есть где найти.
@@ -4405,6 +4490,9 @@ pub fn spawn_streams_rights(
         Ok(id) => {
             if daemon {
                 sched::mark_daemon(id);
+            } else {
+                // Запуск программы Windows — заставка на столе (21.11).
+                crate::ui::launch::note_spawn(id.as_u32(), line);
             }
             Ok(id)
         }
@@ -4595,13 +4683,17 @@ extern "C" fn linux_thread_entry(arg: usize) -> ! {
         sched::yield_now();
     }
     let slot = sched::current_slot();
-    let root = start.process.lock().space.root();
+    let (root, linux) = {
+        let program = start.process.lock();
+        (program.space.root(), program.linux)
+    };
     {
         let mut table = PROGRAMS.lock();
         if let Some(entry) = table.get_mut(slot) {
             *entry = Some(Arc::clone(&start.process));
         }
     }
+    note_linux(slot, linux);
     LINUX_CLEAR_TID[slot].store(start.clear_tid, Ordering::Relaxed);
     LINUX_ALTSTACK[slot].0.store(0, Ordering::Relaxed);
     LINUX_ALTSTACK[slot].1.store(0, Ordering::Relaxed);
@@ -4679,6 +4771,28 @@ pub fn path_of_task(task: u32) -> Option<alloc::string::String> {
     let process = PROGRAMS.lock().get(slot).and_then(Option::as_ref).cloned()?;
     let path = process.lock().path.clone();
     Some(path)
+}
+
+/// Задание процесса Linux задачи `task` ([`Program::linux_job`]) — заставка
+/// запуска (21.11) узнаёт по нему окно запущенной игры. `None` — задача не
+/// программа Linux.
+#[must_use]
+pub fn job_of_task(task: u32) -> Option<u32> {
+    let (slot, _) = sched::lookup(sched::TaskId::new(task))?;
+    let process = PROGRAMS.lock().get(slot).and_then(Option::as_ref).cloned()?;
+    let program = process.lock();
+    program.linux.then(|| program.job())
+}
+
+/// Жив ли ещё хоть один процесс задания `job` (заставка запуска: скрипт
+/// вышел, а Wine ещё поднимает игру).
+#[must_use]
+pub fn job_alive(job: u32) -> bool {
+    let table: alloc::vec::Vec<Arc<Mutex<Program>>> = PROGRAMS.lock().iter().flatten().cloned().collect();
+    table.iter().any(|process| {
+        let program = process.lock();
+        program.linux && program.job() == job
+    })
 }
 
 /// Процесс в слоте `slot` — ссылкой (фаза 71d: `kill` и `SIGCHLD` другому
@@ -4903,10 +5017,10 @@ extern "C" fn linux_fork_entry(arg: usize) -> ! {
     let start = unsafe { alloc::boxed::Box::from_raw(arg as *mut ForkStart) };
     let slot = sched::current_slot();
     let pid = sched::current().as_u32();
-    let (root, ppid) = {
+    let (root, ppid, linux) = {
         let mut program = start.process.lock();
         program.linux_pid = pid;
-        (program.space.root(), program.linux_ppid)
+        (program.space.root(), program.linux_ppid, program.linux)
     };
     crate::linux::register_child(ppid, pid);
     {
@@ -4915,6 +5029,7 @@ extern "C" fn linux_fork_entry(arg: usize) -> ! {
             *entry = Some(Arc::clone(&start.process));
         }
     }
+    note_linux(slot, linux);
     LINUX_SIGMASK[slot].store(start.mask, Ordering::Relaxed);
     LINUX_PENDING[slot].store(0, Ordering::Relaxed);
     LINUX_ALTSTACK[slot].0.store(start.altstack.0, Ordering::Relaxed);
@@ -5033,6 +5148,8 @@ pub fn exec(frame: &mut arch::TrapFrame, path: &str, args: &[&str], env: &[&str]
         linux_dirs.retain(|(fd, _)| files.is_open(*fd));
         (old_space, old_mappings)
     };
+    // The other threads were stopped above: only this slot runs the image.
+    note_linux(slot, loaded.linux.is_some());
     // Знание раньше действия — как при запуске: вытеснение между строками
     // вернёт задачу уже на новый корень.
     sched::set_current_space(Some(root));
@@ -5371,7 +5488,10 @@ extern "C" fn thread_entry(arg: usize) -> ! {
     // ровно этой задаче.
     let start = unsafe { alloc::boxed::Box::from_raw(arg as *mut ThreadStart) };
     let slot = sched::current_slot();
-    let root = start.process.lock().space.root();
+    let (root, linux) = {
+        let program = start.process.lock();
+        (program.space.root(), program.linux)
+    };
 
     {
         let mut table = PROGRAMS.lock();
@@ -5379,6 +5499,7 @@ extern "C" fn thread_entry(arg: usize) -> ! {
             *entry = Some(Arc::clone(&start.process));
         }
     }
+    note_linux(slot, linux);
     // Сторожевая страница — нижняя страница области — в границы не входит.
     set_stack(slot, start.region + PAGE_SIZE, start.region + start.region_bytes);
     IN_USER[slot].store(true, Ordering::Release);
@@ -5886,6 +6007,44 @@ pub fn describe_fault(addr: usize) -> alloc::string::String {
     alloc::format!("{what}; why {}; free frames {free}, regions {regions}, process refs {refs}", last_fault_why().name())
 }
 
+/// Pages mapped per anonymous fault (the faulting one and the following
+/// untouched ones of the same lazy region): 16 since G2 (was 8) - with
+/// zeroed frames from the per-CPU cache a page costs a pop, and a game's
+/// burst of 90 k faults becomes half as many trips through the trap.
+const ANON_FAULT_AROUND: usize = 16;
+
+/// Pages one copy-on-write fault breaks at most, with one TLB shootdown.
+const COW_BATCH: usize = 16;
+/// Shootdowns saved by breaking neighbours in the same fault (perf-diag).
+pub static COW_BATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// `mprotect` that only widens rights sends no TLB shootdown (hw-log14);
+/// `mprotlazy off` - always, as before (A/B).
+pub static LAZY_WIDEN: AtomicBool = AtomicBool::new(true);
+/// `mprotect` calls of multi-thread programs that skipped the shootdown,
+/// and faults that found the page already allowed (stale translation) -
+/// since boot, for perf-diag.
+pub static MPROTECT_NO_FLUSH: AtomicU64 = AtomicU64::new(0);
+pub static SPURIOUS_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// Does the page table of the current program already allow `access` at
+/// `page_addr`? Then a fault there came from a stale, stricter translation
+/// (another CPU widened the rights without a shootdown, or a racing fault
+/// already resolved it) and retrying the instruction is the whole fix.
+fn page_allows(page_addr: usize, access: Touch) -> bool {
+    let Some(Some((_, flags))) =
+        with_current_shared(|program, _| arch::translate(program.space.root(), VirtAddr::new(page_addr)))
+    else {
+        return false;
+    };
+    let need = match access {
+        Touch::Read => PageFlags::READ,
+        Touch::Write => PageFlags::WRITE,
+        Touch::Execute => PageFlags::EXEC,
+    };
+    flags.contains(need | PageFlags::USER)
+}
+
 fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
     let page_addr = addr & !(PAGE_SIZE - 1);
     note_why(FaultWhy::Resolved);
@@ -5893,6 +6052,11 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
     // подкачка тут ни при чём. Кроме памяти кода (фаза 59): у неё «не те
     // права» — обычное состояние, и отказ означает «переключи».
     if present {
+        // Already allowed: a stale translation (lazy widening, hw-log14).
+        if page_allows(page_addr, access) {
+            SPURIOUS_FAULTS.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         // Запись в страницу, разделённую `fork` (фаза 71g).
         if access == Touch::Write
             && with_current_shared(|program, shared| program.cow_break(page_addr, shared)) == Some(true)
@@ -5914,6 +6078,42 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
                 false
             }
         };
+    }
+
+    // Anonymous memory in one round under the process lock (G2, 21.11.2026):
+    // the zeroed frame is taken first (from the per-CPU cache), the plan,
+    // the mapping and the fault-around happen under one lock instead of two
+    // rounds through the program table and the process lock. Anything that
+    // needs a file or shared memory falls through to the general path.
+    if let Some(frame) = take_frame_reserved() {
+        let fast = with_current_shared(|program, shared| {
+            let plan = program.fault_plan(page_addr, access)?;
+            if plan.node.is_some() || plan.shared.is_some() || plan.want != 0 {
+                return None;
+            }
+            let commit = program.fault_commit(page_addr, frame, &plan, shared);
+            if matches!(commit, Commit::Mapped) {
+                program.fault_around_anon(page_addr, plan.flags, ANON_FAULT_AROUND);
+            }
+            Some(commit)
+        })
+        .flatten();
+        match fast {
+            Some(Commit::Mapped) => {
+                note_fault_kind(505);
+                return true;
+            }
+            Some(Commit::Raced) => {
+                crate::mm::frame::put_zeroed(frame);
+                return true;
+            }
+            Some(Commit::Failed) => {
+                return_frame(frame);
+                note_why(FaultWhy::MapFailed);
+                return false;
+            }
+            None => crate::mm::frame::put_zeroed(frame),
+        }
     }
 
     // Шаг первый, под замком: что читать. Нет плана — причина в журнал
@@ -6068,7 +6268,7 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
     let commit = with_current_shared(|program, shared| {
         let commit = program.fault_commit(page_addr, frame, &plan, shared);
         if anonymous && matches!(commit, Commit::Mapped) {
-            program.fault_around_anon(page_addr, plan.flags, 8);
+            program.fault_around_anon(page_addr, plan.flags, ANON_FAULT_AROUND);
         }
         commit
     })

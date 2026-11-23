@@ -85,7 +85,7 @@ impl TrayPop {
     /// Открыть окно `kind` над значком трея `anchor` (экран); `area` — место
     /// основного монитора на столе, `panel_top` — верх панели задач.
     #[must_use]
-    pub fn new(kind: Kind, anchor: Rect, area: Rect, panel_top: i32, scale: u32) -> Option<Self> {
+    pub fn new(kind: Kind, anchor: Rect, area: Rect, panel_top: i32, scale: mini_ui::Scale) -> Option<Self> {
         let ctx = Ctx::scaled(scale);
         let px = |value: u32| value * scale;
         let (w, h) = match kind {
@@ -139,11 +139,11 @@ impl TrayPop {
     }
 
     /// Перерисовать с текущими значениями (громкость сменилась).
-    pub fn refresh(&mut self, scale: u32) {
+    pub fn refresh(&mut self, scale: mini_ui::Scale) {
         self.redraw(scale);
     }
 
-    fn redraw(&mut self, scale: u32) {
+    fn redraw(&mut self, scale: mini_ui::Scale) {
         let ctx = Ctx::scaled(scale);
         let p = ctx.palette;
         let px = |value: u32| value * scale;

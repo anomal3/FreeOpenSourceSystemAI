@@ -77,9 +77,24 @@ impl Bo {
         if size == 0 || size > gpu.info().vram_bytes.max(gpu.info().gart_bytes) {
             return Err(if size == 0 { -e::EINVAL } else { -e::ENOMEM });
         }
-        // Видеопамять — только если её просили и не нужен процессор.
-        let place = if domain & DOMAIN_VRAM != 0 && domain & (DOMAIN_MAPPABLE | DOMAIN_GART) == 0 { Place::Vram } else { Place::Sysmem };
-        let handle = gpu.bo_alloc(size, place).map_err(|err| -i64::from(err.0))?;
+        // Видеопамять — если её просили и не нужен процессор. «LOCAL» NVK
+        // (домен `VRAM|GART`) — тоже в видеопамять, если буфер не делится с
+        // другими (`NO_SHARE`, D4 20.11.2026): до того вся память изображений
+        // и вершин игры лежала в памяти машины, и GPU рисовал через PCIe.
+        // Делимые буферы (кадры WSI, dma-buf) остаются в памяти машины: их
+        // читает стол процессором. `nvk local sys` — как раньше.
+        let gpu_only = domain & DOMAIN_VRAM != 0
+            && domain & DOMAIN_MAPPABLE == 0
+            && (domain & DOMAIN_GART == 0 || (domain & DOMAIN_NO_SHARE != 0 && super::local_in_vram()));
+        let place = if gpu_only { Place::Vram } else { Place::Sysmem };
+        let (place, handle) = match gpu.bo_alloc(size, place) {
+            Ok(handle) => (place, handle),
+            // Видеопамять кончилась — `LOCAL` можно и в памяти машины.
+            Err(_) if place == Place::Vram && domain & DOMAIN_GART != 0 => {
+                (Place::Sysmem, gpu.bo_alloc(size, Place::Sysmem).map_err(|err| -i64::from(err.0))?)
+            }
+            Err(err) => return Err(-i64::from(err.0)),
+        };
         let frames = match place {
             Place::Sysmem => match gpu.bo_frames(handle) {
                 Some(frames) if frames.len() as u64 * PAGE >= size => Some(frames),

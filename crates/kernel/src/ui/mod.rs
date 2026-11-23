@@ -43,16 +43,19 @@
 // иначе файловый менеджер выглядит на этом столе чужой программой. Зависимостей
 // от ядра у них не было ни одной, так что переезд свёлся к переносу двух файлов.
 pub mod appicon;
+pub mod capture;
 pub mod compositor;
 pub mod context;
 pub mod deskcfg;
 pub mod dialog;
 pub mod icons;
 pub mod lock;
+pub mod look;
 pub mod panel;
 pub mod powersheet;
 pub mod pointer;
 pub mod prefs;
+pub mod saver;
 pub mod settings;
 pub mod flight;
 pub mod gesture;
@@ -65,11 +68,16 @@ pub mod tray;
 pub mod statusbar;
 pub mod term;
 pub mod thumbs;
+pub mod snaplay;
 pub mod toast;
+pub mod launch;
 pub mod traypop;
 pub mod trash;
 pub mod wallart;
+pub mod wallpaper;
 pub mod window;
+pub mod winapps;
+pub mod openwith;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -192,20 +200,20 @@ fn hover_button(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
     };
     if let Some(app) = due {
         *HOVER_BUTTON.lock() = None;
-        open_thumbs_for(desktop, app, status, true);
+        open_thumbs_for(desktop, app, status, true, (x, y));
     }
 }
 
 /// Миниатюры окон программы над её кнопкой (72e, макет 04). `hovered` —
 /// открыты наведением и закроются, когда указатель уйдёт.
-fn open_thumbs_for(desktop: &mut Compositor, app: App, status: &Status, hovered: bool) {
+/// `at` — указатель: полоса встаёт над кнопкой панели под ним (22.11).
+fn open_thumbs_for(desktop: &mut Compositor, app: App, status: &Status, hovered: bool, at: (i32, i32)) {
     let mut members = if panel::labels() { alloc::vec::Vec::new() } else { desktop.group_members(app) };
     if members.is_empty() {
         members.push(app);
     }
-    let anchor = members[0];
-    if let Some(rect) = desktop.open_thumbs(members, anchor) {
-        *HOVER_LIST.lock() = hovered.then(|| desktop.button_of(anchor).unwrap_or(rect));
+    if let Some(rect) = desktop.open_thumbs_at(members, app, Some(at)) {
+        *HOVER_LIST.lock() = hovered.then(|| desktop.thumbs_area().map_or(rect, |(_, button)| button));
         kprintln!(
             "  desktop     : thumbnails at {},{} {}x{}{}",
             rect.x,
@@ -244,11 +252,13 @@ fn press_thumbs(desktop: &mut Compositor, x: i32, y: i32, status: &Status) -> bo
         // Крестик: окно закрывается, полоса остаётся с оставшимися.
         Some((app, true)) => {
             let rest: alloc::vec::Vec<App> = desktop.thumbs_apps().into_iter().filter(|other| *other != app).collect();
+            // Над той же кнопкой, над которой полоса стояла (22.11).
+            let at = desktop.thumbs_area().map(|(_, button)| (button.x + button.w as i32 / 2, button.y + button.h as i32 / 2));
             close_from_panel(desktop, app);
             let rest: alloc::vec::Vec<App> = rest.into_iter().filter(|other| desktop.index_of(*other).is_some()).collect();
             match rest.first().copied() {
                 Some(anchor) => {
-                    desktop.open_thumbs(rest, anchor);
+                    desktop.open_thumbs_at(rest, anchor, at);
                 }
                 None => {
                     *HOVER_LIST.lock() = None;
@@ -421,6 +431,11 @@ fn open_file(desktop: &mut Compositor, command: &str, path: &str) {
             recent.insert(0, (String::from(command), String::from(path)));
             recent.truncate(30);
         }
+    }
+    // Программа Windows (22.11) — с правами пакета `proton`, путь с `%20`.
+    if command.contains(panel::PROTON_SCRIPT) {
+        run_choice(desktop, panel::proton_choice(openwith::line(command, path)));
+        return;
     }
     start(desktop, &alloc::format!("{command} {path}"));
 }
@@ -689,13 +704,44 @@ static DESK_FOCUS: AtomicBool = AtomicBool::new(false);
 /// Возвращает `false`, если экрана нет или памяти под окна не хватило. Ядро в
 /// этом случае продолжает работать с оболочкой в серийной консоли — графика не
 /// является условием работы системы.
-/// Выбор масштаба, с которым поднялся стол (0 — по экрану, 1, 2): его
-/// получают программы в `SysInfo::flags`.
+/// Масштаб, которым рисует стол, в процентах (100…200; 0 — стола ещё нет): его получают
+/// программы в `SysInfo::flags`. Один источник правды (20.11): раньше здесь
+/// лежал выбор человека («Авто» = 0), и программа считала «авто» от ширины
+/// экрана сама — после смены режима NVIDIA 1280 → 2560 стол остался в 100 %,
+/// а «Файлы» рисовали в 200 %.
 static APPLIED_SCALE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Выбор масштаба, действующий с запуска стола.
+/// Масштаб стола для программ в процентах (0 — стола нет, программа
+/// считает сама).
 pub fn applied_scale_choice() -> u32 {
     APPLIED_SCALE.load(Ordering::Relaxed)
+}
+
+/// Ряд шрифта для дробного масштаба (20.11): кегли под 125/150/175/200 %
+/// лежат файлами `ui-NNN.fnt` в `/usr/share/fonts/fossai` (в каждый бинарь
+/// их не вшить — это ~0,6 МБ на программу). Читается один раз и остаётся в
+/// памяти. Файла нет — рисуется ближайший встроенный ряд.
+pub fn load_font_pack(scale: mini_ui::Scale) {
+    use mini_ui::typeface;
+    let pct = scale.pct();
+    if theme::is_mobile() || !typeface::pack_wanted(pct) {
+        return;
+    }
+    let Some(path) = typeface::pack_path(pct) else {
+        return;
+    };
+    match crate::fs::read(&path, 2 * 1024 * 1024) {
+        Some(Ok((bytes, _))) => {
+            let size = bytes.len();
+            let bytes: &'static [u8] = alloc::boxed::Box::leak(bytes.into_boxed_slice());
+            if typeface::install_pack(bytes).is_some() {
+                kprintln!("  desktop     : font tier {pct}% from {path} ({} KiB)", size / 1024);
+            } else {
+                kprintln!("  desktop     : font tier {pct}%: {path} damaged, nearest built-in");
+            }
+        }
+        _ => kprintln!("  desktop     : font tier {pct}%: no {path}, nearest built-in"),
+    }
 }
 
 pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
@@ -715,8 +761,9 @@ pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
     // на каждой загрузке. Масштаб — после неё: выбор человека лежит там же.
     prefs::adopt();
     let choice = theme::scale_choice();
-    APPLIED_SCALE.store(choice, Ordering::Relaxed);
     let scale = theme::geometry_scale_for(choice, screen.width(), screen.height());
+    load_font_pack(scale);
+    APPLIED_SCALE.store(scale.pct(), Ordering::Relaxed);
     // Буфер кадра — условие работы стола, а не украшение: без него собирать
     // картинку негде. Не хватило памяти — система работает в серийной линии,
     // ровно как на машине без фреймбуфера.
@@ -1122,7 +1169,12 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
     }
     // От угла рабочей области: панель может стоять сверху или слева (20.11).
     let p = desktop.primary_work();
-    layout_local(desktop, app).translate(p.x, p.y)
+    let rect = layout_local(desktop, app).translate(p.x, p.y);
+    // Окна-программы встают каскадом; диалоги — строго по центру.
+    match app {
+        App::Terminal | App::Settings => desktop.cascade(rect),
+        _ => rect,
+    }
 }
 
 /// [`layout`] в координатах основного монитора.
@@ -1132,7 +1184,6 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
     // выглядело бы как испорченная графика.
     let width = desktop.primary_work().w;
     let work = desktop.primary_work().h.max(1);
-    let margin = width / 24;
 
     // На телефоне окно занимает экран целиком — от строки состояния до
     // полоски жеста у низа (04.11, как у iPhone): дока под программой нет,
@@ -1146,42 +1197,37 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
         return desktop.mobile_rect();
     }
 
+    // Терминал и «Параметры» (20.11): размер в точках макета, умноженный на
+    // множитель, но не больше доли рабочей области ([`theme::window_share`]) —
+    // как окна программ ([`open_window`] берёт размер у программы, а та — у
+    // `app::window_size`). Прежние 5/8 × 3/4 и 7/8 × 9/10 экрана на
+    // 2560×1440 давали окна почти во весь экран. Окно — по центру.
+    let centered = |w: u32, h: u32| {
+        Rect::new(((width.saturating_sub(w)) / 2) as i32, ((work.saturating_sub(h)) / 2) as i32, w, h)
+    };
+    let screen_w = desktop.screen_width();
     match app {
-        App::Terminal | App::TermWin(_) => Rect::new(
-            margin as i32,
-            (work / 16) as i32,
-            width * 5 / 8,
-            work * 3 / 4,
-        ),
-        // «Параметры» — окно из двух колонок: разделы слева и настройки
-        // справа. Ширина считается от них, а не долей экрана: боковая колонка
-        // 240, содержимому нужно место под подпись, пояснение и элемент
-        // справа, а предпросмотр стола — ещё 340. Окно уже этой суммы
-        // показывало бы содержимое в щели между колонкой и краем.
+        App::Terminal | App::TermWin(_) => {
+            let (w, h) = theme::default_window((900, 560), desktop.scale(), (width, work), screen_w);
+            centered(w.max(320.min(width)), h.max(200.min(work)))
+        }
+        // «Параметры» — окно из двух колонок: разделы слева, страница справа.
+        // Высота — не меньше, чем нужно боковой колонке: прокрутки у неё нет,
+        // и все тринадцать разделов обязаны поместиться (520 точек макета).
         App::Settings => {
-            let w = (width * 7 / 8).clamp(560, width.saturating_sub(margin).max(560));
-            // Девять десятых рабочей области, а не четыре пятых, и это не вкус.
-            // С фазы 48 разделов восемь, и у трёх из них содержимое высокое:
-            // список часовых поясов, два поля сети с подписями, перечень томов.
-            // На прежней высоте нижняя строка каждого из них уезжала за край —
-            // клавиатурой она достижима (попадания считаются независимо от
-            // видимости), а мышью нет вовсе. Раздел, которым нельзя
-            // воспользоваться мышью, — это раздел, о котором никто не узнает.
-            let h = (work * 9 / 10).max(360);
-            Rect::new(
-                ((width.saturating_sub(w)) / 2) as i32,
-                (work / 24) as i32,
-                w,
-                h,
-            )
+            let scale = desktop.scale();
+            let (w, h) = theme::default_window((1100, 760), scale, (width, work), screen_w);
+            let w = w.max(560.min(width));
+            let h = h.max((520u32 * scale).min(work * 9 / 10)).max(360.min(work));
+            centered(w, h)
         }
         // Размер диалога — от его содержимого, а не доля экрана: текст и
         // кнопки те же на любом мониторе, и на 1920 окно в половину ширины
         // было бы пустым полем с кнопками в дальнем углу.
         App::About => {
             let scale = desktop.scale();
-            let w = (540 * scale).min(width);
-            let h = (440 * scale).min(work);
+            let w = (540u32 * scale).min(width);
+            let h = (440u32 * scale).min(work);
             Rect::new(
                 ((width - w) / 2) as i32,
                 ((work.saturating_sub(h)) / 2) as i32,
@@ -1195,15 +1241,15 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
         // «Программа не отвечает» и «Удаление файла» — по макету 18.
         App::Hung | App::DeleteAsk => {
             let scale = desktop.scale();
-            let w = (480 * scale).min(width);
-            let h = (230 * scale).min(work);
+            let w = (480u32 * scale).min(width);
+            let h = (230u32 * scale).min(work);
             Rect::new(((width.saturating_sub(w)) / 2) as i32, ((work.saturating_sub(h)) / 2) as i32, w, h)
         }
         // «Как открыть этот файл?» — по макету 18: 480 на 500.
         App::OpenWith => {
             let scale = desktop.scale();
-            let w = (480 * scale).min(width);
-            let h = (500 * scale).min(work);
+            let w = (480u32 * scale).min(width);
+            let h = (500u32 * scale).min(work);
             Rect::new(
                 ((width.saturating_sub(w)) / 2) as i32,
                 ((work.saturating_sub(h)) / 2) as i32,
@@ -1213,8 +1259,8 @@ fn layout_local(desktop: &Compositor, app: App) -> Rect {
         }
         App::Shutdown | App::Restart => {
             let scale = desktop.scale();
-            let w = (500 * scale).min(width);
-            let h = (260 * scale).min(work);
+            let w = (500u32 * scale).min(width);
+            let h = (260u32 * scale).min(work);
             Rect::new(
                 ((width.saturating_sub(w)) / 2) as i32,
                 ((work.saturating_sub(h)) / 2) as i32,
@@ -1580,13 +1626,13 @@ fn drag_tab(desktop: &mut Compositor, x: i32, y: i32) {
     let Some(drag) = *TAB_DRAG.lock() else {
         return;
     };
-    let scale = desktop.scale() as i32;
+    let scale = desktop.scale();
     let Some(window) = desktop.find(drag.app) else {
         *TAB_DRAG.lock() = None;
         return;
     };
     let top = window.rect.y;
-    let bottom = top + Window::title_height(scale as u32) as i32;
+    let bottom = top + Window::title_height(scale) as i32;
     let away = if y < top { top - y } else if y >= bottom { y - bottom + 1 } else { 0 };
     if away > TEAR_OFF * scale && (y - drag.y0).abs() > TEAR_OFF * scale {
         *TAB_DRAG.lock() = None;
@@ -1752,7 +1798,7 @@ fn tab_action(desktop: &mut Compositor, action: context::Action) {
         }
         context::Action::TabDetach => {
             let rect = desktop.rect_of(app).unwrap_or(Rect::new(0, 0, 1, 1));
-            let scale = desktop.scale() as i32;
+            let scale = desktop.scale();
             let (x, y) = (rect.x + 96 * scale, rect.y + 48 * scale);
             tear_off(desktop, app, session, x, y, false);
         }
@@ -1857,6 +1903,39 @@ pub fn output_blit(index: usize) -> (u64, u64) {
 #[must_use]
 pub fn take_worst_frame_ns() -> u64 {
     WORST_FRAME_NS.swap(0, Ordering::Relaxed)
+}
+
+/// G3 (21.11): outputs filled straight from a fullscreen window's pixels -
+/// pieces, nanoseconds (copy + pointer patch + flush) and points.
+static DIRECT_PIECES: AtomicU64 = AtomicU64::new(0);
+static DIRECT_NS: AtomicU64 = AtomicU64::new(0);
+static DIRECT_POINTS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one direct copy (compositor).
+pub fn note_direct(ns: u64, points: u64) {
+    DIRECT_PIECES.fetch_add(1, Ordering::Relaxed);
+    DIRECT_NS.fetch_add(ns, Ordering::Relaxed);
+    DIRECT_POINTS.fetch_add(points, Ordering::Relaxed);
+}
+
+/// G3: frames the display showed straight from a client buffer (flip).
+static FLIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a frame scanned out of a client buffer.
+pub fn note_flip() {
+    FLIPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Direct copies since boot: `(pieces, ns, points, flipped frames)`
+/// (`perf-diag`).
+#[must_use]
+pub fn direct_stats() -> (u64, u64, u64, u64) {
+    (
+        DIRECT_PIECES.load(Ordering::Relaxed),
+        DIRECT_NS.load(Ordering::Relaxed),
+        DIRECT_POINTS.load(Ordering::Relaxed),
+        FLIPS.load(Ordering::Relaxed),
+    )
 }
 
 /// Записать, во что обошлась одна полоса кадра. Зовётся из композитора.
@@ -1997,8 +2076,6 @@ pub fn timing() -> (u64, u64, u64, u64, u64) {
 /// один на 200 мс дают в среднем 5 мс, а палец чувствует именно двести.
 static WORST_FRAME_NS: AtomicU64 = AtomicU64::new(0);
 
-/// Анимация окон включена в «Параметрах» (по умолчанию — да).
-static ANIMATIONS: AtomicBool = AtomicBool::new(true);
 
 /// Сколько стоит кадр во весь экран, наносекунды, — сглаженная оценка по
 /// собранным кадрам. Ноль — ещё не мерили.
@@ -2028,18 +2105,23 @@ pub fn note_screen_cost(ns: u64, points: u64, screen: u64) {
 pub fn animations_allowed() -> bool {
     // Телефону анимация — часть жестов (окно улетает в стопку дока), и
     // отключать её по цене кадра там нельзя.
-    ANIMATIONS.load(Ordering::Relaxed)
+    // Какая именно анимация — решает «Оформление» (`look`, 20.11): здесь
+    // только «включена хоть одна и машина успевает».
+    animations_enabled()
         && (theme::is_mobile() || SCREEN_FRAME_NS.load(Ordering::Relaxed) <= ANIMATION_FRAME_BUDGET_NS)
 }
 
-/// Включена ли анимация окон в «Параметрах».
+/// Включена ли анимация окон в «Параметрах» (хоть одна из двух в
+/// «Оформлении»).
 #[must_use]
 pub fn animations_enabled() -> bool {
-    ANIMATIONS.load(Ordering::Relaxed)
+    look::on(look::Flag::MinMax) || look::on(look::Flag::OpenClose)
 }
 
+/// «Анимация окон» быстрых настроек — обе анимации «Оформления» сразу.
 pub fn set_animations(on: bool) {
-    ANIMATIONS.store(on, Ordering::Relaxed);
+    look::set(look::Flag::MinMax, on);
+    look::set(look::Flag::OpenClose, on);
 }
 
 /// Записать длительность кадра, если он хуже прежнего худшего.
@@ -2197,10 +2279,21 @@ pub fn set_screen_off(off: bool) -> bool {
 static WIFI_SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 pub fn tick() {
+    // Запуски программ Windows (21.11): кончились ли, значки — вне замка
+    // стола (см. `launch`).
+    launch::poll();
     let status = status_now();
     let request = MODE_REQUEST.swap(0, core::sync::atomic::Ordering::Relaxed);
     let layout = LAYOUT_REQUEST.lock().take();
-    with_desktop(|desktop| {
+    // Настройки живой флешки вернулись после запуска стола (21.11).
+    let restored = PREFS_RESTORED.swap(false, Ordering::AcqRel);
+    if restored {
+        prefs::adopt();
+    }
+    let done = with_desktop(|desktop| {
+        if restored {
+            apply_restored(desktop, &status);
+        }
         if request != 0 {
             change_mode(desktop, ((request >> 32) as u32, request as u32), &status);
         }
@@ -2220,7 +2313,24 @@ pub fn tick() {
         desktop.refresh_panel(&status);
         check_gesture_hold(desktop, &status);
         desktop.reload_icons_if_packages_changed();
+        // Каталог стола поменяли (20.11): программа сохранила туда файл,
+        // терминал удалил — значки следом, без «Обновить».
+        if icons::desktop_folder_changed(desktop.icon_editing().is_none()) {
+            desktop.reload_icons();
+            let (total, entries) = desktop.icon_counts();
+            kprintln!("  desktop     : desktop folder changed, icons {total}, {entries} from {}", context::desktop_dir());
+            desktop.repaint_all();
+        }
+        // Фон (22.11, `wallpaper`): картинка перевелась — стол и «Фон» заново.
+        if wallpaper::poll() {
+            desktop.repaint_all();
+            if let Some(window) = desktop.find(App::Settings) {
+                window.refresh_settings();
+            }
+        }
         desktop.expire_toast();
+        // Screen recorder (22.11): «Запись сохранена», a capture left behind.
+        capture::tick(desktop);
         desktop.refresh_lock_clock();
         watch_hung(desktop);
         // Wi-Fi включается отдельной задачей: сменилось состояние —
@@ -2235,6 +2345,9 @@ pub fn tick() {
         }
         desktop.present();
     });
+    if restored && done.is_none() {
+        PREFS_RESTORED.store(true, Ordering::Release);
+    }
     // «Завершить программу» — вне замка стола: снятие задачи берёт свои.
     let task = HUNG_KILL.swap(0, Ordering::Relaxed);
     if task != 0 {
@@ -2244,6 +2357,33 @@ pub fn tick() {
             Ok(count) => kprintln!("  desktop     : killed #{task} ({count} process(es)), it did not respond"),
             Err(_) => kprintln!("  desktop     : #{task} could not be ended"),
         }
+    }
+}
+
+/// Настройки живой флешки вернулись в `/etc` (21.11, `usb::stick_settings`):
+/// стол перечитывает `desktop.cfg` в ближайшем [`tick`].
+static PREFS_RESTORED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Заказать столу перечитать и применить восстановленные настройки.
+pub fn settings_restored() {
+    PREFS_RESTORED.store(true, Ordering::Release);
+}
+
+/// Применить перечитанный `desktop.cfg` (тема, масштаб, панель и «Пуск»,
+/// значки) ко всему столу; раскладка мониторов — заказом, как при загрузке.
+fn apply_restored(desktop: &mut Compositor, status: &Status) {
+    apply_scale(desktop, status);
+    desktop.reload_icons();
+    // Высота заголовка, тема, акцент, обои, панель — и перерисовка всего.
+    desktop.retitle_all(status);
+    kprintln!(
+        "  desktop     : settings from the stick applied (theme {}, scale {}, ui scale {})",
+        if theme::is_dark() { "dark" } else { "light" },
+        theme::scale_choice_tag(theme::scale_choice()),
+        desktop.scale()
+    );
+    if let Some(plan) = saved_layout() {
+        LAYOUT_REQUEST.lock().replace(Some(plan));
     }
 }
 
@@ -2342,6 +2482,15 @@ const INPUT_TRIES: u32 = 250;
 const INPUT_PAUSE_MS: u64 = 2;
 
 fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
+    // The key that ends the screensaver or wakes the dark screen (22.11) is
+    // not delivered, nor its release.
+    let saver_up = desktop.saver_showing();
+    if saver::swallow_key(desktop.blanked() || saver_up, event) {
+        if saver_up {
+            saver::end_on(desktop);
+        }
+        return None;
+    }
     // Поле поиска «Пуска» телефона забирает клавиши раньше всех: пока оно в
     // фокусе, набранное — это запрос, а не команда оболочке под листом.
     if desktop.start_focused() {
@@ -2488,9 +2637,28 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
             desktop.refresh_panel(status);
             return None;
         }
+        // Win+Alt+R — start/stop the screen recording, like the Game Bar
+        // (22.11): a running capture is asked to stop, otherwise
+        // `/bin/screenrec --record` starts with the saved settings.
+        KeyCode::R if event.mods.contains(Modifiers::META) && event.mods.contains(Modifiers::ALT) => {
+            if capture::active() {
+                capture::request_stop();
+            } else {
+                run_choice(desktop, panel::Choice::Program("screenrec", "--record"));
+            }
+            desktop.refresh_panel(status);
+            return None;
+        }
         // Win+R — «Выполнить», как в Windows (фаза П1, 20.11): /bin/run.
         KeyCode::R if event.mods.contains(Modifiers::META) => {
             run_choice(desktop, panel::Choice::Program("run", ""));
+            desktop.refresh_panel(status);
+            return None;
+        }
+        // Win+X — меню опытного пользователя, как в Windows (П3, 20.11):
+        // окно `/bin/admin --winx` у кнопки «Пуск».
+        KeyCode::X if event.mods.contains(Modifiers::META) => {
+            run_choice(desktop, panel::Choice::Program("admin", "--winx"));
             desktop.refresh_panel(status);
             return None;
         }
@@ -2597,6 +2765,26 @@ pub fn dispatch_pointer(event: PointerEvent) {
     }
 }
 
+/// G3: raw mouse motion to the Wayland window that has the pointer: the
+/// window of the active constraint, else the window holding the capture
+/// (a button is down), else the one under the pointer. Only Wayland windows
+/// ([`Window::raw_keys`]) understand [`WIN_RELMOTION`].
+fn send_relative(desktop: &mut Compositor, (dx, dy): (i32, i32)) {
+    let target = match desktop.active_constraint() {
+        Some((app, _)) => Some(app),
+        None => match desktop.captured() {
+            Some((app, _)) => Some(app),
+            None => {
+                let (x, y) = desktop.pointer_position();
+                desktop.program_under(x, y).map(|(app, _, _)| app)
+            }
+        },
+    };
+    if let Some(window) = target.and_then(|app| desktop.find(app)).filter(|window| window.raw_keys) {
+        window.push_relative(dx, dy);
+    }
+}
+
 /// Код средней кнопки в [`WIN_POINTER`] и [`WIN_RELEASE`] (20.11) — третий
 /// бит маски кнопок, как у [`WIN_MOVE`]: 1 левая, 2 правая, 4 средняя.
 const MIDDLE_BUTTON: u32 = 4;
@@ -2672,7 +2860,9 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
     // Автоскрытие панели: край экрана выдвигает её, уход — прячет (20.11).
     desktop.taskbar_pointer(x, y);
     if desktop.menu_open() && !desktop.context_open() {
-        if desktop.menu_mut().is_some_and(|menu| menu.hover(x, y)) {
+        // Строку «Пуска» тащат (21.11) — подсветка цели и подсказка.
+        let dragged = buttons.contains(Buttons::LEFT) && desktop.menu_mut().is_some_and(|menu| menu.drag(x, y));
+        if dragged || desktop.menu_mut().is_some_and(|menu| !menu.dragging() && menu.hover(x, y)) {
             desktop.present();
         }
     }
@@ -2689,6 +2879,11 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
         desktop.hover_title(x, y);
     } else {
         desktop.hover_title(-1, -1);
+    }
+    // Макеты прилипания от кнопки «Развернуть» (20.11): подсветка зоны,
+    // уход с плашки и кнопки — закрыть.
+    if desktop.dragging().is_none() {
+        desktop.snap_layouts_hover(x, y);
     }
     // Форма курсора (72c): растяжка у уголка и пока тянут, текст над
     // терминалом, иначе стрелка.
@@ -2756,7 +2951,8 @@ fn wheel(desktop: &mut Compositor, x: i32, y: i32, clicks: i32) {
     } else if desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open() {
         None
     } else {
-        desktop.program_under(x, y).map(|(app, _, _)| app)
+        // Окно, ждущее ответа модального окна (20.11), колесо не крутит.
+        desktop.program_under(x, y).map(|(app, _, _)| app).filter(|app| !desktop.has_modal(*app))
     };
     if let Some(window) = target.and_then(|app| desktop.find(app)) {
         window.push_event(WinEvent { kind: WIN_WHEEL, code: 0, x: clicks, y: 0 });
@@ -2859,7 +3055,13 @@ pub fn swallow_wake_touch() {
 }
 
 fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
-    if desktop.blanked() {
+    // The screensaver (22.11) ends on the first motion or click, which goes
+    // no further.
+    let saver_up = desktop.saver_showing();
+    if saver_up {
+        saver::end_on(desktop);
+    }
+    if desktop.blanked() || saver_up {
         WAKE_TOUCH.store(true, core::sync::atomic::Ordering::Relaxed);
     }
     if WAKE_TOUCH.load(core::sync::atomic::Ordering::Relaxed) {
@@ -2874,14 +3076,36 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     // На сколько сдвинулся курсор. У мыши это приехало в отчёте, у планшета
     // приходится вычесть одно положение из другого: устройство сообщило точку,
     // а окно можно тащить только на разницу.
+    // G3 (21.11): a game may lock the pointer (it stays and hides) or confine
+    // it to its window; the raw motion goes to it as relative motion either
+    // way (`zwp_relative_pointer_v1`), without our pointer acceleration.
+    let mut relative = (0, 0);
     let (dx, dy) = match event.absolute {
-        Some((x, y)) => desktop.move_pointer_to(x, y),
+        Some((x, y)) => {
+            relative = desktop.tablet_step(x, y);
+            match desktop.constrain_motion(relative.0, relative.1) {
+                None => desktop.move_pointer_to(x, y),
+                Some((mx, my)) => {
+                    if mx != 0 || my != 0 {
+                        desktop.move_pointer(mx, my);
+                    }
+                    (mx, my)
+                }
+            }
+        }
         None if event.dx != 0 || event.dy != 0 => {
-            desktop.move_pointer(event.dx, event.dy);
-            (event.dx, event.dy)
+            relative = (event.dx, event.dy);
+            let (mx, my) = desktop.constrain_motion(event.dx, event.dy).unwrap_or((event.dx, event.dy));
+            if mx != 0 || my != 0 {
+                desktop.move_pointer(mx, my);
+            }
+            (mx, my)
         }
         None => (0, 0),
     };
+    if relative != (0, 0) {
+        send_relative(desktop, relative);
+    }
 
     if dx != 0 || dy != 0 {
         // Перетаскивание — это движение окна вслед за указателем на то же
@@ -2899,6 +3123,8 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         // прилипает к краю соседнего.
         if let Some(window) = desktop.find(App::Settings).filter(|w| w.settings_dragging()) {
             if window.settings_drag(x, y) {
+                // Ползунок размера Dock (20.11): Dock пересобирается живьём.
+                desktop.refresh_panel(status);
                 desktop.present();
             }
         }
@@ -3131,6 +3357,33 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
     if event.released(Buttons::MIDDLE) {
         release_pointer(desktop, x, y, MIDDLE_BUTTON, status);
+    }
+    if event.released(Buttons::LEFT) && desktop.menu_open() {
+        // Нажатая строка «Пуска» (21.11): на месте — запуск, перенесённая —
+        // в папку, к закреплённым или ярлыком на стол.
+        match desktop.menu_mut().and_then(|menu| menu.release(x, y)) {
+            Some(panel::MenuClick::Launch(choice)) => {
+                if let Some(menu) = desktop.menu_mut() {
+                    menu.close();
+                }
+                kprintln!("  desktop     : menu closed");
+                desktop.mark_menu_area();
+                run_choice(desktop, choice);
+                desktop.refresh_panel(status);
+            }
+            Some(panel::MenuClick::Close) => {
+                if let Some(menu) = desktop.menu_mut() {
+                    menu.close();
+                }
+                kprintln!("  desktop     : menu closed");
+                desktop.mark_menu_area();
+                desktop.reload_icons();
+                log_icons(desktop);
+                desktop.refresh_panel(status);
+            }
+            Some(panel::MenuClick::Stay) => desktop.refresh_panel(status),
+            None => {}
+        }
     }
     if event.released(Buttons::LEFT) {
         // Жест по полоске и карточка переключателя — раньше прочего: нажатие,
@@ -3570,6 +3823,21 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         return;
     }
 
+    // 0-launch. Заставка запуска программы Windows (21.11): крестик и
+    // «Закрыть» убирают её, «Подробнее» — журнал событий.
+    if let Some(hit) = desktop.splash_hit(x, y) {
+        match hit {
+            launch::Hit::Details => {
+                desktop.splash_dismiss();
+                start(desktop, "/bin/eventlog");
+            }
+            launch::Hit::Close => desktop.splash_dismiss(),
+            launch::Hit::Inside => {}
+        }
+        desktop.present();
+        return;
+    }
+
     // 0-toast. Уведомление (72h-2): «Открыть» запускает программу.
     if let Some(hit) = desktop.toast_hit(x, y) {
         match hit {
@@ -3591,6 +3859,21 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
     // 0-tray. Окно трея (72h-1).
     if desktop.tray_pop_kind().is_some() && press_tray_pop(desktop, x, y, status) {
         return;
+    }
+
+    // 0-snap. Макеты прилипания (20.11, как Snap Layouts в Windows 11):
+    // щелчок по зоне ставит окно в неё, мимо плашки — закрывает её.
+    if desktop.snap_layouts_open() {
+        if let Some((app, layout, cell)) = desktop.snap_layouts_press(x, y) {
+            kprintln!("  desktop     : snapped '{}' to layout {}.{}", name_of(desktop, app), layout + 1, cell + 1);
+            log_window(desktop, app, true);
+            desktop.refresh_panel(status);
+            desktop.present();
+            return;
+        }
+        if desktop.snap_layouts_contains(x, y) {
+            return;
+        }
     }
 
     // 0-thumbs. Миниатюры окон над панелью (72e).
@@ -3675,7 +3958,11 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                     kprintln!("  start       : opened");
                 }
             }
-            PanelHit::Menu => toggle_menu(desktop, status),
+            PanelHit::Menu => {
+                // «Пуск» — у той панели, чью кнопку нажали (20.11).
+                desktop.aim_menu_at(x, y);
+                toggle_menu(desktop, status);
+            }
             PanelHit::Search => {
                             if desktop.open_start(true) {
                     kprintln!("  start       : opened for search");
@@ -3691,7 +3978,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                     // Над кнопкой — список окон этой программы, щелчок
                     // выбирает нужное (как в Windows 11; 24.10: перебор по
                     // очереди не давал выбрать конкретное окно).
-                    open_thumbs_for(desktop, app, status, false);
+                    open_thumbs_for(desktop, app, status, false, (x, y));
                     return;
                 }
                 // Щелчок по кнопке активного окна сворачивает его — так ведёт
@@ -3813,12 +4100,20 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         // ни щелчка содержимому (оно досталось бы вопросу, в чужих
         // координатах), ни перетаскивания, ни уголка.
         let popup = app.is_some_and(|app| desktop.is_popup(app));
+        // Окно ждёт ответа модального подчинённого (20.11, «Сохранить как»):
+        // ни содержимое, ни заголовок с кнопками ввода не принимают, как в
+        // Windows; поднятие уже вернуло человека к вопросу.
+        if let Some(owner) = app.filter(|app| !popup && desktop.has_modal(*app)) {
+            kprintln!("  desktop     : '{}' waits for its dialog", name_of(desktop, owner));
+            desktop.present();
+            return;
+        }
         // Двойной щелчок по заголовку (20.11): развернуть или вернуть, как в
         // Windows. Первый щелчок мог прийтись на неактивное окно — он только
         // поднял его, но запомнить его надо и тогда.
         if let Some(app) = app.filter(|_| hit == Hit::Title && !popup) {
             let now = if at_ms == 0 { crate::time::uptime_ms() } else { at_ms };
-            let slop = 6 * desktop.scale().max(1) as i32;
+            let slop = 6 * desktop.scale().pct() as i32 / 100;
             let double = {
                 let mut last = LAST_TITLE.lock();
                 let double = last.is_some_and(|(was, at, lx, ly)| {
@@ -3831,7 +4126,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
             if double {
                 desktop.set_drag(None);
                 let name = name_of(desktop, app);
-                if desktop.find(app).is_some_and(|window| window.resizable()) && desktop.toggle_maximize(app) {
+                if desktop.find(app).is_some_and(|window| window.resizable() && !window.dialog) && desktop.toggle_maximize(app) {
                     kprintln!("  desktop     : title double-click on '{name}'");
                     kprintln!("  desktop     : resized '{name}'");
                     log_window(desktop, app, true);
@@ -4007,7 +4302,13 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
             kprintln!("  desktop     : closed '{}'", app.title());
         }
         let entries = core::mem::take(&mut *DELETE_PENDING.lock());
-        if answer == Answer::Confirm {
+        if EMPTY_PENDING.swap(false, Ordering::Relaxed) {
+            if answer == Answer::Confirm {
+                empty_trash(desktop);
+            } else {
+                kprintln!("  desktop     : emptying the trash cancelled");
+            }
+        } else if answer == Answer::Confirm {
             trash_entries(desktop, &entries);
         } else {
             kprintln!("  desktop     : delete cancelled");
@@ -4077,7 +4378,9 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
 /// Окно «Как открыть этот файл?» для `path` (макет 18). Программ нет — сказать
 /// об этом и открыть в «Файлах», как раньше.
 fn choose_program(desktop: &mut Compositor, path: &str) {
-    let choices = file_handlers(path);
+    // Все программы (22.11): подходящие первыми, затем «Программы Windows» и
+    // свои программы — как «Выбрать другое приложение» Windows.
+    let choices: alloc::vec::Vec<(String, String)> = openwith::handlers(path, true).into_iter().map(|handler| (handler.caption, handler.command)).collect();
     if choices.is_empty() {
         kprintln!("  desktop     : no program opens '{path}'");
         start(desktop, &alloc::format!("/bin/files {path}"));
@@ -4545,6 +4848,25 @@ fn desktop_plan(primary: &boot_info::Framebuffer, size: Option<(u32, u32)>) -> V
             entry.rect.y = py;
             x += entry.rect.w as i32;
         }
+    } else if plan.len() > 1 && plan.iter().enumerate().any(|(i, a)| !plan.iter().enumerate().any(|(j, b)| i != j && touches(a.rect, b.rect))) {
+        // Щель между мониторами (железо Романа, 20.11: раскладка, сохранённая
+        // при 1280×720 прошивки, после 2560×1440 оставила второй монитор в
+        // 3840 — 1280 точек пустоты, куда уезжал Dock). Мониторы встают
+        // вплотную в прежнем порядке слева направо, реестр — вместе с ними.
+        let mut order: Vec<usize> = (0..plan.len()).collect();
+        order.sort_by_key(|&i| (plan[i].rect.x, plan[i].rect.y));
+        let mut x = plan[order[0]].rect.x;
+        for &i in &order {
+            plan[i].rect.x = x;
+            plan[i].rect.y = py;
+            x += plan[i].rect.w as i32;
+            let (nx, ny, backend) = (plan[i].rect.x, plan[i].rect.y, plan[i].backend);
+            outputs::update(backend, |out| {
+                out.x = nx;
+                out.y = ny;
+            });
+        }
+        kprintln!("  desktop     : monitor layout had gaps -- packed edge to edge");
     }
     // Стол начинается в левом верхнем углу охватывающего прямоугольника.
     let min_x = plan.iter().map(|p| p.rect.x).min().unwrap_or(0);
@@ -4553,6 +4875,13 @@ fn desktop_plan(primary: &boot_info::Framebuffer, size: Option<(u32, u32)>) -> V
         entry.rect = entry.rect.translate(-min_x, -min_y);
     }
     plan
+}
+
+/// Мониторы соприкасаются краями (общий отрезок стороны).
+fn touches(a: Rect, b: Rect) -> bool {
+    let side = (a.right() == b.x || b.right() == a.x) && a.y < b.bottom() && b.y < a.bottom();
+    let stack = (a.bottom() == b.y || b.bottom() == a.y) && a.x < b.right() && b.x < a.right();
+    side || stack
 }
 
 /// Основной монитор сменил размер `from` → `to`: мониторы правее и ниже
@@ -4603,11 +4932,27 @@ fn adopt_plan(
     }
     let count = slots.len();
     desktop.adopt_outputs(slots, layers, status);
+    // Основной монитор мог смениться размером (NVIDIA: 1280×720 прошивки →
+    // 2560×1440) — масштаб «Авто» заново от него.
+    apply_scale(desktop, status);
     remember_sizes(desktop);
     if count > 1 {
         log_outputs(desktop);
     }
     Ok(())
+}
+
+/// Масштаб стола по выбору человека («Авто» — от основного монитора) —
+/// сразу, на всё: стол, окна ядра и программы (им — через `SysInfo`).
+fn apply_scale(desktop: &mut Compositor, status: &Status) {
+    let p = desktop.primary_rect();
+    let scale = theme::geometry_scale_for(theme::scale_choice(), p.w, p.h);
+    // Ряд шрифта под дробный масштаб — с диска, до перестройки окон: иначе
+    // первый кадр нарисовал бы ближайшим встроенным.
+    load_font_pack(scale);
+    desktop.set_scale(scale, status);
+    APPLIED_SCALE.store(desktop.scale().pct(), Ordering::Relaxed);
+    remember_sizes(desktop);
 }
 
 /// Размеры, которые спрашивают без захвата стола: окно оболочки в знаках,
@@ -4856,11 +5201,33 @@ pub fn taskbar_command(words: &str) {
     });
 }
 
+/// `ui scale auto|100|125|150|175|200`: выбрать масштаб, как в «Параметрах», и сразу
+/// применить ко всему столу (стенд, 20.11).
+pub fn scale_command(word: &str) {
+    let Some(choice) = theme::scale_choice_from_tag(word) else {
+        kprintln!("  desktop     : ui scale: auto, 100, 125, 150, 175 or 200");
+        return;
+    };
+    theme::set_scale_choice(choice);
+    if let Err(err) = prefs::store_scale(choice) {
+        kprintln!("  desktop     : scale not saved: {err}");
+    }
+    let status = status_now();
+    with_desktop(|desktop| {
+        apply_scale(desktop, &status);
+        kprintln!("  desktop     : scale {} -> ui scale {}", theme::scale_choice_tag(choice), desktop.scale());
+        desktop.present();
+    });
+}
+
 pub fn start_command(words: &str) {
     let status = status_now();
-    if words.trim() == "settings" {
+    // `ui start settings` — страница «Пуск»; `... display` — «Дисплей»
+    // (масштаб, стенд scale-live 20.11).
+    if let Some(rest) = words.trim().strip_prefix("settings") {
+        let section = if rest.trim() == "display" { Section::Display } else { Section::Start };
         with_desktop(|desktop| {
-            open_settings(desktop, Section::Start, &status);
+            open_settings(desktop, section, &status);
             desktop.present();
         });
         return;
@@ -4869,6 +5236,76 @@ pub fn start_command(words: &str) {
     with_desktop(|desktop| {
         desktop.reload_menu();
     });
+}
+
+/// Страница «Параметров» по имени (П3, 20.11): наши ключи и привычные имена
+/// `ms-settings:` Windows — для `ui open settings <имя>` и «Выполнить».
+fn section_named(name: &str) -> Option<Section> {
+    let name = name.trim().trim_start_matches("ms-settings:").trim_start_matches("settings:").to_ascii_lowercase();
+    Some(match name.as_str() {
+        "" | "home" => Section::Home,
+        "system" => Section::System,
+        "display" | "screen" | "easeofaccess" | "easeofaccess-display" => Section::Display,
+        "power" | "powersleep" | "batterysaver" => Section::Power,
+        "storage" | "storagesense" => Section::Storage,
+        "about" => Section::About,
+        "devices" | "sound" | "mousetouchpad" | "mouse" | "bluetooth" | "printers" => Section::Devices,
+        "keyboard" | "typing" | "regionlanguage" | "language" => Section::Keyboard,
+        "usb" | "autoplay" => Section::Usb,
+        "network" | "network-status" | "network-ethernet" | "network-wifi" | "network-proxy" => Section::Network,
+        "personal" | "personalization" => Section::Personal,
+        "wallpaper" | "personalization-background" | "background" => Section::Wallpaper,
+        "colors" | "personalization-colors" => Section::Colors,
+        "appearance" | "themes" | "personalization-themes" => Section::Appearance,
+        "dock" | "taskbar" => Section::Dock,
+        "start" | "personalization-start" => Section::Start,
+        "explorer" | "folders" => Section::Explorer,
+        "apps" | "appsfeatures" | "startupapps" => Section::Apps,
+        "packages" | "optionalfeatures" => Section::Packages,
+        "services" => Section::Services,
+        "defaultapps" => Section::DefaultApps,
+        "accounts" | "yourinfo" | "otherusers" | "signinoptions" => Section::Accounts,
+        "time" | "dateandtime" | "region" => Section::Time,
+        "privacy" => Section::Privacy,
+        "update" | "windowsupdate" => Section::Update,
+        "recovery" => Section::Recovery,
+        _ => return None,
+    })
+}
+
+/// `ui open settings [страница]`, `ui open terminal`, `ui open about` —
+/// окно стола по просьбе программы (П3, 20.11). Программа сама открыть окно
+/// ядра не может; «Администрирование» и «Выполнить» просят об этом через
+/// `SYS_KERNEL_COMMAND` (эта команда разрешена и не root: она лишь
+/// показывает окно, то же, что щелчок в «Пуске»).
+pub fn open_command(words: &str) -> Result<String, String> {
+    let mut parts = words.split_whitespace();
+    let what = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("");
+    let status = status_now();
+    match what {
+        "settings" => {
+            let Some(section) = section_named(rest) else {
+                return Err(alloc::format!("no settings page '{rest}'"));
+            };
+            with_desktop(|desktop| {
+                open_settings(desktop, section, &status);
+                desktop.present();
+            });
+            Ok(alloc::format!("settings {section:?}"))
+        }
+        "terminal" | "about" => {
+            let app = if what == "terminal" { App::Terminal } else { App::About };
+            with_desktop(|desktop| {
+                launch(desktop, app);
+                kprintln!("  desktop     : {app:?} opened on request");
+                desktop.refresh_panel(&status);
+                desktop.present();
+            });
+            Ok(String::from(what))
+        }
+        _ => Err(alloc::format!("unknown window '{what}' (settings [page] | terminal | about)")),
+    }
 }
 
 /// Открыть или закрыть меню запуска.
@@ -4917,6 +5354,33 @@ fn handle_menu(desktop: &mut Compositor, event: KeyEvent, status: &Status) {
 
     let mut launching = None;
     let mut closed = false;
+    // Классика (22.11): каскад Windows 98 ходит стрелками по уровням.
+    if menu.is_classic() {
+        let ch = keymap::char_for(event).filter(|_| !event.mods.contains(Modifiers::CTRL) && !event.mods.contains(Modifiers::ALT));
+        match menu.classic_key(code, ch) {
+            panel::ClassicKey::Ignored => return,
+            panel::ClassicKey::Stay => {}
+            panel::ClassicKey::Launch(choice) => {
+                menu.close();
+                closed = true;
+                launching = Some(choice);
+            }
+            panel::ClassicKey::Close => {
+                menu.close();
+                closed = true;
+            }
+        }
+        if closed {
+            kprintln!("  desktop     : menu closed");
+            desktop.mark_menu_area();
+        }
+        if let Some(choice) = launching {
+            run_choice(desktop, choice);
+        }
+        desktop.refresh_panel(status);
+        desktop.present();
+        return;
+    }
     match code {
         KeyCode::Up | KeyCode::Left => menu.move_selection(false),
         KeyCode::Down | KeyCode::Right => menu.move_selection(true),
@@ -5086,7 +5550,23 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
             let Some(command) = desktop.icon_path(index) else {
                 return;
             };
+            // Ярлык программы Windows (21.11) — с правами пакета `proton`,
+            // как из «Пуска».
+            if command.contains(panel::PROTON_SCRIPT) {
+                run_choice(desktop, panel::proton_choice(command));
+                return;
+            }
             start(desktop, &command);
+        }
+        // Ярлык или программа Windows в файле на столе (`.lnk`, `.exe`, 21.11)
+        // — через Proton, префикс — где нашлась цель ярлыка.
+        Some(icons::Kind::File) if desktop.icon_path(index).is_some_and(|path| winapps::is_windows_file(&path)) && winapps::proton_present() => {
+            let Some(path) = desktop.icon_path(index) else {
+                return;
+            };
+            if let Some(line) = winapps::open_line(&path) {
+                run_choice(desktop, panel::proton_choice(line));
+            }
         }
         // Корзина — «Файлы» в её каталоге (он заводится, если корзина ещё
         // ни разу не понадобилась: окно на несуществующем пути было бы пустым
@@ -5134,29 +5614,10 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
 /// допишется). Свои — «Блокнот» для текста; пакетные — по `opens=` их
 /// манифеста (поставили Notepad++ — он появится здесь).
 fn file_handlers(path: &str) -> alloc::vec::Vec<(String, String)> {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let extension = sysconf::filetypes::extension(name);
-    let mut out = alloc::vec::Vec::new();
-    if sysconf::filetypes::is_text(name) || extension.is_empty() {
-        out.push((String::from("Блокнот"), String::from("/bin/notepad")));
-    }
-    if !extension.is_empty() {
-        for launcher in panel::list_packages() {
-            if launcher.opens.split(',').any(|ext| ext.trim().eq_ignore_ascii_case(&extension)) {
-                out.push((launcher.caption.clone(), launcher.start.clone()));
-            }
-        }
-    }
-    // Выбранная человеком — первой («по умолчанию»), даже если её нет в списке
-    // (пакет переустановили без `opens=`).
-    if let Some(command) = prefs::open_with(&extension) {
-        let entry = match out.iter().position(|(_, start)| *start == command) {
-            Some(at) => out.remove(at),
-            None => (String::from(command.rsplit('/').next().unwrap_or(&command)), command),
-        };
-        out.insert(0, entry);
-    }
-    out
+    // С 22.11 — общий список с «Файлами» (`openwith`): выбранная человеком
+    // первой, «Блокнот», пакеты с `opens=` и программы Windows из реестра
+    // префиксов Wine (Notepad++ для `.txt`).
+    openwith::handlers(path, false).into_iter().map(|handler| (handler.caption, handler.command)).collect()
 }
 
 /// Запустить программу третьего кольца по готовой командной строке.
@@ -5223,7 +5684,8 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         | context::Action::Copy => {}
         context::Action::Personalize => {
             desktop.close_context();
-            open_settings(desktop, Section::Personal, status);
+            // Как в Windows: «Персонализация» открывается на «Фоне» (22.11).
+            open_settings(desktop, Section::Wallpaper, status);
         }
         context::Action::OpenNewWindow => {
             desktop.close_context();
@@ -5283,16 +5745,33 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             desktop.close_context();
             kprintln!("  desktop     : context menu closed");
             *DELETE_PENDING.lock() = entries;
+            EMPTY_PENDING.store(false, Ordering::Relaxed);
             let rect = layout(desktop, App::DeleteAsk);
-            if let Some(window) = Window::dialog(App::DeleteAsk, rect, desktop.scale(), Dialog::Delete { question }) {
+            if let Some(window) = Window::dialog(App::DeleteAsk, rect, desktop.scale(), Dialog::Delete { question, forever: false }) {
                 desktop.push(window);
                 kprintln!("  desktop     : opened '{}'", App::DeleteAsk.title());
                 log_focus(desktop);
             }
         }
+        // «Очистить корзину» спрашивает тем же окном, что и удаление (21.11),
+        // а не строкой в карточке меню: вопрос о безвозвратном стирании —
+        // не место для мелкого шрифта.
         context::Action::EmptyTrash => match trash::usage() {
             (0, _) => desktop.context_note("Корзина пуста"),
-            (count, _) => desktop.context_confirm(&alloc::format!("Объектов в корзине: {count}"), true),
+            (count, _) => {
+                desktop.close_context();
+                kprintln!("  desktop     : context menu closed");
+                DELETE_PENDING.lock().clear();
+                EMPTY_PENDING.store(true, Ordering::Relaxed);
+                let question = alloc::format!("Очистить корзину? Объектов: {count}");
+                let rect = layout(desktop, App::DeleteAsk);
+                if let Some(mut window) = Window::dialog(App::DeleteAsk, rect, desktop.scale(), Dialog::Delete { question, forever: true }) {
+                    window.set_caption("Очистка корзины", true);
+                    desktop.push(window);
+                    kprintln!("  desktop     : opened '{}' to empty the trash", App::DeleteAsk.title());
+                    log_focus(desktop);
+                }
+            }
         },
         context::Action::Properties => {
             let trash_selected = desktop.icon_selection().is_some_and(|index| matches!(desktop.icon_kind(index), Some(icons::Kind::Trash(_))));
@@ -5339,7 +5818,7 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         }
         context::Action::Theme => {
             desktop.close_context();
-            let dark = !theme::is_dark();
+            let dark = !theme::chosen_dark();
             theme::set_dark(dark);
             // Записывается здесь же, а не «когда-нибудь потом»: тема, выбранная
             // из меню и не пережившая перезагрузку, — та же ошибка, что тема,
@@ -5502,6 +5981,12 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
         TrayItem::Clock => traypop::Kind::Calendar,
         TrayItem::Volume => traypop::Kind::Volume,
         TrayItem::Bell => traypop::Kind::Quick,
+        // The red recording indicator (22.11): a click stops the recording.
+        TrayItem::Recording => {
+            capture::request_stop();
+            desktop.refresh_panel(status);
+            return;
+        }
     };
     let was = desktop.tray_pop_kind();
     desktop.close_tray_pop();
@@ -5603,6 +6088,7 @@ fn settings_request(desktop: &mut Compositor, request: settings::Request, status
         settings::Request::Shutdown => launch(desktop, App::Shutdown),
         settings::Request::Restart => launch(desktop, App::Restart),
         settings::Request::Panel => {}
+        settings::Request::Scale => apply_scale(desktop, status),
     }
     kprintln!("  desktop     : settings asked for {request:?}");
     desktop.refresh_panel(status);
@@ -5691,36 +6177,18 @@ fn handle_context_key(desktop: &mut Compositor, event: KeyEvent, status: &Status
             desktop.present();
             true
         }
-        context::Reply::Delete => {
-            // Всё выделенное, что лежит в каталоге стола; если выделен один
-            // значок — прежний путь (он же для единственного файла).
-            let mut entries = selected_entries(desktop);
-            if entries.is_empty() {
-                entries.extend(selected_entry(desktop));
-            }
-            if entries.is_empty() {
-                desktop.context_note("nothing is selected");
-            }
-            trash_entries(desktop, &entries);
-            desktop.present();
-            true
-        }
-        context::Reply::EmptyTrash => {
-            match trash::empty() {
-                Ok(count) => {
-                    kprintln!("  desktop     : emptied the trash, {count} items");
-                    desktop.context_note(&alloc::format!("Стёрто объектов: {count}"));
-                }
-                Err(err) => {
-                    kprintln!("  desktop     : cannot empty the trash: {err}");
-                    desktop.context_note(&err);
-                }
-            }
-            desktop.reload_icons();
-            desktop.present();
-            true
-        }
     }
+}
+
+/// Стереть содержимое корзины — ответ «Удалить навсегда» на вопрос об очистке.
+fn empty_trash(desktop: &mut Compositor) {
+    match trash::empty() {
+        Ok(count) => {
+            kprintln!("  desktop     : emptied the trash, {count} items");
+        }
+        Err(err) => kprintln!("  desktop     : cannot empty the trash: {err}"),
+    }
+    desktop.reload_icons();
 }
 
 /// «Свойства» записи стола одной строкой: тип и размер (у ярлыка — команда).
@@ -5743,6 +6211,10 @@ fn entry_facts(path: &str, label: &str) -> String {
 
 /// Что ждёт ответа окна «Удаление файла»: путь и подпись.
 static DELETE_PENDING: SpinLock<alloc::vec::Vec<(String, String)>> = SpinLock::new(alloc::vec::Vec::new());
+
+/// Окно «Удаление» открыто вопросом об очистке корзины, а не об удалении
+/// выделенного (21.11).
+static EMPTY_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Перенести записи стола в корзину; ответ — в меню (если открыто) и журнал.
 fn trash_entries(desktop: &mut Compositor, entries: &[(String, String)]) {
@@ -5956,7 +6428,10 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
     // Значок и группа на панели — по программе задачи. Считаются до стола:
     // путь программы лежит под её замком, а под замком стола его не берут.
     let (art, group) = appicon::of_task(task, title);
-    with_desktop(|desktop| {
+    // Задание процесса — для заставки запуска (21.11): окно ли это
+    // запущенной игры. Тоже до стола.
+    let job = crate::user::job_of_task(task);
+    let opened = with_desktop(|desktop| {
         if desktop.index_of(app).is_some() {
             return Err(WindowError::Exists);
         }
@@ -5979,12 +6454,13 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         let rect = if mobile {
             desktop.app_area()
         } else {
-            Rect::new(
+            // По центру; второе окно на том же месте — каскадом (20.11).
+            desktop.cascade(Rect::new(
                 p.x + ((screen.saturating_sub(w)) / 2) as i32,
                 p.y + ((work.saturating_sub(full_h)) / 2) as i32,
                 w,
                 full_h,
-            )
+            ))
         };
         let mut window =
             Window::program(app, rect, scale, title, pixels).ok_or(WindowError::NoMemory)?;
@@ -6013,7 +6489,11 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         desktop.present();
         Ok(())
     })
-    .unwrap_or_else(|| Err(unavailable()))
+    .unwrap_or_else(|| Err(unavailable()));
+    if opened.is_ok() {
+        launch::window_opened(task, job);
+    }
+    opened
 }
 
 /// Открыть всплывающее окно программы над её окном `owner` (фаза 62e,
@@ -6167,6 +6647,30 @@ pub fn fullscreen_window(task: u32, slot: u32, on: bool) -> Result<(), WindowErr
     .unwrap_or_else(|| Err(unavailable()))
 }
 
+/// G5 (22.11): fullscreen on the monitor under the desktop point `at`
+/// (`xdg_toplevel.set_fullscreen(output)`). A window fullscreen on another
+/// monitor moves over.
+pub fn fullscreen_window_at(task: u32, slot: u32, at: (i32, i32)) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let window = desktop.find(app).ok_or(WindowError::NoWindow)?;
+        let (now, rect) = (window.fullscreen, window.rect);
+        if now && rect.contains(at.0, at.1) {
+            return Ok(());
+        }
+        if now {
+            desktop.set_fullscreen(app, false);
+        }
+        if desktop.set_fullscreen_at(app, true, Some(at)) {
+            kprintln!("  desktop     : '{}' entered fullscreen on the monitor at {},{}", name_of(desktop, app), at.0, at.1);
+            log_window(desktop, app, true);
+            desktop.present();
+        }
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
 /// Открыто ли окно программы во весь экран.
 #[must_use]
 pub fn window_fullscreen(task: u32, slot: u32) -> bool {
@@ -6183,6 +6687,15 @@ pub fn window_maximized(task: u32, slot: u32) -> bool {
 /// меню у края экрана открывалось в другую сторону (фаза 71i).
 pub fn window_rect(task: u32, slot: u32) -> Option<Rect> {
     with_desktop(|desktop| desktop.rect_of(App::Program(task, slot))).flatten()
+}
+
+/// G5 (21.11): where a popup of the program window `slot` may go - the
+/// corner of the window's pixels (popup anchors count from it) and the
+/// monitor under `point` (relative to that corner; the popup's anchor). A
+/// menu of a window on the right monitor stays there instead of being
+/// pushed onto the primary one.
+pub fn popup_bounds(task: u32, slot: u32, point: (i32, i32)) -> Option<((i32, i32), Rect)> {
+    with_desktop(|desktop| desktop.popup_bounds(App::Program(task, slot), point)).flatten()
 }
 
 /// Свернуть окно программы (`xdg_toplevel.set_minimized`).
@@ -6242,6 +6755,110 @@ pub fn shell_status(status: Option<&str>) {
 /// в ядре (фаза 71i); родным программам он не приходит.
 pub const WIN_RAWKEY: u32 = 0x100;
 
+/// G3 (21.11): raw mouse motion (`x`, `y` - device delta, summed while
+/// queued), only to Wayland windows ([`raw_keys_window`]).
+pub const WIN_RELMOTION: u32 = 0x101;
+
+/// G3: lock (`lock`) or confine the pointer for a program window, `region`
+/// in its pixels (`None` - the whole window); `wanted == None` drops it.
+pub fn constrain_pointer(task: u32, slot: u32, wanted: Option<(bool, Option<Rect>)>) {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        desktop.set_constraint(app, wanted);
+        desktop.present();
+    });
+}
+
+/// G3: is the constraint of the window active now (`false` also when the
+/// desktop holds none for it)? `None` - the desktop is busy, ask again.
+#[must_use]
+pub fn pointer_constrained(task: u32, slot: u32) -> Option<bool> {
+    with_desktop(|desktop| {
+        desktop.update_constraint();
+        let state = desktop.constraint_active(App::Program(task, slot)).unwrap_or(false);
+        desktop.present();
+        state
+    })
+}
+
+/// G3: where to put the pointer when the lock of this window ends.
+pub fn constraint_hint(task: u32, slot: u32, x: i32, y: i32) {
+    with_desktop(|desktop| desktop.set_constraint_hint(App::Program(task, slot), x, y));
+}
+
+/// G3: `ui direct on|off` - fullscreen fast path for A/B measurements.
+pub fn direct_command(argument: &str) -> String {
+    match argument.trim() {
+        "on" => compositor::DIRECT.store(true, Ordering::Relaxed),
+        "off" => compositor::DIRECT.store(false, Ordering::Relaxed),
+        // NVIDIA: scan the game's buffer out directly (page flip, no copy);
+        // `flip timed` - without the window notifier (two refresh periods).
+        "flip on" | "flip timed" => {
+            use crate::display::nvidia_disp::{FLIP, FLIP_STOPPED, FLIP_TIMED};
+            FLIP_TIMED.store(argument.trim() == "flip timed", Ordering::Relaxed);
+            FLIP_STOPPED.store(false, Ordering::Relaxed);
+            FLIP.store(true, Ordering::Relaxed);
+        }
+        "flip off" => crate::display::nvidia_disp::FLIP.store(false, Ordering::Relaxed),
+        "" => {}
+        _ => return String::from("  wldirect: usage `wldirect [on|off|flip on|flip timed|flip off]`"),
+    }
+    with_desktop(|desktop| {
+        desktop.repaint_all();
+        desktop.present();
+    });
+    let (pieces, ns, points, flips) = direct_stats();
+    let flip = if !crate::display::nvidia_disp::FLIP.load(Ordering::Relaxed) {
+        "off (`wldirect flip on` to try)"
+    } else if crate::display::nvidia_disp::FLIP_STOPPED.load(Ordering::Relaxed) {
+        "stopped after a display error (`wldirect flip on` tries again)"
+    } else if crate::display::nvidia_disp::FLIP_TIMED.load(Ordering::Relaxed) {
+        "on, timed (no notifier)"
+    } else {
+        "on"
+    };
+    let line = alloc::format!(
+        "  wldirect: {} ({pieces} direct copies, {} us each, {} Kpx each; {flips} frames scanned out of client buffers since boot; scanout flip {flip})",
+        if compositor::DIRECT.load(Ordering::Relaxed) { "on" } else { "off" },
+        ns / pieces.max(1) / 1000,
+        points / pieces.max(1) / 1000,
+    );
+    // The owner's logs show what was switched (hw-log14: not visible).
+    if !argument.trim().is_empty() {
+        kprintln!("  desktop     : `wldirect {}` -> {}", argument.trim(), line.trim_start());
+    }
+    line
+}
+
+/// G3: `wl_pointer.set_cursor` - the program hides (`hidden`, null cursor
+/// surface) or shows the pointer while it is over its window.
+pub fn client_cursor(task: u32, slot: u32, hidden: bool) {
+    with_desktop(|desktop| {
+        desktop.set_client_cursor(App::Program(task, slot), hidden);
+        desktop.present();
+    });
+}
+
+/// G3: raise and focus a program window (`xdg_activation_v1.activate`).
+pub fn activate_window(task: u32, slot: u32) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        desktop.index_of(app).ok_or(WindowError::NoWindow)?;
+        if desktop.find(app).is_some_and(|window| window.minimized) {
+            desktop.restore(app);
+        }
+        if let Some(index) = desktop.index_of(app) {
+            desktop.raise(index);
+        }
+        kprintln!("  desktop     : '{}' activated", name_of(desktop, app));
+        log_focus(desktop);
+        desktop.refresh_panel(&status_now());
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
 /// Окну программы — коды клавиш вместо символов (фаза 71i).
 pub fn raw_keys_window(task: u32, slot: u32) -> Result<(), WindowError> {
     with_desktop(|desktop| {
@@ -6280,11 +6897,50 @@ pub fn paint_window(task: u32, slot: u32, area: Rect, paint: impl FnOnce(&mut Su
             return Err(WindowError::NoWindow);
         };
         paint(pixels);
-        window.commit(Some(area));
+        // G3: shown directly - no copy into the window surface.
+        desktop.commit_program(app, Some(area));
         desktop.present();
         Ok(())
     })
     .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Подменить пиксели окна программы поверхностью того же размера и показать
+/// `area` (D4, 20.11.2026): сервер Wayland кладёт сюда память dma-buf
+/// клиента — кадр игры во весь экран больше не копируется в окно отдельно.
+/// Ответ — прежняя поверхность; `Err` — вернуть переданную (стол занят, окна
+/// нет, размер другой).
+///
+/// `phys` (G3): the physical address of `pixels` when they are a physically
+/// contiguous client buffer - a display that scans out of system memory
+/// shows them with no copy at all; `None` - ordinary memory.
+pub fn swap_window_pixels(task: u32, slot: u32, pixels: Surface, area: Rect, phys: Option<u64>) -> Result<Surface, Surface> {
+    let app = App::Program(task, slot);
+    let mut pixels = Some(pixels);
+    let swapped = with_desktop(|desktop| {
+        let window = desktop.find(app)?;
+        let current = window.program_pixels()?;
+        let next = pixels.take()?;
+        if (current.width(), current.height()) != (next.width(), next.height()) {
+            pixels = Some(next);
+            return None;
+        }
+        let at = next.row(0).as_ptr() as usize;
+        let old = core::mem::replace(current, next);
+        window.direct_phys = phys.map(|phys| (at, phys));
+        // G3: a fullscreen window shown directly goes to the screen from
+        // these pixels - no copy into the window surface, no compose.
+        desktop.commit_program(app, Some(area));
+        desktop.present();
+        Some(old)
+    })
+    .flatten();
+    match (swapped, pixels) {
+        (Some(old), _) => Ok(old),
+        (None, Some(back)) => Err(back),
+        // Не бывает: поверхность ушла в окно только вместе с ответом.
+        (None, None) => Err(Surface::EMPTY),
+    }
 }
 
 /// Сменить окну программы размер (фаза N7d): `pixels` — новая поверхность той же
@@ -6298,6 +6954,9 @@ pub fn resize_window(task: u32, slot: u32, pixels: Surface) -> Result<(), Window
             return Err(WindowError::NoWindow);
         };
         let size = (pixels.width(), pixels.height());
+        // Где окно стояло до этого размера — туда «вернуть» из полного
+        // экрана (D4, 20.11.2026).
+        let before = window.rect;
         if !window.replace_pixels(pixels, focused) {
             return Err(WindowError::NoMemory);
         }
@@ -6318,6 +6977,9 @@ pub fn resize_window(task: u32, slot: u32, pixels: Surface) -> Result<(), Window
         if monitor_sized && chosen && !full {
             if frameless {
                 if desktop.set_fullscreen(app, true) {
+                    if let Some(window) = desktop.find(app) {
+                        window.set_full_from(before);
+                    }
                     kprintln!("  desktop     : '{}' is monitor-sized, fullscreen on its monitor", name_of(desktop, app));
                 }
             } else if !maximized && desktop.toggle_maximize(app) {
@@ -6341,9 +7003,10 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
         let Some(window) = desktop.find(app) else {
             return Err(WindowError::NoWindow);
         };
-        // Диалог (20.11) размера не меняет, что бы ни просили вместе с ним.
+        // Диалог (20.11) — один крестик в заголовке; края тянутся, только если
+        // он попросил это вместе с ним (окно выбора файла, как в Windows).
         let dialog = flags & user_abi::WIN_STYLE_DIALOG != 0;
-        let resizable = flags & user_abi::WIN_STYLE_RESIZABLE != 0 && !dialog;
+        let resizable = flags & user_abi::WIN_STYLE_RESIZABLE != 0;
         if window.dialog != dialog {
             window.dialog = dialog;
             window.draw_decorations(focused);
@@ -6360,7 +7023,7 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
         if flags & user_abi::WIN_STYLE_AT_START != 0 && !theme::is_mobile() {
             let work = desktop.primary_work();
             let home = desktop.start_button_rect();
-            let margin = (12 * desktop.scale()) as i32;
+            let margin = (12u32 * desktop.scale()) as i32;
             let placed = desktop.find(app).map(|window| {
                 let (w, h) = (window.rect.w as i32, window.rect.h as i32);
                 let (cx, cy) = if home.is_empty() { (work.x, work.bottom()) } else { (home.x + home.w as i32 / 2, home.y + home.h as i32 / 2) };
@@ -6426,15 +7089,22 @@ pub fn title_window(task: u32, slot: u32, title: &str) -> Result<(), WindowError
 
 /// Назначить окну программы владельца — её же окно `owner` (фаза 62d,
 /// `user_abi::SYS_WINOWNER`); `None` снимает связь.
-pub fn owner_window(task: u32, slot: u32, owner: Option<u32>, modal: bool) -> Result<(), WindowError> {
+pub fn owner_window(task: u32, slot: u32, owner: Option<(u32, u32)>, modal: bool, center: bool) -> Result<(), WindowError> {
     let app = App::Program(task, slot);
-    let owner = owner.map(|slot| App::Program(task, slot));
+    let owner = owner.map(|(task, slot)| App::Program(task, slot));
     with_desktop(|desktop| {
         if desktop.find(app).is_none() {
             return Err(WindowError::NoWindow);
         }
         if !desktop.set_owner(app, owner, modal) {
             return Err(WindowError::NoWindow);
+        }
+        // Посередине владельца (20.11, окно выбора файла), в пределах
+        // рабочей области; владелец уже поднят вместе с ним (`set_owner`).
+        if let Some(owner) = owner.filter(|_| center) {
+            if desktop.center_over(app, owner) {
+                log_window(desktop, app, desktop.focused_app() == Some(app));
+            }
         }
         if let Some(owner) = owner {
             let kind = if modal { "modal over" } else { "owned by" };

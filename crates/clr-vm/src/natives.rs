@@ -132,6 +132,10 @@ pub(crate) enum Native {
     CommandLine,
     /// Окно формы `System.Windows.Forms.FreeOsWindow` (фаза N6a).
     WindowOpen,
+    /// Системное окно выбора файла `System.Windows.Forms.FreeOsFileDialog`
+    /// (20.11).
+    FileDialogStart,
+    FileDialogPoll,
     WindowFill,
     WindowText,
     TextWidth,
@@ -359,6 +363,8 @@ const TABLE: &[(&str, Native)] = &[
     ("System.Windows.Forms.FreeOsWindow::NextEvent(int32,int32&,int32&,int32&)", Native::WindowEvent),
     ("System.Windows.Forms.FreeOsWindow::Close(int32)", Native::WindowClose),
     ("System.Windows.Forms.FreeOsWindow::Resize(int32,int32,int32)", Native::WindowResize),
+    ("System.Windows.Forms.FreeOsFileDialog::Start(string,int32)", Native::FileDialogStart),
+    ("System.Windows.Forms.FreeOsFileDialog::Poll(int32,string&)", Native::FileDialogPoll),
     ("System.Decimal::Arith(int32,int32,int32,int32,int32,int32,int32,int32,int32,int32&,int32&,int32&,int32&)", Native::DecimalArith),
     ("System.Decimal::Cmp(int32,int32,int32,int32,int32,int32,int32,int32)", Native::DecimalCompare),
     ("System.Decimal::RoundTo(int32,int32,int32,int32,int32,int32,int32&,int32&,int32&,int32&)", Native::DecimalRound),
@@ -1093,6 +1099,34 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
             let (width, height) = (vm.int32(arg(1)?)?, vm.int32(arg(2)?)?);
             let id = if width > 0 && height > 0 { vm.host.window_open(&title, width as u32, height as u32) } else { None };
             Some(Value::I32(id.map_or(-1, |id| id as i32)))
+        }
+        Native::FileDialogStart => {
+            let request = text_arg(vm, arg(0)?)?;
+            let owner = window_arg(vm, arg(1)?)?;
+            let id = vm.host.file_dialog_start(&request, owner);
+            Some(Value::I32(id.map_or(-1, |id| id as i32)))
+        }
+        // 0 — ещё открыто, 1 — выбран путь (в `out`), 2 — отмена.
+        Native::FileDialogPoll => {
+            let dialog = vm.int32(arg(0)?)?;
+            let Value::Ptr(path_out) = arg(1)? else {
+                return Err(vm.invalid("out argument is not a pointer"));
+            };
+            let (state, path) = if dialog < 0 {
+                (2, None)
+            } else {
+                match vm.host.file_dialog_poll(dialog as u32) {
+                    None => (0, None),
+                    Some(None) => (2, None),
+                    Some(Some(path)) => (1, Some(path)),
+                }
+            };
+            let value = match path {
+                Some(path) => vm.new_string_from(&path)?,
+                None => Value::Obj(None),
+            };
+            vm.store(path_out, value)?;
+            Some(Value::I32(state))
         }
         Native::WindowFill => {
             let window = window_arg(vm, arg(0)?)?;

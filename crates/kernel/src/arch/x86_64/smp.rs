@@ -545,7 +545,9 @@ const FLUSH_PATIENCE_MS: u64 = 1_000;
 /// затем полный барьер, затем читаем [`ACTIVE_ROOT`]. Либо мы видим его
 /// корень и шлём просьбу, либо его обход таблиц начнётся после нашей
 /// записи и увидит новые записи.
+#[track_caller]
 pub fn shootdown(root: Option<u64>) {
+    let caller = core::panic::Location::caller();
     let root = root.filter(|_| FLUSH_TARGETED.load(Ordering::Relaxed));
     super::interrupts::without_interrupts(|| {
         let me = current_index();
@@ -585,8 +587,11 @@ pub fn shootdown(root: Option<u64>) {
         let start = super::tsc::counter();
         // Сколько ждали ответов — в `perf-diag` (P1): число сбросов без цены
         // не говорит, тормозят ли они.
-        let _spent = Spent(start);
+        let mut spent = Spent { start, caller, slow: None, syscall: None };
         let patience = super::tsc::frequency() / 1000 * FLUSH_PATIENCE_MS;
+        // After this long the CPU still behind is "slow": remember who it is
+        // and which spin lock keeps its interrupts off (G2 diagnostics).
+        let slow_after = super::tsc::frequency() / 2000;
         loop {
             serve_flush();
             let behind = (0..crate::smp::MAX_CPUS)
@@ -595,6 +600,14 @@ pub fn shootdown(root: Option<u64>) {
             let Some(cpu) = behind else {
                 break;
             };
+            if super::tsc::counter().wrapping_sub(start) > slow_after
+                && spent.slow.is_none_or(|(was, _)| was != cpu)
+            {
+                spent.slow = Some((cpu, crate::sync::irq_off_site(cpu)));
+                // Which Linux call keeps it busy, if any (hw-log14: the late
+                // CPU had no spin lock / without_interrupts site).
+                spent.syscall = crate::linux::recent::on_cpu(cpu);
+            }
             if patience != 0 && super::tsc::counter().wrapping_sub(start) > patience {
                 crate::kprintln!(
                     "  smp         : WARNING: cpu {cpu} did not flush its translations within {FLUSH_PATIENCE_MS} ms                      (ticket {ticket}, done {:?}, interrupts {:?})",
@@ -644,14 +657,139 @@ pub fn note_active_root(root: u64) {
 }
 
 /// Засчитывает ожидание при выходе из [`shootdown`] любой ветвью.
-struct Spent(u64);
+struct Spent {
+    start: u64,
+    /// Who asked for the flush (`#[track_caller]` through
+    /// `flush_user_translations`).
+    caller: &'static core::panic::Location<'static>,
+    /// The last CPU found slow to answer and the spin lock it was holding
+    /// with interrupts off at that moment.
+    slow: Option<(usize, Option<&'static core::panic::Location<'static>>)>,
+    /// The Linux call that slow CPU was in when it was found slow: `(number,
+    /// ns since entered, task slot)`.
+    syscall: Option<(u64, u64, usize)>,
+}
 
 impl Drop for Spent {
     fn drop(&mut self) {
-        let spent = super::tsc::counter().wrapping_sub(self.0);
+        let spent = super::tsc::counter().wrapping_sub(self.start);
         FLUSH_WAIT_TSC.fetch_add(spent, Ordering::Relaxed);
-        FLUSH_WORST_TSC.fetch_max(spent, Ordering::Relaxed);
+        if FLUSH_WORST_TSC.fetch_max(spent, Ordering::Relaxed) < spent {
+            let (cpu, site) = self.slow.unwrap_or((usize::MAX, None));
+            WORST_CALLER.store(core::ptr::from_ref(self.caller) as usize, Ordering::Relaxed);
+            WORST_CPU.store(cpu, Ordering::Relaxed);
+            WORST_SITE.store(site.map_or(0, |site| core::ptr::from_ref(site) as usize), Ordering::Relaxed);
+            let (number, ns, slot) = self.syscall.unwrap_or((u64::MAX, 0, 0));
+            WORST_SYSCALL.store(number, Ordering::Relaxed);
+            WORST_SYSCALL_NS.store(ns, Ordering::Relaxed);
+            WORST_SYSCALL_SLOT.store(slot, Ordering::Relaxed);
+        }
+        if let Some((number, ns, _)) = self.syscall {
+            // Every slow shootdown, not only the worst: which calls the late
+            // CPUs were in and for how long (the worst one per number).
+            note_late_syscall(number, ns);
+        }
+        if self.slow.is_some() {
+            FLUSH_SLOW.fetch_add(1, Ordering::Relaxed);
+            if self.syscall.is_none() {
+                LATE_OUTSIDE.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
+}
+
+/// The Linux call of the late CPU in the worst shootdown (`u64::MAX` - none),
+/// how long it had been running then, and the task slot.
+static WORST_SYSCALL: AtomicU64 = AtomicU64::new(u64::MAX);
+static WORST_SYSCALL_NS: AtomicU64 = AtomicU64::new(0);
+static WORST_SYSCALL_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Slow shootdowns by the Linux call the late CPU was in: number + 1 (0 -
+/// free cell), count and the longest time in that call, since the last
+/// [`late_syscalls`]. Eight cells are plenty: a handful of calls take long.
+const LATE_CELLS: usize = 8;
+static LATE_NR: [AtomicU64; LATE_CELLS] = [const { AtomicU64::new(0) }; LATE_CELLS];
+static LATE_COUNT: [AtomicU64; LATE_CELLS] = [const { AtomicU64::new(0) }; LATE_CELLS];
+static LATE_WORST_NS: [AtomicU64; LATE_CELLS] = [const { AtomicU64::new(0) }; LATE_CELLS];
+/// Slow shootdowns whose late CPU was not in a Linux call.
+static LATE_OUTSIDE: AtomicU64 = AtomicU64::new(0);
+
+fn note_late_syscall(number: u64, ns: u64) {
+    let key = number.wrapping_add(1);
+    for cell in 0..LATE_CELLS {
+        let now = LATE_NR[cell].load(Ordering::Relaxed);
+        let mine = now == key
+            || (now == 0 && LATE_NR[cell].compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed).is_ok())
+            || LATE_NR[cell].load(Ordering::Relaxed) == key;
+        if mine {
+            LATE_COUNT[cell].fetch_add(1, Ordering::Relaxed);
+            LATE_WORST_NS[cell].fetch_max(ns, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Slow shootdowns since the last call grouped by the Linux call the late
+/// CPU was in: `(number, count, longest ns in it)`, and how many had their
+/// late CPU outside any Linux call. Forgets what it returns.
+#[must_use]
+pub fn late_syscalls() -> (alloc::vec::Vec<(u64, u64, u64)>, u64) {
+    let mut rows = alloc::vec::Vec::new();
+    for cell in 0..LATE_CELLS {
+        let key = LATE_NR[cell].swap(0, Ordering::AcqRel);
+        let count = LATE_COUNT[cell].swap(0, Ordering::Relaxed);
+        let worst = LATE_WORST_NS[cell].swap(0, Ordering::Relaxed);
+        if key != 0 && count != 0 {
+            rows.push((key - 1, count, worst));
+        }
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    (rows, LATE_OUTSIDE.swap(0, Ordering::Relaxed))
+}
+
+/// The Linux call of the late CPU in the worst shootdown since the last
+/// call: `(number, ns it had been running, task slot)`. Read right after
+/// [`shootdown_worst`].
+#[must_use]
+pub fn shootdown_worst_syscall() -> Option<(u64, u64, usize)> {
+    let number = WORST_SYSCALL.swap(u64::MAX, Ordering::Relaxed);
+    let ns = WORST_SYSCALL_NS.swap(0, Ordering::Relaxed);
+    let slot = WORST_SYSCALL_SLOT.swap(0, Ordering::Relaxed);
+    (number != u64::MAX).then_some((number, ns, slot))
+}
+
+/// The worst wait since the last question: who asked, which CPU was slow
+/// and where it was deaf (G2).
+static WORST_CALLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static WORST_CPU: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+static WORST_SITE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Shootdowns that waited longer than 0.5 ms for some CPU.
+static FLUSH_SLOW: AtomicU64 = AtomicU64::new(0);
+
+/// `"file:line"` of a stored `&'static Location`, or `"?"`.
+fn place(at: usize) -> alloc::string::String {
+    if at == 0 {
+        return alloc::string::String::from("?");
+    }
+    // SAFETY: only `&'static Location` values are stored in these cells.
+    let at = unsafe { &*(at as *const core::panic::Location<'static>) };
+    alloc::format!("{}:{}", at.file().rsplit(['/', '\\']).next().unwrap_or(""), at.line())
+}
+
+/// The worst shootdown since the last call (read together with
+/// [`shootdown_stats`], which forgets the worst time): `(asked at, slow cpu
+/// or None, that cpu deaf in a spin lock taken at, slow shootdowns total)`.
+#[must_use]
+pub fn shootdown_worst() -> (alloc::string::String, Option<usize>, Option<alloc::string::String>, u64) {
+    let caller = WORST_CALLER.swap(0, Ordering::Relaxed);
+    let cpu = WORST_CPU.swap(usize::MAX, Ordering::Relaxed);
+    let site = WORST_SITE.swap(0, Ordering::Relaxed);
+    (
+        place(caller),
+        (cpu != usize::MAX).then_some(cpu),
+        (site != 0).then(|| place(site)),
+        FLUSH_SLOW.load(Ordering::Relaxed),
+    )
 }
 
 /// Сбросы трансляций с загрузки: `(просьб с прерываниями, суммарное
@@ -705,6 +843,15 @@ pub fn kick_stats() -> (u64, u64) {
 pub fn on_flush_interrupt() {
     FLUSH_IRQS[current_index()].fetch_add(1, Ordering::Relaxed);
     serve_flush();
+}
+
+/// Answer a pending flush request from a spin-wait with interrupts off
+/// (`SpinLock::lock`): one load when there is none.
+#[inline]
+pub fn serve_while_spinning(me: usize) {
+    if FLUSH_DONE[me].load(Ordering::Relaxed) < FLUSH_ASKED.load(Ordering::Relaxed) {
+        serve_flush();
+    }
 }
 
 pub fn serve_flush() {

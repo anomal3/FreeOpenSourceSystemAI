@@ -62,6 +62,8 @@ pub fn adopt() {
         mini_ui::theme::set_wallpaper(wall);
         crate::kprintln!("  desktop     : wallpaper {} from {}", wall.tag(), path);
     }
+    // Фон: картинка, цвет, расположение (22.11, `wallpaper`).
+    super::wallpaper::adopt(text, &path);
     // Электропитание: через сколько гаснет экран. Здесь же, а не в своём файле,
     // потому что это настройка того же рода — её выбирают потом и меняют часто,
     // а установщик о ней ничего не знает.
@@ -116,8 +118,15 @@ pub fn adopt() {
         }
         crate::kprintln!("  desktop     : {key} {} from {}", sysconf::value(text, key).unwrap_or(""), path);
     }
+    // «Оформление» и глубина цвета (20.11, см. `look`) — после `animations=`:
+    // строка `look=` новее и главнее.
+    super::look::adopt(text, &path);
+    // Тема значков (22.11, `appicon`).
+    super::appicon::adopt(text, &path);
     // Панель задач и «Пуск» одним набором (20.11, см. `deskcfg`).
     super::deskcfg::adopt(text, &path);
+    // Заставка (22.11, `saver`).
+    super::saver::adopt(text, &path);
     if let Some(height) = sysconf::title_bar(text) {
         if mini_ui::theme::set_title_h(height) {
             crate::kprintln!("  desktop     : title bar {height} px from {path}");
@@ -214,7 +223,10 @@ pub fn store_panel(pref: super::settings::PanelPref, on: bool) -> Result<(), cra
         super::settings::PanelPref::Uptime => "panel_uptime",
         super::settings::PanelPref::Date => "panel_date",
         super::settings::PanelPref::Labels => "panel_labels",
-        super::settings::PanelPref::Animations => "animations",
+        super::settings::PanelPref::Animations => {
+            // Обе анимации «Оформления» (20.11): строка `look=` главнее.
+            return super::look::store();
+        }
     };
     store_key(key, if on { "on" } else { "off" })
 }

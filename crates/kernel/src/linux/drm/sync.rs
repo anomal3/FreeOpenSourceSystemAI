@@ -198,11 +198,26 @@ impl Object for SyncFile {
 /// Ждать, пока `ready` не ответит `true`, до абсолютного срока `deadline_ns`
 /// по `CLOCK_MONOTONIC` (`None` — без срока). Сигнал или снятие процесса —
 /// `EINTR` (Linux: `ERESTARTSYS`); срок — `ETIME`.
+///
+/// hw-log14: with only 1 ms sleeps (the timer tick) every wait rounded the
+/// fence up to the next tick or two - DRM ioctls averaged 0.4-1.3 ms in D2R.
+/// There is no GPU completion interrupt to wake on (v1), so the first
+/// [`FENCE_SPIN_US`] are a poll loop that stays on the CPU (with
+/// `sched_yield` between polls - a ready task still gets the CPU); a fence
+/// that completes within it is seen within microseconds. Longer waits sleep
+/// as before.
 pub fn wait_until(deadline_ns: Option<u64>, mut ready: impl FnMut() -> Result<bool, i64>) -> Result<(), i64> {
     static KEY: u8 = 0;
+    let started = crate::time::uptime_ns();
+    let spin_ns = FENCE_SPIN_US.load(Ordering::Relaxed) * 1000;
+    let mut slept = false;
+    let mut step = FENCE_STEP_US.load(Ordering::Relaxed).max(1);
     loop {
         refresh();
         if ready()? {
+            let kind = usize::from(slept);
+            WAITS[kind].fetch_add(1, Ordering::Relaxed);
+            WAIT_NS[kind].fetch_add(crate::time::uptime_ns().saturating_sub(started), Ordering::Relaxed);
             return Ok(());
         }
         let now = crate::time::uptime_ns();
@@ -212,9 +227,86 @@ pub fn wait_until(deadline_ns: Option<u64>, mut ready: impl FnMut() -> Result<bo
         if crate::linux::signal::pending() || crate::user::kill_pending() {
             return Err(-e::EINTR);
         }
+        if now.saturating_sub(started) < spin_ns {
+            crate::sched::yield_now();
+            // A poll every ~5 us: `refresh` takes the channel registry lock
+            // and asks every channel.
+            let next = crate::time::uptime_ns() + 5_000;
+            while crate::time::uptime_ns() < next {
+                core::hint::spin_loop();
+            }
+            continue;
+        }
+        slept = true;
+        // hw-log15: whole-tick sleeps made every wait past the poll cost
+        // 1.85 ms. Fine sleeps (hrsleep: one-shot timer) in short steps that
+        // grow 50 -> 100 -> 200 us: a fence that needs 0.3 ms of GPU time
+        // now costs ~0.35 ms, and a long wait costs a few wake-ups per ms.
+        let step_us = FENCE_STEP_US.load(Ordering::Relaxed);
+        if step_us != 0 && crate::sched::hrsleep::enabled() {
+            let now = crate::time::uptime_ns();
+            let mut at = now + step * 1000;
+            if let Some(limit) = deadline_ns {
+                at = at.min(limit);
+            }
+            FINE_SLEEPS.fetch_add(1, Ordering::Relaxed);
+            crate::sched::hrsleep::sleep_until_ns(at, 0, 0, || false);
+            step = (step * 2).min(step_us * 4);
+            continue;
+        }
         let until = crate::time::uptime_ms() + 1;
         crate::sched::block_on_futex(core::ptr::addr_of!(KEY) as usize, Some(until), || false);
     }
+}
+
+/// How long a fence wait polls before it sleeps, us (`fencespin N`, 0 - sleep
+/// at once, as before).
+pub static FENCE_SPIN_US: AtomicU64 = AtomicU64::new(200);
+/// First fine sleep step after the poll, us; doubles up to 4x (`fencestep N`;
+/// 0 - 1 ms tick sleeps as before 22.11).
+pub static FENCE_STEP_US: AtomicU64 = AtomicU64::new(50);
+/// Fine sleep steps taken by fence waits (perf-diag).
+static FINE_SLEEPS: AtomicU64 = AtomicU64::new(0);
+
+/// Fine sleep steps of fence waits since boot.
+#[must_use]
+pub fn fence_fine_sleeps() -> u64 {
+    FINE_SLEEPS.load(Ordering::Relaxed)
+}
+
+/// `hrbench` (kernel shell): `count` waits through [`wait_until`] on a
+/// "fence" that signals `signal_us` after the wait began, with fine step
+/// `step_us` (0 - tick sleeps as before 22.11). Returns `(average, worst)`
+/// wait length, us: how late a fence wait sees its fence.
+pub fn fence_bench(signal_us: u64, count: u32, step_us: u64) -> (u64, u64) {
+    let saved = FENCE_STEP_US.swap(step_us, Ordering::Relaxed);
+    let (mut sum, mut worst) = (0u64, 0u64);
+    for _ in 0..count {
+        let started = crate::time::uptime_ns();
+        let at = started + signal_us * 1000;
+        let _ = wait_until(None, || Ok(crate::time::uptime_ns() >= at));
+        let took = crate::time::uptime_ns() - started;
+        sum += took;
+        worst = worst.max(took);
+    }
+    FENCE_STEP_US.store(saved, Ordering::Relaxed);
+    (sum / u64::from(count.max(1)) / 1000, worst / 1000)
+}
+/// Finished fence waits: [done while polling, done after sleeping] and their
+/// total time, ns.
+static WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static WAIT_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Fence waits since boot: `(done while polling, their ns, done after
+/// sleeping, their ns)` - for perf-diag.
+#[must_use]
+pub fn fence_wait_stats() -> (u64, u64, u64, u64) {
+    (
+        WAITS[0].load(Ordering::Relaxed),
+        WAIT_NS[0].load(Ordering::Relaxed),
+        WAITS[1].load(Ordering::Relaxed),
+        WAIT_NS[1].load(Ordering::Relaxed),
+    )
 }
 
 /// Срок Linux (`timeout_nsec`, абсолютный монотонный) → наш: `i64::MAX` и

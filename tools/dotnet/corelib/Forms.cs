@@ -455,6 +455,64 @@ namespace System.Windows.Forms
 
         internal static bool IsModal(Form form) => modal.Contains(form);
 
+        // Форма, над которой встанет системное окно выбора файла (20.11):
+        // верхняя модальная, иначе последняя открытая.
+        internal static Form DialogOwner()
+        {
+            for (int i = modal.Count - 1; i >= 0; i--)
+            {
+                if (modal[i] != null && !modal[i].IsDisposed)
+                {
+                    return modal[i];
+                }
+            }
+            for (int i = openForms.Count - 1; i >= 0; i--)
+            {
+                if (!openForms[i].IsDisposed)
+                {
+                    return openForms[i];
+                }
+            }
+            return null;
+        }
+
+        // Системное окно выбора файла (20.11, `/bin/filedlg`): отдельное окно
+        // стола, модальное к форме `owner`. Пока оно открыто, формы рисуются,
+        // но ввода не получают (null на вершине `modal` — «ничья»); путь или
+        // null — отмена.
+        internal static string RunFileDialog(string request, Form owner)
+        {
+            int handle = FreeOsFileDialog.Start(request, owner != null ? owner.WindowHandle : -1);
+            if (handle < 0)
+            {
+                return null;
+            }
+            modal.Add(null);
+            try
+            {
+                while (true)
+                {
+                    int state = FreeOsFileDialog.Poll(handle, out string path);
+                    if (state == 1)
+                    {
+                        return path;
+                    }
+                    if (state == 2)
+                    {
+                        return null;
+                    }
+                    if (!DoEventsOnce())
+                    {
+                        Thread.Sleep(IdleSleepMs);
+                    }
+                }
+            }
+            finally
+            {
+                modal.Remove(null);
+            }
+        }
+
         // Свой цикл событий для ShowDialog: пока форма открыта. Кнопка с
         // DialogResult закрывает её после обработчика, как в WinForms; отказ в
         // FormClosing возвращает DialogResult к None.
@@ -1655,6 +1713,10 @@ namespace System.Windows.Forms
         }
 
         protected override Size DefaultSize => new Size(300, 300);
+
+        // Номер окна у среды (−1 — окна нет): им системное окно выбора файла
+        // называет владельца (20.11).
+        internal int WindowHandle => window;
 
         internal bool NeedsPaint { get; set; }
 

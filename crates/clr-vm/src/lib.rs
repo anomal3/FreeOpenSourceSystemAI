@@ -261,6 +261,23 @@ pub trait Host {
         let _ = (window, width, height);
         false
     }
+
+    /// Открыть системное окно выбора файла или папки (20.11, `OpenFileDialog`,
+    /// `SaveFileDialog`, `FolderBrowserDialog`): `request` — строки
+    /// `ключ\tзначение` договора `/bin/filedlg`, `owner` — окно формы, над
+    /// которой оно встанет модальным. Номер окна выбора или `None` — у хоста
+    /// такого окна нет.
+    fn file_dialog_start(&mut self, request: &str, owner: Option<u32>) -> Option<u32> {
+        let _ = (request, owner);
+        None
+    }
+
+    /// Чем кончилось окно выбора, не дожидаясь: `None` — ещё открыто,
+    /// `Some(None)` — отмена, `Some(Some(путь))` — выбран путь.
+    fn file_dialog_poll(&mut self, dialog: u32) -> Option<Option<String>> {
+        let _ = dialog;
+        Some(None)
+    }
 }
 
 /// Глиф: покрытие `width × height` уровнями 0..=255 и где оно стоит

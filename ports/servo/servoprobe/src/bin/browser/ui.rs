@@ -234,7 +234,11 @@ pub fn shell_ui(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     let screen = ctx.content_rect();
     // Страница — без встроенных справа инструментов разработчика.
     let dock = crate::shell::dev_dock() as f32;
-    let page = Rect::from_min_max(pos2(ox as f32, oy as f32), pos2(screen.max.x - dock, screen.max.y));
+    let bar = crate::shell::downloads_bar() as f32;
+    let page = Rect::from_min_max(pos2(ox as f32, oy as f32), pos2(screen.max.x - dock, screen.max.y - bar));
+    if bar > 0.0 {
+        downloads_bar(&ctx, shell, Rect::from_min_max(pos2(screen.min.x, screen.max.y - bar), screen.max), &p, actions);
+    }
     overlays(&ctx, shell, page, &p, actions);
     if let Some(panel) = shell.panel {
         drawer(&ctx, shell, panel, page, &p, actions);
@@ -633,7 +637,7 @@ fn drawer(ctx: &egui::Context, shell: &mut Shell, panel: Panel, page: Rect, p: &
                     Panel::RemoteTabs => remote_tabs(ui, shell, actions),
                     Panel::Sync => sync_panel(ui, shell, actions),
                     Panel::Looks => looks(ui, shell),
-                    Panel::Settings => settings(ui, shell),
+                    Panel::Settings => settings(ui, shell, actions),
                     Panel::Scripts => scripts(ui, shell),
                     Panel::Profiles => profiles(ui, shell),
                     Panel::Downloads => downloads(ui, shell, actions),
@@ -918,7 +922,7 @@ fn password_tools(ui: &mut Ui, shell: &mut Shell) {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            let dir = shell.delegate.downloads.dir.clone();
+            let dir = shell.delegate.downloads.dir.borrow().clone();
             if ui.button("Экспорт закладок").clicked() {
                 let items: Vec<(String, String)> = shell.profile.bookmarks.iter().map(|b| (b.url.clone(), b.title.clone())).collect();
                 let path = dir.join("obsos-bookmarks.html");
@@ -1231,7 +1235,8 @@ fn looks(ui: &mut Ui, shell: &mut Shell) {
     }
 }
 
-fn settings(ui: &mut Ui, shell: &mut Shell) {
+fn settings(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
+    let dir = shell.delegate.downloads.dir.borrow().display().to_string();
     let s = &mut shell.profile.settings;
     let before = (s.search, s.home.clone());
     ui.label(RichText::new("Поиск").strong());
@@ -1253,6 +1258,17 @@ fn settings(ui: &mut Ui, shell: &mut Shell) {
     if ui.checkbox(&mut s.block_ads, "Блокировать рекламу и трекеры").changed() {
         shell.delegate.blocker.borrow_mut().enabled = s.block_ads;
     }
+    ui.label(RichText::new("Загрузки").strong());
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("Папка: {dir}")).small());
+        if ui.small_button("Изменить…").clicked() {
+            actions.push(Action::ChooseDownloadDir);
+        }
+        if !s.download_dir.is_empty() && ui.small_button("Как было").clicked() {
+            s.download_dir.clear();
+        }
+    });
+    ui.checkbox(&mut s.download_ask, "Спрашивать, куда сохранять каждый файл");
     let after = (s.search, s.home.clone());
     if after != before {
         let (search, home) = after;
@@ -1261,6 +1277,7 @@ fn settings(ui: &mut Ui, shell: &mut Shell) {
         shell.update_page_data();
     }
     shell.profile.save_settings();
+    shell.apply_download_settings();
     blocker_lists(ui, shell);
     ui.separator();
     ui.label(RichText::new("Мастер-пароль хранилища").strong());
@@ -1312,18 +1329,199 @@ fn scripts(ui: &mut Ui, shell: &mut Shell) {
     }
 }
 
+/// Открыть скачанный файл: текст и Markdown — страницей просмотра OBSOS,
+/// картинки и HTML — вкладкой, пакет — `pkg install`, остальное — «Файлы»
+/// с этим файлом (там своё «Открыть с помощью»).
+pub fn open_download(path: &std::path::Path, actions: &mut Vec<Action>) {
+    let shown = path.display().to_string();
+    let lower = shown.to_ascii_lowercase();
+    println!("browser: open download {shown}");
+    if crate::pages::viewable_path(&shown) {
+        actions.push(Action::NewTabUrl(crate::pages::view_url(&shown).to_string()));
+    } else if [".html", ".htm", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"].iter().any(|e| lower.ends_with(e)) {
+        actions.push(Action::NewTabUrl(format!("file://{shown}")));
+    } else if lower.ends_with(".fpk") {
+        let _ = crate::window::spawn(&format!("/bin/pkg install {shown}"));
+    } else {
+        show_in_folder(path);
+    }
+}
+
+/// «Показать в папке»: «Файлы» открываются на папке с выделенным файлом.
+pub fn show_in_folder(path: &std::path::Path) {
+    println!("browser: show in folder {}", path.display());
+    let _ = crate::window::spawn(&format!("/bin/files {}", path.display()));
+}
+
+/// Строка состояния загрузки: «37% · 12,3 МБ из 1,0 ГБ · 5,1 МБ/с · ещё 2 мин».
+fn download_status(item: &crate::downloads::Item) -> String {
+    use crate::downloads::{State, human_size, human_time};
+    match &item.state {
+        State::Running => {
+            // Доля — первой: на узкой плашке хвост строки обрезается.
+            let mut parts = Vec::new();
+            if let Some(f) = item.fraction() {
+                parts.push(format!("{:.0}%", f * 100.0));
+            }
+            parts.push(match item.total {
+                Some(t) => format!("{} из {}", human_size(item.got), human_size(t)),
+                None => human_size(item.got),
+            });
+            if item.rate > 0.0 {
+                parts.push(format!("{}/с", human_size(item.rate as u64)));
+            }
+            if let Some(eta) = item.eta() {
+                parts.push(format!("ещё {}", human_time(eta)));
+            }
+            parts.join(" · ")
+        }
+        State::Asking => String::from("куда сохранить?"),
+        State::Probing | State::Page => String::from("проверка ссылки…"),
+        State::Done(_) => format!("готово · {}", human_size(item.got)),
+        State::Failed(e) => format!("ошибка: {e}"),
+        State::Cancelled => String::from("отменено"),
+    }
+}
+
+/// Полоса загрузок внизу окна (как в Chrome): последние загрузки плашками —
+/// имя, ход, скорость; у идущей — отмена, у готовой — «Открыть» и «Показать
+/// в папке»; справа «Все загрузки» и крестик.
+fn downloads_bar(ctx: &egui::Context, shell: &mut Shell, rect: Rect, p: &Palette, actions: &mut Vec<Action>) {
+    use crate::downloads::State;
+    let items = shell.delegate.downloads.snapshot();
+    if items.iter().any(|d| d.active()) {
+        ctx.request_repaint_after(std::time::Duration::from_millis(300));
+    }
+    egui::Area::new(egui::Id::new("obsos-downloads-bar")).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        let (r, _) = ui.allocate_exact_size(rect.size(), Sense::hover());
+        ui.painter().rect_filled(r, 0.0, p.toolbar);
+        ui.painter().line_segment([r.left_top(), r.right_top()], Stroke::new(1.0_f32, mix(p.toolbar, p.text, 0.18)));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r.shrink2(vec2(8.0, 6.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        let ui = &mut child;
+        // Справа: крестик и «Все загрузки».
+        let right_w = 150.0;
+        let chips_w = (r.width() - 16.0 - right_w).max(200.0);
+        let chip_w = 300.0_f32.min(chips_w);
+        let fit = ((chips_w / (chip_w + 6.0)) as usize).max(1);
+        for item in items.iter().rev().take(fit) {
+            let (chip, resp) = ui.allocate_exact_size(vec2(chip_w, r.height() - 12.0), Sense::click());
+            let hovered = resp.hovered();
+            ui.painter().rect_filled(chip, 8.0, if hovered { p.hover } else { mix(p.toolbar, p.sidebar, 0.5) });
+            ui.painter().rect_stroke(chip, 8.0, Stroke::new(1.0_f32, mix(p.toolbar, p.text, 0.12)), egui::StrokeKind::Inside);
+            // Кольцо хода слева (как в Chrome): доля — дугой.
+            let ring = pos2(chip.left() + 20.0, chip.center().y);
+            let color = match item.state {
+                State::Failed(_) | State::Cancelled => Color32::from_rgb(0xe0, 0x70, 0x60),
+                State::Done(_) => p.accent2,
+                _ => p.accent,
+            };
+            ui.painter().circle_stroke(ring, 11.0, Stroke::new(2.5_f32, mix(p.toolbar, p.text, 0.15)));
+            let frac = match item.state {
+                State::Done(_) => 1.0,
+                _ => item.fraction().unwrap_or(0.0),
+            };
+            if frac > 0.0 {
+                let n = (frac * 40.0).ceil().max(2.0) as usize;
+                let pts: Vec<Pos2> = (0..=n)
+                    .map(|i| {
+                        let a = -std::f32::consts::FRAC_PI_2 + i as f32 / n as f32 * frac * std::f32::consts::TAU;
+                        ring + vec2(a.cos() * 11.0, a.sin() * 11.0)
+                    })
+                    .collect();
+                ui.painter().add(egui::Shape::line(pts, Stroke::new(2.5_f32, color)));
+            } else if matches!(item.state, State::Running) {
+                // Размер неизвестен — бегущая дуга.
+                let t = ui.input(|i| i.time) as f32 * 4.0;
+                let pts: Vec<Pos2> = (0..=12).map(|i| ring + vec2((t + i as f32 * 0.12).cos() * 11.0, (t + i as f32 * 0.12).sin() * 11.0)).collect();
+                ui.painter().add(egui::Shape::line(pts, Stroke::new(2.5_f32, color)));
+            }
+            if let State::Done(_) = item.state {
+                ui.painter().line_segment([ring + vec2(-5.0, 0.0), ring + vec2(-1.0, 4.0)], Stroke::new(2.0_f32, color));
+                ui.painter().line_segment([ring + vec2(-1.0, 4.0), ring + vec2(5.0, -4.0)], Stroke::new(2.0_f32, color));
+            }
+            let text_x = chip.left() + 40.0;
+            let name_w = chip.right() - text_x - 34.0;
+            let name = clip(&item.name, (name_w / 7.5) as usize);
+            ui.painter().text(pos2(text_x, chip.center().y - 8.0), Align2::LEFT_CENTER, name, FontId::proportional(13.0), p.text);
+            let status = clip(&download_status(item), (name_w / 6.5) as usize);
+            ui.painter().text(pos2(text_x, chip.center().y + 9.0), Align2::LEFT_CENTER, status, FontId::proportional(11.5), p.dim);
+            // Кнопка справа на плашке: отмена у идущей, «Показать в папке» у готовой.
+            let btn = Rect::from_center_size(pos2(chip.right() - 18.0, chip.center().y), vec2(26.0, 26.0));
+            let btn_resp = ui.interact(btn, ui.id().with(("dl-btn", item.id)), Sense::click());
+            if btn_resp.hovered() {
+                ui.painter().rect_filled(btn, 6.0, mix(p.hover, p.text, 0.1));
+            }
+            match &item.state {
+                State::Running | State::Asking => {
+                    paint_icon(ui.painter(), btn, Icon::Close, p.text);
+                    if btn_resp.on_hover_text("Отменить").clicked() {
+                        println!("browser: download cancel {}", item.name);
+                        shell.delegate.downloads.cancel(item.id);
+                    }
+                }
+                State::Done(path) => {
+                    paint_folder(ui.painter(), btn, p.text);
+                    if btn_resp.on_hover_text("Показать в папке").clicked() {
+                        show_in_folder(path);
+                    }
+                }
+                _ => {
+                    paint_icon(ui.painter(), btn, Icon::Close, p.dim);
+                    if btn_resp.on_hover_text("Убрать из списка").clicked() {
+                        shell.delegate.downloads.remove(item.id);
+                    }
+                }
+            }
+            // Щелчок по плашке: готовую — открыть; иначе — панель загрузок.
+            if resp.clicked() && !btn.contains(resp.interact_pointer_pos().unwrap_or(btn.center())) {
+                match &item.state {
+                    State::Done(path) => open_download(path, actions),
+                    _ => actions.push(Action::Panel(Panel::Downloads)),
+                }
+            }
+            ui.add_space(6.0);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if icon_button(ui, Icon::Close, true, "Скрыть полосу загрузок", p) {
+                shell.dl.bar = false;
+            }
+            if ui.button("Все загрузки").clicked() {
+                actions.push(Action::Panel(Panel::Downloads));
+            }
+        });
+    });
+}
+
+/// Значок папки (кнопка «Показать в папке»).
+fn paint_folder(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let s = Stroke::new(1.6_f32, color);
+    let pts = vec![c + vec2(-7.0, -5.0), c + vec2(-2.0, -5.0), c + vec2(0.0, -3.0), c + vec2(7.0, -3.0), c + vec2(7.0, 5.0), c + vec2(-7.0, 5.0)];
+    painter.add(egui::Shape::closed_line(pts, s));
+}
+
 fn downloads(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     use crate::downloads::{State, human_size};
-    let dir = shell.delegate.downloads.dir.clone();
+    let dir = shell.delegate.downloads.dir.borrow().clone();
     ui.label(RichText::new(format!("Папка: {} («Загрузки» в «Файлах»)", dir.display())).small());
     ui.horizontal(|ui| {
         if ui.button("Открыть папку").clicked() {
+            let _ = std::fs::create_dir_all(&dir);
             let _ = crate::window::spawn(&format!("/bin/files {}", dir.display()));
         }
         if ui.button("Очистить список").clicked() {
             shell.delegate.downloads.clear_finished();
         }
+        if ui.button("Изменить папку…").clicked() {
+            actions.push(Action::ChooseDownloadDir);
+        }
     });
+    let mut ask = shell.profile.settings.download_ask;
+    if ui.checkbox(&mut ask, "Спрашивать, куда сохранять каждый файл").changed() {
+        shell.profile.settings.download_ask = ask;
+        shell.profile.save_settings();
+        shell.apply_download_settings();
+    }
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(&mut shell.filter).hint_text("адрес файла").desired_width(240.0));
         if ui.button("Скачать").clicked() && shell.filter.trim().starts_with("http") {
@@ -1334,47 +1532,53 @@ fn downloads(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     ui.separator();
     let items = shell.delegate.downloads.snapshot();
     if items.is_empty() {
-        ui.label("Загрузок пока нет. Ссылки на архивы, программы, видео и файлы, которые Servo не показывает, скачиваются сюда.");
+        ui.label("Загрузок пока нет. Ссылки на архивы, программы, образы и файлы, которые сервер велит сохранить, скачиваются сюда; правая кнопка на ссылке — «Сохранить ссылку как…».");
     }
-    if items.iter().any(|d| d.state == State::Running) {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(400));
+    if items.iter().any(|d| d.active()) {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
     }
-    for (index, item) in items.iter().enumerate().rev() {
+    for item in items.iter().rev() {
         ui.group(|ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(&item.name).strong());
             match &item.state {
-                State::Running => {
-                    let fraction = item.total.map(|t| item.got as f32 / t.max(1) as f32);
-                    let text = match item.total {
-                        Some(t) => format!("{} из {} · {}/с", human_size(item.got), human_size(t), human_size(item.speed() as u64)),
-                        None => format!("{} · {}/с", human_size(item.got), human_size(item.speed() as u64)),
-                    };
-                    ui.add(egui::ProgressBar::new(fraction.unwrap_or(0.0)).text(text).animate(fraction.is_none()));
+                State::Running | State::Asking | State::Probing | State::Page => {
+                    let fraction = item.fraction();
+                    ui.add(egui::ProgressBar::new(fraction.unwrap_or(0.0)).text(download_status(item)).animate(fraction.is_none()));
                     if ui.small_button("Отменить").clicked() {
-                        shell.delegate.downloads.cancel(index);
+                        shell.delegate.downloads.cancel(item.id);
                     }
                 }
                 State::Done(path) => {
-                    ui.label(RichText::new(format!("готово · {}", human_size(item.got))).small());
+                    ui.label(RichText::new(format!("готово · {} · {}", human_size(item.got), path.display())).small());
+                    if let Some(sha) = &item.sha256 {
+                        ui.label(RichText::new(format!("SHA-256 {sha}")).small().weak().monospace());
+                    }
                     ui.horizontal(|ui| {
-                        let shown = path.display().to_string();
-                        if crate::pages::viewable_path(&shown) && ui.small_button("Открыть").clicked() {
-                            actions.push(Action::NewTabUrl(crate::pages::view_url(&shown).to_string()));
+                        if ui.small_button("Открыть").clicked() {
+                            open_download(path, actions);
                         }
-                        if shown.ends_with(".fpk") && ui.small_button("Установить").clicked() {
-                            let _ = crate::window::spawn(&format!("/bin/pkg install {shown}"));
+                        if ui.small_button("Показать в папке").clicked() {
+                            show_in_folder(path);
                         }
                         if ui.small_button("Скачать снова").clicked() {
                             actions.push(Action::Download(item.url.clone()));
                         }
+                        if ui.small_button("Убрать").clicked() {
+                            shell.delegate.downloads.remove(item.id);
+                        }
                     });
                 }
-                State::Failed(e) => {
-                    ui.colored_label(Color32::from_rgb(0xe0, 0x70, 0x60), format!("не скачалось: {e}"));
-                    if ui.small_button("Повторить").clicked() {
-                        actions.push(Action::Download(item.url.clone()));
-                    }
+                State::Failed(_) | State::Cancelled => {
+                    ui.colored_label(Color32::from_rgb(0xe0, 0x70, 0x60), download_status(item));
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Повторить").clicked() {
+                            actions.push(Action::Download(item.url.clone()));
+                        }
+                        if ui.small_button("Убрать").clicked() {
+                            shell.delegate.downloads.remove(item.id);
+                        }
+                    });
                 }
             }
             ui.label(RichText::new(clip(&item.url, 60)).small().weak());
@@ -1542,9 +1746,28 @@ fn modal(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, action
         }
         Modal::Context(menu, at) => {
             let mut chosen = None;
+            let mut save: Option<String> = None;
+            let info = menu.element_info().clone();
+            let link = info.link_url.filter(|u| matches!(u.scheme(), "http" | "https")).map(|u| u.to_string());
+            let image = info.image_url.filter(|u| matches!(u.scheme(), "http" | "https")).map(|u| u.to_string());
             egui::Area::new(egui::Id::new("obsos-context")).order(egui::Order::Tooltip).fixed_pos(at).show(ctx, |ui| {
                 egui::Frame::popup(&ctx.global_style()).fill(p.sidebar).show(ui, |ui| {
                     ui.set_min_width(200.0);
+                    // Свои пункты (Servo их не знает): сохранить ссылку или
+                    // картинку через окно «Сохранить как».
+                    if let Some(url) = &link {
+                        if ui.add(egui::Button::new("Сохранить ссылку как…").frame(false)).clicked() {
+                            save = Some(url.clone());
+                        }
+                    }
+                    if let Some(url) = &image {
+                        if ui.add(egui::Button::new("Сохранить картинку как…").frame(false)).clicked() {
+                            save = Some(url.clone());
+                        }
+                    }
+                    if link.is_some() || image.is_some() {
+                        ui.separator();
+                    }
                     for item in menu.items() {
                         match item {
                             ContextMenuItem::Item { label, action, enabled } => {
@@ -1559,7 +1782,11 @@ fn modal(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, action
                     }
                 });
             });
-            if let Some(action) = chosen {
+            if let Some(url) = save {
+                println!("browser: context save as {url}");
+                menu.dismiss();
+                actions.push(Action::SaveAs(url));
+            } else if let Some(action) = chosen {
                 menu.select(action);
             } else if backdrop.inner {
                 menu.dismiss();

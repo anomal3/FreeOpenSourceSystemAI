@@ -11,7 +11,8 @@
 //! * Полоса меню «Файл / Правка / Вид / Синтаксис» с сочетаниями справа.
 //! * Открыть, сохранить, сохранить как (Ctrl+O, Ctrl+S, Ctrl+Shift+S) — общим
 //!   окном «Открыть» / «Сохранить как» (`mini_ui::filedlg`, 20.11: быстрый
-//!   доступ, адрес, таблица, тип файла); создать (Ctrl+N). Несохранённое — вопрос
+//!   доступ, адрес, таблица, тип файла; с 20.11 — отдельным модальным окном
+//!   стола `/bin/filedlg`); создать (Ctrl+N). Несохранённое — вопрос
 //!   «Сохранить изменения?» перед «Создать», «Открыть» и закрытием окна.
 //! * Выделение Shift+стрелками, Shift+Home/End, Ctrl+A; Вырезать, Копировать,
 //!   Вставить через общий буфер обмена стола (`SYS_CLIPBOARD`: тот же, что у
@@ -49,7 +50,7 @@ use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface, theme};
 use user_abi::{Dirent, KIND_DIRECTORY, WIN_MOD_CTRL, WIN_MOD_SHIFT};
 use user_progs::app::{self, App, Spec};
-use user_progs::filedlg::{FileDialog, Filter, Options, Outcome, SysHost};
+use user_progs::filedlg::{Dialog, Filter, Options, Outcome};
 use user_progs::{
     Args, SysInfo, WIN_KEY_DELETE, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT, WIN_KEY_PAGE_DOWN,
     WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP, clipboard_get, clipboard_set, close, file_size, open, open_write,
@@ -232,11 +233,10 @@ struct Editor {
     redo: Vec<Snapshot>,
     last_edit: EditKind,
     numbers: bool,
-    /// Окно «Открыть» / «Сохранить как» и что это: сохранение (`true`).
-    dialog: Option<FileDialog>,
+    /// Окно «Открыть» / «Сохранить как» — отдельная программа `/bin/filedlg`
+    /// над нашим окном (20.11) — и что это: сохранение (`true`).
+    dialog: Option<Dialog>,
     dialog_save: bool,
-    /// Система для окна выбора файла (папки, тома, значки).
-    host: SysHost,
     /// Вопрос «Сохранить изменения?» и что сделать после ответа.
     ask_save: Option<Then>,
     quit: bool,
@@ -289,7 +289,6 @@ impl Editor {
             numbers: true,
             dialog: None,
             dialog_save: false,
-            host: SysHost::new("notepad"),
             ask_save: None,
             quit: false,
             home: user_progs::filedlg::home_dir(),
@@ -484,10 +483,21 @@ impl Editor {
         if let Some(path) = &self.path {
             options = options.dir(&parent_of(path));
         }
-        let dialog = FileDialog::new(&self.host, options);
-        println(&format!("notepad: {} dialog at {}", if save { "save" } else { "open" }, dialog.dir()));
-        self.dialog = Some(dialog);
-        self.dialog_save = save;
+        // Окно уже открыто — второе не нужно (стол и так держит его над нами).
+        if self.dialog.is_some() {
+            return;
+        }
+        match Dialog::start(&options, "notepad") {
+            Ok(dialog) => {
+                println(&format!("notepad: {} dialog opened", if save { "save" } else { "open" }));
+                self.dialog = Some(dialog);
+                self.dialog_save = save;
+            }
+            Err(why) => {
+                println(&format!("notepad: FAILED file dialog: {why}"));
+                self.note = Some(format!("Окно выбора файла не открылось: {why}"));
+            }
+        }
     }
 
     /// Ответ окна выбора файла.
@@ -1485,9 +1495,18 @@ impl Editor {
         let p = ctx.palette;
         let metrics = self.metrics(ctx, plan);
         let gutter = Rect::new(plan.text.x, plan.text.y, metrics.gutter_w, plan.text.h);
+        // Классика (22.11): поле текста белое и вдавленное, как у Блокнота
+        // Windows 98.
+        let classic = theme::is_classic();
+        if classic {
+            s.fill(plan.text, ctx.flat(p.sunk));
+        }
         if self.numbers {
             s.fill(gutter, ctx.flat(p.panel));
             draw::vline(s, gutter.right() - 1, gutter.y, gutter.h, p.line.color, p.line.alpha);
+        }
+        if classic {
+            mini_ui::classic::sunken(s, plan.text, mini_ui::classic::unit(ctx.scale));
         }
         let right = plan.text.right() - ctx.px(10) as i32;
         let clip = Rect::new(metrics.x, plan.text.y, (right - metrics.x).max(0) as u32, plan.text.h);
@@ -1620,12 +1639,6 @@ impl Editor {
         }
     }
 
-    fn draw_dialog(&self, s: &mut Surface, ctx: Ctx, area: Rect) {
-        if let Some(dialog) = &self.dialog {
-            dialog.draw(&self.host, s, ctx, area);
-        }
-    }
-
     fn draw_ask(&self, s: &mut Surface, ctx: Ctx, area: Rect) {
         if self.ask_save.is_none() {
             return;
@@ -1691,7 +1704,6 @@ impl App for Editor {
             kit::draw_menu(ctx, s, rect, &entries, selected);
         }
         self.draw_dropdown(s, ctx, area, &plan);
-        self.draw_dialog(s, ctx, area);
         self.draw_font_dialog(s, ctx, area);
         self.draw_ask(s, ctx, area);
     }
@@ -1701,10 +1713,9 @@ impl App for Editor {
             self.font_key(code);
             return true;
         }
-        if let Some(dialog) = self.dialog.as_mut() {
-            let outcome = dialog.key(&self.host, code, mods, latin);
-            self.dialog_done(outcome);
-            return true;
+        // Окно выбора файла открыто: стол ввода нам не даёт; что дошло — мимо.
+        if self.dialog.is_some() {
+            return false;
         }
         if self.ask_save.is_some() {
             match code {
@@ -1854,10 +1865,8 @@ impl App for Editor {
             self.font_click(ctx, area, x, y);
             return true;
         }
-        if let Some(dialog) = self.dialog.as_mut() {
-            let outcome = dialog.click(&self.host, ctx, area, x, y);
-            self.dialog_done(outcome);
-            return true;
+        if self.dialog.is_some() {
+            return false;
         }
         if self.ask_save.is_some() {
             let (_, buttons) = ask_plan(ctx, area);
@@ -1919,9 +1928,8 @@ impl App for Editor {
     }
 
     fn wheel(&mut self, clicks: i32) -> bool {
-        if let Some(dialog) = self.dialog.as_mut() {
-            dialog.wheel(clicks);
-            return true;
+        if self.dialog.is_some() {
+            return false;
         }
         let rows = self.page_rows.get();
         let last = self.lines.len().saturating_sub(rows.max(1));
@@ -1935,32 +1943,17 @@ impl App for Editor {
         Some(format!("Notepad\x1f{} — Блокнот", Editor::title(self)))
     }
 
-    /// Тянут ползунок прокрутки в окне выбора файла.
-    fn drag(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
-        self.dialog.as_mut().is_some_and(|dialog| dialog.drag(ctx, area, x, y))
-    }
-
-    fn release(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
-        match self.dialog.as_mut() {
-            Some(dialog) => {
-                dialog.release();
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Подсветка строк, мест и полосы прокрутки в окне выбора файла (20.11).
-    fn hover(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
-        self.dialog.as_mut().is_some_and(|dialog| dialog.hover(ctx, area, x, y))
-    }
-
-    fn leave(&mut self) -> bool {
-        self.dialog.as_mut().is_some_and(FileDialog::leave)
-    }
-
     fn tick(&mut self, _info: &SysInfo) -> bool {
         false
+    }
+
+    /// Ответ окна выбора файла (`/bin/filedlg`) — не дожидаясь его.
+    fn step(&mut self) -> bool {
+        let Some(outcome) = self.dialog.as_mut().and_then(Dialog::poll) else {
+            return false;
+        };
+        self.dialog_done(outcome);
+        true
     }
 
     /// `q` — буква текста, а не выход: блокнот закрывают крестиком или Ctrl+W.

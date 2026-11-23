@@ -28,6 +28,16 @@ use crate::sync::SpinLock;
 
 /// Как часто дописывать новое, мс.
 const FLUSH_MS: u64 = 2000;
+/// Как часто — пока окна Wayland часто показывают кадры (игра, 21.11):
+/// запись на флешку делит контроллер USB с диском игры (журнал 13: D2R с
+/// exFAT-SSD подвисал периодически). Паника и выключение сбрасывают всё
+/// сразу ([`flush_now`]).
+const FLUSH_BUSY_MS: u64 = 10_000;
+/// Больше стольких показов кадров Wayland в секунду — «идёт игра».
+const BUSY_COMMITS_PER_S: u64 = 20;
+/// SYNCHRONIZE CACHE флешки — не чаще (кроме [`flush_now`]): запись
+/// и так уходит на носитель, команда лишь торопит его внутренний кэш.
+const SYNC_MS: u64 = 30_000;
 /// Как часто снимать кольцо журнала в память, мс: кольцо — 32 КиБ, загрузка
 /// столько за полсекунды не печатает.
 const CAPTURE_MS: u64 = 250;
@@ -167,6 +177,14 @@ pub fn offer(device: &Shared, first_lba: u64) {
             *DISPLAY.lock() = Some(Target { device: device.clone(), runs, size, flushed: 0, fresh: false, failures: 0 });
         }
     }
+    // Настройки живой системы (21.11): `\FREEOS\SETTINGS.DAT` заранее нужного
+    // размера, его читает и переписывает `super::stick_settings`.
+    if SETTINGS.lock().is_none() {
+        if let Some((runs, size)) = file_runs(&fat, &mut device, dir, b"SETTINGSDAT") {
+            kprintln!("  stick-log   : live settings file \\FREEOS\\SETTINGS.DAT ({} KiB)", size / 1024);
+            *SETTINGS.lock() = Some(Target { device: device.clone(), runs, size, flushed: 0, fresh: false, failures: 0 });
+        }
+    }
     if TARGET.lock().is_some() {
         return;
     }
@@ -211,7 +229,7 @@ pub fn store_display(width: u32, height: u32) -> bool {
     let Some(mut target) = DISPLAY.lock().take() else { return false };
     let text = alloc::format!("{width}x{height}\n");
     let size = target.size;
-    let ok = target.write_range(text.as_bytes(), 0, size);
+    let ok = target.write_range(text.as_bytes(), 0, 0, size);
     let _ = target.device.flush();
     *DISPLAY.lock() = Some(target);
     ok
@@ -225,9 +243,37 @@ static LAYOUT: SpinLock<Option<Target>> = SpinLock::new(None);
 pub fn store_layout(text: &str) -> bool {
     let Some(mut layout) = LAYOUT.lock().take() else { return false };
     let size = layout.size;
-    let ok = layout.write_range(text.as_bytes(), 0, size);
+    let ok = layout.write_range(text.as_bytes(), 0, 0, size);
     let _ = layout.device.flush();
     *LAYOUT.lock() = Some(layout);
+    ok
+}
+
+/// Файл настроек живой системы на флешке, если он есть.
+static SETTINGS: SpinLock<Option<Target>> = SpinLock::new(None);
+
+/// Размер `\FREEOS\SETTINGS.DAT`, если флешка с ним уже найдена.
+pub fn settings_size() -> Option<usize> {
+    SETTINGS.lock().as_ref().map(|target| target.size)
+}
+
+/// Прочитать `\FREEOS\SETTINGS.DAT` целиком.
+pub fn settings_read() -> Option<Vec<u8>> {
+    let mut target = SETTINGS.lock().take()?;
+    let bytes = target.read_all();
+    *SETTINGS.lock() = Some(target);
+    Some(bytes)
+}
+
+/// Переписать кусок `\FREEOS\SETTINGS.DAT` с байта `offset` (кратен
+/// сектору): `bytes`, хвост последнего сектора — пробелы. Не трогает ни FAT,
+/// ни каталог; `false` — файла нет, кусок не влезает или запись не удалась.
+pub fn settings_write(offset: usize, bytes: &[u8]) -> bool {
+    let Some(mut target) = SETTINGS.lock().take() else { return false };
+    let end = offset + bytes.len().div_ceil(SECTOR) * SECTOR;
+    let ok = offset % SECTOR == 0 && end <= target.size && target.write_range(bytes, offset, offset, end);
+    let _ = target.device.flush();
+    *SETTINGS.lock() = Some(target);
     ok
 }
 
@@ -256,8 +302,10 @@ impl Target {
         out
     }
 
-    /// Записать сектора файла `[from, to)` из `bytes` (недостающее — пробелы).
-    fn write_range(&mut self, bytes: &[u8], from: usize, to: usize) -> bool {
+    /// Записать сектора файла `[from, to)` из `bytes` (недостающее — пробелы);
+    /// `bytes[0]` — байт файла номер `origin` (`origin` не больше `from`,
+    /// кратен сектору: с 21.11 передаётся только хвост журнала).
+    fn write_range(&mut self, bytes: &[u8], origin: usize, from: usize, to: usize) -> bool {
         let mut sector = from / SECTOR;
         let last = to.div_ceil(SECTOR);
         let mut buffer = alloc::vec![b' '; SECTOR * 16];
@@ -273,7 +321,7 @@ impl Target {
             }
             let chunk = &mut buffer[..count * SECTOR];
             chunk.fill(b' ');
-            let start = sector * SECTOR;
+            let start = sector * SECTOR - origin;
             if start < bytes.len() {
                 let end = (start + chunk.len()).min(bytes.len());
                 chunk[..end - start].copy_from_slice(&bytes[start..end]);
@@ -287,9 +335,31 @@ impl Target {
     }
 }
 
+/// How long the frame rate must stay below a quarter of
+/// [`BUSY_COMMITS_PER_S`] before the log goes back to 2 s flushes (hw-log14).
+const IDLE_BEFORE_2S_MS: u64 = 20_000;
+
+/// Сколько кадров показал сервер Wayland с загрузки (есть только на x86_64).
+fn wayland_commits() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::linux::perfdiag::WL_COMMITS.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
 /// Задача: снимать кольцо журнала в память и дописывать на флешку.
 pub fn task() {
     let mut next_flush = 0u64;
+    let mut last_sync = 0u64;
+    let mut commits = wayland_commits();
+    let mut commits_at = crate::time::uptime_ms();
+    let mut busy = false;
+    // Since when the frame rate has been low while still `busy`.
+    let mut quiet_since: Option<u64> = None;
     let mut chunk = alloc::vec![0u8; 4096];
     loop {
         // Снять новое с кольца.
@@ -306,9 +376,43 @@ pub fn task() {
             captured.extend_from_slice(&chunk[..count.min(room)]);
         }
         let now = crate::time::uptime_ms();
+        // Идёт ли игра: частота показов кадров Wayland за последние ~2 с.
+        if now.saturating_sub(commits_at) >= FLUSH_MS {
+            let total = wayland_commits();
+            let rate = total.saturating_sub(commits) * 1000 / now.saturating_sub(commits_at).max(1);
+            let was = busy;
+            // Hysteresis (hw-log14): D2R at 17-21 frames/s flipped the mode
+            // 7 times in a few minutes - exactly when the game was weakest,
+            // flushes got more frequent. In at once above the threshold; out
+            // only after `IDLE_BEFORE_2S_MS` well below it (a quarter).
+            if rate > BUSY_COMMITS_PER_S {
+                busy = true;
+                quiet_since = None;
+            } else if busy && rate * 4 > BUSY_COMMITS_PER_S {
+                quiet_since = None;
+            } else if busy {
+                let since = *quiet_since.get_or_insert(now);
+                busy = now.saturating_sub(since) < IDLE_BEFORE_2S_MS;
+            }
+            if busy != was {
+                kprintln!(
+                    "  stick-log   : {} ({rate} Wayland frames/s)",
+                    if busy { "game running - log flushed every 10 s" } else { "log flushed every 2 s again" }
+                );
+                if busy {
+                    next_flush = now + FLUSH_BUSY_MS;
+                }
+            }
+            commits = total;
+            commits_at = now;
+        }
         if now >= next_flush {
-            next_flush = now + FLUSH_MS;
-            flush();
+            next_flush = now + if busy { FLUSH_BUSY_MS } else { FLUSH_MS };
+            let sync = now.saturating_sub(last_sync) >= SYNC_MS;
+            if sync {
+                last_sync = now;
+            }
+            flush(sync);
         }
         crate::sched::sleep_ms(CAPTURE_MS);
     }
@@ -329,30 +433,44 @@ pub fn flush_now() {
         captured.extend_from_slice(&chunk[..count.min(room)]);
     }
     CAPTURED_AT.store(position, core::sync::atomic::Ordering::Release);
-    flush();
+    flush(true);
 }
 
-fn flush() {
+/// Дописать новое; `sync` — и SYNCHRONIZE CACHE флешки.
+///
+/// С 21.11 копируется только хвост журнала с последнего записанного сектора
+/// (до этого — клон всех до 4 МиБ каждые 2 с), и только он уходит на флешку.
+fn flush(sync: bool) {
     let Some(mut target) = TARGET.lock().take() else { return };
-    let bytes = CAPTURED.lock().clone();
-    let end = bytes.len().min(target.size);
     let mut ok = true;
     if target.fresh {
         // Прошлая загрузка стирается целиком: иначе её хвост читался бы как
         // продолжение этой.
-        ok = target.write_range(&bytes, 0, target.size);
+        let bytes = CAPTURED.lock().clone();
+        let end = bytes.len().min(target.size);
+        ok = target.write_range(&bytes, 0, 0, target.size);
         target.fresh = !ok;
         target.flushed = end;
-    } else if end > target.flushed {
+    } else {
         // Последний неполный сектор переписывается: в нём дописалось.
         let from = target.flushed / SECTOR * SECTOR;
-        ok = target.write_range(&bytes, from, end);
-        if ok {
-            target.flushed = end;
+        let tail = {
+            let captured = CAPTURED.lock();
+            let end = captured.len().min(target.size);
+            (end > target.flushed).then(|| captured[from..end].to_vec())
+        };
+        if let Some(tail) = tail {
+            let end = from + tail.len();
+            ok = target.write_range(&tail, from, from, end);
+            if ok {
+                target.flushed = end;
+            }
         }
     }
     if ok {
-        let _ = target.device.flush();
+        if sync {
+            let _ = target.device.flush();
+        }
         target.failures = 0;
         *TARGET.lock() = Some(target);
     } else {

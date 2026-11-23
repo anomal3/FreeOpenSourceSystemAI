@@ -214,11 +214,17 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_FDCTL => fdctl(a0, a1, a2),
         // 08.11.2026: блокировки файлов (fcntl F_*LK, flock).
         user_abi::SYS_FLOCK => flock(a0, a1, a2),
+        // 20.11: наблюдение за каталогами (стол, «Файлы», окно выбора файла).
+        user_abi::SYS_FSWATCH => fswatch(a0, a1, a2),
         user_abi::SYS_SOUND => sound(a0, a1, a2),
         // Фаза 68o: вход по SSH в живую систему и команды ядра по сети.
         user_abi::SYS_LIVE_KEYS => live_keys(a0, a1),
         user_abi::SYS_KERNEL_COMMAND => kernel_command(a0, a1, a2),
         user_abi::SYS_CLIPBOARD => clipboard(a0, a1, a2),
+        // 22.11: «Открыть с помощью» для «Файлов» (программы Windows из Wine).
+        user_abi::SYS_OPEN_WITH => open_with(a0, a1, a2),
+        // 22.11: screen capture for the recorder (`/bin/screenrec`).
+        user_abi::SYS_SCREENCAP => crate::ui::capture::syscall(a0, a1, a2),
         // 05.11.2026: время из сети (SNTP службы `dhcp`).
         user_abi::SYS_SETCLOCK => setclock(a0, a1, a2),
         user_abi::SYS_MODEM => modem(a0, a1, a2),
@@ -280,6 +286,15 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
             return match waiting {
                 super::files::Waiting::Write(writer) => pipe_write_waiting(&writer, ptr, len),
                 super::files::Waiting::Read(_) => ERR_PERMISSION,
+            };
+        }
+        // A regular file: written outside the process lock (21.11.2026),
+        // like `read`.
+        if let Some(Some(file)) = super::with_current(|program| program.files.file_io(fd)) {
+            // SAFETY: the range was checked readable above; no lock is held.
+            return match unsafe { file.write_from_user(ptr, len) } {
+                Ok(written) => written as i64,
+                Err(err) => errno(err),
             };
         }
         // В файл уходят байты как есть: это данные, а не текст, и требовать от
@@ -361,7 +376,7 @@ fn open(ptr: usize, len: usize, flags: usize) -> i64 {
     };
 
     let cred = super::credentials();
-    match super::with_current(|program| program.files.open(cred, path, flags)) {
+    match files::open_in_current(cred, path, flags) {
         Some(Ok(fd)) => fd as i64,
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
@@ -659,6 +674,16 @@ fn read(fd: usize, ptr: usize, len: usize) -> i64 {
 
     // Страницы буфера — до замка процесса (см. `prepare_write`).
     super::prepare_write(ptr, len);
+    // A regular file: read outside the process lock (21.11.2026) - only the
+    // descriptor lookup is under it; the open file's own position lock keeps
+    // `read` on a shared descriptor consistent.
+    if let Some(Some(file)) = super::with_current(|program| program.files.file_io(fd)) {
+        // SAFETY: the range was checked writable above; no lock is held here.
+        return match unsafe { file.read_to_user(ptr, len) } {
+            Ok(read) => read as i64,
+            Err(err) => errno(err),
+        };
+    }
     match super::with_current(|program| program.files.read(fd, buffer)) {
         Some(Ok(read)) => read as i64,
         Some(Err(err)) => errno(err),
@@ -1373,6 +1398,50 @@ fn clipboard(action: usize, ptr: usize, len: usize) -> i64 {
     }
 }
 
+/// `SYS_OPEN_WITH` (22.11): программы для файла, их значки, выбор «всегда».
+fn open_with(action: usize, ptr: usize, len: usize) -> i64 {
+    let input_len = action >> 32;
+    let action = action & 0xFFFF_FFFF;
+    if len > (8 << 20) || input_len > len || input_len > 4096 || (len > 0 && !space::user_can(ptr, len, PageFlags::WRITE)) {
+        return ERR_BAD_ADDRESS;
+    }
+    // Вход — копией: страница программы может прийти по касанию.
+    let input = if input_len == 0 { alloc::string::String::new() } else {
+        // SAFETY: диапазон проверен по таблицам программы на чтение.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, input_len) };
+        match core::str::from_utf8(bytes) {
+            Ok(text) => alloc::string::String::from(text),
+            Err(_) => return ERR_BAD_PATH,
+        }
+    };
+    let output: alloc::vec::Vec<u8> = match action {
+        user_abi::OPENWITH_LIST => crate::ui::openwith::list_text(&input).into_bytes(),
+        user_abi::OPENWITH_ICON => match crate::ui::openwith::icon_fimg(&input) {
+            Some(bytes) => bytes,
+            None => return ERR_NOT_FOUND,
+        },
+        user_abi::OPENWITH_REMEMBER => {
+            let Some((ext, command)) = input.split_once('\t') else {
+                return ERR_BAD_PATH;
+            };
+            return match crate::ui::prefs::store_open_with(ext.trim(), command.trim()) {
+                Ok(()) => {
+                    crate::kprintln!("  openwith    : .{} files open with '{}'", ext.trim(), command.trim());
+                    0
+                }
+                Err(_) => ERR_PERMISSION,
+            };
+        }
+        _ => return ERR_UNSUPPORTED,
+    };
+    let count = output.len().min(len);
+    if count > 0 {
+        // SAFETY: диапазон проверен по таблицам программы на запись.
+        unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, count) }.copy_from_slice(&output[..count]);
+    }
+    output.len() as i64
+}
+
 /// `SYS_KERNEL_COMMAND`: исполнить команду оболочки ядра и отдать вывод.
 fn kernel_command(line: usize, len: usize, out: usize) -> i64 {
     if len > 512 || !space::user_can(line, len, PageFlags::READ) {
@@ -1388,7 +1457,11 @@ fn kernel_command(line: usize, len: usize, out: usize) -> i64 {
     };
     // Только root — кроме безвредного «version» (20.11): версию системы
     // показывают «Сведения о системе» и обычному пользователю.
-    if !super::credentials().is_root() && text.trim() != "version" {
+    // П3 (20.11): ещё «открой окно стола» (`ui open …` — «Администрирование»
+    // открывает страницы «Параметров») и три читающие команды видеокарты
+    // без аргументов (страница «Видеокарта и драйверы»).
+    let open_window = text.trim().starts_with("ui open ");
+    if !super::credentials().is_root() && !open_window && !matches!(text.trim(), "version" | "gpu" | "nvk" | "outputs") {
         return ERR_PERMISSION;
     }
     let text = alloc::string::String::from(text);
@@ -1807,6 +1880,26 @@ fn nanosleep(seconds: u64, nanos: u64) -> i64 {
     // Договор обещает «не меньше запрошенного», а не «примерно столько», и
     // платит за это единственным тиком: спящий просыпается позже на десять
     // миллисекунд, зато никогда — раньше срока.
+    // hw-log15: `Sleep(1)` of Wine lasted 2-3 ms that way. Short sleeps
+    // (up to 20 ms) end at their deadline in nanoseconds (hrsleep one-shot
+    // timer), still never before it; `hrsleep off` - the tick way.
+    if seconds == 0 && nanos == 0 {
+        // `nanosleep(0)`: give the CPU to whoever waits for it, as Linux.
+        sched::yield_now();
+        return 0;
+    }
+    if ms <= 20 && sched::hrsleep::enabled() {
+        let deadline = crate::time::uptime_ns() + seconds * 1_000_000_000 + nanos;
+        while crate::time::uptime_ns() < deadline {
+            sched::hrsleep::sleep_until_ns(deadline, 0, 0, || false);
+            if !sched::hrsleep::enabled() {
+                break;
+            }
+        }
+        if crate::time::uptime_ns() >= deadline {
+            return 0;
+        }
+    }
     let tick_ms = 1000 / u64::from(crate::irq::TIMER_HZ);
     sched::sleep_ms(ms.saturating_add(tick_ms));
     0
@@ -1844,6 +1937,24 @@ fn own_window(id: i64) -> Result<u32, i64> {
         return Err(user_abi::ERR_NOT_FOUND);
     }
     Ok(slot)
+}
+
+/// Номер окна **другой** программы (20.11, владелец окна выбора файла):
+/// `(задача, место)`. Чужое окно можно назвать владельцем, только если
+/// программа запущена тем же пользователем — иначе любая программа могла бы
+/// «заблокировать» окно чужого сеанса своим модальным.
+fn foreign_window(id: i64) -> Result<(u32, u32), i64> {
+    let task = (id as u64 & 0xffff_ffff) as u32;
+    let slot = (id as u64 >> 32) as u32;
+    if id <= 0 || slot >= user_abi::MAX_WINDOWS {
+        return Err(user_abi::ERR_NOT_FOUND);
+    }
+    let mine = super::credentials().uid;
+    match super::uid_of_task(task) {
+        Some(uid) if uid == mine || mine == 0 => Ok((task, slot)),
+        Some(_) => Err(user_abi::ERR_PERMISSION),
+        None => Err(user_abi::ERR_NOT_FOUND),
+    }
 }
 
 /// Чем ответить программе, которой не дали окна.
@@ -2182,11 +2293,13 @@ fn mounts(ptr: usize, len: usize) -> i64 {
     let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
     let mut written = 0usize;
     // Место — третьим и четвёртым полем (02.11), `-` — том о нём не знает.
-    for (point, kind, space) in crate::fs::mounted_space() {
+    // Метка тома — пятым (20.11, `Z7S` у exFAT-диска), если есть.
+    for (point, kind, space, label) in crate::fs::mounted_space() {
         let point = if point.is_empty() { "/" } else { point };
+        let label = label.map(|l| alloc::format!("\t{}", l.replace(['\t', '\n'], " "))).unwrap_or_default();
         let line = match space {
-            Some((total, free)) => alloc::format!("{point}\t{kind}\t{total}\t{free}\n"),
-            None => alloc::format!("{point}\t{kind}\t-\t-\n"),
+            Some((total, free)) => alloc::format!("{point}\t{kind}\t{total}\t{free}{label}\n"),
+            None => alloc::format!("{point}\t{kind}\t-\t-{label}\n"),
         };
         let bytes = line.as_bytes();
         if written + bytes.len() > len {
@@ -2235,14 +2348,17 @@ fn sysinfo(out: usize) -> i64 {
         // спрашивает её ровно тогда же, когда спрашивает, что показать. Без
         // этого признака монитор не узнал бы о смене темы вовсе — своего
         // состояния стола у программы нет.
-        // Масштаб — тот, с которым поднялся стол, а не выбранный в «Параметрах»
-        // после: он действует с перезагрузки, и окна до неё должны совпадать
-        // со столом.
+        // Масштаб — тот, которым рисует стол сейчас (один источник правды,
+        // 20.11): он меняется на ходу, и программы перерисовываются в нём.
         flags: (if mini_ui::theme::is_dark() { SYSINFO_DARK } else { 0 })
+            // Классика (22.11) — программы рисуют как Windows 98.
+            | (if mini_ui::theme::is_classic() { user_abi::SYSINFO_CLASSIC } else { 0 })
+            // Тема значков (22.11) — программы меняют значки на ходу.
+            | ((u32::from(mini_ui::image::icon_theme()) << user_abi::SYSINFO_ICONS_SHIFT) & user_abi::SYSINFO_ICONS_MASK)
+            // Проценты (дробный масштаб, 20.11) и старые биты 100/200 разом.
             | match crate::ui::applied_scale_choice() {
-                1 => user_abi::SYSINFO_SCALE_100,
-                2 => user_abi::SYSINFO_SCALE_200,
-                _ => 0,
+                0 => 0,
+                pct => user_abi::sysinfo_scale_flags(pct),
             },
         // Число берётся у самого `mini-ui`, а не собирается здесь заново: тот
         // же счётчик, который читает `Color::pixel`, отвечает и на этот вопрос.
@@ -2368,19 +2484,25 @@ fn winowner(id: i64, owner: i64, flags: usize) -> i64 {
         Ok(slot) => slot,
         Err(err) => return err,
     };
+    // Владелец — окно этой же программы или (20.11) окно другой программы
+    // того же пользователя: окно выбора файла `/bin/filedlg` над Блокнотом.
     let owner = if owner == 0 {
         None
     } else {
         match own_window(owner) {
-            Ok(owner) => Some(owner),
-            Err(err) => return err,
+            Ok(owner) => Some((sched::current().as_u32(), owner)),
+            Err(_) => match foreign_window(owner) {
+                Ok(pair) => Some(pair),
+                Err(err) => return err,
+            },
         }
     };
-    if flags & !(user_abi::WIN_OWNER_MODAL as usize) != 0 {
+    if flags & !((user_abi::WIN_OWNER_MODAL | user_abi::WIN_OWNER_CENTER) as usize) != 0 {
         return ERR_UNSUPPORTED;
     }
     let modal = flags & user_abi::WIN_OWNER_MODAL as usize != 0;
-    match super::owner_window(slot, owner, modal) {
+    let center = flags & user_abi::WIN_OWNER_CENTER as usize != 0;
+    match super::owner_window(slot, owner, modal, center) {
         Ok(()) => 0,
         Err(err) => window_errno(err),
     }
@@ -2463,7 +2585,7 @@ fn futex_wait(addr: usize, expected: u32, timeout_ms: usize) -> i64 {
     // Чтение из ядра по адресу программы законно: `futex_key` проверил и
     // права, и наличие страницы, а вытеснить её у разрешённых видов области
     // некому.
-    sched::block_on_futex(key, until, || {
+    let woken = sched::block_on_futex(key, until, || {
         // SAFETY: адрес проверен `futex_key`: он принадлежит программе,
         // выровнен и отображён на чтение и запись.
         let now = unsafe { core::ptr::read_volatile(word) };
@@ -2475,6 +2597,11 @@ fn futex_wait(addr: usize, expected: u32, timeout_ms: usize) -> i64 {
     });
     if !slept {
         return user_abi::FUTEX_CHANGED;
+    }
+    // Woken by a wake on this word: success even if the deadline passed at
+    // the same moment - reporting a timeout would lose that wake (G2).
+    if woken {
+        return 0;
     }
     match until {
         Some(at) if time::uptime_ms() >= at => user_abi::FUTEX_TIMED_OUT,
@@ -2820,6 +2947,83 @@ fn fdctl(fd: usize, op: usize, arg: usize) -> i64 {
         Some(Ok(answer)) => answer,
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `SYS_FSWATCH` (20.11): наблюдение за каталогами — см. договор. Действие —
+/// в старших 32 битах `a0`, дескриптор — в младших.
+fn fswatch(a0: usize, a1: usize, a2: usize) -> i64 {
+    use crate::fs::notify::{Queue, Watcher};
+    let (op, fd) = (a0 >> 32, a0 & 0xffff_ffff);
+    // Очередь за дескриптором — ссылкой, чтобы работать вне замка программы.
+    let queue_of = |fd: usize| -> Result<alloc::sync::Arc<Queue>, i64> {
+        let object = super::with_current(|program| program.files.object(fd)).ok_or(ERR_NO_PROGRAM)?;
+        let (object, _) = object.ok_or(user_abi::ERR_BAD_FD)?;
+        object.as_any().downcast_ref::<Watcher>().map(|watcher| alloc::sync::Arc::clone(&watcher.queue)).ok_or(user_abi::ERR_BAD_FD)
+    };
+    match op {
+        user_abi::FSWATCH_OPEN => {
+            let Some(queue) = Queue::new() else {
+                return ERR_LIMIT;
+            };
+            let object: alloc::sync::Arc<dyn super::files::Object> = alloc::sync::Arc::new(Watcher { queue });
+            match super::with_current(|program| program.files.install_object(object, true)) {
+                Some(Ok(fd)) => fd as i64,
+                Some(Err(err)) => errno(err),
+                None => ERR_NO_PROGRAM,
+            }
+        }
+        user_abi::FSWATCH_ADD => {
+            let (len, mask) = (a2 & 0xffff_ffff, (a2 >> 32) as u32);
+            let mut buffer = [0u8; MAX_PATH];
+            let path = match copy_path(a1, len, &mut buffer) {
+                Ok(path) => path,
+                Err(err) => return err,
+            };
+            // Следить можно за тем, что можно читать.
+            match crate::fs::resolve_as(super::credentials(), path, crate::vfs::perm::Access::READ) {
+                Some(Ok(node)) if node.metadata().kind == crate::vfs::NodeKind::Directory => {}
+                Some(Ok(_)) => return vfs_errno(crate::vfs::VfsError::WrongKind),
+                Some(Err(err)) => return vfs_errno(err),
+                None => return ERR_NO_FILESYSTEM,
+            }
+            let queue = match queue_of(fd) {
+                Ok(queue) => queue,
+                Err(err) => return err,
+            };
+            queue.add(path, mask).map_or(ERR_LIMIT, i64::from)
+        }
+        user_abi::FSWATCH_REMOVE => match queue_of(fd) {
+            Ok(queue) if queue.remove(a1 as i32) => 0,
+            Ok(_) => user_abi::ERR_NOT_FOUND,
+            Err(err) => err,
+        },
+        user_abi::FSWATCH_READ => {
+            let queue = match queue_of(fd) {
+                Ok(queue) => queue,
+                Err(err) => return err,
+            };
+            let len = a2.min(64 * 1024);
+            if len == 0 {
+                return 0;
+            }
+            if !space::user_can(a1, len, PageFlags::WRITE) {
+                return ERR_BAD_ADDRESS;
+            }
+            // Сначала в память ядра: очередь под своим замком, а страница
+            // программы может потребовать подгрузки.
+            let mut staged = alloc::vec![0u8; len];
+            let used = match queue.read_into(&mut staged) {
+                Ok(used) => used,
+                Err(_) => return ERR_LIMIT,
+            };
+            // SAFETY: диапазон проверен по таблицам программы и доступен ей на
+            // запись; ядро и программа не исполняются одновременно.
+            let out = unsafe { core::slice::from_raw_parts_mut(a1 as *mut u8, used) };
+            out.copy_from_slice(&staged[..used]);
+            used as i64
+        }
+        _ => ERR_UNSUPPORTED,
     }
 }
 

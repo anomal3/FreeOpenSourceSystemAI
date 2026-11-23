@@ -20,7 +20,7 @@ use crate::input::keymap::Layout as KeyLayout;
 use crate::{arch, config, fs};
 
 use super::kit::{self, Ctl, Pass, line_h, row};
-use super::{Deed, Field, MODES, PanelPref, Programs, Section, SettingsView};
+use super::{Deed, Field, LookDeed, MODES, PanelPref, Programs, Section, SettingsView};
 
 impl SettingsView {
     /// Тело страницы: от `y` (уже с учётом прокрутки) вниз.
@@ -48,12 +48,13 @@ impl SettingsView {
             Section::Network => self.network(pass, x, y, w),
             Section::Personal => {
                 let mut y = y;
-                for section in [Section::Wallpaper, Section::Colors, Section::Dock] {
+                for section in [Section::Wallpaper, Section::Colors, Section::Appearance, Section::Dock] {
                     y = nav_row(pass, x, y, w, section);
                 }
             }
-            Section::Wallpaper => wallpaper(pass, x, y, w),
+            Section::Wallpaper => super::background::page(pass, x, y, w),
             Section::Colors => colors(pass, x, y, w),
+            Section::Appearance => appearance(pass, x, y, w),
             Section::Dock => dock(pass, x, y, w),
             Section::Start => start_page(pass, x, y, w),
             Section::Explorer => explorer(pass, x, y, w),
@@ -172,7 +173,7 @@ impl SettingsView {
 
         // ── Быстрые настройки ───────────────────────────────────────────────
         y = pass.group(x, y + ctx.px(8) as i32, w, "Быстрые настройки");
-        let dark = theme::is_dark();
+        let dark = theme::chosen_dark();
         y = row(pass, x, y, w, Some(Fi::Moon), "Тёмная тема", "", Ctl::Toggle(dark), Some(Deed::Theme(!dark)));
         let uptime = super::super::panel::shows(PanelPref::Uptime);
         y = row(pass, x, y, w, Some(Fi::Clock), "Показывать аптайм на панели", "Время работы рядом с часами", Ctl::Toggle(uptime), Some(Deed::Panel(PanelPref::Uptime, !uptime)));
@@ -217,19 +218,29 @@ impl SettingsView {
     fn scale_rows(&self, pass: &mut Pass, x: i32, y: i32, w: u32) {
         let ctx = pass.ctx;
         let mut y = pass.group(x, y, w, "Масштаб и макет");
-        let scale = if ctx.scale >= 2 { "200 %" } else { "100 %" };
+        let scale = match ctx.scale.pct() {
+            125 => "125 %",
+            150 => "150 %",
+            175 => "175 %",
+            200 => "200 %",
+            _ => "100 %",
+        };
         y = row(pass, x, y, w, Some(Fi::Sliders), "Масштаб сейчас", "", Ctl::Value(scale), None);
-        // Выбор действует с перезагрузки: стол перестраивается целиком.
+        // Выбор действует сразу (20.11): стол перестраивается целиком.
         let chosen = theme::scale_choice();
         for (choice, label, hint) in [
-            (0, "Авто", "200 % на экранах от 2560 точек, иначе 100 %"),
-            (1, "100 %", ""),
-            (2, "200 %", "для 4K и мелких точек"),
+            (0, "Авто", "200 % на экранах от 3840 точек (4K), иначе 100 %"),
+            (100, "100 %", ""),
+            (125, "125 %", ""),
+            (150, "150 %", "для 2560×1440 — крупнее и чётко"),
+            (175, "175 %", ""),
+            (200, "200 %", "для 4K и мелких точек"),
         ] {
             y = row(pass, x, y, w, None, label, hint, Ctl::Radio(chosen == choice), Some(Deed::Scale(choice)));
         }
-        y = pass.note(x, y + ctx.px(4) as i32, w, "Масштаб применяется после перезагрузки.");
-        row(pass, x, y, w, Some(Fi::Monitor), "Ориентация", "", Ctl::Value("Альбомная"), None);
+        y = pass.note(x, y + ctx.px(4) as i32, w, "Масштаб применяется сразу ко всему: панели, окнам и программам.");
+        y = row(pass, x, y, w, Some(Fi::Monitor), "Ориентация", "", Ctl::Value("Альбомная"), None);
+        depth_rows(pass, x, y, w);
     }
 
     fn storage(&self, pass: &mut Pass, x: i32, y: i32, w: u32) {
@@ -493,14 +504,14 @@ impl SettingsView {
     /// реестре префикса, в том числе MSI без ярлыков). Без пакета `proton` и
     /// префиксов — раздела нет.
     fn windows_programs(&self, pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
-        use super::super::panel::{pct, proton_line, windows_prefixes, windows_shortcuts};
+        use super::super::panel::{proton_line, windows_prefixes, windows_shortcuts};
         let prefixes = windows_prefixes();
         if prefixes.is_empty() {
             return y;
         }
         let mut y = pass.group(x, y, w, "Программы Windows");
         for shortcut in windows_shortcuts().into_iter().filter(|shortcut| shortcut.uninstall) {
-            let line = proton_line(&format!("--shortcut={}", pct(&shortcut.file)));
+            let line = proton_line(&shortcut.args());
             y = row(pass, x, y, w, Some(Fi::Package), &shortcut.caption, &shortcut.prefix, Ctl::Button("Удалить", Weight::Normal), Some(Deed::Run(line)));
         }
         for prefix in prefixes {
@@ -696,7 +707,8 @@ fn power(pass: &mut Pass, x: i32, y: i32, w: u32) {
         let label = if seconds == 0 { String::from("Никогда") } else { format!("Через {}", screen_off_text(seconds)) };
         y = row(pass, x, y, w, None, &label, "", Ctl::Radio(limit == seconds), Some(Deed::ScreenOff(seconds)));
     }
-    y = pass.note(x, y + ctx.px(4) as i32, w, "Любая клавиша, мышь или касание зажигают экран обратно.");
+    y = pass.note(x, y + ctx.px(4) as i32, w, "Мониторы уходят в режим ожидания; любая клавиша, мышь или касание зажигают их обратно.");
+    y = saver_rows(pass, x, y, w);
     y = pass.group(x, y, w, "Действия");
     if crate::power::can_power_off() {
         y = row(pass, x, y, w, Some(Fi::Power), "Завершение работы", "Счётчики сбрасываются на диск, том помечается чистым", Ctl::Button("Выключить", Weight::Primary), Some(Deed::Shutdown));
@@ -704,7 +716,53 @@ fn power(pass: &mut Pass, x: i32, y: i32, w: u32) {
         y = row(pass, x, y, w, Some(Fi::Power), "Завершение работы", "Эта машина не умеет снять с себя питание", Ctl::Value("Недоступно"), None);
     }
     y = row(pass, x, y, w, Some(Fi::Restart), "Перезагрузка", "Загрузчик снова выберет активный слот", Ctl::Button("Перезагрузить", Weight::Normal), Some(Deed::Restart));
-    pass.note(x, y + ctx.px(4) as i32, w, "Настоящего сна (ACPI S3) здесь нет — машина не засыпает, а перестаёт рисовать.");
+    pass.note(x, y + ctx.px(4) as i32, w, "Настоящего сна (ACPI S3) здесь нет — машина не засыпает, а гасит мониторы и перестаёт рисовать.");
+}
+
+/// «Заставка» на странице «Питание» (22.11, `saver`).
+fn saver_rows(pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
+    use super::super::saver::{self, Deed as Sd, Fit, Kind};
+    let ctx = pass.ctx;
+    let s = saver::settings();
+    let mut y = pass.group(x, y, w, "Заставка");
+    y = row(pass, x, y, w, Some(Fi::Image), "Заставка", "Фото или цвет с часами, пока за машиной никого нет", Ctl::Toggle(s.enabled), Some(Deed::Saver(Sd::Enable(!s.enabled))));
+    if s.enabled {
+        let labels: Vec<String> = saver::AFTER_OPTIONS.iter().map(|&sec| saver::after_text(sec)).collect();
+        let opts: Vec<(&str, Deed, bool)> = saver::AFTER_OPTIONS.iter().zip(&labels).map(|(&sec, label)| (label.as_str(), Deed::Saver(Sd::After(sec)), s.after == sec)).collect();
+        let desc = format!("Без ввода {}; экран гаснет по сроку выше", saver::after_text(s.after));
+        y = seg_row(pass, x, y, w, Fi::Clock, "Появляется через", &desc, &opts);
+        let kinds = [("Фото", Deed::Saver(Sd::Kind(Kind::Photo)), s.kind == Kind::Photo), ("Цвет", Deed::Saver(Sd::Kind(Kind::Color)), s.kind == Kind::Color)];
+        y = seg_row(pass, x, y, w, Fi::Palette, "Фон", "Фото по очереди или ровный цвет", &kinds);
+        if s.kind == Kind::Photo {
+            let from = match &s.preparing {
+                Some(note) => format!("{} — {note}", s.source),
+                None => s.source.clone(),
+            };
+            let sources = [
+                ("Галерея обоев", Deed::Saver(Sd::Gallery), s.gallery),
+                ("Папка…", Deed::Saver(Sd::PickFolder), !s.gallery && s.folder),
+                ("Картинка…", Deed::Saver(Sd::PickPicture), !s.gallery && !s.folder),
+            ];
+            y = seg_row(pass, x, y, w, Fi::Folder, "Фото", &from, &sources);
+            let fits: Vec<(&str, Deed, bool)> = Fit::ALL.iter().map(|&fit| (fit.title(), Deed::Saver(Sd::Fit(fit)), s.fit == fit)).collect();
+            y = seg_row(pass, x, y, w, Fi::Monitor, "Размещение", "Как фото ложится на экран", &fits);
+            let every_labels: Vec<String> = saver::EVERY_OPTIONS.iter().map(|&sec| saver::after_text(sec)).collect();
+            let every: Vec<(&str, Deed, bool)> = saver::EVERY_OPTIONS.iter().zip(&every_labels).map(|(&sec, label)| (label.as_str(), Deed::Saver(Sd::Every(sec)), s.every == sec)).collect();
+            y = seg_row(pass, x, y, w, Fi::Refresh, "Сменять фото", "Если в папке их несколько", &every);
+        } else {
+            let colors: Vec<(&str, Deed, bool)> = saver::COLORS.iter().map(|&(name, rgb)| (name, Deed::Saver(Sd::Color(rgb)), s.color == rgb)).collect();
+            y = seg_row(pass, x, y, w, Fi::Palette, "Цвет", "", &colors);
+        }
+        y = row(pass, x, y, w, Some(Fi::Clock), "Часы и дата", "Крупно, медленно плывут по экрану, чтобы ничего не выжигалось", Ctl::Toggle(s.clock), Some(Deed::Saver(Sd::Clock(!s.clock))));
+        y = row(pass, x, y, w, Some(Fi::Activity), "Сведения о системе", "Загрузка процессора и память", Ctl::Toggle(s.info), Some(Deed::Saver(Sd::Info(!s.info))));
+        y = row(pass, x, y, w, Some(Fi::Lock), "Показывать экран блокировки при выходе", "Первое нажатие убирает заставку, дальше — вход", Ctl::Toggle(s.lock), Some(Deed::Saver(Sd::Lock(!s.lock))));
+    }
+    y = row(pass, x, y, w, Some(Fi::Eye), "Просмотр", "Показать заставку сейчас; любое движение её уберёт", Ctl::Button("Просмотр", Weight::Normal), Some(Deed::Saver(Sd::Preview)));
+    let off = crate::power::screen_off_after();
+    if s.enabled && off != 0 && off <= s.after {
+        y = pass.note(x, y + ctx.px(4) as i32, w, "Экран гаснет раньше, чем появится заставка: увеличьте срок гашения.");
+    }
+    y
 }
 
 fn keyboard(pass: &mut Pass, x: i32, y: i32, w: u32) {
@@ -727,29 +785,6 @@ fn keyboard(pass: &mut Pass, x: i32, y: i32, w: u32) {
     }
 }
 
-fn wallpaper(pass: &mut Pass, x: i32, y: i32, w: u32) {
-    let ctx = pass.ctx;
-    let p = ctx.palette;
-    let gap = ctx.px(12);
-    let count = theme::Wallpaper::ALL.len() as u32;
-    let tile_w = (w.saturating_sub(gap * (count - 1)) / count).min(ctx.px(200));
-    let tile_h = tile_w * 10 / 16;
-    let label_h = line_h(ctx, Role::Caption) as u32 + ctx.px(6);
-    for (index, wall) in theme::Wallpaper::ALL.into_iter().enumerate() {
-        let rect = Rect::new(x + (index as u32 * (tile_w + gap)) as i32, y, tile_w, tile_h);
-        let focused = pass.deed(rect, Deed::Wallpaper(wall));
-        let current = theme::wallpaper() == wall;
-        if pass.visible(Rect::new(rect.x, rect.y, rect.w, rect.h + label_h)) {
-            let (top, bottom) = theme::wallpaper_colors(wall);
-            color_swatch(pass, rect, top, Some(bottom), current, focused);
-            let ink = if current { p.ink } else { p.ink3 };
-            pass.text(Role::Caption, rect.x, rect.bottom() + ctx.px(6) as i32, rect.w, wall.title(), ink);
-        }
-    }
-    let y = y + (tile_h + label_h) as i32 + ctx.px(8) as i32;
-    pass.note(x, y, w, "FossAi — картинка из макета, растягивается под экран; остальные — градиент с разметкой точками.");
-}
-
 fn colors(pass: &mut Pass, x: i32, y: i32, w: u32) {
     let ctx = pass.ctx;
     let mut y = pass.group(x, y, w, "Тема");
@@ -760,7 +795,7 @@ fn colors(pass: &mut Pass, x: i32, y: i32, w: u32) {
         let rect = Rect::new(x + (index as u32 * (swatch_w + gap)) as i32, y, swatch_w, swatch_h);
         let focused = pass.deed(rect, Deed::Theme(dark));
         if pass.visible(rect) {
-            swatch(pass, rect, dark, theme::is_dark() == dark, focused);
+            swatch(pass, rect, dark, theme::chosen_dark() == dark, focused);
         }
     }
     y += (swatch_h + ctx.px(6)) as i32;
@@ -820,9 +855,23 @@ fn dock(pass: &mut Pass, x: i32, y: i32, w: u32) {
     let edges: Vec<(&str, Deed, bool)> = Edge::ALL.iter().map(|edge| (edge.title(), Deed::Taskbar(TaskbarDeed::Edge(*edge)), cfg.edge == *edge)).collect();
     y = seg_row(pass, x, y, w, Fi::Layers, "Расположение", "Сторона экрана, у которой стоит панель", &edges);
     y = row(pass, x, y, w, Some(Fi::Eye), "Автоматически скрывать", "Панель выезжает при наведении на край экрана, окна занимают весь экран", Ctl::Toggle(cfg.autohide), Some(Deed::Taskbar(TaskbarDeed::Autohide(!cfg.autohide))));
-    let labels: Vec<(String, Deed, bool)> = deskcfg::ICON_SIZES.iter().map(|size| (format!("{size}"), Deed::Taskbar(TaskbarDeed::Icon(*size)), cfg.icon == *size)).collect();
-    let sizes: Vec<(&str, Deed, bool)> = labels.iter().map(|(label, deed, on)| (label.as_str(), deed.clone(), *on)).collect();
-    y = seg_row(pass, x, y, w, Fi::Sliders, "Размер значков Dock", "Точки; только в режиме Dock", &sizes);
+    // Размер значков — ползунком и только у Dock; у панели во всю сторону
+    // вместо него «Маленькие значки», как в Windows (Роман, 20.11).
+    if cfg.mode == Mode::Dock {
+        let value = format!("{} точек", cfg.icon);
+        y = slider_row(pass, x, y, w, Fi::Sliders, "Размер значков Dock", &value, cfg.icon, deskcfg::ICON_MIN, deskcfg::ICON_MAX, Deed::Taskbar(TaskbarDeed::Icon(cfg.icon)));
+    } else {
+        y = row(pass, x, y, w, Some(Fi::Sliders), "Маленькие значки", "Панель ниже, значки мельче, часы в одну строку", Ctl::Toggle(cfg.small), Some(Deed::Taskbar(TaskbarDeed::Small(!cfg.small))));
+    }
+
+    // Несколько мониторов (21.11, как в Windows: «Показывать панель задач на
+    // всех дисплеях» и «Показывать кнопки панели задач на»).
+    y = pass.group(x, y, w, "Несколько мониторов");
+    y = row(pass, x, y, w, Some(Fi::Monitor), "Панель задач на всех мониторах", "На каждом мониторе — своя панель и свой «Пуск»", Ctl::Toggle(cfg.all), Some(Deed::Taskbar(TaskbarDeed::AllMonitors(!cfg.all))));
+    if cfg.all {
+        y = row(pass, x, y, w, Some(Fi::Dock), "Кнопки окон на всех панелях", "Каждая панель показывает все окна; активная кнопка горит на мониторе, где окно открыто", Ctl::Radio(!cfg.own), Some(Deed::Taskbar(TaskbarDeed::OwnButtons(false))));
+        y = row(pass, x, y, w, Some(Fi::Dock), "Только на панели, где открыто окно", "Кнопка окна — на панели того монитора, где оно открыто", Ctl::Radio(cfg.own), Some(Deed::Taskbar(TaskbarDeed::OwnButtons(true))));
+    }
 
     // Как «Объединять кнопки панели задач» в Windows 11: значок на программу
     // (окна стопкой) или кнопка с подписью на каждое окно.
@@ -864,6 +913,66 @@ fn start_page(pass: &mut Pass, x: i32, y: i32, w: u32) {
     y = row(pass, x, y, w, Some(Fi::Apps), "Закреплено", "Правая кнопка на программе в «Пуске» — закрепить, открепить, в начало", Ctl::Value(&count), None);
     y = row(pass, x, y, w, Some(Fi::Undo), "Вернуть как было", "Терминал, Параметры, Файлы, папки «Системные утилиты» и «SDK C#»", Ctl::Button("Вернуть", Weight::Normal), Some(Deed::Start(StartDeed::ResetPins)));
     pass.note(x, y, w, "Win или F1 — открыть «Пуск»; набор текста сразу ищет; Ctrl+Shift+Esc — диспетчер задач.");
+}
+
+/// Ширина дорожки ползунка (точки при масштабе 1).
+const SLIDER_W: u32 = 280;
+
+/// Строка-карточка с ползунком справа (20.11, размер значков Dock): щелчок
+/// по дорожке ставит значение, дальше его тянут (`SettingsView::drag_to`).
+/// Пункт `deed` заводится на всю дорожку.
+#[allow(clippy::too_many_arguments)]
+fn slider_row(pass: &mut Pass, x: i32, y: i32, w: u32, icon: Fi, title: &str, value_text: &str, value: u32, min: u32, max: u32, deed: Deed) -> i32 {
+    let ctx = pass.ctx;
+    let p = ctx.palette;
+    let h = ctx.px(60);
+    let rect = Rect::new(x, y, w, h);
+    let next = y + (h + ctx.px(4)) as i32;
+    let pad = ctx.px(18) as i32;
+    let knob = ctx.px(18);
+    let track_w = ctx.px(SLIDER_W).min(w / 2);
+    // Дорожка нажимается во всю высоту строки: попасть в 4 точки трудно.
+    let hit = Rect::new(rect.right() - pad - track_w as i32 - knob as i32 / 2, rect.y, track_w + knob, h);
+    let track = Rect::new(rect.right() - pad - track_w as i32, rect.y + h as i32 / 2 - ctx.px(2) as i32, track_w, ctx.px(4));
+    let focused = pass.deed_in(hit, rect, deed);
+    if !pass.visible(rect) {
+        return next;
+    }
+    let span = max.saturating_sub(min).max(1);
+    let at = track.x + (u64::from(track_w) * u64::from(value.clamp(min, max) - min) / u64::from(span)) as i32;
+    let card = ctx.flat(p.card);
+    let radius = ctx.px(8);
+    pass.on(|s| {
+        draw::rounded(s, rect, radius, card, 255);
+        draw::rounded_stroke(s, rect, radius, if focused { p.acc } else { p.line2.color }, if focused { 255 } else { p.line2.alpha });
+        draw::rounded(s, track, track.h / 2, p.sunk.over(card), 255);
+        let done = Rect::new(track.x, track.y, (at - track.x).max(1) as u32, track.h);
+        draw::rounded(s, done, track.h / 2, p.acc, 255);
+        let k = Rect::new(at - knob as i32 / 2, rect.y + (h as i32 - knob as i32) / 2, knob, knob);
+        draw::rounded(s, k, knob / 2, p.acc, 255);
+        draw::rounded(s, k.shrink(ctx.px(5)), (knob - ctx.px(10)) / 2, Color::rgb(0xFF, 0xFF, 0xFF), 255);
+    });
+    let size = ctx.px(22);
+    pass.icon(icon, rect.x + pad, rect.y + (h as i32 - size as i32) / 2, size, p.ink2);
+    let text_x = rect.x + pad + (size + ctx.px(16)) as i32;
+    let room = (hit.x - ctx.px(14) as i32 - text_x).max(0) as u32;
+    let both = line_h(ctx, Role::Body) + ctx.px(3) as i32 + line_h(ctx, Role::Caption);
+    let top = rect.y + (h as i32 - both) / 2;
+    pass.text(Role::Body, text_x, top, room, title, p.ink);
+    pass.text(Role::Caption, text_x, top + line_h(ctx, Role::Body) + ctx.px(3) as i32, room, value_text, p.ink4);
+    next
+}
+
+/// Значение ползунка по точке `px` на его месте `hit` (как его завёл
+/// [`slider_row`]).
+pub(super) fn slider_value(ctx_scale: mini_ui::Scale, hit: Rect, px: i32, min: u32, max: u32) -> u32 {
+    let knob = (18 * ctx_scale) as i32;
+    let left = hit.x + knob / 2;
+    let width = (hit.w as i32 - knob).max(1);
+    let t = (px - left).clamp(0, width);
+    let raw = min + ((max - min) as i64 * i64::from(t) / i64::from(width)) as u32;
+    // Шаг 4 точки: ровные размеры и меньше пересборок Dock.
+    (raw + 2) / 4 * 4
 }
 
 /// Строка-карточка с переключателем из нескольких кнопок справа.
@@ -1390,4 +1499,92 @@ fn update_servers() -> Vec<String> {
         .map(|value| value.to_string())
         .take(4)
         .collect()
+}
+
+// ── Оформление (20.11, `ui::look`) ──────────────────────────────────────────
+
+/// Имя набора на странице и в отчёте.
+pub(super) const fn preset_title(preset: crate::ui::look::Preset) -> &'static str {
+    match preset {
+        crate::ui::look::Preset::Modern => "Современный",
+        crate::ui::look::Preset::Simple => "Простой",
+        crate::ui::look::Preset::Custom => "Своё",
+    }
+}
+
+/// «Оформление»: два набора и переключатель на каждый эффект. Всё действует
+/// сразу и запоминается в `desktop.cfg` (`look=`).
+fn appearance(pass: &mut Pass, x: i32, y: i32, w: u32) {
+    use crate::ui::look::{self, Flag, Preset};
+    let ctx = pass.ctx;
+    let current = look::preset();
+    let mut y = pass.group(x, y, w, "Вид");
+    y = row(pass, x, y, w, Some(Fi::Palette), "Современный", "Тени, анимация, размытие, скруглённые окна", Ctl::Radio(current == Preset::Modern), Some(Deed::Look(LookDeed::Preset(Preset::Modern))));
+    y = row(pass, x, y, w, Some(Fi::Monitor), "Простой", "Классические рамки, без теней и анимации, контур при перетаскивании — дешевле всего рисовать", Ctl::Radio(current == Preset::Simple), Some(Deed::Look(LookDeed::Preset(Preset::Simple))));
+    if current == Preset::Custom {
+        y = row(pass, x, y, w, Some(Fi::Sliders), "Своё", "Переключатели ниже отличаются от обоих наборов", Ctl::Radio(true), None);
+    }
+    // Классика (22.11): бирюзовый стол Windows 98 — предложением, не
+    // принудительно; выключение возвращает прежние обои.
+    if look::on(Flag::Classic) {
+        let teal = crate::ui::wallpaper::classic_teal_on();
+        y = row(pass, x, y, w, Some(Fi::Image), "Классический бирюзовый фон", "Сплошной #008080, как у Windows 98; выключите — вернутся прежние обои", Ctl::Toggle(teal), Some(Deed::Background(crate::ui::wallpaper::WallDeed::ClassicTeal(!teal))));
+    }
+    y = icon_themes(pass, x, y, w);
+    y = pass.group(x, y + ctx.px(8) as i32, w, "Эффекты");
+    for (flag, icon, title, hint) in [
+        (Flag::MinMax, Fi::Monitor, "Анимация сворачивания и разворачивания", "Окно летит в кнопку панели и обратно, плавный разворот"),
+        (Flag::OpenClose, Fi::Layers, "Анимация открытия и закрытия окон", "Окно вырастает из значка и уходит в него"),
+        (Flag::Shadows, Fi::Layers, "Тени окон", "Мягкая тень под окнами, меню и панелью"),
+        (Flag::Effects, Fi::Image, "Прозрачность и размытие", "Размытый стол под подсмотром окна из панели задач"),
+        (Flag::Outline, Fi::Sliders, "Показывать контур при перетаскивании", "Окно переносится и меняет размер при отпускании — меньше перерисовки"),
+        (Flag::Classic, Fi::Palette, "Классические рамки окон", "Прямые углы, объёмная кромка, заголовок с градиентом"),
+    ] {
+        let on = look::on(flag);
+        y = row(pass, x, y, w, Some(icon), title, hint, Ctl::Toggle(on), Some(Deed::Look(LookDeed::Flag(flag, !on))));
+    }
+    y = pass.note(x, y + ctx.px(4) as i32, w, "Плавной прокрутки в системе нет — прокрутка и так идёт строками, без анимации.");
+    row(pass, x, y, w, Some(Fi::Monitor), "Глубина цвета", "", Ctl::NavValue(look::depth_title(look::depth())), Some(Deed::Open(Section::Display)));
+}
+
+/// «Стиль значков» (22.11): темы значков с образцами — стол, «Пуск», панель,
+/// «Файлы» и окна выбора файла меняются сразу (`appicon::set_theme`).
+fn icon_themes(pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
+    let ctx = pass.ctx;
+    let mut y = pass.group(x, y + ctx.px(8) as i32, w, "Стиль значков");
+    let current = mini_ui::image::icon_theme();
+    for (index, (_, title, hint)) in mini_ui::image::ICON_THEMES.iter().enumerate() {
+        let theme = index as u8;
+        let top = y;
+        y = row(pass, x, y, w, Some(Fi::Image), title, hint, Ctl::Radio(current == theme), Some(Deed::IconTheme(theme)));
+        // Образцы — справа, перед кружком выбора.
+        let h = (y - top) as u32 - ctx.px(4);
+        let side = ctx.px(32);
+        let gap = ctx.px(6) as i32;
+        let names = crate::ui::appicon::PREVIEW;
+        let mut sx = x + w as i32 - ctx.px(70) as i32 - names.len() as i32 * (side as i32 + gap);
+        let sy = top + (h as i32 - side as i32) / 2;
+        if !pass.visible(Rect::new(sx, top, side, h)) || sx < x + w as i32 / 2 {
+            continue;
+        }
+        for name in names {
+            if let Some(image) = crate::ui::appicon::theme_design(theme, name) {
+                pass.on(|s| image.draw(s, Rect::new(sx, sy, side, side)));
+            }
+            sx += side as i32 + gap;
+        }
+    }
+    y
+}
+
+/// «Глубина цвета» на странице «Дисплей».
+fn depth_rows(pass: &mut Pass, x: i32, y: i32, w: u32) {
+    use crate::ui::look;
+    let ctx = pass.ctx;
+    let mut y = pass.group(x, y + ctx.px(8) as i32, w, "Глубина цвета");
+    let current = look::depth();
+    for bits in [32, 16, 8, 4] {
+        y = row(pass, x, y, w, None, look::depth_title(bits), "", Ctl::Radio(current == bits), Some(Deed::Look(LookDeed::Depth(bits))));
+    }
+    pass.note(x, y + ctx.px(4) as i32, w, "Меняется сразу. Кадр собирается в 32 битах и сводится к выбранной палитре при выводе на экран.");
 }

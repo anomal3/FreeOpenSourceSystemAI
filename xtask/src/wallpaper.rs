@@ -29,6 +29,66 @@ pub fn generate(png: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Сторона миниатюры галереи: 16:9, с запасом под плитку «Параметров» при
+/// масштабе 150 %.
+const THUMB: (usize, usize) = (320, 180);
+
+/// Миниатюры галереи обоев (22.11): для каждой картинки `dir/*.jpg|png` —
+/// `<имя>.thumb.qoi` 320×180, «с обрезкой» (как обои «Заполнение») и
+/// усреднением по площади. Сами картинки ядро не читает — их переводит
+/// `/bin/wallconv` при выборе; миниатюры нужны «Параметрам» сразу.
+pub fn gallery_thumbs(dir: &Path) -> Result<()> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .with_context(|| format!("нет каталога галереи {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jpg" || ext == "png"))
+        .collect();
+    names.sort();
+    for path in names {
+        let bytes = std::fs::read(&path).with_context(|| format!("не прочитать {}", path.display()))?;
+        let (width, height, rgb) = if path.extension().is_some_and(|ext| ext == "jpg") {
+            use zune_jpeg::zune_core::colorspace::ColorSpace;
+            use zune_jpeg::zune_core::options::DecoderOptions;
+            let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+            let mut decoder = zune_jpeg::JpegDecoder::new_with_options(&bytes[..], options);
+            let rgb = decoder.decode().map_err(|err| anyhow::anyhow!("{}: {err:?}", path.display()))?;
+            let (width, height) = decoder.dimensions().context("JPEG без размера")?;
+            (width, height, rgb)
+        } else {
+            let (width, height, rgba) = crate::fimg::decode(&bytes).with_context(|| format!("{}", path.display()))?;
+            let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]).collect();
+            (width as usize, height as usize, rgb)
+        };
+        // Обрезка до 16:9 по середине, затем усреднение по площади.
+        let (cw, ch) = if width * THUMB.1 > height * THUMB.0 { (height * THUMB.0 / THUMB.1, height) } else { (width, width * THUMB.1 / THUMB.0) };
+        let (x0, y0) = ((width - cw) / 2, (height - ch) / 2);
+        let mut rgba = Vec::with_capacity(THUMB.0 * THUMB.1 * 4);
+        for ty in 0..THUMB.1 {
+            let (sy0, sy1) = (y0 + ty * ch / THUMB.1, (y0 + (ty + 1) * ch / THUMB.1).max(y0 + ty * ch / THUMB.1 + 1));
+            for tx in 0..THUMB.0 {
+                let (sx0, sx1) = (x0 + tx * cw / THUMB.0, (x0 + (tx + 1) * cw / THUMB.0).max(x0 + tx * cw / THUMB.0 + 1));
+                let mut sum = [0u64; 3];
+                for sy in sy0..sy1 {
+                    for sx in sx0..sx1 {
+                        let at = (sy * width + sx) * 3;
+                        for c in 0..3 {
+                            sum[c] += u64::from(rgb[at + c]);
+                        }
+                    }
+                }
+                let n = ((sy1 - sy0) * (sx1 - sx0)) as u64;
+                rgba.extend_from_slice(&[(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8, 255]);
+            }
+        }
+        let qoi = encode(THUMB.0 as u32, THUMB.1 as u32, &rgba);
+        let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("wallpaper");
+        let out = dir.join(format!("{stem}.thumb.qoi"));
+        std::fs::write(&out, &qoi).with_context(|| format!("не записать {}", out.display()))?;
+        println!("галерея: {} {width}x{height} → {} ({} КиБ)", path.display(), out.display(), qoi.len() / 1024);
+    }
+    Ok(())
+}
+
 /// Закодировать `RGBA` в QOI с тремя каналами: альфа отбрасывается.
 #[must_use]
 pub fn encode(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {

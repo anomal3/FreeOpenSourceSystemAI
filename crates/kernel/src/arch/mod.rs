@@ -32,6 +32,20 @@ pub use x86_64::{
     wait_for_interrupt_unless,
 };
 
+/// Fire this CPU's timer in `ns` instead of at its next tick (hrsleep);
+/// `false` - not armed (no one-shot, or the tick comes first). Interrupts
+/// off.
+#[cfg(target_arch = "x86_64")]
+pub fn arm_short_timer(ns: u64) -> bool {
+    x86_64::apic::arm_short(ns)
+}
+
+/// No one-shot on AArch64 yet: fine sleeps end on the 1 ms tick.
+#[cfg(target_arch = "aarch64")]
+pub fn arm_short_timer(_ns: u64) -> bool {
+    false
+}
+
 /// `wfi`, если `flag` не поднят. `wfi` просыпается и на замаскированном
 /// прерывании, так что окна между проверкой и остановкой тут нет.
 #[cfg(target_arch = "aarch64")]
@@ -231,13 +245,13 @@ pub use aarch64::paging::map_active;
 /// | [`sync_instructions`]    | сделать записанное в кадр видимым как код       |
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::{
-    activate_kernel_space, activate_space, flush_user_translations, free_user_space, kernel_root,
-    new_user_space, space_at, sync_instructions, translate, unmap, unmapped_run,
+    activate_kernel_space, activate_space, flush_user_translations, free_user_space, free_user_space_part,
+    kernel_root, new_user_space, space_at, sync_instructions, translate, unmap, unmapped_run,
 };
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::paging::{
-    activate_kernel_space, activate_space, flush_user_translations, free_user_space, kernel_root,
-    new_user_space, space_at, sync_instructions, translate, unmap, unmapped_run,
+    activate_kernel_space, activate_space, flush_user_translations, free_user_space, free_user_space_part,
+    kernel_root, new_user_space, space_at, sync_instructions, translate, unmap, unmapped_run,
 };
 
 /// Прерывания и исключения. Обе реализации выставляют один набор имён:

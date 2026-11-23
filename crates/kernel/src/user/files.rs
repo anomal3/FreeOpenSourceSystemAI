@@ -65,6 +65,14 @@ struct Open {
     /// договор `SYS_SPAWN`), так что делить позицию может только сама программа
     /// с собой.
     offset: AtomicU64,
+    /// Position lock of this open file (21.11.2026, like Linux `f_pos_lock`):
+    /// [`FileIo`] reads and writes outside the process lock, so "take the
+    /// position, do the I/O, move it" is made atomic here - two threads (or a
+    /// parent and a forked child) reading one descriptor get consecutive
+    /// pieces. Only [`FileIo`] takes it, never under the process lock: it
+    /// copies to the program's memory while holding it, and a fault there
+    /// takes the process lock (order: position, then process).
+    pos: crate::sync::Mutex<()>,
     /// Право писать спрошено при открытии и запомнено здесь. Перепроверять его
     /// на каждой записи не нужно и неверно: в Unix смена прав не отбирает уже
     /// открытый файл, и ровно на это рассчитывает всякий, кто держит файл
@@ -86,6 +94,12 @@ struct Open {
     /// Брал ли этот открытый файл блокировки OFD или `flock` (08.11.2026):
     /// только тогда при его уничтожении есть что снимать в таблице блокировок.
     ofd_locked: AtomicBool,
+    /// Путь файла, открытого на запись по имени (20.11): закрытие после
+    /// записи — событие `FSN_CLOSE_WRITE` наблюдающим за каталогом
+    /// ([`crate::fs::notify`]).
+    path: Option<alloc::boxed::Box<str>>,
+    /// Писали ли в файл через этот открытый.
+    wrote: AtomicBool,
 }
 
 impl Drop for Open {
@@ -94,6 +108,10 @@ impl Drop for Open {
     fn drop(&mut self) {
         if self.ofd_locked.load(Ordering::Relaxed) {
             crate::fs::locks::release(crate::fs::locks::Owner::Open(self as *const Open as usize));
+        }
+        if let Some(path) = self.path.as_deref().filter(|_| self.wrote.load(Ordering::Relaxed)) {
+            crate::fs::notify::emit(path, crate::fs::notify::MODIFY);
+            crate::fs::notify::emit(path, crate::fs::notify::CLOSE_WRITE);
         }
     }
 }
@@ -201,7 +219,128 @@ impl Handle {
     /// (`SCM_RIGHTS`; раскладка клавиатуры Wayland, фаза 71i).
     #[must_use]
     pub fn of_node(node: Arc<dyn Node>, writable: bool) -> Self {
-        Self(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None, append: AtomicBool::new(false), ofd_locked: AtomicBool::new(false) })))
+        Self(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), pos: crate::sync::Mutex::new(()), writable, entries: None, append: AtomicBool::new(false), ofd_locked: AtomicBool::new(false), path: None, wrote: AtomicBool::new(false) })))
+    }
+}
+
+/// `read`/`write` of regular files without the process lock (21.11.2026,
+/// after hw-log14); `fileio off` - under it, as before (A/B in one boot).
+///
+/// Every call of a program takes its process lock at least briefly; the old
+/// `read` held it for the whole file-system read, so one 2 ms exFAT read
+/// from the USB stick stalled all of D2R's threads at their next call.
+pub static UNLOCKED_IO: AtomicBool = AtomicBool::new(true);
+
+/// Reads and writes outside the lock go through a kernel buffer of up to this
+/// much at a time.
+const IO_CHUNK: usize = 64 * 1024;
+
+/// An open regular file taken out of the descriptor table
+/// ([`Table::file_io`]) to be read or written without the process lock.
+///
+/// The file system fills (or drains) a kernel buffer and the program's memory
+/// is touched only between file-system calls: a fault on it (a lazy page,
+/// copy-on-write) takes the process lock, and must never happen inside a
+/// file system's own locks. The position lock ([`Open::pos`]) is held over the
+/// whole call.
+pub struct FileIo(Arc<Open>);
+
+/// Open `path` into the current program's table: the file system is asked
+/// outside the process lock, only the descriptor is installed under it
+/// (`fileio off` - all under it, as before). `None` - no program.
+pub fn open_in_current(cred: Credentials, path: &str, flags: usize) -> Option<Result<usize, FileError>> {
+    if !UNLOCKED_IO.load(Ordering::Relaxed) {
+        return super::with_current(|program| program.files.open(cred, path, flags));
+    }
+    match Table::open_handle(cred, path, flags) {
+        Ok(handle) => super::with_current(|program| program.files.install_handle(handle)),
+        Err(err) => Some(Err(err)),
+    }
+}
+
+fn io_buffer(len: usize) -> Result<Vec<u8>, FileError> {
+    let size = len.min(IO_CHUNK);
+    let mut chunk = Vec::new();
+    chunk.try_reserve_exact(size).map_err(|_| FileError::Vfs(VfsError::OutOfMemory))?;
+    chunk.resize(size, 0);
+    Ok(chunk)
+}
+
+impl FileIo {
+    /// `read(2)` into the program's memory `[ptr, ptr + len)`: from the
+    /// position, which moves by what was read. Zero is the end of the file.
+    ///
+    /// # Safety
+    ///
+    /// The range was checked to be the current program's and writable
+    /// (`space::user_can(.., WRITE)`), and the caller holds no lock that a
+    /// fault on it would take (the process lock in particular).
+    pub unsafe fn read_to_user(&self, ptr: usize, len: usize) -> Result<usize, FileError> {
+        let open = &*self.0;
+        if open.entries.is_some() {
+            return Err(FileError::Vfs(VfsError::WrongKind));
+        }
+        let mut chunk = io_buffer(len)?;
+        let _pos = open.pos.lock();
+        let start = open.offset.load(Ordering::Relaxed);
+        let mut done = 0;
+        while done < len {
+            let want = (len - done).min(IO_CHUNK);
+            let got = match open.node.read_at(start + done as u64, &mut chunk[..want]) {
+                Ok(got) => got.min(want),
+                Err(err) if done == 0 => return Err(FileError::Vfs(err)),
+                Err(_) => break,
+            };
+            // SAFETY: the function's contract.
+            unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), (ptr + done) as *mut u8, got) };
+            done += got;
+            if got < want {
+                break;
+            }
+        }
+        open.offset.store(start + done as u64, Ordering::Relaxed);
+        Ok(done)
+    }
+
+    /// `write(2)` from the program's memory `[ptr, ptr + len)`: at the
+    /// position (or the end with `O_APPEND`), which moves by what was written.
+    ///
+    /// # Safety
+    ///
+    /// As [`FileIo::read_to_user`], the range readable.
+    pub unsafe fn write_from_user(&self, ptr: usize, len: usize) -> Result<usize, FileError> {
+        let open = &*self.0;
+        if !open.writable || open.entries.is_some() {
+            return Err(FileError::Vfs(VfsError::PermissionDenied));
+        }
+        let mut chunk = io_buffer(len)?;
+        let _pos = open.pos.lock();
+        let mut at = if open.append.load(Ordering::Relaxed) {
+            open.node.metadata().size
+        } else {
+            open.offset.load(Ordering::Relaxed)
+        };
+        let mut done = 0;
+        while done < len {
+            let want = (len - done).min(IO_CHUNK);
+            // SAFETY: the function's contract.
+            unsafe { core::ptr::copy_nonoverlapping((ptr + done) as *const u8, chunk.as_mut_ptr(), want) };
+            let written = match open.node.write_at(at, &chunk[..want]) {
+                Ok(written) => written.min(want),
+                Err(err) if done == 0 => return Err(FileError::Vfs(err)),
+                Err(_) => break,
+            };
+            at += written as u64;
+            done += written;
+            if written < want {
+                break;
+            }
+        }
+        open.offset.store(at, Ordering::Relaxed);
+        if open.path.is_some() {
+            open.wrote.store(true, Ordering::Relaxed);
+        }
+        Ok(done)
     }
 }
 
@@ -615,6 +754,16 @@ impl Table {
     /// перепроверять его на каждом чтении не нужно — ровно так же, как в Unix,
     /// где смена прав не отбирает уже открытый файл.
     pub fn open(&mut self, cred: Credentials, path: &str, flags: usize) -> Result<usize, FileError> {
+        let handle = Self::open_handle(cred, path, flags)?;
+        self.install_handle(handle)
+    }
+
+    /// The file-system half of [`Table::open`] (path lookup, directory
+    /// snapshot, truncation) without a table, so callers run it outside the
+    /// process lock and only [`Table::install_handle`] the result under it
+    /// (21.11.2026: D2R's load did 155k `openat` in 30 s on an exFAT stick,
+    /// 0.1 ms each, all while every other thread's call waited at the lock).
+    pub fn open_handle(cred: Credentials, path: &str, flags: usize) -> Result<Handle, FileError> {
         let writable = flags & O_WRITE != 0;
         let want = if writable { Access::WRITE } else { Access::READ };
 
@@ -649,20 +798,22 @@ impl Table {
             None
         };
 
-        if flags & O_TRUNC != 0 && writable {
+        let truncated = flags & O_TRUNC != 0 && writable;
+        if truncated {
             node.truncate(0).map_err(FileError::Vfs)?;
         }
 
-        let fd = self.free_fd(0)?;
-        self.put(fd, Slot::File(Arc::new(Open {
+        Ok(Handle(Slot::File(Arc::new(Open {
             node: Arc::from(node),
             offset: AtomicU64::new(0),
+            pos: crate::sync::Mutex::new(()),
             writable,
             entries,
             append: AtomicBool::new(false),
             ofd_locked: AtomicBool::new(false),
-        })));
-        Ok(fd)
+            path: writable.then(|| alloc::boxed::Box::from(path)),
+            wrote: AtomicBool::new(truncated),
+        }))))
     }
 
     /// Положить в таблицу узел, сделанный ядром в памяти (фаза 71c): файлы
@@ -672,7 +823,7 @@ impl Table {
         // Каталог в памяти (`/proc`, фаза 71h) — со снимком имён, как у
         // открытого с диска.
         let entries = if node.metadata().kind == NodeKind::Directory { node.list().ok() } else { None };
-        self.put(fd, Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries, append: AtomicBool::new(false), ofd_locked: AtomicBool::new(false) })));
+        self.put(fd, Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), pos: crate::sync::Mutex::new(()), writable, entries, append: AtomicBool::new(false), ofd_locked: AtomicBool::new(false), path: None, wrote: AtomicBool::new(false) })));
         Ok(fd)
     }
 
@@ -699,10 +850,13 @@ impl Table {
         self.put(fd, Slot::File(Arc::new(Open {
             node: Arc::from(node),
             offset: AtomicU64::new(0),
+            pos: crate::sync::Mutex::new(()),
             writable: true,
             entries: None,
             append: AtomicBool::new(false),
             ofd_locked: AtomicBool::new(false),
+            path: Some(alloc::boxed::Box::from(path)),
+            wrote: AtomicBool::new(false),
         })));
         Ok(fd)
     }
@@ -721,6 +875,9 @@ impl Table {
                 };
                 let written = open.node.write_at(at, data).map_err(FileError::Vfs)?;
                 open.offset.store(at + written as u64, Ordering::Relaxed);
+                if open.path.is_some() {
+                    open.wrote.store(true, Ordering::Relaxed);
+                }
                 Ok(written)
             }
             // Запись в канал через дескриптор **не ждёт** места, и это не
@@ -793,6 +950,21 @@ impl Table {
                 Err(FileError::Vfs(VfsError::WrongKind))
             }
             None => Err(FileError::BadFd),
+        }
+    }
+
+    /// The open regular file (or directory) behind `fd`, to read or write it
+    /// outside the process lock ([`FileIo`]). `None` - something else (pipe,
+    /// socket, standard stream, Linux object: they keep their own paths), or
+    /// `fileio off` ([`UNLOCKED_IO`]).
+    #[must_use]
+    pub fn file_io(&self, fd: usize) -> Option<FileIo> {
+        if !UNLOCKED_IO.load(Ordering::Relaxed) {
+            return None;
+        }
+        match self.cell(fd).ok()?.as_ref()? {
+            Slot::File(open) => Some(FileIo(Arc::clone(open))),
+            _ => None,
         }
     }
 

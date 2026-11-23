@@ -21,11 +21,11 @@ use crate::fs;
 use crate::vfs::NodeKind;
 
 /// Встроенные команды оболочки — то, что разбирает `run_command`.
-pub const BUILTINS: [&str; 46] = [
-    "acpidump", "arp", "beep", "cat", "cd", "clear", "date", "dmesg", "echo", "exit", "free", "fsck", "guard",
+pub const BUILTINS: [&str; 48] = [
+    "acpidump", "arp", "beep", "cat", "cd", "clear", "cp", "date", "dmesg", "echo", "exit", "free", "fsck", "guard",
     "help", "history", "input", "intel", "ip", "irq", "kill", "lastpanic", "ls", "mem", "mkdir", "mounts",
     "panic", "pci", "ping", "power", "poweroff", "pwd", "quit", "reboot", "resolve", "restart", "rm", "run",
-    "shutdown", "slots", "stat", "sysupdate", "tasks", "tcp", "ui", "uptime", "usb",
+    "shutdown", "slots", "stat", "sum", "sysupdate", "tasks", "tcp", "ui", "uptime", "usb",
 ];
 
 /// Варианты для слова под курсором.

@@ -382,6 +382,7 @@ fn main() {
         blocker: blocker.clone(),
         downloads: downloads.clone(),
         devlog: RefCell::new(devtools::DevLog::default()),
+        held_loads: RefCell::new(Vec::new()),
     });
     let draft_provider = vault.as_ref().and_then(|v| v.account().cloned());
     let mut shell = Shell {
@@ -421,7 +422,9 @@ fn main() {
         dev: Default::default(),
         closed: Vec::new(),
         quit: false,
+        dl: Default::default(),
     };
+    shell.apply_download_settings();
     if let Some(v) = &shell.vault {
         let key = v.sync_key;
         shell.profile.reload_logins(&key);
@@ -724,6 +727,7 @@ fn main() {
         shell.servo.spin_event_loop();
         let mut changed = shell.apply_notes(&window);
         changed |= shell.poll_sync(&window);
+        changed |= shell.poll_downloads(&window);
         if input || changed {
             ui_due = Some(Instant::now());
         }
@@ -772,6 +776,14 @@ fn main() {
             if want_dock != crate::shell::dev_dock() {
                 crate::shell::set_dev_dock(want_dock);
                 shell.resize_all(&window);
+                ui_due = Some(Instant::now());
+            }
+            // Полоса загрузок внизу (как в Chrome): страница на её высоту ниже.
+            let want_bar = if shell.dl.bar && !shell.delegate.downloads.snapshot().is_empty() { crate::shell::DOWNLOADS_BAR_H } else { 0 };
+            if want_bar != crate::shell::downloads_bar() {
+                crate::shell::set_downloads_bar(want_bar);
+                shell.resize_all(&window);
+                println!("browser: downloads bar {}", if want_bar > 0 { "shown" } else { "hidden" });
                 ui_due = Some(Instant::now());
             }
             // Оформление поменялось — стиль egui и место страницы.

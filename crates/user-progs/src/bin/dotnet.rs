@@ -90,8 +90,14 @@ struct Console {
     windows: Vec<Option<ProgramWindow>>,
     /// Шрифт форм, когда графика уже приготовлена.
     face: Option<&'static Face>,
+    /// Масштаб стола, под который выбран `face`, и когда его сверяли (мс):
+    /// масштаб меняется на ходу (20.11), и шрифт форм идёт за ним.
+    scale: mini_ui::Scale,
+    scale_checked: u64,
     /// Имя программы без `.dll` — заголовок окна, которому C# не дал своего.
     program: String,
+    /// Окна выбора файла (20.11, `/bin/filedlg`) по номерам, которые видит C#.
+    dialogs: Vec<Option<user_progs::filedlg::Dialog>>,
     /// Начатая, но не законченная строка вывода.
     ///
     /// `Console.Write` за `Console.Write` уходили ядру отдельными `write`, и
@@ -116,6 +122,24 @@ impl Console {
     /// `None` — графики у машины нет.
     fn graphics(&mut self) -> Option<&'static Face> {
         if let Some(face) = self.face {
+            // Свой цикл, не `app::run`: масштаб стола сверяется здесь, не
+            // чаще раза в секунду — следующая перерисовка формы уже новым
+            // кеглем (раскладка форм — в точках самой программы, как у
+            // WinForms без AutoScale).
+            let now = monotonic_ms();
+            if now < self.scale_checked + 1000 {
+                return Some(face);
+            }
+            self.scale_checked = now;
+            let Some(info) = sysinfo() else { return Some(face) };
+            let scale = user_progs::app::ui_scale(&info);
+            if scale == self.scale {
+                return Some(face);
+            }
+            self.scale = scale;
+            let face = typeface::face(Role::Body, mini_ui::paint::Ctx::scaled(scale).tier);
+            self.face = Some(face);
+            error(&format!("dotnet: forms font follows ui scale {scale}\n"));
             return Some(face);
         }
         let deadline = monotonic_ms() + WAIT_GRAPHICS_MS;
@@ -130,13 +154,9 @@ impl Console {
         };
         mini_ui::use_raw_format(info.pixel_format);
         mini_ui::theme::set_dark(info.flags & SYSINFO_DARK != 0);
-        let tier = mini_ui::paint::Ctx::scaled(mini_ui::theme::geometry_scale_for(
-            user_abi::sysinfo_scale_choice(info.flags),
-            info.screen_w,
-            info.screen_h,
-        ))
-        .tier;
-        let face = typeface::face(Role::Body, tier);
+        self.scale = user_progs::app::ui_scale(&info);
+        self.scale_checked = monotonic_ms();
+        let face = typeface::face(Role::Body, mini_ui::paint::Ctx::scaled(self.scale).tier);
         self.face = Some(face);
         Some(face)
     }
@@ -376,7 +396,7 @@ impl Host for Console {
         coverage.try_reserve_exact(width as usize * height as usize).ok()?;
         for row in 0..usize::from(glyph.h) {
             for column in 0..usize::from(glyph.w) {
-                let byte = typeface::data::COVERAGE.get(glyph.off as usize + row * stride + column / 2).copied().unwrap_or(0);
+                let byte = face.coverage.get(glyph.off as usize + row * stride + column / 2).copied().unwrap_or(0);
                 let level = if column % 2 == 0 { byte & 0x0F } else { byte >> 4 };
                 coverage.push(level * 17);
             }
@@ -441,6 +461,43 @@ impl Host for Console {
         let target = self.window_mut(window)?;
         let (width, height) = (target.width, target.height);
         Some(WindowPixels { pixels: target.window.pixels(), width, height, red_low })
+    }
+
+    // Окно выбора файла (20.11): отдельная программа `/bin/filedlg`, модальная
+    // к окну формы. Запрос C# уже собрал строками договора.
+    fn file_dialog_start(&mut self, request: &str, owner: Option<u32>) -> Option<u32> {
+        let owner_id = owner.and_then(|window| self.window_mut(window)).map_or(0, |target| target.window.id());
+        let (mut options, _, _) = user_progs::filedlg::parse_request(request);
+        // Пустой фильтр C# — «все файлы».
+        if options.filters.is_empty() {
+            options.filters = alloc::vec![user_progs::filedlg::Filter::all()];
+        }
+        self.flush_out();
+        match user_progs::filedlg::Dialog::start_owned(&options, owner_id, "dotnet") {
+            Ok(dialog) => {
+                let index = self.dialogs.iter().position(Option::is_none).unwrap_or(self.dialogs.len());
+                if index == self.dialogs.len() {
+                    self.dialogs.push(None);
+                }
+                self.dialogs[index] = Some(dialog);
+                Some(index as u32)
+            }
+            Err(why) => {
+                error(&format!("dotnet: file dialog failed: {why}\n"));
+                None
+            }
+        }
+    }
+
+    fn file_dialog_poll(&mut self, dialog: u32) -> Option<Option<String>> {
+        let Some(slot) = self.dialogs.get_mut(dialog as usize) else { return Some(None) };
+        let Some(active) = slot.as_mut() else { return Some(None) };
+        let outcome = active.poll()?;
+        *slot = None;
+        Some(match outcome {
+            user_progs::filedlg::Outcome::Chosen(path) => Some(path),
+            _ => None,
+        })
     }
 
     fn window_resize(&mut self, window: u32, width: u32, height: u32) -> bool {
@@ -572,7 +629,10 @@ extern "C" fn run(start: usize) -> ! {
         home: home_directory(&settings),
         offset_minutes: sysconf::timezone_minutes(&settings).unwrap_or(0),
         windows: Vec::new(),
+        dialogs: Vec::new(),
         face: None,
+        scale: mini_ui::Scale::ONE,
+        scale_checked: 0,
         program: String::from(name.strip_suffix(".dll").unwrap_or(name)),
         pending: String::new(),
     };

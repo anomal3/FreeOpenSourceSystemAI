@@ -98,6 +98,11 @@ impl Window {
         true
     }
 
+    /// Номер окна у ядра (владелец модального окна выбора файла).
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
     pub fn set_cursor(&self, shape: CursorShape) {
         if self.cursor.get() != shape {
             self.cursor.set(shape);
@@ -272,6 +277,148 @@ pub enum CursorShape {
     NotAllowed = 4,
     ResizeEw = 5,
     ResizeNs = 6,
+}
+
+const SYS_WRITE: usize = 1;
+const SYS_READ: usize = 6;
+const SYS_CLOSE: usize = 7;
+const SYS_PIPE: usize = 39;
+const SYS_LAUNCH: usize = 40;
+const ERR_AGAIN: isize = -17;
+
+/// Аргумент `SYS_LAUNCH` (user-abi `Launch`): команда и концы каналов.
+#[repr(C)]
+struct Launch {
+    command: u64,
+    command_len: u64,
+    who: u64,
+    stdin: i64,
+    stdout: i64,
+}
+
+fn pipe() -> Option<(isize, isize)> {
+    // SAFETY: вызов без адресов.
+    let packed = unsafe { syscall3(SYS_PIPE, 0, 0, 0) };
+    (packed >= 0).then(|| (packed >> 32, packed & 0xFFFF_FFFF))
+}
+
+fn close_fd(fd: isize) {
+    // SAFETY: дескриптор наш.
+    unsafe { syscall3(SYS_CLOSE, fd as usize, 0, 0) };
+}
+
+/// Окно выбора файла системы (`/bin/filedlg`, 20.11): отдельная программа,
+/// модальная над окном браузера; запрос — строками `ключ\tзначение` в её
+/// стандартный ввод, ответ — строка `\x1efiledlg-answer\tok\tПУТЬ` в выводе
+/// (договор `user_progs::filedlg`). Каналы ядра неблокирующие — `poll` не
+/// ждёт.
+pub struct FileDialog {
+    out: isize,
+    pending: Vec<u8>,
+}
+
+/// Чем кончилось окно выбора файла.
+pub enum DialogAnswer {
+    Chosen(String),
+    Cancelled,
+}
+
+impl FileDialog {
+    /// «Сохранить как»: папка, предложенное имя, окно-владелец.
+    pub fn save(owner: i64, title: &str, dir: &str, name: &str) -> Result<FileDialog, String> {
+        let clean = |t: &str| t.replace(['\n', '\r', '\t'], " ");
+        let request = format!(
+            "mode\tsave\nowner\t{owner}\ntag\tobsos\ntitle\t{}\ndir\t{}\nname\t{}\nindex\t0\nextension\t0\n",
+            clean(title),
+            clean(dir),
+            clean(name)
+        );
+        Self::start(&request)
+    }
+
+    /// «Выбор папки» (папка загрузок в настройках).
+    pub fn folder(owner: i64, title: &str, dir: &str) -> Result<FileDialog, String> {
+        let clean = |t: &str| t.replace(['\n', '\r', '\t'], " ");
+        Self::start(&format!("mode\tfolder\nowner\t{owner}\ntag\tobsos\ntitle\t{}\ndir\t{}\n", clean(title), clean(dir)))
+    }
+
+    fn start(request: &str) -> Result<FileDialog, String> {
+        let (in_read, in_write) = pipe().ok_or("канал не создаётся")?;
+        let Some((out_read, out_write)) = pipe() else {
+            close_fd(in_read);
+            close_fd(in_write);
+            return Err(String::from("канал не создаётся"));
+        };
+        let command = "/bin/filedlg --stdin";
+        let launch = Launch {
+            command: command.as_ptr() as u64,
+            command_len: command.len() as u64,
+            who: u64::MAX,
+            stdin: in_read as i64,
+            stdout: out_write as i64,
+        };
+        // SAFETY: структура и строка живут до возврата из вызова.
+        let task = unsafe { syscall3(SYS_LAUNCH, &launch as *const Launch as usize, 0, 0) };
+        // Свои копии концов, отданных окну, — закрыть: иначе конца файла не
+        // увидит ни оно, ни мы.
+        close_fd(in_read);
+        close_fd(out_write);
+        if task < 0 {
+            close_fd(in_write);
+            close_fd(out_read);
+            return Err(format!("/bin/filedlg не запускается ({task})"));
+        }
+        let bytes = request.as_bytes();
+        let mut sent = 0usize;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while sent < bytes.len() && std::time::Instant::now() < until {
+            // SAFETY: буфер наш.
+            let wrote = unsafe { syscall3(SYS_WRITE, in_write as usize, bytes[sent..].as_ptr() as usize, bytes.len() - sent) };
+            if wrote > 0 {
+                sent += wrote as usize;
+            } else if wrote == ERR_AGAIN {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            } else {
+                break;
+            }
+        }
+        close_fd(in_write);
+        println!("browser: file dialog #{task} started");
+        Ok(FileDialog { out: out_read, pending: Vec::new() })
+    }
+
+    /// Ответ, не дожидаясь: `None` — окно ещё открыто.
+    pub fn poll(&mut self) -> Option<DialogAnswer> {
+        let mut buf = [0u8; 1024];
+        let ended = loop {
+            // SAFETY: буфер наш.
+            let got = unsafe { syscall3(SYS_READ, self.out as usize, buf.as_mut_ptr() as usize, buf.len()) };
+            if got > 0 {
+                self.pending.extend_from_slice(&buf[..got as usize]);
+                continue;
+            }
+            break got == 0 || got != ERR_AGAIN;
+        };
+        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=end).collect();
+            let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+            if let Some(rest) = line.strip_prefix("\x1efiledlg-answer\t") {
+                return Some(match rest.split_once('\t') {
+                    Some(("ok", path)) if !path.is_empty() => DialogAnswer::Chosen(path.to_string()),
+                    _ => DialogAnswer::Cancelled,
+                });
+            } else if !line.is_empty() {
+                println!("{line}");
+            }
+        }
+        ended.then_some(DialogAnswer::Cancelled)
+    }
+}
+
+impl Drop for FileDialog {
+    fn drop(&mut self) {
+        close_fd(self.out);
+    }
 }
 
 pub const CHROMIUM: &str = "/opt/chromium/bin/chromium";

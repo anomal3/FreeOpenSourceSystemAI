@@ -65,6 +65,16 @@ pub enum Aim {
     /// Середина места, которое «Пуск» напечатал строкой `start spot <имя> at
     /// X,Y WxH` (20.11): плитка, папка, кнопка пользователя, строка меню.
     Spot(&'static str),
+    /// Под местом «Пуска» `.0` — на его середине по горизонтали, у нижнего
+    /// края места `.1` (например, плитка и поле закреплённых). Отсюда указатель
+    /// доезжает до плитки по вертикали и не задевает по пути соседние
+    /// плитки-папки: наведение на любую из них раскрывает её поверх нужной
+    /// (21.11, «Средства администрирования» закрывали «Системные утилиты»).
+    SpotBelow(&'static str, &'static str),
+    /// В месте `.1` у его левого края, на высоте места `.0`: отсюда указатель
+    /// подъезжает к плитке по горизонтали, вдоль её ряда (например, из списка
+    /// всех программ к плитке первого ряда — мимо плиток-папок второго).
+    SpotLevel(&'static str, &'static str),
     /// Пустое место ниже [`Aim::Empty`]: туда не попадает меню, открытое в нём.
     EmptyBelow,
     /// Трей: часы у правого края панели задач. Область попадания часов
@@ -139,7 +149,9 @@ pub enum Aim {
 /// строку заново. Первая описывала бы экран, которого уже нет.
 fn desktop_line(log: &str) -> Result<&str> {
     log.lines()
-        .filter(|line| line.contains("desktop     : ") && line.contains("ui scale"))
+        // `, ui scale` — с запятой: строки смены масштаба (`ui scale 1.5
+        // (was 2)`, `scale 150 -> ui scale 1.5`, 20.11) размера экрана не несут.
+        .filter(|line| line.contains("desktop     : ") && line.contains(", ui scale"))
         .last()
         .context("в журнале нет строки с размером экрана")
 }
@@ -204,10 +216,34 @@ const CONTEXT_PAD: i32 = 4;
 /// Поле разделительной черты сверху и снизу.
 const CONTEXT_SEP_PAD: i32 = 4;
 
+/// Классика (22.11, набор «Простой»): по последней строке `look` в журнале
+/// (`desktop     : look simple [outline,classic] depth 32`, «Параметры» и
+/// загрузка из `desktop.cfg` пишут так же).
+fn classic(log: &str) -> bool {
+    log.lines().filter(|line| line.contains(": look ")).last().is_some_and(|line| line.contains("classic"))
+}
+
+/// Высота панели задач: у классики — 28 (`panel::CLASSIC_H`, 22.11).
+fn panel_h(log: &str) -> i32 {
+    if classic(log) { 28 } else { PANEL_H }
+}
+
+/// Высота полосы заголовка: у классики — 24 (`window::CLASSIC_TITLE`).
+fn title_h(log: &str) -> i32 {
+    if classic(log) { 24 } else { TITLE_H }
+}
+
 /// Середина кнопки заголовка, считая справа налево.
 fn title_button(log: &str, title: &str, from_right: i32) -> Result<(i32, i32)> {
     let rect = window(log, title)?;
     let scale = ui_scale(log)?;
+    if classic(log) {
+        // Классика: кнопки 16 группой, закрыть — в 5 от края и на 2 правее
+        // остальных (`Window::title_button`).
+        let right = rect.x + rect.w - 5 * scale;
+        let x = if from_right == 0 { right - 8 * scale } else { right - 16 * scale - 2 * scale - 16 * scale * from_right + 8 * scale };
+        return Ok((x, rect.y + 12 * scale));
+    }
     let step = (TITLE_BTN + TITLE_GAP) * scale;
     let right = rect.x + rect.w - TITLE_MARGIN * scale;
     Ok((
@@ -222,8 +258,31 @@ fn title_button(log: &str, title: &str, from_right: i32) -> Result<(i32, i32)> {
 /// масштабировать перестали — под каждый размерный ряд он растеризован
 /// отдельно, — а геометрию по-прежнему надо, и число в строке теперь означает
 /// именно её.
-fn ui_scale(log: &str) -> Result<i32> {
-    field(log, "ui scale")
+///
+/// С 20.11 масштаб дробный: в строке `ui scale 1.5` — множитель с точкой,
+/// здесь он хранится в процентах, и `точки_макета * scale` округляет до
+/// целой точки так же, как `mini_ui::Scale`.
+fn ui_scale(log: &str) -> Result<Pct> {
+    let line = desktop_line(log)?;
+    let rest = line.split("ui scale").nth(1).context("в строке стола нет 'ui scale'")?;
+    let word: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let value: f64 = word.parse().with_context(|| format!("за 'ui scale' не число: '{word}'"))?;
+    Ok(Pct((value * 100.0).round() as i32))
+}
+
+/// Масштаб в процентах (см. [`ui_scale`]).
+#[derive(Clone, Copy)]
+struct Pct(i32);
+
+impl std::ops::Mul<Pct> for i32 {
+    type Output = i32;
+    fn mul(self, scale: Pct) -> i32 {
+        if self == 1 {
+            return scale.0 / 100;
+        }
+        let v = self * scale.0;
+        if v >= 0 { (v + 50) / 100 } else { -((-v + 50) / 100) }
+    }
 }
 
 /// Высота панели задач в точках.
@@ -242,6 +301,10 @@ pub fn window(log: &str, title: &str) -> Result<Rect> {
     let mut rect: Option<Rect> = None;
 
     for line in log.lines() {
+        // `button of 'X' at` — кнопка окна на панели, не само окно (20.11).
+        if line.contains("button of '") {
+            continue;
+        }
         if let Some(rest) = line.split(&placed).nth(1) {
             if let Some(found) = parse_placement(rest) {
                 rect = Some(found);
@@ -310,14 +373,14 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         // FossAi у самого левого края панели (поле плашки 4).
         Aim::MenuButton => (
             PANEL_INSET + 4 + 22,
-            height - PANEL_INSET - PANEL_H / 2,
+            height - PANEL_INSET - panel_h(log) / 2,
         ),
         // Пустое место полосы перед кнопками окна: с 72h у терминала слева в
         // заголовке — вкладки и «+», а за них окно не таскают.
         Aim::Title(title) => {
             let rect = window(log, title)?;
             let scale = ui_scale(log)?;
-            (rect.x + rect.w - (3 * TITLE_BTN + 40) * scale, rect.y + TITLE_H * scale / 2)
+            (rect.x + rect.w - (3 * TITLE_BTN + 40) * scale, rect.y + title_h(log) * scale / 2)
         }
         // Кнопки заголовка стоят справа налево вплотную к краю: ширина 46,
         // во всю высоту полосы (72b). Числа те же, что в `theme.rs`, и
@@ -339,21 +402,21 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         Aim::Content(title, dx, dy) => {
             let rect = window(log, title)?;
             let scale = ui_scale(log)?;
-            (rect.x + dx, rect.y + TITLE_H * scale + dy)
+            (rect.x + dx, rect.y + title_h(log) * scale + dy)
         }
         // Пустое место: середина экрана по ширине и треть по высоте — там нет
         // ни значков (они слева), ни панели (она внизу). Окна к этому моменту
         // сценарий обязан убрать сам.
         // Колокол — крайний справа в трее (02.11, макет 05).
-        Aim::TrayBell => (width - PANEL_INSET - 12, height - PANEL_INSET - PANEL_H / 2),
+        Aim::TrayBell => (width - PANEL_INSET - 12, height - PANEL_INSET - panel_h(log) / 2),
         // Часы трея: правее них с 02.11 колокол (значок 14 и шаг 14).
-        Aim::Tray => (width - PANEL_INSET - 30 - 28, height - PANEL_INSET - PANEL_H / 2),
-        Aim::TaskButton(n) => (PANEL_INSET + 79 + n * 48, height - PANEL_INSET - PANEL_H / 2),
+        Aim::Tray => (width - PANEL_INSET - 30 - 28, height - PANEL_INSET - panel_h(log) / 2),
+        Aim::TaskButton(n) => (PANEL_INSET + 79 + n * 48, height - PANEL_INSET - panel_h(log) / 2),
         Aim::FilesRow(n) => {
             let rect = window(log, "Files")?;
             // Полоса вкладок (38, с 20.11), панель (48), команды (40), шапка
             // столбцов (27), строки по 34.
-            (rect.x + 340, rect.y + TITLE_H + 38 + 48 + 40 + 27 + n * 34 + 16)
+            (rect.x + 340, rect.y + title_h(log) + 38 + 48 + 40 + 27 + n * 34 + 16)
         }
         Aim::FilesBody => {
             let rect = window(log, "Files")?;
@@ -365,11 +428,11 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         Aim::TaskRow(n) => {
             let rect = window(log, "Task Manager")?;
             // Шапка 56 (макет 17), заголовок таблицы 46, секция 36, строка 34.
-            (rect.x + 400, rect.y + TITLE_H + 56 + 46 + 36 + n * 34 + 17)
+            (rect.x + 400, rect.y + title_h(log) + 56 + 46 + 36 + n * 34 + 17)
         }
         Aim::Program(title, x, y) => {
             let rect = window(log, title)?;
-            (rect.x + x, rect.y + TITLE_H + y)
+            (rect.x + x, rect.y + title_h(log) + y)
         }
         // Высота окна из журнала уже включает полосу заголовка, поэтому низ
         // прямоугольника — низ содержимого.
@@ -451,7 +514,11 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         }
         Aim::Point(x, y) => (x, y),
         Aim::Spot(name) => {
-            let key = format!("start spot {name} at ");
+            // `snap:L.C` — зона макета прилипания (20.11).
+            let key = match name.strip_prefix("snap:") {
+                Some(zone) => format!("snap spot {zone} at "),
+                None => format!("start spot {name} at "),
+            };
             let rect = log
                 .lines()
                 .filter_map(|line| line.split(&key).nth(1).and_then(parse_placement))
@@ -459,10 +526,35 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
                 .with_context(|| format!("в журнале нет места «Пуска» '{name}'"))?;
             (rect.x + rect.w / 2, rect.y + rect.h / 2)
         }
+        Aim::SpotBelow(name, area) | Aim::SpotLevel(name, area) => {
+            let spot = |name: &str| {
+                let key = format!("start spot {name} at ");
+                log.lines()
+                    .filter_map(|line| line.split(&key).nth(1).and_then(parse_placement))
+                    .last()
+                    .with_context(|| format!("в журнале нет места «Пуска» '{name}'"))
+            };
+            let (rect, area) = (spot(name)?, spot(area)?);
+            match aim {
+                Aim::SpotBelow(..) => (rect.x + rect.w / 2, (area.y + area.h - 6).max(rect.y + rect.h / 2)),
+                _ => (area.x + 6, rect.y + rect.h / 2),
+            }
+        }
     };
 
+    // Мониторов несколько (20.11, `multihead-ui`) — предел весь стол
+    // (`desktop     : 2 outputs, desktop 2560x800`), а не основной монитор.
+    let (width, height) = desk_extent(log).map_or((width, height), |(w, h)| (w.max(width), h.max(height)));
     if point.0 < 0 || point.1 < 0 || point.0 >= width || point.1 >= height {
         bail!("цель {aim:?} оказалась за экраном {width}x{height}: {point:?}");
     }
     Ok(point)
+}
+
+/// Размер всего стола из последней строки `N outputs, desktop WxH`.
+fn desk_extent(log: &str) -> Option<(i32, i32)> {
+    let line = log.lines().filter(|line| line.contains(" outputs, desktop ")).last()?;
+    let dims = line.split(" outputs, desktop ").nth(1)?.split_whitespace().next()?;
+    let (w, h) = dims.split_once('x')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }

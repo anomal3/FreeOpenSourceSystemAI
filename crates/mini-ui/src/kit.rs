@@ -31,7 +31,7 @@ use crate::glyphicon::{self, Icon};
 use crate::iconset::{self, Fi};
 use crate::paint::{self, Ctx, RowState};
 use crate::typeface::Role;
-use crate::{Rect, Surface, draw, theme};
+use crate::{Rect, Surface, classic, draw, theme};
 
 // ---------------------------------------------------------------------------
 // Панели
@@ -65,7 +65,13 @@ pub fn toolbar(ctx: Ctx, s: &mut Surface, rect: Rect) -> Ctx {
     let p = ctx.palette;
     if !rect.is_empty() {
         s.fill(rect, ctx.flat(p.panel));
-        draw::hline(s, rect.x, rect.bottom() - 1, rect.w, p.line.color, p.line.alpha);
+        if theme::is_classic() {
+            // Панель инструментов Windows 98 — бороздка снизу.
+            let t = classic::unit(ctx.scale);
+            classic::groove_h(s, rect.x, rect.bottom() - 2 * t as i32, rect.w, t);
+        } else {
+            draw::hline(s, rect.x, rect.bottom() - 1, rect.w, p.line.color, p.line.alpha);
+        }
     }
     ctx.on(theme::panel_bg())
 }
@@ -92,7 +98,12 @@ pub fn status_bar(ctx: Ctx, s: &mut Surface, rect: Rect, text: &str) {
         return;
     }
     s.fill(rect, ctx.flat(p.panel));
-    draw::hline(s, rect.x, rect.y, rect.w, p.line2.color, p.line2.alpha);
+    if theme::is_classic() {
+        let t = classic::unit(ctx.scale);
+        classic::shallow(s, Rect::new(rect.x + 2 * t as i32, rect.y + 2 * t as i32, rect.w.saturating_sub(4 * t), rect.h.saturating_sub(3 * t)), t);
+    } else {
+        draw::hline(s, rect.x, rect.y, rect.w, p.line2.color, p.line2.alpha);
+    }
     let bar = ctx.on(theme::panel_bg());
     let pad = ctx.px(14);
     paint::text_clipped(
@@ -145,6 +156,18 @@ impl Tabs {
     /// Нарисовать поверх панели (`bar` — контекст от [`toolbar`]).
     pub fn draw(&self, bar: Ctx, s: &mut Surface, labels: &[&str], active: usize) {
         let p = bar.palette;
+        if theme::is_classic() {
+            // Переключатель — ряд кнопок; выбранная вдавлена (как
+            // кнопки-переключатели панели инструментов Windows 98).
+            let t = classic::unit(bar.scale);
+            for (index, (rect, label)) in self.tabs.iter().zip(labels).enumerate() {
+                let on = index == active;
+                classic::button(s, *rect, t, on);
+                let area = if on { rect.translate(t as i32, t as i32) } else { *rect };
+                paint::text_centered(bar, s, Role::Caption, area, label, p.ink);
+            }
+            return;
+        }
         paint::sunk(bar, s, self.frame, bar.px(theme::R_ROW));
         for (index, (rect, label)) in self.tabs.iter().zip(labels).enumerate() {
             let on = index == active;
@@ -267,6 +290,23 @@ impl Table {
     pub fn draw_header(&self, ctx: Ctx, s: &mut Surface, columns: &[Rect], titles: &[&str]) {
         let p = ctx.palette;
         let y = paint::baseline(ctx, Role::MonoCaps, self.header);
+        if theme::is_classic() {
+            // Шапка списка Windows 98: ряд выпуклых кнопок-столбцов.
+            let t = classic::unit(ctx.scale);
+            let shown: Vec<Rect> = columns.iter().copied().filter(|rect| rect.w > 0).collect();
+            for (index, rect) in shown.iter().enumerate() {
+                let left = if index == 0 { self.header.x } else { rect.x - ctx.px(8) as i32 };
+                let right = shown.get(index + 1).map_or(self.header.right(), |next| next.x - ctx.px(8) as i32);
+                let cell = Rect::new(left, self.header.y, (right - left).max(0) as u32, self.header.h);
+                classic::button(s, cell, t, false);
+            }
+            for (rect, title) in columns.iter().zip(titles) {
+                if rect.w > 0 {
+                    paint::text(ctx, s, Role::Caption, rect.x, paint::baseline(ctx, Role::Caption, self.header), title, p.ink);
+                }
+            }
+            return;
+        }
         for (rect, title) in columns.iter().zip(titles) {
             if rect.w > 0 {
                 paint::caps(ctx, s, rect.x, y, title);
@@ -366,6 +406,10 @@ pub fn place(at: (i32, i32), size: (u32, u32), area: Rect) -> Rect {
 /// поверх карточки — на ней рисуются и пункты меню, и поле переименования.
 pub fn card(ctx: Ctx, s: &mut Surface, rect: Rect) -> Ctx {
     let p = ctx.palette;
+    if theme::is_classic() {
+        classic::panel(s, rect, classic::unit(ctx.scale));
+        return ctx.on(theme::panel_bg());
+    }
     draw::shadow(s, rect, ctx.px(theme::R_CARD), ctx.px(18), crate::Color::rgb(0, 0, 0), 90);
     draw::rounded(s, rect, ctx.px(theme::R_CARD), ctx.flat(p.panel), 255);
     draw::rounded_stroke(s, rect, ctx.px(theme::R_CARD), p.line3.color, p.line3.alpha);
@@ -396,7 +440,11 @@ pub fn draw_menu(ctx: Ctx, s: &mut Surface, rect: Rect, entries: &[Entry<'_>], s
         let row = entry_rect(inner, rect, entries, index);
         if index > 0 && entry.group != entries[index - 1].group {
             let line_y = row.y - ctx.px(MENU_SEPARATOR) as i32 + ctx.px(4) as i32;
-            paint::separator(inner, s, rect.x + ctx.px(12) as i32, line_y, rect.w.saturating_sub(ctx.px(24)));
+            if theme::is_classic() {
+                classic::groove_h(s, rect.x + ctx.px(4) as i32, line_y, rect.w.saturating_sub(ctx.px(8)), classic::unit(ctx.scale));
+            } else {
+                paint::separator(inner, s, rect.x + ctx.px(12) as i32, line_y, rect.w.saturating_sub(ctx.px(24)));
+            }
         }
         let on = index == selected;
         paint::row(inner, s, row, if on { RowState::Selected } else { RowState::Idle });
@@ -408,7 +456,13 @@ pub fn draw_menu(ctx: Ctx, s: &mut Surface, rect: Rect, entries: &[Entry<'_>], s
                 row.x + ctx.px(14) as i32,
                 row.y + (row.h as i32 - side as i32) / 2,
                 side,
-                if entry.danger { p.bad_ink } else { p.ink3 },
+                if on && theme::is_classic() {
+                    crate::Color::rgb(0xFF, 0xFF, 0xFF)
+                } else if entry.danger {
+                    p.bad_ink
+                } else {
+                    p.ink3
+                },
                 255,
             );
         }
@@ -765,6 +819,12 @@ impl ScrollBar {
     /// под указателем и когда тянут — дорожка и бегунок пошире.
     pub fn draw(&self, ctx: Ctx, s: &mut Surface, scroll: &Scroll) {
         let p = ctx.palette;
+        if theme::is_classic() {
+            // Windows 98: дорожка в шахматку, стрелки на концах, выпуклый
+            // бегунок — всегда, а не только под указателем.
+            classic::scrollbar(s, self.track, self.thumb, self.vertical, classic::unit(ctx.scale));
+            return;
+        }
         let hot = scroll.hot();
         if hot {
             draw::rounded(s, self.track, ctx.px(theme::R_ROW), p.line2.color, p.line2.alpha);
@@ -859,7 +919,9 @@ pub fn status_toggles(ctx: Ctx, rect: Rect, count: usize) -> Vec<Rect> {
 /// Переключатель вида в строке состояния: значок, у включённого — подложка.
 pub fn status_toggle(ctx: Ctx, s: &mut Surface, rect: Rect, icon: Icon, on: bool) {
     let p = ctx.palette;
-    if on {
+    if on && theme::is_classic() {
+        classic::pressed(s, rect, classic::unit(ctx.scale));
+    } else if on {
         draw::rounded(s, rect, ctx.px(theme::R_ROW), ctx.flat(p.btn), 255);
         draw::rounded_stroke(s, rect, ctx.px(theme::R_ROW), p.btnline.color, p.btnline.alpha);
     }
@@ -884,7 +946,13 @@ pub fn status_line(ctx: Ctx, s: &mut Surface, rect: Rect, parts: &[&str], right:
         return;
     }
     s.fill(rect, ctx.flat(p.panel));
-    draw::hline(s, rect.x, rect.y, rect.w, p.line2.color, p.line2.alpha);
+    if theme::is_classic() {
+        // Строка состояния Windows 98 — мелкая вдавленность.
+        let t = classic::unit(ctx.scale);
+        classic::shallow(s, Rect::new(rect.x + 2 * t as i32, rect.y + 2 * t as i32, rect.w.saturating_sub(4 * t), rect.h.saturating_sub(3 * t)), t);
+    } else {
+        draw::hline(s, rect.x, rect.y, rect.w, p.line2.color, p.line2.alpha);
+    }
     let bar = ctx.on(theme::panel_bg());
     let pad = ctx.px(PAD) as i32;
     let role = Role::Caption;
@@ -998,6 +1066,10 @@ impl TabStrip {
         if self.rect.is_empty() {
             return;
         }
+        if theme::is_classic() {
+            self.draw_classic(ctx, s, titles, active, icon);
+            return;
+        }
         s.fill(self.rect, theme::window_bg());
         let panel = ctx.flat(p.panel);
         let r = ctx.px(theme::R_CARD);
@@ -1054,4 +1126,177 @@ impl TabStrip {
         }
         iconset::draw(s, Fi::Plus, self.plus.x + (self.plus.w as i32 - g as i32) / 2, self.plus.y + (self.plus.h as i32 - g as i32) / 2, g, if hover == Some(TabHit::New) { p.ink } else { p.ink3 }, 255);
     }
+
+    /// Вкладки Windows 98 (22.11, классика): выпуклые «ушки», открытая —
+    /// выше остальных и сливается с панелью под полосой.
+    fn draw_classic(&self, ctx: Ctx, s: &mut Surface, titles: &[&str], active: usize, icon: Option<Icon>) {
+        use crate::theme::win98::{DARK, FACE, LIGHT, SHADE};
+        let p = ctx.palette;
+        let t = classic::unit(ctx.scale);
+        let ti = t as i32;
+        s.fill(self.rect, FACE);
+        let base = self.rect.bottom() - ti;
+        s.fill(Rect::new(self.rect.x, base, self.rect.w, t), LIGHT);
+        for (index, (tab, title)) in self.tabs.iter().zip(titles).enumerate() {
+            let on = index == active;
+            let lift = if on { 0 } else { 2 * ti };
+            let ear = Rect::new(tab.x - if on { 2 * ti } else { 0 }, tab.y + lift, tab.w + if on { 4 * t } else { 0 }, (base - tab.y - lift).max(0) as u32 + if on { t } else { 0 });
+            s.fill(ear, FACE);
+            s.fill(Rect::new(ear.x, ear.y + ti, t, ear.h.saturating_sub(t)), LIGHT);
+            s.fill(Rect::new(ear.x + ti, ear.y, ear.w.saturating_sub(3 * t), t), LIGHT);
+            s.fill(Rect::new(ear.right() - 2 * ti, ear.y + ti, t, ear.h.saturating_sub(t)), SHADE);
+            s.fill(Rect::new(ear.right() - ti, ear.y + 2 * ti, t, ear.h.saturating_sub(2 * t)), DARK);
+            let inner = ctx.on(FACE);
+            let mut x = tab.x + ctx.px(8) as i32;
+            if let Some(icon) = icon {
+                let g = ctx.px(14);
+                glyphicon::draw(s, icon, x, tab.y + lift + ((tab.h as i32 - lift) - g as i32) / 2, g, p.ink, 255);
+                x += (g + ctx.px(6)) as i32;
+            }
+            let close = self.closes[index];
+            let room = (close.x - x - ctx.px(4) as i32).max(0) as u32;
+            let band = Rect::new(tab.x, tab.y + lift, tab.w, (tab.h as i32 - lift).max(0) as u32);
+            paint::text_clipped(inner, s, Role::Body, x, paint::baseline(inner, Role::Body, band), room, title, p.ink);
+            let g = ctx.px(10);
+            iconset::draw(s, Fi::X, close.x + (close.w as i32 - g as i32) / 2, close.y + lift / 2 + (close.h as i32 - g as i32) / 2, g, p.ink, 255);
+        }
+        // «+» — маленькая кнопка.
+        let plus = Rect::new(self.plus.x, self.plus.y + 2 * ti, self.plus.w, self.plus.h.saturating_sub(4 * t));
+        classic::button(s, plus, t, false);
+        let g = ctx.px(12);
+        iconset::draw(s, Fi::Plus, plus.x + (plus.w as i32 - g as i32) / 2, plus.y + (plus.h as i32 - g as i32) / 2, g, p.ink, 255);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Вопрос поверх окна
+// ---------------------------------------------------------------------------
+
+/// Вопрос «Удалить?», «Очистить корзину?» поверх окна программы (21.11).
+///
+/// Тот же вид, что у окон-вопросов ядра (`ui::dialog`: «Удаление файла»,
+/// «Выключение»): плитка со значком слева, заголовок, пояснение, черта и
+/// кнопки в правом нижнем углу — действие, потом «Отмена»; кнопка, которую
+/// нажмёт Enter, обведена. Окно под вопросом притушено: отвечать надо ему.
+/// Состояния нет, как и у остального здесь: выбранную кнопку держит
+/// программа, клавиши (Enter, Esc, Tab, стрелки) разбирает она же.
+pub struct Ask<'a> {
+    pub icon: Icon,
+    pub tone: paint::Tone,
+    pub title: &'a str,
+    /// Что именно спрашивается — имя файла, число объектов; строкой между
+    /// заголовком и пояснением. Пусто — строки нет.
+    pub detail: &'a str,
+    pub text: &'a str,
+    /// Подпись и вес кнопки действия; вторая кнопка — «Отмена».
+    pub action: &'a str,
+    pub weight: paint::Weight,
+}
+
+/// Где карточка вопроса и её кнопки: `[действие, отмена]`.
+#[derive(Clone, Copy)]
+pub struct AskLayout {
+    pub card: Rect,
+    pub buttons: [Rect; 2],
+}
+
+/// Поля карточки вопроса.
+const ASK_PAD: u32 = 24;
+/// Плитка со значком.
+const ASK_TILE: u32 = 44;
+/// Высота кнопки.
+const ASK_BUTTON_H: u32 = 32;
+/// Самая узкая кнопка.
+const ASK_BUTTON_MIN_W: u32 = 104;
+
+/// Строки пояснения, разбитые по словам под ширину `width`.
+fn ask_lines(ctx: Ctx, text: &str, width: u32) -> Vec<String> {
+    let face = ctx.face(Role::Body);
+    let space = face.width(" ");
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0;
+    for word in text.split(' ') {
+        let word_w = face.width(word);
+        if !current.is_empty() && current_w + space + word_w > width {
+            out.push(core::mem::take(&mut current));
+            current_w = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+            current_w += space;
+        }
+        current.push_str(word);
+        current_w += word_w;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Раскладка вопроса посреди `area` — одна для отрисовки и для щелчка.
+#[must_use]
+pub fn ask_layout(ctx: Ctx, area: Rect, ask: &Ask<'_>) -> AskLayout {
+    let pad = ctx.px(ASK_PAD);
+    // Заголовок не обрезается: карточка шире, если он длинный.
+    let fit = ctx.face(Role::Heading).width(ask.title) + pad * 2 + ctx.px(ASK_TILE + 16 + 4);
+    let w = fit.max(ctx.px(460)).min(area.w.saturating_sub(ctx.px(24)));
+    let text_w = w.saturating_sub(pad * 2 + ctx.px(ASK_TILE + 16));
+    let lines = ask_lines(ctx, ask.text, text_w).len().max(1) as u32;
+    let heading = u32::from(ctx.face(Role::Heading).line);
+    let body = u32::from(ctx.face(Role::Body).line);
+    let detail = if ask.detail.is_empty() { 0 } else { body + ctx.px(4) };
+    let top = (heading + ctx.px(8) + detail + body * lines).max(ctx.px(ASK_TILE));
+    let h = pad + top + ctx.px(28) + ctx.px(ASK_BUTTON_H) + pad;
+    let card = Rect::new(area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 2, w, h);
+    let face = ctx.face(Role::Label);
+    let width = |label: &str| (face.width(label) + ctx.px(36)).max(ctx.px(ASK_BUTTON_MIN_W));
+    let (yes_w, no_w) = (width(ask.action), width("Отмена"));
+    let gap = ctx.px(8);
+    let by = card.bottom() - (pad + ctx.px(ASK_BUTTON_H)) as i32;
+    let no = Rect::new(card.right() - (pad + no_w) as i32, by, no_w, ctx.px(ASK_BUTTON_H));
+    let yes = Rect::new(no.x - (gap + yes_w) as i32, by, yes_w, ctx.px(ASK_BUTTON_H));
+    AskLayout { card, buttons: [yes, no] }
+}
+
+/// Нарисовать вопрос поверх `area`; `focus` — кнопка под Enter (0 — действие).
+pub fn draw_ask(ctx: Ctx, s: &mut Surface, area: Rect, ask: &Ask<'_>, focus: usize) {
+    let lay = ask_layout(ctx, area, ask);
+    draw::blend_rect(s, area, crate::Color::rgb(0, 0, 0), 70);
+    let inner = card(ctx, s, lay.card);
+    let p = inner.palette;
+    let pad = ctx.px(ASK_PAD) as i32;
+    let tile = Rect::new(lay.card.x + pad, lay.card.y + pad, ctx.px(ASK_TILE), ctx.px(ASK_TILE));
+    paint::icon_tile(inner, s, tile, ask.icon, ask.tone, true);
+    let x = tile.right() + ctx.px(16) as i32;
+    let width = (lay.card.right() - pad - x).max(0) as u32;
+    let mut y = lay.card.y + pad;
+    paint::text_clipped(inner, s, Role::Heading, x, y, width, ask.title, p.ink);
+    y += i32::from(ctx.face(Role::Heading).line) + ctx.px(8) as i32;
+    if !ask.detail.is_empty() {
+        paint::text_clipped(inner, s, Role::Body, x, y, width, ask.detail, p.ink2);
+        y += i32::from(ctx.face(Role::Body).line) + ctx.px(4) as i32;
+    }
+    for line in ask_lines(ctx, ask.text, width) {
+        paint::text_clipped(inner, s, Role::Body, x, y, width, &line, p.ink3);
+        y += i32::from(ctx.face(Role::Body).line);
+    }
+    paint::separator(inner, s, lay.card.x, lay.buttons[0].y - ctx.px(16) as i32, lay.card.w);
+    let specs = [(ask.weight, ask.action), (paint::Weight::Normal, "Отмена")];
+    for (index, (rect, (weight, label))) in lay.buttons.iter().zip(specs).enumerate() {
+        paint::button(inner, s, *rect, weight, label, false);
+        if index == focus {
+            let ring = ctx.px(3);
+            let around = Rect::new(rect.x - ring as i32, rect.y - ring as i32, rect.w + ring * 2, rect.h + ring * 2);
+            draw::rounded_stroke(s, around, ctx.px(theme::R_ROW) + ring, p.accedge, 255);
+        }
+    }
+}
+
+/// Кнопка вопроса под точкой: `Some(true)` — действие, `Some(false)` — отмена.
+#[must_use]
+pub fn ask_hit(ctx: Ctx, area: Rect, ask: &Ask<'_>, x: i32, y: i32) -> Option<bool> {
+    let lay = ask_layout(ctx, area, ask);
+    lay.buttons.iter().position(|rect| rect.contains(x, y)).map(|index| index == 0)
 }

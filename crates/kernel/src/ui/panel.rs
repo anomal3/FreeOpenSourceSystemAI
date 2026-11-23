@@ -49,6 +49,10 @@ use super::window::App;
 use super::deskcfg;
 use super::startapps;
 
+#[path = "cascade.rs"]
+mod cascade;
+pub use cascade::ClassicKey;
+
 /// Надпись на кнопке меню.
 const BRAND: &str = "FossAi";
 
@@ -61,18 +65,32 @@ const APPS_TITLE: &str = "ПРИЛОЖЕНИЯ";
 /// токен на него завёл бы вопрос «а какой белый в светлой».
 const WHITE: Color = Color::rgb(0xFF, 0xFF, 0xFF);
 
+/// Подсветка строки или плитки «Пуска» под указателем: в классике
+/// (22.11) — тёмно-синяя, и текст на ней белый.
+fn hot_plate(s: &mut Surface, rect: Rect, radius: u32, hover: Color) {
+    if theme::is_classic() {
+        s.fill(rect, theme::win98::NAVY);
+        paint::remember_selection(rect);
+    } else {
+        draw::rounded(s, rect, radius, hover, 255);
+    }
+}
+
 /// Контекст стола: панель и меню лежат на обоях, а не в окне.
 ///
 /// Подложка — стекло поверх обоев: плитка значка и подложка выбранной строки
 /// сводятся к ней, и возьми они подложку окна, строка меню оказалась бы светлее
 /// карточки, на которой стоит.
-fn desk_ctx(scale: u32) -> Ctx {
+fn desk_ctx(scale: mini_ui::Scale) -> Ctx {
     Ctx::scaled(scale).on(glass_bg())
 }
 
 /// Надпись в поле дока. Она же говорит, что поле делает: открывает список
 /// приложений и ищет по нему.
 const SEARCH_HINT: &str = "Поиск";
+
+/// Подпись кнопки «Пуск» в классике (22.11) — как у Windows 98.
+const CLASSIC_START: &str = "Пуск";
 
 /// Подпись кнопки «Пуск» на телефоне. Имя системы, а не слово «Пуск»: кнопка
 /// широкая, места хватает, и человек читает, чем он пользуется.
@@ -118,6 +136,10 @@ struct Metrics {
     row_pad: u32,
     /// Поле карточки меню.
     pad: u32,
+    /// Толщина горизонтальной панели (от неё поле вокруг кнопок).
+    bar_h: u32,
+    /// Сторона значка программы на кнопке панели.
+    icon_px: u32,
 }
 
 impl Metrics {
@@ -155,7 +177,28 @@ impl Metrics {
             tile: ctx.px(20),
             row_pad: ctx.px(8),
             pad: ctx.px(10),
+            bar_h: ctx.px(theme::PANEL_H),
+            icon_px: ctx.px(24),
         }
+    }
+
+    /// «Маленькие значки» (20.11, как в Windows): полоса [`SMALL_H`],
+    /// кнопки и значки мельче.
+    const fn small(mut self) -> Self {
+        self.bar_h = self.ctx.px(SMALL_H);
+        self.btn_h = self.ctx.px(SMALL_H - 6);
+        self.icon_px = self.ctx.px(18);
+        self
+    }
+
+    /// Классика (22.11): полоса [`CLASSIC_H`], кнопки 22, значки 16.
+    const fn classic(mut self) -> Self {
+        self.bar_h = self.ctx.px(CLASSIC_H);
+        self.btn_h = self.ctx.px(CLASSIC_H - 6);
+        self.icon_px = self.ctx.px(16);
+        self.side = self.ctx.px(6);
+        self.gap = self.ctx.px(4);
+        self
     }
 
     /// Поле плашки: столько остаётся сверху и снизу от кнопки высотой
@@ -163,7 +206,7 @@ impl Metrics {
     /// слева и справа — иначе кнопка стояла бы в плашке не по центру, а
     /// «примерно по центру».
     const fn plate_pad(self) -> u32 {
-        (self.ctx.px(theme::PANEL_H) - self.btn_h) / 2
+        (self.bar_h - self.btn_h) / 2
     }
 
     /// Сторона значка внутри кнопки панели.
@@ -176,6 +219,10 @@ impl Metrics {
     /// С логотипом (72b) — квадратная кнопка со знаком, как остальные
     /// кнопки панели; без него — значок и подпись «FossAi».
     fn brand_width(self) -> u32 {
+        // Классика (22.11): кнопка «Пуск» Windows 98 — знак и слово.
+        if theme::is_classic() {
+            return self.ctx.px(6 + 16 + 5 + 8) + self.ctx.face(Role::Title).width(CLASSIC_START);
+        }
         if !theme::is_mobile() && super::appicon::logo().is_some() {
             return self.btn_h + self.ctx.px(4);
         }
@@ -192,7 +239,7 @@ impl Metrics {
 
     /// Сторона значка программы на кнопке панели задач.
     const fn icon(self) -> u32 {
-        self.ctx.px(24)
+        self.icon_px
     }
 
     /// Сторона плитки в шапке меню.
@@ -328,6 +375,19 @@ pub enum TrayItem {
     Clock,
     /// Колокол: уведомления и быстрые настройки (02.11, макет 05).
     Bell,
+    /// Screen recording runs (22.11): red dot and elapsed time; a click
+    /// stops it.
+    Recording,
+}
+
+/// Elapsed time of the screen recording for the tray: `0:07`, `12:34`,
+/// `1:02:03`.
+fn recording_text(seconds: u64) -> String {
+    if seconds >= 3600 {
+        alloc::format!("{}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60)
+    } else {
+        alloc::format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
 }
 
 /// Значки трея вместе с их местом на плашке.
@@ -347,7 +407,7 @@ pub struct Panel {
     /// чужого оттенка поверх обоев.
     pub rect: Rect,
     /// Множитель геометрии стола.
-    scale: u32,
+    scale: mini_ui::Scale,
     damage: Rect,
     /// Кнопка меню в координатах поверхности.
     brand: Rect,
@@ -390,6 +450,11 @@ pub struct Panel {
     anim: Option<(u32, u32, u64)>,
     /// Когда спрятать плашку, если указатель так и не вернулся (мс); 0 — нет.
     hide_at: u64,
+    /// Панель второго монитора (20.11, «на всех мониторах»): кнопки окон
+    /// своего монитора, без трея — как у Windows 10.
+    secondary: bool,
+    /// Номер монитора панели — для журнала (`taskbar revealed on output N`).
+    pub output: usize,
 }
 
 /// Сколько длится выезд плашки и сколько ждать, прежде чем её спрятать.
@@ -409,6 +474,12 @@ struct PinInfo {
 
 /// Толщина вертикальной панели (точки при масштабе 1).
 const PANEL_V_W: u32 = 56;
+/// Толщина панели с «маленькими значками»: горизонтальной и боковой.
+const SMALL_H: u32 = 34;
+const SMALL_V_W: u32 = 42;
+/// Горизонтальная панель в классике: 28 точек, кнопки 22, значки 16 — как у
+/// Windows 98.
+const CLASSIC_H: u32 = 28;
 /// Поле Dock от края экрана и поле значков внутри плашки.
 const DOCK_INSET: u32 = 8;
 const DOCK_PAD: u32 = 8;
@@ -421,7 +492,7 @@ impl Panel {
     /// же, как плашка: окно, доведённое до края рабочей области, не ложится
     /// под его тень.
     #[must_use]
-    pub fn thickness(cfg: deskcfg::Taskbar, scale: u32) -> u32 {
+    pub fn thickness(cfg: deskcfg::Taskbar, scale: mini_ui::Scale) -> u32 {
         if theme::is_mobile() {
             // Док у телефона выше панели и отстоит от края дальше: под нижним
             // краем экрана лежит место жеста «домой», а по бокам — скруглённые
@@ -429,7 +500,10 @@ impl Panel {
             return (theme::M_DOCK_H + theme::M_INSET * 2) * scale;
         }
         match cfg.mode {
-            deskcfg::Mode::Panel if cfg.edge.vertical() => PANEL_V_W * scale,
+            deskcfg::Mode::Panel if cfg.edge.vertical() => (if cfg.small { SMALL_V_W } else { PANEL_V_W }) * scale,
+            // Классика (22.11): панель задач Windows 98 — 28 точек.
+            deskcfg::Mode::Panel if theme::is_classic() => CLASSIC_H * scale,
+            deskcfg::Mode::Panel if cfg.small => (SMALL_H + theme::PANEL_INSET * 2) * scale,
             deskcfg::Mode::Panel => (theme::PANEL_H + theme::PANEL_INSET * 2) * scale,
             deskcfg::Mode::Dock => (cfg.icon + DOCK_PAD * 2 + DOCK_INSET * 2) * scale,
         }
@@ -506,8 +580,8 @@ impl Panel {
     /// трей, док — в её собственных координатах, поэтому сдвиг монитора
     /// касается одного `rect`.
     #[must_use]
-    pub fn new(area: Rect, scale: u32) -> Option<Self> {
-        let scale = scale.max(1);
+    pub fn new(area: Rect, scale: mini_ui::Scale) -> Option<Self> {
+        let scale = scale;
         let cfg = deskcfg::taskbar();
         let home = if theme::is_mobile() {
             let inset = theme::M_INSET * scale;
@@ -542,12 +616,59 @@ impl Panel {
             pin_hits: Vec::new(),
             anim: None,
             hide_at: 0,
+            secondary: false,
+            output: 0,
         };
         if cfg.autohide && !theme::is_mobile() {
-            let hidden = panel.hidden_slide();
-            panel.set_slide(hidden);
+            // Размер Dock тянут ползунком — он виден, пока его тянут (20.11).
+            let now = crate::time::uptime_ms();
+            let until = deskcfg::revealed_until();
+            if until > now {
+                panel.hide_at = until;
+            } else {
+                let hidden = panel.hidden_slide();
+                panel.set_slide(hidden);
+            }
         }
         Some(panel)
+    }
+
+    /// Панель второго монитора `area` (20.11): те же настройки, без трея.
+    #[must_use]
+    pub fn new_side(area: Rect, scale: mini_ui::Scale) -> Option<Self> {
+        let mut panel = Self::new(area, scale)?;
+        panel.secondary = true;
+        Some(panel)
+    }
+
+    /// Место монитора, у стороны которого стоит панель.
+    #[must_use]
+    pub const fn area(&self) -> Rect {
+        self.area
+    }
+
+    /// Размеры кнопок под настройки панели («маленькие значки»).
+    fn metrics(&self) -> Metrics {
+        let m = Metrics::new(desk_ctx(self.scale));
+        let panel = self.cfg.mode == deskcfg::Mode::Panel && !theme::is_mobile();
+        if panel && theme::is_classic() && !self.cfg.edge.vertical() {
+            m.classic()
+        } else if self.cfg.small && panel {
+            m.small()
+        } else {
+            m
+        }
+    }
+
+    /// Собрана ли панель под другую толщину, чем требуют настройки сейчас
+    /// (классику включили или выключили, 22.11): тогда её пересобирают.
+    #[must_use]
+    pub fn stale(&self) -> bool {
+        if theme::is_mobile() || self.cfg.mode != deskcfg::Mode::Panel {
+            return false;
+        }
+        let thick = Self::thickness(self.cfg, self.scale);
+        if self.cfg.edge.vertical() { self.home.w != thick } else { self.home.h != thick }
     }
 
     /// Куда плашка едет (или где стоит): 0 — видна.
@@ -564,12 +685,17 @@ impl Panel {
         let area = self.area;
         // Край — две точки у стороны экрана, по всей её длине: в край
         // попадают с размаху, целиться не надо.
-        let at_edge = match self.cfg.edge {
-            deskcfg::Edge::Bottom => y >= area.bottom() - 2 && x >= area.x && x < area.right(),
-            deskcfg::Edge::Top => y <= area.y + 1 && x >= area.x && x < area.right(),
-            deskcfg::Edge::Left => x <= area.x + 1 && y >= area.y && y < area.bottom(),
-            deskcfg::Edge::Right => x >= area.right() - 2 && y >= area.y && y < area.bottom(),
-        };
+        // Только у края **своего** монитора (20.11): указатель на соседнем
+        // справа тоже «правее края» основного, и Dock справа выезжал и
+        // уезжал на чужой экран.
+        let inside = area.contains(x, y);
+        let at_edge = inside
+            && match self.cfg.edge {
+                deskcfg::Edge::Bottom => y >= area.bottom() - 2,
+                deskcfg::Edge::Top => y <= area.y + 1,
+                deskcfg::Edge::Left => x <= area.x + 1,
+                deskcfg::Edge::Right => x >= area.right() - 2,
+            };
         let margin = desk_ctx(self.scale).px(12) as i32;
         let near = Rect::new(self.home.x - margin, self.home.y - margin, self.home.w + margin as u32 * 2, self.home.h + margin as u32 * 2);
         let shown = self.slide_target() == 0;
@@ -577,7 +703,7 @@ impl Panel {
             self.hide_at = 0;
             if !shown {
                 self.start_slide(0, now);
-                crate::kprintln!("  desktop     : taskbar revealed");
+                crate::kprintln!("  desktop     : taskbar revealed on output {} ({},{} {}x{})", self.output, self.home.x, self.home.y, self.home.w, self.home.h);
             }
         } else if shown && self.hide_at == 0 {
             self.hide_at = now + HIDE_DELAY_MS;
@@ -611,7 +737,7 @@ impl Panel {
             self.hide_at = 0;
             let hidden = self.hidden_slide();
             self.start_slide(hidden, now);
-            crate::kprintln!("  desktop     : taskbar hidden");
+            crate::kprintln!("  desktop     : taskbar hidden on output {}", self.output);
         }
         let (from, to, started) = self.anim?;
         let t = (now.saturating_sub(started)).min(SLIDE_MS);
@@ -1031,7 +1157,7 @@ impl Panel {
             return;
         }
         let ctx = desk_ctx(self.scale);
-        let m = Metrics::new(ctx);
+        let m = self.metrics();
         let p = ctx.palette;
         let plate = self.surface.bounds();
 
@@ -1042,6 +1168,18 @@ impl Panel {
         if theme::is_mobile() {
             draw::rounded_stroke(&mut self.surface, plate, m.round, p.line3.color, p.line3.alpha);
             draw::crown(&mut self.surface, plate, m.round, p.crown.color, p.crown.alpha);
+        } else if theme::is_classic() {
+            // Классика (22.11): панель задач Windows 98 — выпуклая кромка со
+            // стороны стола (светло-серая и белая строки).
+            let t = mini_ui::classic::unit(self.scale);
+            let (first, second) = if self.cfg.edge == deskcfg::Edge::Top {
+                (plate.h as i32 - t as i32, plate.h as i32 - 2 * t as i32)
+            } else {
+                (0, t as i32)
+            };
+            let (outer, inner) = if self.cfg.edge == deskcfg::Edge::Top { (theme::win98::DARK, theme::win98::SHADE) } else { (theme::win98::HI, theme::win98::LIGHT) };
+            self.surface.fill(Rect::new(0, first, plate.w, t), outer);
+            self.surface.fill(Rect::new(0, second, plate.w, t), inner);
         } else {
             // Панель во всю ширину (72b): черта только со стороны стола, как
             // в Windows, — сверху у нижней панели, снизу у верхней.
@@ -1062,7 +1200,9 @@ impl Panel {
         // кнопкам достаётся то, что осталось. Наоборот было бы хуже — десяток
         // открытых окон вытеснил бы часы за край экрана.
         let clock = clock_line(status);
-        let date = date_line(status);
+        // Маленькие значки — часы в одну строку, как в Windows.
+        // Классика (22.11) — тоже: в полосе 28 точек только время.
+        let date = if self.cfg.small || theme::is_classic() { None } else { date_line(status) };
         // Раскладка — как в трее Windows: «РУС» и «ENG».
         let lang = match crate::input::keymap::layout() {
             crate::input::keymap::Layout::Ru => "РУС",
@@ -1080,10 +1220,15 @@ impl Panel {
         let _ = mono;
         // Сеть, звук, раскладка, часы, колокол (макет 05).
         let mut status_w = (glyph + step) * 2 + body.width(lang) + step + clock_w + step + glyph;
+        // Screen recording (22.11): red dot and elapsed time before the network.
+        let recording = super::capture::elapsed_s().map(recording_text);
+        let dot = ctx.px(10);
+        let recording_w = recording.as_deref().map_or(0, |text| dot + ctx.px(6) + body.width(text) + step);
+        status_w += recording_w;
         // Совсем узкий экран: показать всё нельзя, и тогда правого края нет
         // вовсе. Обрезанное наполовину число хуже отсутствующего — по нему не
         // понять, что именно обрезано.
-        if status_w + m.brand_width() + m.plate_pad() * 2 + m.gap * 2 > plate.w {
+        if status_w + m.brand_width() + m.plate_pad() * 2 + m.gap * 2 > plate.w || self.secondary {
             status_w = 0;
         }
 
@@ -1100,7 +1245,24 @@ impl Panel {
         let logo = super::appicon::logo();
         let glyph = m.glyph();
         let ink = if logo.is_some() { p.ink } else { WHITE };
+        let classic = theme::is_classic();
         match &logo {
+            _ if classic => {
+                // «Пуск» Windows 98: выпуклая кнопка (открытое меню —
+                // вдавленная), знак и полужирное слово.
+                let t = mini_ui::classic::unit(self.scale);
+                let button = layout.brand;
+                mini_ui::classic::button(&mut self.surface, button, t, menu_open);
+                let shift = if menu_open { t as i32 } else { 0 };
+                let side = ctx.px(16);
+                let at = Rect::new(button.x + ctx.px(6) as i32 + shift, button.y + (button.h as i32 - side as i32) / 2 + shift, side, side);
+                match &logo {
+                    Some(logo) => logo.draw(&mut self.surface, at),
+                    None => draw_grid(&mut self.surface, at, side, p.acc),
+                }
+                let label = Rect::new(at.right() + ctx.px(5) as i32, button.y + shift, button.w, button.h);
+                paint::text(ctx, &mut self.surface, Role::Title, label.x, paint::baseline(ctx, Role::Title, label), CLASSIC_START, p.ink);
+            }
             Some(logo) => {
                 if menu_open {
                     draw::rounded(&mut self.surface, layout.brand, m.round_row, p.hover2.color, p.hover2.alpha);
@@ -1130,7 +1292,7 @@ impl Panel {
                 );
             }
         }
-        if logo.is_none() {
+        if logo.is_none() && !classic {
             paint::text(
                 ctx,
                 &mut self.surface,
@@ -1142,14 +1304,19 @@ impl Panel {
             );
         }
 
-        draw::vline(
-            &mut self.surface,
-            layout.divider.x,
-            layout.divider.y,
-            layout.divider.h,
-            p.line2.color,
-            p.line2.alpha,
-        );
+        if classic {
+            // Бороздка-разделитель Windows 98.
+            mini_ui::classic::groove_v(&mut self.surface, layout.divider.x, layout.divider.y, layout.divider.h, mini_ui::classic::unit(self.scale));
+        } else {
+            draw::vline(
+                &mut self.surface,
+                layout.divider.x,
+                layout.divider.y,
+                layout.divider.h,
+                p.line2.color,
+                p.line2.alpha,
+            );
+        }
 
         let edge = self.cfg.edge;
         for slot in &layout.slots {
@@ -1160,6 +1327,22 @@ impl Panel {
         if status_w > 0 {
             let half = (step / 2) as i32;
             let mut x = plate.right() - (m.plate_pad() + status_w) as i32;
+            if classic {
+                // Трей Windows 98 — мелкая вдавленность вокруг значков и часов.
+                let t = mini_ui::classic::unit(self.scale);
+                let well = Rect::new(x - half - ctx.px(2) as i32, layout.brand.y, (plate.right() - m.plate_pad() as i32 / 2 - (x - half - ctx.px(2) as i32)).max(0) as u32, layout.brand.h);
+                mini_ui::classic::shallow(&mut self.surface, well, t);
+            }
+
+            // Screen recording (22.11): red dot and elapsed time.
+            if let Some(text) = recording.as_deref() {
+                let spot = Rect::new(x, plate.y + (plate.h as i32 - dot as i32) / 2, dot, dot);
+                draw::rounded(&mut self.surface, spot, dot / 2, p.bad, 255);
+                let tx = spot.right() + ctx.px(6) as i32;
+                paint::text(ctx, &mut self.surface, Role::Body, tx, paint::baseline(ctx, Role::Body, plate), text, p.ink);
+                self.tray.push((TrayItem::Recording, Rect::new(x - half, plate.y, recording_w, plate.h)));
+                x += recording_w as i32;
+            }
 
             // Сеть: значок в полную силу, когда адрес есть, и приглушённый,
             // когда карты нет или адрес не получен. Приглушённый, а не другой
@@ -1259,6 +1442,44 @@ impl Panel {
         };
         let active = members.iter().any(|entry| entry.focused && !entry.minimized);
         let all_minimized = members.iter().all(|entry| entry.minimized);
+        if theme::is_classic() {
+            // Кнопка окна Windows 98 (22.11): выпуклая; у активного окна —
+            // вдавленная с серо-белой «шахматкой», как у Windows 98.
+            let t = mini_ui::classic::unit(self.scale);
+            mini_ui::classic::button(&mut self.surface, rect, t, active);
+            if active {
+                let inner = rect.shrink(2 * t);
+                let (a, b) = (theme::win98::LIGHT.pixel(), theme::win98::FACE.pixel());
+                let clip = inner.intersect(&self.surface.bounds());
+                for y in clip.y..clip.bottom() {
+                    let row = self.surface.row_mut(y as u32);
+                    for x in clip.x..clip.right() {
+                        row[x as usize] = if (x + y) & 1 == 0 { a } else { b };
+                    }
+                }
+            }
+            let shift = if active { t as i32 } else { 0 };
+            let side = slot.icon.min(rect.w).min(rect.h).min(ctx.px(20));
+            let labelled = !slot.label.is_empty();
+            let icon_x = if labelled { rect.x + ctx.px(5) as i32 } else { rect.x + (rect.w as i32 - side as i32) / 2 };
+            let icon_rect = Rect::new(icon_x + shift, rect.y + (rect.h as i32 - side as i32) / 2 + shift, side, side);
+            match slot.pin.and_then(|index| self.pins.get(index)) {
+                Some(pin) => pin.art.draw(ctx, &mut self.surface, icon_rect),
+                None => first.art.draw(ctx, &mut self.surface, icon_rect),
+            }
+            if labelled {
+                let role = if active { Role::Title } else { Role::Body };
+                let x = icon_rect.right() + ctx.px(4) as i32;
+                paint::text_clipped(ctx, &mut self.surface, role, x, paint::baseline(ctx, role, rect.translate(0, shift)), (rect.right() - x - ctx.px(4) as i32).max(0) as u32, &slot.label, p.ink);
+            }
+            if members.len() > 1 {
+                // Несколько окон за кнопкой — число в углу.
+                let count = alloc::format!("{}", members.len());
+                paint::text_right(ctx, &mut self.surface, Role::Caption, rect.right() - ctx.px(3) as i32, rect.y + ctx.px(1) as i32, &count, p.ink);
+            }
+            let _ = all_minimized;
+            return;
+        }
         if members.len() > 1 {
             // Стопка: край второй плашки правее (ниже у боковой полосы).
             let shift = ctx.px(3) as i32;
@@ -1324,8 +1545,9 @@ impl Panel {
                 (button, icon, ctx.px(DOCK_PAD), ctx.px(DOCK_GAP), button + ctx.px(DOCK_PAD) * 2)
             }
             deskcfg::Mode::Panel => {
-                let thick = ctx.px(PANEL_V_W);
-                (m.btn_h, m.icon(), (thick - m.btn_h) / 2, ctx.px(4), thick)
+                let thick = ctx.px(if self.cfg.small { SMALL_V_W } else { PANEL_V_W });
+                let button = m.btn_h.min(thick.saturating_sub(ctx.px(6)));
+                (button, m.icon(), (thick - button) / 2, ctx.px(4), thick)
             }
         }
     }
@@ -1342,6 +1564,12 @@ impl Panel {
         let lang = lang_tag();
         let (time, date) = short_clock(status);
         let mut out = alloc::vec![(TrayItem::Network, glyph + step), (TrayItem::Volume, glyph + step)];
+        // Screen recording (22.11): a red dot first (the time is in its row
+        // along a horizontal Dock only).
+        if let Some(seconds) = super::capture::elapsed_s() {
+            let len = if vertical { glyph + step } else { ctx.px(16) + caption.width(&recording_text(seconds)) + step };
+            out.insert(0, (TrayItem::Recording, len));
+        }
         if vertical {
             out.push((TrayItem::Layout, u32::from(caption.line) + step));
             let lines = if date.is_empty() { 1 } else { 2 };
@@ -1358,19 +1586,20 @@ impl Panel {
     /// окна, черта, трей — вдоль оси полосы.
     fn redraw_strip(&mut self, windows: &[Entry], menu_open: bool, status: &Status) {
         let ctx = desk_ctx(self.scale);
-        let m = Metrics::new(ctx);
+        let m = self.metrics();
         let p = ctx.palette;
         let vertical = self.cfg.edge.vertical();
         let dock = self.cfg.mode == deskcfg::Mode::Dock;
         let (button, icon, pad, gap, thick) = self.strip_sizes(m);
-        let tray = self.strip_tray(m, status);
+        let tray = if self.secondary { Vec::new() } else { self.strip_tray(m, status) };
         let tray_len: u32 = tray.iter().map(|(_, len)| *len).sum();
         let plan = plan_slots(windows, &self.pins, false);
 
         // Длина Dock — по содержимому; панель — во всю сторону.
         let side_len = if vertical { self.area.h } else { self.area.w };
         let room = side_len.saturating_sub(ctx.px(DOCK_INSET) * 2);
-        let fixed = pad * 2 + button + gap + gap * 2 + 1 + tray_len;
+        // Без трея (Dock второго монитора) — без черты и поля перед ним.
+        let fixed = pad * 2 + button + gap + if tray.is_empty() { 0 } else { gap * 2 + 1 + tray_len };
         let fits = ((room.saturating_sub(fixed)) / (button + gap)) as usize;
         let shown = plan.len().min(fits);
         if dock {
@@ -1442,7 +1671,7 @@ impl Panel {
         let mut buttons = Buttons::new();
         let mut pin_hits = Vec::new();
         let mut slots = Vec::new();
-        let end = length.saturating_sub(pad + tray_len + gap * 2 + 1);
+        let end = length.saturating_sub(pad + if tray.is_empty() { 0 } else { tray_len + gap * 2 + 1 });
         for (members, pin, label) in plan.into_iter() {
             if at + button > end {
                 break;
@@ -1470,7 +1699,9 @@ impl Panel {
         // самом конце стороны.
         let mut at = if dock { at + gap } else { length.saturating_sub(pad + tray_len) };
         let rule = place(at.saturating_sub(gap + 1), 1, ctx.px(24));
-        if vertical {
+        if self.secondary {
+            // Трея у панели второго монитора нет — и черты перед ним.
+        } else if vertical {
             draw::hline(&mut self.surface, rule.x, rule.y, rule.w, p.line2.color, p.line2.alpha);
         } else {
             let rule = place(at.saturating_sub(gap + 1), 1, ctx.px(24));
@@ -1499,6 +1730,19 @@ impl Panel {
                 }
                 TrayItem::Layout => {
                     paint::text_centered(ctx, &mut self.surface, Role::Caption, rect, lang_tag(), p.ink);
+                }
+                TrayItem::Recording => {
+                    let dot = ctx.px(10);
+                    if vertical {
+                        let (x, y) = center(dot);
+                        draw::rounded(&mut self.surface, Rect::new(x, y, dot, dot), dot / 2, p.bad, 255);
+                    } else {
+                        let spot = Rect::new(rect.x, rect.y + (rect.h as i32 - dot as i32) / 2, dot, dot);
+                        draw::rounded(&mut self.surface, spot, dot / 2, p.bad, 255);
+                        let text = recording_text(super::capture::elapsed_s().unwrap_or(0));
+                        let row = Rect::new(spot.right() + ctx.px(4) as i32, rect.y, rect.w.saturating_sub(dot + ctx.px(4)), rect.h);
+                        paint::text_centered(ctx, &mut self.surface, Role::Caption, row, &text, p.ink);
+                    }
                 }
                 TrayItem::Clock => {
                     let line = i32::from(ctx.face(Role::Caption).line);
@@ -1697,7 +1941,7 @@ fn centered_icon(surface: &mut Surface, rect: Rect, icon: Icon, size: u32, color
 /// Где стоит видимая плашка ПК с этими настройками. `length` — длина
 /// Dock вдоль стороны (по содержимому); `None` — пока неизвестна, берётся
 /// короткая заготовка, первая перерисовка подгонит её.
-fn plate_home(area: Rect, cfg: deskcfg::Taskbar, scale: u32, length: Option<u32>) -> Option<Rect> {
+fn plate_home(area: Rect, cfg: deskcfg::Taskbar, scale: mini_ui::Scale, length: Option<u32>) -> Option<Rect> {
     let thick = Panel::thickness(cfg, scale);
     if area.w <= thick || area.h <= thick {
         return None;
@@ -1812,7 +2056,7 @@ fn panel_layout(m: Metrics, plate: Rect, windows: &[Entry], status_w: u32, pins:
     // а черта внутри одного блока, и широкие поля вокруг неё превратили бы её в
     // третий столбец панели.
     let rule = m.ctx.px(4);
-    let rule_h = m.ctx.px(24);
+    let rule_h = m.ctx.px(24).min(m.btn_h);
     let divider = Rect::new(
         brand.right() + rule as i32,
         plate.y + (plate.h as i32 - rule_h as i32) / 2,
@@ -1969,27 +2213,18 @@ pub(super) fn list_packages() -> Vec<Launcher> {
 
 // ── Программы Windows из префиксов Proton (P12, 18.11.2026) ─────────────────
 
-/// Ярлык программы Windows: `.desktop`, который `winemenubuilder` установщика
-/// записал в `ПРЕФИКС/drive_c/proton_shortcuts/` (так у Proton: не в
-/// `~/.local/share/applications/wine`). Читает его и запускает сценарий
-/// `fossai-proton --shortcut=…`; здесь — только имя, значок и путь.
-pub(super) struct WinShortcut {
-    pub(super) caption: String,
-    /// Путь файла `.desktop`.
-    pub(super) file: String,
-    /// Префикс Wine — каталог с `drive_c`.
-    pub(super) prefix: String,
-    /// FIMG значка, если он уже сделан из PNG; иначе пусто.
-    pub(super) icon: String,
-    /// Ярлык удаления («Uninstall …» — его кладут Inno Setup, NSIS и подобные).
-    pub(super) uninstall: bool,
-}
+/// Ярлык программы Windows (21.11 — из `.lnk` префикса, см. `ui::winapps`;
+/// до того — только `.desktop` `winemenubuilder` из `proton_shortcuts`).
+pub(super) type WinShortcut = super::winapps::WinApp;
 
 /// Сценарий пакета `proton`.
-const PROTON_SCRIPT: &str = "/opt/proton/bin/fossai-proton";
+pub(super) const PROTON_SCRIPT: &str = "/opt/proton/bin/fossai-proton";
 
-/// Где в префиксе лежат ярлыки.
-const SHORTCUTS: &str = "drive_c/proton_shortcuts";
+/// Запуск строки `fossai-proton` с правами пакета `proton` (стол, 21.11).
+pub(super) fn proton_choice(line: String) -> Choice {
+    let rights = list_packages().into_iter().find(|launcher| launcher.name == "proton").map_or(fpk::Rights::NONE, |launcher| launcher.rights);
+    Choice::Command(line, rights)
+}
 
 /// Командная строка `fossai-proton` с аргументами.
 pub(super) fn proton_line(args: &str) -> String {
@@ -2015,58 +2250,11 @@ fn exists(path: &str) -> bool {
     matches!(crate::fs::read(path, 0), Some(Ok(_)))
 }
 
-/// Ярлыки во всех префиксах дома (`~/.proton`, `~/.tmnf`, … — каталоги с
-/// точкой, в которых есть `drive_c/proton_shortcuts`). Дом — того, кто вошёл,
-/// и `/root` (живая флешка и `run` из оболочки ставят туда). Без пакета
-/// `proton` — пусто: запускать ярлыки нечем.
+/// Ярлыки программ Windows во всех префиксах дома (`~/.proton`, `~/.tmnf`,
+/// …) и `/root`: `.lnk` их «Пуска» и стола, `.desktop` `winemenubuilder`.
+/// Без пакета `proton` — пусто: запускать ярлыки нечем.
 pub(super) fn windows_shortcuts() -> Vec<WinShortcut> {
-    const LIMIT: usize = 16 * 1024;
-    let mut out = Vec::new();
-    if !exists(PROTON_SCRIPT) {
-        return out;
-    }
-    let mut homes = alloc::vec![super::context::home_dir()];
-    if homes[0] != "/root" {
-        homes.push(String::from("/root"));
-    }
-    for home in &homes {
-        let Some(Ok(entries)) = crate::fs::list(home) else {
-            continue;
-        };
-        for entry in entries {
-            if entry.kind != crate::vfs::NodeKind::Directory || !entry.name.starts_with('.') || entry.name.len() < 2 {
-                continue;
-            }
-            let prefix = alloc::format!("{home}/{}", entry.name);
-            let dir = alloc::format!("{prefix}/{SHORTCUTS}");
-            let Some(Ok(files)) = crate::fs::list(&dir) else {
-                continue;
-            };
-            for file in files {
-                if file.kind != crate::vfs::NodeKind::File || !file.name.ends_with(".desktop") {
-                    continue;
-                }
-                let path = alloc::format!("{dir}/{}", file.name);
-                let Some(Ok((bytes, _))) = crate::fs::read(&path, LIMIT) else {
-                    continue;
-                };
-                let text = String::from_utf8_lossy(&bytes);
-                let field = |key: &str| {
-                    text.lines().find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('='))).map(str::trim)
-                };
-                if field("NoDisplay") == Some("true") {
-                    continue;
-                }
-                let caption = String::from(field("Name").unwrap_or_else(|| file.name.trim_end_matches(".desktop")));
-                let lower = caption.to_lowercase();
-                let uninstall = lower.starts_with("uninstall") || lower.starts_with("удалить") || file.name.to_lowercase().starts_with("uninstall");
-                let icon = shortcut_icon(&dir, field("Icon").unwrap_or(""));
-                out.push(WinShortcut { caption, file: path, prefix: prefix.clone(), icon, uninstall });
-            }
-        }
-    }
-    out.sort_by(|a, b| a.caption.cmp(&b.caption));
-    out
+    super::winapps::scan()
 }
 
 /// Префиксы Wine в доме (каталоги с точкой, в которых есть `system.reg`):
@@ -2077,10 +2265,8 @@ pub(super) fn windows_prefixes() -> Vec<String> {
     if !exists(PROTON_SCRIPT) {
         return out;
     }
-    let mut homes = alloc::vec![super::context::home_dir()];
-    if homes[0] != "/root" {
-        homes.push(String::from("/root"));
-    }
+    // Те же дома, что у «Программ Windows» (с двойниками в корне Debian).
+    let homes = super::winapps::homes();
     for home in &homes {
         let Some(Ok(entries)) = crate::fs::list(home) else {
             continue;
@@ -2103,7 +2289,7 @@ pub(super) fn windows_prefixes() -> Vec<String> {
 /// `proton_shortcuts/icons/` (по размерам `ШxВ/apps/`) или полный путь. PNG
 /// стол не читает: если FIMG рядом ещё нет, запускается `png2fimg`, и значок
 /// появится при следующем открытии меню; пока — общий значок Windows.
-fn shortcut_icon(dir: &str, icon: &str) -> String {
+pub(super) fn shortcut_icon(dir: &str, icon: &str) -> String {
     if icon.is_empty() {
         return String::new();
     }
@@ -2150,20 +2336,23 @@ fn convert_icon(png: &str, fimg: &str) {
 /// Строки «Пуска» для программ Windows: запуск ярлыка с правами пакета
 /// `proton` (у него `windows files net jit`). Ярлыки удаления — не здесь, а
 /// в «Параметры → Пакеты».
-fn windows_launchers(packages: &[Launcher]) -> Vec<Launcher> {
-    let Some(proton) = packages.iter().find(|launcher| launcher.name == "proton") else {
-        return Vec::new();
+pub(super) fn windows_launchers(packages: &[Launcher]) -> Vec<Launcher> {
+    let rights = match packages.iter().find(|launcher| launcher.name == "proton") {
+        Some(proton) => proton.rights,
+        None if super::winapps::proton_present() => fpk::Rights::NONE,
+        None => return Vec::new(),
     };
     windows_shortcuts()
         .into_iter()
-        .filter(|shortcut| !shortcut.uninstall)
+        // Ярлыки стола префикса — на столе (`Icons::reload`), не в «Пуске».
+        .filter(|shortcut| !shortcut.uninstall && !shortcut.desktop)
         .map(|shortcut| {
             let place = shortcut.prefix.rsplit('/').next().unwrap_or("");
             Launcher {
-                name: alloc::format!("windows:{}", shortcut.file),
-                about: alloc::format!("Windows · {place}"),
-                start: proton_line(&alloc::format!("--shortcut={}", pct(&shortcut.file))),
-                rights: proton.rights,
+                name: shortcut.key(),
+                about: if shortcut.group.is_empty() { alloc::format!("Windows · {place}") } else { alloc::format!("Windows · {place} · {}", shortcut.group) },
+                start: proton_line(&shortcut.args()),
+                rights,
                 desktop: false,
                 icon: if shortcut.icon.is_empty() { String::from("windows-apps") } else { shortcut.icon },
                 opens: String::new(),
@@ -2286,8 +2475,13 @@ enum Target {
 }
 
 /// Маленькие кнопки слева от питания: диспетчер задач, диспетчер
-/// устройств, параметры (Роман, 20.11).
-const TOOLS: [(&str, Fi); 3] = [("Диспетчер задач", Fi::Activity), ("Диспетчер устройств", Fi::Cpu), ("Параметры", Fi::Sliders)];
+/// устройств, «Администрирование» (П3), параметры (Роман, 20.11).
+const TOOLS: [(&str, Fi); 4] = [
+    ("Диспетчер задач", Fi::Activity),
+    ("Диспетчер устройств", Fi::Cpu),
+    ("Администрирование", Fi::ShieldAdmin),
+    ("Параметры", Fi::Sliders),
+];
 
 /// Что делает строка всплывающего меню.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -2298,6 +2492,10 @@ enum PopAct {
     PinTask(String),
     UnpinTask(String),
     First(String),
+    /// Перенести строку (номер в `items`) в папку (пусто — наружу), 21.11.
+    MoveTo(usize, &'static str),
+    /// Ярлык программы Windows на рабочий стол.
+    Desk(usize),
     Account,
     Lock,
     Logout,
@@ -2310,6 +2508,29 @@ enum Popup {
     Menu { at: (i32, i32), rows: Vec<(String, PopAct, bool)> },
     User,
     Folder { folder: &'static startapps::Folder, cell: Rect },
+}
+
+/// Нажатая и, может быть, перетаскиваемая строка «Пуска» (21.11).
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    /// Номер в `items`.
+    index: usize,
+    /// Где нажали и где указатель сейчас (экран).
+    from: (i32, i32),
+    at: (i32, i32),
+    dragging: bool,
+}
+
+/// Куда бросили перетаскиваемую строку.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DropAt {
+    /// Мимо «Пуска» — на стол: ярлык программы Windows.
+    Desktop,
+    /// В папку (пусто — из папок наружу).
+    Folder(&'static str),
+    /// К закреплённым — плиткой.
+    Pin,
+    Nothing,
 }
 
 /// Что сделал щелчок по открытому «Пуску».
@@ -2334,8 +2555,15 @@ pub struct Menu {
     surface: Surface,
     pub rect: Rect,
     /// Множитель геометрии стола.
-    scale: u32,
+    scale: mini_ui::Scale,
     items: Vec<Item>,
+    /// Папка каждой строки (ключ из `FOLDERS`, пусто — верхний уровень):
+    /// своя из манифеста, программы Windows — «Программы Windows», или та,
+    /// куда человек перенёс строку (`deskcfg::start_folder`, 21.11).
+    homes: Vec<&'static str>,
+    /// Строка, на которой нажали кнопку (21.11): запуск — при отпускании
+    /// на месте, перенос — если её потащили.
+    held: Option<Held>,
     /// Выбранная строка — номер в `visible`.
     row: usize,
     open: bool,
@@ -2371,6 +2599,8 @@ pub struct Menu {
     scratch: Option<Surface>,
     /// Сторона панели — с неё «Пуск» открывается.
     edge: deskcfg::Edge,
+    /// Каскадное меню Windows 98 — «Пуск» в классике (22.11, `cascade`).
+    cascade: cascade::Cascade,
 }
 
 /// «Пуск» ПК (72f, 20.11): размеры в точках при масштабе 1.
@@ -2426,8 +2656,8 @@ impl Menu {
     /// «Пуск» у панели основного монитора: `area` — его место на столе,
     /// `panel` — место видимой панели, `cfg` — её настройки.
     #[must_use]
-    pub fn new(area: Rect, panel: Rect, cfg: deskcfg::Taskbar, scale: u32) -> Option<Self> {
-        let scale = scale.max(1);
+    pub fn new(area: Rect, panel: Rect, cfg: deskcfg::Taskbar, scale: mini_ui::Scale) -> Option<Self> {
+        let scale = scale;
         let ctx = desk_ctx(scale);
         let m = Metrics::new(ctx);
         let panel_top = if panel.is_empty() { area.bottom() } else { panel.y };
@@ -2462,7 +2692,31 @@ impl Menu {
         items.extend([Item::App(App::Shutdown), Item::App(App::Restart)]);
 
         let start_cfg = deskcfg::start();
-        let (card_w, card_h, width) = if theme::is_mobile() {
+        // Классика (22.11): каскадное меню Windows 98 вплотную к панели.
+        let cascade = if theme::is_classic() && !theme::is_mobile() {
+            let mut work = area;
+            if !panel.is_empty() && !cfg.autohide {
+                match cfg.edge {
+                    deskcfg::Edge::Bottom => work.h = (panel.y - area.y).max(1) as u32,
+                    deskcfg::Edge::Top => {
+                        work.y = panel.bottom();
+                        work.h = (area.bottom() - panel.bottom()).max(1) as u32;
+                    }
+                    deskcfg::Edge::Left => {
+                        work.x = panel.right();
+                        work.w = (area.right() - panel.right()).max(1) as u32;
+                    }
+                    deskcfg::Edge::Right => work.w = (panel.x - area.x).max(1) as u32,
+                }
+            }
+            cascade::Cascade::new(work)
+        } else {
+            cascade::Cascade::off()
+        };
+        let (card_w, card_h, width) = if cascade.on {
+            let (w, h) = cascade.root_size(ctx);
+            (w, h.min(area.h), 0)
+        } else if theme::is_mobile() {
             // На телефоне «Пуск» занимает экран целиком — от строки состояния
             // до дока.
             let inset = ctx.px(theme::M_INSET);
@@ -2489,6 +2743,8 @@ impl Menu {
         let surface = Surface::new(card_w, card_h, glass_bg())?;
         let rect = if theme::is_mobile() {
             Rect::new(area.x + ctx.px(theme::M_INSET) as i32, panel_top - surface.height() as i32, surface.width(), surface.height())
+        } else if cascade.on {
+            menu_place(area, panel, cfg, surface.width(), surface.height(), 0)
         } else {
             menu_place(area, panel, cfg, surface.width(), surface.height(), ctx.px(8))
         };
@@ -2498,6 +2754,8 @@ impl Menu {
             rect,
             scale,
             items,
+            homes: Vec::new(),
+            held: None,
             row: 0,
             open: false,
             damage: Rect::EMPTY,
@@ -2517,7 +2775,9 @@ impl Menu {
             recent: Vec::new(),
             scratch: None,
             edge: cfg.edge,
+            cascade,
         };
+        menu.compute_homes();
         menu.load_tiles();
         Some(menu)
     }
@@ -2529,7 +2789,7 @@ impl Menu {
         for key in deskcfg::start_pins() {
             if let Some(folder) = startapps::folder(&key) {
                 // Пустая папка (ни одной программы на диске) не ставится.
-                if self.items.iter().any(|item| item.folder() == folder.key) {
+                if self.homes.iter().any(|home| *home == folder.key) {
                     self.tiles.push(Tile::Folder(folder));
                 }
                 continue;
@@ -2538,6 +2798,157 @@ impl Menu {
                 self.tiles.push(Tile::Item(index));
             }
         }
+    }
+
+    /// Папки строк (21.11): перенос человека, иначе своя.
+    fn compute_homes(&mut self) {
+        let homes = (0..self.items.len())
+            .map(|index| {
+                let item = self.items[index];
+                if item.danger() {
+                    return "";
+                }
+                let key = item.key(&self.packages);
+                if let Some(chosen) = deskcfg::start_folder(&key) {
+                    return startapps::folder(&chosen).map_or("", |folder| folder.key);
+                }
+                match item {
+                    Item::Package(n) if self.packages.get(n).is_some_and(|launcher| launcher.name.starts_with("windows:")) => startapps::WINDOWS_FOLDER,
+                    _ => item.folder(),
+                }
+            })
+            .collect();
+        self.homes = homes;
+    }
+
+    /// Папка строки `index` (пусто — верхний уровень).
+    fn home(&self, index: usize) -> &'static str {
+        self.homes.get(index).copied().unwrap_or("")
+    }
+
+    /// Программа Windows ли строка (у неё есть ярлык, который можно положить
+    /// на стол): путь ярлыка.
+    fn windows_file(&self, index: usize) -> Option<&str> {
+        match self.items.get(index)? {
+            Item::Package(n) => self.packages.get(*n)?.name.strip_prefix("windows:"),
+            _ => None,
+        }
+    }
+
+    /// Перенести строку `index` в папку `folder` (пусто — наружу).
+    fn move_to_folder(&mut self, index: usize, folder: &'static str) {
+        let key = self.items[index].key(&self.packages);
+        deskcfg::set_start_folder(&key, folder);
+        crate::kprintln!("  desktop     : start item '{key}' moved to {}", if folder.is_empty() { "the top level" } else { folder });
+        self.compute_homes();
+        if !folder.is_empty() && !self.expanded.contains(&folder) {
+            self.expanded.push(folder);
+        }
+    }
+
+    /// Положить ярлык программы Windows `index` на стол. `true` — положен.
+    fn shortcut_to_desktop(&self, index: usize) -> bool {
+        let Some(file) = self.windows_file(index) else { return false };
+        let caption = self.items[index].caption(&self.packages);
+        match super::winapps::copy_to_desktop(file, caption) {
+            Ok(path) => {
+                crate::kprintln!("  desktop     : shortcut '{caption}' put on the desktop as {path}");
+                true
+            }
+            Err(err) => {
+                crate::kprintln!("  desktop     : shortcut '{caption}' not put on the desktop: {err}");
+                false
+            }
+        }
+    }
+
+    /// Указатель движется с нажатой левой кнопкой (21.11): строку, на которой
+    /// нажали, потащили дальше 8 точек — начался перенос. `true` —
+    /// перерисовано.
+    pub fn drag(&mut self, x: i32, y: i32) -> bool {
+        let Some(held) = self.held.as_mut() else { return false };
+        let moved = (x - held.from.0).abs() > 8 || (y - held.from.1).abs() > 8;
+        if !held.dragging && !moved {
+            return false;
+        }
+        if !held.dragging {
+            held.dragging = true;
+            self.popup = None;
+            let caption = self.items[held.index].caption(&self.packages);
+            crate::kprintln!("  desktop     : start drag of '{caption}'");
+        }
+        held.at = (x, y);
+        self.hot = self.target_at(x, y).map(|(target, _)| target);
+        self.redraw();
+        true
+    }
+
+    /// Тащат ли сейчас строку «Пуска».
+    #[must_use]
+    pub fn dragging(&self) -> bool {
+        self.held.as_ref().is_some_and(|held| held.dragging)
+    }
+
+    /// Куда упадёт перенос в точке `x, y` и что об этом сказать.
+    fn drop_at(&self, index: usize, x: i32, y: i32) -> (DropAt, &'static str) {
+        if !self.rect.contains(x, y) {
+            return if self.windows_file(index).is_some() { (DropAt::Desktop, "Отпустите — ярлык на рабочем столе") } else { (DropAt::Nothing, "Ярлык на стол — только у программ Windows") };
+        }
+        let layout = self.start_layout();
+        let (lx, ly) = (x - self.rect.x, y - self.rect.y);
+        let target = self.target_at(x, y).map(|(target, _)| target);
+        let in_pins = layout.pins.is_some_and(|pins| pins.contains(lx, ly));
+        let in_list = layout.list.is_some_and(|list| list.contains(lx, ly));
+        match target {
+            Some(Target::FolderRow(number)) => (DropAt::Folder(startapps::FOLDERS[number].key), "Отпустите — переместить в папку"),
+            Some(Target::Tile(n)) => match self.tiles.get(n) {
+                Some(Tile::Folder(folder)) => (DropAt::Folder(folder.key), "Отпустите — переместить в папку"),
+                _ if !deskcfg::start_pinned(&self.items[index].key(&self.packages)) => (DropAt::Pin, "Отпустите — закрепить в «Пуске»"),
+                _ => (DropAt::Nothing, ""),
+            },
+            _ if in_pins && !deskcfg::start_pinned(&self.items[index].key(&self.packages)) => (DropAt::Pin, "Отпустите — закрепить в «Пуске»"),
+            Some(Target::Row(other)) if in_list && !self.home(other).is_empty() && self.home(other) != self.home(index) => (DropAt::Folder(self.home(other)), "Отпустите — переместить в папку"),
+            _ if in_list && !self.home(index).is_empty() => (DropAt::Folder(""), "Отпустите — убрать из папки"),
+            _ => (DropAt::Nothing, ""),
+        }
+    }
+
+    /// Левую кнопку отпустили (21.11). Нажатие без переноса — запуск строки,
+    /// как раньше щелчок; перенос — папка, закрепление или ярлык на столе.
+    /// `None` — «Пуск» нажатия не держал.
+    pub fn release(&mut self, x: i32, y: i32) -> Option<MenuClick> {
+        let held = self.held.take()?;
+        if !held.dragging {
+            return Some(self.launch(held.index));
+        }
+        let (place, _) = self.drop_at(held.index, x, y);
+        self.hot = None;
+        let out = match place {
+            DropAt::Desktop => {
+                // Стол перечитает свой каталог сам (наблюдение за ним).
+                self.shortcut_to_desktop(held.index);
+                MenuClick::Close
+            }
+            DropAt::Folder(folder) => {
+                self.move_to_folder(held.index, folder);
+                MenuClick::Stay
+            }
+            DropAt::Pin => {
+                let key = self.items[held.index].key(&self.packages);
+                deskcfg::toggle_start_pin(&key);
+                crate::kprintln!("  desktop     : start pinned '{key}' (dragged)");
+                MenuClick::Stay
+            }
+            DropAt::Nothing => {
+                crate::kprintln!("  desktop     : start drag dropped on nothing");
+                MenuClick::Stay
+            }
+        };
+        self.load_tiles();
+        self.clamp_scroll();
+        self.redraw();
+        self.log_rows();
+        Some(out)
     }
 
     /// Набрать знак в поле поиска (72f). `true` — запрос изменился.
@@ -2615,14 +3026,41 @@ impl Menu {
             self.keys_used = false;
             self.expanded.clear();
             self.recent = super::recent_files();
+            self.cascade.reset();
             self.redraw();
         }
         self.open
     }
 
+    /// Подменю закрытого меню остаются собранными до следующего открытия:
+    /// по ним [`Self::full_rect`] говорит композитору, что стереть.
     pub fn close(&mut self) {
         self.open = false;
         self.popup = None;
+        self.held = None;
+    }
+
+    /// Подменю классического «Пуска» поверх его карточки (22.11): поверхность
+    /// и место на экране.
+    pub fn layers(&self) -> impl Iterator<Item = (&Surface, Rect)> {
+        self.cascade.layers()
+    }
+
+    /// Где появились и откуда ушли подменю (экран).
+    pub fn take_sub_damage(&mut self) -> Rect {
+        self.cascade.take_damage()
+    }
+
+    /// Место карточки вместе с открытыми подменю.
+    #[must_use]
+    pub fn full_rect(&self) -> Rect {
+        self.cascade.span(self.rect)
+    }
+
+    /// Собран ли «Пуск» каскадом Windows 98.
+    #[must_use]
+    pub const fn is_classic(&self) -> bool {
+        self.cascade.on
     }
 
     /// Где что стоит в открытом «Пуске», строками `имя at X,Y WxH` в
@@ -2631,6 +3069,9 @@ impl Menu {
     pub fn spots(&self) -> Vec<String> {
         if theme::is_mobile() {
             return Vec::new();
+        }
+        if self.cascade.on {
+            return self.c_spots();
         }
         let layout = self.start_layout();
         let at = |name: &str, rect: Rect| alloc::format!("{name} at {},{} {}x{}", rect.x + self.rect.x, rect.y + self.rect.y, rect.w, rect.h);
@@ -2649,6 +3090,8 @@ impl Menu {
                     None => continue,
                 },
                 Target::FolderRow(number) => alloc::format!("row:{}", startapps::FOLDERS[number].key),
+                // Программы Windows (21.11) — по подписи: ключ у них — путь.
+                Target::Row(index) if self.windows_file(index).is_some() => alloc::format!("row:win:{}", self.items[index].caption(&self.packages)),
                 Target::User => String::from("user"),
                 Target::Tool(n) => alloc::format!("tool:{n}"),
                 Target::Power(index) => alloc::format!("power:{}", self.items[index].key(&self.packages)),
@@ -2671,6 +3114,14 @@ impl Menu {
     /// Напечатать места строк всплывающего (стенд целится в них).
     fn log_popup(&self) {
         for spot in self.spots().into_iter().filter(|spot| spot.starts_with("pop:") || spot.starts_with("child:")) {
+            crate::kprintln!("  desktop     : start spot {spot}");
+        }
+    }
+
+    /// Напечатать места строк программ Windows в списке (после раскрытия
+    /// папки и переноса стенд целится в них заново).
+    fn log_rows(&self) {
+        for spot in self.spots().into_iter().filter(|spot| spot.starts_with("row:") || spot.starts_with("tile:pkg:windows:")) {
             crate::kprintln!("  desktop     : start spot {spot}");
         }
     }
@@ -2745,7 +3196,7 @@ impl Menu {
     /// прокручен до неё.
     fn reveal_selection(&mut self) {
         let Some(index) = self.visible.get(self.row).copied() else { return };
-        let folder = self.items[index].folder();
+        let folder = self.home(index);
         if !folder.is_empty() && self.query.is_empty() {
             if let Some(known) = startapps::folder(folder) {
                 if !self.expanded.contains(&known.key) {
@@ -2802,13 +3253,13 @@ impl Menu {
         let mut top: Vec<(String, Target)> = Vec::new();
         for index in 0..self.items.len() {
             let item = self.items[index];
-            if item.danger() || !item.folder().is_empty() {
+            if item.danger() || !self.home(index).is_empty() {
                 continue;
             }
             top.push((item.caption(&self.packages).to_lowercase(), Target::Row(index)));
         }
         for (number, folder) in startapps::FOLDERS.iter().enumerate() {
-            if self.items.iter().any(|item| item.folder() == folder.key) {
+            if self.homes.iter().any(|home| *home == folder.key) {
                 top.push((String::from(folder.caption).to_lowercase(), Target::FolderRow(number)));
             }
         }
@@ -2820,7 +3271,7 @@ impl Menu {
                 let folder = &startapps::FOLDERS[number];
                 if self.expanded.contains(&folder.key) {
                     for index in 0..self.items.len() {
-                        if self.items[index].folder() == folder.key {
+                        if self.home(index) == folder.key {
                             rows.push((Target::Row(index), true));
                         }
                     }
@@ -3015,7 +3466,7 @@ impl Menu {
                 Some((rect, lines))
             }
             Popup::Folder { folder, cell } => {
-                let children: Vec<usize> = (0..self.items.len()).filter(|index| self.items[*index].folder() == folder.key).collect();
+                let children: Vec<usize> = (0..self.items.len()).filter(|index| self.home(*index) == folder.key).collect();
                 let columns = (children.len() as u32).clamp(1, 3);
                 let rows = (children.len() as u32).div_ceil(columns).max(1);
                 let w = px(CELL_W) * columns + px(24);
@@ -3075,7 +3526,7 @@ impl Menu {
     /// Колесо над «Пуском»: прокрутить колонку под указателем. `true` —
     /// что-то сдвинулось.
     pub fn wheel(&mut self, x: i32, y: i32, clicks: i32) -> bool {
-        if theme::is_mobile() || !self.rect.contains(x, y) {
+        if theme::is_mobile() || self.cascade.on || !self.rect.contains(x, y) {
             return false;
         }
         let (lx, ly) = (x - self.rect.x, y - self.rect.y);
@@ -3092,6 +3543,7 @@ impl Menu {
             return false;
         }
         crate::kprintln!("  desktop     : start scrolled: list {}, pins {}", self.scroll_list, self.scroll_pins);
+        self.log_rows();
         // Всплывающая папка привязана к плитке — при прокрутке она бы
         // повисла в воздухе.
         if matches!(self.popup, Some(Popup::Folder { .. })) {
@@ -3107,6 +3559,9 @@ impl Menu {
     pub fn hover(&mut self, x: i32, y: i32) -> bool {
         if theme::is_mobile() || !self.open {
             return false;
+        }
+        if self.cascade.on {
+            return self.c_hover(x, y);
         }
         let found = self.target_at(x, y);
         let hot = found.map(|(target, _)| target);
@@ -3158,6 +3613,9 @@ impl Menu {
                 None => MenuClick::Close,
             };
         }
+        if self.cascade.on {
+            return self.c_click(x, y);
+        }
         if !self.rect.contains(x, y) {
             return MenuClick::Close;
         }
@@ -3176,8 +3634,11 @@ impl Menu {
             return MenuClick::Stay;
         };
         match target {
+            // Строка и плитка программы запускаются при отпускании на месте
+            // ([`Self::release`]): нажатую можно утащить в папку, к
+            // закреплённым или на стол (21.11).
             Target::Tile(n) => match self.tiles.get(n).copied() {
-                Some(Tile::Item(index)) => self.launch(index),
+                Some(Tile::Item(index)) => self.hold(index, x, y),
                 Some(Tile::Folder(folder)) => {
                     let again = matches!(&self.popup, Some(Popup::Folder { folder: shown, .. }) if shown.key == folder.key);
                     self.popup = if again { None } else { Some(Popup::Folder { folder, cell: rect }) };
@@ -3186,7 +3647,8 @@ impl Menu {
                 }
                 None => MenuClick::Stay,
             },
-            Target::Row(index) | Target::Child(index) | Target::Power(index) => self.launch(index),
+            Target::Row(index) | Target::Child(index) => self.hold(index, x, y),
+            Target::Power(index) => self.launch(index),
             Target::FolderRow(number) => {
                 let key = startapps::FOLDERS[number].key;
                 match self.expanded.iter().position(|known| *known == key) {
@@ -3201,6 +3663,7 @@ impl Menu {
                 }
                 self.clamp_scroll();
                 self.redraw();
+                self.log_rows();
                 MenuClick::Stay
             }
             Target::Recent(n) => match self.recent.get(n) {
@@ -3219,6 +3682,7 @@ impl Menu {
             Target::Tool(tool) => MenuClick::Launch(match tool {
                 0 => Choice::Program("taskmgr", ""),
                 1 => Choice::Program("devmgr", ""),
+                2 => Choice::Program("admin", ""),
                 _ => Choice::App(App::Settings),
             }),
             Target::Bar(list) => {
@@ -3246,6 +3710,12 @@ impl Menu {
         }
     }
 
+    /// Нажали на строку `index`: запомнить, решит отпускание.
+    fn hold(&mut self, index: usize, x: i32, y: i32) -> MenuClick {
+        self.held = Some(Held { index, from: (x, y), at: (x, y), dragging: false });
+        MenuClick::Stay
+    }
+
     /// Запустить строку `index`.
     fn launch(&mut self, index: usize) -> MenuClick {
         if let Some(at) = self.visible.iter().position(|known| *known == index) {
@@ -3260,6 +3730,11 @@ impl Menu {
     /// Правая кнопка над «Пуском»: меню программы. `false` — точка не над
     /// «Пуском».
     pub fn context(&mut self, x: i32, y: i32) -> bool {
+        if self.cascade.on {
+            // Меню программы в каскаде пока нет — правая кнопка над ним
+            // просто не уходит столу.
+            return self.full_rect().contains(x, y);
+        }
         if theme::is_mobile() || !self.rect.contains(x, y) {
             return false;
         }
@@ -3311,6 +3786,19 @@ impl Menu {
             } else {
                 rows.push((String::from("Закрепить на панели задач"), PopAct::PinTask(key.clone()), true));
             }
+        }
+        // Папки (21.11): строку списка — в любую папку «Пуска» или наружу.
+        if let Some(index) = item.filter(|_| !in_pins) {
+            let home = self.home(index);
+            for folder in startapps::FOLDERS.iter().filter(|folder| folder.key != home) {
+                rows.push((alloc::format!("Переместить в «{}»", folder.caption), PopAct::MoveTo(index, folder.key), true));
+            }
+            if !home.is_empty() {
+                rows.push((String::from("Убрать из папки"), PopAct::MoveTo(index, ""), true));
+            }
+        }
+        if let Some(index) = item.filter(|index| self.windows_file(*index).is_some()) {
+            rows.push((String::from("Создать ярлык на рабочем столе"), PopAct::Desk(index), true));
         }
         crate::kprintln!("  desktop     : start context menu for '{key}'");
         self.popup = Some(Popup::Menu { at, rows });
@@ -3367,6 +3855,16 @@ impl Menu {
                 crate::kprintln!("  desktop     : taskbar {} '{key}'", if pinned { "pinned" } else { "unpinned" });
                 stay(self)
             }
+            PopAct::MoveTo(index, folder) => {
+                self.move_to_folder(index, folder);
+                let out = stay(self);
+                self.log_rows();
+                out
+            }
+            PopAct::Desk(index) => {
+                self.shortcut_to_desktop(index);
+                stay(self)
+            }
             PopAct::Account => MenuClick::Launch(Choice::Settings(super::settings::Section::Accounts)),
             PopAct::Lock => MenuClick::Launch(Choice::Lock),
             PopAct::Logout => MenuClick::Stay,
@@ -3385,16 +3883,26 @@ impl Menu {
         let card = layout.card;
         let fill = p.tb1.over(p.tb2.color);
         self.surface.fill(card, fill);
-        draw::rounded_stroke(&mut self.surface, card, px(theme::R_WINDOW), p.line3.color, p.line3.alpha);
+        let classic = theme::is_classic();
+        if classic {
+            // Классика (22.11): серая карточка с выпуклой кромкой.
+            mini_ui::classic::raised(&mut self.surface, card, mini_ui::classic::unit(self.scale));
+        } else {
+            draw::rounded_stroke(&mut self.surface, card, px(theme::R_WINDOW), p.line3.color, p.line3.alpha);
+        }
         let ctx = ctx.on(fill);
         let hover = p.btnhov.over(fill);
         let selected = if self.keys_used { self.visible.get(self.row).copied() } else { None };
 
         // Поиск.
         let field = layout.search;
-        draw::rounded(&mut self.surface, field, px(theme::R_ROW), p.sunk.over(fill), 255);
-        let focus_line = if self.query.is_empty() { p.line3 } else { p.accline };
-        draw::rounded_stroke(&mut self.surface, field, px(theme::R_ROW), focus_line.color, focus_line.alpha);
+        if classic {
+            mini_ui::classic::field(&mut self.surface, field, mini_ui::classic::unit(self.scale));
+        } else {
+            draw::rounded(&mut self.surface, field, px(theme::R_ROW), p.sunk.over(fill), 255);
+            let focus_line = if self.query.is_empty() { p.line3 } else { p.accline };
+            draw::rounded_stroke(&mut self.surface, field, px(theme::R_ROW), focus_line.color, focus_line.alpha);
+        }
         let glyph = px(14);
         glyphicon::draw(&mut self.surface, Icon::Search, field.x + px(12) as i32, field.y + (field.h as i32 - glyph as i32) / 2, glyph, p.ink4, 255);
         let text_x = field.x + px(34) as i32;
@@ -3437,7 +3945,7 @@ impl Menu {
                     let open_folder = matches!((&self.popup, tile), (Some(Popup::Folder { folder, .. }), Tile::Folder(shown)) if folder.key == shown.key);
                     let chosen = matches!(tile, Tile::Item(index) if Some(index) == selected);
                     if self.hot == Some(*target) || open_folder || chosen {
-                        draw::rounded(&mut scratch, local.shrink(px(2)), px(theme::R_ROW + 2), hover, 255);
+                        hot_plate(&mut scratch, local.shrink(px(2)), px(theme::R_ROW + 2), hover);
                     }
                     if chosen {
                         draw::rounded_stroke(&mut scratch, local.shrink(px(2)), px(theme::R_ROW + 2), p.accline.color, p.accline.alpha);
@@ -3475,7 +3983,7 @@ impl Menu {
             for (rect, n) in rows {
                 let Some((_, path)) = self.recent.get(n) else { continue };
                 if self.hot == Some(Target::Recent(n)) {
-                    draw::rounded(&mut self.surface, rect, px(theme::R_ROW), hover, 255);
+                    hot_plate(&mut self.surface, rect, px(theme::R_ROW), hover);
                 }
                 let side = px(28);
                 let icon = Rect::new(rect.x + px(8) as i32, rect.y + (rect.h as i32 - side as i32) / 2, side, side);
@@ -3511,7 +4019,7 @@ impl Menu {
                     }
                     let chosen = matches!(target, Target::Row(index) if Some(*index) == selected);
                     if self.hot == Some(*target) || chosen {
-                        draw::rounded(&mut scratch, local, px(theme::R_ROW), hover, 255);
+                        hot_plate(&mut scratch, local, px(theme::R_ROW), hover);
                     }
                     if chosen {
                         draw::rounded_stroke(&mut scratch, local, px(theme::R_ROW), p.accline.color, p.accline.alpha);
@@ -3549,7 +4057,11 @@ impl Menu {
 
         // Низ: черта, пользователь, инструменты, питание.
         let foot = layout.foot;
-        draw::hline(&mut self.surface, 0, foot.y, card.w, p.line2.color, p.line2.alpha);
+        if classic {
+            mini_ui::classic::groove_h(&mut self.surface, px(4) as i32, foot.y, card.w.saturating_sub(px(8)), mini_ui::classic::unit(self.scale));
+        } else {
+            draw::hline(&mut self.surface, 0, foot.y, card.w, p.line2.color, p.line2.alpha);
+        }
         let mut tip: Option<(&str, i32, bool)> = None;
         let leftmost = layout.cells.iter().filter(|(_, target)| matches!(target, Target::Tool(_) | Target::Power(_))).map(|(rect, _)| rect.x).min().unwrap_or(card.right());
         for (rect, target) in &layout.cells {
@@ -3557,7 +4069,7 @@ impl Menu {
                 Target::User => {
                     let user = user_name();
                     if self.hot == Some(Target::User) || matches!(self.popup, Some(Popup::User)) {
-                        draw::rounded(&mut self.surface, *rect, px(theme::R_ROW), hover, 255);
+                        hot_plate(&mut self.surface, *rect, px(theme::R_ROW), hover);
                     }
                     let avatar = Rect::new(rect.x + px(6) as i32, rect.y + (rect.h as i32 - px(32) as i32) / 2, px(32), px(32));
                     draw_avatar(ctx, &mut self.surface, avatar, &user);
@@ -3567,7 +4079,11 @@ impl Menu {
                 Target::Tool(tool) => {
                     let hot = self.hot == Some(*target);
                     let plate = if hot { hover } else { p.btn.over(fill) };
-                    draw::rounded(&mut self.surface, *rect, px(theme::R_ROW), plate, 255);
+                    if classic {
+                        mini_ui::classic::button(&mut self.surface, *rect, mini_ui::classic::unit(self.scale), false);
+                    } else {
+                        draw::rounded(&mut self.surface, *rect, px(theme::R_ROW), plate, 255);
+                    }
                     let glyph = px(16);
                     iconset::draw(&mut self.surface, TOOLS[tool].1, rect.x + (rect.w as i32 - glyph as i32) / 2, rect.y + (rect.h as i32 - glyph as i32) / 2, glyph, if hot { p.ink } else { p.ink2 }, 255);
                     if hot {
@@ -3583,7 +4099,11 @@ impl Menu {
                     let item = self.items[index];
                     let hot = self.hot == Some(*target) || Some(index) == selected;
                     let plate = if hot { hover } else { p.btn.over(fill) };
-                    draw::rounded(&mut self.surface, *rect, px(theme::R_ROW), plate, 255);
+                    if classic {
+                        mini_ui::classic::button(&mut self.surface, *rect, mini_ui::classic::unit(self.scale), false);
+                    } else {
+                        draw::rounded(&mut self.surface, *rect, px(theme::R_ROW), plate, 255);
+                    }
                     let glyph = px(16);
                     let icon = if matches!(item, Item::App(App::Restart)) { Icon::Update } else { Icon::Power };
                     let ink = if hot { p.bad_ink } else { p.ink2 };
@@ -3604,6 +4124,21 @@ impl Menu {
         // Всплывающее — поверх всего.
         if let Some((rect, lines)) = &layout.popup {
             self.draw_popup(ctx.on(fill), *rect, lines);
+        }
+        // Перенос строки (21.11): в поле поиска — что будет при отпускании,
+        // у указателя — значок строки.
+        if let Some(held) = self.held.filter(|held| held.dragging) {
+            let (_, hint) = self.drop_at(held.index, held.at.0, held.at.1);
+            let hint = if hint.is_empty() { "Перетащите в папку, к закреплённым или на рабочий стол" } else { hint };
+            draw::rounded(&mut self.surface, field, px(theme::R_ROW), p.acc, 255);
+            paint::text_clipped(ctx, &mut self.surface, Role::Body, field.x + px(12) as i32, paint::baseline(ctx, Role::Body, field), field.w.saturating_sub(px(24)), hint, p.acc_ink);
+            let (lx, ly) = (held.at.0 - self.rect.x, held.at.1 - self.rect.y);
+            if card.contains(lx, ly) {
+                let side = px(32);
+                let ghost = Rect::new(lx - side as i32 / 2, ly - side as i32 / 2, side, side);
+                draw::rounded(&mut self.surface, Rect::new(ghost.x - px(4) as i32, ghost.y - px(4) as i32, side + px(8), side + px(8)), px(theme::R_ROW), p.btnhov.over(fill), 230);
+                draw_item_icon(ctx, &mut self.surface, ghost, self.items[held.index], &self.packages);
+            }
         }
         self.damage = self.surface.bounds();
     }
@@ -3628,7 +4163,7 @@ impl Menu {
         let radius = (rect.w / 4).max(2);
         draw::rounded(s, rect, radius, p.btn.color, p.btn.alpha.saturating_add(40));
         draw::rounded_stroke(s, rect, radius, p.btnline.color, p.btnline.alpha);
-        let children: Vec<Item> = self.items.iter().copied().filter(|item| item.folder() == folder.key).take(4).collect();
+        let children: Vec<Item> = (0..self.items.len()).filter(|index| self.home(*index) == folder.key).map(|index| self.items[index]).take(4).collect();
         let inner = rect.w.saturating_sub(rect.w / 4);
         let mini = (inner / 2).saturating_sub(1).max(1);
         let x0 = rect.x + (rect.w as i32 - (mini * 2 + 2) as i32) / 2;
@@ -3664,6 +4199,8 @@ impl Menu {
                     let icon = match act {
                         PopAct::Open(_) => Some(Fi::ArrowRight),
                         PopAct::First(_) => Some(Fi::ArrowUp),
+                        PopAct::MoveTo(..) => Some(Fi::Folder),
+                        PopAct::Desk(_) => Some(Fi::Monitor),
                         _ => Some(Fi::Pin),
                     };
                     if let Some(icon) = icon {
@@ -3769,6 +4306,10 @@ impl Menu {
     }
 
     fn redraw(&mut self) {
+        if self.cascade.on {
+            self.c_redraw();
+            return;
+        }
         if !theme::is_mobile() {
             self.redraw_start();
             return;
@@ -4207,6 +4748,10 @@ impl Fingerprint {
                 }
             }
             None => clock ^= status.uptime_ms / 1000,
+        }
+        // Screen recording (22.11): the indicator counts seconds.
+        if let Some(seconds) = super::capture::elapsed_s() {
+            clock = (clock ^ (seconds + 1)).wrapping_mul(0x1000_0000_01b3) ^ 4;
         }
         // Время работы на панели — с точностью до минуты; дата меняется
         // вместе с часами, её свёртка уже учтена.

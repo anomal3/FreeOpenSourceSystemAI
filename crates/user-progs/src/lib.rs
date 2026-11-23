@@ -32,6 +32,8 @@ pub mod http;
 pub mod app;
 /// Окно «Открыть» / «Сохранить как»: системная сторона (20.11).
 pub mod filedlg;
+/// Значки темы из `/usr/share/icons` (22.11).
+pub mod icons;
 /// Стартовый код позиционно-независимой программы: перемещения до `_start`.
 mod start;
 
@@ -253,6 +255,14 @@ impl Window {
     pub fn set_style(&self, flags: u32) -> i64 {
         // SAFETY: аргументы — числа.
         insist(|| unsafe { syscall(user_abi::SYS_WINSTYLE, self.id as usize, flags as usize, 0) })
+    }
+
+    /// Назначить окну владельца ([`user_abi::SYS_WINOWNER`]): окно этой же
+    /// программы или (20.11) другой программы того же пользователя; флаги —
+    /// `WIN_OWNER_MODAL`, `WIN_OWNER_CENTER`.
+    pub fn set_owner(&self, owner: i64, flags: u32) -> i64 {
+        // SAFETY: аргументы — числа.
+        insist(|| unsafe { syscall(user_abi::SYS_WINOWNER, self.id as usize, owner as usize, flags as usize) })
     }
 
     /// Сменить имя окна ([`user_abi::SYS_WINTITLE`]): кнопка на панели задач
@@ -1337,6 +1347,80 @@ pub fn launch(line: &str, who: Option<(u32, u32)>, stdin: i64, stdout: i64) -> i
 /// Оставить поток программы как есть — см. [`launch`].
 pub const KEEP: i64 = LAUNCH_KEEP;
 
+/// [`Window::set_owner`] по номеру окна (программы каркаса `app` своего
+/// `Window` в руках не держат — номер даёт `app::window_id`).
+pub fn set_window_owner(window: i64, owner: i64, flags: u32) -> i64 {
+    // SAFETY: аргументы — числа.
+    insist(|| unsafe { syscall(user_abi::SYS_WINOWNER, window as usize, owner as usize, flags as usize) })
+}
+
+/// Наблюдение за каталогами (20.11, [`user_abi::SYS_FSWATCH`]): очередь
+/// событий — дескриптор; закрывается [`close`].
+pub fn fswatch_open() -> i64 {
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(user_abi::SYS_FSWATCH, user_abi::FSWATCH_OPEN << 32, 0, 0) }
+}
+
+/// Следить за каталогом `path` (маска `FSN_*`, ноль — всё). Номер наблюдения
+/// или отказ.
+pub fn fswatch_add(fd: i64, path: &str, mask: u32) -> i64 {
+    if fd < 0 {
+        return fd;
+    }
+    let packed = ((mask as usize) << 32) | path.len();
+    // SAFETY: строка живёт в памяти программы, длина — её собственная.
+    unsafe { syscall(user_abi::SYS_FSWATCH, (user_abi::FSWATCH_ADD << 32) | fd as usize, path.as_ptr() as usize, packed) }
+}
+
+/// Снять наблюдение.
+pub fn fswatch_remove(fd: i64, wd: i64) -> i64 {
+    if fd < 0 {
+        return fd;
+    }
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(user_abi::SYS_FSWATCH, (user_abi::FSWATCH_REMOVE << 32) | fd as usize, wd as usize, 0) }
+}
+
+/// Событие наблюдения: номер, маска `FSN_*` и имя в каталоге.
+#[derive(Clone, Debug)]
+pub struct FsChange {
+    pub wd: i32,
+    pub mask: u32,
+    pub name: alloc::string::String,
+}
+
+/// Забрать накопившиеся события (не ждёт; пусто — ничего не случилось).
+#[must_use]
+pub fn fswatch_read(fd: i64) -> alloc::vec::Vec<FsChange> {
+    let mut out = alloc::vec::Vec::new();
+    if fd < 0 {
+        return out;
+    }
+    let mut buffer = [0u8; 4096];
+    loop {
+        // SAFETY: буфер — память программы, длина — его собственная.
+        let got = unsafe { syscall(user_abi::SYS_FSWATCH, (user_abi::FSWATCH_READ << 32) | fd as usize, buffer.as_mut_ptr() as usize, buffer.len()) };
+        if got <= 0 {
+            break;
+        }
+        let got = got as usize;
+        let mut at = 0usize;
+        while at + 16 <= got {
+            let word = |offset: usize| u32::from_ne_bytes([buffer[at + offset], buffer[at + offset + 1], buffer[at + offset + 2], buffer[at + offset + 3]]);
+            let (wd, mask, len) = (word(0) as i32, word(4), word(12) as usize);
+            let name_bytes = &buffer[(at + 16).min(got)..(at + 16 + len).min(got)];
+            let end = name_bytes.iter().position(|byte| *byte == 0).unwrap_or(name_bytes.len());
+            let name = core::str::from_utf8(&name_bytes[..end]).unwrap_or("").into();
+            out.push(FsChange { wd, mask, name });
+            at += 16 + len;
+        }
+        if got < buffer.len() / 2 {
+            break;
+        }
+    }
+    out
+}
+
 /// Дождаться конца задачи и узнать её код возврата.
 ///
 /// Останавливает программу до тех пор, пока та не закончится. `ERR_NO_TASK`
@@ -1626,6 +1710,61 @@ pub fn clipboard_get() -> alloc::string::String {
         }
         buffer.resize(total, 0);
     }
+}
+
+/// «Открыть с помощью» (22.11, [`user_abi::SYS_OPEN_WITH`]): действие и вход
+/// — ответ целиком (буфер растёт, пока ответ не поместится); `None` — отказ.
+fn open_with_call(action: usize, input: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let mut buffer = alloc::vec![0u8; input.len().max(16 * 1024)];
+    loop {
+        buffer[..input.len()].copy_from_slice(input);
+        // SAFETY: буфер живёт в памяти программы, длина — его собственная.
+        let result = unsafe { syscall(user_abi::SYS_OPEN_WITH, action | (input.len() << 32), buffer.as_mut_ptr() as usize, buffer.len()) };
+        if result < 0 {
+            return None;
+        }
+        let total = result as usize;
+        if total <= buffer.len() {
+            buffer.truncate(total);
+            return Some(buffer);
+        }
+        if total > (8 << 20) {
+            return None;
+        }
+        buffer.resize(total, 0);
+    }
+}
+
+/// Программы для файла `path`: строки `признак\tподпись\tкоманда\tзначок`.
+#[must_use]
+pub fn open_with_list(path: &str) -> alloc::string::String {
+    open_with_call(user_abi::OPENWITH_LIST, path.as_bytes()).map(|bytes| alloc::string::String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default()
+}
+
+/// Значок программы из [`open_with_list`] — картинка FIMG.
+#[must_use]
+pub fn open_with_icon(key: &str) -> Option<alloc::vec::Vec<u8>> {
+    if key.is_empty() {
+        return None;
+    }
+    open_with_call(user_abi::OPENWITH_ICON, key.as_bytes())
+}
+
+/// Запомнить программу для расширения («всегда открывать этой программой»).
+pub fn open_with_remember(ext: &str, command: &str) -> bool {
+    open_with_call(user_abi::OPENWITH_REMEMBER, alloc::format!("{ext}\t{command}").as_bytes()).is_some()
+}
+
+/// Screen capture (22.11, [`user_abi::SYS_SCREENCAP`]): `action` is one of
+/// `CAP_*`, the arguments are as the contract says.
+///
+/// # Safety
+///
+/// Pointers in `a1`/`a2` must point at memory of this program of the size the
+/// action expects (a whole frame for `CAP_GRAB`).
+pub unsafe fn screencap(action: usize, a1: usize, a2: usize) -> i64 {
+    // SAFETY: the caller keeps the contract; the kernel checks the pages.
+    unsafe { syscall(user_abi::SYS_SCREENCAP, action, a1, a2) }
 }
 
 /// Исполнить команду оболочки ядра (фаза 68o). `out` — не короче

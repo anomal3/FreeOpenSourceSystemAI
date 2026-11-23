@@ -116,13 +116,106 @@ static PING: AtomicBool = AtomicBool::new(true);
 /// `wlopaque off` — через `over` по точкам, как раньше.
 pub static OPAQUE_ROWS: AtomicBool = AtomicBool::new(true);
 
-pub fn set_pace(on: bool) {
-    PACE.store(on, Ordering::Relaxed);
+
+/// Частота темпа, заданная руками (`wlpace <Гц>`, мГц); 0 — по монитору.
+static PACE_FORCED_MHZ: AtomicU64 = AtomicU64::new(0);
+/// Частота самого быстрого включённого монитора (мГц) и когда её смотрели.
+static PACE_OUTPUT_MHZ: AtomicU64 = AtomicU64::new(60_000);
+static PACE_CHECKED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `wlpace on|off|unlimited|auto|<Гц>` (D4, 20.11.2026): темп ответов на
+/// `frame`. `auto` (`on`) — частота монитора (у RTX 3060 с монитором на
+/// 144 Гц — 144, у GOP и virtio — 60), `<Гц>` — своя, `off`/`unlimited` — без
+/// темпа (замеры: кадры столько, сколько стол успевает показать). Ответ —
+/// строка для терминала.
+///
+/// Темп держит только того, кто его просит (D7, 21.11.2026): `frame` ждёт
+/// клиент с VSync (Vulkan FIFO, DXVK `SyncInterval 1`, GL swap interval 1).
+/// С выключенной VSync Mesa WSI (`MAILBOX`, `IMMEDIATE` через
+/// `wp_tearing_control_v1`) `frame` не просит и ждёт только
+/// `wl_buffer.release` — сервер возвращает сменённый буфер сразу и
+/// показывает последний кадр с частотой монитора, так что игра рисует
+/// столько, сколько успевает GPU. `off` — принудительно без темпа и для FIFO.
+pub fn pace_command(argument: &str) -> String {
+    match argument.trim() {
+        "on" | "auto" => {
+            PACE_FORCED_MHZ.store(0, Ordering::Relaxed);
+            PACE.store(true, Ordering::Relaxed);
+        }
+        "off" | "unlimited" => PACE.store(false, Ordering::Relaxed),
+        "" => {}
+        hz => match hz.parse::<u64>() {
+            Ok(hz @ 10..=1000) => {
+                PACE_FORCED_MHZ.store(hz * 1000, Ordering::Relaxed);
+                PACE.store(true, Ordering::Relaxed);
+            }
+            _ => return String::from("  wlpace: usage `wlpace [on|auto|off|unlimited|<10..1000 Hz>]`"),
+        },
+    }
+    PACE_CHECKED_MS.store(0, Ordering::Relaxed);
+    if !PACE.load(Ordering::Relaxed) {
+        return String::from("  wlpace: off (unlimited)");
+    }
+    let mhz = pace_mhz();
+    let forced = PACE_FORCED_MHZ.load(Ordering::Relaxed) != 0;
+    alloc::format!(
+        "  wlpace: on, {}.{:03} Hz ({}) for vsync clients (FIFO); vsync-off clients (MAILBOX/IMMEDIATE) are not paced",
+        mhz / 1000,
+        mhz % 1000,
+        // G3: without a forced rate each window is paced by its own monitor;
+        // this number is the fastest one (windows not placed yet).
+        if forced { "forced" } else { "fastest monitor; each window follows its own monitor" }
+    )
 }
-#[must_use]
-pub fn pace() -> bool {
-    PACE.load(Ordering::Relaxed)
+
+/// Частота темпа в мГц: заданная руками или самого быстрого включённого
+/// монитора (реестр выходов смотрится не чаще раза в секунду).
+fn pace_mhz() -> u64 {
+    let forced = PACE_FORCED_MHZ.load(Ordering::Relaxed);
+    if forced != 0 {
+        return forced;
+    }
+    let now = crate::time::uptime_ms();
+    let checked = PACE_CHECKED_MS.load(Ordering::Relaxed);
+    if checked == 0 || now.saturating_sub(checked) >= 1000 {
+        PACE_CHECKED_MS.store(now.max(1), Ordering::Relaxed);
+        let best = crate::display::outputs::list()
+            .iter()
+            .filter(|output| output.enabled)
+            .filter_map(|output| output.current.map(|(_, _, mhz)| u64::from(mhz)))
+            .filter(|mhz| (10_000..=1_000_000).contains(mhz))
+            .max()
+            .unwrap_or(60_000);
+        PACE_OUTPUT_MHZ.store(best, Ordering::Relaxed);
+    }
+    PACE_OUTPUT_MHZ.load(Ordering::Relaxed)
 }
+
+/// Кадр экрана в микросекундах (темп ответов на `frame`).
+fn frame_us() -> u64 {
+    1_000_000_000 / pace_mhz().max(1)
+}
+
+/// G3 (21.11): the enabled monitor under the centre of `rect` (desktop
+/// coordinates of the output registry) and its refresh in mHz.
+fn monitor_of(rect: Rect) -> Option<(Rect, u64)> {
+    let list = crate::display::outputs::list();
+    let lit = || list.iter().filter(|o| o.enabled && o.current.is_some());
+    // The desktop starts at the corner of the box around all monitors; the
+    // registry keeps its own origin (the primary monitor).
+    let left = lit().map(|o| o.x).min()?;
+    let top = lit().map(|o| o.y).min()?;
+    let (cx, cy) = (rect.x + rect.w as i32 / 2 + left, rect.y + rect.h as i32 / 2 + top);
+    lit().find_map(|o| {
+        let (w, h, mhz) = o.current?;
+        let inside = cx >= o.x && cy >= o.y && cx < o.x + w as i32 && cy < o.y + h as i32;
+        (inside && (10_000..=1_000_000).contains(&mhz)).then(|| (Rect::new(o.x - left, o.y - top, w, h), u64::from(mhz)))
+    })
+}
+
+/// How often the monitor of a window is looked up again (it can be dragged
+/// to another monitor).
+const PACE_RECHECK_MS: u64 = 500;
 pub fn set_ping(on: bool) {
     PING.store(on, Ordering::Relaxed);
 }
@@ -168,6 +261,8 @@ fn run() {
             clients.push(client);
         }
         let now = crate::time::uptime_ms();
+        // G5: monitors switched on/off or moved - clients hear it this round.
+        refresh_outputs(now);
         clients.retain_mut(|client| {
             let alive = client.step(now);
             if !alive {
@@ -176,9 +271,19 @@ fn run() {
             }
             alive
         });
+        // G3: buffers of gone clients that a display scanned out - freed
+        // once it does not any more.
+        let graves = {
+            let mut grave = SCAN_GRAVE.lock();
+            grave.retain(|buf| scanned(buf));
+            !grave.is_empty()
+        };
         // События окон приходят без уведомления — опрос раз в кадр; раньше —
         // если у клиента отложен ответ на `frame` (темп экрана, P8).
-        let due = clients.iter().filter_map(Client::frames_due_at).min().unwrap_or(u64::MAX);
+        let mut due = clients.iter().filter_map(Client::frames_due_at).min().unwrap_or(u64::MAX);
+        if graves {
+            due = 0;
+        }
         crate::io_events::wait(seen, Some(due.clamp(now + 1, now + 16)));
     }
 }
@@ -262,7 +367,7 @@ impl Args<'_> {
 // ---- объекты --------------------------------------------------------------------
 
 /// Глобальные объекты: номер в реестре, интерфейс, версия.
-const GLOBALS: [(u32, &str, u32); 9] = [
+const GLOBALS: [(u32, &str, u32); 16] = [
     (1, "wl_compositor", 4),
     (2, "wl_subcompositor", 1),
     (3, "wl_shm", 1),
@@ -274,7 +379,8 @@ const GLOBALS: [(u32, &str, u32); 9] = [
     // запросы (`set_reactive`, `reposition`, `release`) принимаются молча.
     (4, "xdg_wm_base", 6),
     (5, "wl_seat", 5),
-    (6, "wl_output", 4),
+    // `wl_output` (v4) is not here: one global per lit monitor, names from
+    // [`FIRST_OUTPUT_GLOBAL`], added and removed with the layout (G5).
     // Буфер обмена и перетаскивание. Пока — объекты, принимающие запросы, и
     // ни одного предложения данных: Java (AWT на Wayland) без этого глобала не
     // заводит окно вовсе («Can't bind to the wl_data_device_manager»), а
@@ -288,7 +394,267 @@ const GLOBALS: [(u32, &str, u32); 9] = [
     // Буферы dma-buf (18.11.2026): аппаратный Vulkan (Mesa NVK) показывает
     // кадры только так (`wayland_dmabuf.rs`).
     (9, dmabuf::INTERFACE, dmabuf::VERSION),
+    // Вертикальная синхронизация — решение игры (D7, 21.11.2026). Mesa WSI
+    // на Wayland даёт `VK_PRESENT_MODE_IMMEDIATE_KHR` только при этом
+    // глобале (MAILBOX и FIFO — всегда): DXVK/vkd3d с выключенной VSync
+    // выбирают IMMEDIATE (подсказка `async`), иначе MAILBOX.
+    (10, "wp_tearing_control_manager_v1", 1),
+    // Время показа кадра (`wp_presentation_feedback`): Mesa отвечает по нему
+    // на `vkWaitForPresentKHR` (DXVK ждёт им кадр в полёте) — без него ждать
+    // было нечем, кроме `frame`.
+    (11, "wp_presentation", 1),
+    // G3 (21.11): mouse for games. Wine (hw-log13: "relative motion won't
+    // work", "pointer locking/confining won't work") turns cursor clipping
+    // and mouse-look into these: raw device motion, and the pointer locked
+    // (hidden, does not move) or confined to the window.
+    (12, "zwp_relative_pointer_manager_v1", 1),
+    (13, "zwp_pointer_constraints_v1", 1),
+    // Window activation (SetForegroundWindow under Wine) and the preferred
+    // scale of surfaces: our Wayland coordinates are screen pixels
+    // (`wl_output.scale` 1), so the scale announced is 1.0 (120/120).
+    (14, "xdg_activation_v1", 1),
+    (15, "wp_fractional_scale_manager_v1", 1),
+    // 22.11: video players and games keep the screensaver and screen off
+    // away while an inhibitor lives (`power::inhibit`).
+    (16, "zwp_idle_inhibit_manager_v1", 1),
+    // G5 (22.11): logical position and size of each monitor. Wine
+    // (winewayland) places monitors by these - without them all of them sat
+    // at 0,0 and it kept only one.
+    (17, "zxdg_output_manager_v1", 3),
 ];
+
+// ---- мониторы (G5, 22.11) ----------------------------------------------------------
+//
+// One `wl_output` global per lit monitor of the output registry
+// (`display::outputs`), in its coordinates - the primary monitor at 0,0 like
+// Windows: Wine takes the output at 0,0 as the primary one and builds
+// EnumDisplayMonitors from the logical positions (`zxdg_output_v1`). The
+// table is looked up again every [`OUTPUT_RECHECK_MS`]; a monitor switched
+// on or off in Settings -> Display adds or removes its global
+// (`wl_registry.global` / `global_remove`), a moved or re-moded one sends
+// new `geometry`/`mode`/logical position followed by `done`.
+
+/// Registry names of output globals start here (the static ones are below).
+const FIRST_OUTPUT_GLOBAL: u32 = 64;
+const OUTPUT_RECHECK_MS: u64 = 250;
+/// How often surfaces' monitors (`wl_surface.enter`/`leave`) are looked up.
+const ENTER_RECHECK_MS: u64 = 300;
+
+/// One monitor as clients see it.
+#[derive(Clone, PartialEq, Eq)]
+struct OutputInfo {
+    global: u32,
+    /// Driver output and monitor passport: the same monitor keeps its global.
+    key: String,
+    /// Registry coordinates: the primary monitor at 0,0.
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    mhz: u32,
+    mm: (i32, i32),
+    make: String,
+    model: String,
+    /// Connector-like name (`wl_output.name`, v4): `Virtual-1`, `DP-2`.
+    name: String,
+    description: String,
+    primary: bool,
+}
+
+impl OutputInfo {
+    fn rect(&self) -> Rect {
+        Rect::new(self.x, self.y, self.w, self.h)
+    }
+}
+
+struct OutputTable {
+    list: Vec<OutputInfo>,
+    next_global: u32,
+    /// Connector names handed out by key: a monitor switched off and on
+    /// again keeps its name (its global is new).
+    names: Vec<(String, String)>,
+    checked_ms: u64,
+    generation: u32,
+}
+
+static OUTPUT_TABLE: Mutex<OutputTable> =
+    Mutex::new(OutputTable { list: Vec::new(), next_global: FIRST_OUTPUT_GLOBAL, names: Vec::new(), checked_ms: 0, generation: 0 });
+
+/// Look the monitors up again (at most every [`OUTPUT_RECHECK_MS`]).
+fn refresh_outputs(now: u64) {
+    {
+        let table = OUTPUT_TABLE.lock();
+        if table.checked_ms != 0 && now.saturating_sub(table.checked_ms) < OUTPUT_RECHECK_MS {
+            return;
+        }
+    }
+    let registry = crate::display::outputs::list();
+    let lit: Vec<&crate::display::outputs::Output> = registry.iter().filter(|o| o.enabled && o.current.is_some()).collect();
+    // The registry keeps the primary at 0,0; normalised anyway.
+    let origin = lit.iter().find(|o| o.primary).map_or((0, 0), |o| (o.x, o.y));
+    let mut table = OUTPUT_TABLE.lock();
+    table.checked_ms = now.max(1);
+    let mut list: Vec<OutputInfo> = Vec::new();
+    for o in &lit {
+        let Some((w, h, mhz)) = o.current else { continue };
+        let key = match &o.monitor {
+            Some(m) => alloc::format!("{:?}/{}", o.backend, crate::display::outputs::monitor_key(m)),
+            None => alloc::format!("{:?}", o.backend),
+        };
+        let name = match table.names.iter().find(|(k, _)| *k == key) {
+            Some((_, name)) => name.clone(),
+            None => {
+                let (prefix, number) = match o.backend {
+                    crate::display::outputs::Backend::Virtio(n) => ("Virtual", n + 1),
+                    crate::display::outputs::Backend::Nvidia(_) => {
+                        ("DP", table.names.iter().filter(|(_, n)| n.starts_with("DP-")).count() + 1)
+                    }
+                    crate::display::outputs::Backend::Firmware => ("FB", 1),
+                };
+                let mut name = alloc::format!("{prefix}-{number}");
+                while table.names.iter().any(|(_, n)| *n == name) {
+                    name.push('b');
+                }
+                table.names.push((key.clone(), name.clone()));
+                name
+            }
+        };
+        let (make, model, mm) = match &o.monitor {
+            Some(m) => {
+                let model = if m.name.is_empty() { alloc::format!("{:04X}", m.product) } else { m.name.clone() };
+                let mm = if m.width_mm > 0 && m.height_mm > 0 { (m.width_mm as i32, m.height_mm as i32) } else { mm_at_96dpi(w, h) };
+                (String::from(m.maker_str()), model, mm)
+            }
+            None => (String::from("FossAi"), o.name.clone(), mm_at_96dpi(w, h)),
+        };
+        let description = alloc::format!("{} {} ({name})", make, model);
+        let global = table.list.iter().find(|old| old.key == key).map_or(0, |old| old.global);
+        list.push(OutputInfo {
+            global,
+            key,
+            x: o.x - origin.0,
+            y: o.y - origin.1,
+            w,
+            h,
+            mhz: if (10_000..=1_000_000).contains(&mhz) { mhz } else { 60_000 },
+            mm,
+            make,
+            model,
+            name,
+            description,
+            primary: o.primary,
+        });
+    }
+    // No registry (one firmware screen): the primary screen as it is.
+    if list.is_empty() {
+        let (w, h) = crate::ui::screen_size();
+        if w > 0 && h > 0 {
+            let global = table.list.iter().find(|old| old.key == "screen").map_or(0, |old| old.global);
+            list.push(OutputInfo {
+                global,
+                key: String::from("screen"),
+                x: 0,
+                y: 0,
+                w,
+                h,
+                mhz: PACE_OUTPUT_MHZ.load(Ordering::Relaxed) as u32,
+                mm: mm_at_96dpi(w, h),
+                make: String::from("FossAi"),
+                model: String::from("Screen"),
+                name: String::from("FB-1"),
+                description: String::from("FossAi Screen (FB-1)"),
+                primary: true,
+            });
+        }
+    }
+    for info in &mut list {
+        if info.global == 0 {
+            info.global = table.next_global;
+            table.next_global += 1;
+        }
+    }
+    if list != table.list {
+        let lines: Vec<String> = list
+            .iter()
+            .map(|o| alloc::format!("{} '{}' {}x{} at {},{}{}", o.global, o.name, o.w, o.h, o.x, o.y, if o.primary { " primary" } else { "" }))
+            .collect();
+        kprintln!("  wayland     : outputs: {}", lines.join("; "));
+        table.list = list;
+        table.generation = table.generation.wrapping_add(1);
+    }
+}
+
+/// Physical size of a `w`x`h` screen at 96 dots per inch, mm.
+fn mm_at_96dpi(w: u32, h: u32) -> (i32, i32) {
+    ((w * 254 / 960) as i32, (h * 254 / 960) as i32)
+}
+
+/// The middle of the monitor of output global `global`, in desktop
+/// coordinates (they start at the corner of the box around all monitors).
+fn output_point(global: u32) -> Option<(i32, i32)> {
+    let table = OUTPUT_TABLE.lock();
+    let o = table.list.iter().find(|o| o.global == global)?;
+    let left = table.list.iter().map(|o| o.x).min().unwrap_or(0);
+    let top = table.list.iter().map(|o| o.y).min().unwrap_or(0);
+    Some((o.x - left + o.w as i32 / 2, o.y - top + o.h as i32 / 2))
+}
+
+/// A window state request of `xdg_toplevel` (opcode: 9/10 maximize/unset,
+/// 11 fullscreen - on the monitor at `at` if given, 12 unset, 13 minimize)
+/// to the desktop. `true` - the desktop was busy: ask again.
+fn window_op(pid: u32, slot: u32, op: u16, at: Option<(i32, i32)>) -> bool {
+    let done = match op {
+        9 => crate::ui::maximize_window(pid, slot, true),
+        10 => crate::ui::maximize_window(pid, slot, false),
+        11 => match at {
+            Some(at) => crate::ui::fullscreen_window_at(pid, slot, at),
+            None => crate::ui::fullscreen_window(pid, slot, true),
+        },
+        12 => crate::ui::fullscreen_window(pid, slot, false),
+        13 => crate::ui::minimize_window(pid, slot),
+        _ => Ok(()),
+    };
+    if let Err(err) = &done {
+        kprintln!("  wayland     : #{pid} xdg_toplevel request {op}: desktop says {err:?}");
+    }
+    matches!(done, Err(crate::ui::WindowError::Busy))
+}
+
+/// The output table now: generation and monitors.
+fn outputs_now() -> (u32, Vec<OutputInfo>) {
+    let table = OUTPUT_TABLE.lock();
+    (table.generation, table.list.clone())
+}
+
+/// `zwp_pointer_constraints_v1.lifetime`: `persistent` - the constraint
+/// comes back each time its conditions hold again (oneshot ends for good).
+const CONSTRAINT_PERSISTENT: u32 = 2;
+/// `wp_fractional_scale_v1.preferred_scale`: 120 = 1.0.
+const FRACTIONAL_ONE: u32 = 120;
+
+/// A pointer constraint of a client (`zwp_locked_pointer_v1` or
+/// `zwp_confined_pointer_v1`), G3.
+struct PointerConstraint {
+    id: u32,
+    surface: u32,
+    lock: bool,
+    /// Region in surface coordinates (bounding box of the `wl_region`).
+    region: Option<Rect>,
+    persistent: bool,
+    /// Asked of the desktop for the window (again after a focus change or a
+    /// new region).
+    asked: bool,
+    /// `locked`/`confined` sent and not yet `unlocked`/`unconfined`.
+    active: bool,
+    /// Oneshot constraint that ended: inert until destroyed.
+    defunct: bool,
+}
+
+/// `wp_tearing_control_v1.presentation_hint`: `async` — можно с разрывом.
+const TEARING_ASYNC: u32 = 1;
+/// `wp_presentation.clock_id`: время в `presented` — `CLOCK_MONOTONIC`
+/// (`time::uptime_ns`, его же отдаёт `clock_gettime`).
+const PRESENTATION_CLOCK: u32 = 1;
 
 const SHM_ARGB8888: u32 = 0;
 const SHM_XRGB8888: u32 = 1;
@@ -306,9 +672,10 @@ const MOD_CONTROL: u32 = 4;
 const MOD_ALT: u32 = 8;
 const MOD_NUM: u32 = 16;
 const MOD_SUPER: u32 = 64;
-/// Темп ответов на `wl_surface.frame` — кадр экрана 60 Гц (P8): клиент в
-/// режиме FIFO (DXVK, Mesa WSI) рисует не чаще, чем стол показывает.
-const FRAME_MS: u64 = 16;
+// Темп ответов на `wl_surface.frame` (P8): клиент в режиме FIFO (DXVK, Mesa
+// WSI) рисует не чаще, чем стол показывает. До 20.11 — постоянные 16 мс
+// (потолок ~62 к/с и на мониторе 144 Гц, hw-log12); теперь — кадр самого
+// быстрого монитора ([`frame_us`]), `wlpace` меняет.
 /// Дольше этого ответ на `frame` не откладывается, даже если окно ещё не
 /// показано (стол занят): клиент не должен стоять.
 const FRAME_HOLD_MAX_MS: u64 = 100;
@@ -441,14 +808,18 @@ impl Positioner {
     }
 
     /// Место с учётом экрана: `parent` — где на экране угол родителя,
-    /// `screen` — размер экрана. Не влезающее переворачивается к другой
-    /// стороне привязки, а если и так не влезает — сдвигается внутрь, если
-    /// клиент это разрешил.
-    fn constrain(&self, parent: (i32, i32), screen: (i32, i32)) -> (i32, i32) {
+    /// `area` — монитор, в пределах которого всплывать (G5, 21.11: тот, на
+    /// котором привязка, — прежде размер основного от угла стола, и меню
+    /// окна на правом мониторе уезжали на левый). Не влезающее
+    /// переворачивается к другой стороне привязки, а если и так не влезает —
+    /// сдвигается внутрь, если клиент это разрешил.
+    fn constrain(&self, parent: (i32, i32), area: Rect) -> (i32, i32) {
         let (w, h) = (self.width.max(1), self.height.max(1));
         let (mut x, mut y) = self.place();
-        let out_x = |x: i32| parent.0 + x < 0 || parent.0 + x + w > screen.0;
-        let out_y = |y: i32| parent.1 + y < 0 || parent.1 + y + h > screen.1;
+        let (left, top) = (area.x, area.y);
+        let (right, bottom) = (area.x + area.w as i32, area.y + area.h as i32);
+        let out_x = |x: i32| parent.0 + x < left || parent.0 + x + w > right;
+        let out_y = |y: i32| parent.1 + y < top || parent.1 + y + h > bottom;
         if self.adjust & ADJUST_FLIP_X != 0 && out_x(x) {
             let flipped = Self {
                 edge: flip_horizontal(self.edge),
@@ -474,10 +845,10 @@ impl Positioner {
             }
         }
         if self.adjust & ADJUST_SLIDE_X != 0 && out_x(x) {
-            x = (screen.0 - w).min(parent.0 + x).max(0) - parent.0;
+            x = (right - w).min(parent.0 + x).max(left) - parent.0;
         }
         if self.adjust & ADJUST_SLIDE_Y != 0 && out_y(y) {
-            y = (screen.1 - h).min(parent.1 + y).max(0) - parent.1;
+            y = (bottom - h).min(parent.1 + y).max(top) - parent.1;
         }
         (x, y)
     }
@@ -517,6 +888,58 @@ struct SurfaceState {
     /// Перерисовать целиком: новый буфер без объявленных изменений или
     /// другого размера.
     full: bool,
+    /// `wp_viewport` поверхности: действующий и ждущий `commit`.
+    view: View,
+    view_next: Option<View>,
+    /// `wp_tearing_control_v1` поверхности (одна на поверхность) и подсказка
+    /// `async`: действующая и ждущая `commit` (D7).
+    tearing: Option<u32>,
+    tearing_async: bool,
+    tearing_next: Option<bool>,
+    /// `wp_presentation_feedback`, ждущие `commit`.
+    feedback: Vec<u32>,
+    /// Как клиент показывает кадры — уже сказано в журнал (0 — нет, 1 — с
+    /// темпом `frame`, 2 — без него); сколько кадров подряд так же.
+    told: u8,
+    run: u8,
+    run_unpaced: bool,
+}
+
+/// Кусок буфера и размер поверхности (`wp_viewport`, D4 20.11.2026): Wine
+/// изображает режим игры ниже монитора буфером 1280x720 с
+/// `set_destination(2560, 1440)` — раньше это игнорировалось, и кадр
+/// ложился 1:1 в угол («четверть экрана», hw-log12).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct View {
+    /// `set_source`: x, y, w, h в `wl_fixed` (24.8); `None` — весь буфер.
+    src: Option<(i32, i32, i32, i32)>,
+    /// `set_destination`: размер поверхности; `None` — по куску буфера.
+    dst: Option<(u32, u32)>,
+}
+
+impl View {
+    /// Кусок буфера `(x, y, w, h)` в точках буфера, обрезанный по нему.
+    fn source(&self, buf: &Buffer) -> (u32, u32, u32, u32) {
+        let Some((x, y, w, h)) = self.src else {
+            return (0, 0, buf.width, buf.height);
+        };
+        let x = ((x.max(0) as u32) >> 8).min(buf.width.saturating_sub(1));
+        let y = ((y.max(0) as u32) >> 8).min(buf.height.saturating_sub(1));
+        let w = ((w.max(256) as u32 + 255) >> 8).clamp(1, buf.width - x);
+        let h = ((h.max(256) as u32 + 255) >> 8).clamp(1, buf.height - y);
+        (x, y, w, h)
+    }
+
+    /// Размер поверхности с этим буфером.
+    fn size(&self, buf: &Buffer) -> (u32, u32) {
+        match self.dst {
+            Some((w, h)) => (w.clamp(1, 8192), h.clamp(1, 8192)),
+            None => {
+                let (_, _, w, h) = self.source(buf);
+                (w, h)
+            }
+        }
+    }
 }
 
 impl SurfaceState {
@@ -530,7 +953,21 @@ impl SurfaceState {
             damage: Rect::EMPTY,
             ready: Rect::EMPTY,
             full: true,
+            view: View::default(),
+            view_next: None,
+            tearing: None,
+            tearing_async: false,
+            tearing_next: None,
+            feedback: Vec::new(),
+            told: 0,
+            run: 0,
+            run_unpaced: false,
         }
+    }
+
+    /// Размер поверхности: буфер через `wp_viewport`; без буфера — `None`.
+    fn size(&self) -> Option<(u32, u32)> {
+        self.shown.as_ref().map(|(_, buf)| self.view.size(buf))
     }
 }
 
@@ -560,6 +997,27 @@ struct Win {
     /// `set_fullscreen` пришёл до того, как окно открылось (20.11): исполнить
     /// при открытии.
     want_full: bool,
+    /// G5: the output global `set_fullscreen` named (Wine: the monitor the
+    /// game is on in its coordinates) - fullscreen goes there.
+    full_output: Option<u32>,
+    /// G5: a state request (maximize, fullscreen, minimize) the busy desktop
+    /// did not take yet: `xdg_toplevel` opcode and fullscreen monitor point.
+    op_due: Option<(u16, Option<(i32, i32)>)>,
+    /// Буфер, который окно стола показывает без копии (D4, 20.11.2026):
+    /// пиксели окна — прямо память dma-buf клиента. Держит память живой и
+    /// возвращается клиенту, когда окно перейдёт на другой.
+    adopted: Option<(u32, Buffer)>,
+    /// Собственные пиксели окна, отложенные на время показа без копии.
+    stash: Option<Surface>,
+    /// Когда окно последний раз показано (мкс) и до какого мига отложен
+    /// показ кадра, пришедшего без темпа (`MAILBOX`/`IMMEDIATE`, D7): такие
+    /// кадры показываются с частотой монитора, последний побеждает.
+    presented_us: u64,
+    hold_until_us: u64,
+    /// G3: frame of the monitor the window is on (us) and when it was looked
+    /// up (ms): pacing follows the window's own monitor.
+    pace_us: u64,
+    pace_at_ms: u64,
 }
 
 /// Всплывающее окно стола за `xdg_popup`.
@@ -572,6 +1030,11 @@ struct Pop {
     owner: u32,
     /// Место от угла окна верхнего уровня.
     at: (i32, i32),
+    /// G5: where the parent (the window or a parent menu) is from that
+    /// corner - `xdg_popup.reposition` places from it again.
+    base: (i32, i32),
+    /// G5: a new place not yet given to the desktop (it was busy).
+    place_due: bool,
     geometry: Option<(i32, i32, u32, u32)>,
     open: Option<(u32, u32)>,
     dirty: bool,
@@ -603,7 +1066,12 @@ enum Obj {
     Seat,
     Pointer,
     Keyboard,
-    Output,
+    /// `wl_output` bound to the global `global` (G5), with its version.
+    Output { global: u32, version: u32 },
+    /// `zxdg_output_manager_v1` and `zxdg_output_v1` of the `wl_output`
+    /// object `output` (G5).
+    XdgOutputManager(u32),
+    XdgOutput { output: u32, version: u32 },
     DataDeviceManager,
     /// Источник данных клиента и форматы, которые он предложил.
     DataSource(Vec<String>),
@@ -611,9 +1079,30 @@ enum Obj {
     /// Предложение выделения, которое сервер прислал клиенту.
     DataOffer,
     Viewporter,
-    Viewport,
+    /// `wp_viewport` поверхности с этим номером.
+    Viewport(u32),
     Dmabuf,
     DmabufParams(dmabuf::Params),
+    TearingManager,
+    /// `wp_tearing_control_v1` поверхности с этим номером.
+    Tearing(u32),
+    Presentation,
+    Feedback,
+    RelativeManager,
+    RelativePointer,
+    ConstraintsManager,
+    /// `zwp_locked_pointer_v1` / `zwp_confined_pointer_v1` (G3).
+    Locked,
+    Confined,
+    Activation,
+    /// `xdg_activation_token_v1`.
+    ActivationToken,
+    FractionalManager,
+    /// `wp_fractional_scale_v1` of this surface.
+    Fractional(u32),
+    IdleInhibitManager,
+    /// `zwp_idle_inhibitor_v1` (22.11).
+    IdleInhibitor,
 }
 
 impl Obj {
@@ -639,15 +1128,32 @@ impl Obj {
             Self::Seat => "wl_seat",
             Self::Pointer => "wl_pointer",
             Self::Keyboard => "wl_keyboard",
-            Self::Output => "wl_output",
+            Self::Output { .. } => "wl_output",
+            Self::XdgOutputManager(_) => "zxdg_output_manager_v1",
+            Self::XdgOutput { .. } => "zxdg_output_v1",
             Self::DataDeviceManager => "wl_data_device_manager",
             Self::DataSource(_) => "wl_data_source",
             Self::DataDevice => "wl_data_device",
             Self::DataOffer => "wl_data_offer",
             Self::Viewporter => "wp_viewporter",
-            Self::Viewport => "wp_viewport",
+            Self::Viewport(_) => "wp_viewport",
             Self::Dmabuf => "zwp_linux_dmabuf_v1",
             Self::DmabufParams(_) => "zwp_linux_buffer_params_v1",
+            Self::TearingManager => "wp_tearing_control_manager_v1",
+            Self::Tearing(_) => "wp_tearing_control_v1",
+            Self::Presentation => "wp_presentation",
+            Self::Feedback => "wp_presentation_feedback",
+            Self::RelativeManager => "zwp_relative_pointer_manager_v1",
+            Self::RelativePointer => "zwp_relative_pointer_v1",
+            Self::ConstraintsManager => "zwp_pointer_constraints_v1",
+            Self::Locked => "zwp_locked_pointer_v1",
+            Self::Confined => "zwp_confined_pointer_v1",
+            Self::Activation => "xdg_activation_v1",
+            Self::ActivationToken => "xdg_activation_token_v1",
+            Self::FractionalManager => "wp_fractional_scale_manager_v1",
+            Self::Fractional(_) => "wp_fractional_scale_v1",
+            Self::IdleInhibitManager => "zwp_idle_inhibit_manager_v1",
+            Self::IdleInhibitor => "zwp_idle_inhibitor_v1",
         }
     }
 }
@@ -698,6 +1204,8 @@ struct Client {
     /// Нажатые клавиши (коды evdev): повтор ядра отличается от нажатия.
     keys_down: Vec<u32>,
     seat_version: u32,
+    /// G5: version of the client's `xdg_wm_base` (`wm_capabilities` from 5).
+    wm_version: u32,
     broken: bool,
     /// `xdg_wm_base` клиента — ему идут `ping` (P4).
     wm_base: Option<u32>,
@@ -707,10 +1215,45 @@ struct Client {
     ping_sent: u64,
     /// О молчании на `ping` уже сказано в журнале.
     ping_silence_told: bool,
-    /// Когда клиенту последний раз ответили на `frame` (темп, P8) и с какого
-    /// мига ответ отложен.
-    frame_answered: u64,
+    /// Когда клиенту последний раз ответили на `frame` (темп, P8; мкс) и с
+    /// какого мига ответ отложен (мс).
+    frame_answered_us: u64,
     frames_held_since: u64,
+    /// `wp_presentation_feedback` после `commit`: (объект, поверхность,
+    /// поверхность окна) — `presented`, когда окно показано, `discarded`, если
+    /// кадр сменили раньше (D7).
+    feedbacks: Vec<(u32, u32, u32)>,
+    /// Счётчик показов для `presented` (`seq`).
+    present_seq: u64,
+    /// G3: bounding boxes of the client's `wl_region`s (surface coordinates).
+    regions: BTreeMap<u32, Rect>,
+    /// G3: pointer constraints (`zwp_pointer_constraints_v1`).
+    constraints: Vec<PointerConstraint>,
+    /// G3: frame pace of this client (us): the refresh of the monitor its
+    /// paced window is on, not of the fastest monitor; 0 - not known yet.
+    pace_us: u64,
+    /// G3: activation tokens handed out.
+    tokens: u32,
+    /// G3: buffers replaced on screen that a display may still scan out (a
+    /// page flip not on screen yet): `wl_buffer.release` waits for it.
+    scan_held: Vec<(u32, Buffer)>,
+    /// G5: the monitors as last told to this client (globals announced and
+    /// what the bound `wl_output`s were sent), and the table generation.
+    outputs_told: Vec<OutputInfo>,
+    outputs_gen: u32,
+    /// G5: `wl_surface.enter` sent and not left: (surface, `wl_output`
+    /// object); when the monitors under surfaces were last looked up (ms).
+    entered: Vec<(u32, u32)>,
+    enter_checked_ms: u64,
+}
+
+/// A client gone with idle inhibitors alive: they end with it (22.11).
+impl Drop for Client {
+    fn drop(&mut self) {
+        for _ in self.objects.values().filter(|obj| matches!(obj, Obj::IdleInhibitor)) {
+            crate::power::inhibit(false);
+        }
+    }
 }
 
 impl Client {
@@ -744,13 +1287,25 @@ impl Client {
             next_server_id: 0xff00_0000,
             keys_down: Vec::new(),
             seat_version: 1,
+            wm_version: 1,
             broken: false,
             wm_base: None,
             ping: None,
             ping_sent: 0,
             ping_silence_told: false,
-            frame_answered: 0,
+            frame_answered_us: 0,
             frames_held_since: 0,
+            feedbacks: Vec::new(),
+            present_seq: 0,
+            regions: BTreeMap::new(),
+            constraints: Vec::new(),
+            pace_us: 0,
+            tokens: 0,
+            scan_held: Vec::new(),
+            outputs_told: Vec::new(),
+            outputs_gen: 0,
+            entered: Vec::new(),
+            enter_checked_ms: 0,
         }
     }
 
@@ -787,7 +1342,10 @@ impl Client {
     /// Один виток: прочитать, разобрать, отправить. `false` — соединения нет.
     fn step(&mut self, now: u64) -> bool {
         let time = now as u32;
+        self.release_scanned();
         self.answer_frames(now);
+        // G5: before requests, so a registry made now lists what is current.
+        self.sync_outputs();
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             match self.conn.recv(&mut buf) {
@@ -826,11 +1384,20 @@ impl Client {
             self.serve_owner();
             self.window_events(time);
             self.popup_events(time);
+            if !self.constraints.is_empty() {
+                self.sync_constraints();
+            }
+            self.sync_enter(now);
+            let now_us = crate::time::uptime_ns() / 1000;
             for index in 0..self.wins.len() {
-                if self.wins[index].dirty {
+                // Отложенный кадр без темпа (D7) — к своему сроку.
+                if self.wins[index].dirty && now_us >= self.wins[index].hold_until_us {
                     self.present(index);
                 }
                 let win = &mut self.wins[index];
+                if let (Some((op, at)), Some(_)) = (win.op_due, win.open) {
+                    win.op_due = window_op(self.pid, win.slot, op, at).then_some((op, at));
+                }
                 if win.title_due && win.open.is_some() {
                     win.title_due = crate::ui::title_window(self.pid, win.slot, &win.title).is_err();
                 }
@@ -890,6 +1457,10 @@ impl Client {
                     for (name, interface, version) in GLOBALS {
                         self.send(Msg::new(registry, 0).u32(name).str(interface).u32(version));
                     }
+                    let outputs: Vec<u32> = self.outputs_told.iter().map(|o| o.global).collect();
+                    for name in outputs {
+                        self.send(Msg::new(registry, 0).u32(name).str("wl_output").u32(4));
+                    }
                 }
                 _ => {}
             },
@@ -902,14 +1473,249 @@ impl Client {
                     self.bind(name, &interface, version, new);
                 }
             }
-            Obj::Callback | Obj::Region | Obj::Output | Obj::Keyboard => {
+            // `destroy`, `get_tearing_control(id, surface)` (D7).
+            Obj::TearingManager => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let new = args.u32()?;
+                    let surface = args.u32()?;
+                    match self.objects.get_mut(&surface) {
+                        Some(Obj::Surface(state)) if state.tearing.is_some_and(|other| other != new) => {
+                            self.fail(id, 0, "the surface already has a tearing control");
+                            return Ok(());
+                        }
+                        Some(Obj::Surface(state)) => state.tearing = Some(new),
+                        _ => {}
+                    }
+                    self.objects.insert(new, Obj::Tearing(surface));
+                }
+                _ => {}
+            },
+            // `set_presentation_hint(hint)` (с `commit`), `destroy` — снова
+            // `vsync`.
+            Obj::Tearing(surface) => {
+                let surface = *surface;
+                let hint = match opcode {
+                    0 => args.u32()? == TEARING_ASYNC,
+                    1 => {
+                        self.delete(id);
+                        if let Some(Obj::Surface(state)) = self.objects.get_mut(&surface) {
+                            state.tearing = None;
+                        }
+                        false
+                    }
+                    _ => return Ok(()),
+                };
+                if let Some(Obj::Surface(state)) = self.objects.get_mut(&surface) {
+                    state.tearing_next = Some(hint);
+                }
+            }
+            // `destroy`, `feedback(surface, callback)`: ответ — после показа
+            // кадра следующего `commit` этой поверхности.
+            Obj::Presentation => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let surface = args.u32()?;
+                    let callback = args.u32()?;
+                    self.objects.insert(callback, Obj::Feedback);
+                    match self.objects.get_mut(&surface) {
+                        Some(Obj::Surface(state)) => state.feedback.push(callback),
+                        _ => self.feedback_end(callback, None),
+                    }
+                }
+                _ => {}
+            },
+            Obj::Feedback => {}
+            // G3: `wl_region.add(x, y, w, h)` / `subtract` - kept as the
+            // bounding box of what was added (pointer confinement needs no
+            // more: games confine to one rectangle).
+            Obj::Region if opcode == 1 || opcode == 2 => {
+                let (x, y, w, h) = (args.i32()?, args.i32()?, args.i32()?, args.i32()?);
+                if opcode == 1 && w > 0 && h > 0 {
+                    let rect = Rect::new(x, y, w as u32, h as u32);
+                    let next = self.regions.get(&id).map_or(rect, |old| old.union(&rect));
+                    self.regions.insert(id, next);
+                }
+            }
+            Obj::Region if opcode == 0 => {
+                self.regions.remove(&id);
+                self.delete(id);
+            }
+            // G3: `destroy`, `get_relative_pointer(id, pointer)`.
+            Obj::RelativeManager => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let new = args.u32()?;
+                    self.objects.insert(new, Obj::RelativePointer);
+                }
+                _ => {}
+            },
+            Obj::RelativePointer => {
+                if opcode == 0 {
+                    self.delete(id);
+                }
+            }
+            // G3: `destroy`, `lock_pointer` / `confine_pointer(id, surface,
+            // pointer, region, lifetime)`.
+            Obj::ConstraintsManager => match opcode {
+                0 => self.delete(id),
+                1 | 2 => {
+                    let (new, surface, _pointer, region, lifetime) = (args.u32()?, args.u32()?, args.u32()?, args.u32()?, args.u32()?);
+                    if self.constraints.iter().any(|c| c.surface == surface) {
+                        self.fail(id, 1, "the surface already has a pointer constraint");
+                        return Ok(());
+                    }
+                    let lock = opcode == 1;
+                    self.objects.insert(new, if lock { Obj::Locked } else { Obj::Confined });
+                    let region = (region != 0).then(|| self.regions.get(&region).copied().unwrap_or(Rect::EMPTY));
+                    kprintln!(
+                        "  wayland     : #{} asks to {} the pointer on surface {surface}{}",
+                        self.pid,
+                        if lock { "lock" } else { "confine" },
+                        if lifetime == CONSTRAINT_PERSISTENT { " (persistent)" } else { "" }
+                    );
+                    self.constraints.push(PointerConstraint {
+                        id: new,
+                        surface,
+                        lock,
+                        region,
+                        persistent: lifetime == CONSTRAINT_PERSISTENT,
+                        asked: false,
+                        active: false,
+                        defunct: false,
+                    });
+                    self.sync_constraints();
+                }
+                _ => {}
+            },
+            // `zwp_locked_pointer_v1`: `destroy`, `set_cursor_position_hint(x,
+            // y)`, `set_region(region)`; `zwp_confined_pointer_v1`:
+            // `destroy`, `set_region(region)`.
+            Obj::Locked | Obj::Confined => {
+                let lock = matches!(object, Obj::Locked);
+                match (lock, opcode) {
+                    (_, 0) => {
+                        self.drop_constraint(id);
+                        self.delete(id);
+                    }
+                    (true, 1) => {
+                        let (x, y) = (args.i32()? >> 8, args.i32()? >> 8);
+                        if let Some((slot, (gx, gy))) = self.constraint_window(id) {
+                            crate::ui::constraint_hint(self.pid, slot, x - gx, y - gy);
+                        }
+                    }
+                    (true, 2) | (false, 1) => {
+                        let region = args.u32()?;
+                        let region = (region != 0).then(|| self.regions.get(&region).copied().unwrap_or(Rect::EMPTY));
+                        if let Some(c) = self.constraints.iter_mut().find(|c| c.id == id) {
+                            c.region = region;
+                            c.asked = false;
+                        }
+                        self.sync_constraints();
+                    }
+                    _ => {}
+                }
+            }
+            // G3: `destroy`, `get_activation_token(id)`, `activate(token,
+            // surface)`.
+            Obj::Activation => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let new = args.u32()?;
+                    self.objects.insert(new, Obj::ActivationToken);
+                }
+                2 => {
+                    let _token = args.string()?;
+                    let surface = args.u32()?;
+                    let root = self.root_of(surface);
+                    if let Some(slot) = self.wins.iter().find(|win| win.surface == root && win.open.is_some()).map(|win| win.slot) {
+                        let _ = crate::ui::activate_window(self.pid, slot);
+                    }
+                }
+                _ => {}
+            },
+            // `set_serial`, `set_app_id`, `set_surface`, `commit` (-> `done`
+            // with the token), `destroy`.
+            Obj::ActivationToken => match opcode {
+                3 => {
+                    self.tokens = self.tokens.wrapping_add(1);
+                    let token = alloc::format!("fossai-{}-{}", self.pid, self.tokens);
+                    self.send(Msg::new(id, 0).str(&token));
+                }
+                4 => self.delete(id),
+                _ => {}
+            },
+            // G3: `destroy`, `get_fractional_scale(id, surface)`: the scale is
+            // 1.0 - surface coordinates are screen pixels here.
+            Obj::FractionalManager => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let (new, surface) = (args.u32()?, args.u32()?);
+                    if self.objects.values().any(|obj| matches!(obj, Obj::Fractional(of) if *of == surface)) {
+                        self.fail(id, 0, "the surface already has a fractional scale");
+                        return Ok(());
+                    }
+                    self.objects.insert(new, Obj::Fractional(surface));
+                    self.send(Msg::new(new, 0).u32(FRACTIONAL_ONE));
+                }
+                _ => {}
+            },
+            Obj::Fractional(_) => {
+                if opcode == 0 {
+                    self.delete(id);
+                }
+            }
+            // 22.11: `destroy`, `create_inhibitor(id, surface)`; the
+            // inhibitor's only request is `destroy`.
+            Obj::IdleInhibitManager => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let (new, _surface) = (args.u32()?, args.u32()?);
+                    self.objects.insert(new, Obj::IdleInhibitor);
+                    crate::power::inhibit(true);
+                    kprintln!("  wayland     : client #{} inhibits the screensaver", self.pid);
+                }
+                _ => {}
+            },
+            Obj::IdleInhibitor => {
+                if opcode == 0 {
+                    self.delete(id);
+                    crate::power::inhibit(false);
+                }
+            }
+            Obj::Callback | Obj::Region | Obj::Output { .. } | Obj::Keyboard => {
                 // `destroy`/`release` у тех, у кого он есть, — нулевой.
                 let destroys = match object {
                     Obj::Region => opcode == 0,
-                    Obj::Output | Obj::Keyboard => opcode == 0,
+                    Obj::Output { .. } | Obj::Keyboard => opcode == 0,
                     _ => false,
                 };
                 if destroys {
+                    self.entered.retain(|&(_, output)| output != id);
+                    self.delete(id);
+                }
+            }
+            // G5: `destroy`, `get_xdg_output(id, output)`.
+            Obj::XdgOutputManager(version) => {
+                let version = *version;
+                match opcode {
+                    0 => self.delete(id),
+                    1 => {
+                        let (new, output) = (args.u32()?, args.u32()?);
+                        self.objects.insert(new, Obj::XdgOutput { output, version });
+                        let info = match self.objects.get(&output) {
+                            Some(Obj::Output { global, .. }) => self.outputs_told.iter().find(|o| o.global == *global).cloned(),
+                            _ => None,
+                        };
+                        if let Some(info) = info {
+                            self.send_xdg_output(new, output, version, &info, true);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Obj::XdgOutput { .. } => {
+                if opcode == 0 {
                     self.delete(id);
                 }
             }
@@ -977,15 +1783,53 @@ impl Client {
                 0 => self.delete(id),
                 1 => {
                     let new = args.u32()?;
-                    self.objects.insert(new, Obj::Viewport);
+                    let surface = args.u32()?;
+                    self.objects.insert(new, Obj::Viewport(surface));
                 }
                 _ => {}
             },
-            // `destroy`, `set_source`, `set_destination`: окно стола — в размер
-            // буфера, масштаба нет.
-            Obj::Viewport => {
-                if opcode == 0 {
-                    self.delete(id);
+            // `destroy`, `set_source(x, y, w, h)` (`wl_fixed`, все -1 — снять),
+            // `set_destination(w, h)` (-1, -1 — снять). Действуют с `commit`
+            // поверхности (D4, 20.11.2026).
+            Obj::Viewport(surface) => {
+                let surface = *surface;
+                let current = match self.objects.get(&surface) {
+                    Some(Obj::Surface(state)) => state.view_next.unwrap_or(state.view),
+                    _ => View::default(),
+                };
+                let next = match opcode {
+                    0 => {
+                        self.delete(id);
+                        Some(View::default())
+                    }
+                    1 => {
+                        let (x, y, w, h) = (args.i32()?, args.i32()?, args.i32()?, args.i32()?);
+                        let src = if (x, y, w, h) == (-256, -256, -256, -256) {
+                            None
+                        } else if x < 0 || y < 0 || w <= 0 || h <= 0 {
+                            self.fail(id, 0, "bad source rectangle");
+                            return Ok(());
+                        } else {
+                            Some((x, y, w, h))
+                        };
+                        Some(View { src, ..current })
+                    }
+                    2 => {
+                        let (w, h) = (args.i32()?, args.i32()?);
+                        let dst = if (w, h) == (-1, -1) {
+                            None
+                        } else if w <= 0 || h <= 0 {
+                            self.fail(id, 0, "bad destination size");
+                            return Ok(());
+                        } else {
+                            Some((w as u32, h as u32))
+                        };
+                        Some(View { dst, ..current })
+                    }
+                    _ => None,
+                };
+                if let (Some(next), Some(Obj::Surface(state))) = (next, self.objects.get_mut(&surface)) {
+                    state.view_next = Some(next);
                 }
             }
             Obj::Subcompositor => match opcode {
@@ -1207,11 +2051,23 @@ impl Client {
                     // «развернуть», и Wine, не видя состояния, крутил set/unset).
                     // До открытия окна — запомнить.
                     11 | 12 if !self.wins.iter().any(|win| win.toplevel == id && win.open.is_some()) => {
+                        let output = if opcode == 11 { self.output_global(args.u32()?) } else { None };
                         if let Some(win) = self.wins.iter_mut().find(|win| win.toplevel == id) {
                             win.want_full = opcode == 11;
+                            win.full_output = output;
                         }
                     }
-                    5 | 6 | 9 | 10 | 11 | 12 | 13 => {
+                    // G5: `set_fullscreen(output)` - on the monitor asked
+                    // (Wine: the one the game is on in its coordinates).
+                    11 => {
+                        let output = self.output_global(args.u32()?);
+                        let pid = self.pid;
+                        if let Some(win) = self.wins.iter_mut().find(|win| win.toplevel == id && win.open.is_some()) {
+                            let at = output.and_then(output_point);
+                            win.op_due = window_op(pid, win.slot, 11, at).then_some((11, at));
+                        }
+                    }
+                    5 | 6 | 9 | 10 | 12 | 13 => {
                         // `resize(seat, serial, edges)`: у Wayland верх 1, низ 2,
                         // лево 4, право 8 — у стола свои биты.
                         let edges = if opcode == 6 {
@@ -1231,17 +2087,22 @@ impl Client {
                         } else {
                             0
                         };
-                        if let Some(win) = self.wins.iter().find(|win| win.toplevel == id && win.open.is_some()) {
-                            let (pid, slot) = (self.pid, win.slot);
-                            let _ = match opcode {
-                                5 => crate::ui::begin_move(pid, slot),
-                                6 => crate::ui::begin_resize(pid, slot, edges),
-                                9 => crate::ui::maximize_window(pid, slot, true),
-                                10 => crate::ui::maximize_window(pid, slot, false),
-                                11 => crate::ui::fullscreen_window(pid, slot, true),
-                                12 => crate::ui::fullscreen_window(pid, slot, false),
-                                _ => crate::ui::minimize_window(pid, slot),
-                            };
+                        let pid = self.pid;
+                        if let Some(win) = self.wins.iter_mut().find(|win| win.toplevel == id && win.open.is_some()) {
+                            let slot = win.slot;
+                            match opcode {
+                                5 => {
+                                    let _ = crate::ui::begin_move(pid, slot);
+                                }
+                                6 => {
+                                    let _ = crate::ui::begin_resize(pid, slot, edges);
+                                }
+                                // G5 (22.11): the desktop busy (a flight, a
+                                // frame) - asked again on the next rounds, not
+                                // lost (a second set_minimized right after a
+                                // restore was dropped in `wayland-multihead`).
+                                _ => win.op_due = window_op(pid, slot, opcode, None).then_some((opcode, None)),
+                            }
                         }
                     }
                     _ => {}
@@ -1259,6 +2120,10 @@ impl Client {
                         pop.grab = true;
                     }
                 }
+                2 => {
+                    let (positioner, token) = (args.u32()?, args.u32()?);
+                    self.reposition_popup(id, positioner, token);
+                }
                 _ => {}
             },
             Obj::Seat => match opcode {
@@ -1274,16 +2139,43 @@ impl Client {
                 3 => self.delete(id),
                 _ => {}
             },
-            Obj::Pointer => {
-                if opcode == 1 {
-                    self.delete(id);
+            Obj::Pointer => match opcode {
+                // G3: `set_cursor(serial, surface, hx, hy)`: a null surface
+                // hides the pointer over the window (games drawing their own
+                // cursor - then a flipped output needs no cursor at all); a
+                // surface shows ours again (cursor images are not taken yet).
+                0 => {
+                    let _serial = args.u32()?;
+                    let surface = args.u32()?;
+                    let root = self.pointer_on.map(|on| self.root_of(on));
+                    if let Some(win) = root.and_then(|root| self.wins.iter().find(|win| win.surface == root && win.open.is_some())) {
+                        crate::ui::client_cursor(self.pid, win.slot, surface == 0);
+                    }
                 }
-            }
+                1 => self.delete(id),
+                _ => {}
+            },
         }
         Ok(())
     }
 
     fn bind(&mut self, name: u32, interface: &str, version: u32, new: u32) {
+        // G5: a monitor. One removed meanwhile (its `global_remove` still on
+        // the way) gets an inert object, as the protocol asks.
+        if name >= FIRST_OUTPUT_GLOBAL {
+            if interface != "wl_output" {
+                self.fail(1, 0, "interface does not match the global");
+                return;
+            }
+            let version = version.clamp(1, 4);
+            self.objects.insert(new, Obj::Output { global: name, version });
+            if let Some(info) = self.outputs_told.iter().find(|o| o.global == name).cloned() {
+                self.send_output(new, version, &info, true);
+                // Already on screen: its surfaces are on this monitor too.
+                self.enter_checked_ms = 0;
+            }
+            return;
+        }
         let Some((_, global, ours)) = GLOBALS.iter().find(|(number, _, _)| *number == name) else {
             self.fail(1, 0, "no such global");
             return;
@@ -1302,13 +2194,22 @@ impl Client {
             7 => Obj::DataDeviceManager,
             8 => Obj::Viewporter,
             9 => Obj::Dmabuf,
-            _ => Obj::Output,
+            10 => Obj::TearingManager,
+            11 => Obj::Presentation,
+            12 => Obj::RelativeManager,
+            13 => Obj::ConstraintsManager,
+            14 => Obj::Activation,
+            15 => Obj::FractionalManager,
+            16 => Obj::IdleInhibitManager,
+            _ => Obj::XdgOutputManager(version),
         };
         self.objects.insert(new, object);
         if name == 4 {
             self.wm_base = Some(new);
+            self.wm_version = version;
         }
         match name {
+            11 => self.send(Msg::new(new, 0).u32(PRESENTATION_CLOCK)),
             3 => {
                 self.send(Msg::new(new, 0).u32(SHM_ARGB8888));
                 self.send(Msg::new(new, 0).u32(SHM_XRGB8888));
@@ -1331,19 +2232,215 @@ impl Client {
                     self.send(Msg::new(new, 1).str("seat0"));
                 }
             }
-            6 => {
-                let (width, height) = crate::ui::screen_size();
-                // Физический размер — как у экрана 96 точек на дюйм.
-                let (mm_w, mm_h) = ((width * 254 / 960) as i32, (height * 254 / 960) as i32);
-                self.send(Msg::new(new, 0).i32(0).i32(0).i32(mm_w).i32(mm_h).i32(0).str("FossAi").str("Screen").i32(0));
-                self.send(Msg::new(new, 1).u32(3).i32(width as i32).i32(height as i32).i32(60_000));
-                if version >= 2 {
-                    self.send(Msg::new(new, 3).i32(1));
-                    self.send(Msg::new(new, 2));
-                }
-            }
             _ => {}
         }
+    }
+
+    /// G5: `wl_output` events of a monitor - `geometry` (place in the
+    /// registry's desktop, size in mm and make/model from EDID), `mode`
+    /// (current + preferred, the real refresh: Wine and DXVK see 144 Hz),
+    /// `scale` 1, and on bind `name`/`description` (v4); then `done`
+    /// unless an `zxdg_output_v1` update follows.
+    fn send_output(&mut self, id: u32, version: u32, info: &OutputInfo, first: bool) {
+        self.send(
+            Msg::new(id, 0)
+                .i32(info.x)
+                .i32(info.y)
+                .i32(info.mm.0)
+                .i32(info.mm.1)
+                .i32(0)
+                .str(&info.make)
+                .str(&info.model)
+                .i32(0),
+        );
+        self.send(Msg::new(id, 1).u32(3).i32(info.w as i32).i32(info.h as i32).i32(info.mhz as i32));
+        if version >= 2 {
+            self.send(Msg::new(id, 3).i32(1));
+        }
+        if version >= 4 {
+            if first {
+                self.send(Msg::new(id, 4).str(&info.name));
+            }
+            self.send(Msg::new(id, 5).str(&info.description));
+        }
+        if version >= 2 {
+            self.send(Msg::new(id, 2));
+        }
+    }
+
+    /// G5: `zxdg_output_v1` events - logical position and size (scale 1:
+    /// the mode), `name`/`description` (v2), then `done` (v1/v2) or, from
+    /// v3, `wl_output.done` of its output (`done_too`).
+    fn send_xdg_output(&mut self, id: u32, output: u32, version: u32, info: &OutputInfo, done_too: bool) {
+        self.send(Msg::new(id, 0).i32(info.x).i32(info.y));
+        self.send(Msg::new(id, 1).i32(info.w as i32).i32(info.h as i32));
+        if version >= 2 {
+            self.send(Msg::new(id, 3).str(&info.name));
+            self.send(Msg::new(id, 4).str(&info.description));
+        }
+        if version < 3 {
+            self.send(Msg::new(id, 2));
+        } else if done_too && matches!(self.objects.get(&output), Some(Obj::Output { version, .. }) if *version >= 2) {
+            self.send(Msg::new(output, 2));
+        }
+    }
+
+    /// The output global of a `wl_output` object of this client (0 - none).
+    fn output_global(&self, object: u32) -> Option<u32> {
+        match self.objects.get(&object) {
+            Some(Obj::Output { global, .. }) => Some(*global),
+            _ => None,
+        }
+    }
+
+    /// G5: tell the client what changed in the monitors - new globals,
+    /// removed globals, and new geometry/mode/position of bound outputs.
+    fn sync_outputs(&mut self) {
+        let generation = OUTPUT_TABLE.lock().generation;
+        if generation == self.outputs_gen {
+            return;
+        }
+        let (generation, now) = outputs_now();
+        self.outputs_gen = generation;
+        let old = core::mem::replace(&mut self.outputs_told, now.clone());
+        let registries: Vec<u32> = self.objects.iter().filter(|(_, obj)| matches!(obj, Obj::Registry)).map(|(id, _)| *id).collect();
+        for gone in old.iter().filter(|o| !now.iter().any(|n| n.global == o.global)) {
+            for &registry in &registries {
+                self.send(Msg::new(registry, 1).u32(gone.global));
+            }
+        }
+        for added in now.iter().filter(|n| !old.iter().any(|o| o.global == n.global)) {
+            for &registry in &registries {
+                self.send(Msg::new(registry, 0).u32(added.global).str("wl_output").u32(4));
+            }
+        }
+        // Bound outputs whose monitor moved or changed mode.
+        let bound: Vec<(u32, u32, u32)> = self
+            .objects
+            .iter()
+            .filter_map(|(id, obj)| match obj {
+                Obj::Output { global, version } => Some((*id, *global, *version)),
+                _ => None,
+            })
+            .collect();
+        for (id, global, version) in bound {
+            let (Some(before), Some(after)) = (old.iter().find(|o| o.global == global), now.iter().find(|n| n.global == global)) else {
+                continue;
+            };
+            if before == after {
+                continue;
+            }
+            let after = after.clone();
+            let xdg: Vec<(u32, u32)> = self
+                .objects
+                .iter()
+                .filter_map(|(xid, obj)| match obj {
+                    Obj::XdgOutput { output, version } if *output == id => Some((*xid, *version)),
+                    _ => None,
+                })
+                .collect();
+            // `done` once, after the xdg_output events.
+            self.send(
+                Msg::new(id, 0)
+                    .i32(after.x)
+                    .i32(after.y)
+                    .i32(after.mm.0)
+                    .i32(after.mm.1)
+                    .i32(0)
+                    .str(&after.make)
+                    .str(&after.model)
+                    .i32(0),
+            );
+            self.send(Msg::new(id, 1).u32(3).i32(after.w as i32).i32(after.h as i32).i32(after.mhz as i32));
+            if version >= 4 && before.description != after.description {
+                self.send(Msg::new(id, 5).str(&after.description));
+            }
+            for (xid, xversion) in xdg {
+                self.send_xdg_output(xid, id, xversion, &after, false);
+            }
+            if version >= 2 {
+                self.send(Msg::new(id, 2));
+            }
+        }
+        // Surfaces may be on other monitors now.
+        self.enter_checked_ms = 0;
+    }
+
+    /// G5: `wl_surface.enter`/`leave` - every surface of a window (and of a
+    /// menu) is on the monitors its window overlaps, looked up every
+    /// [`ENTER_RECHECK_MS`] (windows are dragged between monitors).
+    fn sync_enter(&mut self, now: u64) {
+        if self.enter_checked_ms != 0 && now.saturating_sub(self.enter_checked_ms) < ENTER_RECHECK_MS {
+            return;
+        }
+        let outputs: Vec<(u32, u32)> = self
+            .objects
+            .iter()
+            .filter_map(|(id, obj)| match obj {
+                Obj::Output { global, .. } => Some((*id, *global)),
+                _ => None,
+            })
+            .collect();
+        if outputs.is_empty() && self.entered.is_empty() {
+            self.enter_checked_ms = now.max(1);
+            return;
+        }
+        // Desktop coordinates start at the corner of the box around all
+        // monitors; the table's at the primary monitor.
+        let left = self.outputs_told.iter().map(|o| o.x).min().unwrap_or(0);
+        let top = self.outputs_told.iter().map(|o| o.y).min().unwrap_or(0);
+        let mut roots: Vec<(u32, u32)> = self.wins.iter().filter(|win| win.open.is_some()).map(|win| (win.surface, win.slot)).collect();
+        roots.extend(self.pops.iter().filter(|pop| pop.open.is_some()).map(|pop| (pop.surface, pop.slot)));
+        let mut want: Vec<(u32, u32)> = Vec::new();
+        let mut root_ids: Vec<u32> = Vec::new();
+        for (root, slot) in roots {
+            root_ids.push(root);
+            let mut tree = vec![root];
+            let mut at = 0;
+            while at < tree.len() && tree.len() < 64 {
+                if let Some(Obj::Surface(state)) = self.objects.get(&tree[at]) {
+                    tree.extend(state.children.iter().copied());
+                }
+                at += 1;
+            }
+            let Some(rect) = crate::ui::window_rect(self.pid, slot) else {
+                // The desktop was busy (or the window not there yet): what
+                // was entered stays until the next look.
+                want.extend(self.entered.iter().copied().filter(|(surface, _)| tree.contains(surface)));
+                continue;
+            };
+            let rect = rect.translate(left, top);
+            let on: Vec<u32> = outputs
+                .iter()
+                .filter(|(_, global)| self.outputs_told.iter().any(|o| o.global == *global && !o.rect().intersect(&rect).is_empty()))
+                .map(|(id, _)| *id)
+                .collect();
+            for surface in tree {
+                for &output in &on {
+                    want.push((surface, output));
+                }
+            }
+        }
+        self.enter_checked_ms = now.max(1);
+        let alive = |objects: &BTreeMap<u32, Obj>, (surface, output): (u32, u32)| {
+            matches!(objects.get(&surface), Some(Obj::Surface(_))) && matches!(objects.get(&output), Some(Obj::Output { .. }))
+        };
+        let entered = core::mem::take(&mut self.entered);
+        for pair in entered.iter().copied() {
+            if alive(&self.objects, pair) && !want.contains(&pair) {
+                self.send(Msg::new(pair.0, 1).u32(pair.1));
+            }
+        }
+        for pair in want.iter().copied() {
+            if !entered.contains(&pair) {
+                self.send(Msg::new(pair.0, 0).u32(pair.1));
+                let global = self.output_global(pair.1).unwrap_or(0);
+                if let Some(o) = self.outputs_told.iter().find(|o| o.global == global).filter(|_| root_ids.contains(&pair.0)) {
+                    kprintln!("  wayland     : #{} surface {} entered output '{}'", self.pid, pair.0, o.name);
+                }
+            }
+        }
+        self.entered = want;
     }
 
     fn surface_request(&mut self, id: u32, opcode: u16, args: &mut Args<'_>) -> Result<(), Bad> {
@@ -1360,6 +2457,16 @@ impl Client {
                     let buffer = *buffer;
                     self.release(buffer);
                 }
+                // Кадры поверхности уже не покажутся.
+                let unsent = match self.objects.get_mut(&id) {
+                    Some(Obj::Surface(state)) => core::mem::take(&mut state.feedback),
+                    _ => Vec::new(),
+                };
+                for feedback in unsent {
+                    self.feedback_end(feedback, None);
+                }
+                self.feedback_discard(|surface, _| surface == id);
+                self.entered.retain(|&(surface, _)| surface != id);
                 self.delete(id);
             }
             1 => {
@@ -1395,6 +2502,50 @@ impl Client {
         Ok(())
     }
 
+    /// Where a popup goes from its parent's corner (`base` from the owner's
+    /// pixels): bounds - the monitor under the anchor rectangle (its middle),
+    /// counted from the owner's pixels like the popup itself
+    /// (`Compositor::popup_rect`; G5).
+    fn popup_place(&self, owner: u32, base: (i32, i32), place: &Positioner) -> (i32, i32) {
+        let (ax, ay, aw, ah) = place.anchor;
+        let point = (base.0 + ax + aw / 2, base.1 + ay + ah / 2);
+        let (origin, area) = crate::ui::popup_bounds(self.pid, owner, point).unwrap_or_else(|| {
+            let (sw, sh) = crate::ui::screen_size();
+            ((0, 0), Rect::new(0, 0, sw, sh))
+        });
+        place.constrain((origin.0 + base.0, origin.1 + base.1), area)
+    }
+
+    /// G5 (22.11): `xdg_popup.reposition(positioner, token)` (xdg_wm_base 3+):
+    /// placed again by the new positioner - `repositioned(token)`, then
+    /// `configure` with the new place and size and `xdg_surface.configure`;
+    /// an open menu moves at once, a new size comes with the client's commit.
+    fn reposition_popup(&mut self, popup: u32, positioner: u32, token: u32) {
+        let Some(index) = self.pops.iter().position(|pop| pop.popup == popup) else {
+            return;
+        };
+        let place = match self.objects.get(&positioner) {
+            Some(Obj::Positioner(place)) => *place,
+            _ => return,
+        };
+        let (owner, base, xdg) = (self.pops[index].owner, self.pops[index].base, self.pops[index].xdg);
+        let (x, y) = self.popup_place(owner, base, &place);
+        let at = (base.0 + x, base.1 + y);
+        let pid = self.pid;
+        let pop = &mut self.pops[index];
+        if pop.at != at {
+            pop.at = at;
+            // The desktop busy - placed with the next paint.
+            pop.place_due = pop.open.is_some() && crate::ui::place_window(pid, pop.slot, at).is_err();
+            pop.dirty |= pop.place_due;
+        }
+        kprintln!("  wayland     : #{pid} popup repositioned to {},{} {}x{}", at.0, at.1, place.width, place.height);
+        self.send(Msg::new(popup, 2).u32(token));
+        self.send(Msg::new(popup, 0).i32(x).i32(y).i32(place.width.max(1)).i32(place.height.max(1)));
+        let serial = self.next_serial();
+        self.send(Msg::new(xdg, 0).u32(serial));
+    }
+
     fn xdg_surface_request(&mut self, id: u32, surface: u32, opcode: u16, args: &mut Args<'_>) -> Result<(), Bad> {
         match opcode {
             0 => self.delete(id),
@@ -1403,6 +2554,21 @@ impl Client {
                 self.objects.insert(new, Obj::Toplevel);
                 if let Some(Obj::Surface(state)) = self.objects.get_mut(&surface) {
                     state.role = Role::Toplevel(id);
+                }
+                // G5 (21.11): `wm_capabilities` (xdg_wm_base 5+) before the
+                // first configure - maximize (2), fullscreen (3), minimize (4).
+                // GE-Proton's winewayland takes "configured, no capabilities"
+                // as "no minimize" and keeps a minimized window mapped: TMNF,
+                // minimized (its corner button, focus loss of a fullscreen
+                // game), stayed on the desktop as a small window showing the
+                // last frame, and the first click on it restored the game to
+                // fullscreen - "windowed TMNF can't be dragged" (hw-log13).
+                if self.wm_version >= 5 {
+                    let mut caps = Vec::with_capacity(12);
+                    for cap in [2u32, 3, 4] {
+                        caps.extend_from_slice(&cap.to_ne_bytes());
+                    }
+                    self.send(Msg::new(new, 3).bytes(&caps));
                 }
                 let slot = self.next_slot;
                 self.next_slot += 1;
@@ -1421,6 +2587,14 @@ impl Client {
                     title_due: false,
                     close_asked: 0,
                     want_full: false,
+                    full_output: None,
+                    op_due: None,
+                    adopted: None,
+                    stash: None,
+                    presented_us: 0,
+                    hold_until_us: 0,
+                    pace_us: 0,
+                    pace_at_ms: 0,
                 });
             }
             2 => {
@@ -1447,9 +2621,7 @@ impl Client {
                     self.send(Msg::new(new, 1));
                     return Ok(());
                 };
-                let origin = crate::ui::window_rect(self.pid, owner).map_or((0, 0), |rect| (rect.x, rect.y));
-                let (sw, sh) = crate::ui::screen_size();
-                let (x, y) = place.constrain((origin.0 + base.0, origin.1 + base.1), (sw as i32, sh as i32));
+                let (x, y) = self.popup_place(owner, base, &place);
                 let slot = self.next_slot;
                 self.next_slot += 1;
                 self.pops.push(Pop {
@@ -1459,6 +2631,8 @@ impl Client {
                     slot,
                     owner,
                     at: (base.0 + x, base.1 + y),
+                    base,
+                    place_due: false,
                     geometry: None,
                     open: None,
                     dirty: false,
@@ -1554,18 +2728,79 @@ impl Client {
 
     fn commit(&mut self, id: u32) {
         super::perfdiag::WL_COMMITS.fetch_add(1, Ordering::Relaxed);
-        let (pending, frames) = match self.objects.get_mut(&id) {
-            Some(Obj::Surface(state)) => (state.pending.take(), core::mem::take(&mut state.frames)),
+        let (pending, frames, feedback) = match self.objects.get_mut(&id) {
+            Some(Obj::Surface(state)) => (state.pending.take(), core::mem::take(&mut state.frames), core::mem::take(&mut state.feedback)),
             _ => return,
         };
+        let paced = !frames.is_empty();
         self.frames_due.extend(frames);
         let attached = pending.is_some();
+        // Кадр без `frame` с новым буфером — клиент не ждёт темпа экрана
+        // (Mesa WSI в `MAILBOX`/`IMMEDIATE`: VSync в игре выключена) — или
+        // прямо разрешил разрыв (`async`). Такой кадр не тормозится, а
+        // показывается не чаще монитора; последний побеждает (D7).
+        let mut unpaced = false;
+        if let Some(Obj::Surface(state)) = self.objects.get_mut(&id) {
+            if let Some(hint) = state.tearing_next.take() {
+                state.tearing_async = hint;
+            }
+            if attached && pending != Some(None) {
+                unpaced = state.tearing_async || !paced;
+                // В журнал — когда видно, что это поток кадров (30 подряд), а
+                // не редкая перерисовка обычной программы.
+                state.run = if unpaced == state.run_unpaced { state.run.saturating_add(1) } else { 1 };
+                state.run_unpaced = unpaced;
+                let mode = if unpaced { 2 } else { 1 };
+                if state.run == 30 && state.told != mode {
+                    state.told = mode;
+                    let how = match (unpaced, state.tearing_async) {
+                        (true, true) => "without vsync (tearing allowed, IMMEDIATE): frames are not paced",
+                        (true, false) => "without frame callbacks (MAILBOX): frames are not paced",
+                        _ => "with frame callbacks (FIFO, vsync): paced by the monitor",
+                    };
+                    kprintln!("  wayland     : #{} surface {id} presents {how}", self.pid);
+                    // Темп и где стоит окно (21.11, журнал 13: D2R на мониторе
+                    // 60 Гц, второй — 180 Гц; темп FIFO — по самому быстрому
+                    // монитору, показ — с частотой монитора окна).
+                    if let Some(win) = self.wins.iter().find(|win| win.surface == id) {
+                        let rect = crate::ui::window_rect(self.pid, win.slot);
+                        let monitor = rect.and_then(monitor_of);
+                        // G3: the pace is the window's own monitor (forced
+                        // `wlpace <Hz>` wins).
+                        let mhz = if PACE_FORCED_MHZ.load(Ordering::Relaxed) != 0 { pace_mhz() } else { monitor.map_or_else(pace_mhz, |m| m.1) };
+                        match monitor {
+                            Some((o, hz_mhz)) => kprintln!(
+                                "  wayland     : #{} surface {id}: window on the monitor at {},{} ({}.{:03} Hz), pace {}.{:03} Hz (the window's monitor)",
+                                self.pid, o.x, o.y, hz_mhz / 1000, hz_mhz % 1000, mhz / 1000, mhz % 1000
+                            ),
+                            None => kprintln!(
+                                "  wayland     : #{} surface {id}: FIFO pace {}.{:03} Hz (window monitor unknown)",
+                                self.pid, mhz / 1000, mhz % 1000
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        // Прежний кадр этой поверхности, так и не показанный, сменён этим.
+        self.feedback_discard(|surface, _| surface == id);
         if let Some(Obj::Surface(state)) = self.objects.get_mut(&id) {
             let damage = core::mem::replace(&mut state.damage, Rect::EMPTY);
             state.ready = state.ready.union(&damage);
             // Новый буфер без объявленных изменений — клиент не сказал, что
             // в нём другое; перерисовать целиком безопаснее.
             if attached && damage.is_empty() {
+                state.full = true;
+            }
+            if let Some(view) = state.view_next.take() {
+                if view != state.view {
+                    state.view = view;
+                    state.full = true;
+                }
+            }
+            // Изменения у масштабируемой поверхности — в точках буфера, а
+            // окно — в точках поверхности: проще перерисовать целиком.
+            if state.view != View::default() {
                 state.full = true;
             }
         }
@@ -1584,9 +2819,11 @@ impl Client {
                 }
                 _ => None,
             };
-            // Прежний буфер больше не читается — вернуть его клиенту.
+            // Прежний буфер больше не читается — вернуть его клиенту. Кроме
+            // буфера, который окно показывает без копии (D4): его вернёт
+            // `present`, когда окно перейдёт на следующий.
             if let Some((old, _)) = old {
-                if Some(old) != next {
+                if Some(old) != next && !self.wins.iter().any(|win| win.adopted.as_ref().is_some_and(|(adopted, _)| *adopted == old)) {
                     self.release(old);
                 }
             }
@@ -1599,9 +2836,17 @@ impl Client {
                 _ => break,
             }
         }
+        self.feedbacks.extend(feedback.into_iter().map(|callback| (callback, id, root)));
         let Some(index) = self.wins.iter().position(|win| win.surface == root) else {
             if let Some(index) = self.pops.iter().position(|pop| pop.surface == root) {
                 self.present_popup(index);
+            }
+            // Меню показывается сразу; поверхность без окна не покажется.
+            let shown = self.pops.iter().any(|pop| pop.surface == root && pop.open.is_some() && !pop.dirty);
+            if shown {
+                self.feedback_presented(root, 0);
+            } else {
+                self.feedback_discard(|_, of| of == root);
             }
             return;
         };
@@ -1611,7 +2856,80 @@ impl Client {
             self.wins[index].configured = true;
             self.configure(index, 0, 0);
         }
+        // Кадр без темпа пришёл раньше кадра монитора после прошлого показа
+        // — показать его (или более новый) к сроку; прежний буфер уже
+        // вернулся клиенту выше, и рисовать ему есть во что (D7).
+        // G3: pace by the monitor this window is on (a 60 Hz and a 180 Hz
+        // monitor side by side, hw-log13), not by the fastest one.
+        let win_us = self.win_frame_us(index);
+        if paced {
+            self.pace_us = win_us;
+        }
+        if unpaced && PACE.load(Ordering::Relaxed) && self.wins[index].open.is_some() {
+            let now_us = crate::time::uptime_ns() / 1000;
+            let due = self.wins[index].presented_us.saturating_add(win_us);
+            if now_us < due {
+                let win = &mut self.wins[index];
+                win.dirty = true;
+                win.hold_until_us = due;
+                super::perfdiag::WL_COALESCED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
         self.present(index);
+    }
+
+    /// Ответ на `wp_presentation_feedback`: `presented` (с временем
+    /// показа) или `discarded`; объект уничтожается сервером.
+    fn feedback_end(&mut self, callback: u32, presented: Option<(u64, u32)>) {
+        if !matches!(self.objects.get(&callback), Some(Obj::Feedback)) {
+            return;
+        }
+        match presented {
+            Some((ns, flags)) => {
+                let secs = ns / 1_000_000_000;
+                let refresh = (self.client_frame_us() * 1000).min(u64::from(u32::MAX)) as u32;
+                let seq = self.present_seq;
+                self.send(
+                    Msg::new(callback, 1)
+                        .u32((secs >> 32) as u32)
+                        .u32(secs as u32)
+                        .u32((ns % 1_000_000_000) as u32)
+                        .u32(refresh)
+                        .u32((seq >> 32) as u32)
+                        .u32(seq as u32)
+                        .u32(flags),
+                );
+            }
+            None => self.send(Msg::new(callback, 2)),
+        }
+        self.delete(callback);
+    }
+
+    /// `discarded` ждущим показа кадрам, отобранным `which(поверхность, окно)`.
+    fn feedback_discard(&mut self, which: impl Fn(u32, u32) -> bool) {
+        if !self.feedbacks.iter().any(|&(_, surface, root)| which(surface, root)) {
+            return;
+        }
+        let (gone, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.feedbacks).into_iter().partition(|&(_, surface, root)| which(surface, root));
+        self.feedbacks = kept;
+        for (callback, _, _) in gone {
+            self.feedback_end(callback, None);
+        }
+    }
+
+    /// Окно с поверхностью `root` показано — `presented` его кадрам.
+    fn feedback_presented(&mut self, root: u32, flags: u32) {
+        if !self.feedbacks.iter().any(|&(_, _, of)| of == root) {
+            return;
+        }
+        self.present_seq += 1;
+        let now = crate::time::uptime_ns();
+        let (done, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.feedbacks).into_iter().partition(|&(_, _, of)| of == root);
+        self.feedbacks = kept;
+        for (callback, _, _) in done {
+            self.feedback_end(callback, Some((now, flags)));
+        }
     }
 
     /// `xdg_toplevel.configure` с размером (0 — «выбери сам») и состояниями
@@ -1648,6 +2966,120 @@ impl Client {
         }
     }
 
+    /// Вернуть буфер, который окно показывало без копии, — если поверхность
+    /// не показывает его и сейчас (тогда его вернёт обычный путь).
+    ///
+    /// G3: a buffer a display may still scan out (page flip not on screen
+    /// yet) is held - released by [`Self::release_scanned`] once the display
+    /// is done with it; no tearing, no reuse under the scanout.
+    fn release_unless_shown(&mut self, _surface: u32, buffer: u32) {
+        let shown = self.objects.values().any(|obj| matches!(obj, Obj::Surface(SurfaceState { shown: Some((id, _)), .. }) if *id == buffer));
+        if shown {
+            return;
+        }
+        if let Some(Obj::Buffer(buf)) = self.objects.get(&buffer) {
+            if scanned(buf) {
+                if !self.scan_held.iter().any(|(id, _)| *id == buffer) {
+                    let buf = buf.clone();
+                    self.scan_held.push((buffer, buf));
+                }
+                return;
+            }
+        }
+        self.release(buffer);
+    }
+
+    /// G3: release the held buffers the displays no longer read.
+    fn release_scanned(&mut self) {
+        if self.scan_held.is_empty() {
+            return;
+        }
+        let mut index = 0;
+        while index < self.scan_held.len() {
+            if scanned(&self.scan_held[index].1) {
+                index += 1;
+                continue;
+            }
+            let (id, _) = self.scan_held.remove(index);
+            // Attached again meanwhile - the usual path releases it later.
+            let shown = self.objects.values().any(|obj| matches!(obj, Obj::Surface(SurfaceState { shown: Some((shown, _)), .. }) if *shown == id));
+            if !shown {
+                self.release(id);
+            }
+        }
+    }
+
+    /// G3: the desktop window of a pointer constraint and the offset of its
+    /// surface coordinates (`set_window_geometry`).
+    fn constraint_window(&self, id: u32) -> Option<(u32, (i32, i32))> {
+        let c = self.constraints.iter().find(|c| c.id == id)?;
+        let root = self.root_of(c.surface);
+        let win = self.wins.iter().find(|win| win.surface == root && win.open.is_some())?;
+        Some((win.slot, win.geometry.map_or((0, 0), |(x, y, _, _)| (x, y))))
+    }
+
+    /// G3: ask the desktop for the constraints and tell the client when they
+    /// start (`locked`/`confined`) and end (`unlocked`/`unconfined`; a
+    /// oneshot one is then over). The desktop decides: focus, menus,
+    /// Alt+Tab, Win, the pointer over the window.
+    fn sync_constraints(&mut self) {
+        for index in 0..self.constraints.len() {
+            let (id, lock, region, asked, active, defunct) = {
+                let c = &self.constraints[index];
+                (c.id, c.lock, c.region, c.asked, c.active, c.defunct)
+            };
+            if defunct {
+                continue;
+            }
+            let Some((slot, (gx, gy))) = self.constraint_window(id) else {
+                if active {
+                    self.end_constraint(index, None);
+                }
+                continue;
+            };
+            if !asked {
+                crate::ui::constrain_pointer(self.pid, slot, Some((lock, region.map(|r| r.translate(-gx, -gy)))));
+                self.constraints[index].asked = true;
+            }
+            match crate::ui::pointer_constrained(self.pid, slot) {
+                Some(true) if !active => {
+                    self.constraints[index].active = true;
+                    kprintln!("  wayland     : #{} pointer {}", self.pid, if lock { "locked" } else { "confined" });
+                    self.send(Msg::new(id, 0));
+                }
+                Some(false) if active => self.end_constraint(index, Some(slot)),
+                _ => {}
+            }
+        }
+    }
+
+    /// G3: `unlocked`/`unconfined`; a oneshot constraint is over for good.
+    fn end_constraint(&mut self, index: usize, slot: Option<u32>) {
+        let c = &mut self.constraints[index];
+        c.active = false;
+        let (id, lock) = (c.id, c.lock);
+        if !c.persistent {
+            c.defunct = true;
+            if let Some(slot) = slot {
+                crate::ui::constrain_pointer(self.pid, slot, None);
+            }
+        }
+        kprintln!("  wayland     : #{} pointer {}", self.pid, if lock { "unlocked" } else { "unconfined" });
+        self.send(Msg::new(id, 1));
+    }
+
+    /// G3: the client destroyed a constraint - the desktop forgets it.
+    fn drop_constraint(&mut self, id: u32) {
+        let window = self.constraint_window(id);
+        let Some(index) = self.constraints.iter().position(|c| c.id == id) else {
+            return;
+        };
+        let c = self.constraints.remove(index);
+        if let (Some((slot, _)), true) = (window, c.asked && !c.defunct) {
+            crate::ui::constrain_pointer(self.pid, slot, None);
+        }
+    }
+
     /// `wl_buffer.release`, если буфер ещё жив.
     fn release(&mut self, buffer: u32) {
         if self.released.contains(&buffer) {
@@ -1678,7 +3110,11 @@ impl Client {
         }
         let held = now.saturating_sub(self.frames_held_since);
         let unshown = self.wins.iter().any(|win| win.dirty) || self.pops.iter().any(|pop| pop.dirty);
-        let early = now < self.frame_answered.saturating_add(FRAME_MS);
+        // Срок — в микросекундах: кадр 144 Гц — 6,94 мс, миллисекундами
+        // темп сбивался бы на целую.
+        let now_us = crate::time::uptime_ns() / 1000;
+        let frame = self.client_frame_us();
+        let early = now_us < self.frame_answered_us.saturating_add(frame);
         if PACE.load(Ordering::Relaxed) && held < FRAME_HOLD_MAX_MS && (unshown || early) {
             return;
         }
@@ -1690,14 +3126,58 @@ impl Client {
                 super::perfdiag::WL_FRAMES.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.frame_answered = now;
+        // Сетка кадров, а не «от последнего ответа» (D7): опоздание задачи
+        // сервера (очередь готовых в QEMU) не копится, и FIFO держит частоту
+        // монитора, а не 52-56 к/с при 60 Гц. Опоздание больше кадра —
+        // сетка заново от «сейчас».
+        let ideal = self.frame_answered_us.saturating_add(frame);
+        self.frame_answered_us = if now_us >= ideal && now_us - ideal < frame { ideal } else { now_us };
         self.frames_held_since = 0;
     }
 
-    /// Когда этому клиенту пора ответить на отложенные `frame` — чтобы
-    /// задача сервера проснулась к сроку, а не на следующем опросе.
+    /// G3: frame of this client's pace (us): its paced window's monitor;
+    /// a forced `wlpace <Hz>` or no window yet - the global pace.
+    fn client_frame_us(&self) -> u64 {
+        if self.pace_us == 0 || PACE_FORCED_MHZ.load(Ordering::Relaxed) != 0 {
+            frame_us()
+        } else {
+            self.pace_us
+        }
+    }
+
+    /// G3: frame (us) of the monitor window `index` is on, looked up again
+    /// every [`PACE_RECHECK_MS`] (windows move between monitors).
+    fn win_frame_us(&mut self, index: usize) -> u64 {
+        if PACE_FORCED_MHZ.load(Ordering::Relaxed) != 0 {
+            return frame_us();
+        }
+        let now = crate::time::uptime_ms();
+        let pid = self.pid;
+        let Some(win) = self.wins.get_mut(index) else {
+            return frame_us();
+        };
+        if win.pace_us == 0 || now.saturating_sub(win.pace_at_ms) >= PACE_RECHECK_MS {
+            win.pace_at_ms = now;
+            let mhz = crate::ui::window_rect(pid, win.slot).and_then(monitor_of).map(|(_, mhz)| mhz);
+            win.pace_us = mhz.map_or_else(frame_us, |mhz| 1_000_000_000 / mhz.max(1));
+        }
+        win.pace_us
+    }
+
+    /// Когда этому клиенту пора ответить на отложенные `frame` (мс, вверх) —
+    /// чтобы задача сервера проснулась к сроку, а не на следующем опросе.
     fn frames_due_at(&self) -> Option<u64> {
-        (!self.frames_due.is_empty()).then(|| self.frame_answered.saturating_add(FRAME_MS))
+        let frames = (!self.frames_due.is_empty()).then(|| self.frame_answered_us.saturating_add(self.client_frame_us()).div_ceil(1000));
+        // И к сроку отложенного показа кадра без темпа (D7).
+        let mut held = self.wins.iter().filter(|win| win.dirty && win.hold_until_us != 0).map(|win| win.hold_until_us.div_ceil(1000)).min();
+        // G3: a buffer held for a flip - look again next millisecond.
+        if !self.scan_held.is_empty() {
+            held = Some(0);
+        }
+        match (frames, held) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// `ping` клиенту и «не отвечает» столу (P4, 18.11.2026).
@@ -1752,12 +3232,32 @@ impl Client {
         }
     }
 
-    /// Свести поверхность окна с подповерхностями и показать на столе.
+    /// Показать окно ([`Self::present_now`]); показано — запомнить когда и
+    /// ответить `presented` его кадрам (D7).
     fn present(&mut self, index: usize) {
+        self.present_now(index);
+        let Some(win) = self.wins.get_mut(index) else {
+            return;
+        };
+        if win.dirty || win.open.is_none() {
+            return;
+        }
+        // Отложенный показ — по сетке кадров (опоздание задачи не копится).
+        let now_us = crate::time::uptime_ns() / 1000;
+        let due = win.hold_until_us;
+        let frame = if win.pace_us != 0 { win.pace_us } else { frame_us() };
+        win.presented_us = if due != 0 && now_us >= due && now_us - due < frame { due } else { now_us };
+        win.hold_until_us = 0;
+        // `ZERO_COPY` (8): окно показывает буфер клиента без копии.
+        let (root, flags) = (win.surface, if win.adopted.is_some() { 8 } else { 0 });
+        self.feedback_presented(root, flags);
+    }
+
+    /// Свести поверхность окна с подповерхностями и показать на столе.
+    fn present_now(&mut self, index: usize) {
         let surface = self.wins[index].surface;
         let (width, height) = match self.objects.get(&surface) {
-            Some(Obj::Surface(SurfaceState { shown: Some((_, buf)), .. })) => (buf.width, buf.height),
-            Some(Obj::Surface(_)) => (0, 0),
+            Some(Obj::Surface(state)) => state.size().unwrap_or((0, 0)),
             _ => return,
         };
         if width == 0 || height == 0 {
@@ -1770,7 +3270,19 @@ impl Client {
         let (gw, gh) = (gw.clamp(1, 4096), gh.clamp(1, 4096));
         let mut layers = Vec::new();
         self.layers(surface, -gx, -gy, 0, &mut layers);
+        // Один буфер на всё окно (до отбора видимых): только такой можно
+        // вернуть клиенту сразу после копии.
+        let single = layers.len() == 1;
+        cull_hidden(&mut layers, gw, gh);
         let damaged = self.damaged(surface, -gx, -gy, 0);
+        // Окно сменит размер — пиксели окна станут новыми, показ без копии
+        // кончается (буфер вернётся клиенту ниже).
+        let mut freed = None;
+        if self.wins[index].open.is_some_and(|size| size != (gw, gh)) {
+            let win = &mut self.wins[index];
+            win.stash = None;
+            freed = win.adopted.take().map(|(id, _)| id);
+        }
         let win = &mut self.wins[index];
         let pid = self.pid;
         let mut whole = win.dirty;
@@ -1790,8 +3302,13 @@ impl Client {
                 let _ = crate::ui::raw_keys_window(pid, win.slot);
                 kprintln!("  wayland     : #{pid} window '{}' {gw}x{gh}", win.title);
                 win.open = Some((gw, gh));
+                // G5: `wl_surface.enter` for its monitor right away.
+                self.enter_checked_ms = 0;
                 if core::mem::take(&mut win.want_full) {
-                    let _ = crate::ui::fullscreen_window(pid, win.slot, true);
+                    let _ = match win.full_output.take().and_then(output_point) {
+                        Some(at) => crate::ui::fullscreen_window_at(pid, win.slot, at),
+                        None => crate::ui::fullscreen_window(pid, win.slot, true),
+                    };
                 }
             }
             Some(size) if size != (gw, gh) => {
@@ -1817,20 +3334,121 @@ impl Client {
         };
         if area.is_empty() {
             win.dirty = false;
+            if let Some(id) = freed {
+                self.release_unless_shown(surface, id);
+            }
             return;
         }
+        // Без копии (D4, 20.11.2026): кадр dma-buf во всё окно становится
+        // пикселями окна; стол переносит его на поверхность окна сам.
+        let shown_id = layers.first().map(|layer| layer.id);
+        let win = &mut self.wins[index];
+        if let (Some(ptr), Some(id)) = (zero_copy_source(&layers, gw, gh, swap), shown_id) {
+            // SAFETY: `ptr` — `gw * gh` точек подряд (`zero_copy_source`:
+            // строка = ширина, кадры подряд), память держит `Buffer` в
+            // `win.adopted`, пока окно её показывает; клиент не пишет в
+            // буфер до `release`, а он уходит только после смены пикселей.
+            if let Some(pixels) = unsafe { Surface::from_raw(ptr, gw, gh) } {
+                let started = crate::time::uptime_ns();
+                let (desk, flush, direct) = (crate::ui::timing(), crate::ui::flush_ns(), crate::ui::direct_stats().1);
+                // G3: the buffer is contiguous frames of the direct map - its
+                // physical address lets a display scan it out directly.
+                let phys = (ptr as u64).checked_sub(crate::mm::PHYS_MAP_BASE as u64);
+                match crate::ui::swap_window_pixels(pid, win.slot, pixels, area, phys) {
+                    Ok(old) => {
+                        // Сборка, вывод полос и сброс кадра стола внутри
+                        // показа (21.11): журнал 13 видел 3,3-4 мс на показ
+                        // без копии — это и есть они (кадр 2560x1440 стол
+                        // собирает и выводит целиком), у пути с копией та же
+                        // цена не входила в `copy ms/paint`. G3: plus the
+                        // direct copy of a fullscreen window (no compose).
+                        let (desk2, flush2, direct2) = (crate::ui::timing(), crate::ui::flush_ns(), crate::ui::direct_stats().1);
+                        super::perfdiag::WL_ZERO_COPY_PRESENT_NS.fetch_add(
+                            desk2.2.saturating_sub(desk.2)
+                                + desk2.3.saturating_sub(desk.3)
+                                + flush2.saturating_sub(flush)
+                                + direct2.saturating_sub(direct),
+                            Ordering::Relaxed,
+                        );
+                        if win.adopted.is_none() {
+                            win.stash = Some(old);
+                            kprintln!("  wayland     : #{pid} window '{}' shows its {gw}x{gh} dma-buf without a copy", win.title);
+                        }
+                        let buffer = layers[0].buf.clone();
+                        let previous = win.adopted.replace((id, buffer)).map(|(old, _)| old);
+                        win.dirty = false;
+                        super::perfdiag::WL_ZERO_COPY.fetch_add(1, Ordering::Relaxed);
+                        super::perfdiag::WL_ZERO_COPY_NS.fetch_add(crate::time::uptime_ns().saturating_sub(started), Ordering::Relaxed);
+                        if win.see_through && crate::ui::alpha_window(pid, win.slot, false, win.geometry.is_none()).is_ok() {
+                            win.see_through = false;
+                        }
+                        self.clear_damage(surface, 0);
+                        for old in [previous, freed].into_iter().flatten() {
+                            if old != id {
+                                self.release_unless_shown(surface, old);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        win.dirty = true;
+                        super::perfdiag::WL_BUSY.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return;
+            }
+        }
+        // Окно показывало буфер без копии, а этот кадр так нельзя: вернуть
+        // окну свои пиксели (в них сейчас и нарисуем).
+        if let Some((old, old_buf)) = win.adopted.take() {
+            let own = match win.stash.take() {
+                Some(own) if (own.width(), own.height()) == (gw, gh) => Some(own),
+                _ => Surface::new(gw, gh, theme::window_bg()),
+            };
+            match own.map(|own| crate::ui::swap_window_pixels(pid, win.slot, own, Rect::EMPTY, None)) {
+                Some(Ok(_borrowed)) => {
+                    whole = true;
+                    self.release_unless_shown(surface, old);
+                }
+                back => {
+                    // Стол занят (или нет памяти) — снова на следующем витке;
+                    // буфер, который окно показывает, пока держим.
+                    if let Some(Err(own)) = back {
+                        win.stash = Some(own);
+                    }
+                    win.adopted = Some((old, old_buf));
+                    win.dirty = true;
+                    super::perfdiag::WL_BUSY.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+        if let Some(id) = freed {
+            self.release_unless_shown(surface, id);
+        }
+        let area = if whole { bounds } else { area };
+        let win = &mut self.wins[index];
         let alpha = has_alpha(&layers);
-        let single = layers.len() == 1;
         let mut clear = false;
         // Копия буфера клиента в окно стола — отдельно от сборки и вывода,
         // которые `paint_window` делает тут же (P1: `perf-diag`).
         let mut copy_ns = 0u64;
+        let (desk, flush, direct) = (crate::ui::timing(), crate::ui::flush_ns(), crate::ui::direct_stats().1);
         let painted = crate::ui::paint_window(pid, win.slot, area, |target| {
             let started = crate::time::uptime_ns();
             clear = paint(target, &layers, swap, area, alpha);
             copy_ns = crate::time::uptime_ns().saturating_sub(started);
         });
         if painted.is_ok() {
+            // Показ после копии (сборка + вывод + сброс), 21.11 — для честного
+            // сравнения с показом без копии (G3: и прямой вывод).
+            let (desk2, flush2, direct2) = (crate::ui::timing(), crate::ui::flush_ns(), crate::ui::direct_stats().1);
+            super::perfdiag::WL_PAINT_PRESENT_NS.fetch_add(
+                desk2.2.saturating_sub(desk.2)
+                    + desk2.3.saturating_sub(desk.3)
+                    + flush2.saturating_sub(flush)
+                    + direct2.saturating_sub(direct),
+                Ordering::Relaxed,
+            );
             super::perfdiag::WL_PAINTS.fetch_add(1, Ordering::Relaxed);
             super::perfdiag::WL_PAINT_NS.fetch_add(copy_ns, Ordering::Relaxed);
             let px = u64::from(area.w) * u64::from(area.h);
@@ -1862,8 +3480,7 @@ impl Client {
             // получить прежний обратно. Только без подповерхностей: их кадр
             // сводится из нескольких буферов при каждой перерисовке.
             if single {
-                if let Some(Obj::Surface(SurfaceState { shown: Some((buffer, _)), .. })) = self.objects.get(&surface) {
-                    let buffer = *buffer;
+                if let Some(buffer) = layers.first().map(|layer| layer.id) {
                     self.release(buffer);
                 }
             }
@@ -1910,8 +3527,7 @@ impl Client {
     fn present_popup(&mut self, index: usize) {
         let surface = self.pops[index].surface;
         let (width, height) = match self.objects.get(&surface) {
-            Some(Obj::Surface(SurfaceState { shown: Some((_, buf)), .. })) => (buf.width, buf.height),
-            Some(Obj::Surface(_)) => (0, 0),
+            Some(Obj::Surface(state)) => state.size().unwrap_or((0, 0)),
             _ => return,
         };
         if width == 0 || height == 0 {
@@ -1935,6 +3551,7 @@ impl Client {
                 }
                 kprintln!("  wayland     : #{pid} popup {gw}x{gh} at {},{}", pop.at.0, pop.at.1);
                 pop.open = Some((gw, gh));
+                self.enter_checked_ms = 0;
             }
             Some(size) if size != (gw, gh) => {
                 let Some(pixels) = Surface::new(gw, gh, theme::window_bg()) else {
@@ -1946,6 +3563,9 @@ impl Client {
                 pop.open = Some((gw, gh));
             }
             Some(_) => {}
+        }
+        if pop.place_due {
+            pop.place_due = crate::ui::place_window(pid, pop.slot, pop.at).is_err();
         }
         let swap = mini_ui::format_code() == user_abi::PIXEL_RGB;
         let area = Rect::new(0, 0, gw, gh);
@@ -2007,14 +3627,16 @@ impl Client {
         // потом лежащие над ней — каждая группа в порядке `children`.
         for under in [true, false] {
             if !under {
-                if let Some((_, buf)) = &state.shown {
+                if let Some((id, buf)) = &state.shown {
                     if out.try_reserve(1).is_err() {
                         return;
                     }
                     // Поверх того, что под ней, поверхность смешивается по
                     // альфе; нижний слой окна — копией, как было.
                     let blend = (depth > 0 || !out.is_empty()) && buf.format == SHM_ARGB8888;
-                    out.push(Layer { buf: buf.clone(), x: dx, y: dy, blend });
+                    let (w, h) = state.view.size(buf);
+                    let src = state.view.source(buf);
+                    out.push(Layer { id: *id, buf: buf.clone(), x: dx, y: dy, w, h, src, blend });
                 }
             }
             if depth >= 8 {
@@ -2042,6 +3664,16 @@ impl Client {
         if win.open.take().is_some() {
             close_slot(self.pid, win.slot);
         }
+        win.hold_until_us = 0;
+        let root = win.surface;
+        self.feedback_discard(|_, of| of == root);
+        let win = &mut self.wins[index];
+        // Окна больше нет — и пикселей из буфера клиента тоже.
+        win.stash = None;
+        if let Some((buffer, _)) = win.adopted.take() {
+            self.release(buffer);
+        }
+        let win = &mut self.wins[index];
         if self.pointer_on == Some(win.surface) {
             self.pointer_on = None;
         }
@@ -2056,6 +3688,26 @@ impl Client {
     }
 
     fn close_all(&mut self) {
+        // G3: memory a display may still scan out stays alive after the
+        // client (the desktop flips back to its frame buffer next frame).
+        {
+            let mut grave = SCAN_GRAVE.lock();
+            for (_, buf) in self.scan_held.drain(..) {
+                grave.push(buf);
+            }
+            for win in &self.wins {
+                if let Some((_, buf)) = &win.adopted {
+                    if scanned(buf) {
+                        grave.push(buf.clone());
+                    }
+                }
+            }
+        }
+        // G3: the pointer comes back if a lock of this client was active.
+        let ids: Vec<u32> = self.constraints.iter().map(|c| c.id).collect();
+        for id in ids {
+            self.drop_constraint(id);
+        }
         while !self.pops.is_empty() {
             self.close_popup(0);
         }
@@ -2215,6 +3867,19 @@ impl Client {
                         }
                     }
                     user_abi::WIN_RESIZE => self.configure(index, event.x, event.y),
+                    // G3: raw mouse motion (device delta, no acceleration) to
+                    // every `zwp_relative_pointer_v1` of the client.
+                    crate::ui::WIN_RELMOTION => {
+                        let (dx, dy) = (event.x, event.y);
+                        let us = crate::time::uptime_ns() / 1000;
+                        let relatives: Vec<u32> =
+                            self.objects.iter().filter(|(_, obj)| matches!(obj, Obj::RelativePointer)).map(|(id, _)| *id).collect();
+                        for relative in relatives {
+                            self.send(
+                                Msg::new(relative, 0).u32((us >> 32) as u32).u32(us as u32).fixed(dx).fixed(dy).fixed(dx).fixed(dy),
+                            );
+                        }
+                    }
                     user_abi::WIN_FOCUS => {
                         // Рамка Chromium у неактивного окна бледнее — ему
                         // нужно знать о фокусе.
@@ -2225,6 +3890,14 @@ impl Client {
                         let (w, h) = self.current_size(index);
                         self.configure(index, w, h);
                         if event.code != 0 {
+                            // G3: back in front - ask for its pointer
+                            // constraints again (another window may have
+                            // taken the desktop's one meanwhile).
+                            for index in 0..self.constraints.len() {
+                                if self.root_of(self.constraints[index].surface) == surface {
+                                    self.constraints[index].asked = false;
+                                }
+                            }
                             self.keyboard_enter(surface);
                         } else if self.keyboard_on == Some(surface) {
                             self.keyboard_on = None;
@@ -2451,8 +4124,8 @@ impl Client {
         if let Some(hit) = child_hit(false) {
             return Some(hit);
         }
-        if let Some((_, buf)) = &state.shown {
-            if x >= 0 && y >= 0 && (x as u32) < buf.width && (y as u32) < buf.height {
+        if let Some((w, h)) = state.size() {
+            if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
                 return Some((id, x, y));
             }
         }
@@ -2519,16 +4192,91 @@ fn close_slot(pid: u32, slot: u32) {
 
 /// Буфер на своём месте в окне.
 struct Layer {
+    /// Номер `wl_buffer`.
+    id: u32,
     buf: Buffer,
     x: i32,
     y: i32,
+    /// Размер слоя в окне (`wp_viewport`: может отличаться от буфера).
+    w: u32,
+    h: u32,
+    /// Кусок буфера, который ложится в `w`×`h`: x, y, ширина, высота.
+    src: (u32, u32, u32, u32),
     blend: bool,
+}
+
+impl Layer {
+    /// Буфер ложится 1:1 (без масштаба).
+    fn unscaled(&self) -> bool {
+        (self.src.2, self.src.3) == (self.w, self.h)
+    }
+
+    /// Слой непрозрачен и закрывает всё окно `w`×`h`.
+    fn covers(&self, w: u32, h: u32) -> bool {
+        !self.blend
+            && self.buf.format == SHM_XRGB8888
+            && self.x <= 0
+            && self.y <= 0
+            && self.x + self.w as i32 >= w as i32
+            && self.y + self.h as i32 >= h as i32
+    }
+}
+
+/// Слои под непрозрачным слоем во всё окно не видны — убрать (D4,
+/// 20.11.2026). Окно игры Wine — поверхность ARGB во весь размер и над ней
+/// подповерхность с кадром Vulkan (dma-buf XRGB): раньше на каждый кадр
+/// заливалась подложка, копировалась нижняя поверхность и поверх неё —
+/// кадр игры с проходом по точкам (альфа); 0 строк одной копией в hw-log12.
+fn cull_hidden(layers: &mut Vec<Layer>, w: u32, h: u32) {
+    if let Some(top) = layers.iter().rposition(|layer| layer.covers(w, h)) {
+        layers.drain(..top);
+    }
 }
 
 /// Может ли окно быть прозрачным: нижний слой с альфой. Нижний XRGB
 /// закрывает всё, что над ним смешивается.
 fn has_alpha(layers: &[Layer]) -> bool {
     layers.first().is_some_and(|layer| layer.buf.format == SHM_ARGB8888)
+}
+
+/// Показ окна без копии (D4, 20.11.2026; `wlzerocopy off` — как раньше).
+pub static ZERO_COPY: AtomicBool = AtomicBool::new(true);
+
+/// G3: buffers of gone clients a display may still scan out.
+static SCAN_GRAVE: crate::sync::SpinLock<Vec<Buffer>> = crate::sync::SpinLock::new(Vec::new());
+
+/// G3: may a display still read this buffer (a page flip to it, or away
+/// from it, not on screen yet)? Only physically contiguous buffers are
+/// ever scanned out.
+fn scanned(buf: &Buffer) -> bool {
+    if !crate::display::flip_any() {
+        return false;
+    }
+    let len = u64::from(buf.stride) * u64::from(buf.height);
+    let Some(ptr) = buf.mem.contiguous(buf.offset, len) else {
+        return false;
+    };
+    let Some(phys) = (ptr as u64).checked_sub(crate::mm::PHYS_MAP_BASE as u64) else {
+        return false;
+    };
+    crate::display::flip_scanning(phys, len)
+}
+
+/// Кадр, который окно может показать прямо из памяти клиента: один
+/// непрозрачный слой ровно в размер окна, 1:1, без перестановки каналов,
+/// строки подряд, кадры буфера подряд (буфер DRM одним куском). Ответ —
+/// адрес первой точки.
+fn zero_copy_source(layers: &[Layer], w: u32, h: u32, swap: bool) -> Option<*mut u32> {
+    let [layer] = layers else { return None };
+    if swap || !ZERO_COPY.load(Ordering::Relaxed) || layer.blend || layer.buf.format != SHM_XRGB8888 {
+        return None;
+    }
+    let buf = &layer.buf;
+    if (layer.x, layer.y) != (0, 0) || (layer.w, layer.h) != (w, h) || layer.src != (0, 0, w, h) || buf.stride != w * 4 || buf.offset % 4 != 0 {
+        return None;
+    }
+    let len = u64::from(buf.stride) * u64::from(h);
+    buf.mem.contiguous(buf.offset, len).map(|ptr| ptr.cast::<u32>())
 }
 
 /// Нарисовать слои в поверхность окна — строками прямо из памяти клиентов.
@@ -2556,8 +4304,8 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
         !layer.blend
             && layer.x <= ax0
             && layer.y <= ay0
-            && layer.x + layer.buf.width as i32 >= ax1
-            && layer.y + layer.buf.height as i32 >= ay1
+            && layer.x + layer.w as i32 >= ax1
+            && layer.y + layer.h as i32 >= ay1
     };
     if !covered {
         for y in ay0..ay1 {
@@ -2575,22 +4323,30 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
     row.resize(area.w as usize, 0u32);
     for layer in layers {
         let buf = &layer.buf;
+        // `wp_viewport` с масштабом (D4) — своим путём.
+        if !layer.unscaled() {
+            if !paint_scaled(target, layer, area, swap, keep) {
+                return false;
+            }
+            super::perfdiag::WL_SCALED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let x0 = layer.x.max(ax0);
-        let x1 = (layer.x + buf.width as i32).min(ax1);
+        let x1 = (layer.x + layer.w as i32).min(ax1);
         if x0 >= x1 {
             continue;
         }
         let count = (x1 - x0) as usize;
-        let first_column = (x0 - layer.x) as u64;
+        let first_column = (x0 - layer.x) as u64 + u64::from(layer.src.0);
         // Только строки слоя, попадающие в изменившуюся область.
         let sy0 = (ay0 - layer.y).max(0) as u32;
-        let sy1 = ((ay1 - layer.y).max(0) as u32).min(buf.height);
+        let sy1 = ((ay1 - layer.y).max(0) as u32).min(layer.h);
         for sy in sy0..sy1 {
             let ty = sy as i32 + layer.y;
             if ty < ay0 || ty >= ay1 {
                 continue;
             }
-            let at = buf.offset + u64::from(sy) * u64::from(buf.stride) + first_column * 4;
+            let at = buf.offset + u64::from(sy + layer.src.1) * u64::from(buf.stride) + first_column * 4;
             if !layer.blend {
                 // Короткий путь (13.11): строка клиента — прямо на место в окне,
                 // затем один простой проход (альфа, при нужде — красный с
@@ -2650,6 +4406,73 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: 
         super::perfdiag::WL_DIRECT.fetch_add(1, Ordering::Relaxed);
     }
     alpha && (ay0..ay1).any(|y| !row_opaque(&target.row(y as u32)[ax0 as usize..ax1 as usize]))
+}
+
+/// Слой с масштабом (`wp_viewport`, D4 20.11.2026): кусок буфера `src`
+/// ложится в `w`×`h` по ближайшей точке. Wine так растягивает кадр игры в
+/// режиме ниже монитора (1280x720 → 2560x1440). Строка буфера читается один
+/// раз; одинаковые строки окна (растяжение по высоте) — копией соседней.
+/// `false` — память буфера не прочиталась.
+fn paint_scaled(target: &mut Surface, layer: &Layer, area: Rect, swap: bool, keep: u32) -> bool {
+    let buf = &layer.buf;
+    let (sx, sy, sw, sh) = layer.src;
+    let bounds = Rect::new(layer.x, layer.y, layer.w, layer.h);
+    let clip = area.intersect(&bounds);
+    if clip.is_empty() || sw == 0 || sh == 0 {
+        return true;
+    }
+    let (cx0, cx1) = (clip.x, clip.right());
+    // Шаг 16.16 по обеим осям; точка окна — середина, как у растяжения GPU.
+    let step_x = (u64::from(sw) << 16) / u64::from(layer.w.max(1));
+    let step_y = (u64::from(sh) << 16) / u64::from(layer.h.max(1));
+    let column = |tx: i32| -> u32 { ((((tx - layer.x) as u64) * step_x + step_x / 2) >> 16).min(u64::from(sw - 1)) as u32 };
+    // Столбцы буфера, нужные этой полосе окна.
+    let (src_x0, src_x1) = (column(cx0), column(cx1 - 1) + 1);
+    let width = (src_x1 - src_x0) as usize;
+    let mut row: Vec<u32> = Vec::new();
+    if row.try_reserve_exact(width).is_err() {
+        return false;
+    }
+    row.resize(width, 0);
+    // Номер столбца буфера для каждой точки полосы — один раз.
+    let mut map: Vec<u32> = Vec::new();
+    if map.try_reserve_exact((cx1 - cx0) as usize).is_err() {
+        return false;
+    }
+    map.extend((cx0..cx1).map(|tx| column(tx) - src_x0));
+    let or = if buf.format == SHM_XRGB8888 { 0xff00_0000 } else { 0 };
+    // Последняя собранная строка окна (непрозрачный слой): соседняя строка
+    // окна с той же строкой буфера — её копия.
+    let mut scaled: Vec<u32> = Vec::new();
+    if !layer.blend && scaled.try_reserve_exact(map.len()).is_err() {
+        return false;
+    }
+    let mut last: Option<u32> = None;
+    for ty in clip.y..clip.bottom() {
+        let line = ((((ty - layer.y) as u64) * step_y + step_y / 2) >> 16).min(u64::from(sh - 1)) as u32;
+        if !layer.blend && last == Some(line) {
+            target.row_mut(ty as u32)[cx0 as usize..cx1 as usize].copy_from_slice(&scaled);
+            continue;
+        }
+        let at = buf.offset + u64::from(sy + line) * u64::from(buf.stride) + u64::from(sx + src_x0) * 4;
+        // SAFETY: байты тех же `width` точек.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(row.as_mut_ptr().cast::<u8>(), width * 4) };
+        if !buf.mem.read(at, bytes) {
+            return false;
+        }
+        let out = &mut target.row_mut(ty as u32)[cx0 as usize..cx1 as usize];
+        for (pixel, &index) in out.iter_mut().zip(map.iter()) {
+            let src = u32::from_le(row[index as usize]) | or;
+            let src = if swap { (src & 0xff00_ff00) | ((src >> 16) & 0xff) | ((src & 0xff) << 16) } else { src };
+            *pixel = if layer.blend { mini_ui::over(src, *pixel) } else { src } & keep;
+        }
+        if !layer.blend {
+            scaled.clear();
+            scaled.extend_from_slice(out);
+            last = Some(line);
+        }
+    }
+    true
 }
 
 /// Привести строку клиента к виду стола: старший байт (`or`, `keep`) и, при

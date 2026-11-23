@@ -47,7 +47,7 @@ impl Thumbs {
     /// основного монитора (`area` — его место на столе), низ — в `PAD` над
     /// `panel_top`.
     #[must_use]
-    pub fn new(apps: Vec<App>, button: Rect, area: Rect, panel_top: i32, scale: u32) -> Self {
+    pub fn new(apps: Vec<App>, button: Rect, area: Rect, panel_top: i32, scale: mini_ui::Scale) -> Self {
         let px = |value: u32| value * scale;
         let count = apps.len().max(1) as u32;
         let card_h = px(PAD + HEAD_H + SHOT_H + PAD);
@@ -81,14 +81,14 @@ impl Thumbs {
 
     /// Крестик карточки `card` (координаты экрана).
     #[must_use]
-    pub fn cross_rect(card: Rect, scale: u32) -> Rect {
+    pub fn cross_rect(card: Rect, scale: mini_ui::Scale) -> Rect {
         let side = CROSS * scale;
-        Rect::new(card.right() - (PAD * scale) as i32 - side as i32 + (4 * scale) as i32, card.y + (4 * scale) as i32, side, side)
+        Rect::new(card.right() - (PAD * scale) as i32 - side as i32 + (4u32 * scale) as i32, card.y + (4u32 * scale) as i32, side, side)
     }
 
     /// Карточка под точкой и попала ли точка в её крестик.
     #[must_use]
-    pub fn hit(&self, x: i32, y: i32, scale: u32) -> Option<(usize, bool)> {
+    pub fn hit(&self, x: i32, y: i32, scale: mini_ui::Scale) -> Option<(usize, bool)> {
         let index = self.cards.iter().position(|card| card.contains(x, y))?;
         Some((index, Self::cross_rect(self.cards[index], scale).contains(x, y)))
     }

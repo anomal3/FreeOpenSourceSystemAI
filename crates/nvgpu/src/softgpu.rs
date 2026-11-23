@@ -58,6 +58,12 @@ use crate::lock::SpinLock;
 pub trait SoftHost: Send + Sync {
     /// Обнулённый кадр 4 КиБ; его физический адрес.
     fn alloc_frame(&self) -> Option<u64>;
+    /// `count` обнулённых кадров подряд (адрес первого) — крупным буферам,
+    /// чтобы хозяин мог показать их без копии; `None` — нет куска (тогда по
+    /// кадру). Каждый кадр куска возвращается `free_frame` по отдельности.
+    fn alloc_run(&self, _count: u64) -> Option<u64> {
+        None
+    }
     fn free_frame(&self, phys: u64);
     fn read_phys(&self, phys: u64, buf: &mut [u8]);
     fn write_phys(&self, phys: u64, data: &[u8]);
@@ -1041,7 +1047,13 @@ impl SoftGpu {
     fn alloc_sys_bo(&self, st: &mut State, size: u64) -> Result<u32, Errno> {
         let n = align_up(size, PAGE) / PAGE;
         let mut frames = Vec::with_capacity(n as usize);
-        for _ in 0..n {
+        // Крупный буфер (кадр WSI) — одним куском, если хозяин может.
+        if n >= 256 {
+            if let Some(base) = self.host.alloc_run(n) {
+                frames.extend((0..n).map(|i| base + i * PAGE));
+            }
+        }
+        for _ in frames.len() as u64..n {
             match self.host.alloc_frame() {
                 Some(f) => frames.push(f),
                 None => {

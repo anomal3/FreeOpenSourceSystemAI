@@ -390,6 +390,7 @@ name = "disk"
 version = "0.8.0"
 dependencies = [
  "fatfs",
+ "flate2",
 ]
 
 [[package]]
@@ -977,6 +978,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "screencast"
+version = "0.8.0"
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1252,12 +1257,14 @@ dependencies = [
  "mini-ui",
  "miniz_oxide",
  "osupdate",
+ "screencast",
  "ssh",
  "sysconf",
  "tls",
  "ttf",
  "user-abi",
  "x509",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1422,6 +1429,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "user-abi",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1438,3 +1446,18 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+
+[[package]]
+name = "zune-core"
+version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"
+
+[[package]]
+name = "zune-jpeg"
+version = "0.4.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29ce2c8a9384ad323cf564b67da86e21d3cfdff87908bc1223ed5c99bc792713"
+dependencies = [
+ "zune-core",
+]

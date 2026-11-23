@@ -145,8 +145,31 @@ impl Reader {
             {
                 let mut inner = self.pipe.inner.lock();
                 if inner.len > 0 {
-                    let read = inner.pop(buffer);
-                    drop(inner);
+                    // The bytes go to `buffer` - a program's memory - only
+                    // after the spin lock is released, through a stack chunk
+                    // (G2, 21.11.2026): a sibling thread's `fork` can make
+                    // that page copy-on-write again at any moment, and a
+                    // write fault under a spin lock cannot be resolved
+                    // (forkpoll: "kernel write fault ... a spin lock is held"
+                    // in `Reader::read`, then a kernel panic).
+                    const CHUNK: usize = 1024;
+                    let mut chunk = [0u8; CHUNK];
+                    let mut read = 0;
+                    loop {
+                        let room = (buffer.len() - read).min(CHUNK);
+                        let take = inner.pop(&mut chunk[..room]);
+                        drop(inner);
+                        buffer[read..read + take].copy_from_slice(&chunk[..take]);
+                        read += take;
+                        if take == 0 || read == buffer.len() {
+                            break;
+                        }
+                        inner = self.pipe.inner.lock();
+                        if inner.len == 0 {
+                            drop(inner);
+                            break;
+                        }
+                    }
                     // Разбудить писателя: в канале освободилось место.
                     sched::wake_lock(channel(&self.pipe));
                     // И тем, кто ждёт `poll` (фаза 65a).

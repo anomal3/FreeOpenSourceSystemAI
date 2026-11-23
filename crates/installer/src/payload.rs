@@ -244,6 +244,28 @@ pub fn probe() -> Result<Payload, Error> {
         }
     }
 
+    // Темы значков (22.11). Без них стол рисует вшитую тему по умолчанию.
+    for (source, target) in ICONS {
+        match stat(&mut root, source, What::Defaults) {
+            Ok(size) => {
+                logln!("[payload] icon theme {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Defaults, size });
+            }
+            Err(_) => logln!("[payload] {source} is missing; only the built-in icon theme will be there"),
+        }
+    }
+
+    // Галерея обоев (22.11). Без неё в «Фоне» — только вшитые обои FossAi.
+    for (source, target) in WALLS {
+        match stat(&mut root, source, What::Defaults) {
+            Ok(size) => {
+                logln!("[payload] wallpaper {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Defaults, size });
+            }
+            Err(_) => logln!("[payload] {source} is missing; the wallpaper gallery will be shorter"),
+        }
+    }
+
     // Сайт по умолчанию. Его отсутствие установку не срывает: сервер без
     // страницы отвечает `404`, и это честнее несостоявшейся установки.
     for (source, target) in SITE {
@@ -293,7 +315,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 64] = [
+const PROGRAMS: [(&CStr16, &str); 67] = [
     // vDSO программ Linux (01.11.2026): время без входа в ядро. Не программа,
     // но едет тем же путём — так он есть и на установленной системе.
     (cstr16!("\\FREEOS\\BIN\\VDSO"), "vdso"),
@@ -362,6 +384,12 @@ const PROGRAMS: [(&CStr16, &str); 64] = [
     (cstr16!("\\FREEOS\\BIN\\PHONE"), "phone"),
     // Значки программ Windows из префиксов Proton: PNG -> FIMG (18.11, P12).
     (cstr16!("\\FREEOS\\BIN\\PNG2FIMG"), "png2fimg"),
+    // Картинка в обои стола (22.11): JPEG/PNG/BMP/QOI -> QOI.
+    (cstr16!("\\FREEOS\\BIN\\WALLCONV"), "wallconv"),
+    // «Запись экрана» (22.11): имя на носителе в 8.3 — `SCRNREC`.
+    (cstr16!("\\FREEOS\\BIN\\SCRNREC"), "screenrec"),
+    // Окно «Открыть» / «Сохранить как» / «Выбор папки» для всех программ (20.11).
+    (cstr16!("\\FREEOS\\BIN\\FILEDLG"), "filedlg"),
     // Своя среда .NET (веха v0.7c, фаза N2).
     (cstr16!("\\FREEOS\\BIN\\DOTNET"), "dotnet"),
     (cstr16!("\\FREEOS\\BIN\\WINSHOW"), "winshow"),
@@ -534,7 +562,7 @@ const FONTS: [(&CStr16, &str); 3] = [
 
 /// Шрифты системы (02.11). Список обязан совпадать с `SYSTEM_FONTS` в
 /// `xtask/src/cbuild.rs`.
-const SYSTEM_FONTS: [(&CStr16, &str); 20] = [
+const SYSTEM_FONTS: [(&CStr16, &str); 24] = [
     (cstr16!("\\FREEOS\\FONTS\\INTER.TTF"), "usr/share/fonts/fossai/Inter.ttf"),
     (cstr16!("\\FREEOS\\FONTS\\INTEROFL.TXT"), "usr/share/fonts/fossai/Inter-OFL.txt"),
     (cstr16!("\\FREEOS\\FONTS\\JBMONO.TTF"), "usr/share/fonts/fossai/JetBrainsMono.ttf"),
@@ -555,6 +583,10 @@ const SYSTEM_FONTS: [(&CStr16, &str); 20] = [
     (cstr16!("\\FREEOS\\FONTS\\PLEXOFL.TXT"), "usr/share/fonts/fossai/IBMPlexMono-OFL.txt"),
     (cstr16!("\\FREEOS\\FONTS\\HACK.TTF"), "usr/share/fonts/fossai/Hack-Regular.ttf"),
     (cstr16!("\\FREEOS\\FONTS\\HACKLIC.TXT"), "usr/share/fonts/fossai/Hack-LICENSE.md"),
+    (cstr16!("\\FREEOS\\FONTS\\UI125.FNT"), "usr/share/fonts/fossai/ui-125.fnt"),
+    (cstr16!("\\FREEOS\\FONTS\\UI150.FNT"), "usr/share/fonts/fossai/ui-150.fnt"),
+    (cstr16!("\\FREEOS\\FONTS\\UI175.FNT"), "usr/share/fonts/fossai/ui-175.fnt"),
+    (cstr16!("\\FREEOS\\FONTS\\UI200.FNT"), "usr/share/fonts/fossai/ui-200.fnt"),
 ];
 
 /// Страница, которую веб-сервер отдаёт по умолчанию, и её оформление.
@@ -563,6 +595,31 @@ const SYSTEM_FONTS: [(&CStr16, &str); 20] = [
 /// второй не для красоты: страница со ссылкой на таблицу стилей — это проверка
 /// того, что сервер отдаёт больше одного файла и берёт тип содержимого из
 /// расширения имени.
+/// Пачки тем значков (22.11). Список обязан совпадать с `PAYLOAD_ICONS` в
+/// `xtask/src/arch.rs`.
+const ICONS: [(&CStr16, &str); 4] = [
+    (cstr16!("\\FREEOS\\ICONS\\GLOSSY.PAK"), "usr/share/icons/glossy.pak"),
+    (cstr16!("\\FREEOS\\ICONS\\CRISP.PAK"), "usr/share/icons/crisp.pak"),
+    (cstr16!("\\FREEOS\\ICONS\\SOFT.PAK"), "usr/share/icons/soft.pak"),
+    (cstr16!("\\FREEOS\\ICONS\\VIVID.PAK"), "usr/share/icons/vivid.pak"),
+];
+
+/// Галерея обоев (22.11): картинки, миниатюры и подписи. Список обязан
+/// совпадать с `PAYLOAD_WALLS` в `xtask/src/arch.rs`.
+const WALLS: [(&CStr16, &str); 11] = [
+    (cstr16!("\\FREEOS\\WALLS\\INDEX.TXT"), "usr/share/wallpapers/index.txt"),
+    (cstr16!("\\FREEOS\\WALLS\\VALLEY.JPG"), "usr/share/wallpapers/valley.jpg"),
+    (cstr16!("\\FREEOS\\WALLS\\VALLEY.TQI"), "usr/share/wallpapers/valley.thumb.qoi"),
+    (cstr16!("\\FREEOS\\WALLS\\GALAXY.JPG"), "usr/share/wallpapers/galaxy.jpg"),
+    (cstr16!("\\FREEOS\\WALLS\\GALAXY.TQI"), "usr/share/wallpapers/galaxy.thumb.qoi"),
+    (cstr16!("\\FREEOS\\WALLS\\ORBIT.JPG"), "usr/share/wallpapers/orbit.jpg"),
+    (cstr16!("\\FREEOS\\WALLS\\ORBIT.TQI"), "usr/share/wallpapers/orbit.thumb.qoi"),
+    (cstr16!("\\FREEOS\\WALLS\\WAVES.JPG"), "usr/share/wallpapers/waves.jpg"),
+    (cstr16!("\\FREEOS\\WALLS\\WAVES.TQI"), "usr/share/wallpapers/waves.thumb.qoi"),
+    (cstr16!("\\FREEOS\\WALLS\\CRYSTAL.JPG"), "usr/share/wallpapers/crystal.jpg"),
+    (cstr16!("\\FREEOS\\WALLS\\CRYSTAL.TQI"), "usr/share/wallpapers/crystal.thumb.qoi"),
+];
+
 const SITE: [(&CStr16, &str); 2] = [
     (cstr16!("\\FREEOS\\WWW\\INDEX.HTM"), "usr/share/httpd/index.html"),
     (cstr16!("\\FREEOS\\WWW\\STYLE.CSS"), "usr/share/httpd/style.css"),

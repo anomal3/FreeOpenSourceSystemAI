@@ -70,6 +70,11 @@ pub const TRB_CYCLE: u32 = 1 << 0;
 pub const TRB_TOGGLE_CYCLE: u32 = 1 << 1;
 /// Бит 5: Interrupt On Completion — контроллер обязан породить событие.
 pub const TRB_IOC: u32 = 1 << 5;
+/// Bit 2: Interrupt on Short Packet.
+pub const TRB_ISP: u32 = 1 << 2;
+/// Bit 4: Chain - the next TRB belongs to the same transfer descriptor
+/// (on a Link TRB: the TD goes on past the link).
+pub const TRB_CHAIN: u32 = 1 << 4;
 /// Бит 6: Immediate Data — параметр TRB содержит сами данные, а не их адрес.
 pub const TRB_IDT: u32 = 1 << 6;
 
@@ -197,11 +202,18 @@ impl Ring {
 
     /// Записать Link TRB в последний элемент.
     fn write_link(&mut self) {
+        self.write_link_chained(false);
+    }
+
+    /// Link TRB; `chain` - a transfer descriptor goes on past it (its Chain
+    /// bit must then be set, xHCI 4.11.5.1).
+    fn write_link_chained(&mut self, chain: bool) {
         let link = Trb {
             parameter: self.buffer.phys().as_u64(),
             status: 0,
             control: (TRB_LINK << TRB_TYPE_SHIFT)
                 | TRB_TOGGLE_CYCLE
+                | if chain { TRB_CHAIN } else { 0 }
                 | if self.cycle { TRB_CYCLE } else { 0 },
         };
         self.write(self.entries - 1, link);
@@ -233,6 +245,7 @@ impl Ring {
     /// потом опознаётся событие о завершении.
     pub fn push(&mut self, mut trb: Trb) -> u64 {
         trb.control = (trb.control & !TRB_CYCLE) | if self.cycle { TRB_CYCLE } else { 0 };
+        let chained = trb.control & TRB_CHAIN != 0;
         let index = self.enqueue;
         self.write(index, trb);
         let addr = self.buffer.phys().as_u64() + (index * TRB_LEN) as u64;
@@ -242,7 +255,7 @@ impl Ring {
         // контроллер остановится на нём, сочтя чужим) и начинаем оборот заново с
         // противоположным значением бита.
         if self.enqueue == self.entries - 1 {
-            self.write_link();
+            self.write_link_chained(chained);
             self.enqueue = 0;
             self.cycle = !self.cycle;
         }

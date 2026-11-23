@@ -40,6 +40,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod crc32;
+pub mod exfat;
 pub mod fat32;
 pub mod gpt;
 pub mod iso9660;

@@ -32,8 +32,13 @@
 //! с сам рабочий стол ради каталога, в котором десяток записей. Список
 //! перечитывается там, где стол и так знает, что что-то произошло, и по пункту
 //! «Обновить» — как в любом обозревателе файлов.
+//!
+//! С 20.11 оповещение есть ([`crate::fs::notify`]): каталог стола
+//! перечитывается и тогда, когда его поменял кто угодно другой — см.
+//! [`desktop_folder_changed`].
 
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use mini_ui::draw;
@@ -66,7 +71,8 @@ const MAX_ENTRIES: usize = 48;
 /// Порядок не алфавитный и не случайный: сначала то, чем человек пользуется,
 /// открыв систему впервые («здесь мои файлы»), затем инструменты. Список
 /// короткий намеренно — стол, засыпанный значками, ничем не лучше пустого.
-const SYSTEM: [App; 3] = [App::Terminal, App::Settings, App::About];
+/// «Параметров» здесь нет с 21.11 (Роман): они в «Пуске» и в меню стола.
+const SYSTEM: [App; 2] = [App::Terminal, App::About];
 
 /// Файловый менеджер — первым значком на столе, как и был.
 ///
@@ -75,6 +81,10 @@ const SYSTEM: [App; 3] = [App::Terminal, App::Settings, App::About];
 /// файлы» остаётся первым, что человек видит, открыв систему.
 const FILES_COMMAND: &str = "/bin/files";
 const FILES_LABEL: &str = "Файлы";
+/// Значок стола (22.11, Роман): «Мой компьютер», как у Windows 98, — «Файлы»
+/// сразу на странице «Этот компьютер» (диски и папки дома).
+const COMPUTER_COMMAND: &str = "/bin/files computer:";
+const COMPUTER_LABEL: &str = "Мой компьютер";
 
 /// Что за значок стоит в ячейке.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -142,7 +152,7 @@ pub enum EditReply {
 /// Значки стола: их места и то, какой из них выбран.
 pub struct Icons {
     /// Масштаб — тот же, что у всего стола.
-    scale: u32,
+    scale: mini_ui::Scale,
     /// Системные значки и содержимое каталога стола, в порядке показа.
     items: Vec<Item>,
     /// Выбранный значок — номер в [`Icons::items`]: тот, по которому щёлкнули
@@ -242,6 +252,48 @@ fn is_hidden(label: &str) -> bool {
     HIDDEN.lock().split('|').any(|item| !item.is_empty() && item == label)
 }
 
+/// Наблюдение за каталогом стола (20.11, [`crate::fs::notify`]): каталог и
+/// очередь событий; `true` — событие пришло, а перечитать ещё не удалось.
+static DESK_WATCH: crate::sync::SpinLock<Option<(String, Arc<crate::fs::notify::Queue>, bool)>> = crate::sync::SpinLock::new(None);
+
+/// Сменилось ли что-то в каталоге стола с прошлого раза (Роман, 20.11: файл,
+/// сохранённый на Рабочий стол Блокнотом, появлялся только после «Обновить»).
+/// Спрашивает [`crate::ui::tick`] раз в полсекунды — заодно и пауза, за
+/// которую пачка событий (запись кусками, копирование папки) сливается в одно
+/// перечитывание. `can` — можно ли перечитать сейчас (не идёт правка
+/// подписи): нельзя — перемена ждёт следующего раза.
+pub fn desktop_folder_changed(can: bool) -> bool {
+    let dir = super::context::desktop_dir();
+    let mut watch = DESK_WATCH.lock();
+    // Вошёл другой человек — другой каталог.
+    if watch.as_ref().is_none_or(|(known, ..)| *known != dir) {
+        let Some(queue) = crate::fs::notify::Queue::new() else {
+            return false;
+        };
+        let mask = crate::fs::notify::CREATE | crate::fs::notify::DELETE | crate::fs::notify::MOVED_FROM | crate::fs::notify::MOVED_TO | crate::fs::notify::CLOSE_WRITE;
+        let _ = queue.add(&dir, mask);
+        // Сам стол и его родитель: каталог стола создают и удаляют целиком.
+        let _ = queue.add(&super::context::home_dir(), crate::fs::notify::CREATE | crate::fs::notify::DELETE | crate::fs::notify::MOVED_TO);
+        *watch = Some((dir, queue, false));
+        return false;
+    }
+    let Some((dir, queue, pending)) = watch.as_mut() else {
+        return false;
+    };
+    let events = queue.drain();
+    let leaf = dir.rsplit('/').next().unwrap_or("");
+    // Каталог стола наблюдается первым (номер 1); у родителя — только
+    // события о самом каталоге стола.
+    if events.iter().any(|event| event.wd == 1 || event.name == leaf || event.mask & crate::fs::notify::OVERFLOW != 0) {
+        *pending = true;
+    }
+    if *pending && can {
+        *pending = false;
+        return true;
+    }
+    false
+}
+
 /// Имена и длины записей реестра пакетов одной строкой — дешёвая подпись
 /// «что установлено». Длина — потому что `pkg` заводит запись раньше, чем
 /// дописывает её: по одному имени стол прочёл бы её пустой и больше не
@@ -254,6 +306,9 @@ fn package_signature() -> String {
             out.push_str(&alloc::format!(":{}/", entry.size));
         }
     }
+    // Ярлыки программ Windows в префиксах Wine (21.11): установщик положил
+    // ярлык на стол префикса — значок появляется сам.
+    out.push_str(&super::winapps::signature());
     out
 }
 
@@ -266,8 +321,15 @@ impl Icons {
         package_signature() != self.packages
     }
 
+    /// Масштаб стола сменился (20.11). Сетку перерисует следующий
+    /// [`Self::set_area`].
+    pub fn set_scale(&mut self, scale: mini_ui::Scale) {
+        self.scale = scale;
+        self.edit = None;
+    }
+
     #[must_use]
-    pub fn new(scale: u32) -> Self {
+    pub fn new(scale: mini_ui::Scale) -> Self {
         let mut icons = Self {
             scale,
             items: Vec::new(),
@@ -436,6 +498,20 @@ impl Icons {
             });
         }
 
+        // Ярлыки, которые установщик программы Windows положил на стол
+        // префикса Wine (`C:\users\Public\Desktop\Notepad++.lnk`, 21.11).
+        // Программу удалили — ярлыка или его цели нет, и значка тоже.
+        for app in super::winapps::scan().into_iter().filter(|app| app.desktop && !app.uninstall && !is_hidden(&app.caption)) {
+            let command = super::panel::proton_line(&app.args());
+            let icon = if app.icon.is_empty() { String::from("windows-apps") } else { app.icon };
+            self.items.push(Item {
+                kind: Kind::Program(Icon::Package),
+                label: app.caption,
+                path: Some(command),
+                shortcut: Some(super::appicon::of_manifest(&icon)),
+            });
+        }
+
         let base = super::context::desktop_dir();
         let Some(Ok(entries)) = crate::fs::list(&base) else {
             // Каталога стола может не быть вовсе — его заводят при первой
@@ -463,11 +539,17 @@ impl Icons {
             } else {
                 alloc::format!("{base}/{name}")
             };
+            // Ярлык Windows (`.lnk`) на столе — значок его программы со
+            // стрелкой, как в Проводнике (21.11).
+            let shortcut = (!directory && name.to_ascii_lowercase().ends_with(".lnk")).then(|| {
+                let icon = super::winapps::icon_of_lnk(&path);
+                super::appicon::of_manifest(if icon.is_empty() { "windows-apps" } else { &icon })
+            });
             self.items.push(Item {
                 kind: if directory { Kind::Folder } else { Kind::File },
                 label: name,
                 path: Some(path),
-                shortcut: None,
+                shortcut,
             });
         }
 
@@ -1034,6 +1116,8 @@ impl Icons {
                     Kind::Folder => super::appicon::file_icon(&item.label, true),
                     Kind::File => super::appicon::file_icon(&item.label, false),
                     Kind::App(app) => super::appicon::design_for(app.icon()),
+                    // «Мой компьютер» — значок «Этот компьютер» из «Файлов».
+                    Kind::Program(_) if item.path.as_deref() == Some(COMPUTER_COMMAND) => super::appicon::design("place-this-pc"),
                     Kind::Program(icon) => item
                         .path
                         .as_deref()
@@ -1059,7 +1143,7 @@ impl Icons {
         let room = cell.w.saturating_sub(pad * 2);
         // На картинке FossAi подпись белая при любой теме — картинка тёмная и
         // одна на обе темы (как подписи на обоях Windows).
-        let ink = if theme::wallpaper() == theme::Wallpaper::Fossai {
+        let ink = if super::wallpaper::white_labels() {
             mini_ui::Color::rgb(0xFF, 0xFF, 0xFF)
         } else if selected {
             p.ink
@@ -1098,7 +1182,12 @@ impl Icons {
             }
             return;
         }
-        let (first, second) = wrap(ctx, &item.label, room);
+        // У ярлыка Windows расширения `.lnk` не видно, как в Проводнике.
+        let label = match item.kind {
+            Kind::File if item.shortcut.is_some() => item.label.strip_suffix(".lnk").or_else(|| item.label.strip_suffix(".LNK")).unwrap_or(&item.label),
+            _ => item.label.as_str(),
+        };
+        let (first, second) = wrap(ctx, label, room);
         centered(ctx, back, cell, y, room, &first, ink);
         if let Some(second) = second {
             y += step as i32;
@@ -1145,7 +1234,7 @@ fn centered(
     let width = ctx.face(Role::Label).width(line).min(room);
     let x = cell.x + (cell.w as i32 - width as i32) / 2;
     // Тень под подписью на картинке: светлые места обоев иначе съедают буквы.
-    if theme::wallpaper() == theme::Wallpaper::Fossai {
+    if super::wallpaper::white_labels() {
         let shift = ctx.px(1) as i32;
         mini_ui::typeface::draw_clipped(s, ctx.face(Role::Label), x + shift, y + shift, line, room, mini_ui::Color::rgb(0, 0, 0), 150);
     }
@@ -1185,9 +1274,9 @@ fn system_items() -> Vec<Item> {
     }
     let mut out = Vec::new();
     out.push(Item {
-        kind: Kind::Program(Icon::Folder),
-        label: FILES_LABEL.to_string(),
-        path: Some(FILES_COMMAND.to_string()),
+        kind: Kind::Program(Icon::Disk),
+        label: COMPUTER_LABEL.to_string(),
+        path: Some(COMPUTER_COMMAND.to_string()),
         shortcut: None,
     });
     out.extend(SYSTEM.iter().map(|app| Item {
@@ -1203,6 +1292,18 @@ fn system_items() -> Vec<Item> {
         path: None,
         shortcut: None,
     });
+    // Браузер OBSOS (21.11, Роман: «браузер мне в сборку»): ярлык на столе,
+    // когда пакет стоит (на живой флешке он встаёт сам после запуска стола —
+    // значки перечитываются по `packages_changed`). После корзины: места
+    // прежних значков не сдвигаются.
+    if matches!(crate::fs::list("/opt/obsos/bin"), Some(Ok(_))) {
+        out.push(Item {
+            kind: Kind::Program(Icon::Network),
+            label: String::from("Браузер"),
+            path: Some(OBSOS_COMMAND.to_string()),
+            shortcut: None,
+        });
+    }
     out
 }
 

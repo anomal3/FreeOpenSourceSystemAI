@@ -1335,6 +1335,20 @@ pub unsafe fn activate_kernel_space() {
     unsafe { activate_space(kernel_root()) };
 }
 
+/// Piecewise freeing (see the x86-64 version) is not done here: `None`, and
+/// [`free_user_space`] frees everything in one go, as before.
+///
+/// # Safety
+///
+/// As [`free_user_space`].
+pub unsafe fn free_user_space_part(
+    _root: PhysAddr,
+    _cursor: &mut usize,
+    _alloc: &mut impl FrameAllocator,
+) -> Option<(usize, usize)> {
+    None
+}
+
 /// Разобрать адресное пространство программы: вернуть в пул поддерево
 /// `window_slot` и саму корневую таблицу.
 ///

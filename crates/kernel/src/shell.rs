@@ -612,7 +612,13 @@ fn run(primary: bool) {
 /// пути к одной настройке пишут в один и тот же файл.
 fn power_settings(argument: &str) {
     let argument = argument.trim();
+    // Заставка (22.11): `power saver …`.
+    if let Some(rest) = argument.strip_prefix("saver") {
+        ui::saver::command(rest);
+        return;
+    }
     if argument.is_empty() {
+        sprintln!("  saver     : {}", ui::saver::describe());
         let after = crate::power::screen_off_after();
         if after == 0 {
             sprintln!("  screen off: never");
@@ -1216,9 +1222,11 @@ fn run_builtin(line: &str) -> bool {
                 }
                 (Some("hw"), Some(on @ ("on" | "off"))) => crate::linux::drm::set_hw(on == "on"),
                 (Some("trace"), Some(on @ ("on" | "off"))) => crate::linux::drm::set_trace(on == "on"),
+                (Some("local"), Some(at @ ("vram" | "sys"))) => crate::linux::drm::set_local_in_vram(at == "vram"),
                 (None, None) => {}
-                _ => sprintln!("  nvk: usage `nvk [soft|hw|trace on|off]`"),
+                _ => sprintln!("  nvk: usage `nvk [soft|hw|trace on|off]`, `nvk local vram|sys`"),
             }
+            sprintln!("  nvk: local memory in {}", if crate::linux::drm::local_in_vram() { "VRAM (not shared buffers)" } else { "system RAM" });
             let (real, soft) = crate::linux::drm::backend_state();
             sprintln!(
                 "  nvk: /dev/dri/renderD128 {} (real backend {}, hw {}, soft {}, trace {})",
@@ -1280,7 +1288,13 @@ fn run_builtin(line: &str) -> bool {
         #[cfg(target_arch = "x86_64")]
         // Адресный сброс TLB и непрозрачные строки подповерхностей (19.11) —
         // тоже: `off` — как до них, для сравнения на одном образе.
-        "wlpace" | "wlping" | "lxshrwx" | "lxcfr" | "tlbtarget" | "wlopaque" => {
+        // `wlpace on|auto|off|unlimited|<Гц>` (D4, 20.11): темп по монитору.
+        "wlpace" => sprintln!("{}", crate::linux::wayland::pace_command(argument)),
+        // G3 (21.11): `wldirect on|off` - fullscreen window straight to the
+        // screen (no compose), for A/B.
+        "wldirect" => sprintln!("{}", crate::ui::direct_command(argument)),
+        #[cfg(target_arch = "x86_64")]
+        "wlping" | "lxshrwx" | "lxcfr" | "tlbtarget" | "wlopaque" | "wlzerocopy" | "lxirq" | "yieldfast" | "mprotlazy" | "fileio" => {
             use core::sync::atomic::Ordering::Relaxed;
             let on = match argument.trim() {
                 "on" => Some(true),
@@ -1289,7 +1303,13 @@ fn run_builtin(line: &str) -> bool {
             };
             if let Some(on) = on {
                 match command {
-                    "wlpace" => crate::linux::wayland::set_pace(on),
+                    // hw-log14: Linux calls with interrupts on; `off` - as before (A/B).
+                    "lxirq" => crate::arch::interrupts::LINUX_SYSCALL_IRQS.store(on, Relaxed),
+                    "yieldfast" => crate::sched::FAST_YIELD.store(on, Relaxed),
+                    "mprotlazy" => crate::user::LAZY_WIDEN.store(on, Relaxed),
+                    // File read/write/open outside the process lock; `off` - under it.
+                    "fileio" => crate::user::files::UNLOCKED_IO.store(on, Relaxed),
+                    "wlzerocopy" => crate::linux::wayland::ZERO_COPY.store(on, Relaxed),
                     "wlping" => crate::linux::wayland::set_ping(on),
                     "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.store(on, Relaxed),
                     "tlbtarget" => crate::arch::smp::FLUSH_TARGETED.store(on, Relaxed),
@@ -1298,7 +1318,11 @@ fn run_builtin(line: &str) -> bool {
                 }
             }
             let now = match command {
-                "wlpace" => crate::linux::wayland::pace(),
+                "lxirq" => crate::arch::interrupts::LINUX_SYSCALL_IRQS.load(Relaxed),
+                "yieldfast" => crate::sched::FAST_YIELD.load(Relaxed),
+                "mprotlazy" => crate::user::LAZY_WIDEN.load(Relaxed),
+                "fileio" => crate::user::files::UNLOCKED_IO.load(Relaxed),
+                "wlzerocopy" => crate::linux::wayland::ZERO_COPY.load(Relaxed),
                 "wlping" => crate::linux::wayland::ping(),
                 "lxcfr" => crate::linux::COPY_FILE_RANGE_ON.load(Relaxed),
                 "tlbtarget" => crate::arch::smp::FLUSH_TARGETED.load(Relaxed),
@@ -1334,6 +1358,94 @@ fn run_builtin(line: &str) -> bool {
             }
             sprintln!("  idlepoll: {} us", crate::sched::idle_poll_us());
         }
+        // DRM fence waits poll the GPU this long before 1 ms sleeps (hw-log14), us.
+        #[cfg(target_arch = "x86_64")]
+        "fencespin" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "off" => crate::linux::drm::FENCE_SPIN_US.store(0, Relaxed),
+                value => match value.parse::<u64>() {
+                    Ok(us) => crate::linux::drm::FENCE_SPIN_US.store(us.min(5_000), Relaxed),
+                    Err(_) => sprintln!("  fencespin: usage `fencespin [MICROSECONDS|off]`"),
+                },
+            }
+            sprintln!("  fencespin: {} us", crate::linux::drm::FENCE_SPIN_US.load(Relaxed));
+        }
+        // hw-log15: first fine sleep step of a fence wait after the poll, us
+        // (doubles up to 4x); 0/off - 1 ms tick sleeps as before.
+        #[cfg(target_arch = "x86_64")]
+        "fencestep" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "off" => crate::linux::drm::FENCE_STEP_US.store(0, Relaxed),
+                value => match value.parse::<u64>() {
+                    Ok(us) => crate::linux::drm::FENCE_STEP_US.store(us.min(1_000), Relaxed),
+                    Err(_) => sprintln!("  fencestep: usage `fencestep [MICROSECONDS|off]`"),
+                },
+            }
+            sprintln!("  fencestep: {} us", crate::linux::drm::FENCE_STEP_US.load(Relaxed));
+        }
+        // hw-log15: a Linux thread spinning on sched_yield naps N us (0 - off).
+        #[cfg(target_arch = "x86_64")]
+        "yieldnap" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "off" => crate::linux::thread::YIELD_NAP_US.store(0, Relaxed),
+                value => match value.parse::<u64>() {
+                    Ok(us) => crate::linux::thread::YIELD_NAP_US.store(us.min(1_000), Relaxed),
+                    Err(_) => sprintln!("  yieldnap: usage `yieldnap [MICROSECONDS|off]`"),
+                },
+            }
+            sprintln!(
+                "  yieldnap: {} us, {} naps since boot",
+                crate::linux::thread::YIELD_NAP_US.load(Relaxed),
+                crate::linux::thread::YIELD_NAPS.load(Relaxed)
+            );
+        }
+        // hw-log15: how late sleeps and fence waits end - fine (hrsleep)
+        // against the tick way, in one boot (scenario `hrsleep`).
+        #[cfg(target_arch = "x86_64")]
+        "hrbench" => {
+            for us in [100u64, 400, 1000] {
+                let (fine_avg, fine_worst) = crate::sched::hrsleep::sleep_bench(us, 100, true);
+                let (tick_avg, tick_worst) = crate::sched::hrsleep::sleep_bench(us, 100, false);
+                sprintln!(
+                    "  hrbench: sleep {us} us: fine {fine_avg} us avg ({fine_worst} worst), tick {tick_avg} us avg ({tick_worst} worst)"
+                );
+            }
+            let step = crate::linux::drm::FENCE_STEP_US.load(core::sync::atomic::Ordering::Relaxed).max(1);
+            for us in [300u64, 700, 1500] {
+                let (fine_avg, fine_worst) = crate::linux::drm::fence_bench(us, 100, step);
+                let (tick_avg, tick_worst) = crate::linux::drm::fence_bench(us, 100, 0);
+                sprintln!(
+                    "  hrbench: fence signalled after {us} us: fine steps {fine_avg} us avg ({fine_worst} worst), tick sleeps {tick_avg} us avg ({tick_worst} worst)"
+                );
+            }
+            let (sleeps, by_deadline, by_event, shots, shot_irqs, late) = crate::sched::hrsleep::stats();
+            sprintln!(
+                "  hrbench: done; hrsleep {sleeps} sleeps, {by_deadline} by deadline ({} us late avg), {by_event} by event, {shots} one-shots, {shot_irqs} fired",
+                late / 1000
+            );
+        }
+        // hw-log15: sub-tick sleeps (one-shot APIC timer) for fence waits,
+        // short nanosleeps and USB disk waits; off - tick sleeps as before.
+        "hrsleep" => {
+            match argument.trim() {
+                "" => {}
+                "on" => crate::sched::hrsleep::set_enabled(true),
+                "off" => crate::sched::hrsleep::set_enabled(false),
+                _ => sprintln!("  hrsleep: usage `hrsleep [on|off]`"),
+            }
+            let (sleeps, by_deadline, by_event, shots, shot_irqs, late) = crate::sched::hrsleep::stats();
+            sprintln!(
+                "  hrsleep: {}; {sleeps} sleeps, {by_deadline} ended by deadline ({} us late on average), {by_event} by an event; {shots} one-shots armed, {shot_irqs} fired",
+                if crate::sched::hrsleep::enabled() { "on" } else { "off" },
+                late / 1000
+            );
+        }
         // Ожидание занятого мьютекса ядра в цикле до сна (20.11), мкс.
         "mutexspin" => {
             use core::sync::atomic::Ordering::Relaxed;
@@ -1360,6 +1472,21 @@ fn run_builtin(line: &str) -> bool {
                 _ => sprintln!("  schedkick: usage `schedkick [on|off]`"),
             }
             sprintln!("  schedkick: {}", if crate::sched::kicks() { "on" } else { "off" });
+        }
+        // Ready queues per CPU with work stealing, or the one global queue
+        // under the scheduler lock (22.11.2026, A/B in one boot).
+        "schedq" => {
+            match argument.trim() {
+                "percpu" => crate::sched::set_percpu(true),
+                "global" => crate::sched::set_percpu(false),
+                "" => {}
+                _ => sprintln!("  schedq: usage `schedq [percpu|global]`"),
+            }
+            let (on, local, stolen, lost, locked) = crate::sched::percpu_stats();
+            sprintln!(
+                "  schedq: {} (per-cpu picks: {local} own queue, {stolen} elsewhere, {lost} lost claims, {locked} with the global lock)",
+                if on { "percpu" } else { "global" }
+            );
         }
         // Право `jit` проверочным программам Linux из `/compat/linux/bin`
         // (P5, 18.11.2026): там нет пакета, который назвал бы его, а проба
@@ -1395,6 +1522,126 @@ fn run_builtin(line: &str) -> bool {
                 stat(&path);
             }
         }
+        // `sum <путь>` — длина и CRC-32 файла (20.11: сверка файлов exFAT-диска
+        // со стендом); `cp <откуда> <куда>` — копия файла (пути без пробелов).
+        "sum" => {
+            if argument.is_empty() {
+                sprintln!("  usage: sum <path>");
+            } else if let Some(path) = human_path(argument) {
+                checksum(&path);
+            }
+        }
+        "fsbench" => {
+            if argument.is_empty() {
+                sprintln!("  usage: fsbench <file>");
+            } else if let Some(path) = human_path(argument) {
+                fsbench(&path);
+            }
+        }
+        // `exfatcache on|off` (21.11) — быстрый путь exFAT (кэш блоков, чтение
+        // мимо замка тома, кэш каталогов); `off` — как до 21.11, для замера.
+        // hw-log15: read-ahead after a random miss on exFAT, KiB.
+        "exfatra" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                value => match value.parse::<u64>() {
+                    Ok(kib) => fs::exfatfs::READAHEAD_RANDOM.store(kib.min(1024) * 1024, Relaxed),
+                    Err(_) => sprintln!("  exfatra: usage `exfatra [KIB]`"),
+                },
+            }
+            sprintln!("  exfatra: {} KiB", fs::exfatfs::READAHEAD_RANDOM.load(Relaxed) / 1024);
+        }
+        // hw-log15: USB disk transfers wait for the xHCI interrupt (`irq`) or
+        // poll and yield as before 22.11 (`poll`).
+        "usbwait" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "irq" => crate::usb::xhci::STORAGE_IRQ_WAIT.store(true, Relaxed),
+                "poll" => crate::usb::xhci::STORAGE_IRQ_WAIT.store(false, Relaxed),
+                _ => sprintln!("  usbwait: usage `usbwait [irq|poll]`"),
+            }
+            let (bulks, ns, bytes, sleeps) = crate::usb::xhci::storage_stats();
+            sprintln!(
+                "  usbwait: {}; {bulks} disk transfers, {} us each, {} KiB, {sleeps} sleeps for the interrupt",
+                if crate::usb::xhci::STORAGE_IRQ_WAIT.load(Relaxed) { "irq" } else { "poll" },
+                ns / bulks.max(1) / 1000,
+                bytes / 1024
+            );
+        }
+        "exfatcache" => match argument {
+            "on" | "off" => {
+                fs::exfatfs::set_fast(argument == "on");
+                sprintln!("  exfat: fast path {argument}");
+            }
+            _ => sprintln!("  exfat: fast path {} (usage: exfatcache on|off)", if fs::exfatfs::fast() { "on" } else { "off" }),
+        },
+        "cp" => match argument.split_once(' ') {
+            Some((from, to)) if !to.trim().is_empty() => {
+                if let (Some(from), Some(to)) = (human_path(from.trim()), human_path(to.trim())) {
+                    copy(&from, &to);
+                }
+            }
+            _ => sprintln!("  usage: cp <from> <to>"),
+        },
+        // `winapps` (21.11) — программы Windows, найденные в префиксах Wine
+        // (то, что показывают «Пуск» и стол); `winapps assume-proton` —
+        // считать пакет `proton` стоящим (стенд, живая система без `/opt`).
+        "winapps" => {
+            if argument == "assume-proton" {
+                crate::ui::winapps::assume_proton();
+                sprintln!("  winapps: proton assumed");
+            }
+            let apps = crate::ui::winapps::scan();
+            for app in &apps {
+                sprintln!(
+                    "  winapps: '{}' {} -> {}{}{}{}",
+                    app.caption,
+                    app.file,
+                    if app.target.is_empty() { "?" } else { &app.target },
+                    if app.desktop { " [desktop]" } else { "" },
+                    if app.uninstall { " [uninstall]" } else { "" },
+                    if app.icon.is_empty() { "" } else { " [icon]" }
+                );
+            }
+            sprintln!("  winapps: {} shortcut(s) in {} prefix(es)", apps.len(), crate::ui::winapps::prefixes().len());
+        }
+        // `openwith <путь>` (22.11) — что «Открыть с помощью» предложит для
+        // файла: `d` выбрана, `f` подходит, `o` прочие (то же, что видят
+        // «Файлы» и стол).
+        "openwith" => {
+            if argument.is_empty() {
+                sprintln!("  usage: openwith <file>");
+            } else if let Some(path) = human_path(argument) {
+                let text = crate::ui::openwith::list_text(&path);
+                for line in text.lines() {
+                    let mut parts = line.split('\t');
+                    let (mark, caption, command) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                    sprintln!("  openwith: {mark} '{caption}' {command}");
+                }
+                sprintln!("  openwith: {} program(s) for {path}", text.lines().count());
+            }
+        }
+        // `mklnk C:\путь\программа.exe > /путь/Имя.lnk` (21.11) — ярлык
+        // Windows, как его пишет Wine: «Программы Windows» проверяются на
+        // префиксе без установки Proton (сценарий `winapps`).
+        "mklnk" => match argument.split_once('>') {
+            Some((target, path)) if !target.trim().is_empty() => {
+                if let Some(path) = human_path(path.trim()) {
+                    let bytes = crate::ui::winapps::build_lnk(target.trim());
+                    match fs::create_as(user::session::credentials(), &path, 0o644) {
+                        Some(Ok(node)) => match node.write_at(0, &bytes) {
+                            Ok(_) => sprintln!("  mklnk: {} bytes to {path}", bytes.len()),
+                            Err(err) => sprintln!("  mklnk {path}: {err}"),
+                        },
+                        Some(Err(err)) => sprintln!("  mklnk {path}: {err}"),
+                        None => sprintln!("  no filesystem is mounted"),
+                    }
+                }
+            }
+            _ => sprintln!("  usage: mklnk <C:\\target.exe> > <file.lnk>"),
+        },
         "cat" => {
             if argument.is_empty() {
                 sprintln!("  usage: cat <path>");
@@ -2278,8 +2525,32 @@ fn ui_status(argument: &str) {
         ui::taskbar_command(words);
         return;
     }
+    // «Оформление» и глубина цвета (20.11): `ui look simple`, `ui look depth 8`.
+    if let Some(words) = argument.trim().strip_prefix("look") {
+        ui::look::command(words);
+        return;
+    }
+    // Тема значков (22.11): `ui icons glossy|crisp`.
+    if let Some(words) = argument.trim().strip_prefix("icons") {
+        ui::appicon::command(words);
+        return;
+    }
     if let Some(words) = argument.trim().strip_prefix("start") {
         ui::start_command(words);
+        return;
+    }
+    // Окно стола по просьбе программы (П3, 20.11): `ui open settings
+    // network`, `ui open terminal` — «Администрирование», «Выполнить».
+    if let Some(words) = argument.trim().strip_prefix("open") {
+        match ui::open_command(words) {
+            Ok(what) => sprintln!("  ui open: {what}"),
+            Err(why) => sprintln!("  ui open: FAILED {why}"),
+        }
+        return;
+    }
+    // Масштаб стола на ходу (20.11): `ui scale auto|100|125|150|175|200`.
+    if let Some(word) = argument.trim().strip_prefix("scale") {
+        ui::scale_command(word.trim());
         return;
     }
     if argument.trim() == "reset" {
@@ -3336,6 +3607,126 @@ fn stat(path: &str) {
             sprintln!("  age    {} s", now.saturating_sub(u64::from(meta.mtime)));
         }
     }
+}
+
+/// `sum`: длина файла и его CRC-32 (IEEE, как у `crc32` и zlib).
+fn checksum(path: &str) {
+    let node = match fs::resolve_as(user::session::credentials(), path, Access::READ) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return sprintln!("  {path}: {err}"),
+        None => return sprintln!("  no filesystem is mounted"),
+    };
+    let mut buf = alloc::vec![0u8; 1 << 20];
+    let mut crc = disk::crc32::Crc32::new();
+    let mut offset = 0u64;
+    loop {
+        match node.read_at(offset, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                crc.update(&buf[..n]);
+                offset += n as u64;
+            }
+            Err(err) => return sprintln!("  {path}: {err} at byte {offset}"),
+        }
+    }
+    sprintln!("  sum: {path} {offset} bytes crc32 {:08x}", crc.finish());
+}
+
+/// `fsbench <файл>` (21.11): задержки файловой системы — поиск пути (то, что
+/// делает `openat`), чтение подряд кусками по 64 КиБ (первое и повторное) и
+/// 4-КиБ чтения вразброс. Замер exFAT-диска (D2R читает с /usb1 так).
+fn fsbench(path: &str) {
+    let cred = user::session::credentials();
+    let t = time::uptime_ns();
+    let node = match fs::resolve_as(cred, path, Access::READ) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return sprintln!("  {path}: {err}"),
+        None => return sprintln!("  no filesystem is mounted"),
+    };
+    let first_open = time::uptime_ns() - t;
+    const OPENS: u64 = 200;
+    let t = time::uptime_ns();
+    for _ in 0..OPENS {
+        if let Some(Err(err)) = fs::resolve_as(cred, path, Access::READ) {
+            return sprintln!("  {path}: {err}");
+        }
+    }
+    let open_avg = (time::uptime_ns() - t) / OPENS;
+    let size = node.metadata().size;
+    let mut buf = alloc::vec![0u8; 64 << 10];
+    let mut seq = [(0u64, 0u64); 2];
+    for pass in &mut seq {
+        let t = time::uptime_ns();
+        let mut offset = 0u64;
+        loop {
+            match node.read_at(offset, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => offset += n as u64,
+                Err(err) => return sprintln!("  {path}: {err} at byte {offset}"),
+            }
+        }
+        *pass = (offset, (time::uptime_ns() - t).max(1));
+    }
+    const RANDOM: u64 = 500;
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let t = time::uptime_ns();
+    for _ in 0..RANDOM {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        let at = ((x >> 16) % size.max(1)) & !4095;
+        if let Err(err) = node.read_at(at, &mut buf[..4096]) {
+            return sprintln!("  {path}: {err} at byte {at}");
+        }
+    }
+    let random_avg = (time::uptime_ns() - t) / RANDOM;
+    let mbs = |(bytes, ns): (u64, u64)| bytes * 1000 / ns;
+    sprintln!(
+        "  fsbench: {path} open {} us first, {} us avg; read 64K cold {} MB/s ({} ms), warm {} MB/s ({} ms); random 4K {} us avg",
+        first_open / 1000,
+        open_avg / 1000,
+        mbs(seq[0]),
+        seq[0].1 / 1_000_000,
+        mbs(seq[1]),
+        seq[1].1 / 1_000_000,
+        random_avg / 1000
+    );
+}
+
+/// `cp`: копия файла кусками по мегабайту; цель создаётся или обрезается.
+fn copy(from: &str, to: &str) {
+    let cred = user::session::credentials();
+    let source = match fs::resolve_as(cred, from, Access::READ) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return sprintln!("  {from}: {err}"),
+        None => return sprintln!("  no filesystem is mounted"),
+    };
+    let target = match fs::resolve_as(cred, to, Access::WRITE) {
+        Some(Ok(node)) => node.truncate(0).map(|()| node),
+        Some(Err(VfsError::NotFound)) => match fs::create_as(cred, to, 0o644) {
+            Some(result) => result,
+            None => return sprintln!("  no filesystem is mounted"),
+        },
+        Some(Err(err)) => Err(err),
+        None => return sprintln!("  no filesystem is mounted"),
+    };
+    let target = match target {
+        Ok(node) => node,
+        Err(err) => return sprintln!("  {to}: {err}"),
+    };
+    let mut buf = alloc::vec![0u8; 1 << 20];
+    let mut offset = 0u64;
+    loop {
+        let n = match source.read_at(offset, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) => return sprintln!("  {from}: {err} at byte {offset}"),
+        };
+        if let Err(err) = target.write_at(offset, &buf[..n]) {
+            return sprintln!("  {to}: {err} at byte {offset}");
+        }
+        offset += n as u64;
+    }
+    fs::writeback_all();
+    sprintln!("  cp: {offset} bytes copied to {to}");
 }
 
 fn show(path: &str) {

@@ -55,6 +55,7 @@ use core::cell::Cell;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use mini_ui::filedlg::Line;
 use mini_ui::glyphicon::{self, Icon};
 use mini_ui::iconset::{self, Fi};
 use mini_ui::kit::{self, Entry};
@@ -151,6 +152,8 @@ struct Row {
     volume: String,
     /// У тома — свободно, байт (`size` — всего); ноль у `size` — неизвестно.
     free: u64,
+    /// У тома — метка (`Z7S` у exFAT-диска, 20.11); пусто — нет.
+    label: String,
 }
 
 impl Row {
@@ -167,6 +170,7 @@ impl Row {
             mtime: entry.mtime,
             volume: String::new(),
             free: 0,
+            label: String::new(),
         }
     }
 
@@ -183,6 +187,7 @@ impl Row {
             mtime: 0,
             volume: kind.to_string(),
             free,
+            label: String::new(),
         }
     }
 
@@ -212,69 +217,14 @@ impl Row {
     }
 }
 
-/// Значки файлов, папок и мест из макета Романа (72g, FIMG 64) — те же, что
-/// у стола (`crates/kernel/src/ui/appicon.rs`).
-static FILE_ICONS: [(&str, &[u8]); 39] = [
-    ("doc-archive", include_bytes!("../../../../assets/icons/file/doc-archive.fimg").as_slice()),
-    ("doc-audio", include_bytes!("../../../../assets/icons/file/doc-audio.fimg").as_slice()),
-    ("doc-code", include_bytes!("../../../../assets/icons/file/doc-code.fimg").as_slice()),
-    ("doc-disk-image", include_bytes!("../../../../assets/icons/file/doc-disk-image.fimg").as_slice()),
-    ("doc-document", include_bytes!("../../../../assets/icons/file/doc-document.fimg").as_slice()),
-    ("doc-executable", include_bytes!("../../../../assets/icons/file/doc-executable.fimg").as_slice()),
-    ("doc-font", include_bytes!("../../../../assets/icons/file/doc-font.fimg").as_slice()),
-    ("doc-fpk", include_bytes!("../../../../assets/icons/file/doc-fpk.fimg").as_slice()),
-    ("doc-image", include_bytes!("../../../../assets/icons/file/doc-image.fimg").as_slice()),
-    ("doc-pdf", include_bytes!("../../../../assets/icons/file/doc-pdf.fimg").as_slice()),
-    ("doc-presentation", include_bytes!("../../../../assets/icons/file/doc-presentation.fimg").as_slice()),
-    ("doc-spreadsheet", include_bytes!("../../../../assets/icons/file/doc-spreadsheet.fimg").as_slice()),
-    ("doc-text", include_bytes!("../../../../assets/icons/file/doc-text.fimg").as_slice()),
-    ("doc-unknown", include_bytes!("../../../../assets/icons/file/doc-unknown.fimg").as_slice()),
-    ("doc-video", include_bytes!("../../../../assets/icons/file/doc-video.fimg").as_slice()),
-    ("folder", include_bytes!("../../../../assets/icons/file/folder.fimg").as_slice()),
-    ("folder-desktop", include_bytes!("../../../../assets/icons/file/folder-desktop.fimg").as_slice()),
-    ("folder-documents", include_bytes!("../../../../assets/icons/file/folder-documents.fimg").as_slice()),
-    ("folder-downloads", include_bytes!("../../../../assets/icons/file/folder-downloads.fimg").as_slice()),
-    ("folder-empty", include_bytes!("../../../../assets/icons/file/folder-empty.fimg").as_slice()),
-    ("folder-full", include_bytes!("../../../../assets/icons/file/folder-full.fimg").as_slice()),
-    ("folder-music", include_bytes!("../../../../assets/icons/file/folder-music.fimg").as_slice()),
-    ("folder-open", include_bytes!("../../../../assets/icons/file/folder-open.fimg").as_slice()),
-    ("folder-pictures", include_bytes!("../../../../assets/icons/file/folder-pictures.fimg").as_slice()),
-    ("folder-videos", include_bytes!("../../../../assets/icons/file/folder-videos.fimg").as_slice()),
-    ("overlay-error", include_bytes!("../../../../assets/icons/file/overlay-error.fimg").as_slice()),
-    ("overlay-lock", include_bytes!("../../../../assets/icons/file/overlay-lock.fimg").as_slice()),
-    ("overlay-shared", include_bytes!("../../../../assets/icons/file/overlay-shared.fimg").as_slice()),
-    ("overlay-shortcut-arrow", include_bytes!("../../../../assets/icons/file/overlay-shortcut-arrow.fimg").as_slice()),
-    ("overlay-sync", include_bytes!("../../../../assets/icons/file/overlay-sync.fimg").as_slice()),
-    ("place-external-drive", include_bytes!("../../../../assets/icons/file/place-external-drive.fimg").as_slice()),
-    ("place-local-disk", include_bytes!("../../../../assets/icons/file/place-local-disk.fimg").as_slice()),
-    ("place-network-folder", include_bytes!("../../../../assets/icons/file/place-network-folder.fimg").as_slice()),
-    ("place-optical", include_bytes!("../../../../assets/icons/file/place-optical.fimg").as_slice()),
-    ("place-system-disk", include_bytes!("../../../../assets/icons/file/place-system-disk.fimg").as_slice()),
-    ("place-this-pc", include_bytes!("../../../../assets/icons/file/place-this-pc.fimg").as_slice()),
-    ("place-trash-empty", include_bytes!("../../../../assets/icons/file/place-trash-empty.fimg").as_slice()),
-    ("place-trash-full", include_bytes!("../../../../assets/icons/file/place-trash-full.fimg").as_slice()),
-    ("place-usb-stick", include_bytes!("../../../../assets/icons/file/place-usb-stick.fimg").as_slice()),
-];
-
 /// Разобранные значки: имя и картинка. Разбираются при первом показе.
 type IconCache = core::cell::RefCell<Vec<(&'static str, Option<mini_ui::image::Image>)>>;
 
 /// Нарисовать значок макета `name` в `rect`. `false` — такого нет.
 fn draw_design_icon(cache: &IconCache, s: &mut Surface, rect: Rect, name: &str) -> bool {
-    let mut cache = cache.borrow_mut();
-    if !cache.iter().any(|(known, _)| *known == name) {
-        let Some((known, bytes)) = FILE_ICONS.iter().find(|(known, _)| *known == name) else {
-            return false;
-        };
-        cache.push((known, mini_ui::image::Image::parse(bytes)));
-    }
-    match cache.iter().find(|(known, _)| *known == name) {
-        Some((_, Some(image))) => {
-            image.draw(s, rect);
-            true
-        }
-        _ => false,
-    }
+    // Значки темы (22.11): одни на систему, `/usr/share/icons/<тема>.pak`.
+    let _ = cache;
+    user_progs::icons::draw(s, rect, name)
 }
 
 /// Значок и тип файла по имени, как в Проводнике (таблица — общая со
@@ -339,6 +289,9 @@ struct Preview {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuItem {
     Open,
+    /// «Открыть с помощью» (22.11): программы для файла, и программы Windows
+    /// из префиксов Wine (Notepad++ для `.txt`), и «Выбрать другую…».
+    OpenWith,
     /// Папку — в новой вкладке (20.11); средняя кнопка делает то же.
     OpenTab,
     /// Папку — в новом окне.
@@ -356,12 +309,15 @@ enum MenuItem {
     Restore,
     /// Стереть всё содержимое корзины.
     EmptyTrash,
+    /// Вставить вырезанное или скопированное в эту папку (21.11).
+    Paste,
 }
 
 impl MenuItem {
     /// Пункты на записи каталога.
-    const ON_ENTRY: [MenuItem; 5] = [
+    const ON_ENTRY: [MenuItem; 6] = [
         MenuItem::Open,
+        MenuItem::OpenWith,
         MenuItem::Rename,
         MenuItem::Delete,
         MenuItem::CopyPath,
@@ -381,7 +337,7 @@ impl MenuItem {
     ];
 
     /// Пункты на пустом месте списка.
-    const ON_FOLDER: [MenuItem; 3] = [MenuItem::NewFolder, MenuItem::NewTextFile, MenuItem::Refresh];
+    const ON_FOLDER: [MenuItem; 4] = [MenuItem::NewFolder, MenuItem::NewTextFile, MenuItem::Refresh, MenuItem::Paste];
 
     /// Пункты на томе.
     const ON_VOLUME: [MenuItem; 2] = [MenuItem::Open, MenuItem::Properties];
@@ -395,6 +351,7 @@ impl MenuItem {
     fn title(self) -> &'static str {
         match self {
             MenuItem::Open => "Открыть",
+            MenuItem::OpenWith => "Открыть с помощью…",
             MenuItem::OpenTab => "Открыть в новой вкладке",
             MenuItem::OpenWindow => "Открыть в новом окне",
             MenuItem::Rename => "Переименовать",
@@ -406,13 +363,14 @@ impl MenuItem {
             MenuItem::Refresh => "Обновить",
             MenuItem::Restore => "Восстановить",
             MenuItem::EmptyTrash => "Очистить корзину",
+            MenuItem::Paste => "Вставить",
         }
     }
 
     fn icon(self) -> Option<Icon> {
         match self {
             MenuItem::Open => Some(Icon::ChevronRight),
-            MenuItem::OpenTab | MenuItem::OpenWindow => None,
+            MenuItem::OpenTab | MenuItem::OpenWindow | MenuItem::OpenWith => None,
             MenuItem::Rename | MenuItem::CopyPath => None,
             MenuItem::Delete => Some(Icon::Close),
             MenuItem::Properties => Some(Icon::Info),
@@ -421,6 +379,7 @@ impl MenuItem {
             MenuItem::Refresh => Some(Icon::Update),
             MenuItem::Restore => Some(Icon::Back),
             MenuItem::EmptyTrash => Some(Icon::Close),
+            MenuItem::Paste => None,
         }
     }
 
@@ -428,6 +387,7 @@ impl MenuItem {
     const fn group(self) -> u8 {
         match self {
             MenuItem::Open
+            | MenuItem::OpenWith
             | MenuItem::OpenTab
             | MenuItem::OpenWindow
             | MenuItem::Rename
@@ -436,7 +396,7 @@ impl MenuItem {
             | MenuItem::EmptyTrash => 0,
             MenuItem::CopyPath | MenuItem::Properties => 1,
             MenuItem::NewFolder | MenuItem::NewTextFile => 2,
-            MenuItem::Refresh => 3,
+            MenuItem::Refresh | MenuItem::Paste => 3,
         }
     }
 
@@ -459,8 +419,213 @@ enum MenuMode {
     Items,
     /// Просит новое имя.
     Rename(String),
-    /// Спрашивает, удалять ли.
-    Confirm,
+    /// Спрашивает, удалять ли, — вопросом посреди окна (`kit::draw_ask`,
+    /// 21.11); число — кнопка под Enter: 0 — «Удалить», 1 — «Отмена».
+    Confirm(usize),
+    /// «Открыть с помощью» (22.11): все программы для файла (`SYS_OPEN_WITH`)
+    /// и выбранная строка; карточка показывает подходящие и последней строкой
+    /// «Выбрать другую программу…».
+    OpenWith(Vec<Prog>, usize),
+    /// «Выбрать другую программу…» — окно посреди «Файлов».
+    Choose(Chooser),
+}
+
+/// Программа из «Открыть с помощью» (22.11).
+struct Prog {
+    caption: String,
+    /// Командная строка без файла (файл допишет [`with_line`]).
+    command: String,
+    icon: Option<mini_ui::image::Image>,
+    /// `d` — выбрана человеком, `f` — подходит к типу, `o` — прочие.
+    mark: u8,
+}
+
+impl Prog {
+    fn fits(&self) -> bool {
+        self.mark == b'd' || self.mark == b'f'
+    }
+
+    fn windows(&self) -> bool {
+        self.command.contains("fossai-proton")
+    }
+}
+
+/// Окно «Выбрать другую программу…».
+struct Chooser {
+    progs: Vec<Prog>,
+    selected: usize,
+    /// Первая показанная строка (список длиннее окна).
+    first: usize,
+    /// «Всегда использовать эту программу для файлов .ext».
+    always: bool,
+}
+
+/// Программы для файла `path` — у ядра (`SYS_OPEN_WITH`), со значками.
+fn load_progs(path: &str) -> Vec<Prog> {
+    let text = user_progs::open_with_list(path);
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let mark = parts.next()?.bytes().next()?;
+            let caption = String::from(parts.next()?);
+            let command = String::from(parts.next()?);
+            let icon = user_progs::open_with_icon(parts.next().unwrap_or("")).and_then(|bytes| mini_ui::image::Image::parse(&bytes));
+            (!command.is_empty()).then_some(Prog { caption, command, icon, mark })
+        })
+        .collect()
+}
+
+/// Строка запуска `command` с файлом `path`: `fossai-proton` получает путь с
+/// `%20` вместо пробела (ядро делит строку по пробелам).
+fn with_line(command: &str, path: &str) -> String {
+    if command.contains("fossai-proton") {
+        let mut encoded = String::with_capacity(path.len());
+        for ch in path.chars() {
+            match ch {
+                ' ' => encoded.push_str("%20"),
+                '%' => encoded.push_str("%25"),
+                _ => encoded.push(ch),
+            }
+        }
+        format!("{command} {encoded}")
+    } else {
+        format!("{command} {path}")
+    }
+}
+
+/// Строк в карточке «Открыть с помощью»: подходящие и «Выбрать другую…».
+fn openwith_rows(progs: &[Prog]) -> usize {
+    progs.iter().filter(|prog| prog.fits()).count() + 1
+}
+
+/// Высота строки карточки и окна выбора.
+const PROG_ROW_H: u32 = 34;
+const CHOOSER_ROW_H: u32 = 44;
+const CHOOSER_ROWS: usize = 7;
+
+/// Раскладка окна выбора программы: карточка, строки, флажок, кнопки.
+struct ChooserPlan {
+    card: Rect,
+    rows: Vec<Rect>,
+    check: Rect,
+    ok: Rect,
+    cancel: Rect,
+}
+
+fn chooser_plan(ctx: Ctx, area: Rect, count: usize) -> ChooserPlan {
+    let pad = ctx.px(20);
+    let w = ctx.px(520).min(area.w.saturating_sub(ctx.px(24)));
+    let shown = count.min(CHOOSER_ROWS).max(1) as u32;
+    let head = ctx.px(58);
+    let h = pad + head + shown * ctx.px(CHOOSER_ROW_H + 2) + ctx.px(12) + ctx.px(28) + ctx.px(20) + ctx.px(32) + pad;
+    let h = h.min(area.h.saturating_sub(ctx.px(16)));
+    let card = Rect::new(area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 2, w, h);
+    let x = card.x + pad as i32;
+    let inner_w = w.saturating_sub(pad * 2);
+    let mut y = card.y + (pad + head) as i32;
+    let mut rows = Vec::new();
+    for _ in 0..shown {
+        rows.push(Rect::new(x, y, inner_w, ctx.px(CHOOSER_ROW_H)));
+        y += ctx.px(CHOOSER_ROW_H + 2) as i32;
+    }
+    y += ctx.px(12) as i32;
+    let check = Rect::new(x, y, inner_w, ctx.px(28));
+    let face = ctx.face(Role::Label);
+    let bw = |label: &str| (face.width(label) + ctx.px(36)).max(ctx.px(104));
+    let by = card.bottom() - (pad + ctx.px(32)) as i32;
+    let cancel = Rect::new(card.right() - (pad + bw("Отмена")) as i32, by, bw("Отмена"), ctx.px(32));
+    let ok = Rect::new(cancel.x - (ctx.px(8) + bw("Открыть")) as i32, by, bw("Открыть"), ctx.px(32));
+    ChooserPlan { card, rows, check, ok, cancel }
+}
+
+/// Последняя строка карточки «Открыть с помощью».
+const OTHER_PROGRAM: &str = "Выбрать другую программу…";
+
+impl Chooser {
+    /// Держать выбранную строку в окне.
+    fn follow(&mut self) {
+        if self.selected < self.first {
+            self.first = self.selected;
+        } else if self.selected >= self.first + CHOOSER_ROWS {
+            self.first = self.selected + 1 - CHOOSER_ROWS;
+        }
+    }
+}
+
+/// Строка `row` карточки «Открыть с помощью» (`fits` подходящих; строка
+/// `fits` — «Выбрать другую…», за чертой).
+fn openwith_row_rect(ctx: Ctx, card: Rect, row: usize, fits: usize) -> Rect {
+    let pad = ctx.px(6);
+    let mut y = card.y + pad as i32 + (row as u32 * ctx.px(PROG_ROW_H)) as i32;
+    if row == fits && fits > 0 {
+        y += ctx.px(9) as i32;
+    }
+    Rect::new(card.x + pad as i32, y, card.w.saturating_sub(pad * 2), ctx.px(PROG_ROW_H))
+}
+
+/// Карточка «Открыть с помощью»: подходящие программы со значками и
+/// «Выбрать другую программу…».
+fn draw_openwith(ctx: Ctx, s: &mut Surface, card: Rect, progs: &[Prog], selected: usize) {
+    let inner = kit::card(ctx, s, card);
+    let p = inner.palette;
+    let fits: Vec<&Prog> = progs.iter().filter(|prog| prog.fits()).collect();
+    for row in 0..=fits.len() {
+        let rect = openwith_row_rect(ctx, card, row, fits.len());
+        if row == fits.len() && row > 0 {
+            paint::separator(inner, s, card.x + ctx.px(12) as i32, rect.y - ctx.px(5) as i32, card.w.saturating_sub(ctx.px(24)));
+        }
+        let on = row == selected;
+        paint::row(inner, s, rect, if on { RowState::Selected } else { RowState::Idle });
+        let side = ctx.px(20);
+        let icon = Rect::new(rect.x + ctx.px(10) as i32, rect.y + (rect.h as i32 - side as i32) / 2, side, side);
+        let tx = icon.right() + ctx.px(10) as i32;
+        let tw = (rect.right() - tx - ctx.px(8) as i32).max(0) as u32;
+        let ink = if on { p.ink } else { p.ink2 };
+        match fits.get(row) {
+            Some(prog) => {
+                draw_prog_icon(inner, s, icon, prog);
+                let label = if prog.mark == b'd' { format!("{} (по умолчанию)", prog.caption) } else { prog.caption.clone() };
+                paint::text_clipped(inner, s, Role::Body, tx, paint::baseline(inner, Role::Body, rect), tw, &label, ink);
+            }
+            None => {
+                paint::text_clipped(inner, s, Role::Body, tx, paint::baseline(inner, Role::Body, rect), tw, OTHER_PROGRAM, ink);
+            }
+        }
+    }
+}
+
+/// Значок программы в квадрат `rect`: её картинка или общий знак.
+fn draw_prog_icon(ctx: Ctx, s: &mut Surface, rect: Rect, prog: &Prog) {
+    match prog.icon.as_ref() {
+        Some(image) => image.draw(s, rect),
+        None => paint::icon_tile(ctx, s, rect, if prog.windows() { Icon::Package } else { Icon::File }, Tone::Accent, false),
+    }
+}
+
+
+/// Вопрос об удалении словами — для `kit::Ask` (21.11).
+struct Question {
+    title: String,
+    text: &'static str,
+    /// Что именно удаляется — строкой над пояснением; пусто — не нужно.
+    detail: String,
+    action: &'static str,
+    /// Стирается безвозвратно: кнопка красная, значок — тревожный.
+    forever: bool,
+}
+
+impl Question {
+    fn as_ask(&self) -> kit::Ask<'_> {
+        kit::Ask {
+            icon: Icon::Close,
+            tone: if self.forever { Tone::Bad } else { Tone::Accent },
+            title: &self.title,
+            detail: &self.detail,
+            text: self.text,
+            action: self.action,
+            weight: if self.forever { Weight::Danger } else { Weight::Primary },
+        }
+    }
 }
 
 /// Контекстное меню — карточка поверх окна.
@@ -522,8 +687,40 @@ struct Files {
     /// украшает, а не прячет. Подпись, вытеснившая путь, превращает «нет такого
     /// файла» в загадку.
     friendly: bool,
-    /// Плиткой, а не таблицей.
-    tiles: bool,
+    /// Вид списка: таблица, «Список» (имена столбиками) или плитка;
+    /// помнится в `~/.config/files.cfg` (21.11).
+    view: ViewMode,
+    /// Отметка, от которой считает Shift+щелчок (21.11, как в Проводнике):
+    /// последняя строка, по которой щёлкнули без Shift.
+    anchor: usize,
+    /// Выделения нет вовсе (21.11): щёлкнули по пустому месту или обвели
+    /// рамкой пустоту. Строка `selected` остаётся курсором клавиатуры, но
+    /// не подсвечена и действиям не достаётся.
+    no_cursor: bool,
+    /// Модификаторы нажатия, которое сейчас обрабатывается (`click_with`).
+    press_mods: i32,
+    /// Ctrl зажат — перетаскивание копирует (нажатие и `WIN_KEYUP`).
+    ctrl_held: bool,
+    /// Рамка выделения по пустому месту (21.11).
+    band: Option<Band>,
+    /// Ширины столбцов «Дата», «Тип», «Размер» в точках макета (21.11:
+    /// тянутся за границу в шапке, помнятся в настройках).
+    cols: [u32; 3],
+    /// Границу столбцов тянут: какую (0 — имя|дата, 1 — дата|тип, 2 —
+    /// тип|размер), откуда и ширины до начала.
+    col_drag: Option<(usize, i32, [u32; 3])>,
+    /// Ширина столбца вида «Список» при этом масштабе (по самому длинному
+    /// имени; считается раз на папку).
+    list_w: Cell<Option<(u32, u32)>>,
+    /// Строк в столбце вида «Список» в последнем кадре — шаг стрелок вбок.
+    list_rows: Cell<usize>,
+    /// Строки вынесены за окно и отпущены (21.11): предложены другому окну
+    /// «Файлов» тем же ящиком, что вкладки, — метка, срок и что было в
+    /// буфере обмена.
+    item_offer: Option<(String, u64, Option<String>, usize)>,
+    /// Указатель вошёл в окно: до этого времени смотреть, не бросили ли
+    /// сюда строки другого окна.
+    item_watch: Option<u64>,
     /// Последний щелчок по строке: её номер и время — для двойного щелчка.
     last_click: Option<(usize, u64)>,
     menu: Option<Menu>,
@@ -590,6 +787,17 @@ struct Files {
     /// Указатель вошёл в окно над полосой вкладок: до этого времени
     /// проверять, не бросили ли сюда вкладку другого окна.
     drop_watch: Option<u64>,
+    /// Наблюдение за открытой папкой (20.11, `SYS_FSWATCH`): очередь, что
+    /// наблюдается (путь, номер) и пришло ли событие, которое ещё не
+    /// показано (меню или копирование — подождут).
+    watch: i64,
+    watched: Option<(String, i64)>,
+    changed: bool,
+    /// Адрес правят текстом (21.11, как в Проводнике): щелчок справа от
+    /// звеньев, Ctrl+L, Alt+D. Строка ввода — та же, что у окна выбора файла.
+    address: Option<Line>,
+    /// Выпавший у шеврона звена список подпапок (21.11).
+    crumb_pop: Option<CrumbPop>,
 }
 
 /// Что под указателем подсвечено.
@@ -603,6 +811,12 @@ enum Hot {
     Place(usize),
     /// Вкладка, её крестик или «+».
     Tab(kit::TabHit),
+    /// Звено адреса, его шеврон, «…» спрятанных звеньев (21.11).
+    Crumb(usize),
+    Chevron(usize),
+    CrumbMore,
+    /// Граница столбцов в шапке таблицы (21.11).
+    Grip(usize),
 }
 
 /// Почтовый ящик переноса вкладок между окнами «Файлов» (20.11).
@@ -693,7 +907,81 @@ struct Drag {
     active: bool,
     /// Папка под указателем, куда отпустить: путь и где она на экране.
     target: Option<(String, Rect)>,
+    /// Что сделать, если кнопку отпустили, не сдвинув (21.11, Проводник):
+    /// Ctrl по отмеченной строке снимает отметку при отпускании (иначе
+    /// Ctrl+перетаскивание отмеченных было бы невозможно), щелчок внутри
+    /// выделения оставляет одну эту строку.
+    after: ClickAfter,
+    /// Указатель за окном: отпускание предложит строки другому окну.
+    out: bool,
+    /// Точки монтирования: перенос между томами по умолчанию — копия.
+    points: Vec<String>,
 }
+
+/// Что делает щелчок без перетаскивания при отпускании.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClickAfter {
+    Nothing,
+    Unpick,
+    Collapse,
+}
+
+/// Рамка выделения: где нажали, где указатель, что было отмечено до неё
+/// (Ctrl — рамка добавляет к нему) и началась ли.
+struct Band {
+    start: (i32, i32),
+    at: (i32, i32),
+    base: BTreeSet<usize>,
+    active: bool,
+}
+
+/// Вид списка.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViewMode {
+    Table,
+    List,
+    Tiles,
+}
+
+impl ViewMode {
+    const ALL: [ViewMode; 3] = [ViewMode::Table, ViewMode::List, ViewMode::Tiles];
+
+    const fn tag(self) -> &'static str {
+        match self {
+            ViewMode::Table => "table",
+            ViewMode::List => "list",
+            ViewMode::Tiles => "tiles",
+        }
+    }
+
+    const fn title(self) -> &'static str {
+        match self {
+            ViewMode::Table => "Таблица",
+            ViewMode::List => "Список",
+            ViewMode::Tiles => "Плитка",
+        }
+    }
+
+    const fn icon(self) -> Icon {
+        match self {
+            ViewMode::Table => Icon::Log,
+            ViewMode::List => Icon::List,
+            ViewMode::Tiles => Icon::Grid,
+        }
+    }
+}
+
+/// Ширины столбцов «Дата изменения», «Тип», «Размер» по умолчанию и
+/// наименьшие, точки макета.
+const COLS_DEFAULT: [u32; 3] = [135, 140, 80];
+const COLS_MIN: [u32; 3] = [70, 60, 56];
+const COL_MAX: u32 = 420;
+
+/// Высота строки вида «Список», точки макета.
+const LIST_ROW_H: u32 = 26;
+
+/// Где помнятся вид и столбцы — от домашнего каталога.
+const SETTINGS: &str = ".config/files.cfg";
 
 /// По чему сортировать список.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -748,6 +1036,8 @@ struct CopyJob {
     items: usize,
     from: String,
     to: String,
+    /// Папка, куда копируется (полный путь): в журнал по окончании.
+    dest: String,
     current: String,
     error: Option<String>,
 }
@@ -775,6 +1065,8 @@ impl Files {
             tab: 0,
             tab_drag: None,
             tab_menu: None,
+            address: None,
+            crumb_pop: None,
             quit: false,
             pointer: None,
             hot: Hot::Nothing,
@@ -791,7 +1083,18 @@ impl Files {
             preview: None,
             home,
             friendly: true,
-            tiles: false,
+            view: ViewMode::Table,
+            anchor: 0,
+            no_cursor: false,
+            press_mods: 0,
+            ctrl_held: false,
+            band: None,
+            cols: COLS_DEFAULT,
+            col_drag: None,
+            list_w: Cell::new(None),
+            list_rows: Cell::new(1),
+            item_offer: None,
+            item_watch: None,
             last_click: None,
             menu: None,
             props: None,
@@ -800,9 +1103,122 @@ impl Files {
             query: String::new(),
             searching: false,
             offset: local_offset(),
+            watch: user_progs::fswatch_open(),
+            watched: None,
+            changed: false,
         };
+        view.load_settings();
         view.reload();
         view
+    }
+
+    /// Вид и ширины столбцов из `~/.config/files.cfg` (21.11).
+    fn load_settings(&mut self) {
+        let Some(text) = read_small(&format!("{}/{SETTINGS}", self.home)) else {
+            return;
+        };
+        if let Some(mode) = sysconf::value(&text, "view").and_then(|tag| ViewMode::ALL.into_iter().find(|mode| mode.tag() == tag.trim())) {
+            self.view = mode;
+        }
+        if let Some(list) = sysconf::value(&text, "columns") {
+            let widths: Vec<u32> = list.split(',').filter_map(|part| part.trim().parse().ok()).collect();
+            if let [date, kind, size] = widths[..] {
+                for (slot, (width, min)) in self.cols.iter_mut().zip([date, kind, size].into_iter().zip(COLS_MIN)) {
+                    *slot = width.clamp(min, COL_MAX);
+                }
+            }
+        }
+        println(&format!("files: settings view {} columns {},{},{}", self.view.tag(), self.cols[0], self.cols[1], self.cols[2]));
+    }
+
+    /// Запомнить вид и столбцы. Где писать некуда (живая система без
+    /// записываемого дома) — молча: вид всё равно сменился.
+    fn save_settings(&self) {
+        let _ = make_dirs(&format!("{}/.config", self.home));
+        let text = format!("view={}\ncolumns={},{},{}\n", self.view.tag(), self.cols[0], self.cols[1], self.cols[2]);
+        if write_file(&format!("{}/{SETTINGS}", self.home), text.as_bytes()).is_err() {
+            println("files: settings not saved");
+        }
+    }
+
+    /// Сменить вид (меню «Вид», кнопки в строке состояния, `T`, `L`).
+    fn set_view(&mut self, mode: ViewMode) -> bool {
+        if mode == self.view {
+            return false;
+        }
+        self.view = mode;
+        self.scroll.reset();
+        self.hscroll.reset();
+        self.scroll.follow(self.selected);
+        println(&format!("files: view {}", mode.tag()));
+        self.save_settings();
+        true
+    }
+
+    /// Подсвечена ли строка как выбранная: отмеченные, а без отметок —
+    /// курсор (если выделение не снято щелчком по пустому месту).
+    fn is_marked(&self, index: usize) -> bool {
+        if self.picked.is_empty() { index == self.selected && !self.no_cursor } else { self.picked.contains(&index) }
+    }
+
+    /// Строка, к которой относятся действия над одной записью
+    /// (переименовать, свойства, Enter): курсор, а если он не отмечен при
+    /// отмеченных других — первая отмеченная. `None` — выделения нет.
+    fn focus(&self) -> Option<usize> {
+        let index = if !self.picked.is_empty() && !self.picked.contains(&self.selected) {
+            *self.picked.iter().next()?
+        } else if self.picked.is_empty() && self.no_cursor {
+            return None;
+        } else {
+            self.selected
+        };
+        (index < self.rows.len()).then_some(index)
+    }
+
+    /// Папку открытой вкладки поменял кто-то другой (20.11: терминал создал
+    /// файл, Блокнот сохранил) — перечитать, сохранив выделение и прокрутку.
+    /// Зовётся на каждом витке цикла; события за виток сливаются в одно
+    /// перечитывание.
+    fn watch_step(&mut self) -> bool {
+        let want = (!self.on_computer()).then(|| self.path.clone());
+        if want.as_deref() != self.watched.as_ref().map(|(path, _)| path.as_str()) {
+            if let Some((_, wd)) = self.watched.take() {
+                user_progs::fswatch_remove(self.watch, wd);
+            }
+            if let Some(path) = want {
+                let wd = user_progs::fswatch_add(self.watch, &path, 0);
+                if wd >= 0 {
+                    self.watched = Some((path, wd));
+                }
+            }
+            // Только что перешли — список и так свежий.
+            let _ = user_progs::fswatch_read(self.watch);
+            self.changed = false;
+            return false;
+        }
+        if !user_progs::fswatch_read(self.watch).is_empty() {
+            self.changed = true;
+        }
+        let idle = self.menu.is_none() && self.drag.is_none() && self.band.is_none() && self.props.is_none() && self.job.is_none() && self.pop.is_none();
+        if !self.changed || !idle {
+            return false;
+        }
+        self.changed = false;
+        let keep = self.rows.get(self.selected).map(|row| row.name.clone());
+        let marked: Vec<String> = self.picked.iter().filter_map(|index| self.rows.get(*index)).map(|row| row.name.clone()).collect();
+        let offset = self.scroll.offset();
+        self.reload();
+        if let Some(at) = keep.and_then(|name| self.rows.iter().position(|row| row.name == name)) {
+            self.selected = at;
+        }
+        for name in marked {
+            if let Some(at) = self.rows.iter().position(|row| row.name == name) {
+                self.picked.insert(at);
+            }
+        }
+        self.scroll.set(offset);
+        println(&format!("files: folder changed, {} item(s) in {}", self.rows.len(), self.path));
+        true
     }
 
     /// На странице «Этот компьютер»?
@@ -814,6 +1230,10 @@ impl Files {
     fn reload(&mut self) {
         self.rows.clear();
         self.selected = 0;
+        self.anchor = 0;
+        self.no_cursor = false;
+        self.band = None;
+        self.list_w.set(None);
         self.picked.clear();
         self.dropped = 0;
         self.error = None;
@@ -907,7 +1327,9 @@ impl Files {
 
     /// Кнопка панели команд (72g, макет 14).
     fn run_command(&mut self, command: Command) -> bool {
-        let row = self.rows.get(self.selected).filter(|row| !row.is_volume()).map(|row| row.name.clone());
+        let focus = self.focus();
+        let row = focus.and_then(|index| self.rows.get(index)).filter(|row| !row.is_volume()).map(|row| row.name.clone());
+        let focus = focus.unwrap_or(self.selected);
         match command {
             Command::NewFolder => {
                 self.create_new(true);
@@ -920,7 +1342,7 @@ impl Files {
             }
             Command::Rename => {
                 let Some(name) = row else { return false };
-                self.open_menu(None, Some(self.selected));
+                self.open_menu(None, Some(focus));
                 if let Some(menu) = self.menu.as_mut() {
                     menu.mode = MenuMode::Rename(name);
                 }
@@ -929,9 +1351,9 @@ impl Files {
                 if row.is_none() {
                     return false;
                 }
-                self.open_menu(None, Some(self.selected));
+                self.open_menu(None, Some(focus));
                 if let Some(menu) = self.menu.as_mut() {
-                    menu.mode = MenuMode::Confirm;
+                    menu.mode = MenuMode::Confirm(0);
                 }
             }
         }
@@ -941,6 +1363,9 @@ impl Files {
     /// Строки, к которым относится действие: отмеченные, иначе выбранная.
     fn targets(&self) -> Vec<usize> {
         if self.picked.is_empty() {
+            if self.no_cursor {
+                return Vec::new();
+            }
             self.rows.get(self.selected).filter(|row| !row.is_volume()).map(|_| self.selected).into_iter().collect()
         } else {
             self.picked.iter().copied().filter(|index| *index < self.rows.len()).collect()
@@ -1033,6 +1458,7 @@ impl Files {
             items: paths.len(),
             from,
             to,
+            dest: dir.clone(),
             current: String::new(),
             error: None,
         });
@@ -1111,7 +1537,7 @@ impl Files {
         if job.next >= job.ops.len() {
             let remove_after = core::mem::take(&mut job.remove_after);
             let items = job.items;
-            let dir = self.path.clone();
+            let dir = job.dest.clone();
             for src in &remove_after {
                 remove_tree(src, 0);
             }
@@ -1150,12 +1576,12 @@ impl Files {
                 out.push((mark(self.descending, "По убыванию"), 1));
                 out
             }
-            _ => alloc::vec![
-                (mark(!self.tiles, "Таблица"), 0),
-                (mark(self.tiles, "Плитка"), 0),
-                (check(!self.friendly, "Показывать системные файлы"), 1),
-                (check(self.hidden, "Показывать скрытые файлы"), 1),
-            ],
+            _ => {
+                let mut out: Vec<(String, u8)> = ViewMode::ALL.iter().map(|mode| (mark(*mode == self.view, mode.title()), 0)).collect();
+                out.push((check(!self.friendly, "Показывать системные файлы"), 1));
+                out.push((check(self.hidden, "Показывать скрытые файлы"), 1));
+                out
+            }
         }
     }
 
@@ -1165,11 +1591,10 @@ impl Files {
             (Command::Sort, 0..=3) => self.set_sort(SortKey::ALL[index], self.descending),
             (Command::Sort, 4) => self.set_sort(self.sort, false),
             (Command::Sort, _) => self.set_sort(self.sort, true),
-            (_, 0 | 1) => {
-                self.tiles = index == 1;
-                println(&format!("files: view {}", if self.tiles { "tiles" } else { "table" }));
+            (_, 0..=2) => {
+                self.set_view(ViewMode::ALL[index]);
             }
-            (_, 2) => {
+            (_, 3) => {
                 self.friendly = !self.friendly;
                 println(&format!("files: system files {}", if self.friendly { "hidden" } else { "shown" }));
                 self.reload();
@@ -1227,20 +1652,32 @@ impl Files {
                 true
             }
             WIN_KEY_DELETE => {
-                if self.rows.get(self.selected).is_some_and(|row| !row.is_volume()) {
-                    self.open_menu(None, Some(self.selected));
+                if let Some(focus) = self.focus().filter(|index| self.rows.get(*index).is_some_and(|row| !row.is_volume())) {
+                    self.open_menu(None, Some(focus));
                     if let Some(menu) = self.menu.as_mut() {
-                        menu.mode = MenuMode::Confirm;
+                        menu.mode = MenuMode::Confirm(0);
                     }
                     return true;
                 }
                 false
             }
-            TILES => {
-                self.tiles = !self.tiles;
-                println(&format!("files: view {}", if self.tiles { "tiles" } else { "table" }));
+            // `T` — плитка или таблица, `L` — «Список» или таблица.
+            TILES => self.set_view(if self.view == ViewMode::Tiles { ViewMode::Table } else { ViewMode::Tiles }),
+            LIST => self.set_view(if self.view == ViewMode::List { ViewMode::Table } else { ViewMode::List }),
+            // В «Списке» строки идут столбцами (21.11): стрелки вбок — в
+            // соседний столбец, как в Проводнике.
+            WIN_KEY_LEFT | WIN_KEY_RIGHT if self.view == ViewMode::List && !self.rows.is_empty() && !self.on_computer() => {
+                let per = self.list_rows.get().max(1);
+                let last = self.rows.len() - 1;
+                if code == WIN_KEY_LEFT {
+                    self.selected = self.selected.saturating_sub(per);
+                } else if self.selected / per < last / per {
+                    self.selected = (self.selected + per).min(last);
+                }
+                self.scroll.follow(self.selected);
                 true
             }
+            ENTER if self.focus().is_none() => false,
             // Клавиши двигают выделение, а вид едет за ним (20.11); колесо —
             // наоборот, см. `wheel_at`.
             WIN_KEY_UP => {
@@ -1398,7 +1835,7 @@ impl Files {
         }
         // Выбор человека («Всегда открывать этой программой») — первым.
         if let Some(command) = chosen_program(&name) {
-            let line = format!("{command} {target}");
+            let line = with_line(&command, &target);
             let id = spawn(&line);
             if id >= 0 {
                 println(&format!("files: started '{line}' as #{id}"));
@@ -1463,7 +1900,7 @@ impl Files {
 
     /// Открыть меню у выбранной строки — клавишей.
     fn open_menu_for_selection(&mut self) {
-        let target = self.rows.get(self.selected).map(|_| self.selected);
+        let target = self.focus();
         // Место посчитает отрисовка: у клавиатуры точки нет, и меню встаёт у
         // строки, к которой относится.
         self.open_menu(None, target);
@@ -1537,7 +1974,70 @@ impl Files {
                 }
                 _ => false,
             },
-            MenuMode::Confirm => match code {
+            MenuMode::OpenWith(progs, selected) => {
+                let rows = openwith_rows(progs);
+                match code {
+                    WIN_KEY_UP => {
+                        *selected = selected.saturating_sub(1);
+                        true
+                    }
+                    WIN_KEY_DOWN => {
+                        if *selected + 1 < rows {
+                            *selected += 1;
+                        }
+                        true
+                    }
+                    ENTER => {
+                        let row = *selected;
+                        self.pick_open_with(row);
+                        true
+                    }
+                    ESCAPE | WIN_KEY_MENU | MENU => {
+                        self.close_menu();
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            // Окно выбора — модальное: стрелки, пробел (флажок), Enter, Esc.
+            MenuMode::Choose(chooser) => match code {
+                WIN_KEY_UP => {
+                    chooser.selected = chooser.selected.saturating_sub(1);
+                    chooser.follow();
+                    true
+                }
+                WIN_KEY_DOWN => {
+                    if chooser.selected + 1 < chooser.progs.len() {
+                        chooser.selected += 1;
+                    }
+                    chooser.follow();
+                    true
+                }
+                0x20 => {
+                    chooser.always = !chooser.always;
+                    true
+                }
+                ENTER => {
+                    self.finish_choose();
+                    true
+                }
+                ESCAPE => {
+                    self.close_menu();
+                    true
+                }
+                _ => true,
+            },
+            // Как у окон-вопросов ядра: Enter — выбранная кнопка, Tab и
+            // стрелки переводят выбор, Esc — отмена; `y`/`n` остались.
+            MenuMode::Confirm(focus) => match code {
+                0x09 | WIN_KEY_LEFT | WIN_KEY_RIGHT => {
+                    *focus = 1 - (*focus).min(1);
+                    true
+                }
+                ENTER if *focus == 1 => {
+                    self.close_menu();
+                    true
+                }
                 ENTER | YES => {
                     self.finish_delete();
                     true
@@ -1546,7 +2046,8 @@ impl Files {
                     self.close_menu();
                     true
                 }
-                _ => false,
+                // Вопрос модальный: прочие клавиши не уходят списку под ним.
+                _ => true,
             },
         }
     }
@@ -1560,6 +2061,28 @@ impl Files {
                 if let Some(index) = target {
                     self.selected = index;
                     self.open_selected();
+                }
+            }
+            MenuItem::OpenWith => {
+                let path = target.and_then(|index| self.rows.get(index)).filter(|row| !row.directory && !row.is_volume()).map(|row| join(&self.path, &row.name));
+                let Some(path) = path else {
+                    self.close_menu();
+                    return;
+                };
+                let progs = load_progs(&path);
+                println(&format!(
+                    "files: open with for '{path}': {} program(s), {} fit: {}",
+                    progs.len(),
+                    progs.iter().filter(|prog| prog.fits()).count(),
+                    progs.iter().filter(|prog| prog.fits()).map(|prog| prog.caption.as_str()).collect::<Vec<_>>().join(", ")
+                ));
+                if let Some(menu) = self.menu.as_mut() {
+                    // Ничего не подходит — сразу окно выбора.
+                    menu.mode = if progs.iter().any(Prog::fits) {
+                        MenuMode::OpenWith(progs, 0)
+                    } else {
+                        MenuMode::Choose(Chooser { progs, selected: 0, first: 0, always: false })
+                    };
                 }
             }
             MenuItem::OpenTab | MenuItem::OpenWindow => {
@@ -1582,7 +2105,7 @@ impl Files {
             }
             MenuItem::Delete => {
                 if let Some(menu) = self.menu.as_mut() {
-                    menu.mode = MenuMode::Confirm;
+                    menu.mode = MenuMode::Confirm(0);
                 }
             }
             MenuItem::CopyPath => {
@@ -1614,6 +2137,10 @@ impl Files {
                 self.close_menu();
                 self.reload();
             }
+            MenuItem::Paste => {
+                self.close_menu();
+                self.paste();
+            }
             MenuItem::Restore => {
                 self.close_menu();
                 if let Some(index) = target {
@@ -1623,10 +2150,129 @@ impl Files {
             MenuItem::EmptyTrash => {
                 if let Some(menu) = self.menu.as_mut() {
                     menu.target = None;
-                    menu.mode = MenuMode::Confirm;
+                    menu.mode = MenuMode::Confirm(0);
                 }
             }
         }
+    }
+
+    /// Файл, для которого открыто меню: путь и имя.
+    fn menu_target_file(&self) -> Option<(String, String)> {
+        let index = self.menu.as_ref()?.target?;
+        let row = self.rows.get(index)?;
+        (!row.directory && !row.is_volume()).then(|| (join(&self.path, &row.name), row.name.clone()))
+    }
+
+    /// Строка `row` карточки «Открыть с помощью»: программа или (последняя)
+    /// «Выбрать другую программу…».
+    fn pick_open_with(&mut self, row: usize) {
+        let Some(menu) = self.menu.as_mut() else { return };
+        let MenuMode::OpenWith(progs, _) = &mut menu.mode else { return };
+        let fits: Vec<usize> = (0..progs.len()).filter(|index| progs[*index].fits()).collect();
+        match fits.get(row) {
+            Some(&index) => {
+                let (command, caption) = (progs[index].command.clone(), progs[index].caption.clone());
+                self.launch_with(&command, &caption);
+            }
+            None => {
+                let progs = core::mem::take(progs);
+                println(&format!("files: choose another program ({} listed)", progs.len()));
+                menu.mode = MenuMode::Choose(Chooser { progs, selected: 0, first: 0, always: false });
+            }
+        }
+    }
+
+    /// «Открыть» в окне выбора: запомнить, если отмечено «всегда», и открыть.
+    fn finish_choose(&mut self) {
+        let Some(MenuMode::Choose(chooser)) = self.menu.as_ref().map(|menu| &menu.mode) else { return };
+        let Some(prog) = chooser.progs.get(chooser.selected) else {
+            self.close_menu();
+            return;
+        };
+        let (command, caption, always) = (prog.command.clone(), prog.caption.clone(), chooser.always);
+        if always {
+            if let Some((_, name)) = self.menu_target_file() {
+                let ext = sysconf::filetypes::extension(&name);
+                if !ext.is_empty() {
+                    if user_progs::open_with_remember(&ext, &command) {
+                        println(&format!("files: .{ext} files open with '{command}'"));
+                    } else {
+                        println(&format!("files: cannot remember the program for .{ext}"));
+                    }
+                }
+            }
+        }
+        self.launch_with(&command, &caption);
+    }
+
+    /// Открыть файл меню программой `command` (22.11).
+    fn launch_with(&mut self, command: &str, caption: &str) {
+        let target = self.menu_target_file();
+        self.close_menu();
+        let Some((path, name)) = target else { return };
+        let line = with_line(command, &path);
+        let id = spawn(&line);
+        if id < 0 {
+            println(&format!("files: cannot start '{line}': error {id}"));
+            self.note = Some(format!("Не удалось открыть «{name}» программой «{caption}»: {}", error_text(id)));
+        } else {
+            println(&format!("files: started '{line}' as #{id}"));
+            self.note = Some(format!("«{name}» открыт программой «{caption}»"));
+        }
+    }
+
+    /// Что спрашивает вопрос об удалении: очистка корзины, стирание из неё
+    /// или перенос в неё (макет 18) — те же слова, что у окна ядра.
+    fn ask(&self) -> Question {
+        let target = self.menu.as_ref().and_then(|menu| menu.target);
+        let name = target.and_then(|index| self.rows.get(index)).map_or(String::new(), |row| row.name.clone());
+        let many = self.picked.len() > 1;
+        match (target, self.in_trash()) {
+            (None, _) => Question {
+                title: format!("Очистить корзину? Объектов: {}", self.rows.len()),
+                text: "Объекты будут стёрты безвозвратно. Восстановить их из корзины будет нельзя.",
+                detail: String::new(),
+                action: "Удалить навсегда",
+                forever: true,
+            },
+            (Some(_), true) => Question {
+                title: if many { format!("Удалить навсегда объекты ({})?", self.picked.len()) } else { format!("Удалить «{name}» навсегда?") },
+                text: "Объект будет стёрт безвозвратно. Восстановить его будет нельзя.",
+                detail: String::new(),
+                action: "Удалить навсегда",
+                forever: true,
+            },
+            // Том без корзины (`/data`, флешка): `rename` в корзину между
+            // томами не бывает, и удаление стирает целиком — так и спросить.
+            (Some(_), false) if !self.trash_reachable() => Question {
+                title: String::from("Удалить без возможности восстановления?"),
+                text: if many { "На этом томе нет корзины: отмеченные объекты будут стёрты безвозвратно." } else { "На этом томе нет корзины: объект будет стёрт безвозвратно." },
+                detail: if many { format!("Объектов: {}", self.picked.len()) } else { format!("«{name}»") },
+                action: "Удалить навсегда",
+                forever: true,
+            },
+            (Some(_), false) => Question {
+                title: if many { format!("Удалить объекты ({})?", self.picked.len()) } else { format!("Удалить «{name}»?") },
+                text: "Файл будет перемещён в корзину. Его можно будет восстановить, пока корзина не очищена.",
+                detail: String::new(),
+                action: "Удалить",
+                forever: false,
+            },
+        }
+    }
+
+    /// Лежит ли открытая папка на том же томе, что и корзина: перенос в
+    /// корзину — `rename`, а между томами его нет (тогда удаление стирает).
+    fn trash_reachable(&self) -> bool {
+        let points = mount_points();
+        let mount = |path: &str| {
+            points
+                .iter()
+                .filter(|point| *point == "/" || path == point.as_str() || path.starts_with(&format!("{point}/")))
+                .max_by_key(|point| point.len())
+                .cloned()
+        };
+        mount(&self.path) == mount(&self.trash)
     }
 
     /// Открыта ли корзина.
@@ -1971,6 +2617,8 @@ impl Files {
     /// Переход вперёд обнуляет список «вперёд» — как в любом обозревателе: путь,
     /// с которого свернули, перестаёт существовать.
     fn go_to(&mut self, path: String) {
+        self.address = None;
+        self.crumb_pop = None;
         if path == self.path {
             return;
         }
@@ -2037,9 +2685,80 @@ impl Files {
     fn on_click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = layout(ctx, area);
 
+        // Окно выбора программы — модальное (22.11).
+        if let Some(MenuMode::Choose(chooser)) = self.menu.as_ref().map(|menu| &menu.mode) {
+            let cp = chooser_plan(ctx, area, chooser.progs.len());
+            enum Act {
+                Open,
+                Cancel,
+                Toggle,
+                Pick(usize),
+                Nothing,
+            }
+            let act = if cp.ok.contains(x, y) {
+                Act::Open
+            } else if cp.cancel.contains(x, y) {
+                Act::Cancel
+            } else if cp.check.contains(x, y) {
+                Act::Toggle
+            } else if let Some(at) = cp.rows.iter().position(|row| row.contains(x, y)) {
+                let index = chooser.first + at;
+                if index >= chooser.progs.len() {
+                    Act::Nothing
+                } else if index == chooser.selected {
+                    Act::Open
+                } else {
+                    Act::Pick(index)
+                }
+            } else {
+                Act::Nothing
+            };
+            match act {
+                Act::Open => self.finish_choose(),
+                Act::Cancel => self.close_menu(),
+                Act::Toggle | Act::Pick(_) => {
+                    if let Some(MenuMode::Choose(chooser)) = self.menu.as_mut().map(|menu| &mut menu.mode) {
+                        match act {
+                            Act::Toggle => chooser.always = !chooser.always,
+                            Act::Pick(index) => chooser.selected = index,
+                            _ => {}
+                        }
+                    }
+                }
+                Act::Nothing => {}
+            }
+            return true;
+        }
+
+        // Вопрос об удалении — модальный (21.11): отвечают его кнопками,
+        // щелчок мимо них ничего не делает.
+        if let Some(MenuMode::Confirm(_)) = self.menu.as_ref().map(|menu| &menu.mode) {
+            match kit::ask_hit(ctx, area, &self.ask().as_ask(), x, y) {
+                Some(true) => self.finish_delete(),
+                Some(false) => self.close_menu(),
+                None => return false,
+            }
+            return true;
+        }
+
         // Меню вкладки — первым, как всякое открытое меню.
         if self.tab_menu.is_some() {
             return self.click_tab_menu(ctx, area, x, y);
+        }
+        // Список подпапок у шеврона адреса (21.11).
+        if self.crumb_pop.is_some() {
+            return self.click_crumb_pop(ctx, area, &plan, x, y);
+        }
+        // Адрес правят текстом: щелчок в поле ставит каретку, мимо — отмена.
+        if self.address.is_some() {
+            if plan.path.contains(x, y) {
+                let text = address_text(ctx, &plan);
+                if let Some(line) = self.address.as_mut() {
+                    line.click(ctx.face(Role::Body), text.w, x - text.x);
+                }
+                return true;
+            }
+            self.address = None;
         }
         // Полоса вкладок (20.11).
         if let Some(hit) = self.tab_strip(ctx, &plan).hit(x, y) {
@@ -2089,11 +2808,14 @@ impl Files {
             return true;
         }
         // Заголовок столбца — сортировка по нему; второй щелчок — обратно.
-        if !self.tiles && plan.header.contains(x, y) && !self.on_computer() && self.preview.is_none() && self.props.is_none() {
-            let size_right = self.table_list(ctx, &plan).right() - ctx.px(16) as i32;
-            let type_x = size_right - ctx.px(80 + 140) as i32;
-            let date_x = type_x - ctx.px(135) as i32;
-            let key = if x >= size_right - ctx.px(80) as i32 {
+        if self.view == ViewMode::Table && plan.header.contains(x, y) && !self.on_computer() && self.preview.is_none() && self.props.is_none() {
+            // Граница столбцов (21.11) — тянуть ширину, а не сортировать.
+            if let Some(boundary) = self.col_grip(ctx, &plan, x) {
+                self.col_drag = Some((boundary, x, self.cols));
+                return true;
+            }
+            let (date_x, type_x, size_x, _) = self.columns(ctx, self.table_list(ctx, &plan));
+            let key = if x >= size_x {
                 SortKey::Size
             } else if x >= type_x {
                 SortKey::Kind
@@ -2112,6 +2834,15 @@ impl Files {
         // меню, которое человек видел.
         if let Some(menu) = self.menu.as_ref() {
             if let Some(card) = self.menu_rect(ctx, area) {
+                if let MenuMode::OpenWith(progs, _) = &menu.mode {
+                    if card.contains(x, y) {
+                        let fits = openwith_rows(progs) - 1;
+                        if let Some(row) = (0..=fits).find(|row| openwith_row_rect(ctx, card, *row, fits).contains(x, y)) {
+                            self.pick_open_with(row);
+                        }
+                        return true;
+                    }
+                }
                 if matches!(menu.mode, MenuMode::Items) && card.contains(x, y) {
                     // Та же геометрия пунктов, что у отрисовки: считает её `kit`.
                     let hit = kit::menu_hit(ctx, card, &entries(&menu.items), x, y).map(|index| menu.items[index]);
@@ -2136,14 +2867,8 @@ impl Files {
         }
 
         // Вид переехал в строку состояния (макет 14): две кнопки справа.
-        if plan.view[0].contains(x, y) || plan.view[1].contains(x, y) {
-            let tiles = plan.view[1].contains(x, y);
-            if tiles != self.tiles {
-                self.tiles = tiles;
-                println(&format!("files: view {}", if self.tiles { "tiles" } else { "table" }));
-                return true;
-            }
-            return false;
+        if let Some(at) = plan.view.iter().position(|rect| rect.contains(x, y)) {
+            return self.set_view(ViewMode::ALL[at]);
         }
         if let Some((command, _)) = plan.commands.iter().find(|(_, rect)| rect.contains(x, y)) {
             self.searching = false;
@@ -2168,21 +2893,28 @@ impl Files {
                 self.reload();
                 return true;
             }
-            // Звено адреса — переход в него.
+            // Звено адреса — переход в него, шеврон — список подпапок, «…» —
+            // спрятанные звенья, пустое место справа — адрес текстом (21.11,
+            // как в Проводнике).
             if plan.path.contains(x, y) {
-                let face = ctx.face(Role::Body);
-                let mut at = plan.path.x + ctx.px(12) as i32;
-                for (label, path) in breadcrumb(&self.path, &self.home) {
-                    let width = face.width(&label) as i32;
-                    if x >= at && x < at + width {
-                        if path != self.path {
-                            self.go_to(path);
+                let (slots, lead) = self.crumb_slots(ctx, &plan);
+                if lead.contains(x, y) {
+                    return self.open_crumb_pop(ctx, &plan, None);
+                }
+                for (index, slot) in slots.iter().enumerate() {
+                    if slot.rect.contains(x, y) {
+                        if slot.path != self.path {
+                            self.go_to(slot.path.clone());
                             return true;
                         }
                         return false;
                     }
-                    at += width + ctx.px(CRUMB_GAP) as i32;
+                    if slot.chevron.contains(x, y) {
+                        return self.open_crumb_pop(ctx, &plan, Some(index));
+                    }
                 }
+                self.edit_address();
+                return true;
             }
             return was;
         }
@@ -2229,38 +2961,78 @@ impl Files {
         }
         // В просмотре и в свойствах списка нет, и щёлкать в нём не по чему:
         // «попал в невидимую строку» — это выбор вслепую.
-        let body = if self.on_computer() { plan.list.union(&plan.header) } else { plan.list };
+        // Таблица — под шапкой, плитка и «Список» — вместе с местом шапки.
+        let body = if self.on_computer() || self.view != ViewMode::Table { plan.list.union(&plan.header) } else { plan.list };
         if self.preview.is_some() || self.props.is_some() || !body.contains(x, y) {
             return false;
         }
         let Some(index) = self.row_at(&plan, ctx, x, y) else {
-            // Щелчок по пустому месту списка снимает выделение с мысли, но не
-            // с экрана: выбранная строка остаётся, как в Windows остаётся
-            // курсор. Нужен он для того, чтобы двойной щелчок не открыл
-            // строку, по которой попали один раз.
+            // Пустое место (21.11, как в Проводнике): щелчок снимает
+            // выделение, нажатие с протяжкой — рамка выделения; с Ctrl рамка
+            // добавляет к отмеченному. Строка `selected` остаётся курсором
+            // клавиатуры, но не подсвечена.
             self.last_click = None;
-            return false;
+            if self.on_computer() || self.error.is_some() {
+                return false;
+            }
+            let ctrl = self.press_mods & WIN_MOD_CTRL != 0;
+            let had = !self.picked.is_empty() || !self.no_cursor;
+            if !ctrl {
+                self.picked.clear();
+                self.no_cursor = true;
+            }
+            self.band = Some(Band { start: (x, y), at: (x, y), base: self.picked.clone(), active: false });
+            return had && !ctrl;
         };
         // Одиночный щелчок выбирает, двойной открывает. Двойного щелчка окно
         // не получает — приходят два обычных, — и «двойной» здесь значит
         // «второй по той же строке не позже [`DOUBLE_CLICK_MS`]».
         let now = monotonic_ms();
         let double = matches!(self.last_click, Some((last, at)) if last == index && now.saturating_sub(at) <= DOUBLE_CLICK_MS);
-        // Простой щелчок снимает отметки — как в Проводнике.
-        self.picked.clear();
+        // Простой щелчок снимает отметки — как в Проводнике. Но щелчок по
+        // строке внутри выделения его не трогает до отпускания: может быть,
+        // выделение сейчас потащат (21.11).
+        let inside = self.picked.len() > 1 && self.picked.contains(&index);
+        if !inside {
+            self.picked.clear();
+        }
         self.selected = index;
+        self.anchor = index;
+        self.no_cursor = false;
         // Строка, видная краем, выезжает целиком.
         self.scroll.follow(index);
         if double {
             self.last_click = None;
+            self.picked.clear();
             return self.open_selected();
         }
         self.last_click = Some((index, now));
         // Нажатие на строке — возможно, начало перетаскивания.
-        if !self.on_computer() && self.rows.get(index).is_some_and(|row| !row.is_volume()) {
-            self.drag = Some(Drag { from: index, start: (x, y), at: (x, y), active: false, target: None });
-        }
+        self.start_drag(index, x, y, if inside { ClickAfter::Collapse } else { ClickAfter::Nothing });
         true
+    }
+
+    /// Нажали на строке: может быть, её (или выделение) сейчас потащат.
+    fn start_drag(&mut self, index: usize, x: i32, y: i32, after: ClickAfter) {
+        if !self.on_computer() && self.rows.get(index).is_some_and(|row| !row.is_volume()) {
+            self.drag = Some(Drag { from: index, start: (x, y), at: (x, y), active: false, target: None, after, out: false, points: Vec::new() });
+        }
+    }
+
+    /// Строки, которые тянут: выделение, если нажали на отмеченную, иначе
+    /// одна строка нажатия.
+    fn dragged(&self, drag: &Drag) -> Vec<usize> {
+        if self.picked.contains(&drag.from) {
+            self.picked.iter().copied().filter(|index| *index < self.rows.len()).collect()
+        } else {
+            alloc::vec![drag.from]
+        }
+    }
+
+    /// Копирует ли перетаскивание в `dir` (а не переносит): с Ctrl — всегда,
+    /// без него — между разными томами, как в Проводнике.
+    fn drag_copies(&self, drag: &Drag, dir: &str) -> bool {
+        self.ctrl_held || mount_of(&drag.points, dir) != mount_of(&drag.points, &self.path)
     }
 
     /// Указатель с зажатой кнопкой: тянуть строку, подсветить папку под ним.
@@ -2273,18 +3045,25 @@ impl Files {
             let (v, h) = self.bars(ctx, &plan);
             return v.is_some_and(|bar| bar.drag(&self.scroll, x, y)) | h.is_some_and(|bar| bar.drag(&self.hscroll, x, y));
         }
+        if let Some((boundary, from, widths)) = self.col_drag {
+            return self.drag_column(boundary, x - from, widths, ctx);
+        }
+        if self.band.is_some() {
+            return self.drag_band(area, ctx, x, y);
+        }
         if self.drag.is_none() {
             return false;
         }
         let plan = layout(ctx, area);
-        // Куда бросить: папка в списке (не та, что тянут) или место слева.
+        let dragged = self.drag.as_ref().map(|drag| self.dragged(drag)).unwrap_or_default();
+        // Куда бросить: папка в списке (не та, что тянут), место слева,
+        // звено адреса, другая вкладка (21.11).
         let mut target = None;
-        if plan.list.contains(x, y) {
+        let body = if self.view == ViewMode::Table { plan.list } else { plan.list.union(&plan.header) };
+        if body.contains(x, y) {
             if let Some(index) = self.row_at(&plan, ctx, x, y) {
-                let dragged = self.drag.as_ref().map_or(usize::MAX, |drag| drag.from);
-                if index != dragged && !self.picked.contains(&index) && self.rows.get(index).is_some_and(|row| row.directory && !row.is_volume()) {
-                    let rect = if self.tiles { Rect::EMPTY } else { plan.row_rect_at(ctx, index, self.scroll.offset()) };
-                    target = Some((join(&self.path, &self.rows[index].name), rect));
+                if !dragged.contains(&index) && self.rows.get(index).is_some_and(|row| row.directory && !row.is_volume()) {
+                    target = Some((join(&self.path, &self.rows[index].name), self.item_rect(ctx, &plan, index)));
                 }
             }
         } else if let Some(side) = plan.side.filter(|side| side.contains(x, y)) {
@@ -2294,6 +3073,28 @@ impl Files {
                     target = Some((slot.path, slot.rect));
                 }
             }
+        } else if plan.path.contains(x, y) && self.address.is_none() {
+            let (slots, _) = self.crumb_slots(ctx, &plan);
+            if let Some(slot) = slots.into_iter().find(|slot| slot.rect.contains(x, y)) {
+                if slot.path != COMPUTER && slot.path != self.path {
+                    target = Some((slot.path, slot.rect));
+                }
+            }
+        } else if let Some(kit::TabHit::Tab(index) | kit::TabHit::Close(index)) = self.tab_strip(ctx, &plan).hit(x, y) {
+            let path = self.tabs.get(index).map(|tab| tab.path.clone()).filter(|path| index != self.tab && path != COMPUTER && *path != self.path);
+            if let Some(path) = path {
+                target = Some((path, Rect::EMPTY));
+            }
+        }
+        // Сюда не бросить: в тянущуюся папку и внутрь неё.
+        if let Some((dir, _)) = &target {
+            let inside = dragged.iter().filter_map(|index| self.rows.get(*index)).any(|row| {
+                let src = join(&self.path, &row.name);
+                *dir == src || dir.starts_with(&format!("{src}/"))
+            });
+            if inside {
+                target = None;
+            }
         }
         let Some(drag) = self.drag.as_mut() else {
             return false;
@@ -2301,40 +3102,158 @@ impl Files {
         drag.at = (x, y);
         if !drag.active && ((x - drag.start.0).abs() > 8 || (y - drag.start.1).abs() > 8) {
             drag.active = true;
+            drag.points = mount_points();
+            println(&format!("files: dragging {} item(s)", dragged.len()));
         }
+        drag.out = !area.contains(x, y);
         drag.target = target;
         drag.active
     }
 
-    /// Отпустили: если тянули на папку — перенести туда.
+    /// Где строка `index` на экране — в том виде, что открыт.
+    fn item_rect(&self, ctx: Ctx, plan: &Plan, index: usize) -> Rect {
+        match self.view {
+            ViewMode::Tiles => plan.tile_rect(&plan.grid(ctx), index, self.scroll.offset()).unwrap_or(Rect::EMPTY),
+            ViewMode::List => {
+                let list = self.list_plan(ctx, plan);
+                self.list_item_rect(&list, index, self.scroll.offset())
+            }
+            ViewMode::Table => {
+                let table = self.table_list(ctx, plan);
+                let pad = ctx.px(12);
+                Rect::new(table.x + pad as i32, table.y + (index as u32 * (plan.row_h + plan.row_gap)) as i32 - self.scroll.offset(), table.w.saturating_sub(pad * 2), plan.row_h)
+            }
+        }
+    }
+
+    /// Рамку выделения тянут: отмечено то, что она задевает, плюс то, что
+    /// было отмечено до неё с Ctrl.
+    fn drag_band(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        let plan = layout(ctx, area);
+        let Some(band) = self.band.as_mut() else {
+            return false;
+        };
+        band.at = (x, y);
+        if !band.active && (x - band.start.0).abs() + (y - band.start.1).abs() < 6 {
+            return false;
+        }
+        band.active = true;
+        let frame = band_rect(band.start, band.at);
+        let mut picked = band.base.clone();
+        // Рамка не выходит за список.
+        let visible = if self.view == ViewMode::Table { plan.list } else { plan.list.union(&plan.header) };
+        let frame = frame.intersect(&visible);
+        if let Some(band) = self.band.as_mut() {
+            band.at = (band.at.0.clamp(visible.x, visible.right() - 1), band.at.1.clamp(visible.y, visible.bottom() - 1));
+        }
+        let mut first = None;
+        for index in 0..self.rows.len() {
+            let rect = self.item_rect(ctx, &plan, index);
+            if rect.is_empty() || rect.intersect(&visible).is_empty() {
+                continue;
+            }
+            if !rect.intersect(&frame).is_empty() {
+                picked.insert(index);
+                first.get_or_insert(index);
+            }
+        }
+        if let Some(index) = first {
+            self.selected = index;
+            self.no_cursor = false;
+        } else if picked.is_empty() {
+            self.no_cursor = true;
+        }
+        self.picked = picked;
+        // Рамка рисуется на каждом движении, даже без смены отметок.
+        true
+    }
+
+    /// Границу столбцов тянут на `dx` точек от нажатия.
+    fn drag_column(&mut self, boundary: usize, dx: i32, start: [u32; 3], ctx: Ctx) -> bool {
+        let dx = dx * 100 / ctx.px(100).max(1) as i32;
+        let grow = |width: u32, by: i32, min: u32| (width as i32 + by).clamp(min as i32, COL_MAX as i32) as u32;
+        let mut cols = start;
+        match boundary {
+            // Имя | дата: имя тянется за счёт даты.
+            0 => cols[0] = grow(start[0], -dx, COLS_MIN[0]),
+            // Дата | тип и тип | размер: левый шире — правый уже.
+            1 | 2 => {
+                let (left, right) = (boundary - 1, boundary);
+                let moved = (grow(start[left], dx, COLS_MIN[left]) as i32 - start[left] as i32).min(start[right] as i32 - COLS_MIN[right] as i32);
+                cols[left] = (start[left] as i32 + moved) as u32;
+                cols[right] = (start[right] as i32 - moved) as u32;
+            }
+            _ => {}
+        }
+        let changed = cols != self.cols;
+        self.cols = cols;
+        changed
+    }
+
+    /// Отпустили: рамку — убрать, границу столбца — запомнить, строки на
+    /// папке — перенести или скопировать туда, за окном — предложить
+    /// другому окну «Файлов».
     fn on_release(&mut self) -> bool {
+        if self.col_drag.take().is_some() {
+            println(&format!("files: columns {},{},{}", self.cols[0], self.cols[1], self.cols[2]));
+            self.save_settings();
+            return true;
+        }
+        if let Some(band) = self.band.take() {
+            if band.active {
+                println(&format!("files: {} item(s) marked by the frame", self.picked.len()));
+            }
+            return true;
+        }
         let Some(drag) = self.drag.take() else {
             return false;
         };
         if !drag.active {
-            return false;
+            // Щелчок без перетаскивания: Ctrl по отмеченной — снять отметку,
+            // щелчок внутри выделения — оставить одну строку.
+            return match drag.after {
+                ClickAfter::Unpick => {
+                    self.picked.remove(&drag.from);
+                    println(&format!("files: {} item(s) marked", self.picked.len()));
+                    true
+                }
+                ClickAfter::Collapse => {
+                    self.picked.clear();
+                    true
+                }
+                ClickAfter::Nothing => false,
+            };
         }
-        let Some((dir, _)) = drag.target else {
+        let paths: Vec<String> = self.dragged(&drag).iter().filter_map(|index| self.rows.get(*index)).map(|row| join(&self.path, &row.name)).collect();
+        let Some((dir, _)) = drag.target.clone() else {
+            if drag.out && !paths.is_empty() {
+                let copy = self.ctrl_held;
+                return self.offer_items(&paths, copy);
+            }
             return true;
         };
-        let mut indices = self.targets();
-        if !indices.contains(&drag.from) {
-            indices = alloc::vec![drag.from];
-        }
-        let paths: Vec<String> = indices.iter().filter_map(|index| self.rows.get(*index)).map(|row| join(&self.path, &row.name)).collect();
-        println(&format!("files: dropped {} item(s) on {dir}", paths.len()));
-        // Перенос — тем же путём, что «Вырезать» и «Вставить»; буфер человека
-        // при этом не трогается.
-        let saved = self.clip.replace((paths, true));
-        self.paste_into(dir);
-        if self.clip.is_none() {
-            self.clip = saved;
-        }
+        let copy = self.drag_copies(&drag, &dir);
+        println(&format!("files: dropped {} item(s) on {dir}{}", paths.len(), if copy { " (copy)" } else { "" }));
+        self.drop_paths(paths, dir, copy);
         true
+    }
+
+    /// Перенести (или скопировать) `paths` в `dir` — тем же путём, что
+    /// «Вырезать»/«Копировать» и «Вставить»; буфер человека не трогается.
+    fn drop_paths(&mut self, paths: Vec<String>, dir: String, copy: bool) {
+        let saved = self.clip.replace((paths, !copy));
+        self.paste_into(dir);
+        self.clip = saved;
     }
 
     /// Что тянут — подпись у указателя и рамка папки, куда бросить.
     fn draw_drag(&self, s: &mut Surface, ctx: Ctx) {
+        if let Some(band) = self.band.as_ref().filter(|band| band.active) {
+            let p = ctx.palette;
+            let frame = band_rect(band.start, band.at);
+            draw::rounded(s, frame, 0, p.acc, 48);
+            draw::rounded_stroke(s, frame, 0, p.acc, 200);
+        }
         let Some(drag) = self.drag.as_ref().filter(|drag| drag.active) else {
             return;
         };
@@ -2344,10 +3263,14 @@ impl Files {
                 draw::rounded_stroke(s, *rect, ctx.px(theme::R_ROW), p.acc, 255);
             }
         }
-        let count = if self.picked.contains(&drag.from) { self.picked.len() } else { 1 };
+        let count = self.dragged(drag).len();
         let label = if count > 1 { format!("Объектов: {count}") } else { self.rows.get(drag.from).map(|row| row.name.clone()).unwrap_or_default() };
         let label = match &drag.target {
-            Some((dir, _)) => format!("{label} → {}", dir.rsplit('/').next().unwrap_or(dir)),
+            Some((dir, _)) => {
+                let verb = if self.drag_copies(drag, dir) { "+ Копировать в" } else { "→ Переместить в" };
+                format!("{verb} «{}»: {label}", place_title(dir, &self.home).rsplit('/').next().unwrap_or(dir))
+            }
+            None if drag.out => format!("{label} — в другое окно «Файлов»{}", if self.ctrl_held { " (копия)" } else { "" }),
             None => label,
         };
         let w = ctx.face(Role::Body).width(&label) + ctx.px(20);
@@ -2374,12 +3297,26 @@ impl Files {
             self.close_menu();
             return true;
         }
-        if self.preview.is_some() || self.props.is_some() || !plan.list.contains(x, y) {
+        let body = if self.on_computer() || self.view != ViewMode::Table { plan.list.union(&plan.header) } else { plan.list };
+        if self.preview.is_some() || self.props.is_some() || !body.contains(x, y) {
             return false;
         }
         let target = self.row_at(&plan, ctx, x, y);
-        if let Some(index) = target {
-            self.selected = index;
+        // Как в Проводнике: правая кнопка по строке вне выделения выбирает
+        // её одну; по отмеченной — меню для всех отмеченных.
+        match target {
+            Some(index) => {
+                if !self.picked.contains(&index) {
+                    self.picked.clear();
+                }
+                self.selected = index;
+                self.no_cursor = false;
+            }
+            None if !self.on_computer() => {
+                self.picked.clear();
+                self.no_cursor = true;
+            }
+            None => {}
         }
         self.open_menu(Some((x, y)), target);
         true
@@ -2391,7 +3328,27 @@ impl Files {
             let (_, cards, _, _) = self.computer_layout(ctx, plan);
             return cards.iter().position(|card| card.contains(x, y));
         }
-        if self.tiles {
+        if self.view == ViewMode::List {
+            let list = self.list_plan(ctx, plan);
+            if !list.area.contains(x, y) {
+                return None;
+            }
+            let inside_x = x - list.area.x - list.pad + self.scroll.offset();
+            let inside_y = y - list.area.y - list.top;
+            if inside_x < 0 || inside_y < 0 {
+                return None;
+            }
+            let row = (inside_y / list.step.max(1) as i32) as usize;
+            if row >= list.per_col {
+                return None;
+            }
+            let index = (inside_x / list.col_w.max(1) as i32) as usize * list.per_col + row;
+            if index >= self.rows.len() || !self.list_item_rect(&list, index, self.scroll.offset()).contains(x, y) {
+                return None;
+            }
+            return Some(index);
+        }
+        if self.view == ViewMode::Tiles {
             let grid = plan.grid(ctx);
             let area = plan.list.union(&plan.header);
             if grid.cols == 0 || !area.contains(x, y) {
@@ -2429,10 +3386,14 @@ impl Files {
             // У клавиатуры точки нет: карточка встаёт у строки.
             let plan = layout(ctx, area);
             match menu.target {
-                Some(index) if self.tiles => {
+                Some(index) if self.view == ViewMode::Tiles => {
                     let grid = plan.grid(ctx);
                     plan.tile_rect(&grid, index, self.scroll.offset())
                         .map_or((plan.list.x, plan.list.y), |r| (r.x + r.w as i32 / 2, r.bottom()))
+                }
+                Some(index) if self.view == ViewMode::List => {
+                    let r = self.item_rect(ctx, &plan, index);
+                    (r.x + ctx.px(32) as i32, r.bottom())
                 }
                 Some(index) => {
                     let r = plan.row_rect_at(ctx, index, self.scroll.offset());
@@ -2456,8 +3417,24 @@ impl Files {
         let pad = ctx.px(6);
         match &menu.mode {
             MenuMode::Items => kit::menu_size(ctx, &entries(&menu.items)),
-            MenuMode::Rename(_) | MenuMode::Confirm => {
-                let hint = ctx.face(Role::Caption).width(RENAME_HINT).max(ctx.face(Role::Caption).width(CONFIRM_HINT));
+            MenuMode::OpenWith(progs, _) => {
+                let face = ctx.face(Role::Body);
+                let widest = progs
+                    .iter()
+                    .filter(|prog| prog.fits())
+                    .map(|prog| face.width(&prog.caption) + if prog.mark == b'd' { face.width(" (по умолчанию)") } else { 0 })
+                    .chain(core::iter::once(face.width(OTHER_PROGRAM)))
+                    .max()
+                    .unwrap_or(0);
+                let fits = openwith_rows(progs) as u32 - 1;
+                (
+                    (widest + ctx.px(10 + 20 + 10 + 16) + pad * 2).max(ctx.px(240)),
+                    pad * 2 + ctx.px(PROG_ROW_H) * (fits + 1) + if fits > 0 { ctx.px(9) } else { 0 },
+                )
+            }
+            MenuMode::Choose(_) => (ctx.px(10), ctx.px(10)),
+            MenuMode::Rename(_) | MenuMode::Confirm(_) => {
+                let hint = ctx.face(Role::Caption).width(RENAME_HINT);
                 (hint.max(ctx.px(320)) + ctx.px(28), ctx.px(40) + ctx.px(32) + ctx.px(28) + pad * 2)
             }
         }
@@ -2471,6 +3448,10 @@ impl Files {
     fn render(&self, surface: &mut Surface, area: Rect, ctx: Ctx) {
         surface.fill(area, theme::window_bg());
         let plan = layout(ctx, area);
+        // Классика (22.11): область списка белая, как у Проводника Windows 98.
+        if theme::is_classic() {
+            surface.fill(plan.list.union(&plan.header), ctx.flat(ctx.palette.sunk));
+        }
         // Список — первым (20.11). Строки едут по точкам, и край строки,
         // ушедшей под шапку, панель или боковую колонку, закрывают они сами,
         // нарисованные поверх: отсечения у поверхности нет.
@@ -2478,8 +3459,10 @@ impl Files {
             self.draw_preview(surface, ctx, &plan, preview);
         } else if self.on_computer() && self.error.is_none() {
             self.draw_computer(surface, ctx, &plan);
-        } else if self.tiles {
+        } else if self.view == ViewMode::Tiles {
             self.draw_tiles(surface, ctx, &plan);
+        } else if self.view == ViewMode::List {
+            self.draw_list_view(surface, ctx, &plan);
         } else {
             self.draw_list(surface, ctx, &plan);
         }
@@ -2500,6 +3483,7 @@ impl Files {
         }
         self.draw_menu(surface, ctx, area);
         self.draw_pop(surface, ctx, area, &plan);
+        self.draw_crumb_pop(surface, ctx, area, &plan);
         self.draw_job(surface, ctx, &plan);
         self.draw_drag(surface, ctx);
         self.draw_tab_extras(surface, ctx, area);
@@ -2578,7 +3562,7 @@ impl Files {
             let tx = icon.right() + ctx.px(14) as i32;
             let room = (card.right() - tx - ctx.px(14) as i32).max(0) as u32;
             let mut ty = card.y + ctx.px(14) as i32;
-            paint::text_clipped(ctx, s, Role::Body, tx, ty, room, &volume_title(&row.name), p.ink);
+            paint::text_clipped(ctx, s, Role::Body, tx, ty, room, &volume_title(&row.name, &row.label), p.ink);
             ty += ctx.px(24) as i32;
             if row.size > 0 {
                 let used = row.size.saturating_sub(row.free);
@@ -2823,7 +3807,7 @@ impl Files {
             let Some(cell) = plan.tile_rect(&grid, index, at) else {
                 break;
             };
-            let selected = index == self.selected;
+            let selected = self.is_marked(index);
             if selected {
                 draw::rounded(s, cell, ctx.px(theme::R_CARD), p.hover1.color, p.hover1.alpha.max(40));
                 draw::rounded_stroke(s, cell, ctx.px(theme::R_CARD), p.accline.color, p.accline.alpha);
@@ -2837,8 +3821,17 @@ impl Files {
                 side,
                 side,
             );
-            let (icon, tone, filled) = row.icon();
-            paint::icon_tile(ctx, s, tile, icon, tone, filled);
+            // Картинка темы без плитки (22.11, Роман: «синий квадрат с синей
+            // папкой» не нужен); плитка — только если картинки нет.
+            let kind_icon = if row.is_volume() {
+                if row.name == "/" { "place-system-disk" } else if row.name.starts_with("/usb") { "place-usb-stick" } else { "place-local-disk" }
+            } else {
+                file_kind(&row.name, row.directory).0
+            };
+            if !draw_design_icon(&self.icons, s, tile, kind_icon) {
+                let (icon, tone, filled) = row.icon();
+                paint::icon_tile(ctx, s, tile, icon, tone, filled);
+            }
             let label = Rect::new(
                 cell.x + ctx.px(4) as i32,
                 tile.bottom() + ctx.px(theme::ICON_LABEL_GAP) as i32,
@@ -2866,7 +3859,7 @@ impl Files {
     /// Подпись плитки.
     fn tile_name(&self, row: &Row) -> String {
         if row.is_volume() {
-            return volume_title(&row.name);
+            return volume_title(&row.name, &row.label);
         }
         self.shown_name(row).to_string()
     }
@@ -2935,6 +3928,18 @@ impl Files {
             kit::draw_menu(ctx, s, card, &entries(&menu.items), menu.selected);
             return;
         }
+        if let MenuMode::Confirm(focus) = menu.mode {
+            kit::draw_ask(ctx, s, area, &self.ask().as_ask(), focus);
+            return;
+        }
+        if let MenuMode::Choose(chooser) = &menu.mode {
+            self.draw_chooser(s, ctx, area, chooser);
+            return;
+        }
+        if let MenuMode::OpenWith(progs, selected) = &menu.mode {
+            draw_openwith(ctx, s, card, progs, *selected);
+            return;
+        }
         let inner = kit::card(ctx, s, card);
         let p = inner.palette;
         match &menu.mode {
@@ -2961,39 +3966,66 @@ impl Files {
                 y += field.h as i32 + ctx.px(10) as i32;
                 paint::text_clipped(inner, s, Role::Caption, x, y, room, RENAME_HINT, p.ink4);
             }
-            MenuMode::Confirm => {
-                let x = card.x + ctx.px(14) as i32;
-                let room = card.w.saturating_sub(ctx.px(28));
-                let mut y = card.y + ctx.px(12) as i32;
-                let name = menu
-                    .target
-                    .and_then(|index| self.rows.get(index))
-                    .map_or(String::new(), |row| row.name.clone());
-                let question = match (menu.target, self.in_trash()) {
-                    (None, _) => String::from("Очистить корзину? Всё в ней сотрётся навсегда"),
-                    (Some(_), true) => format!("Удалить «{name}» навсегда?"),
-                    // Макет 18: вопрос «Удалить?», в корзину — главной кнопкой.
-                    (Some(_), false) if self.picked.len() > 1 => format!("Удалить {} объектов в корзину?", self.picked.len()),
-                    (Some(_), false) => format!("Удалить «{name}» в корзину?"),
-                };
-                let forever = menu.target.is_none() || self.in_trash();
-                paint::text_clipped(inner, s, Role::Body, x, y, room, &question, p.ink);
-                y += ctx.px(30) as i32;
-                let btn_w = ctx.px(120);
-                let btn_h = ctx.px(30);
-                paint::button(inner, s, Rect::new(x, y, btn_w, btn_h), if forever { Weight::Danger } else { Weight::Primary }, "Удалить", false);
-                paint::button(
-                    inner,
-                    s,
-                    Rect::new(x + btn_w as i32 + ctx.px(8) as i32, y, btn_w, btn_h),
-                    Weight::Normal,
-                    "Отмена",
-                    false,
-                );
-                y += btn_h as i32 + ctx.px(10) as i32;
-                paint::text_clipped(inner, s, Role::Caption, x, y, room, CONFIRM_HINT, p.ink4);
+            MenuMode::Confirm(_) | MenuMode::OpenWith(..) | MenuMode::Choose(_) => {}
+        }
+    }
+
+    /// Окно «Выбрать другую программу…» посреди «Файлов» (22.11).
+    fn draw_chooser(&self, s: &mut Surface, ctx: Ctx, area: Rect, chooser: &Chooser) {
+        let cp = chooser_plan(ctx, area, chooser.progs.len());
+        draw::blend_rect(s, area, mini_ui::Color::rgb(0, 0, 0), 70);
+        let inner = kit::card(ctx, s, cp.card);
+        let p = inner.palette;
+        let pad = ctx.px(20) as i32;
+        let x = cp.card.x + pad;
+        let width = cp.card.w.saturating_sub(ctx.px(40));
+        let name = self.menu_target_file().map(|(_, name)| name).unwrap_or_default();
+        paint::text_clipped(inner, s, Role::Heading, x, cp.card.y + pad, width, "Выбрать другую программу", p.ink);
+        let what = format!("Чем открыть «{name}»?");
+        paint::text_clipped(inner, s, Role::Caption, x, cp.card.y + pad + i32::from(ctx.face(Role::Heading).line) + ctx.px(6) as i32, width, &what, p.ink3);
+        for (slot, row) in cp.rows.iter().enumerate() {
+            let index = chooser.first + slot;
+            let Some(prog) = chooser.progs.get(index) else { break };
+            let on = index == chooser.selected;
+            paint::row(inner, s, *row, if on { RowState::Selected } else { RowState::Idle });
+            let side = ctx.px(28);
+            let icon = Rect::new(row.x + ctx.px(10) as i32, row.y + (row.h as i32 - side as i32) / 2, side, side);
+            draw_prog_icon(inner, s, icon, prog);
+            let tx = icon.right() + ctx.px(12) as i32;
+            let tw = (row.right() - tx - ctx.px(10) as i32).max(0) as u32;
+            let note = match (prog.mark, prog.windows()) {
+                (b'd', _) => "выбрана для этого типа",
+                (b'f', true) => "рекомендуется · программа Windows",
+                (b'f', false) => "рекомендуется",
+                (_, true) => "программа Windows",
+                _ => "программа FossAi",
+            };
+            let top = row.y + (row.h as i32 - i32::from(ctx.face(Role::Body).line) - i32::from(ctx.face(Role::Caption).line)) / 2;
+            paint::text_clipped(inner, s, Role::Body, tx, top, tw, &prog.caption, if on { p.ink } else { p.ink2 });
+            paint::text_clipped(inner, s, Role::Caption, tx, top + i32::from(ctx.face(Role::Body).line), tw, note, p.ink4);
+        }
+        // Список длиннее окна — сколько ещё ниже и выше.
+        if chooser.progs.len() > cp.rows.len() {
+            let more = format!("{}–{} из {}", chooser.first + 1, (chooser.first + cp.rows.len()).min(chooser.progs.len()), chooser.progs.len());
+            if let Some(last) = cp.rows.last() {
+                paint::text_right(inner, s, Role::Caption, last.right(), cp.check.y + ctx.px(6) as i32, &more, p.ink4);
             }
         }
+        let side = ctx.px(16);
+        let bx = Rect::new(cp.check.x, cp.check.y + (cp.check.h as i32 - side as i32) / 2, side, side);
+        if chooser.always {
+            draw::rounded(s, bx, ctx.px(3), p.acc, 255);
+            glyphicon::draw(s, Icon::Check, bx.x, bx.y, bx.w, p.acc_ink, 255);
+        } else {
+            draw::rounded_stroke(s, bx, ctx.px(3), p.ink4, 255);
+        }
+        let ext = sysconf::filetypes::extension(&name);
+        let label = if ext.is_empty() { String::from("Всегда использовать эту программу") } else { format!("Всегда использовать для файлов .{ext}") };
+        let lx = bx.right() + ctx.px(10) as i32;
+        paint::text_clipped(inner, s, Role::Body, lx, paint::baseline(inner, Role::Body, cp.check), (cp.check.right() - lx - ctx.px(90) as i32).max(0) as u32, &label, p.ink2);
+        paint::separator(inner, s, cp.card.x, cp.ok.y - ctx.px(14) as i32, cp.card.w);
+        paint::button(inner, s, cp.ok, Weight::Primary, "Открыть", false);
+        paint::button(inner, s, cp.cancel, Weight::Normal, "Отмена", false);
     }
 
     /// Панель инструментов: три стрелки и строка пути.
@@ -3020,27 +4052,7 @@ impl Files {
         // Адрес звеньями, как в Проводнике: «Этот компьютер › Системный диск
         // › bin».
         if !plan.path.is_empty() {
-            paint::sunk(bar, s, plan.path, ctx.px(theme::R_ROW));
-            let pad = ctx.px(12);
-            let y = paint::baseline(bar, Role::Body, plan.path);
-            let right = plan.path.right() - pad as i32;
-            let mut x = plan.path.x + pad as i32;
-            let links = breadcrumb(&self.path, &self.home);
-            let last = links.len().saturating_sub(1);
-            for (index, (label, _)) in links.iter().enumerate() {
-                let room = (right - x).max(0) as u32;
-                let used = paint::text_clipped(bar, s, Role::Body, x, y, room, label, if index == last { p.ink } else { p.ink3 });
-                x += used as i32;
-                // Разделитель — значок «›»: в шрифте такого знака нет.
-                if index != last && x + (CRUMB_GAP * ctx.scale) as i32 <= right {
-                    let glyph = ctx.px(10);
-                    glyphicon::draw(s, Icon::ChevronRight, x + ctx.px(5) as i32, plan.path.y + (plan.path.h as i32 - glyph as i32) / 2, glyph, p.ink4, 255);
-                    x += ctx.px(CRUMB_GAP) as i32;
-                }
-            }
-            if let Some(preview) = self.preview.as_ref() {
-                paint::text_clipped(bar, s, Role::Body, x, y, (right - x).max(0) as u32, &format!("  ·  {}", preview.name), p.ink4);
-            }
+            self.draw_address(s, bar, plan);
         }
 
         // Поиск: «Поиск: <папка>», с курсором, пока в поле печатают.
@@ -3152,41 +4164,11 @@ impl Files {
         // Узкое окно (20.11) не теряет столбцы, а листает таблицу вбок: она
         // раскладывается в свою ширину и сдвигается на прокрутку.
         let table = self.table_list(ctx, plan);
-        let size_right = table.right() - ctx.px(16) as i32;
-        let type_x = size_right - ctx.px(80 + 140) as i32;
-        let date_x = type_x - ctx.px(135) as i32;
+        let (date_x, type_x, size_x, size_right) = self.columns(ctx, table);
         // Шапка — после строк: строка, наполовину ушедшая вверх, уходит под неё.
-        let header = |s: &mut Surface| self.draw_list_header(s, ctx, plan, table.x, date_x, type_x, size_right);
+        let header = |s: &mut Surface| self.draw_list_header(s, ctx, plan, table.x, [date_x, type_x, size_x], size_right);
 
-        if let Some(error) = &self.error {
-            let rect = plan.row_rect(ctx, 0);
-            paint::text_clipped(
-                ctx,
-                s,
-                Role::Body,
-                rect.x + ctx.px(10) as i32,
-                paint::baseline(ctx, Role::Body, rect),
-                rect.w.saturating_sub(ctx.px(20)),
-                error,
-                p.bad_ink,
-            );
-            header(s);
-            return;
-        }
-        if self.rows.is_empty() {
-            // Пустая папка (макет 14): по центру значок, надпись и подсказка.
-            let side = ctx.px(64);
-            let cx = plan.list.x + plan.list.w as i32 / 2;
-            let top = plan.list.y + plan.list.h as i32 / 3 - side as i32;
-            let icon = Rect::new(cx - side as i32 / 2, top.max(plan.list.y), side, side);
-            draw_design_icon(&self.icons, s, icon, "folder");
-            let title = "Эта папка пуста";
-            let hint = "Перетащите файлы сюда или нажмите «Создать»";
-            let y = icon.bottom() + ctx.px(14) as i32;
-            let tw = ctx.face(Role::Strong).width(title) as i32;
-            paint::text(ctx, s, Role::Strong, cx - tw / 2, y, title, p.ink2);
-            let hw = ctx.face(Role::Body).width(hint) as i32;
-            paint::text(ctx, s, Role::Body, cx - hw / 2, y + ctx.px(26) as i32, hint, p.ink4);
+        if self.draw_no_rows(s, ctx, plan) {
             header(s);
             return;
         }
@@ -3203,7 +4185,7 @@ impl Files {
         for index in self.scroll.rows(view.h, step, self.rows.len()) {
             let row = &self.rows[index];
             let rect = Rect::new(table.x + pad as i32, table.y + (index as u32 * step) as i32 - at, table.w.saturating_sub(pad * 2), plan.row_h);
-            let selected = index == self.selected || self.picked.contains(&index);
+            let selected = self.is_marked(index);
             let state = if selected {
                 RowState::Selected
             } else if hot == Hot::Row(index) {
@@ -3236,15 +4218,15 @@ impl Files {
             paint::text_right(ctx, s, Role::Body, size_right, small, &size, p.ink3);
             // Программа в `/bin` — «Приложение», что бы ни было в имени.
             let kind = if !row.directory && row.program && row.mode & 0o111 != 0 { "Приложение" } else { kind_name };
-            paint::text_clipped(ctx, s, Role::Body, type_x, small, (size_right - ctx.px(90) as i32 - type_x).max(0) as u32, kind, p.ink3);
-            paint::text_clipped(ctx, s, Role::Body, date_x, small, ctx.px(140), &date_text(row.mtime, self.offset), p.ink3);
+            paint::text_clipped(ctx, s, Role::Body, type_x, small, (size_x - ctx.px(10) as i32 - type_x).max(0) as u32, kind, p.ink3);
+            paint::text_clipped(ctx, s, Role::Body, date_x, small, (type_x - ctx.px(10) as i32 - date_x).max(0) as u32, &date_text(row.mtime, self.offset), p.ink3);
             let right = date_x - ctx.px(12) as i32;
 
             let name_x = icon.right() + ctx.px(10) as i32;
             let room = (right - name_x).max(0) as u32;
             let ink = if selected { p.ink } else { p.ink2 };
             let shown = if row.is_volume() {
-                volume_title(&row.name)
+                volume_title(&row.name, &row.label)
             } else {
                 self.shown_name(row).to_string()
             };
@@ -3255,12 +4237,12 @@ impl Files {
 
     /// Шапка таблицы: подписи столбцов (у столбца сортировки — стрелка) и
     /// линия под ними. Фон заливается: под шапку уходят строки.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_list_header(&self, s: &mut Surface, ctx: Ctx, plan: &Plan, left: i32, date_x: i32, type_x: i32, size_right: i32) {
+    fn draw_list_header(&self, s: &mut Surface, ctx: Ctx, plan: &Plan, left: i32, bounds: [i32; 3], size_right: i32) {
         let p = ctx.palette;
         if plan.header.is_empty() {
             return;
         }
+        let [date_x, type_x, _] = bounds;
         s.fill(plan.header, theme::window_bg());
         let y = paint::baseline(ctx, Role::Caption, plan.header);
         // Столбец сортировки — со стрелкой (↑ по возрастанию, ↓ по убыванию).
@@ -3270,6 +4252,21 @@ impl Files {
         paint::text(ctx, s, Role::Caption, date_x, y, &title(SortKey::Date), p.ink4);
         paint::text(ctx, s, Role::Caption, type_x, y, &title(SortKey::Kind), p.ink4);
         paint::text_right(ctx, s, Role::Caption, size_right, y, &title(SortKey::Size), p.ink4);
+        // Границы столбцов (21.11): тонкая черта, под указателем и когда
+        // тянут — ярче; за неё тянут ширину.
+        if !self.on_computer() {
+            let grip = self.col_drag.map(|(boundary, ..)| boundary).or(match self.hot_now(ctx, plan) {
+                Hot::Grip(boundary) => Some(boundary),
+                _ => None,
+            });
+            let h = plan.header.h.saturating_sub(ctx.px(14));
+            for (index, x) in bounds.iter().enumerate() {
+                let x = x - ctx.px(8) as i32;
+                let (ink, w) = if grip == Some(index) { (p.acc, ctx.px(2)) } else { (p.line.color, 1) };
+                let alpha = if grip == Some(index) { 255 } else { p.line.alpha };
+                draw::blend_rect(s, Rect::new(x, plan.header.y + ctx.px(7) as i32, w, h), ink, alpha);
+            }
+        }
         draw::hline(
             s,
             plan.header.x + ctx.px(12) as i32,
@@ -3351,10 +4348,10 @@ impl Files {
         }
         let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
         kit::status_line(ctx, s, plan.status, &parts, "", plan.view.len());
-        // Вид — две кнопки справа (макет 14): таблица и плитка.
-        for (rect, (icon, active)) in plan.view.iter().zip([(Icon::Log, !self.tiles), (Icon::Grid, self.tiles)]) {
+        // Вид — кнопки справа (макет 14): таблица, «Список», плитка.
+        for (rect, mode) in plan.view.iter().zip(ViewMode::ALL) {
             if !rect.is_empty() {
-                kit::status_toggle(ctx, s, *rect, icon, active);
+                kit::status_toggle(ctx, s, *rect, mode.icon(), mode == self.view);
             }
         }
     }
@@ -3374,12 +4371,13 @@ const ESCAPE: u32 = 0x1B;
 const MENU: u32 = 'm' as u32;
 /// `T` — плитка или таблица.
 const TILES: u32 = 't' as u32;
+/// `L` — «Список» или таблица (21.11).
+const LIST: u32 = 'l' as u32;
 /// Ответы на вопрос об удалении.
 const YES: u32 = 'y' as u32;
 const NO: u32 = 'n' as u32;
 /// Подсказки под полем имени и под вопросом.
 const RENAME_HINT: &str = "Enter — переименовать    Esc — отмена    Ctrl+U — очистить";
-const CONFIRM_HINT: &str = "Enter или Y — удалить    Esc или N — оставить";
 
 /// Обновить список. `r` — потому что F-ряд договор программам не отдаёт.
 const REFRESH: u32 = 'r' as u32;
@@ -3407,6 +4405,20 @@ struct Grid {
     margin: u32,
 }
 
+/// Раскладка вида «Список»: область, поля, шаг и высота строки, зазор
+/// между столбцами, строк в столбце, ширина столбца и всего содержимого.
+struct ListPlan {
+    area: Rect,
+    pad: i32,
+    top: i32,
+    step: u32,
+    row_h: u32,
+    gap: u32,
+    per_col: usize,
+    col_w: u32,
+    content: u32,
+}
+
 struct Plan {
     /// Полоса вкладок над панелью (20.11).
     tabs: Rect,
@@ -3419,10 +4431,10 @@ struct Plan {
     search: Rect,
     /// Панель команд под адресом.
     commands: Vec<(Command, Rect)>,
-    /// Лунка переключателя вида и две его кнопки: таблица, плитка (в строке
-    /// состояния справа).
+    /// Лунка переключателя вида и его кнопки: таблица, «Список», плитка (в
+    /// строке состояния справа).
     view_box: Rect,
-    view: [Rect; 2],
+    view: [Rect; 3],
     side: Option<Rect>,
     header: Rect,
     list: Rect,
@@ -3557,8 +4569,8 @@ fn layout(ctx: Ctx, area: Rect) -> Plan {
     let status_y = (area.bottom() - status_h as i32).max(toolbar.bottom());
     let status = Rect::new(area.x, status_y, area.w, status_h);
     // Переключатели вида — места строки состояния единого вида (`kit`).
-    let toggles = kit::status_toggles(ctx, status, 2);
-    let view = [toggles[0], toggles[1]];
+    let toggles = kit::status_toggles(ctx, status, 3);
+    let view = [toggles[0], toggles[1], toggles[2]];
 
     let top = toolbar.bottom() + command_h as i32;
     let bottom = status.y;
@@ -3644,8 +4656,12 @@ impl Command {
     }
 }
 
-/// Место под разделитель звеньев адреса.
-const CRUMB_GAP: u32 = 20;
+/// Поле подписи звена адреса слева и справа и ширина его шеврона (21.11:
+/// у каждого — своя подсветка, как в Проводнике).
+const CRUMB_PAD: u32 = 8;
+const CRUMB_CHEVRON: u32 = 22;
+/// Сколько подпапок показывает список у шеврона.
+const CRUMB_POP_MAX: usize = 24;
 
 /// Звенья адреса: подпись и куда ведёт (72g). Дом — «Главная», корень —
 /// «Этот компьютер › Системный диск».
@@ -3730,7 +4746,7 @@ fn places(home: &str) -> Vec<(Option<&'static str>, String)> {
     }
     out.push((Some("—"), String::from(COMPUTER)));
     out.push((None, String::from("/")));
-    for disk in ["/data", "/usb"] {
+    for disk in USB_PLACES {
         let mut info = Stat::default();
         if stat(disk, &mut info) >= 0 && info.kind == KIND_DIRECTORY {
             out.push((None, String::from(disk)));
@@ -3739,6 +4755,10 @@ fn places(home: &str) -> Vec<(Option<&'static str>, String)> {
     out.push((None, format!("{home}/.local/share/Trash/files")));
     out
 }
+
+/// Диски в боковой колонке под «Этим компьютером»: данные и съёмные
+/// (`/usb`, `/usb1`… — второй накопитель, например exFAT-диск, 20.11).
+const USB_PLACES: [&str; 5] = ["/data", "/usb", "/usb1", "/usb2", "/usb3"];
 
 /// Подпись места в боковой колонке (72g).
 fn place_title<'a>(path: &'a str, home: &str) -> &'a str {
@@ -3749,6 +4769,9 @@ fn place_title<'a>(path: &'a str, home: &str) -> &'a str {
         _ if path == COMPUTER => "Этот компьютер",
         _ if path == "/" => "Системный диск",
         _ if path == "/usb" => "USB-накопитель",
+        _ if path == "/usb1" => "USB-накопитель 2",
+        _ if path == "/usb2" => "USB-накопитель 3",
+        _ if path == "/usb3" => "USB-накопитель 4",
         _ if path == "/data" => "Данные",
         _ if path.ends_with("/.local/share/Trash/files") => "Корзина",
         "Desktop" => "Рабочий стол",
@@ -3769,7 +4792,7 @@ fn place_icon(path: &str, home: &str) -> &'static str {
     match path {
         COMPUTER => "place-this-pc",
         "/" => "place-system-disk",
-        "/usb" => "place-usb-stick",
+        "/usb" | "/usb1" | "/usb2" | "/usb3" => "place-usb-stick",
         "/data" => "place-local-disk",
         _ if path.ends_with("/.local/share/Trash/files") => {
             if dir_has_entries(path) { "place-trash-full" } else { "place-trash-empty" }
@@ -3778,13 +4801,46 @@ fn place_icon(path: &str, home: &str) -> &'static str {
     }
 }
 
-/// Имя тома на странице «Этот компьютер».
-fn volume_title(point: &str) -> String {
+/// Имя тома на странице «Этот компьютер»: у съёмного с меткой — как в
+/// Проводнике, «Z7S (/usb1)».
+fn volume_title(point: &str, label: &str) -> String {
     match point {
         "/" => String::from("Системный диск"),
         "/data" => String::from("Данные (/data)"),
+        other if !label.is_empty() => format!("{label} ({other})"),
+        other if other.starts_with("/usb") => format!("USB-накопитель ({other})"),
         other => other.to_string(),
     }
+}
+
+/// Прямоугольник рамки выделения между двумя точками.
+fn band_rect(a: (i32, i32), b: (i32, i32)) -> Rect {
+    Rect::new(a.0.min(b.0), a.1.min(b.1), (a.0 - b.0).unsigned_abs().max(1), (a.1 - b.1).unsigned_abs().max(1))
+}
+
+/// Том, на котором лежит `path`: самая длинная точка монтирования, которой
+/// путь начинается.
+fn mount_of<'a>(points: &'a [String], path: &str) -> Option<&'a str> {
+    points
+        .iter()
+        .filter(|point| *point == "/" || path == point.as_str() || path.starts_with(&format!("{point}/")))
+        .max_by_key(|point| point.len())
+        .map(String::as_str)
+}
+
+/// Точки монтирования томов (`SYS_MOUNTS`, первое поле строки).
+fn mount_points() -> Vec<String> {
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(MOUNTS_LIMIT).is_err() {
+        return Vec::new();
+    }
+    buffer.resize(MOUNTS_LIMIT, 0u8);
+    let got = mounts(&mut buffer);
+    if got <= 0 {
+        return Vec::new();
+    }
+    let text = core::str::from_utf8(&buffer[..(got as usize).min(buffer.len())]).unwrap_or("");
+    text.lines().filter_map(|line| line.split('\t').next()).filter(|point| !point.is_empty()).map(String::from).collect()
 }
 
 /// Тома — из ядра, по строке на каждый.
@@ -3807,9 +4863,26 @@ fn list_volumes() -> Vec<Row> {
             let kind = fields.next()?;
             let total = fields.next().and_then(|value| value.parse().ok()).unwrap_or(0);
             let free = fields.next().and_then(|value| value.parse().ok()).unwrap_or(0);
-            Some(Row::volume(point, kind, total, free))
+            let mut row = Row::volume(point, kind, total, free);
+            // Пятое поле — метка тома (20.11).
+            row.label = fields.next().unwrap_or("").to_string();
+            Some(row)
         })
-        .collect()
+        .fold(Vec::new(), |mut out: Vec<Row>, row| {
+            // Не диски (21.11): тома в памяти, которые ядро заводит живой
+            // системе под `/tmp`, `/root`, `/etc`, `/opt`, `/var` (метки
+            // `scratch-*`, `live-*`), — «Этот компьютер» показывал их
+            // тремя-пятью «дисками»; и один раздел состояния, смонтированный
+            // ветками (`/etc`, `/home`, `/var`…), — это один том, а не пять.
+            if row.label.starts_with("scratch-") || row.label.starts_with("live-") {
+                return out;
+            }
+            let same = |other: &Row| other.size != 0 && other.size == row.size && other.free == row.free && other.volume == row.volume && other.label == row.label;
+            if !out.iter().any(same) {
+                out.push(row);
+            }
+            out
+        })
 }
 
 /// Время работы в виде `Ч:ММ:СС`.
@@ -3854,7 +4927,7 @@ fn place_slots(ctx: Ctx, side: Rect, home: &str) -> Vec<PlaceSlot> {
             0
         };
         // Диски — под «Этим компьютером», с отступом.
-        let indent = if matches!(path.as_str(), "/" | "/data" | "/usb") { ctx.px(16) } else { 0 };
+        let indent = if matches!(path.as_str(), "/" | "/data" | "/usb" | "/usb1" | "/usb2" | "/usb3") { ctx.px(16) } else { 0 };
         let rect = Rect::new(
             side.x + (padx + indent) as i32,
             y,
@@ -4418,11 +5491,18 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // строку запуска ядро режет по пробелам.
     let path = (1..args.len()).filter_map(|index| args.get(index)).collect::<Vec<_>>().join(" ");
     let start = starting_dir((!path.is_empty()).then_some(path.as_str()));
+    // Путь к файлу (20.11, «Показать в папке» из загрузок браузера): папка
+    // открывается с этим файлом выделенным.
+    let reveal = (!path.is_empty() && start != path && parent_of(&path) == start).then(|| path.rsplit('/').next().unwrap_or("").to_string());
     let home = home_dir();
     let size = window_size(&info);
 
     app::run(&SPEC, &info, size, move |_, _| {
-        let view = Files::new(start, home);
+        let mut view = Files::new(start, home);
+        if let Some(at) = reveal.as_deref().and_then(|name| view.rows.iter().position(|row| row.name == name)) {
+            view.selected = at;
+            view.scroll.follow(at);
+        }
         // Что именно прочитано — в журнал, по разу на каждый каталог.
         // Нарисованное на экране снаружи не проверить, а строка проверяется:
         // она и отличает «список показан» от «окно нарисовано пустым».
@@ -4449,6 +5529,15 @@ impl App for Files {
     /// Сочетания (макет 14): Ctrl+X/C/V/A, Alt+Enter — свойства, Shift+стрелки
     /// и пробел — отметить несколько. Остальное — [`Files::on_key`].
     fn key_with(&mut self, code: u32, mods: i32, latin: u32) -> bool {
+        // Сам Ctrl (21.11): посреди перетаскивания он переключает «перенести»
+        // на «копировать»; больше ничего не делает.
+        if code == user_abi::WIN_KEY_CTRL {
+            self.ctrl_held = true;
+            return self.drag.as_ref().is_some_and(|drag| drag.active);
+        }
+        if matches!(code, user_abi::WIN_KEY_SHIFT | user_abi::WIN_KEY_ALT) {
+            return false;
+        }
         // Меню вкладки: стрелки, Enter, всё прочее закрывает.
         if let Some((index, x, y, selected)) = self.tab_menu {
             match code {
@@ -4458,6 +5547,11 @@ impl App for Files {
                 _ => self.tab_menu = None,
             }
             return true;
+        }
+        // Адрес и список подпапок у шеврона (21.11) — раньше всего прочего:
+        // буквы здесь — набор, а не сочетания.
+        if let Some(handled) = self.key_address(code, mods, latin) {
+            return handled;
         }
         // Вкладки (20.11): Ctrl+T — новая, Ctrl+W — закрыть, Ctrl+Tab и
         // Ctrl+Shift+Tab — соседняя, Ctrl+Enter — папку в новой вкладке.
@@ -4518,6 +5612,7 @@ impl App for Files {
                 return true;
             }
             if mods & WIN_MOD_SHIFT != 0 && matches!(code, WIN_KEY_UP | WIN_KEY_DOWN) && !self.rows.is_empty() {
+                self.no_cursor = false;
                 self.picked.insert(self.selected);
                 let changed = self.on_key(code);
                 self.picked.insert(self.selected);
@@ -4530,11 +5625,21 @@ impl App for Files {
                 return true;
             }
             // Стрелка без Shift снимает отметки — как в Проводнике.
-            if matches!(code, WIN_KEY_UP | WIN_KEY_DOWN | WIN_KEY_HOME | WIN_KEY_END) {
+            if matches!(code, WIN_KEY_UP | WIN_KEY_DOWN | WIN_KEY_HOME | WIN_KEY_END | WIN_KEY_PAGE_UP | WIN_KEY_PAGE_DOWN) {
                 self.picked.clear();
+                self.no_cursor = false;
+            }
+            if self.view == ViewMode::List && matches!(code, WIN_KEY_LEFT | WIN_KEY_RIGHT) {
+                self.picked.clear();
+                self.no_cursor = false;
             }
         }
-        self.on_key(code)
+        let changed = self.on_key(code);
+        // Курсор, сдвинутый клавишей, — новый якорь Shift+щелчка.
+        if !busy && mods & WIN_MOD_SHIFT == 0 && matches!(code, WIN_KEY_UP | WIN_KEY_DOWN | WIN_KEY_HOME | WIN_KEY_END | WIN_KEY_PAGE_UP | WIN_KEY_PAGE_DOWN | WIN_KEY_LEFT | WIN_KEY_RIGHT) {
+            self.anchor = self.selected;
+        }
+        changed
     }
 
     fn drag(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
@@ -4557,7 +5662,7 @@ impl App for Files {
     /// Копирование кусками — на каждом витке цикла окна; перенос вкладки
     /// между окнами.
     fn step(&mut self) -> bool {
-        self.copy_step() | self.offer_step() | self.watch_drop()
+        self.copy_step() | self.offer_step() | self.watch_drop() | self.item_offer_step() | self.watch_items() | self.watch_step()
     }
 
     fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
@@ -4567,23 +5672,38 @@ impl App for Files {
     /// Ctrl+щелчок — отметить строку или снять отметку; Shift+щелчок —
     /// отметить всё от выбранной до этой (как в Проводнике).
     fn click_with(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32, mods: i32) -> bool {
+        self.press_mods = mods;
+        self.ctrl_held = mods & WIN_MOD_CTRL != 0;
         let idle = self.menu.is_none() && self.pop.is_none() && self.job.is_none() && self.props.is_none() && self.preview.is_none();
         if mods & (WIN_MOD_CTRL | WIN_MOD_SHIFT) != 0 && idle && !self.on_computer() {
             let plan = layout(ctx, area);
-            if plan.list.contains(x, y) {
+            let body = if self.view == ViewMode::Table { plan.list } else { plan.list.union(&plan.header) };
+            let bar = { let (v, h) = self.bars(ctx, &plan); v.is_some_and(|bar| bar.contains(x, y)) || h.is_some_and(|bar| bar.contains(x, y)) };
+            if body.contains(x, y) && !bar {
                 if let Some(index) = self.row_at(&plan, ctx, x, y) {
                     if mods & WIN_MOD_SHIFT != 0 {
-                        let (from, to) = (self.selected.min(index), self.selected.max(index));
-                        self.picked.extend(from..=to);
+                        // Shift — от отметки-якоря до этой строки (21.11:
+                        // заменяет отмеченное, с Ctrl — добавляет), как в
+                        // Проводнике.
+                        let anchor = if self.anchor < self.rows.len() { self.anchor } else { self.selected };
+                        if mods & WIN_MOD_CTRL == 0 {
+                            self.picked.clear();
+                        }
+                        self.picked.extend(anchor.min(index)..=anchor.max(index));
+                        self.selected = index;
+                        self.no_cursor = false;
                     } else {
-                        if self.picked.is_empty() && self.selected != index {
+                        // Ctrl — отметить. Уже отмеченная снимается при
+                        // отпускании: Ctrl+перетаскивание её копирует.
+                        if self.picked.is_empty() && self.selected != index && !self.no_cursor && self.selected < self.rows.len() {
                             self.picked.insert(self.selected);
                         }
-                        if !self.picked.remove(&index) {
-                            self.picked.insert(index);
-                        }
+                        let was = !self.picked.insert(index);
+                        self.selected = index;
+                        self.anchor = index;
+                        self.no_cursor = false;
+                        self.start_drag(index, x, y, if was { ClickAfter::Unpick } else { ClickAfter::Nothing });
                     }
-                    self.selected = index;
                     self.last_click = None;
                     println(&format!("files: {} item(s) marked", self.picked.len()));
                     return true;
@@ -4591,6 +5711,15 @@ impl App for Files {
             }
         }
         self.on_click(area, ctx, x, y)
+    }
+
+    /// Ctrl отпустили — перетаскивание снова переносит.
+    fn key_up(&mut self, code: u32) -> bool {
+        if code == user_abi::WIN_KEY_CTRL {
+            self.ctrl_held = false;
+            return self.drag.as_ref().is_some_and(|drag| drag.active);
+        }
+        false
     }
 
     fn click_right(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
@@ -4602,6 +5731,13 @@ impl App for Files {
     /// выделение прыгает по папкам»). В просмотре листает текст; в открытом
     /// меню и в поле переименования ничего не делает.
     fn wheel_at(&mut self, area: Rect, ctx: Ctx, clicks: i32) -> bool {
+        // Окно выбора программы листает свой список (22.11).
+        if let Some(MenuMode::Choose(chooser)) = self.menu.as_mut().map(|menu| &mut menu.mode) {
+            let last = chooser.progs.len().saturating_sub(CHOOSER_ROWS);
+            let step = clicks.unsigned_abs() as usize;
+            chooser.first = if clicks > 0 { chooser.first.saturating_sub(step) } else { (chooser.first + step).min(last) };
+            return true;
+        }
         if self.menu.is_some() || self.tab_menu.is_some() || clicks == 0 {
             return false;
         }
@@ -4615,9 +5751,11 @@ impl App for Files {
         }
         let plan = layout(ctx, area);
         let (view, content, line) = self.view_metrics(ctx, &plan);
-        let moved = self.scroll.wheel(clicks, view.h, content, line);
+        // «Список» колесо листает вбок — столбец за щелчок.
+        let span = if self.view == ViewMode::List && !self.on_computer() { view.w } else { view.h };
+        let moved = self.scroll.wheel(clicks, span, content, line);
         if moved {
-            println(&format!("files: scrolled to {} of {}", self.scroll.offset(), kit::Scroll::limit(view.h, content)));
+            println(&format!("files: scrolled to {} of {}", self.scroll.offset(), kit::Scroll::limit(span, content)));
         }
         moved
     }
@@ -4634,11 +5772,23 @@ impl App for Files {
         if self.pointer.is_none() && plan.tabs.union(&plan.toolbar).contains(x, y) {
             self.drop_watch = Some(monotonic_ms() + TAB_DROP_WATCH_MS);
         }
+        // Вошёл куда угодно — не бросили ли сюда строки другого окна (21.11).
+        if self.pointer.is_none() {
+            self.item_watch = Some(monotonic_ms() + TAB_DROP_WATCH_MS);
+        }
         self.pointer = Some((x, y));
         let hot = self.hot_at(ctx, &plan, x, y);
         let changed = hot != self.hot;
         self.hot = hot;
-        bars | changed
+        // Подсветка звеньев адреса — строкой для стенда (21.11).
+        if changed {
+            match hot {
+                Hot::Crumb(index) => println(&format!("files: hover crumb {index}")),
+                Hot::Chevron(index) => println(&format!("files: hover chevron {index}")),
+                _ => {}
+            }
+        }
+        bars | changed | self.hover_crumb_pop(ctx, area, &plan, x, y)
     }
 
     fn leave(&mut self) -> bool {
@@ -4688,7 +5838,7 @@ impl App for Files {
     /// проверялся лишь просмотр файла, и имя с буквой «q», набранное в поле
     /// переименования, закрывало окно на полуслове.
     fn quits_on_q(&self) -> bool {
-        self.preview.is_none() && self.menu.is_none() && self.tab_menu.is_none()
+        self.preview.is_none() && self.menu.is_none() && self.tab_menu.is_none() && self.address.is_none() && self.crumb_pop.is_none()
     }
 }
 
@@ -4959,23 +6109,139 @@ impl Files {
         false
     }
 
+    /// Строки вынесли за окно и отпустили (21.11): предложить их окну
+    /// «Файлов» под указателем тем же ящиком, что вкладки ([`TAB_DROP`]):
+    /// `items <метка> <время> <c|m> <пути через \x1e>`. Взявшее окно само
+    /// переносит (или копирует) их в свою папку.
+    fn offer_items(&mut self, paths: &[String], copy: bool) -> bool {
+        let now = monotonic_ms();
+        let token = format!("{now}.i{}", paths.len());
+        let saved = clipboard_get();
+        let text = format!("items {token} {now} {} {}", if copy { 'c' } else { 'm' }, paths.join("\u{1e}"));
+        let Some(by_clipboard) = mailbox_write(&text) else {
+            self.note = Some(String::from("Перетаскивать в другое окно некуда: нет записываемого /tmp"));
+            return true;
+        };
+        println(&format!("files: offered {} item(s) to another window", paths.len()));
+        self.item_offer = Some((token, now + TAB_DROP_WAIT_MS, by_clipboard.then_some(saved), paths.len()));
+        true
+    }
+
+    /// Ждать, возьмёт ли строки другое окно.
+    fn item_offer_step(&mut self) -> bool {
+        let Some((token, deadline, _, count)) = self.item_offer.clone() else {
+            return false;
+        };
+        let answer = format!("taken {token}");
+        let taken = mailbox_read().iter().any(|text| *text == answer);
+        if !taken && monotonic_ms() < deadline {
+            return false;
+        }
+        if let Some((_, _, Some(saved), _)) = self.item_offer.take() {
+            clipboard_set(&saved);
+        }
+        let _ = remove(TAB_DROP);
+        if taken {
+            println(&format!("files: {count} item(s) taken by another window"));
+            self.note = Some(format!("Объектов передано в другое окно: {count}"));
+        } else {
+            // Стол брошенное не принимает (его значки рисует ядро, договора
+            // «бросить файл на стол» нет) — на «Рабочий стол» слева можно.
+            println(&format!("files: nobody took {count} item(s)"));
+            self.note = Some(String::from("Отпустите над папкой, вкладкой или окном «Файлов»"));
+        }
+        true
+    }
+
+    /// Указатель вошёл в окно: свежие строки другого окна — перенести или
+    /// скопировать в папку под указателем (или в открытую) и ответить
+    /// «взяты».
+    fn watch_items(&mut self) -> bool {
+        let Some(until) = self.item_watch else {
+            return false;
+        };
+        let now = monotonic_ms();
+        if now > until {
+            self.item_watch = None;
+            return false;
+        }
+        for text in mailbox_read() {
+            let mut parts = text.splitn(5, ' ');
+            let (Some("items"), Some(token), Some(at), Some(mode), Some(list)) = (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            if self.item_offer.as_ref().is_some_and(|(own, ..)| own == token) {
+                continue;
+            }
+            if !at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) <= TAB_DROP_WAIT_MS) {
+                continue;
+            }
+            // Некуда положить: «Этот компьютер», просмотр, идёт копирование.
+            if self.on_computer() || self.preview.is_some() || self.job.is_some() || self.error.is_some() {
+                continue;
+            }
+            let dir = match self.hot {
+                Hot::Row(index) => self.rows.get(index).filter(|row| row.directory && !row.is_volume()).map(|row| join(&self.path, &row.name)),
+                _ => None,
+            }
+            .unwrap_or_else(|| self.path.clone());
+            let paths: Vec<String> = list.split('\u{1e}').filter(|path| !path.is_empty()).map(String::from).collect();
+            if mailbox_write(&format!("taken {token}")).is_none() {
+                return false;
+            }
+            self.item_watch = None;
+            let copy = mode == "c" || paths.first().is_some_and(|path| mount_of(&mount_points(), path) != mount_of(&mount_points(), &dir));
+            println(&format!("files: took {} item(s) from another window into {dir}{}", paths.len(), if copy { " (copy)" } else { "" }));
+            self.drop_paths(paths, dir, copy);
+            return true;
+        }
+        false
+    }
+
     /// Что подсвечено под указателем `x, y`. Пока открыто меню, свойства или
     /// что-то тянут — ничего.
     fn hot_at(&self, ctx: Ctx, plan: &Plan, x: i32, y: i32) -> Hot {
         let busy = self.menu.is_some()
             || self.tab_menu.is_some()
             || self.pop.is_some()
+            || self.crumb_pop.is_some()
             || self.props.is_some()
             || self.job.is_some()
             || self.tab_drag.is_some()
             || self.drag.as_ref().is_some_and(|drag| drag.active)
+            || self.band.is_some()
+            || self.col_drag.is_some()
             || self.scroll.dragging()
             || self.hscroll.dragging();
         if busy {
             return Hot::Nothing;
         }
+        if plan.header.contains(x, y) {
+            if let Some(boundary) = self.col_grip(ctx, plan, x) {
+                return Hot::Grip(boundary);
+            }
+        }
         if let Some(hit) = self.tab_strip(ctx, plan).hit(x, y) {
             return if hit == kit::TabHit::Strip { Hot::Nothing } else { Hot::Tab(hit) };
+        }
+        // Звенья адреса и их шевроны (21.11).
+        if plan.path.contains(x, y) {
+            if self.address.is_some() {
+                return Hot::Nothing;
+            }
+            let (slots, lead) = self.crumb_slots(ctx, plan);
+            if lead.contains(x, y) {
+                return Hot::CrumbMore;
+            }
+            for (index, slot) in slots.iter().enumerate() {
+                if slot.rect.contains(x, y) {
+                    return Hot::Crumb(index);
+                }
+                if slot.chevron.contains(x, y) {
+                    return Hot::Chevron(index);
+                }
+            }
+            return Hot::Nothing;
         }
         if let Some(side) = plan.side.filter(|side| side.contains(x, y)) {
             let inner = ctx.on(theme::panel_bg());
@@ -5120,7 +6386,13 @@ impl Files {
 
     /// Нужна ли таблице прокрутка вбок.
     fn hbar_needed(&self, ctx: Ctx, plan: &Plan) -> bool {
-        !self.tiles && !self.on_computer() && self.preview.is_none() && self.error.is_none() && plan.list.w < ctx.px(TABLE_MIN_W)
+        self.view == ViewMode::Table && !self.on_computer() && self.preview.is_none() && self.error.is_none() && plan.list.w < ctx.px(self.table_min_w())
+    }
+
+    /// Самая узкая таблица со всеми столбцами: имя не уже 160 точек плюс
+    /// столбцы, как их растянули (по умолчанию — [`TABLE_MIN_W`]).
+    fn table_min_w(&self) -> u32 {
+        TABLE_MIN_W - COLS_DEFAULT.iter().sum::<u32>() + self.cols.iter().sum::<u32>()
     }
 
     /// Прямоугольник таблицы: в узком окне — шире окна и сдвинут на прокрутку.
@@ -5128,19 +6400,172 @@ impl Files {
         if !self.hbar_needed(ctx, plan) {
             return plan.list;
         }
-        let width = ctx.px(TABLE_MIN_W);
+        let width = ctx.px(self.table_min_w());
         self.hscroll.clamp(plan.list.w, width);
         Rect::new(plan.list.x - self.hscroll.offset(), plan.list.y, width, plan.list.h)
     }
 
+    /// Левые края столбцов «Дата», «Тип», «Размер» и правый край размера в
+    /// таблице `table` — по ширинам `cols` (21.11).
+    fn columns(&self, ctx: Ctx, table: Rect) -> (i32, i32, i32, i32) {
+        let size_right = table.right() - ctx.px(16) as i32;
+        let size_x = size_right - ctx.px(self.cols[2]) as i32;
+        let type_x = size_x - ctx.px(self.cols[1]) as i32;
+        let date_x = type_x - ctx.px(self.cols[0]) as i32;
+        (date_x, type_x, size_x, size_right)
+    }
+
+    /// Граница столбцов под `x` в шапке таблицы: 0 — имя|дата, 1 —
+    /// дата|тип, 2 — тип|размер. Черта рисуется на 8 точек левее края
+    /// столбца; хватать можно в 5 точках от неё.
+    fn col_grip(&self, ctx: Ctx, plan: &Plan, x: i32) -> Option<usize> {
+        if self.view != ViewMode::Table || self.on_computer() || self.preview.is_some() || self.error.is_some() {
+            return None;
+        }
+        let (date_x, type_x, size_x, _) = self.columns(ctx, self.table_list(ctx, plan));
+        let reach = ctx.px(5) as i32;
+        [date_x, type_x, size_x].iter().position(|edge| (x - (edge - ctx.px(8) as i32)).abs() <= reach)
+    }
+
+    /// Раскладка вида «Список» (21.11): имена с маленьким значком идут
+    /// сверху вниз, столбец за столбцом, а вид листается вбок.
+    fn list_plan(&self, ctx: Ctx, plan: &Plan) -> ListPlan {
+        let area = plan.list.union(&plan.header);
+        let step = ctx.px(LIST_ROW_H + 2);
+        let top = ctx.px(8);
+        let usable = area.h.saturating_sub(top + ctx.px(kit::SCROLLBAR_W) + ctx.px(6));
+        let per_col = (usable / step.max(1)).max(1) as usize;
+        let col_w = self.list_col_w(ctx);
+        let cols = self.rows.len().div_ceil(per_col) as u32;
+        let pad = ctx.px(12);
+        ListPlan { area, pad: pad as i32, top: top as i32, step, row_h: ctx.px(LIST_ROW_H), gap: ctx.px(6), per_col, col_w, content: pad * 2 + cols * col_w }
+    }
+
+    /// Ширина столбца «Списка»: по самому длинному имени папки, но не уже
+    /// 160 и не шире 360 точек — как у Проводника.
+    fn list_col_w(&self, ctx: Ctx) -> u32 {
+        let key = ctx.px(100);
+        if let Some((known, width)) = self.list_w.get() {
+            if known == key {
+                return width;
+            }
+        }
+        let face = ctx.face(Role::Body);
+        let widest = self.rows.iter().map(|row| face.width(self.shown_name(row))).max().unwrap_or(0);
+        let width = (widest + ctx.px(8 + 16 + 10 + 18)).clamp(ctx.px(160), ctx.px(360));
+        self.list_w.set(Some((key, width)));
+        width
+    }
+
+    /// Место строки `index` в «Списке» при прокрутке `scroll`.
+    fn list_item_rect(&self, list: &ListPlan, index: usize, scroll: i32) -> Rect {
+        let col = index / list.per_col.max(1);
+        let row = index % list.per_col.max(1);
+        Rect::new(
+            list.area.x + list.pad + (col as u32 * list.col_w) as i32 - scroll,
+            list.area.y + list.top + (row as u32 * list.step) as i32,
+            list.col_w.saturating_sub(list.gap),
+            list.row_h,
+        )
+    }
+
+    /// Ошибка чтения или пустая папка вместо строк. `true` — нарисовано.
+    fn draw_no_rows(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) -> bool {
+        let p = ctx.palette;
+        if let Some(error) = &self.error {
+            let rect = plan.row_rect(ctx, 0);
+            paint::text_clipped(
+                ctx,
+                s,
+                Role::Body,
+                rect.x + ctx.px(10) as i32,
+                paint::baseline(ctx, Role::Body, rect),
+                rect.w.saturating_sub(ctx.px(20)),
+                error,
+                p.bad_ink,
+            );
+            return true;
+        }
+        if !self.rows.is_empty() {
+            return false;
+        }
+        // Пустая папка (макет 14): по центру значок, надпись и подсказка.
+        let side = ctx.px(64);
+        let cx = plan.list.x + plan.list.w as i32 / 2;
+        let top = plan.list.y + plan.list.h as i32 / 3 - side as i32;
+        let icon = Rect::new(cx - side as i32 / 2, top.max(plan.list.y), side, side);
+        draw_design_icon(&self.icons, s, icon, "folder");
+        let title = "Эта папка пуста";
+        let hint = "Перетащите файлы сюда или нажмите «Создать»";
+        let y = icon.bottom() + ctx.px(14) as i32;
+        let tw = ctx.face(Role::Strong).width(title) as i32;
+        paint::text(ctx, s, Role::Strong, cx - tw / 2, y, title, p.ink2);
+        let hw = ctx.face(Role::Body).width(hint) as i32;
+        paint::text(ctx, s, Role::Body, cx - hw / 2, y + ctx.px(26) as i32, hint, p.ink4);
+        true
+    }
+
+    /// Вид «Список» (21.11): значок 16 и имя, столбцами; выделение,
+    /// отметки и подсветка — как у таблицы.
+    fn draw_list_view(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
+        let p = ctx.palette;
+        let list = self.list_plan(ctx, plan);
+        if list.area.is_empty() || self.draw_no_rows(s, ctx, plan) {
+            return;
+        }
+        let per = list.per_col.max(1);
+        let col_w = list.col_w.max(1);
+        let pad = list.pad;
+        self.scroll.sync_with(list.area.w, list.content, |index| Some((pad + ((index / per) as u32 * col_w) as i32, col_w)));
+        self.page_rows.set(per);
+        self.list_rows.set(per);
+        let at = self.scroll.offset();
+        let first_col = ((at - pad).max(0) as u32 / col_w) as usize;
+        let shown_cols = (list.area.w / col_w) as usize + 2;
+        let hot = self.hot_now(ctx, plan);
+        let end = ((first_col + shown_cols) * per).min(self.rows.len());
+        for index in (first_col * per).min(end)..end {
+            let row = &self.rows[index];
+            let rect = self.list_item_rect(&list, index, at);
+            if rect.right() <= list.area.x || rect.x >= list.area.right() {
+                continue;
+            }
+            let selected = self.is_marked(index);
+            let state = if selected {
+                RowState::Selected
+            } else if hot == Hot::Row(index) {
+                RowState::Hover
+            } else {
+                RowState::Idle
+            };
+            paint::row(ctx, s, rect, state);
+            let side = ctx.px(16);
+            let icon = Rect::new(rect.x + ctx.px(8) as i32, rect.y + (rect.h as i32 - side as i32) / 2, side, side);
+            let (kind_icon, _) = file_kind(&row.name, row.directory);
+            if !draw_design_icon(&self.icons, s, icon, kind_icon) {
+                let (glyph, tone, filled) = row.icon();
+                paint::icon_tile(ctx, s, icon, glyph, tone, filled);
+            }
+            let name_x = icon.right() + ctx.px(8) as i32;
+            // Край вида справа режет имя, как у Проводника.
+            let right = rect.right().min(list.area.right() - ctx.px(4) as i32) - ctx.px(6) as i32;
+            let ink = if selected { p.ink } else { p.ink2 };
+            paint::text_clipped(ctx, s, Role::Body, name_x, paint::baseline(ctx, Role::Body, rect), (right - name_x).max(0) as u32, self.shown_name(row), ink);
+        }
+    }
+
     /// Видимая часть, высота всего содержимого и шаг колеса — для прокрутки
-    /// списка (или плитки).
+    /// списка (или плитки). У «Списка» — ширина всего и шаг в треть столбца.
     fn view_metrics(&self, ctx: Ctx, plan: &Plan) -> (Rect, u32, u32) {
         let step = plan.row_h + plan.row_gap;
         if self.on_computer() || self.error.is_some() {
             return (plan.list, 0, step);
         }
-        if self.tiles {
+        if self.view == ViewMode::List {
+            let list = self.list_plan(ctx, plan);
+            return (list.area, list.content, (list.col_w / 3).max(1));
+        }
+        if self.view == ViewMode::Tiles {
             let grid = plan.grid(ctx);
             let area = plan.list.union(&plan.header);
             let rows = self.rows.len().div_ceil(grid.cols.max(1)) as u32;
@@ -5160,8 +6585,13 @@ impl Files {
             return (None, None);
         }
         let (view, content, _) = self.view_metrics(ctx, plan);
+        // «Список» листается вбок той же прокруткой `scroll`: его полоса —
+        // в первом месте, где её ищут нажатие, перетаскивание и подсветка.
+        if self.view == ViewMode::List && !self.on_computer() && self.error.is_none() {
+            return (kit::ScrollBar::horizontal(ctx, view, content, &self.scroll), None);
+        }
         let vertical = kit::ScrollBar::vertical(ctx, view, content, &self.scroll);
-        let horizontal = if self.hbar_needed(ctx, plan) { kit::ScrollBar::horizontal(ctx, plan.list, ctx.px(TABLE_MIN_W), &self.hscroll) } else { None };
+        let horizontal = if self.hbar_needed(ctx, plan) { kit::ScrollBar::horizontal(ctx, plan.list, ctx.px(self.table_min_w()), &self.hscroll) } else { None };
         (vertical, horizontal)
     }
 
@@ -5245,6 +6675,379 @@ fn starting_dir(argument: Option<&str>) -> String {
 fn window_size(info: &SysInfo) -> (u32, u32) {
     // С 20.11 — общее правило каркаса: желаемый размер в точках макета,
     // умноженный на масштаб и ограниченный рабочей областью.
-    app::window_size(info, app::size::FILES)
+    // Но не уже, чем нужно, чтобы таблица со всеми столбцами встала рядом с
+    // боковой колонкой (240 + TABLE_MIN_W + поля, 850 точек макета): на 2560
+    // при 200 % доля в 56 % (20.11) прятала «Размер» за прокруткой вбок.
+    let (w, h) = app::window_size(info, app::size::FILES);
+    let scale = app::ui_scale(info);
+    let fit = (850u32 * scale).min(info.screen_w * 85 / 100);
+    (w.max(fit), h)
 }
 
+
+// ---------------------------------------------------------------------------
+// Адрес (21.11): звенья с подсветкой, шевроны со списком подпапок, правка
+// текстом — как в Проводнике Windows 11 и в окне выбора файла.
+// ---------------------------------------------------------------------------
+
+/// Звено адреса на панели: подпись, путь, место подписи и шеврона.
+struct CrumbSlot {
+    label: String,
+    path: String,
+    rect: Rect,
+    chevron: Rect,
+}
+
+/// Список у шеврона: чьего звена (`None` — у «…», спрятанные звенья), где
+/// его левый край, пункты (подпись, путь; пустой путь — пояснение) и
+/// выбранный пункт.
+struct CrumbPop {
+    which: Option<usize>,
+    at: i32,
+    items: Vec<(String, String)>,
+    selected: usize,
+}
+
+/// Место текста в поле адреса, когда его правят.
+fn address_text(ctx: Ctx, plan: &Plan) -> Rect {
+    let pad = ctx.px(12);
+    Rect::new(plan.path.x + pad as i32, plan.path.y, plan.path.w.saturating_sub(pad * 2), plan.path.h)
+}
+
+/// Куда ведёт набранный адрес: `~`, `~/…`, абсолютный путь, путь от
+/// открытой папки, «Этот компьютер»; `.` и `..` разобраны.
+fn resolve_address(text: &str, here: &str, home: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    if text == "Этот компьютер" || text == COMPUTER {
+        return Some(String::from(COMPUTER));
+    }
+    let raw = if text == "~" {
+        home.to_string()
+    } else if let Some(rest) = text.strip_prefix("~/") {
+        join(home, rest)
+    } else if text.starts_with('/') {
+        text.to_string()
+    } else if here == COMPUTER {
+        format!("/{text}")
+    } else {
+        join(here, text)
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(if parts.is_empty() { String::from("/") } else { format!("/{}", parts.join("/")) })
+}
+
+/// Каталог ли это.
+fn is_directory(path: &str) -> bool {
+    let mut info = Stat::default();
+    stat(path, &mut info) >= 0 && info.kind == KIND_DIRECTORY
+}
+
+impl Files {
+    /// Звенья адреса, которые помещаются: у каждого — кнопка подписи и
+    /// шеврон справа. Не влезают — уходят первые, на их месте «…» (второе
+    /// значение — его место, пусто — нет).
+    fn crumb_slots(&self, ctx: Ctx, plan: &Plan) -> (Vec<CrumbSlot>, Rect) {
+        let field = plan.path;
+        if field.is_empty() {
+            return (Vec::new(), Rect::EMPTY);
+        }
+        let face = ctx.face(Role::Body);
+        let links = breadcrumb(&self.path, &self.home);
+        let pad = ctx.px(CRUMB_PAD) as i32;
+        let chev = ctx.px(CRUMB_CHEVRON) as i32;
+        let start = field.x + ctx.px(4) as i32;
+        let end = field.right() - ctx.px(4) as i32;
+        let widths: Vec<i32> = links.iter().map(|(label, _)| face.width(label) as i32 + pad * 2).collect();
+        let ellipsis = face.width("…") as i32 + pad * 2;
+        let mut first = 0;
+        loop {
+            let lead = if first > 0 { ellipsis + chev } else { 0 };
+            let total: i32 = lead + widths[first..].iter().map(|w| w + chev).sum::<i32>();
+            if start + total <= end || first + 1 >= links.len() {
+                break;
+            }
+            first += 1;
+        }
+        let y = field.y + ctx.px(3) as i32;
+        let h = field.h.saturating_sub(ctx.px(6));
+        let mut x = start;
+        let lead = if first > 0 {
+            let rect = Rect::new(x, y, ellipsis as u32, h);
+            x += ellipsis;
+            rect
+        } else {
+            Rect::EMPTY
+        };
+        let mut out = Vec::new();
+        for ((label, path), w) in links.into_iter().zip(widths).skip(first) {
+            let w = w.min((end - x).max(0));
+            let rect = Rect::new(x, y, w as u32, h);
+            x += w;
+            let cw = chev.min((end - x).max(0));
+            let chevron = Rect::new(x, y, cw as u32, h);
+            x += cw;
+            out.push(CrumbSlot { label, path, rect, chevron });
+        }
+        (out, lead)
+    }
+
+    /// Поле адреса: звенья с подсветкой под указателем или строка правки.
+    fn draw_address(&self, s: &mut Surface, bar: Ctx, plan: &Plan) {
+        let ctx = bar;
+        let p = ctx.palette;
+        let radius = ctx.px(theme::R_ROW);
+        paint::sunk(bar, s, plan.path, radius);
+        let field = bar.on(bar.flat(p.sunk));
+        if let Some(line) = &self.address {
+            draw::rounded_stroke(s, plan.path, radius, p.acc, 255);
+            line.draw(field, s, address_text(ctx, plan), true, p.ink);
+            return;
+        }
+        let (slots, lead) = self.crumb_slots(ctx, plan);
+        let y = paint::baseline(field, Role::Body, plan.path);
+        let pad = ctx.px(CRUMB_PAD) as i32;
+        let open = self.crumb_pop.as_ref().map(|pop| pop.which);
+        if !lead.is_empty() {
+            if self.hot == Hot::CrumbMore || open == Some(None) {
+                paint::row(field, s, lead, RowState::Hover);
+            }
+            paint::text(field, s, Role::Body, lead.x + pad, y, "…", p.ink3);
+        }
+        let last = slots.len().saturating_sub(1);
+        let mut end = plan.path.x + ctx.px(12) as i32;
+        for (index, slot) in slots.iter().enumerate() {
+            if self.hot == Hot::Crumb(index) {
+                paint::row(field, s, slot.rect, RowState::Hover);
+            }
+            let open_here = open == Some(Some(index));
+            if self.hot == Hot::Chevron(index) || open_here {
+                paint::row(field, s, slot.chevron, RowState::Hover);
+            }
+            let room = slot.rect.w.saturating_sub(pad as u32 * 2);
+            paint::text_clipped(field, s, Role::Body, slot.rect.x + pad, y, room, &slot.label, if index == last { p.ink } else { p.ink3 });
+            // Разделитель — значок «›» (в шрифте такого знака нет); у
+            // раскрытого списка — «⌄», как в Проводнике.
+            let glyph = ctx.px(10);
+            if slot.chevron.w >= glyph {
+                let icon = if open_here { Icon::ChevronDown } else { Icon::ChevronRight };
+                let gx = slot.chevron.x + (slot.chevron.w as i32 - glyph as i32) / 2;
+                glyphicon::draw(s, icon, gx, plan.path.y + (plan.path.h as i32 - glyph as i32) / 2, glyph, p.ink4, 255);
+            }
+            end = slot.chevron.right();
+        }
+        if let Some(preview) = self.preview.as_ref() {
+            let right = plan.path.right() - ctx.px(8) as i32;
+            paint::text_clipped(field, s, Role::Body, end, y, (right - end).max(0) as u32, &format!(" ·  {}", preview.name), p.ink4);
+        }
+        // Список у шеврона рисуется последним — поверх списка файлов
+        // (см. [`Files::draw_crumb_pop`]).
+    }
+
+    /// Начать правку адреса текстом: весь путь выделен, как в Проводнике.
+    fn edit_address(&mut self) {
+        let text = if self.on_computer() { String::from("Этот компьютер") } else { self.path.clone() };
+        self.address = Some(Line::selected(&text));
+        self.crumb_pop = None;
+        self.searching = false;
+        println(&format!("files: address editing '{text}'"));
+    }
+
+    /// Enter в поле адреса: перейти. Файл — открыть его папку и выбрать его.
+    fn commit_address(&mut self) -> bool {
+        let text = self.address.as_ref().map(|line| line.text.trim().to_string()).unwrap_or_default();
+        let Some(target) = resolve_address(&text, &self.path, &self.home) else {
+            self.address = None;
+            return true;
+        };
+        if target == COMPUTER || is_directory(&target) {
+            self.address = None;
+            println(&format!("files: address -> '{target}'"));
+            if target == self.path {
+                self.reload();
+            } else {
+                self.go_to(target);
+            }
+            return true;
+        }
+        if exists(&target) {
+            let name = target.rsplit('/').next().unwrap_or("").to_string();
+            self.address = None;
+            println(&format!("files: address -> file '{target}'"));
+            self.go_to(parent_of(&target));
+            if let Some(index) = self.rows.iter().position(|row| row.name == name) {
+                self.selected = index;
+            }
+            return true;
+        }
+        self.note = Some(format!("Путь «{text}» не найден"));
+        println(&format!("files: address '{text}' not found"));
+        true
+    }
+
+    /// Клавиши адреса и списка у шеврона. `None` — не их.
+    fn key_address(&mut self, code: u32, mods: i32, latin: u32) -> Option<bool> {
+        if let Some(pop) = self.crumb_pop.as_mut() {
+            match code {
+                WIN_KEY_UP => pop.selected = pop.selected.saturating_sub(1),
+                WIN_KEY_DOWN => pop.selected = (pop.selected + 1).min(pop.items.len().saturating_sub(1)),
+                ENTER => {
+                    let path = pop.items.get(pop.selected).map(|(_, path)| path.clone()).filter(|path| !path.is_empty());
+                    self.crumb_pop = None;
+                    if let Some(path) = path {
+                        self.go_to(path);
+                    }
+                }
+                _ => self.crumb_pop = None,
+            }
+            return Some(true);
+        }
+        if self.address.is_some() {
+            match code {
+                ESCAPE => {
+                    self.address = None;
+                    println("files: address editing cancelled");
+                }
+                ENTER | 0x0D => return Some(self.commit_address()),
+                _ => {
+                    if let Some(line) = self.address.as_mut() {
+                        line.key(code, mods, latin);
+                    }
+                }
+            }
+            return Some(true);
+        }
+        let letter = char::from_u32(latin).map(|ch| ch.to_ascii_lowercase());
+        let idle = self.menu.is_none() && self.props.is_none() && self.preview.is_none() && self.tab_menu.is_none();
+        if idle && ((mods & WIN_MOD_CTRL != 0 && letter == Some('l')) || (mods & WIN_MOD_ALT != 0 && letter == Some('d'))) {
+            self.edit_address();
+            return Some(true);
+        }
+        None
+    }
+
+    /// Подпапки `path` для списка у шеврона; у «Этого компьютера» — тома.
+    fn subfolders(&self, path: &str) -> Vec<(String, String)> {
+        if path == COMPUTER {
+            return list_volumes().into_iter().map(|row| (volume_title(&row.name, &row.label), row.name.clone())).collect();
+        }
+        let Ok((rows, _)) = list_dir(path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String)> = rows
+            .into_iter()
+            .filter(|row| row.directory && (self.hidden || !row.name.starts_with('.')))
+            .map(|row| (row.name.clone(), join(path, &row.name)))
+            .collect();
+        out.sort_by_key(|(name, _)| name.to_lowercase());
+        out
+    }
+
+    /// Открыть список у шеврона звена `which` (`None` — у «…»).
+    fn open_crumb_pop(&mut self, ctx: Ctx, plan: &Plan, which: Option<usize>) -> bool {
+        let (slots, lead) = self.crumb_slots(ctx, plan);
+        let (at, mut items) = match which {
+            Some(index) => {
+                let Some(slot) = slots.get(index) else { return false };
+                (slot.chevron.x, self.subfolders(&slot.path))
+            }
+            None => {
+                let links = breadcrumb(&self.path, &self.home);
+                let hidden = links.len().saturating_sub(slots.len());
+                (lead.x, links.into_iter().take(hidden).collect())
+            }
+        };
+        let total = items.len();
+        items.truncate(CRUMB_POP_MAX);
+        if total > CRUMB_POP_MAX {
+            items.push((format!("… ещё {}", total - CRUMB_POP_MAX), String::new()));
+        }
+        if items.is_empty() {
+            items.push((String::from("Нет вложенных папок"), String::new()));
+        }
+        // Выбран пункт, ведущий туда, где мы сейчас (или глубже).
+        let selected = items.iter().position(|(_, path)| !path.is_empty() && (self.path == *path || self.path.starts_with(&format!("{path}/")))).unwrap_or(0);
+        println(&format!("files: crumb list {} item(s)", total));
+        self.crumb_pop = Some(CrumbPop { which, at, items, selected });
+        self.pop = None;
+        true
+    }
+
+    /// Место списка у шеврона.
+    fn crumb_pop_rect(&self, ctx: Ctx, area: Rect, plan: &Plan) -> Option<Rect> {
+        let pop = self.crumb_pop.as_ref()?;
+        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+        let size = kit::menu_size(ctx, &entries);
+        Some(kit::place((pop.at, plan.path.bottom() + ctx.px(2) as i32), size, area))
+    }
+
+    fn draw_crumb_pop(&self, s: &mut Surface, ctx: Ctx, area: Rect, plan: &Plan) {
+        let (Some(pop), Some(rect)) = (self.crumb_pop.as_ref(), self.crumb_pop_rect(ctx, area, plan)) else {
+            return;
+        };
+        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+        kit::draw_menu(ctx, s, rect, &entries, pop.selected);
+    }
+
+    /// Щелчок при открытом списке: пункт — перейти; мимо — закрыть (по
+    /// другому шеврону — открыть его список).
+    fn click_crumb_pop(&mut self, ctx: Ctx, area: Rect, plan: &Plan, x: i32, y: i32) -> bool {
+        let rect = self.crumb_pop_rect(ctx, area, plan);
+        let Some(pop) = self.crumb_pop.take() else { return false };
+        if let Some(rect) = rect {
+            let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+            if let Some(index) = kit::menu_hit(ctx, rect, &entries, x, y) {
+                drop(entries);
+                let path = pop.items[index].1.clone();
+                if !path.is_empty() {
+                    self.go_to(path);
+                } else {
+                    self.crumb_pop = Some(pop);
+                }
+                return true;
+            }
+            if rect.contains(x, y) {
+                self.crumb_pop = Some(pop);
+                return false;
+            }
+        }
+        if plan.path.contains(x, y) {
+            let (slots, lead) = self.crumb_slots(ctx, plan);
+            if lead.contains(x, y) && pop.which.is_some() {
+                return self.open_crumb_pop(ctx, plan, None);
+            }
+            if let Some(index) = slots.iter().position(|slot| slot.chevron.contains(x, y)) {
+                if pop.which != Some(index) {
+                    return self.open_crumb_pop(ctx, plan, Some(index));
+                }
+            }
+        }
+        true
+    }
+
+    /// Указатель над списком у шеврона — пункт под ним выбран.
+    fn hover_crumb_pop(&mut self, ctx: Ctx, area: Rect, plan: &Plan, x: i32, y: i32) -> bool {
+        let Some(rect) = self.crumb_pop_rect(ctx, area, plan) else { return false };
+        let Some(pop) = self.crumb_pop.as_mut() else { return false };
+        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+        let hit = kit::menu_hit(ctx, rect, &entries, x, y);
+        drop(entries);
+        match hit {
+            Some(index) if index != pop.selected => {
+                pop.selected = index;
+                true
+            }
+            _ => false,
+        }
+    }
+}

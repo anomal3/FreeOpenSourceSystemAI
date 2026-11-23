@@ -433,6 +433,17 @@ impl Space {
     /// Диапазон обязан принадлежать этой программе и не быть ничем другим:
     /// кадры уезжают в пул, и второй владелец получил бы чужую память.
     pub unsafe fn unmap_range(&mut self, base: VirtAddr, pages: usize, everywhere: bool) -> usize {
+        // One shootdown per call, not per 64 pages (G2, 21.11.2026): D2R
+        // frees hundreds of MB at an area change, and every 64-page portion
+        // sent IPIs to all CPUs of the process and waited for them (16 k
+        // shootdowns per 30 s on hw-log13). Frames wait in a list until the
+        // single flush; without memory for the list - the old way.
+        if everywhere && pages > CHUNK_PAGES {
+            // SAFETY: the caller's contract.
+            if let Some(freed) = unsafe { self.unmap_range_batched(base, pages) } {
+                return freed;
+            }
+        }
         let root = self.root;
         let mut freed = 0;
         let mut done = 0;
@@ -500,6 +511,64 @@ impl Space {
 
         self.owned = self.owned.saturating_sub(freed);
         freed
+    }
+
+    /// [`Space::unmap_range`] with one TLB shootdown per [`BATCH_RUNS`]
+    /// removed runs (normally one per call). `None` - no memory for the list
+    /// of runs, nothing was done.
+    ///
+    /// # Safety
+    ///
+    /// As [`Space::unmap_range`].
+    unsafe fn unmap_range_batched(&mut self, base: VirtAddr, pages: usize) -> Option<usize> {
+        let root = self.root;
+        let mut taken: alloc::vec::Vec<(PhysAddr, usize)> = alloc::vec::Vec::new();
+        taken.try_reserve_exact(pages.min(BATCH_RUNS)).ok()?;
+        let mut freed = 0;
+        let mut at = 0;
+        let flush_and_free = |taken: &mut alloc::vec::Vec<(PhysAddr, usize)>| -> usize {
+            if taken.is_empty() {
+                return 0;
+            }
+            arch::flush_user_translations(Some(root));
+            let mut got = 0;
+            // Back to the pool in portions: the pool lock closes interrupts.
+            for portion in taken.chunks(CHUNK_PAGES) {
+                got += crate::mm::frame::with(|frames| {
+                    let mut got = 0;
+                    for &(phys, count) in portion {
+                        for offset in 0..count {
+                            // SAFETY: the frame came from this tree, no table
+                            // refers to it any more and the translations were
+                            // flushed everywhere just above.
+                            unsafe { frames.free(PhysAddr::new(phys.as_u64() + (offset * PAGE_SIZE) as u64)) };
+                        }
+                        got += count;
+                    }
+                    got
+                })
+                .unwrap_or(0);
+            }
+            taken.clear();
+            got
+        };
+        while at < pages {
+            let virt = VirtAddr::new(base.as_usize() + at * PAGE_SIZE);
+            // SAFETY: as in `unmap_range`.
+            match unsafe { arch::unmap(root, virt) } {
+                Some((phys, count)) => {
+                    taken.push((phys, count));
+                    at += count;
+                    if taken.len() == taken.capacity() {
+                        freed += flush_and_free(&mut taken);
+                    }
+                }
+                None => at += arch::unmapped_run(root, virt).max(1),
+            }
+        }
+        freed += flush_and_free(&mut taken);
+        self.owned = self.owned.saturating_sub(freed);
+        Some(freed)
     }
 
     /// Отобразить программе кадры, которые завёл и которыми владеет **кто-то
@@ -625,14 +694,34 @@ pub enum Dup {
 /// замка не стал дороже самой работы.
 const CHUNK_PAGES: usize = 64;
 
+/// Removed runs (a 4 KiB page or a large page each) per TLB shootdown in
+/// [`Space::unmap_range_batched`]: 64 MiB of small pages, 128 KiB of list.
+const BATCH_RUNS: usize = 16 * 1024;
+
 impl Drop for Space {
     fn drop(&mut self) {
         // SAFETY: пространство больше не активно — `run` возвращает процессор
         // на таблицы ядра сразу после выхода из программы, на обоих путях; сам
         // корень выдан `new_user_space` и никем не разделяется.
+        //
+        // Piece by piece first, the pool lock (interrupts off) per 2 MiB of
+        // the space (hw-log14: one lock for a ~5 GB D2R space was 10.7 ms of
+        // a deaf CPU at the game's exit); then the remaining upper tables and
+        // the root in one go, as before.
+        let root = self.root;
+        let mut cursor = 0;
+        let (mut part_tables, mut part_pages) = (0, 0);
+        // SAFETY: as below - the space is active nowhere and owned by us.
+        while let Some(Some((tables, pages))) =
+            crate::mm::frame::with(|frames| unsafe { arch::free_user_space_part(root, &mut cursor, frames) })
+        {
+            part_tables += tables;
+            part_pages += pages;
+        }
         let freed = crate::mm::frame::with(|frames| unsafe {
             arch::free_user_space(self.root, WINDOW_SLOT, frames)
-        });
+        })
+        .map(|(tables, pages)| (tables + part_tables, pages + part_pages));
 
         match freed {
             Some((tables, pages)) => kprintln!(
@@ -703,7 +792,14 @@ pub fn user_can(ptr: usize, len: usize, need: PageFlags) -> bool {
                     return false;
                 }
                 match arch::translate(root, virt) {
-                    Some((_, flags)) => flags,
+                    // `fault_in` подтвердил: область пускает запись (копия
+                    // разорвана, код переключён). Если запись страницы снова
+                    // «только на чтение» — это `fork` соседнего потока успел
+                    // разделить её после разбора (20.11.2026, `forkpoll` в
+                    // выпускной сборке: `poll` отвечал `EINVAL`). Право от
+                    // этого не пропало: отказ записи ядра разберётся как у
+                    // программы (`kernel_fault_in`), а `put_user` — фиксапом.
+                    Some((_, flags)) => flags | PageFlags::WRITE,
                     None => return false,
                 }
             }
@@ -724,6 +820,9 @@ pub fn user_can(ptr: usize, len: usize, need: PageFlags) -> bool {
                     return false;
                 }
                 match arch::translate(root, virt) {
+                    // Та же гонка с `fork` соседа, что и выше: подкачанную
+                    // страницу он мог уже разделить «только на чтение».
+                    Some((_, flags)) if write => flags | PageFlags::WRITE,
                     Some((_, flags)) => flags,
                     // Подкачка сказала «сделано», а страницы нет. Верить ей на
                     // слово нельзя: соврала бы она — ядро следующей же строкой

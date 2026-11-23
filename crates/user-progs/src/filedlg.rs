@@ -1,19 +1,37 @@
-//! Окно «Открыть» / «Сохранить как» для программ (20.11): системная сторона.
+//! Окно «Открыть» / «Сохранить как» / «Выбор папки» для программ (20.11):
+//! системная сторона.
 //!
 //! Само окно — `mini_ui::filedlg` (рисует и разбирает ввод, системных вызовов
 //! не знает). Здесь [`SysHost`] — всё, что окну нужно от системы: папки, тома,
 //! создание папки, значки макета, дата по часовому поясу, память о последней
-//! папке (`~/.config/filedlg.cfg`). Как подключить окно к программе — в
-//! заголовке `mini_ui::filedlg`.
+//! папке (`~/.config/filedlg.cfg`).
+//!
+//! # Как программе спросить файл
+//!
+//! Окно — отдельная программа `/bin/filedlg` со своим окном стола: заголовок,
+//! перетаскивание, края, модальность к окну программы (стол не отдаёт
+//! владельцу ввод, ставит окно посередине него, кнопка на панели задач — одна).
+//! Роман (20.11): окно, нарисованное внутри Блокнота, выглядело наложением.
+//! Программе — [`Dialog`]:
+//!
+//! ```ignore
+//! let options = Options::save("Без имени.txt").filters(vec![Filter::new("Текстовые файлы", &["txt"]), Filter::all()]);
+//! self.dialog = Dialog::start(&options, "notepad").ok();   // окно открылось над нашим
+//! // В App::step (каждые ~30 мс):
+//! if let Some(outcome) = self.dialog.as_mut().and_then(Dialog::poll) { self.dialog = None; /* Chosen(path) | Cancelled */ }
+//! ```
+//!
+//! Договор с `/bin/filedlg`: запрос — строки `ключ\tзначение` в стандартный
+//! ввод ([`request_text`], [`parse_request`]), ответ — строка
+//! [`ANSWER`]`ok\t<путь>` или [`ANSWER`]`cancel` в стандартный вывод; прочие
+//! строки вывода — журнал окна, [`Dialog`] печатает их от себя.
 
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 pub use mini_ui::filedlg::{COMPUTER, FileDialog, Filter, Host, Item, Mode, Options, Outcome, Volume, join, parent_of};
 use mini_ui::filedlg as dlg;
-use mini_ui::image::Image;
 use mini_ui::{Rect, Surface};
 use user_abi::{Dirent, KIND_DIRECTORY, Stat};
 
@@ -37,28 +55,6 @@ const _: () = {
     assert!(dlg::MOD_ALT == user_abi::WIN_MOD_ALT);
 };
 
-/// Значки макета (FIMG 64), которые окно показывает: папки, документы, тома.
-/// Те же файлы, что у «Файлов» и стола (`assets/icons/file`).
-static ICONS: [(&str, &[u8]); 17] = [
-    ("folder", include_bytes!("../../../assets/icons/file/folder.fimg").as_slice()),
-    ("folder-desktop", include_bytes!("../../../assets/icons/file/folder-desktop.fimg").as_slice()),
-    ("folder-documents", include_bytes!("../../../assets/icons/file/folder-documents.fimg").as_slice()),
-    ("folder-downloads", include_bytes!("../../../assets/icons/file/folder-downloads.fimg").as_slice()),
-    ("folder-music", include_bytes!("../../../assets/icons/file/folder-music.fimg").as_slice()),
-    ("folder-pictures", include_bytes!("../../../assets/icons/file/folder-pictures.fimg").as_slice()),
-    ("folder-videos", include_bytes!("../../../assets/icons/file/folder-videos.fimg").as_slice()),
-    ("doc-text", include_bytes!("../../../assets/icons/file/doc-text.fimg").as_slice()),
-    ("doc-code", include_bytes!("../../../assets/icons/file/doc-code.fimg").as_slice()),
-    ("doc-image", include_bytes!("../../../assets/icons/file/doc-image.fimg").as_slice()),
-    ("doc-archive", include_bytes!("../../../assets/icons/file/doc-archive.fimg").as_slice()),
-    ("doc-unknown", include_bytes!("../../../assets/icons/file/doc-unknown.fimg").as_slice()),
-    ("place-this-pc", include_bytes!("../../../assets/icons/file/place-this-pc.fimg").as_slice()),
-    ("place-system-disk", include_bytes!("../../../assets/icons/file/place-system-disk.fimg").as_slice()),
-    ("place-local-disk", include_bytes!("../../../assets/icons/file/place-local-disk.fimg").as_slice()),
-    ("place-usb-stick", include_bytes!("../../../assets/icons/file/place-usb-stick.fimg").as_slice()),
-    ("place-external-drive", include_bytes!("../../../assets/icons/file/place-external-drive.fimg").as_slice()),
-];
-
 /// Самое большее записей одной папки.
 const MAX_ENTRIES: usize = 4096;
 /// Буфер ответа `mounts`.
@@ -73,15 +69,13 @@ pub struct SysHost {
     home: String,
     /// Смещение местного времени, минуты.
     offset: i32,
-    /// Разобранные значки по имени (разбираются при первом показе).
-    icons: RefCell<Vec<(String, Option<Image>)>>,
 }
 
 impl SysHost {
     /// `tag` — имя программы в журнале.
     #[must_use]
     pub fn new(tag: &'static str) -> Self {
-        Self { tag, home: home_dir(), offset: local_offset(), icons: RefCell::new(Vec::new()) }
+        Self { tag, home: home_dir(), offset: local_offset() }
     }
 }
 
@@ -195,24 +189,10 @@ impl Host for SysHost {
     }
 
     fn draw_icon(&self, s: &mut Surface, rect: Rect, name: &str) -> bool {
-        let mut cache = self.icons.borrow_mut();
-        let at = match cache.iter().position(|(known, _)| known == name) {
-            Some(at) => at,
-            None => {
-                // Нет в наборе окна — та же папка или «неизвестный документ».
-                let fallback = if name.starts_with("folder") { "folder" } else { "doc-unknown" };
-                let bytes = ICONS.iter().find(|(known, _)| *known == name).or_else(|| ICONS.iter().find(|(known, _)| *known == fallback)).map(|(_, bytes)| *bytes);
-                cache.push((name.to_string(), bytes.and_then(Image::parse)));
-                cache.len() - 1
-            }
-        };
-        match &cache[at].1 {
-            Some(image) => {
-                image.draw(s, rect);
-                true
-            }
-            None => false,
-        }
+        // Значки темы (22.11, `crate::icons`); нет такого — та же папка или
+        // «неизвестный документ».
+        let fallback = if name.starts_with("folder") { "folder" } else { "doc-unknown" };
+        crate::icons::draw(s, rect, name) || crate::icons::draw(s, rect, fallback)
     }
 
     fn last_dir(&self) -> Option<String> {
@@ -290,6 +270,201 @@ fn read_small(path: &str) -> Option<String> {
         return None;
     }
     core::str::from_utf8(&buffer[..got as usize]).ok().map(ToString::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// Окно отдельной программой: `/bin/filedlg`
+// ---------------------------------------------------------------------------
+
+/// Начало строки ответа `/bin/filedlg` в его стандартном выводе.
+pub const ANSWER: &str = "\x1efiledlg-answer\t";
+
+/// Где лежит программа окна.
+pub const PROGRAM: &str = "/bin/filedlg";
+
+/// Запрос окну: строки `ключ\tзначение`.
+#[must_use]
+pub fn request_text(options: &Options, owner: i64, tag: &str) -> String {
+    let clean = |text: &str| text.replace(['\n', '\r', '\t'], " ");
+    let mode = match options.mode {
+        Mode::Open => "open",
+        Mode::Save => "save",
+        Mode::Folder => "folder",
+    };
+    let mut out = format!("mode\t{mode}\nowner\t{owner}\ntag\t{}\n", clean(tag));
+    if let Some(title) = &options.title {
+        out.push_str(&format!("title\t{}\n", clean(title)));
+    }
+    if let Some(dir) = &options.dir {
+        out.push_str(&format!("dir\t{}\n", clean(dir)));
+    }
+    if !options.name.is_empty() {
+        out.push_str(&format!("name\t{}\n", clean(&options.name)));
+    }
+    for filter in &options.filters {
+        // Подпись — без масок: `Filter::new` допишет их заново.
+        let label = filter.label.split(" (").next().unwrap_or(&filter.label);
+        out.push_str(&format!("filter\t{}\t{}\n", clean(label), filter.exts.join(";")));
+    }
+    out.push_str(&format!("index\t{}\nextension\t{}\n", options.filter, u8::from(options.add_extension)));
+    out
+}
+
+/// Разобрать запрос: параметры окна, номер окна-владельца и имя программы.
+#[must_use]
+pub fn parse_request(text: &str) -> (Options, i64, String) {
+    let mut options = Options::open();
+    let mut owner = 0i64;
+    let mut tag = String::from("filedlg");
+    let mut filters: Vec<Filter> = Vec::new();
+    let mut extension = None;
+    for line in text.lines() {
+        let mut fields = line.split('\t');
+        let (Some(key), Some(value)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        match key {
+            "mode" => {
+                options.mode = match value {
+                    "save" => Mode::Save,
+                    "folder" => Mode::Folder,
+                    _ => Mode::Open,
+                };
+            }
+            "owner" => owner = value.trim().parse().unwrap_or(0),
+            "tag" => tag = value.to_string(),
+            "title" if !value.trim().is_empty() => options.title = Some(value.to_string()),
+            "dir" if !value.trim().is_empty() => options.dir = Some(value.to_string()),
+            "name" => options.name = value.to_string(),
+            "filter" => {
+                let exts: Vec<&str> = fields.next().unwrap_or("").split([';', ',']).map(|ext| ext.trim().trim_start_matches("*.").trim_start_matches('.')).filter(|ext| !ext.is_empty() && *ext != "*").collect();
+                filters.push(if exts.is_empty() { Filter::all() } else { Filter::new(value, &exts) });
+            }
+            "index" => options.filter = value.trim().parse().unwrap_or(0),
+            "extension" => extension = Some(value.trim() == "1"),
+            _ => {}
+        }
+    }
+    if !filters.is_empty() {
+        options.filters = filters;
+    }
+    options.add_extension = extension.unwrap_or(options.mode == Mode::Save);
+    (options, owner, tag)
+}
+
+/// Окно выбора файла, открытое отдельной программой (см. заголовок модуля).
+pub struct Dialog {
+    task: i64,
+    out: i64,
+    pending: Vec<u8>,
+    tag: String,
+}
+
+impl Dialog {
+    /// Открыть окно над окном этой программы (`app::window_id`). `tag` —
+    /// имя программы в журнале окна.
+    pub fn start(options: &Options, tag: &str) -> Result<Self, String> {
+        Self::start_owned(options, crate::app::window_id(), tag)
+    }
+
+    /// То же, владелец назван явно (ноль — без владельца): `dotnet` держит
+    /// окна сам.
+    pub fn start_owned(options: &Options, owner: i64, tag: &str) -> Result<Self, String> {
+        let (in_read, in_write) = crate::pipe().map_err(error_text)?;
+        let (out_read, out_write) = match crate::pipe() {
+            Ok(pair) => pair,
+            Err(code) => {
+                close(in_read);
+                close(in_write);
+                return Err(error_text(code));
+            }
+        };
+        let task = crate::launch(&format!("{PROGRAM} --stdin"), None, in_read, out_write);
+        // Свои копии концов, отданных окну, — закрыть сразу: иначе конца
+        // файла не будет ни у него, ни у нас.
+        close(in_read);
+        close(out_write);
+        if task < 0 {
+            close(in_write);
+            close(out_read);
+            return Err(format!("{PROGRAM} не запускается: {}", error_text(task)));
+        }
+        let request = request_text(options, owner, tag);
+        let mut sent = 0usize;
+        let bytes = request.as_bytes();
+        let deadline = monotonic_ms() + 2_000;
+        while sent < bytes.len() && monotonic_ms() < deadline {
+            let wrote = write(in_write, &bytes[sent..]);
+            if wrote > 0 {
+                sent += wrote as usize;
+            } else if wrote != user_abi::ERR_AGAIN {
+                break;
+            } else {
+                crate::nanosleep(0, 5_000_000);
+            }
+        }
+        close(in_write);
+        println(&format!("{tag}: file dialog #{task} started"));
+        Ok(Self { task, out: out_read, pending: Vec::new(), tag: tag.to_string() })
+    }
+
+    /// Номер задачи окна.
+    #[must_use]
+    pub const fn task(&self) -> i64 {
+        self.task
+    }
+
+    /// Чем кончилось — не дожидаясь: `None` — окно ещё открыто. Строки
+    /// журнала окна печатаются от имени программы.
+    pub fn poll(&mut self) -> Option<Outcome> {
+        let mut buffer = [0u8; 1024];
+        let ended = loop {
+            let got = read(self.out, &mut buffer);
+            if got > 0 {
+                self.pending.extend_from_slice(&buffer[..got as usize]);
+                continue;
+            }
+            break got == 0 || (got < 0 && got != user_abi::ERR_AGAIN);
+        };
+        let mut answer = None;
+        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=end).collect();
+            let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+            if let Some(rest) = line.strip_prefix(ANSWER) {
+                answer = Some(match rest.split_once('\t') {
+                    Some(("ok", path)) if !path.is_empty() => Outcome::Chosen(path.to_string()),
+                    _ => Outcome::Cancelled,
+                });
+            } else if !line.is_empty() {
+                println(&line);
+            }
+        }
+        if answer.is_some() {
+            return answer;
+        }
+        if ended {
+            println(&format!("{}: file dialog #{} ended without an answer", self.tag, self.task));
+            return Some(Outcome::Cancelled);
+        }
+        None
+    }
+
+    /// Дождаться ответа (программа со своим циклом событий зовёт [`Self::poll`]
+    /// сама; это — для тех, кому окно своё перерисовывать не нужно).
+    pub fn wait(mut self) -> Outcome {
+        loop {
+            if let Some(outcome) = self.poll() {
+                return outcome;
+            }
+            crate::nanosleep(0, 20_000_000);
+        }
+    }
+}
+
+impl Drop for Dialog {
+    fn drop(&mut self) {
+        close(self.out);
+    }
 }
 
 fn error_text(code: i64) -> String {

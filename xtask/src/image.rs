@@ -385,9 +385,14 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // `FOSSAI_LIVE_APPS=0` (18.11, Роман: «редакторы и OBSOS пока на
             // флешку не грузить, проверяем только Proton и игры») — без OBSOS
             // и Craft: флешка меньше, пакеты ставятся быстрее.
+            //
+            // Браузер с 20.11 решает свой ключ `FOSSAI_LIVE_BROWSER` (Роман:
+            // «браузер мне в сборку помести»): по умолчанию он едет на флешку и
+            // при `FOSSAI_LIVE_APPS=0` — без браузера только `FOSSAI_LIVE_BROWSER=0`.
             let live_apps = std::env::var("FOSSAI_LIVE_APPS").map_or(true, |v| v != "0");
-            if built.release && live_apps {
-                if let Some(bytes) = crate::package::servo(arch)? {
+            let live_browser = std::env::var("FOSSAI_LIVE_BROWSER").map_or(true, |v| v != "0");
+            if built.release && live_browser {
+                if let Some(bytes) = crate::package::servo_live(arch)? {
                     payload.push(Payload {
                         path: format!("{}/OBSOS.FPK", arch::PAYLOAD_PKG_DIR),
                         data: bytes,
@@ -567,6 +572,8 @@ fn medium_name(name: &str) -> String {
         "sysupdate" => String::from("SYSUPD"),
         // Одиннадцать знаков и дефис — ни в какие 8.3 не лезет (фаза 38c).
         "sftp-server" => String::from("SFTPSRV"),
+        // Девять знаков (22.11, «Запись экрана»).
+        "screenrec" => String::from("SCRNREC"),
         other => other.to_uppercase(),
     }
 }
@@ -694,6 +701,11 @@ fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
         // чтения, и ядро переписывает этот файл на месте.
         logs.write_file_path(&mut dev, "FREEOS/LAYOUT.TXT", &vec![b' '; 4096])
             .map_err(|err| anyhow::anyhow!("не удалось записать файл раскладки: {err}"))?;
+        // Настройки живой системы (21.11): два снимка по 128 КиБ, ядро
+        // переписывает их на месте (`usb::stick_settings`). Пробелы — «снимка
+        // ещё нет».
+        logs.write_file_path(&mut dev, "FREEOS/SETTINGS.DAT", &vec![b' '; 256 * 1024])
+            .map_err(|err| anyhow::anyhow!("не удалось записать файл настроек: {err}"))?;
         logs.finish(&mut dev)
             .map_err(|err| anyhow::anyhow!("не удалось завершить раздел журнала: {err}"))?;
     }

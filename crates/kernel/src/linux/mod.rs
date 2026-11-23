@@ -49,7 +49,7 @@ pub mod profile;
 pub mod signal;
 mod snd;
 mod special;
-mod thread;
+pub mod thread;
 pub mod vdso;
 pub mod wayland;
 
@@ -336,13 +336,17 @@ unsafe fn native(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
 /// Только из обработчика ловушки, пришедшей из третьего кольца: `exit` не
 /// возвращается.
 pub unsafe fn syscall(frame: &mut crate::arch::TrapFrame) {
-    match crate::user::with_current(|program| program.linux) {
-        Some(true) => {}
+    // Without the process lock (21.11.2026): asking `program.linux` under it
+    // queued every call behind any thread holding it.
+    let linux = if crate::user::files::UNLOCKED_IO.load(core::sync::atomic::Ordering::Relaxed) {
+        crate::user::current_is_linux()
+    } else {
+        crate::user::with_current(|program| program.linux).unwrap_or(false)
+    };
+    if !linux {
         // `syscall` из родной программы: таблицы Linux ей не положено.
-        _ => {
-            frame.rax = (-e::ENOSYS) as u64;
-            return;
-        }
+        frame.rax = (-e::ENOSYS) as u64;
+        return;
     }
     let number = frame.rax as usize;
     // `rt_sigreturn` возвращает не ответ, а прерванные регистры целиком.
@@ -357,6 +361,8 @@ pub unsafe fn syscall(frame: &mut crate::arch::TrapFrame) {
     // SAFETY: контракт функции.
     let result = unsafe { dispatch(number, args, frame) };
     profile::count(number, crate::time::uptime_ns().saturating_sub(started));
+    // Who makes the calls (hw-log15): every 256th call of a number.
+    profile::sample(number, frame.rip, frame.rsp);
     // Чтение до дна (`EAGAIN`) — для фронта `EPOLLET` (см. `ipc::note_drained`):
     // read, readv, recvfrom, recvmsg, recvmmsg.
     if result == -11 && matches!(number, 0 | 19 | 45 | 47 | 299) {
@@ -411,8 +417,10 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::GETSOCKOPT => netlink::getsockopt(a0, a1, a2, a3, a4)
                 .or_else(|| net::getsockopt(a0, a1, a2, a3, a4))
                 .unwrap_or_else(|| ipc::getsockopt(a0, a1, a2, a3, a4)),
-            // Netlink принимает и забывает все (`SO_RCVBUF`, `SOL_NETLINK` …).
-            nr::SETSOCKOPT if net::is_inet(a0) || netlink::is_netlink(a0) => 0,
+            // Netlink принимает и забывает все (`SO_RCVBUF`, `SOL_NETLINK` …);
+            // `AF_INET` запоминает (сроки `SO_RCVTIMEO`/`SO_SNDTIMEO`, 22.11).
+            nr::SETSOCKOPT if net::is_inet(a0) => net::setsockopt(a0, a1, a2, a3, a4).unwrap_or(0),
+            nr::SETSOCKOPT if netlink::is_netlink(a0) => 0,
             nr::SETSOCKOPT => ipc::setsockopt(a0, a1, a2, a3, a4),
             nr::SENDMSG => netlink::sendmsg(a0, a1, a2).or_else(|| net::sendmsg(a0, a1, a2)).unwrap_or_else(|| ipc::sendmsg(a0, a1, a2)),
             nr::SENDMMSG => net::sendmmsg(a0, a1, a2, a3),
@@ -522,7 +530,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::UMASK => 0o022,
             nr::GETTIMEOFDAY => gettimeofday(a0),
             nr::TIME => time(a0),
-            nr::GETRUSAGE => zero_out(a1, 144),
+            nr::GETRUSAGE => getrusage(a0 as i32, a1),
             nr::SYSINFO => sysinfo(a0),
             nr::TIMES => times(a0),
             // Группы процессов и сеансы: процесс один и сам себе группа.
@@ -587,8 +595,17 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             // служебную страницу, фаза 74).
             nr::MLOCK | nr::MUNLOCK | nr::MLOCKALL | nr::MUNLOCKALL | nr::MLOCK2 => 0,
             nr::MEMBARRIER => membarrier(a0),
-            nr::IOCTL => ioctl(a0, a1, a2),
-            nr::SCHED_YIELD => errno(native(SYS_YIELD, 0, 0, 0)),
+            nr::IOCTL => {
+                // Per request number for perf-diag (hw-log15).
+                let started = crate::time::uptime_ns();
+                let answer = ioctl(a0, a1, a2);
+                profile::count_ioctl(a1 as u32, crate::time::uptime_ns().saturating_sub(started));
+                answer
+            }
+            nr::SCHED_YIELD => {
+                thread::yield_nap();
+                errno(native(SYS_YIELD, 0, 0, 0))
+            }
             // Совет о памяти или о чтении файла — совет: не принять его можно
             // всегда.
             nr::MADVISE => madvise(a0, a1, a2),
@@ -597,8 +614,11 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::COPY_FILE_RANGE => copy_file_range(a0, a1, a2, a3, a4, a5),
             nr::INOTIFY_INIT => ipc::inotify_init(0),
             nr::INOTIFY_INIT1 => ipc::inotify_init(a0),
-            nr::INOTIFY_ADD_WATCH => ipc::inotify_add_watch(a0),
-            nr::INOTIFY_RM_WATCH => 0,
+            nr::INOTIFY_ADD_WATCH => match linux_path(AT_FDCWD, a1) {
+                Ok(linux) => ipc::inotify_add_watch(a0, &fsops::place(&linux), a2 as u32),
+                Err(err) => err,
+            },
+            nr::INOTIFY_RM_WATCH => ipc::inotify_rm_watch(a0, a1),
             // Какие страницы в памяти: все — подкачки нет, а ленивая
             // страница придёт по первому касанию так же быстро.
             nr::MINCORE => {
@@ -884,7 +904,7 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     if flags & O_TRUNC != 0 {
         native_flags |= user_abi::O_TRUNC;
     }
-    let fd = match crate::user::with_current(|program| program.files.open(cred, &path, native_flags)) {
+    let fd = match crate::user::files::open_in_current(cred, &path, native_flags) {
         Some(Ok(fd)) => fd,
         Some(Err(err)) => return file_errno(err),
         None => return -e::ESRCH,
@@ -1652,10 +1672,43 @@ fn sysinfo(out: usize) -> i64 {
 /// `times`: процессорного времени по процессу ядро не считает — нули; ответ —
 /// время работы в тиках по 10 мс (`AT_CLKTCK` = 100).
 fn times(out: usize) -> i64 {
-    if out != 0 && zero_out(out, 32) != 0 {
-        return -e::EFAULT;
+    if out != 0 {
+        if !space::user_can(out, 32, PageFlags::WRITE) {
+            return -e::EFAULT;
+        }
+        // `tms_utime` in clock ticks (100 Hz); the rest zero. The kernel does
+        // not split user and system time.
+        let ticks = crate::sched::process_cpu_ns() / 10_000_000;
+        // SAFETY: checked one line above.
+        unsafe { core::ptr::write_unaligned(out as *mut [u64; 4], [ticks, 0, 0, 0]) };
     }
     (crate::time::uptime_ms() / 10) as i64
+}
+
+/// `getrusage(who, usage)` (hw-log14): CPU time from the scheduler's
+/// lock-free counters - `RUSAGE_SELF` (0) the process (threads sharing the
+/// address space), `RUSAGE_THREAD` (1) the calling thread, `RUSAGE_CHILDREN`
+/// (-1) zeros. All of it is reported as user time (the kernel does not split
+/// user and system). It used to be zeros: D2R/Wine spun on it ~0.9 M times a
+/// second waiting for the time to move.
+fn getrusage(who: i32, out: usize) -> i64 {
+    const SIZE: usize = 144;
+    let ns = match who {
+        0 => crate::sched::process_cpu_ns(),
+        1 => crate::sched::thread_cpu_ns(),
+        -1 => 0,
+        _ => return -e::EINVAL,
+    };
+    if !space::user_can(out, SIZE, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    let mut usage = [0u64; SIZE / 8];
+    // `ru_utime` - a `timeval`: seconds and microseconds.
+    usage[0] = ns / 1_000_000_000;
+    usage[1] = ns / 1000 % 1_000_000;
+    // SAFETY: checked above.
+    unsafe { core::ptr::write_unaligned(out as *mut [u64; SIZE / 8], usage) };
+    0
 }
 
 /// `writev` — по куску родным `write`.
@@ -2215,9 +2268,11 @@ unsafe fn clock_gettime(clock: usize, out: usize) -> i64 {
             if !space::user_can(out, 16, PageFlags::WRITE) {
                 return -e::EFAULT;
             }
-            let ms = crate::sched::cpu_ms(crate::sched::current()).unwrap_or(0);
+            // Nanoseconds without the scheduler lock (hw-log14); the process
+            // clock sums its threads.
+            let ns = if other == 2 { crate::sched::process_cpu_ns() } else { crate::sched::thread_cpu_ns() };
             // SAFETY: проверено строкой выше.
-            unsafe { core::ptr::write_unaligned(out as *mut [u64; 2], [ms / 1000, (ms % 1000) * 1_000_000]) };
+            unsafe { core::ptr::write_unaligned(out as *mut [u64; 2], [ns / 1_000_000_000, ns % 1_000_000_000]) };
             return 0;
         }
         _ => return -e::EINVAL,
@@ -2234,7 +2289,7 @@ fn uname(out: usize) -> i64 {
     }
     // Версия ядра — такая, какую glibc примет за достаточно новую: она
     // сверяет её со своим минимумом и иначе отказывается работать.
-    let fields: [&[u8]; 6] = [b"Linux", b"fossai", b"6.1.0-fossai", b"#1 FossAi", b"x86_64", b"(none)"];
+    let fields: [&[u8]; 6] = [b"Linux", net::HOSTNAME.as_bytes(), b"6.1.0-fossai", b"#1 FossAi", b"x86_64", b"(none)"];
     for (index, field) in fields.iter().enumerate() {
         let at = out + index * FIELD;
         // SAFETY: весь буфер проверен на запись выше.
@@ -2366,6 +2421,26 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usi
                         let now = u128::from(crate::time::uptime_ns());
                         if at <= now {
                             return -e::ETIMEDOUT;
+                        }
+                        // hw-log15: a short timeout ends at its nanosecond
+                        // deadline (hrsleep), not 1-2 ticks after it.
+                        if at - now <= 20_000_000 && crate::sched::hrsleep::enabled() {
+                            let Some(key) = crate::user::futex_key(addr) else { return -e::EFAULT };
+                            let mut changed = false;
+                            let woken = crate::sched::hrsleep::block_on_futex_ns(key, at as u64, || {
+                                // SAFETY: `futex_key` checked the address:
+                                // the program's, aligned, mapped read-write.
+                                let now = unsafe { core::ptr::read_volatile(addr as *const u32) };
+                                changed = now != value as u32;
+                                changed
+                            });
+                            if changed {
+                                return -e::EAGAIN;
+                            }
+                            if woken {
+                                return 0;
+                            }
+                            continue;
                         }
                         ((at - now).div_ceil(1_000_000) as usize).max(1)
                     }

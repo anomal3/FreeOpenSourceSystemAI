@@ -766,6 +766,18 @@ fn execute(
     } else {
         None
     };
+    // Проба сети Proton (`proton-net`, 22.11): те же два HTTPS-сервера (корень
+    // гостя и чужой) на маленьком каталоге - без репозитория обновлений и без
+    // `/etc/update.cfg`, чтобы гость с Proton не начал обновляться.
+    let _netprobe_tls = if scenario.name == "proton-net" {
+        let root = netprobe_site()?;
+        Some((
+            start_host_tls12_site(root.clone(), ports.tls, tlskeys::trusted()?)?,
+            start_host_tls12_site(root, ports.stranger, tlskeys::stranger()?)?,
+        ))
+    } else {
+        None
+    };
 
     let mut extra: Vec<String> = scenario.qemu_args(arch).iter().map(|s| (*s).to_string()).collect();
     // `{wav}` — файл, куда QEMU пишет звук гостя (фаза 67e): свой у каждого
@@ -783,12 +795,18 @@ fn execute(
     } else {
         String::new()
     };
-    extra.extend(
-        scenario
-            .extra
-            .iter()
-            .map(|s| s.replace("{wav}", &wav_arg).replace("{stick}", &stick_arg)),
-    );
+    // `{exfat}` — внешний диск exFAT (20.11), распакованный заново: гость в
+    // него пишет, а стенд потом проверяет его чужим `fsck.exfat`.
+    let exfat_arg = if scenario.extra.iter().any(|s| s.contains("{exfat}")) {
+        let image = paths::test_dir().join(format!("{prefix}-exfat.img"));
+        stick::build_exfat(&image)?;
+        crate::util::qemu_path(&image)?
+    } else {
+        String::new()
+    };
+    extra.extend(scenario.extra.iter().map(|s| {
+        s.replace("{wav}", &wav_arg).replace("{stick}", &stick_arg).replace("{exfat}", &exfat_arg)
+    }));
     // Лишние аргументы QEMU для всех сценариев разом, например `-accel whpx`:
     // гостевой код тогда исполняет настоящий процессор, а не эмулятор. Нужно
     // затем, что эмулятор прощает то, чего не прощает железо, — бит Accessed
@@ -1106,6 +1124,16 @@ fn play(
                     bail!("шаг {index}: за {prefix:?} стоит {number}, а нужно не меньше {limit}");
                 }
             }
+            Step::SeenAtLeast(prefix, limit) => {
+                say!("  [{at:>6} мс] шаг {index}: число за {prefix:?} в выводе, не меньше {limit}");
+                let Some(number) = line.seen_number(prefix) else {
+                    bail!("шаг {index}: в выводе нет числа за {prefix:?}");
+                };
+                say!("             получено {number}");
+                if number < *limit {
+                    bail!("шаг {index}: за {prefix:?} стоит {number}, а нужно не меньше {limit}");
+                }
+            }
             Step::Expect(needle) => {
                 let needle = fill(needle, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: проверяем {needle:?}");
@@ -1147,8 +1175,11 @@ fn play(
                 }
             }
             Step::Type(text) => {
+                // Порты стенда — и в набираемом тексте (адрес сайта хоста в
+                // строке браузера).
+                let text = fill(text, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: набираем {text:?}");
-                for name in keys::spell(text).with_context(|| format!("шаг {index}"))? {
+                for name in keys::spell(&text).with_context(|| format!("шаг {index}"))? {
                     hmp.sendkey(&name).with_context(|| format!("шаг {index}"))?;
                     std::thread::sleep(KEY_DELAY);
                 }
@@ -1231,6 +1262,27 @@ fn play(
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(POINTER_DELAY);
                 press_middle(qmp.as_deref_mut(), hmp, false)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(KEY_DELAY);
+            }
+            Step::ClickWith(keys) => {
+                say!("  [{at:>6} мс] шаг {index}: {keys}+щелчок");
+                // Монитор держит клавишу сам и отпускает по сроку; щелчок —
+                // внутри срока, после того как нажатие дошло до гостя.
+                hmp.sendkey(&format!("{keys} 700")).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(Duration::from_millis(200));
+                press_button(qmp.as_deref_mut(), hmp, true)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(POINTER_DELAY);
+                press_button(qmp.as_deref_mut(), hmp, false)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(Duration::from_millis(700) + KEY_DELAY);
+            }
+            Step::PressWith(keys, ms) => {
+                say!("  [{at:>6} мс] шаг {index}: {keys}+нажатие на {ms} мс");
+                hmp.sendkey(&format!("{keys} {ms}")).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(Duration::from_millis(200));
+                press_button(qmp.as_deref_mut(), hmp, true)
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
@@ -2201,15 +2253,24 @@ where
 /// половины одной ошибки согласны друг с другом. Расписание ключей, разбор
 /// расширений, порядок сообщений — всё это `rustls` делает по стандарту, а не
 /// так, как поняли его мы.
-fn start_host_tls_repo(
-    root: PathBuf,
-    port: u16,
-    material: tlskeys::Material,
-) -> Result<HostServer> {
+fn start_host_tls_repo(root: PathBuf, port: u16, material: tlskeys::Material) -> Result<HostServer> {
+    start_host_tls(root, port, material, false)
+}
+
+/// То же с TLS 1.2 (22.11): WinHTTP/schannel Wine в `proton-net` 1.3 не
+/// предлагает, а настоящие серверы (API Universe of Tanks) 1.2 принимают.
+fn start_host_tls12_site(root: PathBuf, port: u16, material: tlskeys::Material) -> Result<HostServer> {
+    start_host_tls(root, port, material, true)
+}
+
+fn start_host_tls(root: PathBuf, port: u16, material: tlskeys::Material, tls12: bool) -> Result<HostServer> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::sync::Arc;
 
-    let config = rustls::ServerConfig::builder()
+    // TLS 1.3, как было; 1.2 - только для `proton-net` ([`start_host_tls12_site`]).
+    let versions: &[&rustls::SupportedProtocolVersion] =
+        if tls12 { &[&rustls::version::TLS13, &rustls::version::TLS12] } else { &[&rustls::version::TLS13] };
+    let config = rustls::ServerConfig::builder_with_protocol_versions(versions)
         .with_no_client_auth()
         .with_single_cert(
             vec![CertificateDer::from(material.leaf_der)],
@@ -2752,6 +2813,62 @@ fn start_host_site() -> Result<(HostServer, u16)> {
                 answer.extend((0..scenarios::SITE_STREAM_BYTES).map(|at| (at % 251) as u8));
                 answer
             }
+            // Загрузки OBSOS (20.11): страница со ссылками, файл, который
+            // сервер велит сохранить (`Content-Disposition: attachment` при
+            // типе text/plain — Servo показал бы его страницей), и образ
+            // больше гигабайта без расширения в адресе — их узнаёт проверка
+            // ссылки браузера по заголовкам. Тела детерминированные, их
+            // SHA-256 записаны в сценарии `obsos-downloads`.
+            "/dl/" => {
+                let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Загрузки OBSOS</title>\
+                    <style>body{font-family:sans-serif;margin:32px;background:#f4f6fb}a{display:block;margin:14px 0;font-size:20px}</style></head>\
+                    <body><h1>Загрузки OBSOS</h1><a id=\"report\" href=\"/dl/report\">Отчёт (Content-Disposition: attachment)</a>\
+                    <a id=\"big\" href=\"/dl/fossai-live\">Образ 1,1 ГиБ (application/octet-stream)</a>\
+                    <a href=\"/hello.txt\">Текстовая страница</a></body></html>\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
+            "/dl/report" => {
+                let body: String = (0..2000).map(|n| format!("Отчёт FossAi, строка {n}\n")).collect();
+                let mut answer = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+                     Content-Disposition: attachment; filename=\"report.txt\"; filename*=UTF-8''%D0%9E%D1%82%D1%87%D1%91%D1%82%202026.txt\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                answer.extend_from_slice(body.as_bytes());
+                answer
+            }
+            "/dl/fossai-live" => {
+                // Гигабайт с лишним — потоком и в своём потоке: остальные
+                // запросы гостя (страницы, значок) не ждут конца образа.
+                std::thread::spawn(move || {
+                    let total = scenarios::SITE_DOWNLOAD_BYTES;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                    let pattern: Vec<u8> = (0..251u32).map(|b| b as u8).collect();
+                    let block: Vec<u8> = pattern.iter().copied().cycle().take(1024 * 1024 + 251).collect();
+                    let mut sent = 0u64;
+                    while sent < total {
+                        let offset = (sent % 251) as usize;
+                        let n = (total - sent).min(1024 * 1024) as usize;
+                        if stream.write_all(&block[offset..offset + n]).is_err() {
+                            say!("             сайт хоста: образ оборван на {sent} байт");
+                            return;
+                        }
+                        sent += n as u64;
+                    }
+                    say!("             сайт хоста: образ отдан, {sent} байт");
+                });
+                return;
+            }
             "/chunked.txt" => {
                 // Ответ кусками. Наш прокси обязан отказаться его передавать:
                 // границу такого сообщения считают по-разному, и передать
@@ -3082,6 +3199,30 @@ fn place_update_config(disk_path: &std::path::Path, ports: HostPorts) -> Result<
     fs.finish()
 }
 
+/// Каталог, который раздают HTTPS-серверы сценария `proton-net`: `health`
+/// (как у API Universe of Tanks) и `blob` в 256 КиБ (сотни записей TLS).
+fn netprobe_site() -> Result<PathBuf> {
+    let dir = paths::test_dir().join("netprobe-site");
+    std::fs::create_dir_all(&dir).with_context(|| format!("не удалось создать {}", dir.display()))?;
+    std::fs::write(dir.join("health"), b"{\"status\":\"ok\"}\n")?;
+    let blob: Vec<u8> = (0..256 * 1024).map(|index| (index % 251) as u8).collect();
+    std::fs::write(dir.join("blob"), blob)?;
+    Ok(dir)
+}
+
+/// Корень стенда - гостю в `/etc/ca.pem` (без `/etc/update.cfg`): ядро
+/// добавляет его к корням Mozilla в `/etc/ssl/certs/ca-certificates.crt`
+/// программ Linux, и Wine ему доверяет.
+fn place_ca_root(disk_path: &std::path::Path) -> Result<()> {
+    let ca = tlskeys::trusted()?.root_pem;
+    let mut fs = crate::statefs::StateVolume::open(disk_path)?;
+    match fs.write_file_path("etc/ca.pem", ca.as_bytes(), 0o644, 0, 0)? {
+        Some(_) => say!("стенд: гостю положен /etc/ca.pem с корнем стенда"),
+        None => say!("стенд: /etc/ca.pem у гостя уже лежит"),
+    }
+    fs.finish()
+}
+
 /// Стереть пути с раздела состояния гостя — до запуска.
 ///
 /// Файл — `unlink`, каталог — `rmdir` (только пустой: рекурсии нет намеренно,
@@ -3213,6 +3354,9 @@ fn prepare_drives(
             if scenario.host_repo {
                 prepare_repo(built)?;
                 place_update_config(&disk, ports)?;
+            }
+            if scenario.name == "proton-net" {
+                place_ca_root(&disk)?;
             }
             vec![Drive::Image(disk)]
         }

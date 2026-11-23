@@ -53,7 +53,7 @@ const NOTE_NO_OFF: &str = "Погасить этот телефон систем
 pub struct Sheet {
     surface: Surface,
     pub rect: Rect,
-    scale: u32,
+    scale: mini_ui::Scale,
     can_off: bool,
     off: Rect,
     restart: Rect,
@@ -68,7 +68,7 @@ fn bg() -> Color {
 impl Sheet {
     /// Собрать лист над доком. `can_off` — умеет ли машина выключиться сама.
     #[must_use]
-    pub fn open(screen_w: u32, screen_h: u32, scale: u32, can_off: bool) -> Option<Self> {
+    pub fn open(screen_w: u32, screen_h: u32, scale: mini_ui::Scale, can_off: bool) -> Option<Self> {
         let ctx = Ctx::scaled(scale);
         let inset = ctx.px(theme::M_INSET);
         let width = screen_w.checked_sub(inset * 2).filter(|w| *w > 0)?;

@@ -40,6 +40,8 @@ pub(crate) mod sync;
 pub mod sysfs;
 mod vm;
 
+pub use sync::{FENCE_SPIN_US, FENCE_STEP_US, fence_bench, fence_fine_sleeps, fence_wait_stats};
+
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -78,11 +80,26 @@ struct Backends {
 
 static BACKENDS: SpinLock<Backends> = SpinLock::new(Backends { real: None, soft: None });
 
-/// Показывать ли узел настоящей карты (`nvk hw on|off`). По умолчанию —
-/// нет (решение ведущего, 18.11.2026): пока M5 не пройден, NVK на настоящей
-/// карте сломан, и DXVK выбрал бы его вместо lavapipe. Включается руками.
-pub const DEFAULT_HW: bool = false;
+/// Показывать ли узел настоящей карты (`nvk hw on|off`). До 20.11 — нет
+/// (пока M5 не пройден, DXVK выбрал бы сломанный NVK вместо lavapipe). С
+/// D4 (20.11.2026, `gpu gametest` 7/7 на RTX 3060) — да: узел появляется сам,
+/// как только GSP-RM поднят и бэкенд зарегистрирован, и игра из «Пуска» сразу
+/// берёт видеокарту (первый запуск TMNF в hw-log12 шёл на процессоре).
+pub const DEFAULT_HW: bool = true;
 static HW: AtomicBool = AtomicBool::new(DEFAULT_HW);
+
+/// «LOCAL»-память NVK, не делимую с другими, — в видеопамять (`nvk local
+/// vram|sys`, D4 20.11.2026; см. `gem::Bo::new`).
+static LOCAL_VRAM: AtomicBool = AtomicBool::new(true);
+
+pub fn set_local_in_vram(on: bool) {
+    LOCAL_VRAM.store(on, Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn local_in_vram() -> bool {
+    LOCAL_VRAM.load(Ordering::Relaxed)
+}
 
 /// Трассировка ioctl в журнал (`nvk trace on`).
 static TRACE: AtomicBool = AtomicBool::new(false);
@@ -93,7 +110,12 @@ static TRACE: AtomicBool = AtomicBool::new(false);
 /// бэкенд до закрытия; новые `open` видят новый.
 pub fn set_backend(gpu: Option<Arc<dyn GpuBackend>>) {
     match &gpu {
-        Some(gpu) => crate::kprintln!("nvgpu: drm backend real registered ({}), node {}", gpu.info().name, if hw() { "on" } else { "off until `nvk hw on`" }),
+        Some(gpu) => crate::kprintln!(
+            "nvgpu: drm backend real registered ({}), node {}{}",
+            gpu.info().name,
+            if hw() { "/dev/dri/renderD128 on" } else { "off until `nvk hw on`" },
+            if local_in_vram() { ", NVK local memory in VRAM" } else { ", NVK local memory in system RAM" }
+        ),
         None => crate::kprintln!("nvgpu: drm backend real removed"),
     }
     BACKENDS.lock().real = gpu;

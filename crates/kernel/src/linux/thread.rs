@@ -131,18 +131,117 @@ pub fn prctl(option: usize, arg: usize) -> i64 {
     const PR_SET_NO_NEW_PRIVS: usize = 38;
     const PR_GET_NO_NEW_PRIVS: usize = 39;
     match option {
-        PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_NAME | PR_SET_NO_NEW_PRIVS => 0,
+        PR_SET_NAME => {
+            // hw-log15: kept per thread - perf-diag names the thread that
+            // spins (`pthread_setname_np` of glibc for the calling thread).
+            // Up to 16 bytes, stopping at the NUL or an unreadable byte (a
+            // short name may end right before an unmapped page).
+            let mut name = [0u8; 16];
+            for (index, byte) in name.iter_mut().enumerate().take(15) {
+                if !space::user_can(arg + index, 1, PageFlags::READ) {
+                    if index == 0 {
+                        return -e::EFAULT;
+                    }
+                    break;
+                }
+                // SAFETY: checked by the line above.
+                *byte = unsafe { core::ptr::read_volatile((arg + index) as *const u8) };
+                if *byte == 0 {
+                    break;
+                }
+            }
+            set_thread_name(&name);
+            0
+        }
+        PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_NO_NEW_PRIVS => 0,
         PR_GET_DUMPABLE | PR_GET_NO_NEW_PRIVS => i64::from(option == PR_GET_DUMPABLE),
         PR_CAPBSET_READ => 0,
         PR_GET_NAME => {
             if !space::user_can(arg, 16, PageFlags::WRITE) {
                 return -e::EFAULT;
             }
-            let name = b"linux\0";
+            let slot = sched::current_slot();
+            let mut name = [0u8; 16];
+            match thread_name(slot) {
+                Some(own) => {
+                    let len = own.len().min(15);
+                    name[..len].copy_from_slice(&own.as_bytes()[..len]);
+                }
+                None => name[..5].copy_from_slice(b"linux"),
+            }
             // SAFETY: проверено строкой выше.
             unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), arg as *mut u8, name.len()) };
             0
         }
         _ => -e::EINVAL,
+    }
+}
+
+/// Thread names (`PR_SET_NAME`) by task slot: 16 bytes, and the task id
+/// they belong to (a reused slot has no name until it sets one).
+static NAMES: [[core::sync::atomic::AtomicU64; 2]; sched::MAX_TASKS] =
+    [const { [const { core::sync::atomic::AtomicU64::new(0) }; 2] }; sched::MAX_TASKS];
+static NAME_IDS: [core::sync::atomic::AtomicU32; sched::MAX_TASKS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; sched::MAX_TASKS];
+
+fn set_thread_name(name: &[u8; 16]) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let slot = sched::current_slot();
+    let id = sched::current();
+    NAME_IDS[slot].store(0, Relaxed);
+    NAMES[slot][0].store(u64::from_le_bytes(name[..8].try_into().unwrap_or([0; 8])), Relaxed);
+    NAMES[slot][1].store(u64::from_le_bytes(name[8..].try_into().unwrap_or([0; 8])), Relaxed);
+    NAME_IDS[slot].store(id.as_u32(), Relaxed);
+}
+
+/// Name a Linux thread gave itself (`PR_SET_NAME`), if the task in `slot`
+/// did.
+#[must_use]
+pub fn thread_name(slot: usize) -> Option<alloc::string::String> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let id = NAME_IDS.get(slot)?.load(Relaxed);
+    if id == 0 || sched::slot_task_id(slot) != Some(id) {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&NAMES[slot][0].load(Relaxed).to_le_bytes());
+    bytes[8..].copy_from_slice(&NAMES[slot][1].load(Relaxed).to_le_bytes());
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(16);
+    Some(alloc::string::String::from_utf8_lossy(&bytes[..len]).into_owned())
+}
+
+/// `yieldnap N` (hw-log15): a thread that calls `sched_yield` in a tight
+/// loop (64 yields in a row, each within 200 us of the last) sleeps `N` us
+/// before each further yield; 0 - off (default: yield stays advisory and
+/// immediate, as in Linux; turn on to test on hardware whether D2R's
+/// getrusage+yield spinner gives its CPU back without losing frames).
+pub static YIELD_NAP_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static YIELD_STREAK: [core::sync::atomic::AtomicU32; sched::MAX_TASKS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; sched::MAX_TASKS];
+static YIELD_LAST_NS: [core::sync::atomic::AtomicU64; sched::MAX_TASKS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; sched::MAX_TASKS];
+/// Naps taken (perf-diag / `yieldnap`).
+pub static YIELD_NAPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Before a `sched_yield` of a Linux thread: nap if it spins (see above).
+pub fn yield_nap() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let nap = YIELD_NAP_US.load(Relaxed);
+    if nap == 0 {
+        return;
+    }
+    let slot = sched::current_slot();
+    let now = crate::time::uptime_ns();
+    let last = YIELD_LAST_NS[slot].swap(now, Relaxed);
+    let streak = if now.saturating_sub(last) < 200_000 + nap * 1000 {
+        YIELD_STREAK[slot].fetch_add(1, Relaxed) + 1
+    } else {
+        YIELD_STREAK[slot].store(0, Relaxed);
+        0
+    };
+    if streak >= 64 && sched::hrsleep::enabled() {
+        YIELD_NAPS.fetch_add(1, Relaxed);
+        sched::hrsleep::sleep_until_ns(now + nap * 1000, 0, 0, || false);
+        YIELD_LAST_NS[slot].store(crate::time::uptime_ns(), Relaxed);
     }
 }

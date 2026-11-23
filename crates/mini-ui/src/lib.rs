@@ -41,6 +41,8 @@ extern crate alloc;
 
 /// Псевдографика по ячейке терминала: рамки и блоки от края до края (фаза С9).
 pub mod boxdraw;
+/// Классика — кромки и элементы Windows 98 (22.11).
+pub mod classic;
 pub mod draw;
 /// Окно «Открыть» / «Сохранить как» — одно на все программы (20.11).
 pub mod filedlg;
@@ -63,6 +65,9 @@ pub mod kit;
 pub mod paint;
 /// Картинки QOI — обои стола (фаза 72a).
 pub mod qoi;
+/// Масштаб интерфейса в процентах (100/125/150/175/200, 20.11).
+pub mod scale;
+pub use scale::Scale;
 /// Подсветка синтаксиса Блокнота (02.11).
 pub mod syntax;
 pub mod text;

@@ -164,13 +164,35 @@ static CURRENT: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::new(u64::MAX
 static CURRENT_ARGS: [[AtomicU64; 4]; sched::MAX_TASKS] =
     [const { [const { AtomicU64::new(0) }; 4] }; sched::MAX_TASKS];
 
+/// When the current call was entered (`time::uptime_ns`) - for the TLB
+/// shootdown report: "cpu N late, in syscall #nr since X us" (hw-log14).
+static CURRENT_SINCE: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::new(0) }; sched::MAX_TASKS];
+
 /// Поток входит в вызов `number` (`usize::MAX` — выходит).
 pub fn begin(number: usize, args: &[usize; 6]) {
     let slot = sched::current_slot();
     for (cell, value) in CURRENT_ARGS[slot].iter().zip(args) {
         cell.store(*value as u64, Ordering::Relaxed);
     }
+    if number != usize::MAX {
+        CURRENT_SINCE[slot].store(crate::time::uptime_ns(), Ordering::Relaxed);
+    }
     CURRENT[slot].store(number as u64, Ordering::Relaxed);
+}
+
+/// The Linux call the task running on `cpu` is in right now: `(number,
+/// nanoseconds since it was entered, task slot)`; `None` - that CPU runs no
+/// Linux call (kernel task, user code, idle). Lock-free and racy by design:
+/// a diagnostic snapshot taken while that CPU does not answer a flush.
+#[must_use]
+pub fn on_cpu(cpu: usize) -> Option<(u64, u64, usize)> {
+    let slot = sched::running_slot_on(cpu)?;
+    let number = CURRENT.get(slot)?.load(Ordering::Relaxed);
+    if number == u64::MAX {
+        return None;
+    }
+    let since = CURRENT_SINCE[slot].load(Ordering::Relaxed);
+    Some((number, crate::time::uptime_ns().saturating_sub(since), slot))
 }
 
 /// Вызов, в котором стоит поток слота `slot`: номер и четыре аргумента.

@@ -582,6 +582,15 @@ pub struct Task {
     /// значит «не исполняется».
     pub cpu: Option<usize>,
 
+    /// Задача уходит с процессора: контекст ещё сохраняется (D4, 20.11.2026).
+    /// Метку [`Self::cpu`] уходящей снимает теперь сам планировщик под своим
+    /// замком, а «переключение ещё не кончилось» живёт здесь — и снимает его
+    /// пришедшая задача без замка (`sched::finish_switch`): прежде на это
+    /// уходил второй захват замка планировщика на каждое переключение
+    /// (0,6–0,8 млн ожиданий за 30 с в hw-log12). Пока стоит — взять задачу
+    /// и освободить её стек нельзя, как и с меткой.
+    pub leaving: core::sync::atomic::AtomicBool,
+
     /// Настоящая точка входа и её аргумент.
     ///
     /// Контекст новой задачи ведёт не в неё, а в общий батут планировщика: тот
@@ -673,6 +682,7 @@ impl Task {
             result: 0,
             daemon: false,
             cpu: Some(cpu),
+            leaving: core::sync::atomic::AtomicBool::new(false),
             entry: None,
             arg: 0,
             futex_keys: None,
@@ -720,6 +730,7 @@ impl Task {
             result: 0,
             daemon: false,
             cpu: None,
+            leaving: core::sync::atomic::AtomicBool::new(false),
             entry: None,
             arg: 0,
             futex_keys: None,

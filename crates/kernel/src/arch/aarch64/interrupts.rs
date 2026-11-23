@@ -584,6 +584,8 @@ fn handle_irq(from_user: bool) {
         // немедленно вернул бы нас сюда же.
         // SAFETY: таймер инициализирован (иначе INTID 30 не был бы разрешён).
         unsafe { timer::rearm() };
+        // No one-shot here: fine sleeps (hrsleep) end on the tick.
+        let _ = crate::sched::hrsleep::on_timer_interrupt(false);
         crate::irq::on_timer_tick();
     } else if intid == input::UART_INTID {
         // Ровно та же логика, что у таймера: линия UART уровневая, и `EOI` до

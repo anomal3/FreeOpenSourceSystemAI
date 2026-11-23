@@ -34,8 +34,12 @@ pub fn ppoll(fds: usize, count: usize, timeout: usize) -> i64 {
 }
 
 fn wait(fds: usize, count: usize, deadline: Option<u64>) -> i64 {
-    if count > 4096 || !space::user_can(fds, count * 8, PageFlags::WRITE) {
+    // Как у Linux: `EINVAL` — только за число записей, плохой адрес — `EFAULT`.
+    if count > 4096 {
         return -e::EINVAL;
+    }
+    if !space::user_can(fds, count * 8, PageFlags::WRITE) {
+        return -e::EFAULT;
     }
     loop {
         let seen = crate::io_events::generation();

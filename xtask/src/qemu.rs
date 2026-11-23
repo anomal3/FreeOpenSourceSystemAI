@@ -90,6 +90,9 @@ pub enum DiskBus {
     /// держалось до Phase 26c с пометкой «проверить нечем» — а проверить, как
     /// выяснилось, есть чем.
     Nvme4k,
+    /// Флешка USB (20.11): `usb-storage` на xHCI, загрузочная — живой образ
+    /// так, как его вставит человек (пакеты `\FREEOS\PKG` ставятся сами).
+    Usb,
 }
 
 impl DiskBus {
@@ -510,6 +513,9 @@ fn attach_disk(
             );
             cmd.args(["-device", &device]);
         }
+        // Флешка — устройство на шине USB, а контроллер заводится позже
+        // (`command`, после дисков): `usb-storage` подключается там же.
+        DiskBus::Usb => {}
     }
     Ok(())
 }
@@ -637,6 +643,15 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
     // подключена, `sendkey` QEMU отдаёт нажатия ей, а не PS/2 (проверено
     // счётчиком отчётов), и до контроллера PS/2 не доходит ничего.
     cmd.args(["-device", &format!("usb-kbd,bus={},id=usbkbd", opts.usb.bus())]);
+    // Живой образ флешкой USB (`DiskBus::Usb`): носитель `-drive` уже заведён
+    // в `attach_disk`, здесь — устройство на появившейся шине, загрузочное.
+    if opts.disk_bus == DiskBus::Usb {
+        for (index, drive) in opts.drives.iter().enumerate() {
+            if matches!(drive, Drive::Image(_)) {
+                cmd.args(["-device", &format!("usb-storage,bus={},drive=disk{index},bootindex=0", opts.usb.bus())]);
+            }
+        }
+    }
     // Манипулятор — второе устройство на том же контроллере, и именно поэтому
     // он здесь: он занимает **свой** слот и своё кольцо. Одно устройство на
     // контроллер драйвер обслуживал бы вдвое меньшим кодом — и молча отдавал бы

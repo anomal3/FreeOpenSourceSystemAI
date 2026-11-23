@@ -48,7 +48,7 @@ use mini_ui::draw;
 use mini_ui::glyphicon::{self, Icon};
 use mini_ui::iconset::{self, Fi};
 use mini_ui::typeface::Role;
-use mini_ui::{Rect, Surface};
+use mini_ui::{Color, Rect, Surface};
 
 use mini_ui::paint::{self, Ctx, RowState};
 use mini_ui::theme;
@@ -538,9 +538,6 @@ pub static UNPIN_TASKBAR: core::sync::atomic::AtomicBool = core::sync::atomic::A
 enum Mode {
     /// Обычный список пунктов.
     Menu,
-    /// Ждём подтверждения удаления: `forever` — стереть (очистка корзины),
-    /// иначе — перенести в корзину.
-    Confirm { name: String, forever: bool },
 }
 
 /// Что меню просит сделать в ответ на клавишу.
@@ -555,17 +552,13 @@ pub enum Reply {
     Close,
     /// Выполнить пункт.
     Run(Action),
-    /// Перенос в корзину подтверждён.
-    Delete,
-    /// Очистка корзины подтверждена.
-    EmptyTrash,
 }
 
 /// Меню стола: где оно, что в нём выбрано и чем оно занято.
 pub struct ContextMenu {
     surface: Surface,
     pub rect: Rect,
-    scale: u32,
+    scale: mini_ui::Scale,
     /// Пункты этого открытия — они зависят от того, куда щёлкнули.
     items: Vec<Action>,
     selected: usize,
@@ -606,7 +599,7 @@ pub struct ContextMenu {
 
 impl ContextMenu {
     #[must_use]
-    pub fn new(scale: u32) -> Option<Self> {
+    pub fn new(scale: mini_ui::Scale) -> Option<Self> {
         let ctx = Ctx::scaled(scale);
         // Ширина считается по самому длинному пункту и по самой длинной
         // подсказке: меню, которое меняет ширину вместе с содержимым, прыгало
@@ -764,8 +757,13 @@ impl ContextMenu {
         let enabled: Vec<bool> = self.sub_items.iter().map(|action| self.is_enabled(*action)).collect();
         let s = &mut self.sub_surface;
         s.fill(Rect::new(0, 0, s.width(), card.h), glass);
-        draw::rounded_stroke(s, card, radius, p.line3.color, p.line3.alpha);
-        draw::crown(s, card, radius, p.crown.color, p.crown.alpha);
+        if theme::is_classic() {
+            // Классика (22.11): меню Windows 98 — серая карточка с кромкой.
+            mini_ui::classic::raised(s, card, mini_ui::classic::unit(ctx.scale));
+        } else {
+            draw::rounded_stroke(s, card, radius, p.line3.color, p.line3.alpha);
+            draw::crown(s, card, radius, p.crown.color, p.crown.alpha);
+        }
         draw_lines(inner, s, card, &layout.lines);
         for (index, slot) in layout.rows.iter().enumerate() {
             draw_row(inner, s, slot, &labels[index], index == self.sub_selected, enabled[index]);
@@ -898,26 +896,6 @@ impl ContextMenu {
         Rect::new(0, 0, self.rect.w, self.rect.h)
     }
 
-    /// Спросить, точно ли удалять: `forever` — стереть безвозвратно (очистка
-    /// корзины), иначе — перенести в корзину (макет 18).
-    pub fn start_confirm(&mut self, name: &str, forever: bool) {
-        self.widen();
-        self.mode = Mode::Confirm { name: name.to_string(), forever };
-        self.note = None;
-        self.fit(confirm_height(self.ctx()));
-        self.redraw();
-    }
-
-    /// Поле имени и вопрос об удалении шире пунктов: подсказки под ними
-    /// длинные. Карточка расширяется влево, если справа не хватает экрана.
-    fn widen(&mut self) {
-        let wide = self.surface.width();
-        if self.rect.w < wide {
-            self.rect.w = wide;
-            let max_x = (self.area.right() - wide as i32).max(self.area.x);
-            self.rect.x = self.rect.x.clamp(self.area.x, max_x);
-        }
-    }
 
     /// Подогнать карточку под новую высоту, не дав ей выехать вниз.
     ///
@@ -939,16 +917,6 @@ impl ContextMenu {
         }
         match &mut self.mode {
             Mode::Menu => self.menu_key(event.code),
-            Mode::Confirm { forever, .. } => match event.code {
-                KeyCode::Y | KeyCode::Enter if *forever => Reply::EmptyTrash,
-                KeyCode::Y | KeyCode::Enter => Reply::Delete,
-                KeyCode::N | KeyCode::Escape => {
-                    self.mode = Mode::Menu;
-                    self.redraw();
-                    Reply::Handled
-                }
-                _ => Reply::Handled,
-            },
         }
     }
 
@@ -1111,8 +1079,13 @@ impl ContextMenu {
             // углы срезает композитор, а точки, оставшиеся от прошлой
             // отрисовки, просвечивали бы сквозь его сглаживание.
             s.fill(bounds, glass);
-            draw::rounded_stroke(s, card, radius, p.line3.color, p.line3.alpha);
-            draw::crown(s, card, radius, p.crown.color, p.crown.alpha);
+            if theme::is_classic() {
+                // Классика (22.11): меню Windows 98 — серая карточка с кромкой.
+                mini_ui::classic::raised(s, card, mini_ui::classic::unit(ctx.scale));
+            } else {
+                draw::rounded_stroke(s, card, radius, p.line3.color, p.line3.alpha);
+                draw::crown(s, card, radius, p.crown.color, p.crown.alpha);
+            }
         }
 
         match &self.mode {
@@ -1130,10 +1103,6 @@ impl ContextMenu {
                         draw_cross(inner, s, slot.rect, index == selected, index == selected && self.cross);
                     }
                 }
-            }
-            Mode::Confirm { name, forever } => {
-                let s = &mut self.surface;
-                draw_confirm(inner, s, card, name, *forever);
             }
         }
 
@@ -1241,13 +1210,6 @@ fn rows_height(ctx: Ctx, items: &[Action]) -> u32 {
     (last + ctx.px(CARD_PAD) as i32).max(0) as u32
 }
 
-/// Высота карточки с вопросом об удалении.
-fn confirm_height(ctx: Ctx) -> u32 {
-    let title = u32::from(ctx.face(Role::Strong).line);
-    let caption = u32::from(ctx.face(Role::Caption).line);
-    ctx.px(CARD_PAD + 4) + title + ctx.px(8) + caption * 2 + ctx.px(10) + caption + ctx.px(CARD_PAD + 4)
-}
-
 /// Ширина места под крестик в строке окна.
 const CROSS: u32 = 28;
 
@@ -1289,7 +1251,12 @@ fn draw_cross(ctx: Ctx, s: &mut Surface, row: Rect, shown: bool, hot: bool) {
 fn draw_lines(ctx: Ctx, s: &mut Surface, card: Rect, lines: &[i32]) {
     let inset = ctx.px(CARD_PAD + ROW_PAD_L);
     for y in lines {
-        paint::separator(ctx, s, card.x + inset as i32, *y, card.w.saturating_sub(inset * 2));
+        if theme::is_classic() {
+            let t = mini_ui::classic::unit(ctx.scale);
+            mini_ui::classic::groove_h(s, card.x + ctx.px(3) as i32, *y, card.w.saturating_sub(ctx.px(6)), t);
+        } else {
+            paint::separator(ctx, s, card.x + inset as i32, *y, card.w.saturating_sub(inset * 2));
+        }
     }
 }
 
@@ -1299,11 +1266,15 @@ fn draw_lines(ctx: Ctx, s: &mut Surface, card: Rect, lines: &[i32]) {
 fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool, enabled: bool) {
     let p = ctx.palette;
     let lit = selected && enabled;
+    let classic = theme::is_classic();
     if lit {
-        paint::row(ctx, s, slot.rect, RowState::Hover);
+        // Классика (22.11): пункт под указателем — тёмно-синий, белым.
+        paint::row(ctx, s, slot.rect, if classic { RowState::Selected } else { RowState::Hover });
     }
     let ink = if !enabled {
-        p.ink4
+        if classic { theme::win98::SHADE } else { p.ink4 }
+    } else if lit && classic {
+        Color::rgb(0xFF, 0xFF, 0xFF)
     } else if lit {
         p.ink
     } else {
@@ -1335,30 +1306,6 @@ fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool,
     // подтянутая к краю, ломает колонку подписей.
     let x = slot.rect.x + (pad_l + icon + ctx.px(ICON_GAP)) as i32;
     paint::text_clipped(ctx, s, Role::Body, x, paint::baseline(ctx, Role::Body, slot.rect), (right - x).max(0) as u32, label, ink);
-}
-
-/// Вопрос об удалении.
-fn draw_confirm(ctx: Ctx, s: &mut Surface, card: Rect, name: &str, forever: bool) {
-    let p = ctx.palette;
-    let pad = ctx.px(CARD_PAD + ROW_PAD);
-    let left = card.x + pad as i32;
-    let width = card.w.saturating_sub(pad * 2);
-    let mut y = card.y + ctx.px(CARD_PAD + 4) as i32;
-
-    // Макет 18: вопрос, пояснение, что будет; ответ — клавишей.
-    let (question, first, second) = if forever {
-        (alloc::format!("Стереть: {name}?"), "Удалённое из корзины стирается навсегда.", "Вернуть его будет нельзя.")
-    } else {
-        (alloc::format!("Удалить «{name}»?"), "Файл будет перемещён в корзину.", "Его можно восстановить, пока корзина не очищена.")
-    };
-    paint::text_clipped(ctx, s, Role::Strong, left, y, width, &question, p.ink);
-    y += (u32::from(ctx.face(Role::Strong).line) + ctx.px(8)) as i32;
-    for line in [first, second] {
-        paint::text_clipped(ctx, s, Role::Caption, left, y, width, line, p.ink3);
-        y += i32::from(ctx.face(Role::Caption).line);
-    }
-    y += ctx.px(10) as i32;
-    paint::text_clipped(ctx, s, Role::Caption, left, y, width, CONFIRM_HINT, if forever { p.bad_ink } else { p.acc_ink });
 }
 
 /// Каталог стола — там появляется всё, что создаётся его меню.

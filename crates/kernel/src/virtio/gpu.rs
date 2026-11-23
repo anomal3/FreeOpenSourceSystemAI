@@ -134,6 +134,9 @@ struct VirtioGpu {
     cursor: Option<Cursor>,
     /// Память ресурса курсора — заводится один раз.
     cursor_memory: Option<PhysAddr>,
+    /// G3: per output, the client buffer shown instead of the desktop
+    /// resource ([`flip_scanout`]): its resource and physical address.
+    flips: [Option<(u32, u64)>; MAX_SCANOUTS],
 }
 
 #[derive(Clone, Copy)]
@@ -214,10 +217,48 @@ pub fn release_scanout(scanout: usize) {
     }
     if let Some(scan) = gpu.scans[scanout].take() {
         let _ = gpu.set_scanout(scanout, 0, 0, 0);
+        if let Some((resource, _)) = gpu.flips[scanout].take() {
+            let _ = gpu.detach_and_unref(resource);
+        }
         let _ = gpu.detach_and_unref(scan.resource);
         // SAFETY: ресурс снят, устройство память больше не читает.
         crate::mm::frame::with(|frames| unsafe { frames.free_contiguous(scan.screen.memory, scan.screen.pages) });
     }
+}
+
+/// Screen off (22.11): `false` - every lit output shows nothing
+/// (`SET_SCANOUT` with resource 0, the virtio way to disable a scanout: the
+/// host window says "Display output is not active"); `true` - the desktop
+/// resource (or the flipped client buffer) back, transferred whole. Returns
+/// how many outputs changed.
+pub fn set_power(on: bool) -> usize {
+    let mut guard = GPU.lock();
+    let Some(gpu) = guard.as_mut() else {
+        return 0;
+    };
+    let mut done = 0;
+    for scanout in 0..MAX_SCANOUTS {
+        let Some(scan) = gpu.scans[scanout] else {
+            continue;
+        };
+        let (w, h) = (scan.screen.width, scan.screen.height);
+        let result = if on {
+            let id = gpu.flips[scanout].map_or(scan.resource, |(resource, _)| resource);
+            gpu.set_scanout(scanout, id, w, h)
+                .and_then(|()| gpu.transfer(id, (0, 0, w, h), w))
+                .and_then(|()| gpu.resource_flush((0, 0, w, h), id))
+        } else {
+            gpu.set_scanout(scanout, 0, 0, 0)
+        };
+        match result {
+            Ok(()) => {
+                done += 1;
+                kprintln!("  virtio-gpu  : output {scanout} scanout {}", if on { "enabled again" } else { "disabled (display off)" });
+            }
+            Err(err) => kprintln!("  virtio-gpu  : output {scanout} scanout {} failed: {err}", if on { "enable" } else { "disable" }),
+        }
+    }
+    done
 }
 
 /// Показать изменившийся прямоугольник выхода `scanout` (свои координаты).
@@ -366,7 +407,103 @@ pub fn cursor_visible(visible: bool, x: i32, y: i32) {
     }
 }
 
+/// G3: resource numbers of client buffers shown on `scanout` (two, in turn).
+const fn flip_resource(scanout: usize, second: bool) -> u32 {
+    200 + 2 * scanout as u32 + second as u32
+}
+
+/// G3 (21.11): show the client buffer at `phys` (physically contiguous,
+/// the output's size, rows of width x 4 bytes, XRGB8888) on `scanout`
+/// instead of the desktop resource; `None` - the desktop resource again
+/// (the compositor repainted it). The QEMU stand-in of the NVIDIA page flip:
+/// a resource backed by the client buffer is created, transferred and put on
+/// the scanout; the one shown before is released. Every command completes
+/// before the answer, so the host never reads the buffer later on its own.
+pub fn flip_scanout(scanout: usize, phys: Option<u64>) -> Result<(), &'static str> {
+    let mut guard = GPU.lock();
+    let gpu = guard.as_mut().ok_or("no virtio-gpu")?;
+    let scan = gpu.scans.get(scanout).copied().flatten().ok_or("virtio-gpu output not lit")?;
+    let (w, h) = (scan.screen.width, scan.screen.height);
+    let old = gpu.flips[scanout];
+    let whole = (0, 0, w, h);
+    match phys {
+        Some(addr) if old.is_some_and(|(_, at)| at == addr) => Ok(()),
+        Some(addr) => {
+            let id = flip_resource(scanout, old.is_some_and(|(resource, _)| resource == flip_resource(scanout, false)));
+            let made = gpu
+                .create_backed(id, w, h, addr, u64::from(w) * 4 * u64::from(h))
+                .and_then(|()| gpu.transfer(id, whole, w))
+                .and_then(|()| gpu.set_scanout(scanout, id, w, h))
+                .and_then(|()| gpu.resource_flush(whole, id));
+            if let Err(err) = made {
+                kprintln!("  virtio-gpu  : output {scanout} cannot show the client buffer: {err}");
+                let _ = gpu.set_scanout(scanout, scan.resource, w, h);
+                let _ = gpu.detach_and_unref(id);
+                return Err("virtio-gpu refused the client buffer");
+            }
+            if let Some((resource, _)) = old {
+                let _ = gpu.detach_and_unref(resource);
+            }
+            gpu.flips[scanout] = Some((id, addr));
+            Ok(())
+        }
+        None => {
+            let Some((resource, _)) = old else {
+                return Ok(());
+            };
+            gpu.set_scanout(scanout, scan.resource, w, h)
+                .and_then(|()| gpu.transfer(scan.resource, whole, w))
+                .and_then(|()| gpu.resource_flush(whole, scan.resource))
+                .map_err(|_| "virtio-gpu did not take the desktop resource back")?;
+            let _ = gpu.detach_and_unref(resource);
+            gpu.flips[scanout] = None;
+            Ok(())
+        }
+    }
+}
+
+/// G3: the flipped client buffer of `scanout` changed `(x, y, w, h)` in
+/// place - transfer it to the host.
+pub fn flip_refresh(scanout: usize, x: i32, y: i32, w: u32, h: u32) {
+    let mut guard = GPU.lock();
+    let Some(gpu) = guard.as_mut() else {
+        return;
+    };
+    let (Some(scan), Some((resource, _))) = (gpu.scans.get(scanout).copied().flatten(), gpu.flips.get(scanout).copied().flatten()) else {
+        return;
+    };
+    let screen = scan.screen;
+    let left = x.max(0) as u32;
+    let top = y.max(0) as u32;
+    let right = (i64::from(x) + i64::from(w)).clamp(0, i64::from(screen.width)) as u32;
+    let bottom = (i64::from(y) + i64::from(h)).clamp(0, i64::from(screen.height)) as u32;
+    if left >= right || top >= bottom {
+        return;
+    }
+    let rect = (left, top, right - left, bottom - top);
+    if let Err(err) = gpu.transfer(resource, rect, screen.width).and_then(|()| gpu.resource_flush(rect, resource)) {
+        kprintln!("  virtio-gpu  : flush of the client buffer on output {scanout} failed: {err}");
+    }
+}
+
 impl VirtioGpu {
+    /// G3: a 2D resource backed by `bytes` of guest memory at `phys`.
+    fn create_backed(&mut self, id: u32, width: u32, height: u32, phys: u64, bytes: u64) -> Result<(), VirtioError> {
+        self.header(CMD_RESOURCE_CREATE_2D);
+        self.put_u32(HEADER_SIZE, id);
+        self.put_u32(HEADER_SIZE + 4, FORMAT_B8G8R8X8_UNORM);
+        self.put_u32(HEADER_SIZE + 8, width);
+        self.put_u32(HEADER_SIZE + 12, height);
+        self.submit(HEADER_SIZE + 16, HEADER_SIZE, RESP_OK_NODATA)?;
+        self.header(CMD_RESOURCE_ATTACH_BACKING);
+        self.put_u32(HEADER_SIZE, id);
+        self.put_u32(HEADER_SIZE + 4, 1);
+        self.put_u64(HEADER_SIZE + 8, phys);
+        self.put_u32(HEADER_SIZE + 16, bytes as u32);
+        self.put_u32(HEADER_SIZE + 20, 0);
+        self.submit(HEADER_SIZE + 24, HEADER_SIZE, RESP_OK_NODATA)
+    }
+
     /// # Safety
     ///
     /// Ядро должно исполняться на собственных таблицах страниц.
@@ -398,6 +535,7 @@ impl VirtioGpu {
             cursor_command,
             cursor: None,
             cursor_memory: None,
+            flips: [None; MAX_SCANOUTS],
         };
         gpu.display_info()?;
         let (enabled, w, h) = gpu.heads[0];
@@ -476,6 +614,10 @@ impl VirtioGpu {
             return Err(DisplayError::Refused("virtio-gpu refused the resource"));
         }
 
+        // G3: a client buffer the output showed is replaced too.
+        if let Some((resource, _)) = self.flips[scanout].take() {
+            let _ = self.detach_and_unref(resource);
+        }
         // Экран показывает новый ресурс — старый можно снять.
         if let Some(old) = self.scans[scanout].take() {
             let _ = self.detach_and_unref(old.resource);

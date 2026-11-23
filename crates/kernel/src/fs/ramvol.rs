@@ -199,6 +199,14 @@ pub fn mount_missing_scratch() {
     if missing("/root") && mount("/root", 4096, "scratch-root", *b"fossai-scratch-r") {
         let _ = super::chmod_as(crate::vfs::perm::Credentials::ROOT, "/root", 0o700);
     }
+    // `/etc` (21.11, журнал 13): на живой флешке его нет вовсе, и настройки
+    // стола (громкость, панель, тема) не записывались — «volume not saved: no
+    // such file or directory» на каждое движение ползунка. Пустой том в
+    // памяти: чтение настроек и так идёт к эталону образа, пока в `/etc`
+    // ничего не записано; записанное живёт до перезагрузки.
+    if missing("/etc") && mount("/etc", 64, "scratch-etc", *b"fossai-scratch-e") {
+        let _ = super::chmod_as(crate::vfs::perm::Credentials::ROOT, "/etc", 0o755);
+    }
 }
 
 /// Есть ли у живой системы `/opt` и `/var` для пакетов.

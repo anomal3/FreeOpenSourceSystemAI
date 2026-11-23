@@ -116,7 +116,7 @@ pub struct User {
 pub struct Start {
     surface: Surface,
     pub rect: Rect,
-    scale: u32,
+    scale: mini_ui::Scale,
     query: String,
     focused: bool,
     user: User,
@@ -160,7 +160,7 @@ fn bg() -> Color {
 impl Start {
     /// Собрать лист. `bottom` — нижний край: над доком или над клавиатурой.
     #[must_use]
-    pub fn open(screen_w: u32, bottom: i32, scale: u32, user: User, focused: bool) -> Option<Self> {
+    pub fn open(screen_w: u32, bottom: i32, scale: mini_ui::Scale, user: User, focused: bool) -> Option<Self> {
         let ctx = Ctx::scaled(scale);
         let side = ctx.px(8);
         let width = screen_w.checked_sub(side * 2).filter(|w| *w > 0)?;

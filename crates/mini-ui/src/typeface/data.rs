@@ -5615,6 +5615,7 @@ pub static CAPTIONNORMAL: Face = Face {
     ascent: 11,
     mono: 0,
     glyphs: &CAPTIONNORMAL_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Body · Normal · 13 pt · вес 400.
@@ -5832,6 +5833,7 @@ pub static BODYNORMAL: Face = Face {
     ascent: 13,
     mono: 0,
     glyphs: &BODYNORMAL_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Label · Normal · 12 pt · вес 500.
@@ -6049,6 +6051,7 @@ pub static LABELNORMAL: Face = Face {
     ascent: 12,
     mono: 0,
     glyphs: &LABELNORMAL_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Title · Normal · 13 pt · вес 600.
@@ -6266,6 +6269,7 @@ pub static TITLENORMAL: Face = Face {
     ascent: 13,
     mono: 0,
     glyphs: &TITLENORMAL_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Strong · Normal · 14 pt · вес 600.
@@ -6483,6 +6487,7 @@ pub static STRONGNORMAL: Face = Face {
     ascent: 14,
     mono: 0,
     glyphs: &STRONGNORMAL_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Heading · Normal · 20 pt · вес 600.
@@ -6700,6 +6705,7 @@ pub static HEADINGNORMAL: Face = Face {
     ascent: 20,
     mono: 0,
     glyphs: &HEADINGNORMAL_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Mono · Normal · 12 pt · вес 400.
@@ -6917,6 +6923,7 @@ pub static MONONORMAL: Face = Face {
     ascent: 13,
     mono: 7,
     glyphs: &MONONORMAL_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// MonoSmall · Normal · 11 pt · вес 400.
@@ -7134,6 +7141,7 @@ pub static MONOSMALLNORMAL: Face = Face {
     ascent: 12,
     mono: 7,
     glyphs: &MONOSMALLNORMAL_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// MonoCaps · Normal · 10 pt · вес 500.
@@ -7351,6 +7359,7 @@ pub static MONOCAPSNORMAL: Face = Face {
     ascent: 11,
     mono: 6,
     glyphs: &MONOCAPSNORMAL_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Caption · Large · 15 pt · вес 400.
@@ -7568,6 +7577,7 @@ pub static CAPTIONLARGE: Face = Face {
     ascent: 15,
     mono: 0,
     glyphs: &CAPTIONLARGE_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Body · Large · 18 pt · вес 400.
@@ -7785,6 +7795,7 @@ pub static BODYLARGE: Face = Face {
     ascent: 18,
     mono: 0,
     glyphs: &BODYLARGE_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Label · Large · 16 pt · вес 500.
@@ -8002,6 +8013,7 @@ pub static LABELLARGE: Face = Face {
     ascent: 16,
     mono: 0,
     glyphs: &LABELLARGE_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Title · Large · 18 pt · вес 600.
@@ -8219,6 +8231,7 @@ pub static TITLELARGE: Face = Face {
     ascent: 18,
     mono: 0,
     glyphs: &TITLELARGE_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Strong · Large · 19 pt · вес 600.
@@ -8436,6 +8449,7 @@ pub static STRONGLARGE: Face = Face {
     ascent: 19,
     mono: 0,
     glyphs: &STRONGLARGE_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Heading · Large · 27 pt · вес 600.
@@ -8653,6 +8667,7 @@ pub static HEADINGLARGE: Face = Face {
     ascent: 27,
     mono: 0,
     glyphs: &HEADINGLARGE_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// Mono · Large · 16 pt · вес 400.
@@ -8870,6 +8885,7 @@ pub static MONOLARGE: Face = Face {
     ascent: 17,
     mono: 10,
     glyphs: &MONOLARGE_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// MonoSmall · Large · 14 pt · вес 400.
@@ -9087,6 +9103,7 @@ pub static MONOSMALLLARGE: Face = Face {
     ascent: 15,
     mono: 8,
     glyphs: &MONOSMALLLARGE_GLYPHS,
+    coverage: &COVERAGE,
 };
 
 /// MonoCaps · Large · 13 pt · вес 500.
@@ -9304,4 +9321,5 @@ pub static MONOCAPSLARGE: Face = Face {
     ascent: 14,
     mono: 8,
     glyphs: &MONOCAPSLARGE_GLYPHS,
+    coverage: &COVERAGE,
 };

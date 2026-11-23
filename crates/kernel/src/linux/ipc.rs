@@ -1202,30 +1202,12 @@ pub fn eventfd(initial: usize, flags: usize) -> i64 {
 
 // ---- inotify -------------------------------------------------------------------
 
-/// `inotify` (фаза 71i): наблюдение принимается, событий не бывает — файлы
-/// в системе меняют только сами программы. Chromium без него не поднимает
-/// сетевую службу (наблюдает `/etc/resolv.conf` и `/etc/hosts`).
-struct Inotify {
-    next: Mutex<i32>,
-}
-
-impl Object for Inotify {
-    fn read(&self, _buf: &mut [u8]) -> Result<usize, i64> {
-        Err(-e::EAGAIN)
-    }
-    fn write(&self, _data: &[u8]) -> Result<usize, i64> {
-        Err(-e::EINVAL)
-    }
-    fn readiness(&self) -> (bool, bool, bool) {
-        (false, false, false)
-    }
-    fn mode(&self) -> u32 {
-        0
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+/// `inotify` (фаза 71i; с 20.11 — с настоящими событиями): тот же объект,
+/// что у родных программ ([`crate::fs::notify::Watcher`]). Chromium без него
+/// не поднимает сетевую службу (наблюдает `/etc/resolv.conf` и `/etc/hosts`).
+/// Наблюдение за файлом (а не каталогом) принимается и молчит: события —
+/// только об именах в каталоге.
+use crate::fs::notify::Watcher as Inotify;
 
 /// `inotify_init1(flags)` (и `inotify_init` с нулём).
 pub fn inotify_init(flags: usize) -> i64 {
@@ -1235,19 +1217,29 @@ pub fn inotify_init(flags: usize) -> i64 {
     if flags & !(IN_NONBLOCK | IN_CLOEXEC) != 0 {
         return -e::EINVAL;
     }
-    install(Arc::new(Inotify { next: Mutex::new(1) }), flags & IN_NONBLOCK != 0, flags & IN_CLOEXEC != 0)
+    let Some(queue) = crate::fs::notify::Queue::new() else {
+        return -e::EMFILE;
+    };
+    install(Arc::new(Inotify { queue }), flags & IN_NONBLOCK != 0, flags & IN_CLOEXEC != 0)
 }
 
 /// `inotify_add_watch(fd, path, mask)`: номер наблюдения.
-pub fn inotify_add_watch(fd: usize) -> i64 {
+pub fn inotify_add_watch(fd: usize, path: &str, mask: u32) -> i64 {
     match object_of(fd) {
         Ok((object, _)) => match object.as_any().downcast_ref::<Inotify>() {
-            Some(inotify) => {
-                let mut next = inotify.next.lock();
-                *next += 1;
-                i64::from(*next - 1)
-            }
+            Some(inotify) => inotify.queue.add(path, mask & 0x0fff).map_or(-e::ENOSPC, i64::from),
             None => -e::EINVAL,
+        },
+        Err(err) => err,
+    }
+}
+
+/// `inotify_rm_watch(fd, wd)`.
+pub fn inotify_rm_watch(fd: usize, wd: usize) -> i64 {
+    match object_of(fd) {
+        Ok((object, _)) => match object.as_any().downcast_ref::<Inotify>() {
+            Some(inotify) if inotify.queue.remove(wd as i32) => 0,
+            _ => -e::EINVAL,
         },
         Err(err) => err,
     }

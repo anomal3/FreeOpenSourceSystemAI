@@ -334,6 +334,35 @@ impl SharedMem {
         .is_ok()
     }
 
+    /// Адрес ядра куска `[offset, offset + len)`, если его кадры лежат
+    /// подряд и уже есть (буфер DRM, выделенный одним куском) — так сервер
+    /// Wayland показывает кадр игры без копии (D4, 20.11.2026). `None` —
+    /// кадры вразброс или их нет.
+    #[must_use]
+    pub fn contiguous(&self, offset: u64, len: u64) -> Option<*mut u8> {
+        if len == 0 {
+            return None;
+        }
+        let first = (offset as usize) / PAGE_SIZE;
+        let last = (offset.checked_add(len - 1)? as usize) / PAGE_SIZE;
+        let frames = self.frames.lock();
+        let base = *frames.get(&first)?;
+        let mut count = 0usize;
+        for (page, frame) in frames.range(first..=last) {
+            let want = base.as_u64() + ((page - first) * PAGE_SIZE) as u64;
+            if *page != first + count || frame.as_u64() != want {
+                return None;
+            }
+            count += 1;
+        }
+        if count != last - first + 1 {
+            return None;
+        }
+        // SAFETY: кадры принадлежат объекту (или его владельцу `keep`) и живы,
+        // пока жив он; прямое отображение подряд идущих кадров — подряд.
+        Some(unsafe { super::frame_bytes(base).add(offset as usize % PAGE_SIZE) })
+    }
+
     fn copy(&self, offset: u64, len: usize, mut each: impl FnMut(*mut u8, usize, usize)) -> VfsResult<()> {
         let mut done = 0;
         let mut frames = self.frames.lock();

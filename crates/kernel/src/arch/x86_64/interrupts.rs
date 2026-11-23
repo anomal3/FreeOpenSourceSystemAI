@@ -141,6 +141,10 @@ pub const VECTOR_SYSCALL: u8 = 0x80;
 /// `dispatch` узнаёт вызов Linux раньше, чем отрежет номер до байта.
 const LINUX_SYSCALL_MARK: u64 = 0x100;
 
+/// Linux calls run with interrupts on (hw-log14, 21.11.2026); `lxirq off`
+/// keeps them off for the whole call, as before - for A/B on one image.
+pub static LINUX_SYSCALL_IRQS: AtomicBool = AtomicBool::new(true);
+
 /// MSR входа `syscall` (SDM, Vol. 3A, 5.8.8).
 const IA32_EFER: u32 = 0xC000_0080;
 const IA32_STAR: u32 = 0xC000_0081;
@@ -463,11 +467,27 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
     // хочется: номер вектора по определению не шире байта.
     // Вызов программы Linux (фаза 71a) — до маски: его «вектор» шире байта.
     if frame.vector == LINUX_SYSCALL_MARK {
+        // Interrupts on for the whole call (hw-log14, 21.11.2026), like Linux
+        // and like our own `int 0x80` (a trap gate): `syscall` masks IF only
+        // so that nothing lands on the program's stack, and the entry stub has
+        // already switched to this task's kernel stack and put GS back. Until
+        // now a Linux call ran start to end with IF = 0 - a 2 ms read from
+        // the stick or a long ioctl/mprotect left the CPU deaf to TLB flush
+        // IPIs and to the timer, and D2R's 16 threads stalled 7-16 ms in
+        // shootdowns waiting for it. The handlers are the native ones (run
+        // with IF = 1 for native programs) plus the Linux layer, which holds
+        // no `Racy` state and pins per-CPU work with `without_interrupts` or
+        // the scheduler lock. Off again before the epilogue: `iretq` takes
+        // IF from the saved user RFLAGS. `lxirq off` - the old way (A/B).
+        if LINUX_SYSCALL_IRQS.load(Ordering::Relaxed) {
+            enable();
+        }
         // SAFETY: кадр сложен входом `syscall` из третьего кольца, то есть
         // `enter_user` исполняется и вернуться есть куда.
         unsafe { crate::linux::syscall(frame) };
         // SAFETY: см. тот же вызов у родного системного вызова ниже.
         unsafe { crate::user::check_kill() };
+        disable();
         return;
     }
     let vector = (frame.vector & 0xFF) as u8;
@@ -478,7 +498,7 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
     // `int 0x80` программы Linux — системный вызов i386 (12.11.2026): Wine в
     // режиме WoW64 так заводит 32-битный `FS` (`set_thread_area`). Родной ABI
     // `int 0x80` ей не положен.
-    if vector == VECTOR_SYSCALL && crate::user::with_current(|program| program.linux).unwrap_or(false) {
+    if vector == VECTOR_SYSCALL && crate::user::current_is_linux() {
         frame.rax = crate::linux::i386_syscall(frame) as i32 as u32 as u64;
         // SAFETY: как у родного системного вызова ниже.
         unsafe { crate::user::check_kill() };
@@ -582,7 +602,12 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
     if vector >= VECTOR_FIRST_EXTERNAL {
         match vector {
             apic::VECTOR_TIMER => {
-                crate::irq::on_timer_tick();
+                // A one-shot of a fine sleeper (hrsleep) or the regular tick;
+                // the one-shot runs the tick's work only when it is owed.
+                let short = apic::timer_fired();
+                if crate::sched::hrsleep::on_timer_interrupt(short) {
+                    crate::irq::on_timer_tick();
+                }
                 apic::eoi();
             }
             // Клавиатура и приём по UART: оба обработчика вычитывают устройство
@@ -811,9 +836,9 @@ const KERNEL_FAULT_LOG: u64 = 8;
 /// запись, присутствующая страница и нет) идёт в `user::kernel_fault_in`, а
 /// неразобранный пишет причину.
 ///
-/// Флаг прерываний — как у прерванного кода: вызовы программ Linux входят
-/// через `syscall` и исполняются с запрещёнными прерываниями, но без локов;
-/// разбор под ними может уснуть на мьютексе — как и сам вызов.
+/// Флаг прерываний — как у прерванного кода (вызовы программ Linux с
+/// 21.11.2026 исполняются с разрешёнными, см. `dispatch`); разбор может
+/// уснуть на мьютексе — как и сам вызов.
 fn kernel_user_fault(frame: &mut TrapFrame) -> bool {
     let addr = read_cr2();
     if frame.error & (PF_INSTRUCTION_FETCH | PF_RESERVED) != 0
@@ -1200,6 +1225,8 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
     let was_enabled = enabled();
     let since = if was_enabled {
         disable();
+        // Where this CPU went deaf - for the TLB shootdown report (G2).
+        crate::sync::mark_irq_off(core::ptr::from_ref(core::panic::Location::caller()) as usize);
         crate::latency::start()
     } else {
         0
@@ -1207,6 +1234,7 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
     let result = f();
     if was_enabled {
         crate::latency::irq_off_ended(since, core::panic::Location::caller());
+        crate::sync::mark_irq_off(0);
         enable();
     }
     result

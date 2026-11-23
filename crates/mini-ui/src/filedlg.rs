@@ -132,6 +132,9 @@ const STANDARD: [(&str, &str, &str, Fi); 6] = [
 pub enum Mode {
     Open,
     Save,
+    /// «Выбор папки» (20.11, `FolderBrowserDialog`): в списке только папки,
+    /// кнопка выбирает выделенную папку или ту, где стоим.
+    Folder,
 }
 
 /// Тип файла в списке «Тип файла»: подпись и расширения (строчными, без
@@ -184,19 +187,36 @@ pub struct Options {
     pub filter: usize,
     /// Галочка «Добавлять расширение».
     pub add_extension: bool,
+    /// Окно — отдельное окно стола (20.11, `/bin/filedlg`), а не карточка
+    /// поверх окна программы: заголовок, крестик и тень рисует стол, окно
+    /// занимает всю поверхность.
+    pub windowed: bool,
 }
 
 impl Options {
     /// «Открыть»: все файлы, без имени.
     #[must_use]
     pub fn open() -> Self {
-        Self { mode: Mode::Open, title: None, dir: None, name: String::new(), filters: vec![Filter::all()], filter: 0, add_extension: false }
+        Self { mode: Mode::Open, title: None, dir: None, name: String::new(), filters: vec![Filter::all()], filter: 0, add_extension: false, windowed: false }
     }
 
     /// «Сохранить как» с именем по умолчанию.
     #[must_use]
     pub fn save(name: &str) -> Self {
-        Self { mode: Mode::Save, title: None, dir: None, name: name.to_string(), filters: vec![Filter::all()], filter: 0, add_extension: true }
+        Self { mode: Mode::Save, title: None, dir: None, name: name.to_string(), filters: vec![Filter::all()], filter: 0, add_extension: true, windowed: false }
+    }
+
+    /// «Выбор папки».
+    #[must_use]
+    pub fn folder() -> Self {
+        Self { mode: Mode::Folder, title: None, dir: None, name: String::new(), filters: vec![Filter::all()], filter: 0, add_extension: false, windowed: false }
+    }
+
+    /// Отдельным окном стола.
+    #[must_use]
+    pub fn windowed(mut self) -> Self {
+        self.windowed = true;
+        self
     }
 
     #[must_use]
@@ -302,20 +322,23 @@ pub trait Host {
 // ---------------------------------------------------------------------------
 
 /// Строка с кареткой и выделением. Позиции — в символах, не байтах.
+///
+/// Открыта наружу (21.11): ею же правят адрес в «Файлах» — щелчок справа
+/// от звеньев, как в Проводнике и в этом окне.
 #[derive(Clone, Default, Debug)]
-struct Line {
-    text: String,
+pub struct Line {
+    pub text: String,
     caret: usize,
     anchor: Option<usize>,
 }
 
 impl Line {
-    fn new(text: &str) -> Self {
+    pub fn new(text: &str) -> Self {
         Self { text: text.to_string(), caret: text.chars().count(), anchor: None }
     }
 
     /// Строка, выделенная целиком (имя по умолчанию, адрес при правке).
-    fn selected(text: &str) -> Self {
+    pub fn selected(text: &str) -> Self {
         let mut line = Self::new(text);
         if !text.is_empty() {
             line.anchor = Some(0);
@@ -372,7 +395,7 @@ impl Line {
 
     /// Клавиша правки. `None` — не своя; `Some(changed)` — разобрана, и
     /// `changed` — поменялся ли текст.
-    fn key(&mut self, code: u32, mods: i32, latin: u32) -> Option<bool> {
+    pub fn key(&mut self, code: u32, mods: i32, latin: u32) -> Option<bool> {
         let shift = mods & MOD_SHIFT != 0;
         let ctrl = mods & MOD_CTRL != 0;
         match code {
@@ -443,7 +466,7 @@ impl Line {
     }
 
     /// Каретку — к точке `x` (от левого края текста).
-    fn click(&mut self, face: &Face, room: u32, x: i32) {
+    pub fn click(&mut self, face: &Face, room: u32, x: i32) {
         let first = self.first_shown(face, room);
         let mut pen = 0i32;
         let mut at = first;
@@ -460,7 +483,7 @@ impl Line {
     }
 
     /// Нарисовать текст в `rect` (уже с полями): выделение, каретку.
-    fn draw(&self, ctx: Ctx, s: &mut Surface, rect: Rect, focused: bool, ink: Color) {
+    pub fn draw(&self, ctx: Ctx, s: &mut Surface, rect: Rect, focused: bool, ink: Color) {
         let p = ctx.palette;
         let face = ctx.face(Role::Body);
         let first = self.first_shown(face, rect.w.saturating_sub(ctx.px(2)));
@@ -559,6 +582,8 @@ enum View {
 enum Target {
     Row(usize),
     Place(usize),
+    /// Звено адреса под указателем (21.11: подсветка, как в Проводнике).
+    Crumb(usize),
 }
 
 /// Окно «Открыть» / «Сохранить как». См. заголовок модуля.
@@ -608,6 +633,8 @@ pub struct FileDialog {
     /// Раскладка последней отрисовки — клавишам (PageDown листает ровно на
     /// экран, а сколько это — знает только отрисовка).
     geometry: Cell<Option<(Ctx, Rect)>>,
+    /// Отдельное окно стола (см. [`Options::windowed`]).
+    windowed: bool,
 }
 
 impl FileDialog {
@@ -640,7 +667,7 @@ impl FileDialog {
             .flatten()
             .find(|dir| host.stat(dir) == Some(true))
             .unwrap_or_else(|| String::from("/"));
-        let title = options.title.clone().unwrap_or_else(|| String::from(if options.mode == Mode::Save { "Сохранить как" } else { "Открыть" }));
+        let title = options.title.clone().unwrap_or_else(|| default_title(options.mode).to_string());
         let filters = if options.filters.is_empty() { vec![Filter::all()] } else { options.filters };
         let filter = options.filter.min(filters.len() - 1);
         let mut dialog = Self {
@@ -674,11 +701,49 @@ impl FileDialog {
             scroll: kit::Scroll::new(),
             hover: None,
             geometry: Cell::new(None),
+            windowed: options.windowed,
         };
         dialog.places = dialog.make_places(host);
         dialog.reload(host);
-        host.log(&format!("filedlg: {} at {}", if dialog.mode == Mode::Save { "save" } else { "open" }, dialog.dir));
+        let mode = match dialog.mode {
+            Mode::Save => "save",
+            Mode::Open => "open",
+            Mode::Folder => "folder",
+        };
+        host.log(&format!("filedlg: {mode} at {}", dialog.dir));
         dialog
+    }
+
+    /// Заголовок окна («Сохранить как», «Открыть», «Выбор папки» или свой).
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Папка, которую сейчас показывает список, — за ней стоит следить
+    /// (`None` — «Этот компьютер»).
+    #[must_use]
+    pub fn watched_dir(&self) -> Option<&str> {
+        (self.dir != COMPUTER).then_some(self.dir.as_str())
+    }
+
+    /// Папку поменял кто-то другой (20.11, событие наблюдения): перечитать,
+    /// сохранив выделение и прокрутку. Во время переименования — не сейчас.
+    pub fn refresh(&mut self, host: &dyn Host) -> bool {
+        if self.rename.is_some() {
+            return false;
+        }
+        let keep = self.selected_row().map(|row| row.path.clone());
+        let top = self.top;
+        self.reload(host);
+        if let Some(at) = keep.and_then(|path| self.shown.iter().position(|index| self.rows[*index].path == path)) {
+            self.selected = Some(at);
+        }
+        let (per_line, lines) = self.page();
+        let last = self.shown.len().div_ceil(per_line.max(1)).saturating_sub(lines);
+        self.top = top.min(last);
+        host.log(&format!("filedlg: refreshed {} ({} items)", self.dir, self.shown.len()));
+        true
     }
 
     /// Текущая папка.
@@ -751,7 +816,8 @@ impl FileDialog {
                 Ok(items) => {
                     let filter = &self.filters[self.filter];
                     for item in items {
-                        if item.name.starts_with('.') || (!item.dir && !filter.matches(&item.name)) {
+                        let hidden = !item.dir && (self.mode == Mode::Folder || !filter.matches(&item.name));
+                        if item.name.starts_with('.') || hidden {
                             continue;
                         }
                         let (icon, kind) = host.kind(&item.name, item.dir);
@@ -820,6 +886,10 @@ impl FileDialog {
         self.search = Line::default();
         self.address = None;
         self.rename = None;
+        // «Выбор папки»: имя в поле было именем папки там, откуда ушли.
+        if self.mode == Mode::Folder {
+            self.name = Line::default();
+        }
         self.reload(host);
         if self.focus == Focus::Search || self.focus == Focus::Address {
             self.focus = Focus::List;
@@ -939,6 +1009,10 @@ impl FileDialog {
             if !row.dir {
                 let name = row.label.clone();
                 self.name = if self.mode == Mode::Save { Line::selected(&name) } else { Line::new(&name) };
+            } else if self.mode == Mode::Folder {
+                // «Выбор папки»: в поле — выделенная папка (у тома — путь).
+                let name = if row.volume || self.dir == COMPUTER { row.path.clone() } else { row.path.rsplit('/').next().unwrap_or("").to_string() };
+                self.name = Line::new(&name);
             }
         }
     }
@@ -964,6 +1038,9 @@ impl FileDialog {
     fn accept(&mut self, host: &dyn Host) -> Outcome {
         self.error = None;
         let typed = self.name.text.trim().to_string();
+        if self.mode == Mode::Folder {
+            return self.accept_folder(host, &typed);
+        }
         if typed.is_empty() {
             if let Some(row) = self.selected_row().cloned() {
                 if row.dir {
@@ -1031,6 +1108,46 @@ impl FileDialog {
                     return Outcome::Pending;
                 }
                 self.chosen(host, path)
+            }
+        }
+    }
+
+    /// «Выбор папки»: имя в поле (выделенная папка, набранный путь) или,
+    /// если поле пусто, папка, где стоим.
+    fn accept_folder(&mut self, host: &dyn Host, typed: &str) -> Outcome {
+        let path = if typed.is_empty() {
+            if self.dir == COMPUTER {
+                self.error = Some(String::from("Выберите папку"));
+                return Outcome::Pending;
+            }
+            self.dir.clone()
+        } else if typed.starts_with('/') {
+            normalize(typed)
+        } else if let Some(rest) = typed.strip_prefix("~/") {
+            normalize(&join(&self.home, rest))
+        } else if typed == "~" {
+            self.home.clone()
+        } else if self.dir == COMPUTER {
+            self.error = Some(String::from("Выберите папку"));
+            return Outcome::Pending;
+        } else {
+            normalize(&join(&self.dir, typed))
+        };
+        match host.stat(&path) {
+            Some(true) => {
+                host.log(&format!("filedlg: chosen {path}"));
+                host.remember_dir(&path);
+                Outcome::Chosen(path)
+            }
+            Some(false) => {
+                self.error = Some(String::from("Это файл, а нужна папка"));
+                Outcome::Pending
+            }
+            None => {
+                let leaf = path.rsplit('/').next().unwrap_or("").to_string();
+                self.error = Some(format!("Папка «{leaf}» не найдена"));
+                self.focus = Focus::Name;
+                Outcome::Pending
             }
         }
     }
@@ -1350,6 +1467,12 @@ impl FileDialog {
         if lay.places.contains(x, y) {
             return lay.place_rects(ctx, &self.places).iter().position(|rect| rect.contains(x, y)).map(Target::Place);
         }
+        if lay.address.contains(x, y) {
+            if self.address.is_some() {
+                return None;
+            }
+            return self.crumbs(ctx, lay).iter().position(|(rect, _)| rect.contains(x, y)).map(Target::Crumb);
+        }
         if !lay.rows.contains(x, y) {
             return None;
         }
@@ -1582,19 +1705,31 @@ impl FileDialog {
     pub fn draw(&self, host: &dyn Host, s: &mut Surface, ctx: Ctx, area: Rect) {
         self.geometry.set(Some((ctx, area)));
         let lay = Layout::new(ctx, area, self);
-        draw::blend_rect(s, area, Color::rgb(0, 0, 0), 110);
-        let inner = kit::card(ctx, s, lay.card);
+        let inner = if self.windowed {
+            // Отдельное окно (20.11): рамку, заголовок и тень рисует стол.
+            s.fill(area, ctx.flat(ctx.palette.panel));
+            ctx.on(theme::panel_bg())
+        } else {
+            draw::blend_rect(s, area, Color::rgb(0, 0, 0), 110);
+            kit::card(ctx, s, lay.card)
+        };
         let p = inner.palette;
         let pad = ctx.px(16) as i32;
 
         // ── Заголовок и панель ──────────────────────────────────────────────
-        let g = ctx.px(18);
-        iconset::draw(s, if self.mode == Mode::Save { Fi::Download } else { Fi::FolderOpen }, lay.card.x + pad, lay.close.y + (lay.close.h as i32 - g as i32) / 2, g, p.acc, 255);
-        paint::text(inner, s, Role::Title, lay.card.x + pad + g as i32 + ctx.px(10) as i32, paint::baseline(inner, Role::Title, lay.close), &self.title, p.ink);
+        if !self.windowed {
+            let g = ctx.px(18);
+            let icon = match self.mode {
+                Mode::Save => Fi::Download,
+                Mode::Open | Mode::Folder => Fi::FolderOpen,
+            };
+            iconset::draw(s, icon, lay.card.x + pad, lay.close.y + (lay.close.h as i32 - g as i32) / 2, g, p.acc, 255);
+            paint::text(inner, s, Role::Title, lay.card.x + pad + g as i32 + ctx.px(10) as i32, paint::baseline(inner, Role::Title, lay.close), &self.title, p.ink);
+            icon_only(inner, s, lay.close, Fi::X, true);
+        }
         ghost_button(inner, s, lay.new_folder, Some(Fi::Plus), "Новая папка");
         segmented(inner, s, lay.view_details, Fi::List, self.view == View::Details);
         segmented(inner, s, lay.view_icons, Fi::Apps, self.view == View::Icons);
-        icon_only(inner, s, lay.close, Fi::X, true);
 
         // ── Строка адреса ───────────────────────────────────────────────────
         icon_only(inner, s, lay.back, Fi::ArrowLeft, !self.back.is_empty());
@@ -1613,8 +1748,16 @@ impl FileDialog {
             if crumbs.len() < self.crumb_paths().len() {
                 paint::text(field_ctx, s, Role::Body, lay.address.x + ctx.px(32) as i32, paint::baseline(ctx, Role::Body, lay.address), "…", p.ink3);
             }
-            for (rect, path) in &crumbs {
+            let hot = match self.hover_target(ctx, &lay) {
+                Some(Target::Crumb(at)) => Some(at),
+                _ => None,
+            };
+            for (index, (rect, path)) in crumbs.iter().enumerate() {
                 let label = self.crumb_label(path);
+                // Звено под указателем подсвечено, как строка списка.
+                if hot == Some(index) {
+                    paint::row(field_ctx, s, *rect, RowState::Hover);
+                }
                 let gs = ctx.px(10);
                 iconset::draw(s, Fi::ChevronRight, rect.x - ctx.px(14) as i32, lay.address.y + (lay.address.h as i32 - gs as i32) / 2, gs, p.ink4, 255);
                 let last = *path == self.dir;
@@ -1675,26 +1818,35 @@ impl FileDialog {
 
         // ── Низ: имя, тип, кнопки ───────────────────────────────────────────
         let label_role = Role::Body;
-        paint::text_right(inner, s, label_role, lay.name.x - ctx.px(10) as i32, paint::baseline(ctx, label_role, lay.name), "Имя файла:", p.ink2);
-        paint::text_right(inner, s, label_role, lay.kind.x - ctx.px(10) as i32, paint::baseline(ctx, label_role, lay.kind), "Тип файла:", p.ink2);
+        let name_label = if self.mode == Mode::Folder { "Папка:" } else { "Имя файла:" };
+        paint::text_right(inner, s, label_role, lay.name.x - ctx.px(10) as i32, paint::baseline(ctx, label_role, lay.name), name_label, p.ink2);
         paint::sunk(inner, s, lay.name, ctx.px(theme::R_ROW));
         if self.focus == Focus::Name {
             draw::rounded_stroke(s, lay.name, ctx.px(theme::R_ROW), p.acc, 255);
         }
         self.name.draw(field_ctx, s, field_text(ctx, lay.name), self.focus == Focus::Name, p.ink);
-        paint::sunk(inner, s, lay.kind, ctx.px(theme::R_ROW));
-        if self.type_menu.is_some() {
-            draw::rounded_stroke(s, lay.kind, ctx.px(theme::R_ROW), p.acc, 255);
+        // У «Выбора папки» типа файла нет.
+        if !lay.kind.is_empty() {
+            paint::text_right(inner, s, label_role, lay.kind.x - ctx.px(10) as i32, paint::baseline(ctx, label_role, lay.kind), "Тип файла:", p.ink2);
+            paint::sunk(inner, s, lay.kind, ctx.px(theme::R_ROW));
+            if self.type_menu.is_some() {
+                draw::rounded_stroke(s, lay.kind, ctx.px(theme::R_ROW), p.acc, 255);
+            }
+            let gc = ctx.px(12);
+            iconset::draw(s, Fi::ChevronDown, lay.kind.right() - ctx.px(22) as i32, lay.kind.y + (lay.kind.h as i32 - gc as i32) / 2, gc, p.ink3, 255);
+            let kind_text = field_text(ctx, lay.kind);
+            paint::text_clipped(field_ctx, s, Role::Body, kind_text.x, paint::baseline(ctx, Role::Body, kind_text), kind_text.w.saturating_sub(ctx.px(24)), &self.filters[self.filter].label, p.ink);
         }
-        let gc = ctx.px(12);
-        iconset::draw(s, Fi::ChevronDown, lay.kind.right() - ctx.px(22) as i32, lay.kind.y + (lay.kind.h as i32 - gc as i32) / 2, gc, p.ink3, 255);
-        let kind_text = field_text(ctx, lay.kind);
-        paint::text_clipped(field_ctx, s, Role::Body, kind_text.x, paint::baseline(ctx, Role::Body, kind_text), kind_text.w.saturating_sub(ctx.px(24)), &self.filters[self.filter].label, p.ink);
 
         if self.mode == Mode::Save {
             checkbox(inner, s, lay.check, self.add_ext, "Добавлять расширение");
         }
-        paint::button(inner, s, lay.ok, Weight::Primary, if self.mode == Mode::Save { "Сохранить" } else { "Открыть" }, false);
+        let ok_label = match self.mode {
+            Mode::Save => "Сохранить",
+            Mode::Open => "Открыть",
+            Mode::Folder => "Выбор папки",
+        };
+        paint::button(inner, s, lay.ok, Weight::Primary, ok_label, false);
         paint::button(inner, s, lay.cancel, Weight::Normal, "Отмена", false);
         let (message, ink) = match &self.error {
             Some(error) => (error.clone(), p.bad_ink),
@@ -1984,18 +2136,27 @@ impl Layout {
         let margin = ctx.px(12);
         let w = ctx.px(860).min(area.w.saturating_sub(margin * 2)).max(ctx.px(320).min(area.w));
         let h = ctx.px(560).min(area.h.saturating_sub(margin * 2)).max(ctx.px(300).min(area.h));
-        let card = Rect::new(area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 2, w, h);
+        // Отдельное окно (20.11) — во всю поверхность.
+        let card = if dialog.windowed { area } else { Rect::new(area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 2, w, h) };
         let pad = ctx.px(16) as i32;
         let gap = ctx.px(6) as i32;
         let b = ctx.px(32);
 
-        // Заголовок: подпись слева; «Новая папка», вид, крестик справа.
+        // Заголовок: подпись слева; «Новая папка», вид, крестик справа. У
+        // отдельного окна подпись и крестик — в заголовке стола, здесь —
+        // строка команд: «Новая папка» слева, вид справа, как в Проводнике.
         let title_y = card.y + ctx.px(10) as i32;
-        let close = Rect::new(card.right() - pad - b as i32, title_y, b, b);
-        let view_icons = Rect::new(close.x - ctx.px(14) as i32 - b as i32, title_y, b, b);
-        let view_details = Rect::new(view_icons.x - b as i32, title_y, b, b);
         let nf_w = ctx.face(Role::Body).width("Новая папка") + ctx.px(46);
-        let new_folder = Rect::new(view_details.x - ctx.px(10) as i32 - nf_w as i32, title_y, nf_w, b);
+        let (close, view_icons, view_details, new_folder) = if dialog.windowed {
+            let view_icons = Rect::new(card.right() - pad - b as i32, title_y, b, b);
+            let view_details = Rect::new(view_icons.x - b as i32, title_y, b, b);
+            (Rect::new(view_icons.x, title_y, 0, b), view_icons, view_details, Rect::new(card.x + pad, title_y, nf_w, b))
+        } else {
+            let close = Rect::new(card.right() - pad - b as i32, title_y, b, b);
+            let view_icons = Rect::new(close.x - ctx.px(14) as i32 - b as i32, title_y, b, b);
+            let view_details = Rect::new(view_icons.x - b as i32, title_y, b, b);
+            (close, view_icons, view_details, Rect::new(view_details.x - ctx.px(10) as i32 - nf_w as i32, title_y, nf_w, b))
+        };
 
         // Адрес: назад, вперёд, вверх, крошки с «обновить», поиск.
         let nav_y = close.bottom() + ctx.px(10) as i32;
@@ -2013,7 +2174,8 @@ impl Layout {
         let button_h = ctx.px(34);
         let bw = ctx.px(116);
         let cancel = Rect::new(card.right() - pad - bw as i32, card.bottom() - pad - button_h as i32, bw, button_h);
-        let ok = Rect::new(cancel.x - ctx.px(10) as i32 - bw as i32, cancel.y, bw, button_h);
+        let ok_w = if dialog.mode == Mode::Folder { bw.max(ctx.face(Role::Body).width("Выбор папки") + ctx.px(36)) } else { bw };
+        let ok = Rect::new(cancel.x - ctx.px(10) as i32 - ok_w as i32, cancel.y, ok_w, button_h);
         let check_label = ctx.face(Role::Body).width("Добавлять расширение");
         let check_w = check_label + ctx.px(28);
         let check = if dialog.mode == Mode::Save { Rect::new(ok.x - ctx.px(24) as i32 - check_w as i32, ok.y, check_w, button_h) } else { Rect::EMPTY };
@@ -2023,6 +2185,8 @@ impl Layout {
         let fields_w = (card.right() - pad - fields_x).max(0) as u32;
         let kind = Rect::new(fields_x, ok.y - ctx.px(14) as i32 - field_h as i32, fields_w, field_h);
         let name = Rect::new(fields_x, kind.y - ctx.px(8) as i32 - field_h as i32, fields_w, field_h);
+        // «Выбор папки» — без типа файла: имя встаёт на его место.
+        let (name, kind) = if dialog.mode == Mode::Folder { (kind, Rect::new(kind.x, kind.y, 0, 0)) } else { (name, kind) };
 
         // Тело.
         let body_y = nav_y + b as i32 + ctx.px(10) as i32;
@@ -2234,6 +2398,16 @@ fn checkbox(ctx: Ctx, s: &mut Surface, rect: Rect, on: bool, label: &str) {
 // ---------------------------------------------------------------------------
 // Пути и слова
 // ---------------------------------------------------------------------------
+
+/// Заголовок окна по умолчанию.
+#[must_use]
+pub fn default_title(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Save => "Сохранить как",
+        Mode::Open => "Открыть",
+        Mode::Folder => "Выбор папки",
+    }
+}
 
 /// Имя в папке: `dir` + `/` + `name`.
 #[must_use]

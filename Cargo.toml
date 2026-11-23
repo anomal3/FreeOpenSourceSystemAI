@@ -26,6 +26,7 @@ members = [
     "crates/nvgpu",
     "crates/osupdate",
     "crates/raster",
+    "crates/screencast",
     "crates/slots",
     "crates/ssh",
     "crates/swipe",

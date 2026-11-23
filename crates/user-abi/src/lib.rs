@@ -1443,6 +1443,17 @@ pub const SYS_WINOWNER: usize = 76;
 /// поднятии уходит подчинённому.
 pub const WIN_OWNER_MODAL: u32 = 1;
 
+/// [`SYS_WINOWNER`] (20.11): поставить окно посередине владельца (в
+/// пределах рабочей области) — так открываются окна выбора файла.
+///
+/// С 20.11 владелец бывает и окном **другой** программы того же
+/// пользователя: `/bin/filedlg` открывает «Сохранить как» над Блокнотом,
+/// который его запустил. Номер окна несёт номер задачи (см. [`SYS_WINOPEN`]),
+/// так что владелец назван однозначно. Модальное окно чужой программы не
+/// получает своей кнопки на панели задач, владелец ввода не принимает, пока
+/// оно открыто, а закрытие владельца закрывает и его.
+pub const WIN_OWNER_CENTER: u32 = 2;
+
 /// Открыть всплывающее окно над окном-владельцем. `(указатель на
 /// WindowSpec, id владельца, (x << 32) | y) -> 0` (фаза 62e).
 ///
@@ -1698,6 +1709,149 @@ pub const SYS_SIGACTION: usize = 91;
 /// на который указывает стек (`ret` обработчика снял адрес возврата).
 pub const SYS_SIGRETURN: usize = 92;
 
+/// Наблюдение за каталогами (20.11, как `inotify` Linux):
+/// `((действие << 32) | дескриптор, a1, a2)` — действие [`FSWATCH_OPEN`],
+/// [`FSWATCH_ADD`], [`FSWATCH_REMOVE`] или [`FSWATCH_READ`].
+///
+/// * `OPEN: (0, 0, 0) -> дескриптор` — очередь событий (не ждущая);
+///   закрывается обычным [`SYS_CLOSE`], вместе с ней снимаются все её
+///   наблюдения.
+/// * `ADD: (…, указатель на путь, (маска << 32) | длина) -> номер наблюдения`
+///   — следить за каталогом (маска — `FSN_*`, ноль — все).
+/// * `REMOVE: (…, номер, 0) -> 0`.
+/// * `READ: (…, буфер, длина) -> байт` — события, разобранные
+///   записями [`FsEvent`] с именем следом (как `struct inotify_event`: имя
+///   с нулём и выравниванием до 16 байт входит в `len`). Ноль — событий нет:
+///   вызов не ждёт.
+///
+/// Событие говорит об **имени в каталоге**: создан, удалён, переименован,
+/// записан и закрыт файл. Стол обновляет по ним значки, «Файлы» — открытые
+/// папки, окно выбора файла — свой список.
+pub const SYS_FSWATCH: usize = 93;
+/// Действия [`SYS_FSWATCH`].
+pub const FSWATCH_OPEN: usize = 0;
+pub const FSWATCH_ADD: usize = 1;
+pub const FSWATCH_REMOVE: usize = 2;
+pub const FSWATCH_READ: usize = 3;
+/// Маска события [`SYS_FSWATCH`] — те же биты, что у `inotify` Linux.
+pub const FSN_MODIFY: u32 = 0x2;
+pub const FSN_ATTRIB: u32 = 0x4;
+pub const FSN_CLOSE_WRITE: u32 = 0x8;
+pub const FSN_MOVED_FROM: u32 = 0x40;
+pub const FSN_MOVED_TO: u32 = 0x80;
+pub const FSN_CREATE: u32 = 0x100;
+pub const FSN_DELETE: u32 = 0x200;
+pub const FSN_DELETE_SELF: u32 = 0x400;
+/// Очередь переполнилась: часть событий потеряна, перечитать каталог целиком.
+pub const FSN_OVERFLOW: u32 = 0x4000;
+/// Имя — каталог.
+pub const FSN_ISDIR: u32 = 0x4000_0000;
+
+/// Запись события [`SYS_FSWATCH`] (раскладка `struct inotify_event`); за ней
+/// `len` байт имени — с нулём в конце и нулями до кратного 16.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FsEvent {
+    pub wd: i32,
+    pub mask: u32,
+    pub cookie: u32,
+    pub len: u32,
+}
+
+/// «Открыть с помощью» (22.11): `(действие | длина_входа << 32, адрес
+/// буфера, длина буфера) -> длина ответа`. Вход — первые `длина_входа` байт
+/// буфера, ответ пишется в тот же буфер; ответ длиннее буфера обрезан —
+/// повторить с большим.
+///
+/// [`OPENWITH_LIST`] — вход: путь файла; ответ: строки
+/// `признак\tподпись\tкоманда\tзначок\n` (`d` — выбрана человеком, `f` —
+/// подходит к типу, `o` — прочие программы). Запуск — `команда ПУТЬ`, у
+/// `fossai-proton` путь с `%20`. [`OPENWITH_ICON`] — вход: значок из списка;
+/// ответ: картинка FIMG (до 64×64). [`OPENWITH_REMEMBER`] — вход:
+/// `расширение\tкоманда` («всегда открывать этой программой», `open_with=`
+/// в `desktop.cfg`); ответ — 0.
+pub const SYS_OPEN_WITH: usize = 94;
+pub const OPENWITH_LIST: usize = 0;
+pub const OPENWITH_ICON: usize = 1;
+pub const OPENWITH_REMEMBER: usize = 2;
+
+/// Screen capture for the recorder (22.11, `/bin/screenrec`):
+/// `(action, a1, a2) -> answer`. One capture at a time on the whole system.
+///
+/// The compositor keeps a mirror of the captured rectangle in ordinary
+/// memory, filled at present time from the composed bands (or the client
+/// buffer of a fullscreen window shown directly), so a grab costs one copy
+/// and never reads the scanout memory.
+///
+/// * [`CAP_INFO`] — `a1` = [`CapInfo`]: monitors on the desktop.
+/// * [`CAP_START`] — `a1` = [`CapSpec`]: start; [`ERR_EXISTS`] if another
+///   capture runs.
+/// * [`CAP_GRAB`] — `a1` = buffer of `w * h` points (`u32`, the format of
+///   [`CapInfo::format`]), `a2` = the sequence number of the frame the caller
+///   already has. Answer: sequence number of the frame now in the buffer
+///   (> 0); equal to `a2` — nothing changed and nothing was copied.
+/// * [`CAP_STOP`] — `a1`/`a2` = path of the saved file (UTF-8; empty — no
+///   notification): stop and show «Запись сохранена».
+/// * [`CAP_STATUS`] — `a1` = [`CapStatus`].
+/// * [`CAP_REQUEST_STOP`] — ask the recording program to stop (hotkey,
+///   tray, the recorder window).
+/// * [`CAP_WINDOWS`] — `a1`/`a2` = text buffer: windows top first, lines
+///   `x\ty\tw\th\tname\n`; answer — bytes written.
+pub const SYS_SCREENCAP: usize = 95;
+pub const CAP_INFO: usize = 0;
+pub const CAP_START: usize = 1;
+pub const CAP_GRAB: usize = 2;
+pub const CAP_STOP: usize = 3;
+pub const CAP_STATUS: usize = 4;
+pub const CAP_REQUEST_STOP: usize = 5;
+pub const CAP_WINDOWS: usize = 6;
+
+/// [`CapSpec::flags`]: draw the pointer into the frames.
+pub const CAP_POINTER: u32 = 1;
+
+/// Monitors on the desktop (desktop coordinates, top-left of the union is
+/// 0,0) — answer of [`CAP_INFO`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CapInfo {
+    pub count: u32,
+    /// [`PIXEL_RGB`] or [`PIXEL_BGR`].
+    pub format: u32,
+    pub desk_w: u32,
+    pub desk_h: u32,
+    /// `x, y, w, h` of each monitor, primary first.
+    pub outputs: [[i32; 4]; 8],
+}
+
+/// What to capture — argument of [`CAP_START`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CapSpec {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    /// `CAP_*` flags.
+    pub flags: u32,
+    pub fps: u32,
+}
+
+/// State of the capture — answer of [`CAP_STATUS`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CapStatus {
+    /// 1 — a capture runs.
+    pub active: u32,
+    /// 1 — somebody asked the recorder to stop.
+    pub stop_requested: u32,
+    pub w: u32,
+    pub h: u32,
+    /// Milliseconds since the start.
+    pub elapsed_ms: u64,
+    /// Frames changed so far (sequence number).
+    pub seq: u64,
+}
+
 /// Размер буфера вывода [`SYS_KERNEL_COMMAND`].
 pub const KERNEL_COMMAND_OUT: usize = 64 * 1024;
 
@@ -1869,7 +2023,54 @@ pub const SYSINFO_SCALE_100: u32 = 2;
 /// [`SysInfo::flags`]: масштаб стола задан человеком — 200 %.
 pub const SYSINFO_SCALE_200: u32 = 4;
 
+/// [`SysInfo::flags`]: классическое оформление (Windows 98, 22.11) —
+/// программа рисует серой гранью с объёмными кромками
+/// (`mini_ui::theme::set_classic`). Бит 16 — выше поля масштаба.
+pub const SYSINFO_CLASSIC: u32 = 1 << 16;
+
+/// [`SysInfo::flags`]: тема значков (22.11) — номер в
+/// `mini_ui::image::ICON_THEMES`, биты 17..20. Программы берут значки из
+/// `/usr/share/icons/<тема>.pak` и меняют их на ходу.
+pub const SYSINFO_ICONS_SHIFT: u32 = 17;
+/// Маска поля [`SYSINFO_ICONS_SHIFT`].
+pub const SYSINFO_ICONS_MASK: u32 = 0x7 << SYSINFO_ICONS_SHIFT;
+
+/// Номер темы значков из [`SysInfo::flags`].
+#[must_use]
+pub const fn sysinfo_icon_theme(flags: u32) -> u8 {
+    ((flags & SYSINFO_ICONS_MASK) >> SYSINFO_ICONS_SHIFT) as u8
+}
+
+/// [`SysInfo::flags`]: масштаб стола в процентах (100/125/150/175/200) —
+/// биты 8..16 (20.11, дробный масштаб). Ноль — ядро старое, смотреть на
+/// [`SYSINFO_SCALE_100`]/[`SYSINFO_SCALE_200`]. Старые биты ядро ставит
+/// по-прежнему (125 % — `SCALE_100`, от 150 % — `SCALE_200`): программа,
+/// собранная раньше, рисует в ближайшем целом масштабе.
+pub const SYSINFO_SCALE_PCT_SHIFT: u32 = 8;
+/// Маска поля [`SYSINFO_SCALE_PCT_SHIFT`].
+pub const SYSINFO_SCALE_PCT_MASK: u32 = 0xFF << SYSINFO_SCALE_PCT_SHIFT;
+
+/// Признаки масштаба для [`SysInfo::flags`] по процентам стола.
+#[must_use]
+pub const fn sysinfo_scale_flags(percent: u32) -> u32 {
+    let legacy = if percent >= 150 { SYSINFO_SCALE_200 } else { SYSINFO_SCALE_100 };
+    legacy | ((percent & 0xFF) << SYSINFO_SCALE_PCT_SHIFT)
+}
+
+/// Масштаб стола из [`SysInfo::flags`] в процентах; 0 — не задан (по
+/// экрану). Понимает и старое ядро (только биты 100/200).
+#[must_use]
+pub const fn sysinfo_scale_percent(flags: u32) -> u32 {
+    let pct = (flags & SYSINFO_SCALE_PCT_MASK) >> SYSINFO_SCALE_PCT_SHIFT;
+    if pct != 0 {
+        pct
+    } else {
+        sysinfo_scale_choice(flags) * 100
+    }
+}
+
 /// Выбор масштаба из [`SysInfo::flags`]: 0 — по экрану, 1 или 2 — задан.
+/// Только целые; дробный — [`sysinfo_scale_percent`].
 #[must_use]
 pub const fn sysinfo_scale_choice(flags: u32) -> u32 {
     if flags & SYSINFO_SCALE_200 != 0 {
@@ -2774,6 +2975,7 @@ mod tests {
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
             SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK, SYS_MODEM, SYS_FLOCK,
+            SYS_FSWATCH, SYS_OPEN_WITH, SYS_SCREENCAP,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(

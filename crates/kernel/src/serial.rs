@@ -7,7 +7,7 @@
 use crate::arch;
 use crate::sync::SpinLock;
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Общий интерфейс UART, который реализует каждая архитектура.
 ///
@@ -58,10 +58,12 @@ impl Tx {
     fn push(&mut self, byte: u8) {
         if self.room() == 0 {
             self.dropped += 1;
+            DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return;
         }
         self.bytes[(self.head % TX_CAPACITY as u64) as usize] = byte;
         self.head += 1;
+        QUEUED_HEAD.store(self.head, Ordering::Release);
     }
 }
 
@@ -77,26 +79,94 @@ impl Write for Tx {
     }
 }
 
+/// Mirrors of `Tx::head`/`Tx::tail` readable without the queue lock: the
+/// idle loop and the tick ask "anything to send?" on every round (G4).
+static QUEUED_HEAD: AtomicU64 = AtomicU64::new(0);
+static QUEUED_TAIL: AtomicU64 = AtomicU64::new(0);
+/// One drainer at a time. A flag, not a lock: the drainer runs with
+/// interrupts on and takes the queue and the port only per FIFO load.
+static PUMPING: AtomicBool = AtomicBool::new(false);
+/// Bytes dropped because the queue was full, since boot (perf-diag).
+static DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes a drain with interrupts off may move per call (the tick, a print
+/// from under a spin lock or an interrupt handler). The rest goes from the
+/// idle loop or the next print with interrupts on.
+const BUDGET_IRQ_OFF: usize = 64;
+
+/// Bytes lost because the queue was full since boot.
+#[must_use]
+pub fn dropped_total() -> u64 {
+    DROPPED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Bytes waiting in the queue.
+#[must_use]
+pub fn queued() -> u64 {
+    QUEUED_HEAD.load(Ordering::Acquire).saturating_sub(QUEUED_TAIL.load(Ordering::Acquire))
+}
+
 /// Переложить из очереди в порт, сколько он примет без ожидания. Зовётся
-/// после печати и из обработчика тика; занято — значит перекладывает другой.
+/// после печати, из обработчика тика и из холостого цикла; занято — значит
+/// перекладывает другой.
+///
+/// G4 (21.11): the drain no longer holds the port and the queue for the whole
+/// batch. It was 4 KiB under both spin locks with interrupts off: on QEMU
+/// every byte is a VM exit, and kprint on a neighbour CPU spun on the queue
+/// lock meanwhile - `irq-off worst 27-55 ms at print.rs:52` on 16 CPUs. Now
+/// the queue lock covers a 16-byte copy, the port lock one FIFO load, and
+/// interrupts are open between loads when the caller had them open. With
+/// interrupts off (tick, print under a lock) only [`BUDGET_IRQ_OFF`] bytes.
 pub fn pump() {
     if !QUEUED.load(Ordering::Acquire) {
         return;
     }
-    let Some(mut port) = SERIAL.try_lock() else { return };
-    let Some(mut tx) = TX.try_lock() else { return };
-    // Не больше 4 КиБ за раз: столько порт QEMU берёт мгновенно, а держать
-    // прерывания запрещёнными дольше незачем — остальное заберёт тик.
-    let mut budget = 4096usize;
-    while tx.head > tx.tail && budget > 0 {
-        let at = (tx.tail % TX_CAPACITY as u64) as usize;
-        let run = ((tx.head - tx.tail) as usize).min(TX_CAPACITY - at).min(budget);
-        let sent = port.try_send(&tx.bytes[at..at + run]);
-        if sent == 0 {
-            break;
+    loop {
+        if queued() == 0 {
+            return;
         }
-        tx.tail += sent as u64;
-        budget -= sent;
+        if PUMPING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let mut budget = if arch::interrupts::enabled() { usize::MAX } else { BUDGET_IRQ_OFF };
+        let mut port_busy = false;
+        let mut moved = 0usize;
+        while budget > 0 {
+            let mut chunk = [0u8; 16];
+            let taken = {
+                let Some(tx) = TX.try_lock() else { break };
+                let run = ((tx.head - tx.tail) as usize).min(chunk.len()).min(budget);
+                for (offset, byte) in chunk[..run].iter_mut().enumerate() {
+                    *byte = tx.bytes[((tx.tail + offset as u64) % TX_CAPACITY as u64) as usize];
+                }
+                run
+            };
+            if taken == 0 {
+                break;
+            }
+            let sent = match SERIAL.try_lock() {
+                Some(mut port) => port.try_send(&chunk[..taken]),
+                None => 0,
+            };
+            if sent == 0 {
+                port_busy = true;
+                break;
+            }
+            // Only the drainer moves the tail, so the bytes just sent are
+            // still the oldest ones in the queue.
+            if let Some(mut tx) = TX.try_lock() {
+                tx.tail += sent as u64;
+                QUEUED_TAIL.store(tx.tail, Ordering::Release);
+            }
+            budget = budget.saturating_sub(sent);
+            moved += sent;
+        }
+        PUMPING.store(false, Ordering::Release);
+        // A print between our last look and the release left its bytes to
+        // us (it saw the flag): look again while the port takes them.
+        if port_busy || budget == 0 || moved == 0 {
+            return;
+        }
     }
 }
 
@@ -121,6 +191,7 @@ pub fn drain_and_stop_queue() {
         port.write_byte(byte);
         tx.tail += 1;
     }
+    QUEUED_TAIL.store(tx.tail, Ordering::Release);
     if tx.dropped > 0 {
         let dropped = tx.dropped;
         tx.dropped = 0;
@@ -281,6 +352,14 @@ impl Write for Port<'_> {
 /// та потеря, против которой весь этот модуль и написан.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {
+    queue(args);
+    pump();
+}
+
+/// Put `args` into the queue without draining it (kprint drains after it
+/// opens interrupts again, G4); before the first tick and after the machine
+/// stops - straight to the port, as [`_print`] did.
+pub fn queue(args: fmt::Arguments<'_>) {
     if !READY.load(Ordering::Acquire) {
         return;
     }
@@ -304,8 +383,6 @@ pub fn _print(args: fmt::Arguments<'_>) {
                 let _ = write!(tx, "\n[serial: {dropped} bytes dropped, queue was full]\n");
             }
             let _ = tx.write_fmt(args);
-            drop(tx);
-            pump();
             return;
         }
         // Дальше напрямую, как ниже.

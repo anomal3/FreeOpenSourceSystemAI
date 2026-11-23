@@ -37,7 +37,7 @@ use mini_ui::{Color, Rect, Surface};
 
 /// Место, которое строка занимает наверху экрана.
 #[must_use]
-pub fn bounds(screen_w: u32, scale: u32) -> Rect {
+pub fn bounds(screen_w: u32, scale: mini_ui::Scale) -> Rect {
     Rect::new(0, 0, screen_w, Ctx::scaled(scale).px(theme::M_STATUS_H))
 }
 
@@ -55,7 +55,7 @@ pub fn bounds(screen_w: u32, scale: u32) -> Rect {
 /// «62 %» значило бы показывать человеку число, которому нельзя верить.
 ///
 /// `dy` — сдвиг из координат экрана в координаты полосы, тот же, что у значков.
-pub fn draw(back: &mut Surface, band: Rect, dy: i32, screen_w: u32, scale: u32) {
+pub fn draw(back: &mut Surface, band: Rect, dy: i32, screen_w: u32, scale: mini_ui::Scale) {
     if !theme::is_mobile() {
         return;
     }

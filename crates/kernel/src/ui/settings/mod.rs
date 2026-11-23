@@ -27,6 +27,7 @@
 //! ([`kit::Pass`]), и проход этот либо рисует, либо только запоминает, куда
 //! можно нажать и в каком порядке по пунктам ходит клавиатура.
 
+mod background;
 mod displays;
 mod kit;
 mod pages;
@@ -66,6 +67,8 @@ pub enum Section {
     Personal,
     Wallpaper,
     Colors,
+    /// «Оформление» (20.11): наборы «Современный»/«Простой» и эффекты.
+    Appearance,
     Dock,
     /// «Пуск» (20.11): ширина, разделы, закреплённые.
     Start,
@@ -102,7 +105,7 @@ const NAV: [Section; 13] = [
 ];
 
 /// Все страницы — для поиска.
-const ALL: [Section; 25] = [
+const ALL: [Section; 26] = [
     Section::Home,
     Section::System,
     Section::Display,
@@ -116,6 +119,7 @@ const ALL: [Section; 25] = [
     Section::Personal,
     Section::Wallpaper,
     Section::Colors,
+    Section::Appearance,
     Section::Dock,
     Section::Start,
     Section::Explorer,
@@ -147,6 +151,7 @@ impl Section {
             Section::Personal => "Персонализация",
             Section::Wallpaper => "Фон",
             Section::Colors => "Цвета",
+            Section::Appearance => "Оформление",
             Section::Dock => "Dock и панель задач",
             Section::Start => "Пуск",
             Section::Explorer => "Проводник",
@@ -177,7 +182,7 @@ impl Section {
                 Some(Section::System)
             }
             Section::Keyboard | Section::Usb => Some(Section::Devices),
-            Section::Wallpaper | Section::Colors => Some(Section::Personal),
+            Section::Wallpaper | Section::Colors | Section::Appearance => Some(Section::Personal),
             Section::Start => Some(Section::Dock),
             Section::Packages | Section::Services | Section::DefaultApps => Some(Section::Apps),
             _ => None,
@@ -205,6 +210,7 @@ impl Section {
             Section::Network => Fi::Globe,
             Section::Personal | Section::Colors => Fi::Palette,
             Section::Wallpaper => Fi::Image,
+            Section::Appearance => Fi::Sliders,
             Section::Dock => Fi::Dock,
             Section::Start => Fi::Apps,
             Section::Explorer => Fi::Folder,
@@ -256,9 +262,10 @@ impl Section {
             Section::Keyboard => "Раскладка и горячие клавиши",
             Section::Usb => "Подключённые устройства и контроллеры",
             Section::Network => "Адрес: по DHCP или постоянный",
-            Section::Personal => "Фон, цвета, тема",
-            Section::Wallpaper => "Градиент рабочего стола",
+            Section::Personal => "Фон, цвета, тема, оформление",
+            Section::Wallpaper => "Картинка, цвет и расположение",
             Section::Colors => "Тема, акцентный цвет, заголовок окна",
+            Section::Appearance => "Современный или простой вид, эффекты, контур окна",
             Section::Dock => "Вид, сторона экрана, автоскрытие, значки",
             Section::Start => "Ширина, разделы и закреплённые программы",
             Section::Explorer => "Файловый менеджер",
@@ -279,7 +286,7 @@ impl Section {
         match self {
             Section::Home => "главная обзор",
             Section::System => "система уведомления",
-            Section::Display => "дисплей экран разрешение масштаб режим монитор мониторы частота основной расположение",
+            Section::Display => "дисплей экран разрешение масштаб режим монитор мониторы частота основной расположение глубина цвета бит цветов",
             Section::Power => "питание выключить перезагрузить гасить экран сон",
             Section::Storage => "хранилище диск том проверка fsck смонтировано место",
             Section::About => "о системе версия архитектура процессор память время работы сборка",
@@ -288,9 +295,10 @@ impl Section {
             Section::Usb => "usb xhci ehci ohci контроллер мышь планшет",
             Section::Network => "сеть адрес dhcp шлюз ip mac dns",
             Section::Personal => "персонализация оформление",
-            Section::Wallpaper => "фон обои градиент",
+            Section::Wallpaper => "фон обои градиент картинка цвет",
             Section::Colors => "цвета тема тёмная светлая акцент заголовок",
-            Section::Dock => "панель задач dock аптайм дата часы расположение скрывать автоскрытие сверху слева справа значки",
+            Section::Appearance => "оформление интерфейс вид эффекты анимация сворачивание открытие тени прозрачность размытие подсмотр контур перетаскивание простой классический современный быстродействие",
+            Section::Dock => "панель задач dock аптайм дата часы расположение скрывать автоскрытие сверху слева справа значки мониторы дисплеи кнопки окон",
             Section::Start => "пуск меню закреплённые недавние все программы ширина широкий",
             Section::Explorer => "проводник файлы папки files",
             Section::Apps => "приложения программы",
@@ -352,6 +360,8 @@ pub enum Request {
     Restart,
     /// Перерисовать панель задач: сменилось то, что она показывает.
     Panel,
+    /// Сменился выбор масштаба — применить ко всему столу сразу (20.11).
+    Scale,
 }
 
 /// Что делает пункт, по которому нажали.
@@ -365,13 +375,21 @@ enum Deed {
     Theme(bool),
     Accent(theme::Accent),
     Wallpaper(theme::Wallpaper),
+    /// Фон: картинка, «Обзор…», цвет, расположение (22.11, `wallpaper`).
+    Background(super::wallpaper::WallDeed),
     TitleBar(u32),
     ScreenOff(u32),
+    /// Заставка (22.11, `saver`).
+    Saver(super::saver::Deed),
     Panel(PanelPref, bool),
     /// Панель задач и Dock (20.11, `deskcfg`).
     Taskbar(super::deskcfg::TaskbarDeed),
     /// «Пуск» (20.11).
     Start(super::deskcfg::StartDeed),
+    /// «Оформление» и глубина цвета (20.11, `look`).
+    Look(LookDeed),
+    /// Тема значков (22.11, номер в `mini_ui::image::ICON_THEMES`).
+    IconTheme(u8),
     Layout(crate::input::keymap::Layout),
     Timezone(i32),
     NetDhcp,
@@ -424,6 +442,14 @@ enum Deed {
     DisplaysKeep,
     /// «Отменить изменения» там же.
     DisplaysRevert,
+}
+
+/// Что меняют на странице «Оформление» и в «Глубине цвета».
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LookDeed {
+    Preset(super::look::Preset),
+    Flag(super::look::Flag, bool),
+    Depth(u32),
 }
 
 /// Какое из двух полей раздела «Сеть» правится.
@@ -560,6 +586,8 @@ pub struct SettingsView {
     seen: Cell<Option<Seen>>,
     /// Черновик раскладки мониторов («Дисплей», 16.11).
     displays: displays::Displays,
+    /// Ползунок размера значков Dock держат (20.11): его место в окне.
+    dock_slider: Option<Rect>,
 }
 
 /// Что вернул проход.
@@ -595,6 +623,7 @@ impl SettingsView {
             cache: Cache::default(),
             seen: Cell::new(None),
             displays: displays::Displays::load(),
+            dock_slider: None,
         };
         view.refresh();
         view
@@ -685,7 +714,7 @@ impl SettingsView {
     fn layout(&self) -> Layout {
         let seen = self.seen.get().unwrap_or(Seen {
             area: Rect::new(0, 0, self.screen.0 * 7 / 8, self.screen.1 * 8 / 10),
-            ctx: Ctx::scaled(1),
+            ctx: Ctx::scaled(mini_ui::Scale::ONE),
         });
         self.run(seen.ctx, seen.area, None)
     }
@@ -726,7 +755,7 @@ impl SettingsView {
     /// Колесо мыши над окном. `true` — содержимое сдвинулось.
     pub fn wheel(&mut self, clicks: i32) -> bool {
         let before = self.scroll;
-        let step = self.seen.get().map_or(1, |seen| seen.ctx.scale) as i32 * 64;
+        let step = self.seen.get().map_or(64, |seen| seen.ctx.px(64)) as i32;
         let layout = self.layout();
         // Положительное — от себя: содержимое едет вниз, то есть к началу.
         self.scroll -= clicks * step;
@@ -804,16 +833,34 @@ impl SettingsView {
     /// Тянут ли монитор на холсте «Дисплея».
     #[must_use]
     pub fn dragging(&self) -> bool {
-        self.displays.dragging()
+        self.displays.dragging() || self.dock_slider.is_some()
     }
 
     /// Монитор тянут: указатель в точке окна `x`, `y`.
     pub fn drag_to(&mut self, x: i32, y: i32) -> bool {
+        if let Some(track) = self.dock_slider {
+            return self.slide_dock(track, x);
+        }
         self.displays.drag_to(x, y)
+    }
+
+    /// Ползунок размера значков Dock в точке `x` (20.11): Dock меняется
+    /// сразу и показан, пока его тянут. `true` — значение сменилось.
+    fn slide_dock(&mut self, track: Rect, x: i32) -> bool {
+        let scale = self.seen.get().map_or(mini_ui::Scale::ONE, |seen| seen.ctx.scale);
+        let size = pages::slider_value(scale, track, x, super::deskcfg::ICON_MIN, super::deskcfg::ICON_MAX);
+        if size == super::deskcfg::taskbar().icon {
+            return false;
+        }
+        self.perform(Deed::Taskbar(super::deskcfg::TaskbarDeed::Icon(size)));
+        true
     }
 
     /// Монитор отпустили.
     pub fn drop_drag(&mut self) {
+        if self.dock_slider.take().is_some() {
+            kprintln!("  settings    : dock icon size {} (slider released)", super::deskcfg::taskbar().icon);
+        }
         if let Some((index, x, y)) = self.displays.drop_drag() {
             kprintln!("  settings    : display {} moved to {x},{y}", index + 1);
         }
@@ -1055,6 +1102,12 @@ impl SettingsView {
                 if let Deed::PickOutput(index) = deed {
                     self.displays.grab(index, x, y);
                 }
+                // Ползунок Dock: значение — по точке щелчка, дальше тянут.
+                if let Deed::Taskbar(super::deskcfg::TaskbarDeed::Icon(_)) = deed {
+                    self.dock_slider = Some(hit.rect);
+                    self.slide_dock(hit.rect, x);
+                    return true;
+                }
                 self.perform(deed);
                 true
             }
@@ -1139,10 +1192,11 @@ impl SettingsView {
             }
             Deed::Scale(choice) => {
                 theme::set_scale_choice(choice);
+                self.request = Some(Request::Scale);
                 self.report = Some(match super::prefs::store_scale(choice) {
                     Ok(()) => {
                         kprintln!("  settings    : scale {} saved", theme::scale_choice_tag(choice));
-                        Report::ok(String::from("масштаб запомнен, применится после перезагрузки"))
+                        Report::ok(String::from("масштаб применён и запомнен"))
                     }
                     Err(err) => Report::bad(format!("масштаб не запомнен: {err}")),
                 });
@@ -1172,7 +1226,8 @@ impl SettingsView {
                 });
             }
             Deed::Wallpaper(wall) => {
-                if theme::set_wallpaper(wall) {
+                // Картинка и цвет фона уступают обоям темы (22.11).
+                if super::wallpaper::use_preset() | theme::set_wallpaper(wall) {
                     self.theme_changed = true;
                 }
                 self.report = Some(match super::prefs::store_wallpaper(wall) {
@@ -1181,6 +1236,15 @@ impl SettingsView {
                         Report::ok(format!("обои «{}» запомнены", wall.title()))
                     }
                     Err(err) => Report::bad(format!("обои применены, но не запомнены: {err}")),
+                });
+            }
+            Deed::Background(deed) => {
+                let (text, result) = super::wallpaper::apply(deed);
+                // Стол целиком: другой фон — другие подписи значков.
+                self.theme_changed = true;
+                self.report = Some(match result {
+                    Ok(()) => Report::ok(text),
+                    Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
                 });
             }
             Deed::TitleBar(height) => {
@@ -1210,6 +1274,12 @@ impl SettingsView {
                     Err(err) => Report::bad(format!("срок применён, но не запомнен: {err}")),
                 });
             }
+            Deed::Saver(deed) => {
+                self.report = Some(match super::saver::apply(deed) {
+                    Ok(said) => Report::ok(said),
+                    Err(said) => Report::bad(said),
+                });
+            }
             Deed::Panel(pref, on) => {
                 super::panel::set_shows(pref, on);
                 self.request = Some(Request::Panel);
@@ -1233,6 +1303,47 @@ impl SettingsView {
                 kprintln!("  settings    : taskbar {}", super::deskcfg::describe());
                 self.report = Some(match result {
                     Ok(()) => Report::ok(text),
+                    Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
+                });
+            }
+            Deed::Look(deed) => {
+                use super::look;
+                let title_before = super::window::Window::title_height(mini_ui::Scale::ONE);
+                let (text, result) = match deed {
+                    LookDeed::Preset(preset) => {
+                        look::apply_preset(preset);
+                        (format!("набор «{}» применён и запомнен", pages::preset_title(preset)), look::store())
+                    }
+                    LookDeed::Flag(flag, on) => {
+                        look::set(flag, on);
+                        (String::from(if on { "включено и запомнено" } else { "выключено и запомнено" }), look::store())
+                    }
+                    LookDeed::Depth(bits) => {
+                        look::set_depth(bits);
+                        (format!("глубина цвета: {}", look::depth_title(look::depth())), look::store_depth())
+                    }
+                };
+                // Перерисовать всё: рамки окон, тени, кадр в новой глубине.
+                self.theme_changed = true;
+                // Классика — другая высота заголовка (22.11): окна пересобрать.
+                if super::window::Window::title_height(mini_ui::Scale::ONE) != title_before {
+                    self.title_changed = true;
+                }
+                kprintln!("  settings    : look {}", look::describe());
+                self.report = Some(match result {
+                    Ok(()) => Report::ok(text),
+                    Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
+                });
+            }
+            Deed::IconTheme(index) => {
+                super::appicon::set_theme(index);
+                let result = super::appicon::store();
+                // Перерисовать всё: стол, «Пуск», панель, окна программ.
+                self.theme_changed = true;
+                let title = mini_ui::image::ICON_THEMES.get(usize::from(index)).map_or("", |theme| theme.1);
+                kprintln!("  settings    : icon theme {}", mini_ui::image::icon_theme_id());
+                self.report = Some(match result {
+                    Ok(()) => Report::ok(format!("значки «{title}» применены и запомнены")),
                     Err(err) => Report::bad(format!("применено, но не запомнено: {err}")),
                 });
             }
@@ -1739,7 +1850,15 @@ impl SettingsView {
         if area.w <= pad * 2 || area.h <= pad * 2 {
             return area.y;
         }
-        let main = Rect::new(area.x + pad as i32, area.y, area.w - pad * 2, area.h);
+        let full = Rect::new(area.x + pad as i32, area.y, area.w - pad * 2, area.h);
+        // Колонка страницы: карточки тянутся во всю ширину, как у
+        // «Параметров» Windows 11, но не шире 1100 точек макета — на окне во
+        // весь развёрнутый экран 2560 строка в две тысячи точек отрывала бы
+        // значение справа от подписи слева. Шире — колонка встаёт по центру
+        // места страницы вместе с заголовком и низом (21.11, Роман: у
+        // Windows 11 так, clip-1); на узком окне она его заполняет (clip-2).
+        let w = full.w.min(ctx.px(1100));
+        let main = Rect::new(full.x + ((full.w - w) / 2) as i32, full.y, w, full.h);
 
         // ── Заголовок (не прокручивается) ────────────────────────────────────
         let mut y = main.y + ctx.px(22) as i32;
@@ -1771,7 +1890,6 @@ impl SettingsView {
         pass.limit = main.bottom() - bottom_h as i32;
 
         // ── Страница ─────────────────────────────────────────────────────────
-        let w = main.w.min(ctx.px(900));
         let start = top - self.scroll;
         if self.search.is_empty() {
             self.page_body(pass, main.x, start, w);
@@ -1794,7 +1912,9 @@ impl SettingsView {
         let limit = pass.limit;
         pass.top = area.y;
         pass.limit = main.bottom();
-        self.draw_footer(pass, Rect::new(main.x, limit, main.w, bottom_h), &buttons);
+        // Кнопки — у правого края карточек, а не окна: на широком окне
+        // «Применить» иначе уезжала далеко от того, что применяет.
+        self.draw_footer(pass, Rect::new(main.x, limit, w, bottom_h), &buttons);
         pass.extent = extent;
         pass.limit = limit;
         top

@@ -146,14 +146,15 @@ fn task() {
 /// Вместо ступеней 1–4 — программная видеокарта (QEMU).
 fn soft_steps(run: &mut Run) -> bool {
     let t = crate::time::uptime_ms();
-    let ok = if SOFT_AMD.load(Ordering::Relaxed) {
-        crate::linux::drm::amdgpu::set_soft(true);
+    let amd = SOFT_AMD.load(Ordering::Relaxed);
+    let ok = if amd {
+        drm::amdgpu::set_soft(true);
         true
     } else {
-        crate::linux::drm::set_soft(true)
+        drm::set_soft(true)
     };
-    let node = crate::linux::drm::node_visible();
-    run.step("soft-node", ok && node, t, &format!("{} {}, /dev/dri/renderD128 {}", if SOFT_AMD.load(Ordering::Relaxed) { "soft AMD" } else { "SoftGpu" }, if ok { "on" } else { "not available" }, if node { "present" } else { "absent" }))
+    let node = drm::node_visible();
+    run.step("soft-node", ok && node, t, &format!("{} {}, /dev/dri/renderD128 {}", if amd { "soft AMD" } else { "SoftGpu" }, if ok { "on" } else { "not available" }, if node { "present" } else { "absent" }))
 }
 
 /// Ступени 1–4. `false` — дальше идти незачем.
@@ -193,9 +194,9 @@ fn kernel_steps(run: &mut Run, mode: u8) -> bool {
     }
     // 4. Узел DRM настоящей карты.
     let t = crate::time::uptime_ms();
-    crate::linux::drm::set_hw(true);
-    let (real, _) = crate::linux::drm::backend_state();
-    let node = crate::linux::drm::node_visible();
+    drm::set_hw(true);
+    let (real, _) = drm::backend_state();
+    let node = drm::node_visible();
     run.step("drm-node", node && real, t, &format!("/dev/dri/renderD128 {}, real backend {}", if node { "present" } else { "absent" }, if real { "registered" } else { "none" }))
 }
 
@@ -236,9 +237,9 @@ fn script_step(run: &mut Run) {
                     // Первые вызовы NVK к карте — в журнал (vkCreateDevice:
                     // каналы, объекты, первые EXEC): если споткнётся, видно где.
                     if text.starts_with("gametest: run vkprobe") {
-                        crate::linux::drm::trace_next(800);
+                        drm::trace_next(800);
                     } else if text.starts_with("gametest: PASS vkprobe") || text.starts_with("gametest: FAIL vkprobe") {
-                        crate::linux::drm::trace_next(0);
+                        drm::trace_next(0);
                     }
                     if text.starts_with("gametest: summary") {
                         summary = Some(String::from(text));
@@ -268,4 +269,24 @@ fn script_step(run: &mut Run) {
     }
     let ok = summary.as_deref().is_some_and(|s| s.contains(" 0 failed"));
     run.step("script", ok, t, summary.as_deref().unwrap_or("no summary line from the script"));
+}
+
+/// Слой DRM живёт в `crate::linux`, который собирается только на x86_64.
+#[cfg(target_arch = "x86_64")]
+use crate::linux::drm;
+
+/// На aarch64 слоя Linux нет: узла DRM нет, ступени честно проваливаются.
+#[cfg(not(target_arch = "x86_64"))]
+mod drm {
+    pub fn set_soft(_on: bool) -> bool {
+        false
+    }
+    pub fn set_hw(_on: bool) {}
+    pub fn backend_state() -> (bool, bool) {
+        (false, false)
+    }
+    pub fn node_visible() -> bool {
+        false
+    }
+    pub fn trace_next(_ioctls: u64) {}
 }

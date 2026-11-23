@@ -56,6 +56,31 @@ pub fn spin_held_count() -> u32 {
 /// 0 — ещё нигде) — для сторожа [`check_switch`].
 static LAST_TAKEN: [AtomicUsize; crate::smp::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::smp::MAX_CPUS];
 
+/// Where each CPU took the outermost [`SpinLock`] it holds now, that is
+/// where its current interrupts-off stretch began (`&'static Location`, 0 -
+/// none). For the TLB shootdown diagnostics (G2): a CPU slow to answer
+/// names the place that keeps it deaf.
+static IRQ_OFF_AT: [AtomicUsize; crate::smp::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::smp::MAX_CPUS];
+
+/// `without_interrupts` marks its own stretch (`at` - a `&'static Location`
+/// as an address, 0 - ended). Interrupts must be off.
+#[inline]
+pub fn mark_irq_off(at: usize) {
+    if let Some(cell) = IRQ_OFF_AT.get(crate::smp::cpu()) {
+        cell.store(at, Ordering::Relaxed);
+    }
+}
+
+/// `file:line` of the spin lock (or `without_interrupts`) that keeps `cpu`
+/// with interrupts off right now, or `None` (interrupts on, or off for
+/// another reason: an interrupt handler, the task switch).
+#[must_use]
+pub fn irq_off_site(cpu: usize) -> Option<&'static core::panic::Location<'static>> {
+    let at = IRQ_OFF_AT.get(cpu)?.load(Ordering::Relaxed);
+    // SAFETY: only `&'static Location` values are stored there.
+    (at != 0).then(|| unsafe { &*(at as *const core::panic::Location<'static>) })
+}
+
 /// Первое переключение задач с удержанным [`SpinLock`]: `(процессор, счёт,
 /// место последнего захвата)`; процессор `usize::MAX` — не было.
 static SWITCH_HELD: [AtomicUsize; 3] = [AtomicUsize::new(usize::MAX), AtomicUsize::new(0), AtomicUsize::new(0)];
@@ -192,14 +217,47 @@ impl<T> SpinLock<T> {
             // Пока лок занят, читаем обычной загрузкой, не пытаясь занять шину
             // атомарной операцией на каждом витке.
             while self.owner.load(Ordering::Relaxed) != FREE {
+                // Interrupts are off while we spin: answer TLB shootdown
+                // requests here, or their sender waits for us as long as
+                // the holder keeps the lock (G2: 14-54 ms shootdown waits
+                // on the game, CPUs spinning on the scheduler lock).
+                crate::arch::smp::serve_while_spinning(me);
                 core::hint::spin_loop();
             }
         }
         SPIN_HELD[me].fetch_add(1, Ordering::Relaxed);
         let at = core::panic::Location::caller();
         LAST_TAKEN[me].store(core::ptr::from_ref(at) as usize, Ordering::Relaxed);
+        if irq_was_enabled {
+            IRQ_OFF_AT[me].store(core::ptr::from_ref(at) as usize, Ordering::Relaxed);
+        }
 
         SpinGuard { lock: self, irq_was_enabled, since, at }
+    }
+
+    /// One attempt, no waiting (hw-log15, hrsleep): `None` if anybody holds
+    /// the lock. For interrupt handlers that must not spin behind a holder
+    /// (a timer interrupt on several CPUs waiting for the scheduler lock
+    /// slowed the whole machine to a crawl under QEMU).
+    #[track_caller]
+    pub fn try_lock_once(&self) -> Option<SpinGuard<'_, T>> {
+        let irq_was_enabled = crate::arch::interrupts::enabled();
+        crate::arch::interrupts::disable();
+        let since = if irq_was_enabled { crate::latency::start() } else { 0 };
+        let at = core::panic::Location::caller();
+        let me = crate::smp::cpu();
+        if self.owner.compare_exchange(FREE, me, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            SPIN_HELD[me].fetch_add(1, Ordering::Relaxed);
+            LAST_TAKEN[me].store(core::ptr::from_ref(at) as usize, Ordering::Relaxed);
+            if irq_was_enabled {
+                IRQ_OFF_AT[me].store(core::ptr::from_ref(at) as usize, Ordering::Relaxed);
+            }
+            return Some(SpinGuard { lock: self, irq_was_enabled, since, at });
+        }
+        if irq_was_enabled {
+            crate::arch::interrupts::enable();
+        }
+        None
     }
 
     /// Захватить лок, если его не держит **этот же** процессор.
@@ -231,6 +289,9 @@ impl<T> SpinLock<T> {
                 Ok(_) => {
                     SPIN_HELD[me].fetch_add(1, Ordering::Relaxed);
                     LAST_TAKEN[me].store(core::ptr::from_ref(at) as usize, Ordering::Relaxed);
+                    if irq_was_enabled {
+                        IRQ_OFF_AT[me].store(core::ptr::from_ref(at) as usize, Ordering::Relaxed);
+                    }
                     return Some(SpinGuard { lock: self, irq_was_enabled, since, at });
                 }
                 Err(holder) if holder == me => {
@@ -242,7 +303,10 @@ impl<T> SpinLock<T> {
                     return None;
                 }
                 // Держит сосед, либо слабое сравнение отказало впустую.
-                Err(_) => core::hint::spin_loop(),
+                Err(_) => {
+                    crate::arch::smp::serve_while_spinning(me);
+                    core::hint::spin_loop();
+                }
             }
         }
     }
@@ -291,6 +355,7 @@ impl<T> Drop for SpinGuard<'_, T> {
         SPIN_HELD[taken_on.min(crate::smp::MAX_CPUS - 1)].fetch_sub(1, Ordering::Relaxed);
         self.lock.owner.store(FREE, Ordering::Release);
         if self.irq_was_enabled {
+            IRQ_OFF_AT[taken_on.min(crate::smp::MAX_CPUS - 1)].store(0, Ordering::Relaxed);
             crate::latency::irq_off_ended(self.since, self.at);
             crate::arch::interrupts::enable();
         }

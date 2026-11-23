@@ -134,6 +134,19 @@ impl Picture {
         }
     }
 
+    /// Картинка из готовых точек `R G B` (22.11: уменьшенная копия обоев).
+    /// `None` — точек не столько, сколько велит размер.
+    #[must_use]
+    pub fn from_rgb(width: u32, height: u32, rgb: Vec<u8>) -> Option<Self> {
+        (width > 0 && height > 0 && rgb.len() == (width * height * 3) as usize).then_some(Self { width, height, rgb })
+    }
+
+    /// Точки `R G B` построчно.
+    #[must_use]
+    pub fn rgb(&self) -> &[u8] {
+        &self.rgb
+    }
+
     fn at(&self, row: usize, col: usize) -> [u8; 3] {
         let index = (row * self.width as usize + col) * 3;
         [self.rgb[index], self.rgb[index + 1], self.rgb[index + 2]]

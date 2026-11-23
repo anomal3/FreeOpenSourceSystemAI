@@ -116,6 +116,9 @@ pub struct Ext2Fs {
     meta: crate::sync::SpinLock<Meta>,
     /// То же устройство, что под кэшем в `inner`, — для чтения мимо замка тома.
     lane: Lane,
+    /// Метка тома из суперблока (21.11): по ней «Файлы» отличают тома в
+    /// памяти (`scratch-tmp`, `live-opt`) от дисков.
+    label: Option<String>,
 }
 
 /// Сколько имён и inode помнить, прежде чем начать заново.
@@ -251,6 +254,7 @@ impl Ext2Fs {
         let lane = Lane::new(device);
         let mut disk = Cached::deferred(lane.clone());
         let fs = ext2::Ext2::mount(&mut disk, first_lba).map_err(convert)?;
+        let label = ext2::Ext2::label(&mut disk, first_lba).ok().filter(|label| !label.is_empty());
         // На томе только для чтения редактор не открывается вовсе — и не
         // только потому, что писать не собираемся: само открытие помечает том
         // используемым, то есть **пишет** в суперблок. Безопасный режим,
@@ -268,6 +272,7 @@ impl Ext2Fs {
             inner: Mutex::new(Inner { disk, fs, editor, marked_clean: false }),
             meta: crate::sync::SpinLock::new(Meta::default()),
             lane,
+            label,
         })))
     }
 
@@ -436,6 +441,10 @@ impl Ext2Mount {
 impl FileSystem for Ext2Mount {
     fn name(&self) -> &'static str {
         "ext2"
+    }
+
+    fn label(&self) -> Option<String> {
+        self.0.label.clone()
     }
 
     fn root(&self) -> VfsResult<Box<dyn Node>> {

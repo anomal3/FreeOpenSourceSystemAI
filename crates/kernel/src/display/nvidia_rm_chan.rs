@@ -343,11 +343,20 @@ pub fn attach(log: &mut Log) -> Res<Arc<RmBackend>> {
         state: Mutex::new(State { hw, bos: BTreeMap::new(), vms: BTreeMap::new(), chans: BTreeMap::new(), next: 0, userd_pages: alloc::vec![false; 256] }),
     });
     *BACKEND.lock() = Some(backend.clone());
-    // Слою DRM (WP-C): только регистрация — узел /dev/dri/renderD128
-    // настоящей карты появляется после `nvk hw on`.
-    let gpu: Arc<dyn GpuBackend> = backend.clone();
-    crate::linux::drm::set_backend(Some(gpu));
-    say(log, "nvgpu: backend attached (DRM node stays off until 'nvk hw on')".into());
+    // Слою DRM (WP-C): регистрация — узел /dev/dri/renderD128 настоящей
+    // карты появляется сразу (D4, 20.11: `drm::DEFAULT_HW`), `nvk hw off`
+    // прячет.
+    // Слой Linux (`crate::linux`) есть только на x86_64.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let gpu: Arc<dyn GpuBackend> = backend.clone();
+        crate::linux::drm::set_backend(Some(gpu));
+    }
+    #[cfg(target_arch = "x86_64")]
+    say(
+        log,
+        alloc::format!("nvgpu: backend attached, DRM node {}", if crate::linux::drm::hw() { "/dev/dri/renderD128 present" } else { "hidden ('nvk hw on')" }),
+    );
     Ok(backend)
 }
 
@@ -360,6 +369,7 @@ pub(crate) fn shutdown(rm: &mut Rm) -> Log {
         *b = None;
     }
     // Новые open узла DRM больше не увидят карту; открытые получают ENODEV.
+    #[cfg(target_arch = "x86_64")]
     crate::linux::drm::set_backend(None);
     let clients: Vec<u32> = core::mem::take(&mut *super::nvidia_rm_vmm::LIVE_CLIENTS.lock());
     for client in clients {
@@ -660,6 +670,28 @@ fn release_chan(chan: Chan, vmm: &mut Vmm) {
 }
 
 
+/// От такого размера буфер в памяти машины берётся одним куском.
+const CONTIGUOUS_FROM: u64 = 1 << 20;
+
+/// Буфер в памяти машины по страницам (обнулёнными).
+fn sysmem_pages(place: Place, size: u64) -> Result<Bo, Errno> {
+    let mut frames = Vec::with_capacity((size / PAGE) as usize);
+    for _ in 0..size / PAGE {
+        match crate::mm::frame::with(|f| f.allocate()).flatten() {
+            Some(p) => {
+                // SAFETY: кадр только что выделен; прямое отображение.
+                unsafe { core::ptr::write_bytes(p.to_direct_map().as_usize() as *mut u8, 0, PAGE as usize) };
+                frames.push(p.as_u64());
+            }
+            None => {
+                free_frames(&frames);
+                return Err(Errno::ENOMEM);
+            }
+        }
+    }
+    Ok(Bo { place, size, vram: 0, frames })
+}
+
 impl GpuBackend for RmBackend {
     fn info(&self) -> &GpuInfo {
         &self.info
@@ -676,23 +708,17 @@ impl GpuBackend for RmBackend {
                 let mem = vram::bulk_alloc(size, 0x1_0000).map_err(|_| Errno::ENOMEM)?;
                 Bo { place, size, vram: mem, frames: Vec::new() }
             }
-            Place::Sysmem => {
-                let mut frames = Vec::with_capacity((size / PAGE) as usize);
-                for _ in 0..size / PAGE {
-                    match crate::mm::frame::with(|f| f.allocate()).flatten() {
-                        Some(p) => {
-                            // SAFETY: кадр только что выделен; прямое отображение.
-                            unsafe { core::ptr::write_bytes(p.to_direct_map().as_usize() as *mut u8, 0, PAGE as usize) };
-                            frames.push(p.as_u64());
-                        }
-                        None => {
-                            free_frames(&frames);
-                            return Err(Errno::ENOMEM);
-                        }
-                    }
+            // Крупный буфер — сначала одним куском (D4, 20.11.2026): кадр
+            // WSI (dma-buf) тогда виден ядру подряд, и стол показывает его без
+            // копии (`SharedMem::contiguous`). Нет куска — по страницам.
+            Place::Sysmem if size >= CONTIGUOUS_FROM => match crate::mm::frame::take_contiguous_zeroed((size / PAGE) as usize, 0) {
+                Some(base) => {
+                    let frames = (0..size / PAGE).map(|i| base.as_u64() + i * PAGE).collect();
+                    Bo { place, size, vram: 0, frames }
                 }
-                Bo { place, size, vram: 0, frames }
-            }
+                None => sysmem_pages(place, size)?,
+            },
+            Place::Sysmem => sysmem_pages(place, size)?,
         };
         let mut st = self.state.lock();
         let h = st.handle();

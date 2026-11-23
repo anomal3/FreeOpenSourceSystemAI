@@ -52,8 +52,9 @@ pub enum Dialog {
     OpenWith(OpenWith),
     /// «Программа не отвечает» (макет 18): имя программы и сколько секунд.
     NotResponding { name: String, seconds: u64 },
-    /// «Удалить «имя»?» (макет 18) — в корзину.
-    Delete { question: String },
+    /// «Удалить «имя»?» (макет 18) — в корзину; `forever` — безвозвратно
+    /// («Очистить корзину?», 21.11: тем же окном, а не строкой в меню).
+    Delete { question: String, forever: bool },
 }
 
 /// Выбор программы для файла.
@@ -171,8 +172,12 @@ impl DialogView {
                 Some((Answer::Confirm, Weight::Danger, "Завершить программу")),
                 Some((Answer::Close, Weight::Primary, "Подождать")),
             ],
-            Dialog::Delete { .. } => [
+            Dialog::Delete { forever: false, .. } => [
                 Some((Answer::Confirm, Weight::Primary, "Удалить")),
+                Some((Answer::Close, Weight::Normal, "Отмена")),
+            ],
+            Dialog::Delete { forever: true, .. } => [
+                Some((Answer::Confirm, Weight::Danger, "Удалить навсегда")),
                 Some((Answer::Close, Weight::Normal, "Отмена")),
             ],
         };
@@ -284,13 +289,25 @@ impl DialogView {
             Dialog::About(_) | Dialog::OpenWith(_) => (Icon::Info, Tone::Accent),
             Dialog::Power { .. } => (Icon::Power, Tone::Bad),
             Dialog::NotResponding { .. } => (Icon::Info, Tone::Warn),
-            Dialog::Delete { .. } => (Icon::Close, Tone::Accent),
+            Dialog::Delete { forever: false, .. } => (Icon::Close, Tone::Accent),
+            Dialog::Delete { forever: true, .. } => (Icon::Close, Tone::Bad),
         };
         let tile = Rect::new(area.x + pad, area.y + pad, ctx.px(TILE), ctx.px(TILE));
         // «О системе» — логотип FossAi на плитке (фаза 72a).
+        // Значки диалогов — из темы значков (22.11), плитка — если нет.
+        let themed = match self.dialog {
+            Dialog::About(_) | Dialog::OpenWith(_) => "dlg-info",
+            Dialog::Power { .. } => "power",
+            Dialog::NotResponding { .. } => "dlg-warning",
+            Dialog::Delete { forever: false, .. } => "dlg-question",
+            Dialog::Delete { forever: true, .. } => "dlg-warning",
+        };
         match super::appicon::logo_tile().filter(|_| matches!(self.dialog, Dialog::About(_))) {
             Some(logo) => logo.draw(s, tile),
-            None => paint::icon_tile(ctx, s, tile, icon, tone, true),
+            None => match super::appicon::design(themed) {
+                Some(image) => image.draw(s, tile),
+                None => paint::icon_tile(ctx, s, tile, icon, tone, true),
+            },
         }
 
         let x = tile.right() + ctx.px(16) as i32;
@@ -300,11 +317,16 @@ impl DialogView {
             Dialog::About(facts) => draw_about(ctx, s, x, &mut y, width, facts),
             Dialog::Power { restart } => draw_power(ctx, s, x, &mut y, width, *restart),
             Dialog::OpenWith(_) => {}
-            Dialog::Delete { question } => {
+            Dialog::Delete { question, forever } => {
                 let p = ctx.palette;
-                paint::text(ctx, s, Role::Heading, x, y, question, p.ink);
+                paint::text_clipped(ctx, s, Role::Heading, x, y, width, question, p.ink);
                 y += line(ctx, Role::Heading) + ctx.px(8) as i32;
-                paragraph(ctx, s, Role::Body, x, &mut y, width, "Файл будет перемещён в корзину. Его можно будет восстановить, пока корзина не очищена.", p.ink3);
+                let text = if *forever {
+                    "Объекты будут стёрты безвозвратно. Восстановить их из корзины будет нельзя."
+                } else {
+                    "Файл будет перемещён в корзину. Его можно будет восстановить, пока корзина не очищена."
+                };
+                paragraph(ctx, s, Role::Body, x, &mut y, width, text, p.ink3);
             }
             Dialog::NotResponding { name, seconds } => {
                 let p = ctx.palette;
@@ -391,7 +413,10 @@ fn draw_open_with(ctx: Ctx, s: &mut Surface, area: Rect, choice: &OpenWith) {
         }
         let tile = Rect::new(row.x + ctx.px(12) as i32, row.y + (row.h as i32 - ctx.px(28) as i32) / 2, ctx.px(28), ctx.px(28));
         let glyph = if label == "Блокнот" { Icon::File } else { Icon::Package };
-        paint::icon_tile(ctx, s, tile, glyph, Tone::Accent, false);
+        match super::appicon::design(if label == "Блокнот" { "notepad" } else { "generic" }) {
+            Some(image) => image.draw(s, tile),
+            None => paint::icon_tile(ctx, s, tile, glyph, Tone::Accent, false),
+        }
         let text_x = tile.right() + ctx.px(14) as i32;
         let radio = ctx.px(8);
         let text_w = (row.right() - text_x - ctx.px(40) as i32).max(0) as u32;

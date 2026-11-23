@@ -331,6 +331,37 @@ pub const PAYLOAD_SITE_DIR: &str = "FREEOS/WWW";
 pub const PAYLOAD_SITE: [(&str, &str); 2] =
     [("index.html", "INDEX.HTM"), ("style.css", "STYLE.CSS")];
 
+/// Каталог пачек тем значков на установочном носителе (22.11).
+pub const PAYLOAD_ICONS_DIR: &str = "FREEOS/ICONS";
+
+/// Что из `initrd/usr/share/icons/` едет на носитель и под каким именем 8.3 —
+/// пачки тем значков (`cargo xtask wallpaper`, `mini_ui::image::ICON_THEMES`).
+///
+/// Список обязан совпадать с `ICONS` в `crates/installer/src/payload.rs`.
+pub const PAYLOAD_ICONS: [(&str, &str); 4] =
+    [("glossy.pak", "GLOSSY.PAK"), ("crisp.pak", "CRISP.PAK"), ("soft.pak", "SOFT.PAK"), ("vivid.pak", "VIVID.PAK")];
+
+/// Каталог галереи обоев на установочном носителе (22.11).
+pub const PAYLOAD_WALLS_DIR: &str = "FREEOS/WALLS";
+
+/// Что из `initrd/usr/share/wallpapers/` едет на носитель и под каким именем
+/// 8.3: картинки JPEG, миниатюры QOI (`cargo xtask wallpaper`) и подписи.
+///
+/// Список обязан совпадать с `WALLS` в `crates/installer/src/payload.rs`.
+pub const PAYLOAD_WALLS: [(&str, &str); 11] = [
+    ("index.txt", "INDEX.TXT"),
+    ("valley.jpg", "VALLEY.JPG"),
+    ("valley.thumb.qoi", "VALLEY.TQI"),
+    ("galaxy.jpg", "GALAXY.JPG"),
+    ("galaxy.thumb.qoi", "GALAXY.TQI"),
+    ("orbit.jpg", "ORBIT.JPG"),
+    ("orbit.thumb.qoi", "ORBIT.TQI"),
+    ("waves.jpg", "WAVES.JPG"),
+    ("waves.thumb.qoi", "WAVES.TQI"),
+    ("crystal.jpg", "CRYSTAL.JPG"),
+    ("crystal.thumb.qoi", "CRYSTAL.TQI"),
+];
+
 /// Каталог своей среды .NET на установочном носителе (фаза N5a).
 ///
 /// Без базовой библиотеки `/bin/dotnet` на установленной системе не запускает
@@ -374,7 +405,7 @@ pub struct ImageShare {
 /// Добавляя новую группу, её дописывают сюда — и она сама доезжает и на
 /// носитель, и в обновление. Длина списка закреплена: новая группа не
 /// проскочит мимо этого места молча.
-pub const IMAGE_SHARE: [ImageShare; 5] = [
+pub const IMAGE_SHARE: [ImageShare; 7] = [
     ImageShare {
         dir: "usr/share/defaults/etc",
         subdirs: &[],
@@ -386,6 +417,21 @@ pub const IMAGE_SHARE: [ImageShare; 5] = [
         subdirs: &["samples"],
         medium_dir: PAYLOAD_DOTNET_DIR,
         files: &PAYLOAD_DOTNET,
+    },
+    // Темы значков (22.11) — посередине списка: сценарий `update` проверяет
+    // крайние группы.
+    ImageShare {
+        dir: "usr/share/icons",
+        subdirs: &[],
+        medium_dir: PAYLOAD_ICONS_DIR,
+        files: &PAYLOAD_ICONS,
+    },
+    // Галерея обоев (22.11) — тоже не с краю.
+    ImageShare {
+        dir: "usr/share/wallpapers",
+        subdirs: &[],
+        medium_dir: PAYLOAD_WALLS_DIR,
+        files: &PAYLOAD_WALLS,
     },
     ImageShare {
         dir: "usr/share/lua",

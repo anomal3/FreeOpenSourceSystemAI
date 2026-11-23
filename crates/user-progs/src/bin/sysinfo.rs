@@ -707,6 +707,6 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         user_progs::exit(0);
     }
     let info = app::start(&SPEC);
-    let size = app::two_thirds(&info);
+    let size = app::window_size(&info, (900, 620));
     app::run(&SPEC, &info, size, |_, _| Info::new())
 }

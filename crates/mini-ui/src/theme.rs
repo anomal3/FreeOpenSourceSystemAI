@@ -43,7 +43,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
-use crate::Color;
+use crate::{Color, Scale};
 
 /// Цвет вместе с прозрачностью — ровно в том виде, в каком он записан в макете.
 #[derive(Clone, Copy)]
@@ -278,6 +278,122 @@ pub const LIGHT: Palette = Palette {
     hover2: Ink::rgba(0x1F, 0x29, 0x37, 18),
     shadow: Ink::rgba(0x1F, 0x29, 0x37, 60),
 };
+
+/// Классика (22.11, Роман: «Упрощённый» набор оформления — настоящий
+/// Windows 98 во всём интерфейсе, а не только заголовок окна).
+///
+/// Серая грань #C0C0C0, объёмные кромки (белый, светло-серый, серый,
+/// чёрный), выделение тёмно-синим с белым текстом, никаких полупрозрачных
+/// слоёв — каждый токен непрозрачен. Тёмная/светлая тема и акцент под
+/// классикой не действуют: у Windows 98 одна схема «Стандартная».
+pub const CLASSIC_PALETTE: Palette = Palette {
+    wall_top: Color::rgb(0x00, 0x80, 0x80),
+    wall_bottom: Color::rgb(0x00, 0x80, 0x80),
+    wall_dot: Ink::rgba(0x00, 0x80, 0x80, 0),
+
+    win: Ink::rgb(0xC0, 0xC0, 0xC0),
+    panel: Ink::rgb(0xC0, 0xC0, 0xC0),
+    sunk: Ink::rgb(0xFF, 0xFF, 0xFF),
+    card: Ink::rgba(0xC0, 0xC0, 0xC0, 0),
+
+    line: Ink::rgb(0x80, 0x80, 0x80),
+    line2: Ink::rgb(0x80, 0x80, 0x80),
+    line3: Ink::rgb(0x00, 0x00, 0x00),
+
+    tb1: Ink::rgb(0xC0, 0xC0, 0xC0),
+    tb2: Ink::rgb(0xC0, 0xC0, 0xC0),
+    tbline: Ink::rgb(0x80, 0x80, 0x80),
+    crown: Ink::rgba(0xFF, 0xFF, 0xFF, 0),
+
+    ink: Color::rgb(0x00, 0x00, 0x00),
+    ink2: Color::rgb(0x00, 0x00, 0x00),
+    ink3: Color::rgb(0x00, 0x00, 0x00),
+    ink4: Color::rgb(0x40, 0x40, 0x40),
+    ink5: Color::rgb(0x40, 0x40, 0x40),
+    ink6: Color::rgb(0x80, 0x80, 0x80),
+
+    btn: Ink::rgb(0xC0, 0xC0, 0xC0),
+    btnline: Ink::rgb(0x00, 0x00, 0x00),
+    btnhov: Ink::rgb(0xC0, 0xC0, 0xC0),
+    ghost: Ink::rgba(0xC0, 0xC0, 0xC0, 0),
+
+    acc: Color::rgb(0x00, 0x00, 0x80),
+    acc2: Color::rgb(0x00, 0x00, 0x80),
+    accline: Ink::rgb(0x00, 0x00, 0x80),
+    acctint: Ink::rgba(0x00, 0x00, 0x80, 40),
+    accedge: Color::rgb(0x00, 0x00, 0x80),
+    acc_ink: Color::rgb(0x00, 0x00, 0x80),
+    sel1: Ink::rgb(0x00, 0x00, 0x80),
+    sel2: Ink::rgb(0x00, 0x00, 0x80),
+
+    ok: Color::rgb(0x00, 0x80, 0x00),
+    ok2: Color::rgb(0x00, 0x60, 0x00),
+    okbg: Ink::rgba(0x00, 0x80, 0x00, 30),
+    okline: Color::rgb(0x00, 0x80, 0x00),
+    ok_ink: Color::rgb(0x00, 0x60, 0x00),
+
+    bad: Color::rgb(0xC0, 0x00, 0x00),
+    bad_ink: Color::rgb(0x80, 0x00, 0x00),
+    badbg: Ink::rgba(0x80, 0x00, 0x00, 30),
+    badline: Color::rgb(0x80, 0x00, 0x00),
+
+    warn: Color::rgb(0x80, 0x80, 0x00),
+    warnbg: Ink::rgba(0x80, 0x80, 0x00, 30),
+    warnline: Color::rgb(0x80, 0x80, 0x00),
+
+    glass: Ink::rgb(0xC0, 0xC0, 0xC0),
+    hover1: Ink::rgba(0x00, 0x00, 0x00, 0),
+    hover2: Ink::rgba(0x00, 0x00, 0x00, 0),
+    shadow: Ink::rgba(0x00, 0x00, 0x00, 0),
+};
+
+/// Цвета классики по именам Windows 98 — для объёмных кромок
+/// ([`crate::classic`]).
+pub mod win98 {
+    use crate::Color;
+    /// Грань кнопок и окон (`COLOR_3DFACE`).
+    pub const FACE: Color = Color::rgb(0xC0, 0xC0, 0xC0);
+    /// Блик (`COLOR_3DHILIGHT`).
+    pub const LIGHT: Color = Color::rgb(0xFF, 0xFF, 0xFF);
+    /// Светлая кромка внутри (`COLOR_3DLIGHT`).
+    pub const HI: Color = Color::rgb(0xDF, 0xDF, 0xDF);
+    /// Тень (`COLOR_3DSHADOW`).
+    pub const SHADE: Color = Color::rgb(0x80, 0x80, 0x80);
+    /// Тёмная тень (`COLOR_3DDKSHADOW`).
+    pub const DARK: Color = Color::rgb(0x00, 0x00, 0x00);
+    /// Выделение и активный заголовок.
+    pub const NAVY: Color = Color::rgb(0x00, 0x00, 0x80);
+    /// Правый край градиента активного заголовка.
+    pub const CAPTION2: Color = Color::rgb(0x10, 0x84, 0xD0);
+    /// Неактивный заголовок: слева и справа.
+    pub const GREY_CAPTION: Color = Color::rgb(0x80, 0x80, 0x80);
+    pub const GREY_CAPTION2: Color = Color::rgb(0xB5, 0xB5, 0xB5);
+    /// Подпись неактивного заголовка.
+    pub const GREY_TEXT: Color = Color::rgb(0xC0, 0xC0, 0xC0);
+    /// Стол без обоев.
+    pub const DESKTOP: Color = Color::rgb(0x00, 0x80, 0x80);
+}
+
+/// Признак классики (см. [`CLASSIC_PALETTE`]). Как и тема, у каждой стороны
+/// свой: программа узнаёт его из `SysInfo::flags` (`SYSINFO_CLASSIC`).
+static CLASSIC: AtomicBool = AtomicBool::new(false);
+
+/// Включена ли классика (на телефоне — никогда).
+#[must_use]
+pub fn is_classic() -> bool {
+    CLASSIC.load(Ordering::Relaxed) && !is_mobile()
+}
+
+/// Включить или выключить классику. `true` — изменилась.
+pub fn set_classic(on: bool) -> bool {
+    CLASSIC.swap(on, Ordering::Relaxed) != on
+}
+
+/// Скругление с учётом классики: у Windows 98 углы прямые везде.
+#[must_use]
+pub fn radius(r: u32) -> u32 {
+    if is_classic() { 0 } else { r }
+}
 
 /// Какая тема сейчас.
 ///
@@ -575,6 +691,9 @@ pub fn set_title_h(height: u32) -> bool {
 /// Текущая палитра: тема, акцент и обои.
 #[must_use]
 pub fn palette() -> &'static Palette {
+    if is_classic() {
+        return &CLASSIC_PALETTE;
+    }
     let theme = if DARK_THEME.load(Ordering::Relaxed) { 0 } else { 1 };
     let accent = (ACCENT.load(Ordering::Relaxed) as usize).min(4);
     let wall = (WALLPAPER.load(Ordering::Relaxed) as usize).min(4);
@@ -584,6 +703,15 @@ pub fn palette() -> &'static Palette {
 /// Тёмная ли тема сейчас.
 #[must_use]
 pub fn is_dark() -> bool {
+    // Классика — светлая схема: значки и оттенки, выбранные «для светлой
+    // темы», ложатся на серую грань правильно.
+    DARK_THEME.load(Ordering::Relaxed) && !is_classic()
+}
+
+/// Тёмная ли тема, выбранная человеком (без поправки на классику): её
+/// запоминают и показывают в «Параметрах».
+#[must_use]
+pub fn chosen_dark() -> bool {
     DARK_THEME.load(Ordering::Relaxed)
 }
 
@@ -781,60 +909,109 @@ pub const fn form_for(width: u32, height: u32) -> Form {
 /// него пальцем нельзя. Мерить плотность нам нечем — прошивка её не сообщает, —
 /// но форма экрана о ней говорит достаточно: портретный экран уже девятисот
 /// точек не бывает редким.
+///
+/// Порог — 3840 (4K), а не 2560 (Роман, 20.11, монитор 2560×1440): при 200 %
+/// окна там слишком крупные, при 100 % — «компактно и аккуратно». Программы
+/// масштаб сами не считают: ядро отдаёт им масштаб стола в `SysInfo::flags`.
 #[must_use]
-pub const fn geometry_scale(width: u32, height: u32) -> u32 {
-    if width >= 2560 {
-        return 2;
+pub const fn geometry_scale(width: u32, height: u32) -> Scale {
+    if width >= 3840 {
+        return Scale::TWO;
     }
     if matches!(form_for(width, height), Form::Mobile) {
-        return 2;
+        return Scale::TWO;
     }
-    1
+    Scale::ONE
 }
 
-/// Множитель с учётом выбора человека: 0 — по экрану ([`geometry_scale`]),
-/// 1 или 2 — заданный в «Параметрах» (01.11: на мониторе 2560 автоматические
-/// 200 % слишком крупны, а выбрать было нечем).
+/// Масштаб с учётом выбора человека: 0 — по экрану ([`geometry_scale`]),
+/// иначе — проценты, заданные в «Параметрах» (100/125/150/175/200, 20.11;
+/// прежние 1 и 2 — это 100 и 200 %).
 #[must_use]
-pub const fn geometry_scale_for(choice: u32, width: u32, height: u32) -> u32 {
+pub const fn geometry_scale_for(choice: u32, width: u32, height: u32) -> Scale {
     match choice {
-        1 | 2 => choice,
-        _ => geometry_scale(width, height),
+        0 => geometry_scale(width, height),
+        1 | 2 => Scale::whole(choice),
+        pct => Scale::percent(pct),
     }
 }
 
-/// Выбор масштаба, запомненный в настройках (0 — авто, 1, 2). Действует он
-/// с запуска стола: стол перестраивать на ходу дорого и рискованно.
+/// Какую долю рабочей области окно может занять при открытии, проценты
+/// `(ширина, высота)`.
+///
+/// Роман, 20.11, монитор 2560×1440: «Файлы» открывались на четыре пятых
+/// экрана, «Параметры» — почти во весь. Доля падает с ростом экрана, как у
+/// Windows: на 1280 окну нужно почти всё место (82 × 86 %), на 2560 и больше
+/// — чуть больше половины ширины и две трети высоты (56 × 66 %); между ними —
+/// по прямой.
+#[must_use]
+pub const fn window_share(screen_w: u32) -> (u32, u32) {
+    let s = if screen_w < 1280 {
+        1280
+    } else if screen_w > 2560 {
+        2560
+    } else {
+        screen_w
+    };
+    let t = s - 1280;
+    (82 - t * 26 / 1280, 86 - t * 20 / 1280)
+}
+
+/// Размер нового окна: желаемый в точках макета `logical`, умноженный на
+/// `scale`, но не больше [`window_share`] рабочей области `work` экрана
+/// шириной `screen_w`.
+#[must_use]
+pub const fn default_window(logical: (u32, u32), scale: Scale, work: (u32, u32), screen_w: u32) -> (u32, u32) {
+    let (sw, sh) = window_share(screen_w);
+    let (max_w, max_h) = (work.0 * sw / 100, work.1 * sh / 100);
+    let (w, h) = (scale.px(logical.0), scale.px(logical.1));
+    (if w < max_w { w } else { max_w }, if h < max_h { h } else { max_h })
+}
+
+/// Выбор масштаба, запомненный в настройках: 0 — авто, иначе проценты
+/// (100/125/150/175/200). Применяется сразу (20.11).
 static SCALE_CHOICE: AtomicU8 = AtomicU8::new(0);
 
-/// Запомнить выбор масштаба.
+/// Запомнить выбор масштаба (0 — авто, проценты; прежние 1 и 2 — 100 и 200).
 pub fn set_scale_choice(choice: u32) {
-    SCALE_CHOICE.store(if choice <= 2 { choice as u8 } else { 0 }, Ordering::Relaxed);
+    let value = match choice {
+        0 => 0,
+        1 | 2 => choice * 100,
+        pct => Scale::percent(pct).pct(),
+    };
+    SCALE_CHOICE.store(value as u8, Ordering::Relaxed);
 }
 
-/// Выбор масштаба: 0 — авто, 1 — 100 %, 2 — 200 %.
+/// Выбор масштаба: 0 — авто, иначе проценты.
 #[must_use]
 pub fn scale_choice() -> u32 {
     u32::from(SCALE_CHOICE.load(Ordering::Relaxed))
 }
 
-/// Слово выбора для файла настроек и журнала.
+/// Слово выбора для файла настроек и журнала: `auto`, `100`, `125`…
 #[must_use]
-pub const fn scale_choice_tag(choice: u32) -> &'static str {
+pub fn scale_choice_tag(choice: u32) -> &'static str {
     match choice {
-        1 => "100",
-        2 => "200",
+        100 | 1 => "100",
+        125 => "125",
+        150 => "150",
+        175 => "175",
+        200 | 2 => "200",
         _ => "auto",
     }
 }
 
-/// Выбор из слова файла настроек.
+/// Выбор из слова файла настроек (`auto`, `100`, `125`, `150`, `175`,
+/// `200`; можно со знаком `%`).
 #[must_use]
 pub fn scale_choice_from_tag(tag: &str) -> Option<u32> {
-    match tag {
+    match tag.trim().trim_end_matches('%').trim() {
         "auto" => Some(0),
-        "100" => Some(1),
-        "200" => Some(2),
+        "100" => Some(100),
+        "125" => Some(125),
+        "150" => Some(150),
+        "175" => Some(175),
+        "200" => Some(200),
         _ => None,
     }
 }

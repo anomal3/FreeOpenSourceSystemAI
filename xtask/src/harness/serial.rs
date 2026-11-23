@@ -270,6 +270,15 @@ impl SerialLine {
         }
     }
 
+    /// Число сразу за первым вхождением подстроки во всём выводе (без
+    /// ожидания и без сдвига курсора); `None` — подстроки или числа нет.
+    pub fn seen_number(&self, prefix: &str) -> Option<u64> {
+        let guard = self.buffer.lock().expect("буфер линии");
+        let at = guard.text.find(prefix)? + prefix.len();
+        let digits: String = guard.text[at..].chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+
     /// Встречалась ли подстрока во всём выводе.
     pub fn seen(&self, needle: &str) -> bool {
         self.buffer.lock().expect("буфер линии").text.contains(needle)

@@ -21,7 +21,9 @@
 //! Первый том, который удалось открыть: разделы GPT, разделы MBR или
 //! «суперфлоппи» — FAT прямо с нулевого сектора, как у многих флешек. FAT32 и
 //! ext2 — только на чтение: съёмный носитель выдёргивают без спроса, а запись
-//! в FAT ядро и не умеет. Точки — `/usb`, `/usb1`, … по порядку.
+//! в FAT ядро и не умеет. exFAT (20.11: внешние диски Windows, SSD Романа с
+//! игрой) — на чтение и запись: запись идёт сразу на носитель, том помечен
+//! грязным только пока пишут. Точки — `/usb`, `/usb1`, … по порядку.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -119,18 +121,19 @@ fn bring_up(handle: StorageHandle) {
         super::stick_log::offer(&device, *first_lba);
     }
     for (first_lba, count, origin) in found {
-        if let Some((kind, label, fs)) = open_volume(&device, first_lba, count) {
+        if let Some((kind, label, fs, writable)) = open_volume(&device, first_lba, count) {
             let path = MOUNT_POINTS[point];
             crate::fs::mount_volume_at(path, fs);
             MOUNTED.lock()[point] = Some(handle);
+            let how = if writable { "read-write" } else { "read-only" };
             kprintln!(
-                "  usb-storage : {kind} volume '{label}' ({origin}, LBA {first_lba}) mounted read-only at {path}"
+                "  usb-storage : {kind} volume '{label}' ({origin}, LBA {first_lba}) mounted {how} at {path}"
             );
             live_packages(path);
             return;
         }
     }
-    kprintln!("  usb-storage : no FAT32 or ext2 volume on the device");
+    kprintln!("  usb-storage : no FAT32, exFAT or ext2 volume on the device");
 }
 
 /// Пакеты живой флешки (16.11, Роман: «браузер обсос в образ … на живом
@@ -209,6 +212,19 @@ fn live_install_task() {
 fn volumes(device: &mut Shared) -> Vec<(u64, u64, &'static str)> {
     let mut found = Vec::new();
     if let Ok(table) = disk::gpt::read(device) {
+        // Разделы — в журнал (20.11: по журналу диска Романа не было видно,
+        // прочитана ли GPT и какого типа раздел).
+        let sector = device.sector_size() as usize;
+        for partition in &table.partitions {
+            kprintln!(
+                "  usb-storage : GPT part {}: {} MiB at LBA {}, type {}, '{}'",
+                partition.index + 1,
+                partition.range().bytes(sector) / (1024 * 1024),
+                partition.first_lba,
+                partition.type_guid,
+                partition.name_string(),
+            );
+        }
         for partition in &table.partitions {
             found.push((partition.first_lba, partition.last_lba - partition.first_lba + 1, "GPT"));
         }
@@ -243,24 +259,40 @@ fn volumes(device: &mut Shared) -> Vec<(u64, u64, &'static str)> {
     found
 }
 
-/// Открыть том: FAT32 или ext2. Возвращает формат, метку и файловую систему.
+/// Открыть том: FAT32, exFAT или ext2. Возвращает формат, метку, файловую
+/// систему и открыт ли том на запись.
 fn open_volume(
     device: &Shared,
     first_lba: u64,
     count: u64,
-) -> Option<(&'static str, String, Arc<dyn vfs::FileSystem>)> {
+) -> Option<(&'static str, String, Arc<dyn vfs::FileSystem>, bool)> {
     if device.sector_size() as usize == vfs::BLOCK_SIZE {
         let window = Window { device: device.clone(), first_lba, blocks: count };
         if let Ok(fat) = crate::fs::Fat32::mount(Box::new(window)) {
             let label = fat.label().unwrap_or_else(|| String::from("<unlabelled>"));
-            return Some(("FAT32", label, Arc::new(fat)));
+            return Some(("FAT32", label, Arc::new(fat), false));
         }
+    }
+    // exFAT узнаётся по подписи и сумме загрузочной области; чужой том
+    // отказывает, ничего не записав.
+    match crate::fs::ExfatFs::mount(device.clone(), first_lba, count, false) {
+        Ok(exfat) => {
+            let label = exfat.label();
+            let label = if label.is_empty() { String::from("<unlabelled>") } else { label };
+            if exfat.was_dirty() {
+                kprintln!("  usb-storage : exFAT volume '{label}' was not closed cleanly (unplugged while writing?)");
+            }
+            let writable = !exfat.read_only();
+            return Some(("exFAT", label, Arc::new(exfat), writable));
+        }
+        Err(disk::exfat::Error::NotExfat) => {}
+        Err(err) => kprintln!("  usb-storage : exFAT volume at LBA {first_lba} not mounted: {err}"),
     }
     // ext2 опознаёт себя сам: монтирование не своего тома отказывает на
     // суперблоке, ничего не записав (на чтение редактор не открывается).
     crate::fs::Ext2Fs::mount(Box::new(device.clone()), first_lba, false)
         .ok()
-        .map(|mount| ("ext2", String::from("-"), Arc::new(mount) as Arc<dyn vfs::FileSystem>))
+        .map(|mount| ("ext2", String::from("-"), Arc::new(mount) as Arc<dyn vfs::FileSystem>, false))
 }
 
 /// Том как `vfs::BlockDevice`: окно носителя с сектора `first_lba`.
