@@ -102,6 +102,7 @@
 // забытый код (та же ситуация и та же причина, что в `mm/mod.rs`).
 #![allow(dead_code)]
 
+pub mod hrsleep;
 mod task;
 mod waitq;
 
@@ -2282,6 +2283,10 @@ pub fn idle_wait() {
         POLLING[cpu].store(true, Ordering::SeqCst);
         let deadline = crate::time::uptime_ns().saturating_add(budget * 1000);
         while !KICKED[cpu].load(Ordering::SeqCst) && crate::time::uptime_ns() < deadline {
+            // A fine sleeper's deadline (hrsleep): wake it from here.
+            if hrsleep::due() {
+                hrsleep::expire();
+            }
             for _ in 0..64 {
                 core::hint::spin_loop();
             }

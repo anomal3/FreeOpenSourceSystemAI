@@ -39,7 +39,7 @@ mod sync;
 pub mod sysfs;
 mod vm;
 
-pub use sync::{FENCE_SPIN_US, fence_wait_stats};
+pub use sync::{FENCE_SPIN_US, FENCE_STEP_US, fence_bench, fence_fine_sleeps, fence_wait_stats};
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;

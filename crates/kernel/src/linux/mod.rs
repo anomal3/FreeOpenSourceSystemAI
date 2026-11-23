@@ -2411,6 +2411,26 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usi
                         if at <= now {
                             return -e::ETIMEDOUT;
                         }
+                        // hw-log15: a short timeout ends at its nanosecond
+                        // deadline (hrsleep), not 1-2 ticks after it.
+                        if at - now <= 20_000_000 && crate::sched::hrsleep::enabled() {
+                            let Some(key) = crate::user::futex_key(addr) else { return -e::EFAULT };
+                            let mut changed = false;
+                            let woken = crate::sched::hrsleep::block_on_futex_ns(key, at as u64, || {
+                                // SAFETY: `futex_key` checked the address:
+                                // the program's, aligned, mapped read-write.
+                                let now = unsafe { core::ptr::read_volatile(addr as *const u32) };
+                                changed = now != value as u32;
+                                changed
+                            });
+                            if changed {
+                                return -e::EAGAIN;
+                            }
+                            if woken {
+                                return 0;
+                            }
+                            continue;
+                        }
                         ((at - now).div_ceil(1_000_000) as usize).max(1)
                     }
                 };

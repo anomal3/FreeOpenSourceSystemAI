@@ -1880,6 +1880,26 @@ fn nanosleep(seconds: u64, nanos: u64) -> i64 {
     // Договор обещает «не меньше запрошенного», а не «примерно столько», и
     // платит за это единственным тиком: спящий просыпается позже на десять
     // миллисекунд, зато никогда — раньше срока.
+    // hw-log15: `Sleep(1)` of Wine lasted 2-3 ms that way. Short sleeps
+    // (up to 20 ms) end at their deadline in nanoseconds (hrsleep one-shot
+    // timer), still never before it; `hrsleep off` - the tick way.
+    if seconds == 0 && nanos == 0 {
+        // `nanosleep(0)`: give the CPU to whoever waits for it, as Linux.
+        sched::yield_now();
+        return 0;
+    }
+    if ms <= 20 && sched::hrsleep::enabled() {
+        let deadline = crate::time::uptime_ns() + seconds * 1_000_000_000 + nanos;
+        while crate::time::uptime_ns() < deadline {
+            sched::hrsleep::sleep_until_ns(deadline, 0, 0, || false);
+            if !sched::hrsleep::enabled() {
+                break;
+            }
+        }
+        if crate::time::uptime_ns() >= deadline {
+            return 0;
+        }
+    }
     let tick_ms = 1000 / u64::from(crate::irq::TIMER_HZ);
     sched::sleep_ms(ms.saturating_add(tick_ms));
     0

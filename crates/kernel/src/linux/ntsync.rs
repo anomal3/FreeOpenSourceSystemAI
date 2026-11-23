@@ -638,6 +638,14 @@ fn wait(dev: &Arc<Device>, arg: usize, all: bool) -> i64 {
                 if at <= now {
                     break -e::ETIMEDOUT;
                 }
+                // hw-log15: a short timeout ends at its nanosecond deadline
+                // (hrsleep), not 1-2 ticks after it.
+                if at - now <= 20_000_000 && crate::sched::hrsleep::enabled() {
+                    crate::sched::hrsleep::block_on_futex_ns(key, at as u64, || {
+                        waiter.signaled.load(Ordering::Acquire) != -1
+                    });
+                    continue;
+                }
                 let ms = (at - now).div_ceil(1_000_000) as u64;
                 Some(crate::time::uptime_ms().saturating_add(ms.max(1)))
             }

@@ -368,10 +368,16 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     {
         use core::sync::atomic::Ordering::Relaxed;
         let (polled, polled_ns, slept, slept_ns) = super::drm::fence_wait_stats();
+        // hw-log15: fine sleeps (one-shot timer) instead of whole ticks.
+        let (fine, by_deadline, by_event, shots, shot_irqs, late) = crate::sched::hrsleep::stats();
         kprintln!(
-            "  perf-diag   : {secs} s since boot: fence waits {polled} done while polling ({} us each), {slept} after sleeping ({} us each); mprotect without shootdown {}, faults on a stale translation {}, copy-on-write pages batched {}",
+            "  perf-diag   : {secs} s since boot: fence waits {polled} done while polling ({} us each), {slept} after sleeping ({} us each, {} fine steps of {} us first); hrsleep {}: {fine} sleeps, {by_deadline} by deadline ({} us late avg), {by_event} by event, {shots} one-shots armed, {shot_irqs} fired; mprotect without shootdown {}, faults on a stale translation {}, copy-on-write pages batched {}",
             polled_ns / polled.max(1) / 1000,
             slept_ns / slept.max(1) / 1000,
+            super::drm::fence_fine_sleeps(),
+            super::drm::FENCE_STEP_US.load(Relaxed),
+            if crate::sched::hrsleep::enabled() { "on" } else { "off" },
+            late / 1000,
             crate::user::MPROTECT_NO_FLUSH.load(Relaxed),
             crate::user::SPURIOUS_FAULTS.load(Relaxed),
             crate::user::COW_BATCHED.load(Relaxed),

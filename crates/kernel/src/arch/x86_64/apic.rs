@@ -657,6 +657,45 @@ pub const VECTOR_IPI_KICK: u8 = 0x32;
 /// пришлось бы объяснять. Ноль — таймер не запущен и на остальных не нужен.
 static TIMER_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// A one-shot is armed on this CPU (hrsleep, 22.11.2026): the periodic
+/// timer was restarted with a shorter count, and its next interrupt is the
+/// shot, not a tick.
+static SHORT_ARMED: [AtomicBool; crate::smp::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::smp::MAX_CPUS];
+
+/// Fire the timer of this CPU in `ns` nanoseconds instead of at its next
+/// tick (a fine sleeper's deadline). A write of the initial count restarts
+/// the periodic countdown from the new value; the shot's interrupt puts the
+/// tick's count back ([`timer_fired`]), so the tick only shifts in phase.
+/// `false` - nothing armed: no timer, or the tick (or an earlier shot)
+/// comes first anyway. Call with interrupts off.
+pub fn arm_short(ns: u64) -> bool {
+    let per_ms = u64::from(TIMER_COUNT.load(Ordering::Relaxed));
+    if per_ms == 0 {
+        return false;
+    }
+    let count = (u128::from(ns) * u128::from(per_ms) / 1_000_000).max(1) as u64;
+    let left = u64::from(read_reg(REG_TIMER_CURRENT_COUNT));
+    if count >= left {
+        return false;
+    }
+    write_reg(REG_TIMER_INITIAL_COUNT, count as u32);
+    SHORT_ARMED[crate::smp::cpu()].store(true, Ordering::Relaxed);
+    true
+}
+
+/// The timer interrupt of this CPU came: was it a one-shot? Puts the tick's
+/// count back (the next tick comes a full period after this interrupt).
+pub fn timer_fired() -> bool {
+    if !SHORT_ARMED[crate::smp::cpu()].swap(false, Ordering::Relaxed) {
+        return false;
+    }
+    let count = TIMER_COUNT.load(Ordering::Relaxed);
+    if count != 0 {
+        write_reg(REG_TIMER_INITIAL_COUNT, count);
+    }
+    true
+}
+
 /// Регистр команды межпроцессорного прерывания: младшая и старшая половины.
 const REG_ICR_LOW: u32 = 0x300;
 const REG_ICR_HIGH: u32 = 0x310;

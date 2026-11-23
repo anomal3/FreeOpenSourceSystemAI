@@ -235,6 +235,31 @@ impl<T> SpinLock<T> {
         SpinGuard { lock: self, irq_was_enabled, since, at }
     }
 
+    /// One attempt, no waiting (hw-log15, hrsleep): `None` if anybody holds
+    /// the lock. For interrupt handlers that must not spin behind a holder
+    /// (a timer interrupt on several CPUs waiting for the scheduler lock
+    /// slowed the whole machine to a crawl under QEMU).
+    #[track_caller]
+    pub fn try_lock_once(&self) -> Option<SpinGuard<'_, T>> {
+        let irq_was_enabled = crate::arch::interrupts::enabled();
+        crate::arch::interrupts::disable();
+        let since = if irq_was_enabled { crate::latency::start() } else { 0 };
+        let at = core::panic::Location::caller();
+        let me = crate::smp::cpu();
+        if self.owner.compare_exchange(FREE, me, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            SPIN_HELD[me].fetch_add(1, Ordering::Relaxed);
+            LAST_TAKEN[me].store(core::ptr::from_ref(at) as usize, Ordering::Relaxed);
+            if irq_was_enabled {
+                IRQ_OFF_AT[me].store(core::ptr::from_ref(at) as usize, Ordering::Relaxed);
+            }
+            return Some(SpinGuard { lock: self, irq_was_enabled, since, at });
+        }
+        if irq_was_enabled {
+            crate::arch::interrupts::enable();
+        }
+        None
+    }
+
     /// Захватить лок, если его не держит **этот же** процессор.
     ///
     /// `None` означает ровно одно: лок занят кодом, который мы прервали, и

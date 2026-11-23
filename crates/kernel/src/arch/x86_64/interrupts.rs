@@ -602,7 +602,12 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
     if vector >= VECTOR_FIRST_EXTERNAL {
         match vector {
             apic::VECTOR_TIMER => {
-                crate::irq::on_timer_tick();
+                // A one-shot of a fine sleeper (hrsleep) or the regular tick;
+                // the one-shot runs the tick's work only when it is owed.
+                let short = apic::timer_fired();
+                if crate::sched::hrsleep::on_timer_interrupt(short) {
+                    crate::irq::on_timer_tick();
+                }
                 apic::eoi();
             }
             // Клавиатура и приём по UART: оба обработчика вычитывают устройство

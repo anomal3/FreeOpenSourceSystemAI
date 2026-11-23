@@ -1350,6 +1350,62 @@ fn run_builtin(line: &str) -> bool {
             }
             sprintln!("  fencespin: {} us", crate::linux::drm::FENCE_SPIN_US.load(Relaxed));
         }
+        // hw-log15: first fine sleep step of a fence wait after the poll, us
+        // (doubles up to 4x); 0/off - 1 ms tick sleeps as before.
+        #[cfg(target_arch = "x86_64")]
+        "fencestep" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "off" => crate::linux::drm::FENCE_STEP_US.store(0, Relaxed),
+                value => match value.parse::<u64>() {
+                    Ok(us) => crate::linux::drm::FENCE_STEP_US.store(us.min(1_000), Relaxed),
+                    Err(_) => sprintln!("  fencestep: usage `fencestep [MICROSECONDS|off]`"),
+                },
+            }
+            sprintln!("  fencestep: {} us", crate::linux::drm::FENCE_STEP_US.load(Relaxed));
+        }
+        // hw-log15: how late sleeps and fence waits end - fine (hrsleep)
+        // against the tick way, in one boot (scenario `hrsleep`).
+        #[cfg(target_arch = "x86_64")]
+        "hrbench" => {
+            for us in [100u64, 400, 1000] {
+                let (fine_avg, fine_worst) = crate::sched::hrsleep::sleep_bench(us, 100, true);
+                let (tick_avg, tick_worst) = crate::sched::hrsleep::sleep_bench(us, 100, false);
+                sprintln!(
+                    "  hrbench: sleep {us} us: fine {fine_avg} us avg ({fine_worst} worst), tick {tick_avg} us avg ({tick_worst} worst)"
+                );
+            }
+            let step = crate::linux::drm::FENCE_STEP_US.load(core::sync::atomic::Ordering::Relaxed).max(1);
+            for us in [300u64, 700, 1500] {
+                let (fine_avg, fine_worst) = crate::linux::drm::fence_bench(us, 100, step);
+                let (tick_avg, tick_worst) = crate::linux::drm::fence_bench(us, 100, 0);
+                sprintln!(
+                    "  hrbench: fence signalled after {us} us: fine steps {fine_avg} us avg ({fine_worst} worst), tick sleeps {tick_avg} us avg ({tick_worst} worst)"
+                );
+            }
+            let (sleeps, by_deadline, by_event, shots, shot_irqs, late) = crate::sched::hrsleep::stats();
+            sprintln!(
+                "  hrbench: done; hrsleep {sleeps} sleeps, {by_deadline} by deadline ({} us late avg), {by_event} by event, {shots} one-shots, {shot_irqs} fired",
+                late / 1000
+            );
+        }
+        // hw-log15: sub-tick sleeps (one-shot APIC timer) for fence waits,
+        // short nanosleeps and USB disk waits; off - tick sleeps as before.
+        "hrsleep" => {
+            match argument.trim() {
+                "" => {}
+                "on" => crate::sched::hrsleep::set_enabled(true),
+                "off" => crate::sched::hrsleep::set_enabled(false),
+                _ => sprintln!("  hrsleep: usage `hrsleep [on|off]`"),
+            }
+            let (sleeps, by_deadline, by_event, shots, shot_irqs, late) = crate::sched::hrsleep::stats();
+            sprintln!(
+                "  hrsleep: {}; {sleeps} sleeps, {by_deadline} ended by deadline ({} us late on average), {by_event} by an event; {shots} one-shots armed, {shot_irqs} fired",
+                if crate::sched::hrsleep::enabled() { "on" } else { "off" },
+                late / 1000
+            );
+        }
         // Ожидание занятого мьютекса ядра в цикле до сна (20.11), мкс.
         "mutexspin" => {
             use core::sync::atomic::Ordering::Relaxed;
