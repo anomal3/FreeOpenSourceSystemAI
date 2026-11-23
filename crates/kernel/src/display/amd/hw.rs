@@ -192,9 +192,14 @@ fn sh_mem_init(window: &Window) {
 pub fn clear() {
     let mut guard = HW.lock();
     let Some(hw) = guard.as_mut() else { return };
-    hw.zero(0, PD_BYTES);
+    // Только занятые записи PD: обнулять все 128 КиБ через BAR на каждый GEM_VA слишком дорого.
+    for pde in 0..hw.pt_of.len() {
+        if hw.pt_of[pde] != u16::MAX {
+            hw.put64(pde * 8, 0);
+            hw.pt_of[pde] = u16::MAX;
+        }
+    }
     hw.pt_next = 0;
-    hw.pt_of.iter_mut().for_each(|entry| *entry = u16::MAX);
     flush_locked();
 }
 

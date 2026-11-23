@@ -328,6 +328,15 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // The fourth marker (FOSSAI_AMD_GART=1) also enables the GART of VMID0 and tests it (P5).
             // The fifth marker (FOSSAI_AMD_CS=1): fence, IB and the user VM (VMID 1) test (P5 step 2).
             // The sixth marker (FOSSAI_AMD_SHADER=1): golden registers and the first compute shader (P6).
+            // The eighth marker (FOSSAI_AMD_RADV=1): after the live stick has installed Proton into RAM
+            // (FOSSAI_WITH_PROTON=1), the kernel runs vkprobe and vulkaninfo through RADV on the card.
+            if std::env::var("FOSSAI_AMD_RADV").is_ok_and(|v| v == "1") {
+                payload.push(Payload {
+                    path: String::from("FREEOS/AMD/RADV.TXT"),
+                    data: b"radv\n".to_vec(),
+                    source: PathBuf::from("(FOSSAI_AMD_RADV=1)"),
+                });
+            }
             // The seventh marker (FOSSAI_AMD_HW=1): the hardware DRM backend self-test (VMID 1 over 64 GiB).
             if std::env::var("FOSSAI_AMD_HW").is_ok_and(|v| v == "1") {
                 payload.push(Payload {
@@ -430,6 +439,10 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     (crate::proton::package_path(), "PROTON.FPK"),
                     (crate::tmnf::package_path(), "TMNF.FPK"),
                 ] {
+                    // FOSSAI_LIVE_NO_GAME=1: без Trackmania (0,5 ГиБ) - для проверки видеокарты она не нужна.
+                    if esp == "TMNF.FPK" && std::env::var("FOSSAI_LIVE_NO_GAME").is_ok_and(|v| v == "1") {
+                        continue;
+                    }
                     if path.is_file() {
                         payload.push(read_payload(&format!("{}/{esp}", arch::PAYLOAD_PKG_DIR), &path)?);
                     } else {

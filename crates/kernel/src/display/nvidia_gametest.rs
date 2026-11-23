@@ -69,6 +69,8 @@ pub fn running() -> bool {
 static MODE: AtomicU8 = AtomicU8::new(0);
 /// `soft amd`: программный узел AMD (RADV) вместо NVIDIA (NVK).
 static SOFT_AMD: AtomicBool = AtomicBool::new(false);
+/// `hw`: узел AMD на настоящей карте (`amdnode hw on`), а не на программной.
+static HW_AMD: AtomicBool = AtomicBool::new(false);
 /// Аргументы сценария (`gpu gametest -- …`).
 static SCRIPT_ARGS: SpinLock<String> = SpinLock::new(String::new());
 
@@ -80,9 +82,11 @@ pub fn start(argument: &str) -> String {
     ECHO.lock().clear();
     let (ours, script) = argument.split_once("--").map_or((argument, ""), |(a, b)| (a, b.trim()));
     let words: Vec<&str> = ours.split_whitespace().collect();
-    SOFT_AMD.store(words.contains(&"amd"), Ordering::Relaxed);
+    // `hw`: настоящая карта AMD (кольцо `amd ring` уже работает), `soft amd`: программная.
+    HW_AMD.store(words.contains(&"hw"), Ordering::Relaxed);
+    SOFT_AMD.store(words.contains(&"amd") || words.contains(&"hw"), Ordering::Relaxed);
     MODE.store(
-        if words.contains(&"soft") {
+        if words.contains(&"soft") || words.contains(&"hw") {
             3
         } else if words.contains(&"kernel") {
             2
@@ -147,14 +151,22 @@ fn task() {
 fn soft_steps(run: &mut Run) -> bool {
     let t = crate::time::uptime_ms();
     let amd = SOFT_AMD.load(Ordering::Relaxed);
-    let ok = if amd {
+    let hw = HW_AMD.load(Ordering::Relaxed);
+    let ok = if hw {
+        // Настоящая карта: кольцо и микрокод поднимает цепочка `amd smc start`/`ucode`/`ring`.
+        for line in drm::amdgpu::set_hw(true) {
+            say(format!("gametest: amd hw: {line}"));
+        }
+        crate::display::amd::hw::ready()
+    } else if amd {
         drm::amdgpu::set_soft(true);
         true
     } else {
         drm::set_soft(true)
     };
     let node = drm::node_visible();
-    run.step("soft-node", ok && node, t, &format!("{} {}, /dev/dri/renderD128 {}", if amd { "soft AMD" } else { "SoftGpu" }, if ok { "on" } else { "not available" }, if node { "present" } else { "absent" }))
+    let kind = if hw { "AMD on the card" } else if amd { "soft AMD" } else { "SoftGpu" };
+    run.step("soft-node", ok && node, t, &format!("{kind} {}, /dev/dri/renderD128 {}", if ok { "on" } else { "not available" }, if node { "present" } else { "absent" }))
 }
 
 /// Ступени 1–4. `false` — дальше идти незачем.

@@ -1141,10 +1141,42 @@ pub fn auto_task() {
                 crate::kprintln!("  amdgpu     : auto start: HW.TXT found, testing the hardware DRM backend");
                 let _ = hw::selftest();
             }
+            // The eighth marker (FOSSAI_AMD_RADV=1): RADV on the card. The live stick installs Debian and Proton
+            // into RAM (FOSSAI_WITH_PROTON=1); when that is done the whole vkprobe/vulkaninfo check runs on the node.
+            if firmware_file("RADV.TXT").is_ok() {
+                crate::kprintln!("  amdgpu     : auto start: RADV.TXT found, waiting for Proton and running RADV on the card");
+                radv_auto();
+            }
         }
     } else {
         crate::kprintln!("  amdgpu     : auto start: no FREEOS/AMD/UCODE.TXT, microcode not loaded ('amd ucode' by hand)");
     }
+}
+
+/// Ждать, пока флешка поставит Debian и Proton в память, и прогнать RADV на настоящей карте:
+/// `gpu gametest hw -- vk` (vkprobe и vulkaninfo). Результат - строки `gametest|` в `LOG.TXT`.
+fn radv_auto() {
+    // До 25 минут: Proton с флешки - больше гигабайта.
+    for waited in 0..750u32 {
+        let installed = matches!(crate::fs::list("/opt/proton/bin"), Some(Ok(_)));
+        if installed && !crate::usb::storage::live_busy() {
+            break;
+        }
+        if waited % 30 == 0 {
+            crate::kprintln!("  amdgpu     : radv: waiting for the live packages ({} s)", waited * 2);
+        }
+        crate::sched::sleep_ms(2000);
+    }
+    if !matches!(crate::fs::list("/opt/proton/bin"), Some(Ok(_))) {
+        crate::kprintln!("  amdgpu     : radv: Proton did not appear in /opt (was the image built with FOSSAI_WITH_PROTON=1?)");
+        return;
+    }
+    crate::kprintln!("  amdgpu     : radv: {}", super::nvidia_gametest::start("hw amd -- vk"));
+    // Не уходить, пока проверка идёт: лог на флешку сбрасывает сама проверка.
+    while super::nvidia_gametest::running() {
+        crate::sched::sleep_ms(1000);
+    }
+    crate::usb::stick_log::flush_now();
 }
 
 // --- Загрузка микрокода CP/RLC/SDMA через SMC (`amd ucode`) ----------------

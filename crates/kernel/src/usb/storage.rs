@@ -184,6 +184,12 @@ const LIVE_ORDER: [&str; 8] = ["obsos", "gridcraf", "wordcraf", "pdfcraft", "mai
 static LIVE_QUEUE: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
 static LIVE_RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Идёт ли установка пакетов с живой флешки (очередь не пуста или пакет ставится).
+#[must_use]
+pub fn live_busy() -> bool {
+    LIVE_RUNNING.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Ставит пакеты очереди по одному, дожидаясь каждого.
 fn live_install_task() {
     loop {
