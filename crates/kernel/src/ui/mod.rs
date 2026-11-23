@@ -2284,7 +2284,7 @@ pub fn tick() {
     launch::poll();
     let status = status_now();
     let request = MODE_REQUEST.swap(0, core::sync::atomic::Ordering::Relaxed);
-    let layout = LAYOUT_REQUEST.lock().take();
+    let mut layout = LAYOUT_REQUEST.lock().take();
     // Настройки живой флешки вернулись после запуска стола (21.11).
     let restored = PREFS_RESTORED.swap(false, Ordering::AcqRel);
     if restored {
@@ -2297,7 +2297,7 @@ pub fn tick() {
         if request != 0 {
             change_mode(desktop, ((request >> 32) as u32, request as u32), &status);
         }
-        if let Some(plan) = layout {
+        if let Some(plan) = layout.take() {
             match run_layout(desktop, plan, &status) {
                 Ok(()) => kprintln!("  desktop     : layout applied"),
                 Err(why) => kprintln!("  desktop     : layout refused: {why}"),
@@ -2347,6 +2347,20 @@ pub fn tick() {
     });
     if restored && done.is_none() {
         PREFS_RESTORED.store(true, Ordering::Release);
+    }
+    // Стол был занят (или ещё не поднят) — заказы не теряются, а ждут
+    // следующего `tick` (23.11: второй монитор QEMU, подключённый при
+    // загрузке, так и не попал на стол — заказ раскладки пропал).
+    if done.is_none() {
+        if let Some(plan) = layout.take() {
+            let mut slot = LAYOUT_REQUEST.lock();
+            if slot.is_none() {
+                *slot = Some(plan);
+            }
+        }
+        if request != 0 {
+            let _ = MODE_REQUEST.compare_exchange(0, request, Ordering::Relaxed, Ordering::Relaxed);
+        }
     }
     // «Завершить программу» — вне замка стола: снятие задачи берёт свои.
     let task = HUNG_KILL.swap(0, Ordering::Relaxed);

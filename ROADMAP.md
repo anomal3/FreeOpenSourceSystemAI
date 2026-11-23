@@ -16967,7 +16967,10 @@ install,obs -j 1` — `pkg install obs` (65 с), eglinfo Wayland, OBS, окно,
 одному в `/opt` в памяти (потолок 16 ГиБ, память — под распакованное) в
 порядке `LIVE_ORDER` (`usb/storage.rs`): debian, proton, **obs**, tmnf, obsos,
 Craft. Образ Роману: `set FOSSAI_WITH_PROTON=1&& set FOSSAI_WITH_OBS=1&& set
-FOSSAI_LIVE_APPS=0&& cargo xtask image -r -a x86_64`.
+FOSSAI_LIVE_APPS=0&& cargo xtask image -r -a x86_64`. Проверено 23.11 в QEMU
+(образ 0.8.1051 как USB-флешка, 12 ГБ, 8 ЦП): debian 0 с, proton 25 с, obs 8 с,
+tmnf 6 с, obsos 1 с, все с кодом 0; «Пуск» → поиск «obs» → «OBS Studio»
+запускается, сцена «Экран» показывает стол.
 
 **TODO, по порядку.**
 1. Выход OBS: в одном прогоне из двух поток кодера AAC (FFmpeg) на
