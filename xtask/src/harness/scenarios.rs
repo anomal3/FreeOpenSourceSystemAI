@@ -5446,14 +5446,15 @@ pub const ALL: &[Scenario] = &[
             // сверху — файловый менеджер, и с фазы 47c это `/bin/files`, а не
             // окно ядра. Путь запуска новый: до неё значок умел открывать
             // только окна ядра, а программы запускались единственно из меню.
+            // С 22.11 значок — «Мой компьютер»: `/bin/files computer:`.
             Step::Aim(Aim::Icon(0)),
             Step::DoubleClick,
-            Step::Await("desktop     : started '/bin/files'", 15_000),
+            Step::Await("desktop     : started '/bin/files computer:'", 15_000),
             // Три строки, и каждая проверяет своё звено: ядро завело задачу,
-            // программа попросила окно, программа прочитала каталог. Оборвись
-            // цепочка посередине — видно, где именно.
+            // программа попросила окно, программа прочитала список дисков.
+            // Оборвись цепочка посередине — видно, где именно.
             Step::Await("desktop     : opened 'Files' for ", 30_000),
-            Step::Await("files: / has ", 30_000),
+            Step::Await("files: this computer has ", 30_000),
             Step::Wait(1_500),
             Step::Shot("05-icon-opened"),
             // Крестиком окно **просят** закрыться, а закрывает его программа.
@@ -15134,7 +15135,7 @@ pub const ALL: &[Scenario] = &[
             // Блокноту и посередине него; её журнал Блокнот печатает от себя.
             Step::Await("desktop     : 'File dialog' is modal over 'Notepad'", 15_000),
             Step::Await("notepad: filedlg: save at /root/Documents", 15_000),
-            Step::Await("window      : 'File dialog' at", 15_000),
+            Step::AwaitAny("window      : 'File dialog' at", 15_000),
             Step::Wait(1_500),
             Step::Shot("01-save-as"),
             // Блокнот под окном ввода не принимает: щелчок по его краю
@@ -15310,7 +15311,7 @@ pub const ALL: &[Scenario] = &[
             Step::Type("saved to the desktop"),
             Step::Key("ctrl-shift-s"),
             Step::Await("notepad: filedlg: save at ", 15_000),
-            Step::Await("window      : 'File dialog' at", 15_000),
+            Step::AwaitAny("window      : 'File dialog' at", 15_000),
             Step::Wait(1_000),
             // «Рабочий стол» в быстром доступе — вторая строка (114 + 30).
             Step::Aim(Aim::Program("File dialog", 88, 144)),
@@ -17759,13 +17760,14 @@ pub const ALL: &[Scenario] = &[
             Step::Shot("07b-bin-list"),
             Step::Key("l"),
             Step::Await("files: view table", 15_000),
-            // Свойства — пятый пункт меню записи. Клавиша меню у QEMU зовётся
+            // Свойства — шестой пункт меню записи (с 22.11 вторым идёт
+            // «Открыть с помощью…»). Клавиша меню у QEMU зовётся
             // `compose`: это она даёт `E0 5D` и usage 0x65; `menu` у него —
             // другая, мультимедийная. Первая строка `/bin` — `admin`
             // (358b067; до него была `ask`).
             Step::Key("compose"),
             Step::Await("files: menu opened for 'admin'", 15_000),
-            Step::Repeat("down", 4),
+            Step::Repeat("down", 5),
             Step::Key("ret"),
             Step::Await("files: properties of 'admin'", 15_000),
             Step::Wait(1_000),
