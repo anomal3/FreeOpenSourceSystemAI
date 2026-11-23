@@ -47,6 +47,7 @@ mod tmnf;
 mod wine;
 mod rider;
 mod ruststd;
+mod screenmedia;
 mod statefs;
 mod debian;
 mod fimg;
