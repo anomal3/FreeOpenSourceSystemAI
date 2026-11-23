@@ -255,7 +255,7 @@ pub fn describe() -> alloc::string::String {
 /// `ui look settings` — то же, что страница «Оформление», для стенда.
 pub fn command(words: &str) {
     let status = super::status_now();
-    let title_before = super::window::Window::title_height(mini_ui::Scale::ONE);
+    let title_before = super::window::Window::chrome_key();
     let mut words = words.split_whitespace();
     let first = words.next().unwrap_or("");
     match first {
@@ -304,7 +304,7 @@ pub fn command(words: &str) {
     }
     kprintln!("  desktop     : look {}", describe());
     // Классика меняет высоту заголовка (22.11) — окна пересобираются.
-    let retitle = super::window::Window::title_height(mini_ui::Scale::ONE) != title_before;
+    let retitle = super::window::Window::chrome_key() != title_before;
     super::with_desktop(|desktop| {
         if retitle {
             desktop.retitle_all(&status);

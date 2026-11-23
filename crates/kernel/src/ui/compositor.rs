@@ -1285,6 +1285,12 @@ impl Compositor {
         self.windows.iter_mut().find(|window| window.app == app)
     }
 
+    /// The window of `app`, read-only (23.11: the journal of content sizes).
+    #[must_use]
+    pub fn peek(&self, app: App) -> Option<&Window> {
+        self.windows.iter().find(|window| window.app == app)
+    }
+
     /// Окно стало прозрачным или непрозрачным (см. [`Window::translucent`]):
     /// перерисовать его место вместе с тенью — она появляется или уходит.
     pub fn set_alpha(&mut self, app: App, translucent: bool, shaped: bool) -> bool {
@@ -4924,6 +4930,18 @@ impl Compositor {
             let overflow = window.rect.bottom() - work.bottom();
             if overflow > 0 {
                 window.rect.y = (window.rect.y - overflow).max(work.y);
+            }
+            // 23.11: a framed program keeps its content size (or is asked for
+            // the new one, see `Window::retitle`) - the journal says which.
+            if window.is_program() && !window.frameless && !window.popup {
+                let (w, h) = window.program_size();
+                crate::kprintln!(
+                    "  desktop     : retitled '{}' {}x{}, content {w}x{h} frame {}",
+                    window.caption(),
+                    window.rect.w,
+                    window.rect.h,
+                    window.frame()
+                );
             }
         }
         self.restyle(status);

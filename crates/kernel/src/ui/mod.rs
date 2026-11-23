@@ -6439,7 +6439,10 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         // Окно выше поверхности на полосу заголовка: программа просит место
         // **под содержимое**, а полосу рисует ядро. Считать иначе значило бы
         // отдавать ей окно, в котором её же рисунок наполовину под заголовком.
-        let full_h = if framed { h.saturating_add(Window::title_height(scale)) } else { h };
+        // Classic (23.11): plus the Windows 98 frame on the sides and below.
+        let (chrome_w, chrome_h) = if framed { Window::chrome_for(scale) } else { (0, 0) };
+        let full_w = w.saturating_add(chrome_w);
+        let full_h = h.saturating_add(chrome_h);
         // Окно программы открывается на основном мониторе, по центру его
         // рабочей области.
         let p = desktop.primary_work();
@@ -6456,9 +6459,9 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         } else {
             // По центру; второе окно на том же месте — каскадом (20.11).
             desktop.cascade(Rect::new(
-                p.x + ((screen.saturating_sub(w)) / 2) as i32,
+                p.x + ((screen.saturating_sub(full_w)) / 2) as i32,
                 p.y + ((work.saturating_sub(full_h)) / 2) as i32,
-                w,
+                full_w,
                 full_h,
             ))
         };
@@ -7192,4 +7195,15 @@ fn log_window(desktop: &Compositor, app: App, focused: bool) {
         rect.h,
         if focused { " (focused)" } else { "" }
     );
+    // A framed program window (23.11): the size of its content - the program
+    // pixels - and the side frame around it (classic look: 4 px outside).
+    if let Some(window) = desktop.peek(app).filter(|window| window.is_program() && !window.frameless && !window.popup) {
+        let (w, h) = window.program_size();
+        kprintln!(
+            "  window      : '{}' content {w}x{h} frame {} bar {}",
+            own.as_deref().unwrap_or(app.title()),
+            window.frame(),
+            window.bar()
+        );
+    }
 }
