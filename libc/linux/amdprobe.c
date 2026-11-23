@@ -525,6 +525,55 @@ static void test_prime(void) {
     io(DRM_IOCTL_GEM_CLOSE_, &bo);
 }
 
+/* sync_file: забор syncobj наружу и слияние двух (SYNC_IOC_MERGE), как у Mesa WSI и libdrm. */
+struct amd_syncobj_handle { u32 handle, flags; i32 fd; u32 pad; };
+struct amd_pollfd { i32 fd; u16 events, revents; };
+struct amd_sync_merge { char name[32]; i32 fd2, fence; u32 flags, pad; };
+_Static_assert(sizeof(struct amd_syncobj_handle) == 16, "drm_syncobj_handle");
+_Static_assert(sizeof(struct amd_sync_merge) == 48, "sync_merge_data");
+static int sync_ready(int fd) {
+    struct amd_pollfd p = {fd, 1 /* POLLIN */, 0};
+    sys3(7 /* poll */, (u64)&p, 1, 0);
+    return (p.revents & 1) != 0;
+}
+static void test_syncfile(void) {
+    u32 a = 0, b = 0, empty = 0;
+    i64 r = syncobj_create(SYNCOBJ_CREATE_SIGNALED, &a);
+    check_v(r == 0, "sync_file: a signaled syncobj", r);
+    r = syncobj_create(SYNCOBJ_CREATE_SIGNALED, &b);
+    check_v(r == 0, "sync_file: a second signaled syncobj", r);
+    syncobj_create(0, &empty);
+    /* Linux: у syncobj без забора экспортировать нечего (drm_syncobj_export_sync_file) */
+    struct amd_syncobj_handle none = {empty, 1 /* EXPORT_SYNC_FILE */, -1, 0};
+    r = io(0xC01064C1u /* SYNCOBJ_HANDLE_TO_FD */, &none);
+    check_v(r == -EINVAL, "sync_file: a syncobj without a fence cannot be exported (EINVAL)", r);
+    struct amd_syncobj_handle ea = {a, 1, -1, 0};
+    struct amd_syncobj_handle eb = {b, 1, -1, 0};
+    i64 ra = io(0xC01064C1u, &ea);
+    i64 rb = io(0xC01064C1u, &eb);
+    check_v(ra == 0 && rb == 0 && ea.fd >= 0 && eb.fd >= 0, "sync_file: SYNCOBJ_HANDLE_TO_FD exports a sync_file", ra ? ra : rb);
+    if (ra != 0 || rb != 0) return;
+    check_v(sync_ready(ea.fd) && sync_ready(eb.fd), "sync_file: poll shows the exported fences signaled", 0);
+    struct amd_sync_merge m = {"amdprobe", eb.fd, -1, 0, 0};
+    r = sys3(SYS_ioctl, ea.fd, 0xC0303E03u /* SYNC_IOC_MERGE */, &m);
+    check_v(r == 0 && m.fence >= 0 && m.fence != ea.fd && m.fence != eb.fd, "sync_file: SYNC_IOC_MERGE gives a new sync_file", r);
+    if (r == 0) {
+        check_v(sync_ready(m.fence), "sync_file: the merge of two signaled is signaled", 0);
+        sys3(SYS_close, m.fence, 0, 0);
+    }
+    struct amd_sync_merge bad = {"amdprobe", 999, -1, 0, 0};
+    r = sys3(SYS_ioctl, ea.fd, 0xC0303E03u, &bad);
+    check_v(r == -EBADF, "sync_file: SYNC_IOC_MERGE with a closed fd2 is EBADF", r);
+    struct amd_sync_merge flagged = {"amdprobe", eb.fd, -1, 1, 0};
+    r = sys3(SYS_ioctl, ea.fd, 0xC0303E03u, &flagged);
+    check_v(r == -EINVAL, "sync_file: SYNC_IOC_MERGE with flags is EINVAL", r);
+    struct amd_sync_merge notsync = {"amdprobe", drm, -1, 0, 0};
+    r = sys3(SYS_ioctl, ea.fd, 0xC0303E03u, &notsync);
+    check_v(r == -EINVAL, "sync_file: SYNC_IOC_MERGE with a render node as fd2 is EINVAL", r);
+    sys3(SYS_close, ea.fd, 0, 0);
+    sys3(SYS_close, eb.fd, 0, 0);
+}
+
 static void test_cs(void) {
     u32 ib_bo = 0, data_bo = 0, ctx = 0, so = 0, tl = 0;
     gem_create(1 << 16, 2, &ib_bo);
@@ -637,6 +686,7 @@ __attribute__((used)) void start_c(u64 *sp) {
     test_info(sysfs_device, sysfs_rev);
     test_gem();
     test_prime();
+    test_syncfile();
     test_cs();
     i64 r = sys3(SYS_close, drm, 0, 0);
     check_v(r == 0, "close the render node", r);

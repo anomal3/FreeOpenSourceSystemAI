@@ -470,6 +470,8 @@ impl SyncHost for AmdFile {
 impl Drop for AmdFile {
     fn drop(&mut self) {
         let st = self.st.lock();
+        // Страницы файла уходят из таблиц железа до того, как кадры вернутся в пул.
+        hw_forget(st.vm_gen);
         crate::kprintln!("amdgpu: drm close pid {} (gem {} ctx {} va {})", self.pid, st.bos.len(), st.ctxs.len(), st.va.len());
     }
 }
@@ -971,6 +973,8 @@ fn gem_va(file: &AmdFile, arg: usize) -> i64 {
         return -e::EINVAL;
     }
     let mut st = file.st.lock();
+    // Отображение уходит или меняется: из таблиц железа убрать всё до того, как буфер может освободиться.
+    hw_forget(st.vm_gen);
     st.vm_gen = NEXT_GEN.fetch_add(1, Ordering::Relaxed);
     let start = args.va_address;
     let end = start + args.map_size;
@@ -1371,6 +1375,14 @@ struct CsPlan {
     fence: Option<(u32, u32)>,
     waits: Vec<(Arc<Syncobj>, u64)>,
     signals: Vec<(Arc<Syncobj>, u64)>,
+}
+
+/// Если в железе стоит адресное пространство с поколением `generation`, снять его: PTE не должны
+/// пережить кадры, на которые указывают (GPU простаивает - отправка синхронная).
+fn hw_forget(generation: u64) {
+    if HW_GEN.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        crate::display::amd::hw::clear();
+    }
 }
 
 /// Исполнение на железе: поставить адресное пространство файла в VMID 1 (если там чужое или оно

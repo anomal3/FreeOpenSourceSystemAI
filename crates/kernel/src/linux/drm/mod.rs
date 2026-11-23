@@ -460,10 +460,47 @@ pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
     if object.as_any().downcast_ref::<gem::DmaBuf>().is_some() || object.as_any().downcast_ref::<amdgpu::AmdDmaBuf>().is_some() {
         return Some(gem::dmabuf_ioctl(&object, request, arg));
     }
-    if object.as_any().downcast_ref::<sync::SyncFile>().is_some() || object.as_any().downcast_ref::<sync::SyncobjFile>().is_some() {
+    if let Some(file) = object.as_any().downcast_ref::<sync::SyncFile>() {
+        return Some(sync_file_ioctl(file, request, arg));
+    }
+    if object.as_any().downcast_ref::<sync::SyncobjFile>().is_some() {
         return Some(-e::ENOTTY);
     }
     None
+}
+
+/// `struct sync_merge_data` (Linux `uapi/linux/sync_file.h`): имя, второй fd, результат, флаги.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SyncMergeData {
+    name: [u8; 32],
+    fd2: i32,
+    fence: i32,
+    flags: u32,
+    pad: u32,
+}
+
+/// ioctl на `sync_file`: `SYNC_IOC_MERGE` (`_IOWR('>', 3, struct sync_merge_data)`) - новый
+/// `sync_file`, который сигнален, когда сигнальны оба. Остальное - `ENOTTY`.
+fn sync_file_ioctl(file: &sync::SyncFile, request: u32, arg: usize) -> i64 {
+    const SYNC_IOC_MERGE: u32 = 0xc030_3e03;
+    if request != SYNC_IOC_MERGE {
+        return -e::ENOTTY;
+    }
+    let Ok(mut data) = get::<SyncMergeData>(arg) else { return -e::EFAULT };
+    if data.flags != 0 || data.pad != 0 {
+        return -e::EINVAL;
+    }
+    let Some(other) = object_of(data.fd2 as u32 as usize) else { return -e::EBADF };
+    let Some(other) = other.as_any().downcast_ref::<sync::SyncFile>() else { return -e::EINVAL };
+    let mut merged = file.0.clone();
+    merged.merge(&other.0);
+    let fd = install(Arc::new(sync::SyncFile(merged)), false, true);
+    if fd < 0 {
+        return fd;
+    }
+    data.fence = fd as i32;
+    if put(arg, data).is_err() { -e::EFAULT } else { 0 }
 }
 
 /// Номер ioctl так, как его знает ядро. Linux (`drm_ioctl`) берёт из запроса

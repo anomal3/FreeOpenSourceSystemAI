@@ -363,3 +363,24 @@ time_ns() -> u64;  vram_used() -> u64;  gtt_used()
     - наличие `card0`-узла и `/sys/class/drm/card0` в нашем слое;
     - как `xtask/src/harness/mod.rs` цепляет Installed-сценарии в цепочку (нужен ли предшествующий `proton-gl` для `-s nvk-soft-vk`) — не читал;
     - реальный `AMDGPU_KMS_DRIVER_MINOR` ядра 6.12 (в документе тоже помечен «не нашёл»).
+
+## 9. Фактическое состояние (23.11.2026)
+
+План из разделов 6–7 выполнен с отклонением: вместо трейта `AmdBackend` и крейта `crates/amdgpu`
+сделано проще — `AmdFile` рядом с `DrmFile` (nouveau не тронут), без вынесения в крейт.
+
+| Что | Где | Проверено |
+| --- | --- | --- |
+| Узел `renderD128` для AMD (`amdnode soft on`), sysfs, `VERSION`, `GET_CAP`, `AMDGPU_INFO` (Polaris10) | `linux/drm/amdgpu.rs`, `sysfs.rs` | QEMU: `amd-soft` |
+| `GEM_CREATE/MMAP/CLOSE/METADATA/OP/WAIT_IDLE`, `GEM_VA` (MAP/UNMAP/REPLACE/CLEAR, PRT-резерв, 64 ГиБ), `CTX` | `amdgpu.rs` | QEMU: `amd-soft` |
+| `CS` (интерпретатор PM4: `WRITE_DATA`, `EVENT_WRITE_EOP`, `INDIRECT_BUFFER`, `DMA_DATA`), `WAIT_CS`, syncobj/timeline (общий `sync.rs`, трейт `SyncHost`) | `amdgpu.rs`, `sync.rs` | QEMU: `amd-soft` |
+| PRIME: dma-buf (`HANDLE_TO_FD`/`FD_TO_HANDLE`, `mmap`, `dmabuf_memory` для Wayland) | `amdgpu.rs` (`AmdDmaBuf`), `mod.rs` | QEMU: `amd-soft` |
+| `sync_file`: `SYNC_IOC_MERGE` | `mod.rs` | QEMU: `amd-soft` |
+| RADV из пакета Proton: создаёт устройство Polaris10, отправка, забор, `vulkaninfo` | `xtask/src/{mesa,proton}.rs`, сценарий `radv-soft-vk` | QEMU |
+| Бэкенд на железе: VMID 1 на 64 ГиБ, PD + пул PT в VRAM, отправка IB кольцом GFX с fence, `SH_MEM_*` VMID 1..15, шейдер из пользовательского VA | `display/amd/hw.rs`, `amdnode hw on`, `amd hw` | железо (RX 590): `HW RESULT`, `HW SHADER RESULT` PASSED |
+
+Не сделано: запуск RADV на железе (нужна установленная система с Proton), исполнение шейдеров на
+программной карте, прерывания (IH) вместо опроса fence, SDMA и compute-очереди, clear-state для
+графики (draw), VRAM-домен буферов (все буферы - системная память), PRT на железе (резерв
+запоминается, но не отображается), `GEM_USERPTR`, DXVK поверх RADV. Образы для флешки:
+`FOSSAI_AMD_{SMC_START,UCODE,RING,GART,CS,SHADER,HW}=1 cargo xtask image --release`.
