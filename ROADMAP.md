@@ -16880,3 +16880,97 @@ sshd живой системы пускает только `live` — нужен
 6. Полный порт OBS Studio (сцены, источники, стриминг): libobs + Qt6 +
    ffmpeg + openh264 + OpenGL (EGL/Mesa) + наш источник захвата (этот же
    `SYS_SCREENCAP`) и звук (`pcmC0D0c`). Оценка: 6–10 недель.
+
+## OBS Studio через слой Linux (23.11.2026) — **работает в QEMU, проверить на железе**
+
+Роман: OBS для Windows под Wine не запускается; родной порт — 6–10 недель.
+Сделано быстрее: **сборка Debian 13 (trixie) `obs-studio` 30.2.3 как есть**
+поверх слоя Linux ядра — Qt6 на нашем сервере Wayland (`qt6-wayland`,
+xdg-shell), OpenGL через EGL Mesa (llvmpipe), звук ALSA ядра, кодирование
+x264/FFmpeg. Захват экрана — свой модуль OBS вместо PipeWire и портала.
+
+**Пакет** — `cargo xtask thirdparty --only obs` → `obs-30.fpk` (`xtask/src/obs.rs`),
+в носитель — только с `FOSSAI_WITH_OBS=1` (как Proton). Состав: замыкание
+`DT_NEEDED` от `obs`, выбранных модулей OBS и модулей Qt по 209 пакетам
+trixie (снимок 20261020, хеши из `Packages`), своя glibc 2.41
+(`/opt/obs/glibc`, `PT_INTERP` переписан), Mesa — `mesa::add` (без lavapipe и
+проб Vulkan), шрифты DejaVu, xkb-data, локаль C.UTF-8 (`LOCPATH`). OBS ищет
+данные и модули от своего файла — `/opt/obs` повторяет `/usr`. Модули OBS:
+image-source, obs-ffmpeg (+ obs-ffmpeg-mux), obs-filters, obs-outputs,
+obs-transitions, obs-x264, rtmp-services, text-freetype2, linux-alsa и свой
+`obs-fossai.so`. Не взяты: frontend-tools (сценарии Python/Lua), linux-capture
+(X11), linux-pipewire, linux-pulseaudio, v4l2, decklink, vlc, websocket.
+**Размер: 663 МиБ** (Mesa с LLVM ≈ 190, FFmpeg с кодеками и фильтрами, которые
+тянут libavdevice/libavfilter, ≈ 150, Qt6 + ICU ≈ 60). «Пуск» и стол: «OBS
+Studio» со своим значком; запуск `/opt/obs/bin/fossai-obs` (ключи `--gpu`,
+`--env=ИМЯ=ЗНАЧЕНИЕ`, `--run=eglinfo|es2gears_wayland|ffprobe`, `--probe-last`).
+
+**Первый запуск** кладёт `~/.config/obs-studio`: русский язык, без мастера,
+профиль «FossAi» (простой режим, MP4, x264 veryfast, CRF, `~/Videos`, AAC 48 кГц),
+горячие клавиши **F9 — начать запись, F10 — остановить** (под Wayland — когда
+окно OBS в фокусе), сцена «Сцена» с источниками «Экран» (Захват экрана FossAi,
+весь стол, с указателем) и «Звук рабочего стола» (ALSA `default` → `pcmC0D0c`,
+отвод того, что играет система, `sound/loopback.rs`).
+
+**Захват:** `/dev/fossai-capture` (`crates/kernel/src/linux/fossaicap.rs`) —
+те же действия `SYS_SCREENCAP` ioctl-ами (`'F'` 1–6: INFO, START, GRAB, STOP,
+STATUS, WINDOWS); захват, начатый дескриптором, кончается с его закрытием.
+Модуль `libc/linux/obs-fossai.c` (clang + sysroot Debian 12 + заголовки
+libobs-dev): «Захват экрана FossAi» (весь стол или монитор, указатель, к/с) и
+«Захват окна FossAi» (прямоугольник окна по заголовку, следует за окном; видно
+то, что на экране в этом месте). Ядро держит один захват: второй источник ждёт.
+
+**Журнал правок, чтобы OBS заработал:**
+1. Сервер Wayland слал `wl_data_device.selection` сразу после
+   `get_data_device` — Qt 6 падал (буфер обмена платформы ещё не создан).
+   Теперь выделение — только клиенту с фокусом клавиатуры, перед `enter`
+   (как в протоколе) — `wayland.rs` `sync_selection`.
+2. `/proc/cpuinfo` без `physical id` — libobs (`os_get_cores_internal`)
+   падал в `strstr(…, NULL)`. Добавлены `physical id`, `siblings`, `core id`.
+3. Qt без UTF-8 и без раскладок Xkb («failed to create xkb context») —
+   локаль C.utf8 из libc-bin trixie и xkb-data в пакете.
+4. OBS запускает `obs-ffmpeg-mux` с **пустым** окружением (`posix_spawn`,
+   `envp = NULL`) — загрузчик не находил `libobs.so.0`, код 127, пустой файл.
+   Переходник `bin/obs-ffmpeg-mux` (bash) ставит `LD_LIBRARY_PATH`; путь к нему
+   переписан в `obs-ffmpeg.so` (там зашит `/usr/lib/…/obs-ffmpeg-mux`).
+5. Установщик не знал `OBS.FPK` (`crates/installer/src/payload.rs`).
+6. Капкан стенда: с Proton + TMNF + OBS корень тестового диска (4,6 ГБ)
+   переполняется, и установщик **молча висит** после `obsos` — TODO
+   установщика: отказ с «нет места». Сценарий `obs` — `install` без Proton.
+Не мешают: D-Bus нет (OBS пишет ошибку и живёт), `get_mempolicy` (239, libnuma)
+не реализован, `xdg-screensaver` нет (предупреждение).
+
+**Проверка:** `set FOSSAI_WITH_OBS=1` и `cargo xtask test -r -a x86_64 -s
+install,obs -j 1` — `pkg install obs` (65 с), eglinfo Wayland, OBS, окно, захват
+1280x720, F9, 12 с записи, F10, выход (Ctrl+Q), ffprobe записи в госте.
+Прогон 23.11 (obs9): **ок**, `~/Videos/2026-11-23 13-31-28.mp4`, 168 КБ:
+`h264 1280x720 30/1` + `aac 48000 Гц 2 канала`, выход OBS чистый.
+Снимки `build/test/obs-x86_64-release-obs-{main,recording,stopped}.png`.
+
+**Скорость.** В QEMU (TCG, 4 vCPU, без ускорения) OBS живой, но рисует 2–3
+кадра в секунду (97 % кадров «отстали по отрисовке», 20–35 % пропущено
+кодером) — llvmpipe и x264 под эмулятором; это не мерило. Для ПК Романа
+(Ryzen 8/16, RTX 3060, 2560x1440), оценка:
+* захват ядра — копия зеркала 14,7 МБ на кадр (~1,5 мс), 60 к/с ≈ 0,9 ГБ/с;
+* llvmpipe (`LP_NUM_THREADS` = все ЦП): загрузка текстуры 1440p, сцена,
+  перевод в NV12 и превью — порядка 10–15 мс на кадр: **30 к/с — да,
+  60 к/с — на грани**;
+* x264 veryfast 1440p30 — около половины ЦП; 1440p60 — почти весь ЦП:
+  для 60 к/с — superfast/ultrafast или вывод 1080p (Настройки → Видео);
+* `fossai-obs --gpu` — OpenGL через zink на NVK (узел nouveau ядра):
+  сцена и перевод цвета на видеокарте; **не проверено** (в QEMU NVIDIA нет).
+  Кодирование всё равно на ЦП: NVENC — только у закрытого драйвера NVIDIA,
+  VA-API нет.
+
+**TODO, по порядку.**
+1. Выход OBS: в одном прогоне из двух поток кодера AAC (FFmpeg) на
+   закрытии падал в `free()` (glibc `unlink_chunk`, порча кучи) — запись уже
+   закрыта, но OBS не доходит до «Freeing OBS context data». Разобрать
+   (munmap ядра или гонка под нашим планировщиком).
+2. Под нагрузкой OBS (очередь 7–12 готовых потоков на 4 ЦП) строка оболочки
+   ждёт минутами — справедливость планировщика к интерактивным задачам.
+3. Рамка окна: Qt рисует свою; `zxdg_decoration_manager_v1` с рамкой стола.
+4. Проверить на железе: `--gpu` (zink/NVK), 2560x1440@30/60, звук стола
+   через HDA, «Захват окна», трансляция RTMP (сеть есть, не проверялась).
+5. frontend-tools (сценарии, таймер записи) — нужна стандартная библиотека
+   Python (~30 МБ) или сборка без Python.

@@ -640,7 +640,7 @@ const DOTNET: [(&CStr16, &str); 3] = [
 ///
 /// Их отсутствие — не отказ: пакеты собирает `xtask`, и носитель, собранный без
 /// них, остаётся годным установочным носителем.
-const PACKAGES: [(&CStr16, &str); 17] = [
+const PACKAGES: [(&CStr16, &str); 18] = [
     (cstr16!("\\FREEOS\\PKG\\HELLO.FPK"), "hello-1.0.fpk"),
     (cstr16!("\\FREEOS\\PKG\\EXTRA.FPK"), "extra-1.0.fpk"),
     // Программа WinForms пакетом (фаза N8).
@@ -673,6 +673,9 @@ const PACKAGES: [(&CStr16, &str); 17] = [
     // Браузер OBSOS на движке Servo (N4–N7, 08.11.2026) — только если собран
     // Linux-хостом сборки (ports/servo/builder).
     (cstr16!("\\FREEOS\\PKG\\OBSOS.FPK"), "obsos-0.1.fpk"),
+    // OBS Studio из Debian 13 (23.11.2026) — только если собран и
+    // `FOSSAI_WITH_OBS=1`.
+    (cstr16!("\\FREEOS\\PKG\\OBS.FPK"), "obs-30.fpk"),
 ];
 
 /// Размер файла по данным файловой системы.

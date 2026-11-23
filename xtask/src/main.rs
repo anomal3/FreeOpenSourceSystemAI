@@ -42,6 +42,7 @@ mod netsurf;
 mod chromium;
 mod java;
 mod mesa;
+mod obs;
 mod proton;
 mod tmnf;
 mod wine;
