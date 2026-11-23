@@ -8874,6 +8874,11 @@ pub const ALL: &[Scenario] = &[
             // A pointer move wakes the desktop to take the second monitor.
             Step::Move(5, 5),
             Step::AwaitAny("desktop     : 2 outputs, desktop 2560x800", 60_000),
+            // `install` only copies the package to /media: install it here
+            // (already installed after `proton` - pkg says so).
+            Step::Line("pkg install proton"),
+            Step::AwaitOneOf(&["pkg: installed proton 11, ", "is already installed"], 2_400_000),
+            Step::Wait(10_000),
             Step::Line("power never"),
             Step::Await("screen off: never", 15_000),
             Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton /opt/proton/share/fossai/d3dprobe.exe monitors"),
