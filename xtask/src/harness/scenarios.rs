@@ -7197,6 +7197,111 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "radv-soft-vk",
+        about: "Proton уже установлен (после `proton-gl`): RADV из пакета Proton на программном узле amdgpu (22.11.2026, docs/AMD_DRM_PLAN.md) - `gpu gametest soft amd -- vk`: загрузчик Vulkan видит RADV (Polaris10), vkprobe создаёт устройство, пустая отправка с забором, vkCmdFillBuffer + vkCmdCopyBuffer. Шейдеры программная карта не выполняет.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "8G",
+        extra: &["-cpu", "max", "-smp", "4"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // На диске может стоять Proton без NVK (до 18.11): поставить заново
+            // из пакета образа и убедиться, что описатель NVK на месте.
+            // `install` с FOSSAI_WITH_PROTON=1 мог и не поставить Proton
+            // (20.11: «is not installed») — тогда сразу ставить.
+            Step::Line("pkg remove proton"),
+            Step::AwaitOneOf(&["pkg: removed proton", "pkg: proton is not installed"], 900_000),
+            Step::Wait(5_000),
+            Step::Line("pkg install proton"),
+            Step::Await("pkg: installed proton 11, ", 2_400_000),
+            Step::Wait(10_000),
+            Step::Line("run /opt/debian/bin/ls /opt/proton/share/vulkan/icd.d"),
+            Step::Await("radeon_icd.x86_64.json", 30_000),
+            // Утренняя проверка Романа (`gpu gametest`) в режиме SoftGpu
+            // (20.11): та же пользовательская часть (fossai-gametest), её
+            // вывод - через канал в журнал ядра (`gametest| `). vk: vkprobe
+            // на NVK, vulkaninfo, vkcube 600 кадров буферами
+            // zwp_linux_dmabuf_v1 (M7). SoftGpu шейдеры не выполняет -
+            // картинка не проверяется, только путь.
+            Step::Line("power never"),
+            Step::Await("screen off: never", 15_000),
+            Step::Line("gpu gametest soft amd -- vk"),
+            Step::Await("gametest: PASS soft-node", 30_000),
+            Step::Await("gametest| vkprobe: start", 300_000),
+            Step::Await("gametest| vkprobe: ok vkEnumeratePhysicalDevices finds a device", 300_000),
+            Step::Await("gametest| vkprobe: ok vkCreateDevice", 600_000),
+            Step::Await("gametest| vkprobe: ok vkWaitForFences (5 s)", 300_000),
+            // Заливку и копию 1 МиБ RADV делает compute-шейдером, а программная карта
+            // шейдеры не выполняет: данные не проверяются, только отправка и забор.
+            Step::Await("gametest| vkprobe: ok fill + copy submitted and the fence signalled", 300_000),
+            Step::Await("gametest| gametest: run vulkaninfo", 300_000),
+            Step::Await("gametest: done", 600_000),
+            Step::Absent("vkprobe: FAILED vkCreateDevice"),
+            Step::Absent("vkprobe: FAILED vkEnumeratePhysicalDevices"),
+            Step::Absent("protocol error"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "radv-debug",
+        about: "RADV debug on the amdgpu node: vkprobe with VK_LOADER_DEBUG=all (after install,proton).",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "8G",
+        extra: &["-cpu", "max", "-smp", "4"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // На диске может стоять Proton без NVK (до 18.11): поставить заново
+            // из пакета образа и убедиться, что описатель NVK на месте.
+            // `install` с FOSSAI_WITH_PROTON=1 мог и не поставить Proton
+            // (20.11: «is not installed») — тогда сразу ставить.
+            Step::Line("power never"),
+            Step::Await("screen off: never", 15_000),
+            Step::Line("amdnode soft on"),
+            Step::Line("run /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=VK_LOADER_DEBUG=all --env=RADV_DEBUG=info --run=vkprobe"),
+            Step::Await("vkprobe: 1 checks failed", 300_000),
+            Step::Wait(3_000),
+            Step::Absent("vkprobe: FAILED"),
+            Step::Absent("gametest| gametest: FAIL"),
+            Step::Absent("protocol error"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "proton-d3d",
         about: "Proton уже установлен (после `proton-gl`): DirectX в Wine (12.11, шаг 6) - d3dprobe.exe через wined3d (OpenGL, llvmpipe), затем D3D11 и D3D9 через DXVK (Vulkan, lavapipe).",
         target: Target::Installed,

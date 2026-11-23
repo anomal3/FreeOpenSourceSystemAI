@@ -67,6 +67,8 @@ pub fn running() -> bool {
 }
 /// 0 — всё, 1 — `force`, 2 — `kernel` (без сценария), 3 — `soft`.
 static MODE: AtomicU8 = AtomicU8::new(0);
+/// `soft amd`: программный узел AMD (RADV) вместо NVIDIA (NVK).
+static SOFT_AMD: AtomicBool = AtomicBool::new(false);
 /// Аргументы сценария (`gpu gametest -- …`).
 static SCRIPT_ARGS: SpinLock<String> = SpinLock::new(String::new());
 
@@ -78,6 +80,7 @@ pub fn start(argument: &str) -> String {
     ECHO.lock().clear();
     let (ours, script) = argument.split_once("--").map_or((argument, ""), |(a, b)| (a, b.trim()));
     let words: Vec<&str> = ours.split_whitespace().collect();
+    SOFT_AMD.store(words.contains(&"amd"), Ordering::Relaxed);
     MODE.store(
         if words.contains(&"soft") {
             3
@@ -143,9 +146,14 @@ fn task() {
 /// Вместо ступеней 1–4 — программная видеокарта (QEMU).
 fn soft_steps(run: &mut Run) -> bool {
     let t = crate::time::uptime_ms();
-    let ok = crate::linux::drm::set_soft(true);
+    let ok = if SOFT_AMD.load(Ordering::Relaxed) {
+        crate::linux::drm::amdgpu::set_soft(true);
+        true
+    } else {
+        crate::linux::drm::set_soft(true)
+    };
     let node = crate::linux::drm::node_visible();
-    run.step("soft-node", ok && node, t, &format!("SoftGpu {}, /dev/dri/renderD128 {}", if ok { "on" } else { "not available" }, if node { "present" } else { "absent" }))
+    run.step("soft-node", ok && node, t, &format!("{} {}, /dev/dri/renderD128 {}", if SOFT_AMD.load(Ordering::Relaxed) { "soft AMD" } else { "SoftGpu" }, if ok { "on" } else { "not available" }, if node { "present" } else { "absent" }))
 }
 
 /// Ступени 1–4. `false` — дальше идти незачем.

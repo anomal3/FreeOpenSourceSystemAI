@@ -530,7 +530,7 @@ pub fn build(arch: Arch) -> Result<()> {
         \tlvp) export VK_DRIVER_FILES=$V/lvp_icd.x86_64.json ;;\n\
         \tnvk) export VK_DRIVER_FILES=$V/nouveau_icd.x86_64.json ;;\n\
         \tradv) export VK_DRIVER_FILES=$V/radeon_icd.x86_64.json ;;\n\
-        \t*) if [ -e /dev/dri/renderD128 ] && [ -e $V/radeon_icd.x86_64.json ] && grep -qs 'DRIVER=amdgpu' /sys/class/drm/renderD128/device/uevent; then\n\
+        \t*) D=$(cat /sys/class/drm/renderD128/device/uevent 2>/dev/null); if [ -e $V/radeon_icd.x86_64.json ] && [ \"${D#*DRIVER=amdgpu}\" != \"$D\" ]; then\n\
         \t\texport VK_DRIVER_FILES=$V/radeon_icd.x86_64.json:$V/lvp_icd.x86_64.json\n\
         \telif [ -e /dev/dri/renderD128 ] && [ -e $V/nouveau_icd.x86_64.json ]; then\n\
         \t\texport VK_DRIVER_FILES=$V/nouveau_icd.x86_64.json:$V/lvp_icd.x86_64.json\n\
@@ -840,7 +840,8 @@ P=/opt/proton/bin/fossai-proton
 B=/opt/debian/bin/bash
 X=/opt/proton/share/fossai/d3dprobe.exe
 # Только NVK (fossai-proton читает FOSSAI_VULKAN до разбора `--env=`).
-export FOSSAI_VULKAN=nvk
+D=$(cat /sys/class/drm/renderD128/device/uevent 2>/dev/null)
+if [ "${D#*DRIVER=amdgpu}" != "$D" ]; then export FOSSAI_VULKAN=radv; VKNAME=RADV; else export FOSSAI_VULKAN=nvk; VKNAME=NVK; fi
 NVK=
 WHAT=${1:-all}
 VKFAIL=
@@ -874,7 +875,7 @@ if [ ! -e /dev/dri/renderD128 ]; then
 fi
 case $WHAT in all|vk)
     # 1. Vulkan на NVK: устройство, отправка с забором, заливка и копия 1 МиБ.
-    step vkprobe 300 $B $P $NVK --run=vkprobe NVK || VKFAIL=1
+    step vkprobe 300 $B $P $NVK --run=vkprobe $VKNAME || VKFAIL=1
     # 2. Что видит загрузчик (имя, драйвер, версии) - для журнала.
     step vulkaninfo 120 $B $P $NVK --run=vulkaninfo --summary
     # 3. vkcube: 600 кадров через zwp_linux_dmabuf_v1 (окно на столе).

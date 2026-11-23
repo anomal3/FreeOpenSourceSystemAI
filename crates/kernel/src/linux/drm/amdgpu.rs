@@ -319,7 +319,7 @@ impl AmdInfo {
             pcie_gen: 3,
             ids_flags: 0, // дискретная: без FUSION
             virtual_address_offset: 1 << 16,
-            virtual_address_max: (1 << 30) - 0x40_4000, // 1 ГиБ VA (наш PD) без верхнего резерва
+            virtual_address_max: (64u64 << 30) - 0x40_4000, // 64 GiB (как vm_size Linux; libdrm_amdgpu берёт общие VA выше 4 GiB)
             virtual_address_alignment: 4096,
             pte_fragment_size: 512 * 4096, // фрагмент 9 бит
             gart_page_size: 4096,
@@ -390,6 +390,8 @@ pub struct AmdFile {
 /// отображения (держат ссылки на буферы), потом ручки.
 struct AmdState {
     va: BTreeMap<u64, Mapping>,
+    /// PRT: разреженные области без буфера (начало -> размер), читаются нулями.
+    prt: BTreeMap<u64, u64>,
     ctxs: BTreeMap<u32, Ctx>,
     next_ctx: u32,
     bos: BTreeMap<u32, Arc<AmdBo>>,
@@ -402,6 +404,7 @@ impl AmdState {
     fn new() -> Self {
         Self {
             va: BTreeMap::new(),
+            prt: BTreeMap::new(),
             ctxs: BTreeMap::new(),
             next_ctx: 1,
             bos: BTreeMap::new(),
@@ -710,7 +713,10 @@ fn info_ioctl(file: &AmdFile, arg: usize) -> i64 {
         | INFO_NUM_VRAM_CPU_PAGE_FAULTS => reply(&request, &0u64.to_le_bytes()),
         INFO_VRAM_LOST_COUNTER => reply(&request, &0u32.to_le_bytes()),
         // Остальное (датчики, VBIOS, видео-возможности, MAX_IBS…) RADV терпит как ошибку.
-        _ => -e::EINVAL,
+        other => {
+            crate::kprintln!("amdgpu: INFO query {other:#x} is not supported");
+            -e::EINVAL
+        }
     }
 }
 
@@ -848,6 +854,11 @@ impl AmdState {
         handle
     }
 
+    /// Пересекает ли `[start, end)` разреженная область PRT.
+    fn prt_clash(&self, start: u64, end: u64) -> bool {
+        self.prt.iter().any(|(&from, &size)| from < end && from + size > start)
+    }
+
     /// Отображения, пересекающие `[start, end)`: их начала.
     fn overlapping(&self, start: u64, end: u64) -> Vec<u64> {
         self.va.iter().filter(|&(&from, map)| from < end && from + map.size > start).map(|(&from, _)| from).collect()
@@ -936,7 +947,11 @@ fn gem_va(file: &AmdFile, arg: usize) -> i64 {
             }
             // PRT: отображение без буфера (handle 0) — разреженная область; пока нет.
             if args.flags & VM_PAGE_PRT != 0 && args.handle == 0 {
-                return -e::EINVAL;
+                if args.operation != VA_OP_MAP || !st.overlapping(start, end).is_empty() || st.prt_clash(start, end) {
+                    return -e::EINVAL;
+                }
+                st.prt.insert(start, args.map_size);
+                return 0;
             }
             let Some(bo) = st.bos.get(&args.handle).cloned() else { return -e::ENOENT };
             if args.offset_in_bo.checked_add(args.map_size).is_none_or(|top| top > bo.size) {
@@ -945,7 +960,7 @@ fn gem_va(file: &AmdFile, arg: usize) -> i64 {
             let clash = st.overlapping(start, end);
             if args.operation == VA_OP_MAP {
                 // `amdgpu_vm_bo_map`: пересечение с уже отображённым — EINVAL.
-                if !clash.is_empty() {
+                if !clash.is_empty() || st.prt_clash(start, end) {
                     return -e::EINVAL;
                 }
             } else {
@@ -955,6 +970,10 @@ fn gem_va(file: &AmdFile, arg: usize) -> i64 {
                 }
             }
             st.va.insert(start, Mapping { bo, offset: args.offset_in_bo, size: args.map_size, flags: args.flags });
+            0
+        }
+        VA_OP_UNMAP if st.prt.get(&start).is_some_and(|&size| size == args.map_size || args.map_size == 0) => {
+            st.prt.remove(&start);
             0
         }
         VA_OP_UNMAP => match st.va.get(&start) {
@@ -967,6 +986,7 @@ fn gem_va(file: &AmdFile, arg: usize) -> i64 {
         },
         _ => {
             // CLEAR: снять всё, что пересекает диапазон.
+            st.prt.retain(|&from, &mut size| !(from < end && from + size > start));
             for from in st.overlapping(start, end) {
                 st.va.remove(&from);
             }
