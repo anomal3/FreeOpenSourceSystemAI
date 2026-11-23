@@ -1365,6 +1365,24 @@ fn run_builtin(line: &str) -> bool {
             }
             sprintln!("  fencestep: {} us", crate::linux::drm::FENCE_STEP_US.load(Relaxed));
         }
+        // hw-log15: a Linux thread spinning on sched_yield naps N us (0 - off).
+        #[cfg(target_arch = "x86_64")]
+        "yieldnap" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "off" => crate::linux::thread::YIELD_NAP_US.store(0, Relaxed),
+                value => match value.parse::<u64>() {
+                    Ok(us) => crate::linux::thread::YIELD_NAP_US.store(us.min(1_000), Relaxed),
+                    Err(_) => sprintln!("  yieldnap: usage `yieldnap [MICROSECONDS|off]`"),
+                },
+            }
+            sprintln!(
+                "  yieldnap: {} us, {} naps since boot",
+                crate::linux::thread::YIELD_NAP_US.load(Relaxed),
+                crate::linux::thread::YIELD_NAPS.load(Relaxed)
+            );
+        }
         // hw-log15: how late sleeps and fence waits end - fine (hrsleep)
         // against the tick way, in one boot (scenario `hrsleep`).
         #[cfg(target_arch = "x86_64")]

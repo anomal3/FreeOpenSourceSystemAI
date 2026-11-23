@@ -269,6 +269,57 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     }
     line.pop();
     kprintln!("  perf-diag   : {line}");
+    // hw-log15: who makes the most frequent calls - sampled call sites
+    // (every 256th call): return address into the caller, the file mapped
+    // there (offset/length), the thread (its own name if it set one).
+    let sites = profile::take_sites();
+    let top: Vec<usize> = rows.iter().filter(|row| row.0 < 500).take(3).map(|row| row.0).collect();
+    let mut line = String::new();
+    for number in &top {
+        let mine: Vec<&profile::Site> = sites.iter().filter(|site| site.0 == *number).collect();
+        let total: u64 = mine.iter().map(|site| site.1).sum();
+        if total == 0 {
+            continue;
+        }
+        let _ = write!(line, " {}:", name(*number));
+        for site in mine.iter().take(2) {
+            let (_, hits, ret, rip, off, len, slot) = **site;
+            let task = crate::sched::slot_task_name(slot).unwrap_or("?");
+            let thread = super::thread::thread_name(slot).map_or_else(String::new, |own| alloc::format!(" '{own}'"));
+            let _ = write!(
+                line,
+                " {}% ret {ret:#x} (file +{off:#x} of {len} bytes) rip {rip:#x} task {task}{thread} slot {slot} tid {},",
+                hits * 100 / total,
+                crate::sched::slot_task_id(slot).unwrap_or(0),
+            );
+        }
+        line.pop();
+        line.push(';');
+    }
+    if !line.is_empty() {
+        line.pop();
+        kprintln!("  perf-diag   : {secs} s callers of the most frequent calls:{line}");
+    }
+    // hw-log15: ioctl by request - top 5 by time.
+    let ioctls = profile::take_ioctls();
+    if !ioctls.is_empty() {
+        let mut line = String::new();
+        let _ = write!(line, "{secs} s ioctl by request:");
+        for (request, calls, ns, worst) in ioctls.iter().take(5) {
+            let known = profile::ioctl_name(*request);
+            let _ = write!(
+                line,
+                " {request:#010x}{}{} {calls}x {} ms ({} us avg, worst {} us),",
+                if known.is_empty() { "" } else { " " },
+                known,
+                ms(*ns),
+                ns / calls.max(&1) / 1000,
+                worst / 1000
+            );
+        }
+        line.pop();
+        kprintln!("  perf-diag   : {line}");
+    }
 
     // 2. Память и синхронизация.
     let mut line = String::new();

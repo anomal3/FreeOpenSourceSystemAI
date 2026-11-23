@@ -1729,6 +1729,19 @@ pub fn lookup(id: TaskId) -> Option<(usize, TaskState)> {
         })
 }
 
+/// Task id in a slot without the lock (0 - none): a hint, as `SLOT_ID`.
+#[must_use]
+pub fn slot_task_id(slot: usize) -> Option<u32> {
+    SLOT_ID.get(slot).map(|id| id.load(Ordering::Relaxed)).filter(|&id| id != 0)
+}
+
+/// Name of the task in a slot (perf-diag).
+#[must_use]
+pub fn slot_task_name(slot: usize) -> Option<&'static str> {
+    let sched = sched_lock();
+    sched.tasks.get(slot).and_then(Option::as_ref).map(|task| task.name)
+}
+
 /// Идентификатор задачи в слоте — обратное к [`lookup`].
 ///
 /// Нужен тому, кто знает слоты, а не задачи: таблица программ разложена по

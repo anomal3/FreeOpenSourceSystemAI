@@ -48,6 +48,196 @@ pub fn count(number: usize, nanos: u64) {
     }
 }
 
+// ---- who makes the calls (hw-log15) ------------------------------------------
+//
+// D2R made 5-12 M `getrusage` and half as many `sched_yield` per 30 s - one
+// thread spinning - and nothing in the log said whose loop it was. Every
+// 256th call of a number samples where it came from: the user RIP (in the
+// libc wrapper), the return address on the user stack (the caller - libc
+// wrappers of these calls are leaf functions), the file mapped there (offset
+// and file length: the library is recognisable by its length), and the task
+// slot. 32 cells for the window, by (number, return address).
+
+/// Sample cells: number + 1 (0 - empty), return address, RIP, image offset
+/// of the return address, image file length, hits, last slot.
+const SITES: usize = 32;
+static SITE_NR: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+static SITE_RET: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+static SITE_RIP: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+static SITE_IMG_OFF: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+static SITE_IMG_LEN: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+static SITE_HITS: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+static SITE_SLOT: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+
+/// Sample one call of `number` (every 256th of its calls): `rip` and `rsp`
+/// of the user at the `syscall` instruction.
+pub fn sample(number: usize, rip: u64, rsp: u64) {
+    if number >= SLOTS || CALLS[number].load(Ordering::Relaxed) % 256 != 0 {
+        return;
+    }
+    let ret = if crate::user::space::user_can(rsp as usize, 8, crate::mm::PageFlags::READ) {
+        // SAFETY: checked by the line above.
+        unsafe { core::ptr::read_unaligned(rsp as *const u64) }
+    } else {
+        0
+    };
+    let key = number as u64 + 1;
+    let found = (0..SITES).find(|&i| SITE_NR[i].load(Ordering::Relaxed) == key && SITE_RET[i].load(Ordering::Relaxed) == ret);
+    let cell = match found {
+        Some(cell) => cell,
+        None => {
+            let Some(cell) = (0..SITES).find(|&i| SITE_NR[i].compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed).is_ok())
+            else {
+                return;
+            };
+            let (off, len) = crate::user::with_current(|program| program.image_at(ret as usize))
+                .flatten()
+                .unwrap_or((0, 0));
+            SITE_RET[cell].store(ret, Ordering::Relaxed);
+            SITE_RIP[cell].store(rip, Ordering::Relaxed);
+            SITE_IMG_OFF[cell].store(off, Ordering::Relaxed);
+            SITE_IMG_LEN[cell].store(len, Ordering::Relaxed);
+            cell
+        }
+    };
+    SITE_HITS[cell].fetch_add(1, Ordering::Relaxed);
+    SITE_SLOT[cell].store(crate::sched::running_slot() as u64, Ordering::Relaxed);
+}
+
+/// A sampled call site: `(number, samples, return address, rip, image
+/// offset of the return address, image file length, last task slot)`.
+pub type Site = (usize, u64, u64, u64, u64, u64, usize);
+
+/// The sampled sites of the window, most samples first - and forget them.
+pub fn take_sites() -> Vec<Site> {
+    let mut sites: Vec<Site> = (0..SITES)
+        .filter_map(|i| {
+            let key = SITE_NR[i].load(Ordering::Acquire);
+            if key == 0 {
+                return None;
+            }
+            let site = (
+                key as usize - 1,
+                SITE_HITS[i].swap(0, Ordering::Relaxed),
+                SITE_RET[i].load(Ordering::Relaxed),
+                SITE_RIP[i].load(Ordering::Relaxed),
+                SITE_IMG_OFF[i].load(Ordering::Relaxed),
+                SITE_IMG_LEN[i].load(Ordering::Relaxed),
+                SITE_SLOT[i].load(Ordering::Relaxed) as usize,
+            );
+            SITE_NR[i].store(0, Ordering::Release);
+            Some(site)
+        })
+        .collect();
+    sites.sort_by(|a, b| b.1.cmp(&a.1));
+    sites
+}
+
+// ---- ioctl by request (hw-log15) -------------------------------------------
+//
+// `ioctl` averaged 291-719 us in D2R (40-80 thread-seconds per 30 s) and only
+// part of it was fence waits: per request number - count, ns, worst.
+
+const IOCTLS: usize = 48;
+static IOCTL_REQ: [AtomicU64; IOCTLS] = [const { AtomicU64::new(0) }; IOCTLS];
+static IOCTL_CALLS: [AtomicU64; IOCTLS] = [const { AtomicU64::new(0) }; IOCTLS];
+static IOCTL_NS: [AtomicU64; IOCTLS] = [const { AtomicU64::new(0) }; IOCTLS];
+static IOCTL_WORST: [AtomicU64; IOCTLS] = [const { AtomicU64::new(0) }; IOCTLS];
+
+/// Count one `ioctl` with request `request` that took `nanos`.
+pub fn count_ioctl(request: u32, nanos: u64) {
+    // 0 marks an empty cell: request 0 is counted as 1<<32.
+    let key = if request == 0 { 1 << 32 } else { u64::from(request) };
+    let mut cell = None;
+    for i in 0..IOCTLS {
+        let now = IOCTL_REQ[i].load(Ordering::Relaxed);
+        if now == key {
+            cell = Some(i);
+            break;
+        }
+        if now == 0 {
+            match IOCTL_REQ[i].compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => {
+                    cell = Some(i);
+                    break;
+                }
+                Err(other) if other == key => {
+                    cell = Some(i);
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    let Some(i) = cell else { return };
+    IOCTL_CALLS[i].fetch_add(1, Ordering::Relaxed);
+    IOCTL_NS[i].fetch_add(nanos, Ordering::Relaxed);
+    IOCTL_WORST[i].fetch_max(nanos, Ordering::Relaxed);
+}
+
+/// `ioctl`s of the window by request: `(request, calls, ns, worst ns)`, the
+/// most time first - and start a new window.
+pub fn take_ioctls() -> Vec<(u32, u64, u64, u64)> {
+    let mut rows: Vec<(u32, u64, u64, u64)> = (0..IOCTLS)
+        .filter_map(|i| {
+            let key = IOCTL_REQ[i].load(Ordering::Acquire);
+            if key == 0 {
+                return None;
+            }
+            let calls = IOCTL_CALLS[i].swap(0, Ordering::Relaxed);
+            let ns = IOCTL_NS[i].swap(0, Ordering::Relaxed);
+            let worst = IOCTL_WORST[i].swap(0, Ordering::Relaxed);
+            (calls > 0).then_some((key as u32, calls, ns, worst))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows
+}
+
+/// Name of an `ioctl` request for perf-diag: DRM core and nouveau numbers,
+/// dma-buf, terminal; otherwise empty.
+#[must_use]
+pub fn ioctl_name(request: u32) -> &'static str {
+    let kind = (request >> 8) & 0xff;
+    let nr = request & 0xff;
+    match (kind, nr) {
+        (0x64, 0x00) => "DRM_VERSION",
+        (0x64, 0x09) => "GEM_CLOSE",
+        (0x64, 0x0c) => "GET_CAP",
+        (0x64, 0x2d) => "PRIME_HANDLE_TO_FD",
+        (0x64, 0x2e) => "PRIME_FD_TO_HANDLE",
+        (0x64, 0xbf) => "SYNCOBJ_CREATE",
+        (0x64, 0xc0) => "SYNCOBJ_DESTROY",
+        (0x64, 0xc1) => "SYNCOBJ_HANDLE_TO_FD",
+        (0x64, 0xc2) => "SYNCOBJ_FD_TO_HANDLE",
+        (0x64, 0xc3) => "SYNCOBJ_WAIT",
+        (0x64, 0xc4) => "SYNCOBJ_RESET",
+        (0x64, 0xc5) => "SYNCOBJ_SIGNAL",
+        (0x64, 0xca) => "SYNCOBJ_TIMELINE_WAIT",
+        (0x64, 0xcb) => "SYNCOBJ_QUERY",
+        (0x64, 0xcc) => "SYNCOBJ_TRANSFER",
+        (0x64, 0xcd) => "SYNCOBJ_TIMELINE_SIGNAL",
+        (0x64, 0x40) => "NOUVEAU_GETPARAM",
+        (0x64, 0x42) => "NOUVEAU_CHANNEL_ALLOC",
+        (0x64, 0x43) => "NOUVEAU_CHANNEL_FREE",
+        (0x64, 0x47) => "NOUVEAU_NVIF",
+        (0x64, 0x50) => "NOUVEAU_VM_INIT",
+        (0x64, 0x51) => "NOUVEAU_VM_BIND",
+        (0x64, 0x52) => "NOUVEAU_EXEC",
+        (0x64, 0x80) => "NOUVEAU_GEM_NEW",
+        (0x64, 0x81) => "NOUVEAU_GEM_PUSHBUF",
+        (0x64, 0x82) => "NOUVEAU_GEM_CPU_PREP",
+        (0x64, 0x83) => "NOUVEAU_GEM_CPU_FINI",
+        (0x64, 0x84) => "NOUVEAU_GEM_INFO",
+        (0x62, 0x00) => "DMA_BUF_SYNC",
+        (0x62, 0x02) => "DMA_BUF_EXPORT_SYNC_FILE",
+        (0x62, 0x03) => "DMA_BUF_IMPORT_SYNC_FILE",
+        (0x54, _) => "tty",
+        (0x89, _) => "socket",
+        _ => "",
+    }
+}
+
 /// The longest single call since the last [`take_worst`] and its number.
 static WORST_NS: AtomicU64 = AtomicU64::new(0);
 static WORST_NR: AtomicU64 = AtomicU64::new(0);

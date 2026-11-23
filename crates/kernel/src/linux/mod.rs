@@ -49,7 +49,7 @@ pub mod profile;
 pub mod signal;
 mod snd;
 mod special;
-mod thread;
+pub mod thread;
 pub mod vdso;
 pub mod wayland;
 
@@ -361,6 +361,8 @@ pub unsafe fn syscall(frame: &mut crate::arch::TrapFrame) {
     // SAFETY: контракт функции.
     let result = unsafe { dispatch(number, args, frame) };
     profile::count(number, crate::time::uptime_ns().saturating_sub(started));
+    // Who makes the calls (hw-log15): every 256th call of a number.
+    profile::sample(number, frame.rip, frame.rsp);
     // Чтение до дна (`EAGAIN`) — для фронта `EPOLLET` (см. `ipc::note_drained`):
     // read, readv, recvfrom, recvmsg, recvmmsg.
     if result == -11 && matches!(number, 0 | 19 | 45 | 47 | 299) {
@@ -593,8 +595,17 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             // служебную страницу, фаза 74).
             nr::MLOCK | nr::MUNLOCK | nr::MLOCKALL | nr::MUNLOCKALL | nr::MLOCK2 => 0,
             nr::MEMBARRIER => membarrier(a0),
-            nr::IOCTL => ioctl(a0, a1, a2),
-            nr::SCHED_YIELD => errno(native(SYS_YIELD, 0, 0, 0)),
+            nr::IOCTL => {
+                // Per request number for perf-diag (hw-log15).
+                let started = crate::time::uptime_ns();
+                let answer = ioctl(a0, a1, a2);
+                profile::count_ioctl(a1 as u32, crate::time::uptime_ns().saturating_sub(started));
+                answer
+            }
+            nr::SCHED_YIELD => {
+                thread::yield_nap();
+                errno(native(SYS_YIELD, 0, 0, 0))
+            }
             // Совет о памяти или о чтении файла — совет: не принять его можно
             // всегда.
             nr::MADVISE => madvise(a0, a1, a2),
