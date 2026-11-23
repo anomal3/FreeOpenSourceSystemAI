@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::{
-    system_page, wait_for, Window, MM_GRBM_STATUS, MM_VM_CONTEXT1_CNTL, MM_VM_CONTEXT1_CNTL2,
+    system_page, Window, MM_GRBM_STATUS, MM_VM_CONTEXT1_CNTL, MM_VM_CONTEXT1_CNTL2,
     MM_VM_CONTEXT1_PAGE_TABLE_BASE_ADDR, MM_VM_CONTEXT1_PAGE_TABLE_END_ADDR, MM_VM_CONTEXT1_PAGE_TABLE_START_ADDR,
     MM_VM_CONTEXT1_PROTECTION_FAULT_ADDR, MM_VM_CONTEXT1_PROTECTION_FAULT_DEFAULT_ADDR,
     MM_VM_CONTEXT1_PROTECTION_FAULT_MCCLIENT, MM_VM_CONTEXT1_PROTECTION_FAULT_STATUS, MM_VM_INVALIDATE_REQUEST,
@@ -161,8 +161,31 @@ pub fn start() -> Vec<String> {
         PD_BYTES / 1024,
         window.rd(MM_VM_CONTEXT1_CNTL * 4)
     ));
+    note(super::gfx_init(&window));
+    sh_mem_init(&window);
+    note(format!("SH_MEM_* of VMID 1..15 set like gfx_v8_0_constants_init (SH_MEM_CONFIG {SH_MEM_CONFIG_USER:#x}, SH_MEM_BASES {SH_MEM_BASES_USER:#x})"));
     *HW.lock() = Some(hw);
     lines
+}
+
+/// `SRBM_GFX_CNTL` (dword 0x391): VMID в битах 7:4.
+const MM_SRBM_GFX_CNTL: usize = 0x391;
+/// `SH_MEM_CONFIG` VMID > 0 (`gfx_v8_0_constants_init`): ALIGNMENT_MODE = UNALIGNED (3 << 3), DEFAULT_MTYPE и
+/// APE1_MTYPE - UC (3), как у VMID 0 (на этой карте проверен именно он; Linux ставит NC для DEFAULT_MTYPE).
+const SH_MEM_CONFIG_USER: u32 = (3 << 3) | (3 << 5) | (3 << 8);
+/// `shared_aperture_start >> 48` (gmc_v8_0.c: 0x2000_0000_0000_0000).
+const SH_MEM_BASES_USER: u32 = 0x2000;
+
+/// `SH_MEM_*` контекстов 1..15: без них шейдеры с VMID > 0 работают с нулевыми базами апертур.
+fn sh_mem_init(window: &Window) {
+    for vmid in 1..16u32 {
+        window.wr(MM_SRBM_GFX_CNTL * 4, vmid << 4);
+        window.wr(super::MM_SH_MEM_CONFIG * 4, SH_MEM_CONFIG_USER);
+        window.wr(super::MM_SH_MEM_BASES * 4, SH_MEM_BASES_USER);
+        window.wr(super::MM_SH_MEM_APE1_BASE * 4, 1);
+        window.wr(super::MM_SH_MEM_APE1_LIMIT * 4, 0);
+    }
+    window.wr(MM_SRBM_GFX_CNTL * 4, 0);
 }
 
 /// Сбросить адресное пространство: все PDE пустые, пул PT свободен.
@@ -252,11 +275,71 @@ pub fn selftest() -> Vec<String> {
         }
         Err(why) => note(format!("HW RESULT: FAILED: {why}")),
     }
+    // Второй этап: compute-шейдер из пользовательского VA (то, что делает RADV для vkCmdFillBuffer).
+    const SHADER_VA: u64 = 0x3_0000_0000; // 12 ГиБ
+    let (Ok((shader_phys, shader_virt)), Ok((ib2_phys, ib2_virt))) = (system_page(0), system_page(0)) else {
+        note(String::from("out of memory pages"));
+        return lines;
+    };
+    const IB2_VA: u64 = 0x3_0010_0000;
+    if let Err(why) = map(SHADER_VA, &[shader_phys]).and_then(|()| map(IB2_VA, &[ib2_phys])) {
+        note(why);
+        return lines;
+    }
+    for (index, word) in super::SHADER_GFX8.iter().enumerate() {
+        // SAFETY: страница выделена выше, шейдер (15 слов) внутри неё.
+        unsafe { core::ptr::write_volatile((shader_virt + index * 4) as *mut u32, *word) };
+    }
+    let flag = DATA_VA + 0x40;
+    let data = DATA_VA + 0x20;
+    // SAFETY: страница данных, прямое отображение.
+    unsafe {
+        core::ptr::write_volatile((data_virt + 0x20) as *mut u32, 0);
+        core::ptr::write_volatile((data_virt + 0x40) as *mut u32, 0);
+    }
+    let program = SHADER_VA >> 8;
+    let sh = |count: u32| super::set_sh_reg(count, false);
+    let reg = |register: usize| (register - super::PM4_SET_SH_REG_START) as u32;
+    let ib2: Vec<u32> = alloc::vec![
+        super::PM4_CONTEXT_CONTROL_1, 0x8000_0000, 0x8000_0000,
+        sh(2), reg(0x2e0c), program as u32, (program >> 32) as u32, // COMPUTE_PGM_LO/HI
+        sh(2), reg(0x2e12), 0x002c_0040, 0x0000_0010, // COMPUTE_PGM_RSRC1/2
+        sh(3), reg(0x2e16), 0xffff_ffff, 0xffff_ffff, 0x0000_0100, // STATIC_THREAD_MGMT_SE0/1, TMPRING_SIZE
+        sh(2), reg(0x2e19), 0xffff_ffff, 0xffff_ffff, // STATIC_THREAD_MGMT_SE2/3
+        sh(2), reg(0x2e40), data as u32, (data >> 32) as u32, // COMPUTE_USER_DATA_0/1
+        sh(1), reg(0x2e15), 0, // COMPUTE_RESOURCE_LIMITS
+        sh(3), reg(0x2e07), 1, 1, 1, // COMPUTE_NUM_THREAD_X/Y/Z
+        super::dispatch_direct(false), 1, 1, 1, 0x0000_0045, // DISPATCH_DIRECT 1x1x1
+        super::PM4_EVENT_WRITE_0, 0x0000_0407, // CS_PARTIAL_FLUSH
+        super::PM4_WRITE_DATA_3, super::WRITE_DATA_MEMORY_CONFIRM, flag as u32, (flag >> 32) as u32, 99,
+    ];
+    for (index, word) in ib2.iter().enumerate() {
+        // SAFETY: страница выделена выше, буфер (около 60 слов) внутри неё.
+        unsafe { core::ptr::write_volatile((ib2_virt + index * 4) as *mut u32, *word) };
+    }
+    note(format!("shader at VA {SHADER_VA:#x}, IB of {} dwords at VA {IB2_VA:#x}, buffer_store_dword to VA {data:#x}, flag at {flag:#x}", ib2.len()));
+    match submit_timeout(IB2_VA, ib2.len(), 3000) {
+        Ok(()) => {
+            // SAFETY: страница данных, прямое отображение.
+            let (word, flag_word) = unsafe { (core::ptr::read_volatile((data_virt + 0x20) as *const u32), core::ptr::read_volatile((data_virt + 0x40) as *const u32)) };
+            let ok = word == 42 && flag_word == 99;
+            note(format!(
+                "HW SHADER RESULT: {} (the shader in VMID 1 wrote {word:#x} (want 0x2a), the flag {flag_word:#x} (want 0x63))",
+                if ok { "PASSED" } else { "FAILED" }
+            ));
+        }
+        Err(why) => note(format!("HW SHADER RESULT: FAILED: {why}")),
+    }
     lines
 }
 
 /// Выполнить буфер команд из `dwords` слов по адресу GPU `va` (VMID 1) и дождаться его конца.
 pub fn submit(va: u64, dwords: usize) -> Result<(), String> {
+    submit_timeout(va, dwords, 200)
+}
+
+/// То же, но ждать забор до `timeout_ms` миллисекунд (шейдеру с долгим циклом нужны секунды).
+pub fn submit_timeout(va: u64, dwords: usize, timeout_ms: u32) -> Result<(), String> {
     let Some(window) = window() else { return Err(String::from("no Polaris card was probed")) };
     let (seq, fence_mc, area) = {
         let mut guard = HW.lock();
@@ -278,11 +361,16 @@ pub fn submit(va: u64, dwords: usize) -> Result<(), String> {
         0,
     ];
     super::ring_submit(&window, &packets)?;
-    let value = wait_for(seq, || {
+    let mut value = 0;
+    for _ in 0..u64::from(timeout_ms) * 20 {
         window.hdp_invalidate();
         // SAFETY: слово fence внутри отображённой области, выровнено.
-        unsafe { core::ptr::read_volatile((area + FENCE_OFFSET) as *const u32) }
-    });
+        value = unsafe { core::ptr::read_volatile((area + FENCE_OFFSET) as *const u32) };
+        if value == seq {
+            break;
+        }
+        super::super::nvidia::spin_us(50);
+    }
     if value == seq {
         return Ok(());
     }
