@@ -4,13 +4,24 @@
 //!
 //! * `screenrec` — the window: source (monitor, whole desktop, a window's
 //!   area), 30/60 frames per second, size (as is / 1080p / 720p), pointer,
-//!   folder; «Начать запись» / «Остановить».
-//! * `screenrec --record [--seconds N] [--dir D] [--fps F] [--size H]` — the
-//!   recording itself, without a window (Win+Alt+R starts it; the window
-//!   too). Stops when asked through the kernel (`CAP_REQUEST_STOP`: Win+Alt+R,
-//!   the red tray indicator, the window) or after N seconds.
-//! * `screenrec --probe FILE` — check a recorded AVI: chunk structure,
-//!   indexes, every JPEG frame complete, sample frames decoded.
+//!   format (MP4 H.264 + Opus or AVI MJPEG «Совместимость»), quality, system
+//!   sound, folder; «Начать запись» / «Остановить».
+//! * `screenrec --record [--seconds N] [--dir D] [--fps F] [--size H]
+//!   [--format mp4|avi] [--quality high|medium|low] [--sound on|off]
+//!   [--out FILE]` — the recording itself, without a window (Win+Alt+R
+//!   starts it; the window too). Stops when asked through the kernel
+//!   (`CAP_REQUEST_STOP`: Win+Alt+R, the red tray indicator, the window) or
+//!   after N seconds.
+//! * `screenrec --probe FILE` — check a recording: MP4 (boxes, tables, NAL
+//!   units, Opus packets — `mp4rec::probe_fd`) or AVI (chunk structure,
+//!   indexes, every JPEG frame complete, sample frames decoded).
+//! * `screenrec --loopback-test N` — listen to the system sound loopback for
+//!   N seconds and print the level and pitch.
+//!
+//! MP4 (23.11, default) is in `mp4rec.rs`: H.264 by openh264 and Opus by
+//! libopus, C libraries linked in by `build.rs` with their C runtime in
+//! `crt.rs`. Without the library (no SDK when built) the recorder writes AVI
+//! only.
 //!
 //! # Pipeline
 //!
@@ -31,6 +42,11 @@
 #![no_main]
 
 extern crate alloc;
+
+#[cfg(screenrec_media)]
+mod crt;
+#[cfg(screenrec_media)]
+mod mp4rec;
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -61,6 +77,11 @@ const MAX_WORKERS: usize = 8;
 const WORKER_STACK: usize = 256 * 1024;
 /// JPEG quality (libjpeg scale): text of the desktop stays readable.
 const QUALITY: u32 = 80;
+/// H.264 and Opus are linked in (see `build.rs`).
+const MEDIA: bool = cfg!(screenrec_media);
+/// Names of the quality presets of MP4 (`mp4rec::PRESETS`).
+const PRESET_NAMES: [&str; 3] = ["Высокое", "Среднее", "Экономное"];
+const PRESET_KEYS: [&str; 3] = ["high", "medium", "low"];
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -86,11 +107,27 @@ struct Settings {
     area: Area,
     pointer: bool,
     quality: u32,
+    /// MP4 (H.264 + Opus); `false` — AVI (MJPEG), «Совместимость».
+    mp4: bool,
+    /// MP4 quality preset: 0 high, 1 medium, 2 economical.
+    preset: usize,
+    /// Record the system sound (MP4 only).
+    sound: bool,
 }
 
 impl Settings {
     fn defaults() -> Self {
-        Self { dir: format!("{}/Videos", user_progs::filedlg::home_dir()), fps: 30, size: 0, area: Area::Monitor(0), pointer: true, quality: QUALITY }
+        Self {
+            dir: format!("{}/Videos", user_progs::filedlg::home_dir()),
+            fps: 30,
+            size: 0,
+            area: Area::Monitor(0),
+            pointer: true,
+            quality: QUALITY,
+            mp4: MEDIA,
+            preset: 1,
+            sound: true,
+        }
     }
 
     fn path() -> String {
@@ -113,6 +150,9 @@ impl Settings {
                 "size" => settings.size = value.parse().ok().filter(|v| matches!(v, 0 | 720 | 1080)).unwrap_or(0),
                 "pointer" => settings.pointer = value != "0",
                 "quality" => settings.quality = value.parse().unwrap_or(QUALITY).clamp(30, 95),
+                "format" => settings.mp4 = MEDIA && value != "avi",
+                "preset" => settings.preset = PRESET_KEYS.iter().position(|k| *k == value).unwrap_or(1),
+                "sound" => settings.sound = value != "0",
                 "area" => {
                     settings.area = if value == "desktop" {
                         Area::Desktop
@@ -138,12 +178,15 @@ impl Settings {
             Area::Rect(x, y, w, h) => format!("rect:{x},{y},{w},{h}"),
         };
         let text = format!(
-            "# Запись экрана (screenrec)\ndir={}\nfps={}\nsize={}\narea={area}\npointer={}\nquality={}\n",
+            "# Запись экрана (screenrec)\ndir={}\nfps={}\nsize={}\narea={area}\npointer={}\nquality={}\nformat={}\npreset={}\nsound={}\n",
             self.dir,
             self.fps,
             self.size,
             u8::from(self.pointer),
-            self.quality
+            self.quality,
+            if self.mp4 { "mp4" } else { "avi" },
+            PRESET_KEYS[self.preset.min(2)],
+            u8::from(self.sound)
         );
         let config = format!("{}/.config", user_progs::filedlg::home_dir());
         let _ = mkdir(&config, 0o755);
@@ -314,6 +357,13 @@ fn area_rect(area: Area, info: &CapInfo) -> (i32, i32, u32, u32) {
     (x0, y0, ((x1 - x0) as u32) & !1, ((y1 - y0) as u32) & !1)
 }
 
+/// Bitrate of an MP4 preset, bits per second (as `mp4rec::video_bitrate`,
+/// also for builds without it — the window shows it).
+fn mp4_bitrate(preset: usize, w: u32, h: u32, fps: u32) -> i32 {
+    const BPP: [f32; 3] = [0.15, 0.08, 0.04];
+    ((w as f32) * (h as f32) * (fps as f32) * BPP[preset.min(2)]).clamp(1_500_000.0, 40_000_000.0) as i32
+}
+
 /// Output size for a captured `w`×`h` and the size setting.
 fn out_size(w: u32, h: u32, size: u32) -> (u32, u32) {
     if size == 0 || h <= size {
@@ -433,14 +483,14 @@ fn map_buffer(bytes: usize) -> Option<*mut u8> {
     (at > 0).then_some(at as usize as *mut u8)
 }
 
-/// File name from the local time: `Screen_2026-11-22_14-05-33.avi`.
-fn file_name() -> String {
+/// File name from the local time: `Screen_2026-11-22_14-05-33.<ext>`.
+fn file_name(ext: &str) -> String {
     let offset = local_offset();
     let now = user_progs::time_now() as i64 + i64::from(offset) * 60;
     let days = now.div_euclid(86_400);
     let secs = now.rem_euclid(86_400);
     let (year, month, day) = calendar::civil_from_days(days);
-    format!("Screen_{year:04}-{month:02}-{day:02}_{:02}-{:02}-{:02}.avi", secs / 3600, secs / 60 % 60, secs % 60)
+    format!("Screen_{year:04}-{month:02}-{day:02}_{:02}-{:02}-{:02}.{ext}", secs / 3600, secs / 60 % 60, secs % 60)
 }
 
 /// Local time offset, minutes (`/etc/system.cfg`, as the kernel reads it).
@@ -452,7 +502,7 @@ fn local_offset() -> i32 {
 }
 
 /// The recording: until asked to stop or `seconds` pass. Exit code.
-fn record(settings: &Settings, seconds: Option<u64>) -> i64 {
+fn record(settings: &Settings, seconds: Option<u64>, out: Option<String>) -> i64 {
     let Some(info) = cap_info() else {
         println("screenrec: FAILED no desktop to capture");
         return 1;
@@ -483,7 +533,7 @@ fn record(settings: &Settings, seconds: Option<u64>) -> i64 {
     };
 
     make_dirs(&settings.dir);
-    let base = format!("{}/{}", settings.dir.trim_end_matches('/'), file_name());
+    let base = format!("{}/{}", settings.dir.trim_end_matches('/'), file_name("avi"));
     let mut path = base.clone();
     for n in 2..100 {
         let mut info = user_abi::Stat::default();
@@ -492,6 +542,7 @@ fn record(settings: &Settings, seconds: Option<u64>) -> i64 {
         }
         path = format!("{}_{n}.avi", base.trim_end_matches(".avi"));
     }
+    let path = out.unwrap_or(path);
     let fd = open_write(&path, true, true);
     if fd < 0 {
         return give_up(format!("cannot create {path}: {fd}"));
@@ -757,6 +808,13 @@ fn probe_file(path: &str) -> Result<String, String> {
 }
 
 fn probe_fd(fd: i64) -> Result<String, String> {
+    let mut magic = [0u8; 8];
+    if read_exact_at(fd, 0, &mut magic) && &magic[4..8] == b"ftyp" {
+        #[cfg(screenrec_media)]
+        return mp4rec::probe_fd(fd);
+        #[cfg(not(screenrec_media))]
+        return Err(String::from("MP4, but this build has no MP4 support"));
+    }
     let size = user_progs::file_size(fd).max(0) as u64;
     let mut head = [0u8; 12];
     let mut at = 0u64;
@@ -882,6 +940,10 @@ enum Action {
     Fps(u32),
     Size(u32),
     Pointer(bool),
+    /// MP4 (`true`) or AVI.
+    Format(bool),
+    Preset(usize),
+    Sound(bool),
     Folder,
     Start,
     Stop,
@@ -954,7 +1016,10 @@ impl Recorder {
         let face = ctx.face(Role::Body);
         let mut controls = Vec::new();
         let mut labels = Vec::new();
-        let mut y = area.y + ctx.px(96) as i32;
+        // A 720p screen leaves the window ~520 points: rows closer there.
+        let compact = area.h < ctx.px(620);
+        let mut y = area.y + ctx.px(if compact { 82 } else { 96 }) as i32;
+        let row_gap = ctx.px(if compact { 6 } else { 14 }) as i32;
         let right = area.right() - pad;
         let row = |label: &str, items: Vec<(Action, String, bool)>, y: &mut i32, controls: &mut Vec<Control>, labels: &mut Vec<(String, i32)>| {
             labels.push((label.to_string(), *y));
@@ -968,7 +1033,7 @@ impl Recorder {
                 controls.push(Control { action, rect: Rect::new(x, *y, w, row_h), label: text, on });
                 x += w as i32 + gap;
             }
-            *y += row_h as i32 + ctx.px(14) as i32;
+            *y += row_h as i32 + row_gap;
         };
         let mut items: Vec<(Action, String, bool)> = self.areas().into_iter().enumerate().map(|(i, (text, value))| (Action::Area(i), text, self.settings.area == value)).collect();
         let window_label = match &self.window {
@@ -997,12 +1062,38 @@ impl Recorder {
         );
         let pointer = self.settings.pointer;
         row("Указатель", alloc::vec![(Action::Pointer(true), String::from("Показывать"), pointer), (Action::Pointer(false), String::from("Скрыть"), !pointer)], &mut y, &mut controls, &mut labels);
+        let mp4 = self.settings.mp4;
+        row(
+            "Формат",
+            alloc::vec![(Action::Format(true), String::from("MP4 (H.264 + Opus)"), mp4), (Action::Format(false), String::from("AVI — совместимость"), !mp4)],
+            &mut y,
+            &mut controls,
+            &mut labels,
+        );
+        if mp4 {
+            let (w, h) = out_size(w, h, size);
+            let presets = (0..PRESET_NAMES.len())
+                .map(|i| {
+                    let mbit = mp4_bitrate(i, w, h, self.settings.fps) / 100_000;
+                    (Action::Preset(i), format!("{} · {}.{} Мбит/с", PRESET_NAMES[i], mbit / 10, mbit % 10), self.settings.preset == i)
+                })
+                .collect();
+            row("Качество", presets, &mut y, &mut controls, &mut labels);
+            let sound = self.settings.sound;
+            row(
+                "Звук системы",
+                alloc::vec![(Action::Sound(true), String::from("Записывать"), sound), (Action::Sound(false), String::from("Без звука"), !sound)],
+                &mut y,
+                &mut controls,
+                &mut labels,
+            );
+        }
         row("Папка", alloc::vec![(Action::Folder, String::from("Изменить…"), false)], &mut y, &mut controls, &mut labels);
         // The folder path goes on the row of «Папка» after the button.
         let folder_row = controls.last().map_or(Rect::EMPTY, |c| Rect::new(c.rect.right() + gap, c.rect.y, (right - c.rect.right() - gap).max(0) as u32, c.rect.h));
         // The big button.
         let big_w = ctx.px(260);
-        let big = Rect::new(area.x + pad + label_w, y + ctx.px(36) as i32, big_w, ctx.px(44));
+        let big = Rect::new(area.x + pad + label_w, y + ctx.px(if compact { 28 } else { 36 }) as i32, big_w, ctx.px(44));
         if self.recording() {
             controls.push(Control { action: Action::Stop, rect: big, label: String::from("Остановить запись"), on: true });
         } else {
@@ -1039,6 +1130,15 @@ impl Recorder {
             Action::Fps(fps) => self.settings.fps = fps,
             Action::Size(size) => self.settings.size = size,
             Action::Pointer(on) => self.settings.pointer = on,
+            Action::Format(mp4) => {
+                if mp4 && !MEDIA {
+                    self.note = Some(String::from("MP4 в этой сборке нет (собрана без набора C) — пишется AVI"));
+                } else {
+                    self.settings.mp4 = mp4;
+                }
+            }
+            Action::Preset(preset) => self.settings.preset = preset,
+            Action::Sound(on) => self.settings.sound = on,
             Action::Folder => {
                 let options = Options::folder().title("Папка для записей").dir(&self.settings.dir);
                 match Dialog::start_owned(&options, app::window_id(), "screenrec") {
@@ -1169,7 +1269,7 @@ impl App for Recorder {
         let sub = if self.recording() {
             format!("Идёт запись · {} · {}×{}", clock_text(self.status.elapsed_ms), self.status.w, self.status.h)
         } else {
-            String::from("Видео экрана в файл AVI (MJPEG) · Win+Alt+R — начать и остановить")
+            String::from(if self.settings.mp4 { "Видео экрана в MP4 (H.264, звук Opus) · Win+Alt+R — начать и остановить" } else { "Видео экрана в AVI (MJPEG) · Win+Alt+R — начать и остановить" })
         };
         paint::text_clipped(ctx, s, Role::Body, tx, tile.y + i32::from(ctx.face(Role::Heading).line) + ctx.px(4) as i32, room, &sub, if self.recording() { p.bad } else { p.ink3 });
 
@@ -1240,7 +1340,7 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
             while user_progs::readdir(fd, &mut entry) {
                 let len = (entry.name_len as usize).min(entry.name.len());
                 let name = String::from_utf8_lossy(&entry.name[..len]).to_string();
-                if name.ends_with(".avi") {
+                if name.ends_with(".avi") || name.ends_with(".mp4") {
                     names.push(name);
                 }
             }
@@ -1271,10 +1371,36 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         if let Some(area) = value("--area") {
             settings.area = if area == "desktop" { Area::Desktop } else { Area::Monitor(area.trim_start_matches("monitor:").parse().unwrap_or(0)) };
         }
+        if let Some(format) = value("--format") {
+            settings.mp4 = format != "avi";
+        }
+        if let Some(quality) = value("--quality") {
+            settings.preset = PRESET_KEYS.iter().position(|k| *k == quality).unwrap_or(1);
+        }
+        if let Some(sound) = value("--sound") {
+            settings.sound = sound != "off" && sound != "0";
+        }
         let seconds = value("--seconds").and_then(|v| v.parse().ok());
-        exit(record(&settings, seconds));
+        let out = value("--out");
+        if settings.mp4 {
+            #[cfg(screenrec_media)]
+            exit(mp4rec::record(&settings, seconds, out));
+            #[cfg(not(screenrec_media))]
+            println("screenrec: note: this build has no H.264 (SDK was missing), recording AVI");
+        }
+        exit(record(&settings, seconds, out));
+    }
+    if let Some(seconds) = value("--loopback-test").and_then(|v| v.parse().ok()) {
+        #[cfg(screenrec_media)]
+        exit(mp4rec::loopback_test(seconds));
+        #[cfg(not(screenrec_media))]
+        {
+            let _: u64 = seconds;
+            println("screenrec: FAILED this build has no sound support");
+            exit(1);
+        }
     }
     let info = app::start(&SPEC);
-    let size = app::window_size(&info, (760, 520));
+    let size = app::window_size(&info, (800, 660));
     app::run(&SPEC, &info, size, |_, _| Recorder::new())
 }

@@ -57,8 +57,12 @@ miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-a
 # JPEG, а ядро читает только QOI. Без `std` и без SIMD-обнаружения (оно из
 # `std`): разбор скалярный, обои переводятся один раз при выборе.
 zune-jpeg = { version = "0.4", default-features = false }
-# «Запись экрана» (22.11, `screenrec`): кодер JPEG и запись AVI (MJPEG).
+# «Запись экрана» (22.11, `screenrec`): кодер JPEG и запись AVI (MJPEG);
+# с 23.11 — H.264 + Opus в MP4 (кодеры на C, см. `build.rs`).
 screencast = { path = "../screencast" }
+# `log`, `floor`, `sqrtf` для кодеров на C в `screenrec` (23.11): своей libm
+# у программы на Rust нет. Та же версия, что у `raster` и `clr-vm`.
+libm = "0.2"
 
 [lints]
 workspace = true

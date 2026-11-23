@@ -2288,6 +2288,20 @@ pub fn futex_wait(word: &core::sync::atomic::AtomicU32, expected: u32) -> Option
     }
 }
 
+/// [`futex_wait`] with a limit of `ms` milliseconds (23.11, the C runtime of
+/// `/bin/screenrec`: `sem_timedwait`). `Some(true)` — woken, `Some(false)` —
+/// the word was different or the time ran out.
+pub fn futex_wait_for(word: &core::sync::atomic::AtomicU32, expected: u32, ms: u64) -> Option<bool> {
+    let addr = core::ptr::from_ref(word) as usize;
+    // SAFETY: the call does not write into the program; the address is its own word.
+    let result = unsafe { syscall(SYS_FUTEX_WAIT, addr, expected as usize, ms.max(1) as usize) };
+    match result {
+        0 => Some(true),
+        FUTEX_CHANGED | user_abi::FUTEX_TIMED_OUT => Some(false),
+        _ => None,
+    }
+}
+
 /// Разбудить ждущих на адресе. `count` в ноль — всех. Возвращает, скольких.
 pub fn futex_wake(word: &core::sync::atomic::AtomicU32, count: usize) -> usize {
     let addr = core::ptr::from_ref(word) as usize;

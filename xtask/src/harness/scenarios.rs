@@ -3508,6 +3508,74 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("KERNEL PANIC"),
         ],
     },
+    // «Запись экрана» в MP4 (23.11): H.264 (openh264) и звук системы (Opus)
+    // из отвода ядра. Сначала отвод сам по себе — `--loopback-test` слышит
+    // гудок ядра 440 Гц; затем 10 с стола 640×360 со звуком, проверка файла
+    // в госте (`--probe`: таблицы, NAL, IDR первым, пакеты Opus по 20 мс).
+    // Вынуть файл scp нельзя: sshd живой системы пускает только `live`, а
+    // `Step::Sftp` ходит под `roman` (TODO в ROADMAP).
+    Scenario {
+        name: "screenrec-mp4",
+        about: "Запись экрана в MP4: H.264 + Opus, звук системы из отвода ядра (гудок 440 Гц), проверка файла в госте.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 22,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: true,
+        memory: "",
+        extra: &["-cpu", "max", "-smp", "4", "-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
+        steps: &[
+            Step::AwaitAny("virtio-snd  : at ", BOOT),
+            Step::Await(PROMPT, BOOT),
+            Step::AwaitAny("sshd: listening on port 22", 90_000),
+            Step::Wait(1_000),
+            // ── The loopback alone: what the card plays comes back.
+            Step::Line("run -b /bin/screenrec --loopback-test 4"),
+            Step::Wait(800),
+            Step::Line("beep 440 2000"),
+            Step::Await("screenrec: loopback heard ", 30_000),
+            Step::Expect("~440 Hz"),
+            // ── 10 s into MP4 with the sound of the system.
+            // MP4, «Среднее», sound on — the defaults (the kernel passes
+            // eight words of a command line, the program's name included).
+            Step::Line("run -b /bin/screenrec --record --seconds 10 --size 360 --out /root/rec-test.mp4"),
+            Step::Await("capture     : started", 30_000),
+            Step::Await("screenrec: recording ", 30_000),
+            Step::Expect("MP4 H.264"),
+            Step::Wait(1_500),
+            Step::Line("beep 440 3000"),
+            Step::Line("run -b /bin/screenrec"),
+            Step::Await("screenrec: ready", 30_000),
+            Step::Wait(2_000),
+            Step::Shot("01-mp4-window"),
+            Step::Await("screenrec: stopped (time is up)", 60_000),
+            Step::Await("screenrec: encode ", 10_000),
+            Step::Await("screenrec: sound ", 10_000),
+            Step::Await("screenrec: saved /root/rec-test.mp4", 30_000),
+            // The window has the focus — typing goes to it: close it first.
+            Step::Key("alt-f4"),
+            Step::Await("screenrec: closing on request", 15_000),
+            Step::Wait(1_000),
+            Step::Line("run /bin/screenrec --probe /root/rec-test.mp4"),
+            Step::Await("screenrec: probe OK mp4 h264 640x360", 120_000),
+            Step::Expect("Opus "),
+            Step::Absent("screenrec: probe FAILED"),
+            Step::Absent("screenrec: FAILED"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
     Scenario {
         name: "admin",
         about: "«Администрирование» (П3): центр, поиск, страницы «Параметров», Управление компьютером, Монитор ресурсов, Автозагрузка, Редактор конфигурации, Win+X.",

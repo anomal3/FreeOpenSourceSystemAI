@@ -320,6 +320,9 @@ mod tests {
     fn build_screenmedia() {
         let library = super::ensure(crate::arch::Arch::X86_64).expect("x86_64 build");
         assert!(library.is_file());
+        if crate::cbuild::sysroot(crate::arch::Arch::Aarch64).join("include/stdio.h").is_file() {
+            assert!(super::ensure(crate::arch::Arch::Aarch64).expect("aarch64 build").is_file());
+        }
         if cfg!(windows) {
             assert!(super::ensure_host().expect("host build").is_file());
         }
