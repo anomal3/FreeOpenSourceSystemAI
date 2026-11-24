@@ -10179,7 +10179,7 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "vlc",
-        about: "VLC (24.11): vlc 3.0 Debian 13 через слой Linux (`install` с FOSSAI_WITH_VLC=1) - видео по умолчанию у VLC (реестр), запись экрана в MP4 (H.264 + Opus, гудок 660 Гц), «Файлы» открывают её (путь с пробелами) в VLC: окно Qt5 на Wayland по-русски, видео - подповерхность wl_shm, звук - ALSA ядра (тон 660 Гц в звуке гостя), пауза, полный экран, выход.",
+        about: "VLC (24.11): vlc 3.0 Debian 13 через слой Linux (`install` с FOSSAI_WITH_VLC=1) - видео по умолчанию у VLC (реестр), запись экрана в MP4 (H.264 + Opus, гудок 660 Гц), «Файлы» открывают её (путь с пробелами) в VLC: окно Qt5 на Wayland по-русски, видео - подповерхность wl_shm, звук - ALSA ядра (тон 660 Гц в звуке гостя), пауза, полный экран, хранитель экрана ждёт, пока идёт видео (zwp_idle_inhibitor_v1), выход.",
         target: Target::Installed,
         usb_only: false,
         tablet: false,
@@ -10208,13 +10208,16 @@ pub const ALL: &[Scenario] = &[
             Step::Line("pkg install vlc"),
             Step::AwaitOneOf(&["pkg: installed vlc 3.0, ", "is already installed", "pkg: no package 'vlc'"], 1_800_000),
             Step::Absent("pkg: no package 'vlc'"),
-            Step::Wait(10_000),
+            // `setup=` of the package: the plugins cache (vlc-cache-gen).
+            Step::AwaitOneOf(&["fossai-vlc: plugins cache ", "fossai-vlc: no plugins cache", "is already installed"], 600_000),
+            Step::Absent("fossai-vlc: no plugins cache"),
+            Step::Wait(5_000),
             // Video files open in VLC by default (sysconf::store::BUILTIN) -
             // the script of the installed package is there.
             Step::Line("reg get filetypes/.mp4/default"),
             Step::Await("reg: filetypes/.mp4/default = /opt/debian/bin/bash /opt/vlc/bin/fossai-vlc", 15_000),
-            // A clip of our own: 8 s of the screen with a 660 Hz beep.
-            Step::Line("run -b /bin/screenrec --record --seconds 8 --size 360 --out /home/roman/clip.mp4"),
+            // A clip of our own: 16 s of the screen with a 660 Hz beep.
+            Step::Line("run -b /bin/screenrec --record --seconds 16 --size 360 --out /home/roman/clip.mp4"),
             Step::Await("screenrec: recording ", 30_000),
             Step::Wait(1_500),
             Step::Line("beep 660 3000"),
@@ -10222,6 +10225,9 @@ pub const ALL: &[Scenario] = &[
             Step::Line("mkdir /home/roman/My Videos"),
             Step::Line("cp /home/roman/clip.mp4 /home/roman/My Videos/test clip.mp4"),
             Step::Wait(2_000),
+            // The beep itself is in the guest sound too: the tone is looked
+            // for only in what VLC plays from here on.
+            Step::SoundMark,
             // «Файлы»: Enter on the only file opens it with the default
             // program, the path with spaces in quotes.
             Step::Line("run -b /bin/files /home/roman/My Videos"),
@@ -10234,27 +10240,50 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("/opt/debian/bin/bash: killed by the kernel"),
             Step::AwaitAny("Медиапроигрыватель VLC", 600_000),
             Step::AwaitAny("starts playback", 600_000),
-            Step::Wait(4_000),
+            // The video window holds the screensaver back (own inhibit
+            // module -> zwp_idle_inhibitor_v1), its pictures are wl_shm
+            // buffers in memfd memory (not "cannot create buffers").
+            Step::AwaitAny("inhibits the screensaver", 60_000),
+            Step::Absent("cannot create buffers"),
+            Step::Wait(3_000),
             Step::Move(1, 0),
             Step::Wait(1_000),
             Step::Painted("vlc-playing"),
             // Space pauses, F - full screen (keys go to the focused VLC).
             Step::Key("spc"),
-            Step::Wait(3_000),
+            Step::Wait(2_000),
             Step::Shot("vlc-paused"),
             Step::Key("spc"),
-            Step::Wait(1_500),
+            Step::Wait(1_000),
             Step::Key("f"),
-            Step::Wait(5_000),
+            Step::AwaitAny("Медиапроигрыватель VLC' entered fullscreen", 15_000),
+            Step::Wait(2_000),
             Step::Shot("vlc-fullscreen"),
             Step::Key("f"),
-            Step::Wait(3_000),
+            Step::AwaitAny("Медиапроигрыватель VLC' left fullscreen", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("vlc-windowed"),
             Step::AwaitAny("snd         : playback closed: ", 600_000),
             Step::Tone(660),
             Step::Wait(3_000),
             Step::Shot("vlc-ended"),
             Step::Key("ctrl-q"),
-            Step::Wait(10_000),
+            Step::Wait(5_000),
+            // «Файлы» too: the serial lines below go to the terminal.
+            Step::Key("alt-f4"),
+            Step::Wait(2_000),
+            // The screensaver waits while a video plays: saver after 10 s, the
+            // clip in a loop, no input - the idle inhibitor of the video
+            // window holds it back.
+            Step::Line("power saver on 10"),
+            Step::Line("run -b /opt/debian/bin/bash /opt/vlc/bin/fossai-vlc --loop /home/roman/clip.mp4"),
+            Step::AwaitAny("held back: a Wayland client holds an idle inhibitor", 90_000),
+            Step::Wait(2_000),
+            Step::Shot("vlc-no-saver"),
+            Step::Key("ctrl-q"),
+            Step::Wait(5_000),
+            Step::Line("power saver off"),
+            Step::Wait(2_000),
             Step::Absent("KERNEL PANIC"),
         ],
     },
