@@ -161,6 +161,7 @@ pub fn build_with_key(built: &Built, kind: Kind, live_key: Option<&Path>) -> Res
     if kind == Kind::System {
         payload.push(live_file());
         payload.push(display_file());
+        payload.push(boot_cfg_file());
     }
     let bytes = assemble(&payload, kind)?;
 
@@ -219,6 +220,20 @@ fn display_file() -> Payload {
         path: String::from("FREEOS/DISPLAY.CFG"),
         data,
         source: PathBuf::from("(режим экрана для загрузчика)"),
+    }
+}
+
+/// Boot mode for the loader on a live stick `\FREEOS\BOOT.CFG` (24.11):
+/// one sector, `normal` and spaces; the kernel rewrites it in place with
+/// `verbose` (`usb::stick_log::store_boot_cfg`) from «Параметры →
+/// Восстановление → Подробная загрузка».
+fn boot_cfg_file() -> Payload {
+    let mut data = vec![b' '; 512];
+    data[..7].copy_from_slice(b"normal\n");
+    Payload {
+        path: String::from("FREEOS/BOOT.CFG"),
+        data,
+        source: PathBuf::from("(режим загрузки для загрузчика)"),
     }
 }
 

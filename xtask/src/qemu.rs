@@ -341,6 +341,21 @@ pub fn prepare_esp(built: &Built, unattended: bool) -> Result<PathBuf> {
     if let Ok(mode) = std::env::var("FREEOS_SCREEN") {
         request_screen(&esp, mode.trim())?;
     }
+    // Boot mode (24.11): `FREEOS_BOOT=verbose` - the boot log instead of the
+    // logo, as `\FREEOS\BOOT.CFG` written by «Параметры» asks. A run without
+    // it starts with the normal boot screen, whatever an earlier run left.
+    let boot_cfg = esp.join("FREEOS").join("BOOT.CFG");
+    match std::env::var("FREEOS_BOOT") {
+        Ok(mode) => {
+            std::fs::create_dir_all(esp.join("FREEOS")).context("не удалось создать каталог FREEOS")?;
+            std::fs::write(&boot_cfg, format!("{}\n", mode.trim()))
+                .with_context(|| format!("не удалось записать {}", boot_cfg.display()))?;
+        }
+        Err(_) if unattended && boot_cfg.is_file() => {
+            std::fs::remove_file(&boot_cfg).with_context(|| format!("не удалось удалить {}", boot_cfg.display()))?;
+        }
+        Err(_) => {}
+    }
 
     Ok(esp)
 }

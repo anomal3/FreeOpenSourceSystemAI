@@ -23,7 +23,7 @@
 
 use core::time::Duration;
 
-use boot_info::{BOOT_CHECK_DISK, BOOT_ONE_CPU, BOOT_SAFE_MODE};
+use boot_info::{BOOT_CHECK_DISK, BOOT_ONE_CPU, BOOT_SAFE_MODE, BOOT_VERBOSE};
 use uefi::proto::console::text::{Key, ScanCode};
 use uefi::{boot, println, system};
 
@@ -113,6 +113,7 @@ fn ask() -> Choice {
                     return Choice { flags: 0, keep_display: true };
                 }
                 '6' => return chosen("one processor: the others stay asleep", BOOT_ONE_CPU),
+                '7' => return chosen("verbose boot: the boot log on the screen", BOOT_VERBOSE),
                 _ => println!("  unknown choice, try again"),
             },
             Key::Special(ScanCode::ESCAPE) => return chosen("normal boot", 0),
@@ -135,8 +136,9 @@ fn show() {
     println!("  4. Safe mode and check the volume");
     println!("  5. Keep the firmware's display mode (if the screen goes black)");
     println!("  6. Start on one processor (if the boot hangs at \"processors\")");
+    println!("  7. Verbose boot: the boot log instead of the logo");
     println!("");
-    println!("  choose 1-6:");
+    println!("  choose 1-7:");
 }
 
 /// Дождаться нажатия не дольше `limit`.

@@ -507,6 +507,35 @@ pub fn request_screen_mode(width: u32, height: u32) -> Result<(), alloc::string:
 /// Где на ESP лежит просьба о разрешении экрана.
 const DISPLAY_CFG: &str = "FREEOS/DISPLAY.CFG";
 
+/// Boot mode for the loader (24.11): `FREEOS/BOOT.CFG`, `verbose` - the boot
+/// log on the screen instead of the logo, `normal` - the logo and the bar.
+const BOOT_CFG: &str = "FREEOS/BOOT.CFG";
+
+/// Remember on the ESP how the next boots look («Параметры →
+/// Восстановление → Подробная загрузка»). Same road as
+/// [`request_screen_mode`]: the loader reads it before the kernel exists.
+pub fn request_boot_log(verbose: bool) -> Result<(), alloc::string::String> {
+    let bytes: &[u8] = if verbose { b"verbose\n" } else { b"normal\n" };
+    if crate::usb::stick_log::store_boot_cfg(verbose) {
+        crate::kprintln!("  settings    : boot {} saved for the loader on the stick (\\FREEOS\\BOOT.CFG)", if verbose { "verbose" } else { "normal" });
+        return Ok(());
+    }
+    let mut guard = LAYOUT.lock();
+    let layout = guard.as_mut().ok_or_else(|| alloc::string::String::from("no ESP on this machine"))?;
+    let (device, first_lba) = layout.esp.as_mut().ok_or_else(|| alloc::string::String::from("no ESP on this machine"))?;
+    let mut esp = device.clone();
+    let esp_lba = *first_lba;
+    let mut volume = disk::fat32::open(&mut esp, esp_lba).map_err(|err| alloc::format!("{err:?}"))?;
+    let reservation = volume.reserve_file(&mut esp, BOOT_CFG, bytes.len() as u64).map_err(|err| alloc::format!("{err:?}"))?;
+    let sector = esp.sector_size() as usize;
+    let mut block = [0u8; disk::MAX_SECTOR_SIZE];
+    block[..bytes.len()].copy_from_slice(bytes);
+    esp.write(reservation.first_lba, &block[..sector]).map_err(|err| alloc::format!("{err:?}"))?;
+    volume.commit_file(&mut esp, BOOT_CFG, &reservation, bytes.len() as u64).map_err(|err| alloc::format!("{err:?}"))?;
+    kprintln!("  settings    : boot {} saved for the loader (\\FREEOS\\BOOT.CFG)", if verbose { "verbose" } else { "normal" });
+    Ok(())
+}
+
 fn write_esp_file(
     node: &dyn Node,
     header: &Header,

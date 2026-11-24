@@ -127,10 +127,41 @@ pub fn adopt() {
     super::deskcfg::adopt(text, &path);
     // Заставка (22.11, `saver`).
     super::saver::adopt(text, &path);
+    // Подробная загрузка (24.11): what «Восстановление» shows; the loader
+    // itself reads `\FREEOS\BOOT.CFG`.
+    if let Some(mode) = sysconf::value(text, "boot_log") {
+        BOOT_VERBOSE.store(mode.trim() == "verbose", core::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(height) = sysconf::title_bar(text) {
         if mini_ui::theme::set_title_h(height) {
             crate::kprintln!("  desktop     : title bar {height} px from {path}");
         }
+    }
+}
+
+/// «Подробная загрузка» chosen in «Параметрах» (24.11).
+static BOOT_VERBOSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Is the verbose boot chosen for the next boots.
+#[must_use]
+pub fn boot_verbose() -> bool {
+    BOOT_VERBOSE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Choose the normal (logo and bar) or verbose (log) boot for the next
+/// boots: `\FREEOS\BOOT.CFG` for the loader and `boot_log=` here. `Ok` -
+/// what to tell the person.
+pub fn set_boot_verbose(on: bool) -> Result<alloc::string::String, alloc::string::String> {
+    BOOT_VERBOSE.store(on, core::sync::atomic::Ordering::Relaxed);
+    let mode = if on { "verbose" } else { "normal" };
+    crate::kprintln!("  settings    : boot {mode}");
+    let said = alloc::string::String::from(if on { "со следующей загрузки — журнал вместо логотипа" } else { "со следующей загрузки — логотип и полоса" });
+    let loader = crate::slot::request_boot_log(on);
+    let stored = store_line("boot_log", mode);
+    match (loader, stored) {
+        (Ok(()), Ok(())) => Ok(said),
+        (Err(err), _) => Err(alloc::format!("{said}: загрузчику не записано ({err})")),
+        (_, Err(err)) => Err(alloc::format!("{said}, но не запомнено: {err}")),
     }
 }
 
