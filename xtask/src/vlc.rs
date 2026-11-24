@@ -27,9 +27,12 @@
 //!
 //! # Раскладка
 //!
-//! Модули VLC — по `VLC_PLUGIN_PATH` (`lib/vlc/plugins`; свой поиск от
-//! `libvlccore` по `/proc/self/maps` у слоя Linux находит путь программы),
-//! данные — по `VLC_DATA_PATH` (`share/vlc`), перевод — `share/locale`
+//! Модули VLC — `lib/vlc/plugins` (VLC находит их сам — от строки
+//! `libvlccore.so.9` в `/proc/self/maps`) с кешем `plugins.dat`: его пишет
+//! `vlc-cache-gen` при установке (`setup=` манифеста — в кеше время изменения
+//! каждого модуля, а оно есть только у установленных файлов). Свой модуль
+//! `fossai_inhibit` — хранитель экрана ждёт, пока идёт видео. Данные — по
+//! `VLC_DATA_PATH` (`share/vlc`), перевод — `share/locale`
 //! (`share/vlc/../locale`). Библиотеки — плоско в `lib/`, модули Qt —
 //! `lib/qt5/plugins`. Русский интерфейс: локаль `ru_RU.UTF-8` — копия
 //! `C.utf8` glibc под этим именем (своих данных локали у неё нет, нужен
@@ -66,7 +69,7 @@ pub fn enabled() -> bool {
 }
 
 /// Пакеты trixie (снимок 20261020): путь в архиве и SHA-256 из `Packages`.
-const PACKAGES: [(&str, &str); 171] = [
+const PACKAGES: [(&str, &str); 174] = [
     ("pool/main/f/fonts-dejavu/fonts-dejavu-core_2.37-8_all.deb", "86635b3d25b3655fc11cb3ecc3af59f0bf19643b02b94f2de48bd10253cdba12"),
     ("pool/main/a/aom/libaom3_3.12.1-1+deb13u1_amd64.deb", "743eec7c94ae30295bc557ebac3dfae948e7390e89a2743c585d56297e9d312e"),
     ("pool/main/a/aribb24/libaribb24-0t64_1.0.3-2.1+b2_amd64.deb", "ae84f3e5f53e304cf0addca456419f996597c9828117f6f99d84d5432c32825f"),
@@ -198,6 +201,11 @@ const PACKAGES: [(&str, &str); 171] = [
     ("pool/main/libv/libva/libva-x11-2_2.22.0-3_amd64.deb", "97baabc9ae8dfbe718ca80543dc7337d330dd17e2a59138bf42a66a35d59309b"),
     ("pool/main/libv/libva/libva2_2.22.0-3_amd64.deb", "b76bdd330de47a826698aaed10f53435b703e9a7d4415dd68269c97709f46a9b"),
     ("pool/main/libv/libvdpau/libvdpau1_1.5-3+b1_amd64.deb", "7c872493296cc8ce829ab38a68b5e51c351466a5fd0daf485984c829282a94e3"),
+    // The plugins cache generator (`vlc-cache-gen`, run by `setup=`) and
+    // the headers the own inhibit module is built with.
+    ("pool/main/v/vlc/libvlc-bin_3.0.23-0+deb13u1_amd64.deb", "bc6857db7144bfd7447a77757689e43b8097e4b1b7cd6433b93b9451e83af8d6"),
+    ("pool/main/v/vlc/libvlccore-dev_3.0.23-0+deb13u1_amd64.deb", "a1e1d78baa3ed7f769b30a908d32cd482c5d95a6495528eeceb2f979463d9c5e"),
+    ("pool/main/w/wayland/libwayland-dev_1.23.1-3_amd64.deb", "66055b7df9a6c4b15fe0b52a42a76680bb4d0f4d1083800e7cd7ba26e59e68ed"),
     ("pool/main/v/vlc/libvlc5_3.0.23-0+deb13u1_amd64.deb", "73a7789c1aa31fba279544c48088416e0658702cb7aa4ec4385995dc418a9a73"),
     ("pool/main/v/vlc/libvlccore9_3.0.23-0+deb13u1_amd64.deb", "df7767917a140e331c8d4ed9c71974446c72e6cd9df67c910e391f3ba3d57770"),
     ("pool/main/libv/libvorbis/libvorbis0a_1.3.7-3_amd64.deb", "0465f7f602f7b00965e58e7273b5876060ab7946f0452a9f95d979046932cc42"),
@@ -354,8 +362,15 @@ const FONTS_CONF: &str = "<?xml version=\"1.0\"?>\n\
 /// без вопроса о доступе к сети (`qt-privacy-ask`) и проверки обновлений,
 /// без загрузки обложек и сведений из сети, аппаратное декодирование
 /// выключено (VA-API/VDPAU нет), одно окно (видео внутри окна VLC), окно
-/// не подстраивается под видео (с подстройкой Qt и сервер качали размер
-/// 600x420 <-> 640x432 без конца), звук — ALSA.
+/// не подстраивается под видео, звук — ALSA.
+///
+/// Подстройка окна (24.11): VLC 3 создаёт вывод видео на каждую попытку
+/// декодера — FFmpeg предлагает форматы VA-API и VDPAU, и `avcodec-hw=none`
+/// отказывает только после того, как под них создан вывод; Qt с подстройкой
+/// растягивает окно под видео (640x432) и сжимает обратно (600x420), когда
+/// вывод уходит. Пока буферы wl_shm не создавались (`vlc_memfd`), попыток
+/// было без конца — отсюда «качание». Теперь — три попытки в первую секунду,
+/// но и это окно, прыгающее на старте, поэтому подстройка выключена.
 const VLCRC: &str = "###\n\
     ### vlc 3.0.23 - FossAi defaults (fossai-vlc)\n\
     ###\n\
@@ -410,11 +425,23 @@ export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
 export ALSA_CONFIG_DIR=$P/share/alsa
 export ALSA_CONFIG_PATH=$P/share/alsa/alsa.conf:$P/share/alsa/fossai.conf
 export VLC_DATA_PATH=$P/share/vlc
-# Модули: VLC ищет их от libvlccore по /proc/self/maps, а там у слоя Linux
-# путь самой программы (/opt/vlc/bin/vlc/plugins) - путь явно.
-export VLC_PLUGIN_PATH=$P/lib/vlc/plugins
+# Модули VLC находит сам: от строки libvlccore.so в /proc/self/maps -
+# $P/lib/vlc/plugins (с их кешем plugins.dat, его пишет --cache-gen).
+unset VLC_PLUGIN_PATH
 # `--env=ИМЯ=ЗНАЧЕНИЕ` первыми - своя переменная (у `run` окружения нет).
 while case "$1" in --env=*) true ;; *) false ;; esac; do export "${1#--env=}"; shift; done
+# Кеш модулей (setup= пакета, pkg install): без него VLC при каждом запуске
+# открывает все модули. Время изменения файлов в кеше - установленных.
+if [ "$1" = "--cache-gen" ]; then
+    LD_LIBRARY_PATH= rm -f "$P/lib/vlc/plugins/plugins.dat"
+    $P/lib/vlc/vlc-cache-gen "$P/lib/vlc/plugins"; rc=$?
+    if [ -s "$P/lib/vlc/plugins/plugins.dat" ]; then
+        echo "fossai-vlc: plugins cache $(LD_LIBRARY_PATH= stat -c %s "$P/lib/vlc/plugins/plugins.dat") bytes, code $rc"
+    else
+        echo "fossai-vlc: no plugins cache, code $rc"
+    fi
+    exit $rc
+fi
 C=$XDG_CONFIG_HOME/vlc
 L=$HOME/.cache/fossai-vlc
 LD_LIBRARY_PATH= mkdir -p "$L" "$C"
@@ -586,6 +613,18 @@ pub fn build(arch: Arch) -> Result<()> {
     files.push((String::from("share/fossai/vlcrc"), VLCRC.as_bytes().to_vec(), 0o644));
     files.push((String::from("bin/fossai-vlc"), SCRIPT.as_bytes().to_vec(), 0o755));
     files.push((String::from("bin/vlc"), build_launcher()?, 0o755));
+    // Own inhibit module: the screensaver waits while a video plays.
+    files.push((String::from("lib/vlc/plugins/misc/libfossai_inhibit_plugin.so"), build_inhibit(&deb)?, 0o644));
+    // `plugins.dat` is made at install time (`setup=`): it holds the mtime
+    // of every module, and only the installed files have theirs.
+    let Some((data, _)) = follow(&deb, &format!("{DIR}vlc/vlc-cache-gen"), 0) else {
+        bail!("в libvlc-bin нет vlc-cache-gen");
+    };
+    // Its loader - the own glibc (`ld.so` run as a program dies in the
+    // Linux layer, 24.11): the path fits in place of /lib64/ld-linux-x86-64.so.2.
+    let mut cache_gen = data.clone();
+    set_interp(&mut cache_gen, INTERP).context("vlc-cache-gen")?;
+    files.push((String::from("lib/vlc/vlc-cache-gen"), cache_gen, 0o755));
 
     let icon = follow(&deb, "usr/share/icons/hicolor/256x256/apps/vlc.png", 0).map(|(data, _)| data.clone());
     let icon_field = match icon.as_deref().map(crate::fimg::from_png) {
@@ -604,6 +643,7 @@ pub fn build(arch: Arch) -> Result<()> {
     builder.field("about", "VLC: видеоплеер и аудиоплеер");
     builder.field("caption", "Видеоплеер VLC");
     builder.field("start", "/opt/debian/bin/bash /opt/vlc/bin/fossai-vlc");
+    builder.field("setup", "/opt/debian/bin/bash /opt/vlc/bin/fossai-vlc --cache-gen");
     builder.field("opens", OPENS);
     builder.field("desktop", "yes");
     builder.field("icon", icon_field);
@@ -619,6 +659,87 @@ pub fn build(arch: Arch) -> Result<()> {
     fs::write(&out, builder.finish())?;
     say!("vlc: {} — {} файлов, {} МиБ", out.display(), files.len(), bytes / (1024 * 1024));
     Ok(())
+}
+
+/// Заменить загрузчик (`PT_INTERP`) ELF64 на `interp` — на месте, если путь
+/// не длиннее прежнего (остаток — нули).
+fn set_interp(elf: &mut [u8], interp: &str) -> Result<()> {
+    let u16_at = |at: usize| u16::from_le_bytes([elf[at], elf[at + 1]]) as usize;
+    let u64_at = |at: usize| u64::from_le_bytes(elf[at..at + 8].try_into().unwrap()) as usize;
+    if elf.len() < 64 || &elf[..4] != b"\x7fELF" || elf[4] != 2 {
+        bail!("не ELF64");
+    }
+    let (phoff, phentsize, phnum) = (u64_at(32), u16_at(54), u16_at(56));
+    for index in 0..phnum {
+        let ph = phoff + index * phentsize;
+        if u32::from_le_bytes(elf[ph..ph + 4].try_into().unwrap()) != 3 {
+            continue;
+        }
+        let (offset, size) = (u64_at(ph + 8), u64_at(ph + 32));
+        if interp.len() + 1 > size || offset + size > elf.len() {
+            bail!("загрузчик {interp} не помещается в PT_INTERP ({size} байт)");
+        }
+        let slot = &mut elf[offset..offset + size];
+        slot.fill(0);
+        slot[..interp.len()].copy_from_slice(interp.as_bytes());
+        return Ok(());
+    }
+    bail!("нет PT_INTERP")
+}
+
+/// Собрать свой модуль VLC `fossai_inhibit` (`libc/linux/fossai-vlc-inhibit.c`,
+/// capability `inhibit`: `zwp_idle_inhibitor_v1` на поверхности видео) —
+/// clang-ом против sysroot glibc Debian 12 и заголовков `libvlccore-dev` и
+/// `libwayland-dev` trixie; `libvlccore.so.9` и `libwayland-client.so.0`
+/// пакета — в `DT_NEEDED`.
+fn build_inhibit(deb: &BTreeMap<String, Node>) -> Result<Vec<u8>> {
+    let work = sdk::root().join("linux/vlc-inhibit");
+    let include = work.join("include");
+    let libs = work.join("lib");
+    fs::create_dir_all(&libs)?;
+    for path in deb.keys() {
+        let rest = path
+            .strip_prefix("usr/include/vlc/plugins/")
+            .or_else(|| path.strip_prefix("usr/include/").filter(|name| name.starts_with("wayland-") && !name.contains('/')));
+        let Some(rest) = rest else { continue };
+        if let Some((data, _)) = follow(deb, path, 0) {
+            let to = include.join(rest);
+            fs::create_dir_all(to.parent().unwrap())?;
+            fs::write(&to, data)?;
+        }
+    }
+    let mut needed_libs = Vec::new();
+    for name in ["libvlccore.so.9", "libwayland-client.so.0"] {
+        let Some((data, _)) = follow(deb, &format!("{DIR}{name}"), 0) else {
+            bail!("в пакетах нет {name}");
+        };
+        let to = libs.join(name);
+        fs::write(&to, data)?;
+        needed_libs.push(to);
+    }
+    let sysroot = crate::debian::glibc_sysroot()?;
+    let lib = sysroot.join("usr/lib/x86_64-linux-gnu");
+    let output = work.join("libfossai_inhibit_plugin.so");
+    let mut cmd = std::process::Command::new(cbuild::llvm_tool("clang")?);
+    cmd.arg("--target=x86_64-linux-gnu")
+        .arg(format!("--sysroot={}", sysroot.display()))
+        .args(["-std=gnu11", "-O2", "-Wall", "-Werror", "-fPIC", "-shared", "-fuse-ld=lld", "-nostdlib"])
+        .args(["-D__PLUGIN__", "-D_FILE_OFFSET_BITS=64", "-D_REENTRANT", "-D_THREAD_SAFE", "-DMODULE_STRING=\"fossai_inhibit\""])
+        .arg(format!("-I{}", include.display()))
+        .arg("-Wl,-soname,libfossai_inhibit_plugin.so")
+        .arg(cbuild::libc_dir().join("linux").join("fossai-vlc-inhibit.c"))
+        .args(&needed_libs)
+        .arg(format!("-L{}", lib.display()))
+        .arg(format!("-L{}", sysroot.join("lib/x86_64-linux-gnu").display()))
+        .arg("-lc")
+        .arg("-o")
+        .arg(&output);
+    say!("> clang (glibc) fossai-vlc-inhibit.c");
+    let status = cmd.status().context("не удалось запустить clang")?;
+    if !status.success() {
+        bail!("fossai-vlc-inhibit.c не собрался ({status})");
+    }
+    Ok(fs::read(&output)?)
 }
 
 /// Собрать свою `vlc` (`libc/linux/fossai-vlc.c`) clang-ом: sysroot glibc

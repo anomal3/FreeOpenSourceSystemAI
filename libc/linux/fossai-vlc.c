@@ -15,7 +15,7 @@
  *
  * So this program does what `bin/vlc.c` of VLC does (libvlc_new with the
  * command line, the default interface, play, wait) through dlopen of
- * libvlc.so.5, and the executable exports three symbols that win over the
+ * libvlc.so.5, and the executable exports symbols that win over the
  * libraries (the main program comes first in the global lookup scope):
  *
  *  - XOpenDisplay/XCloseDisplay: with no DISPLAY a dummy display for the
@@ -23,7 +23,8 @@
  *  - QApplication::QApplication(int&, char**, int) (base object constructor,
  *    version Qt_5 from the version script): `-platform xcb` becomes
  *    `-platform wayland` (or FOSSAI_VLC_QPA), then the real constructor of
- *    libQt5Widgets runs.
+ *    libQt5Widgets runs;
+ *  - vlc_memfd (libvlccore): video buffers in memfd memory, not in a file.
  *
  * Built by xtask (vlc.rs) with clang against the Debian glibc sysroot.
  */
@@ -34,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 typedef struct libvlc_instance_t libvlc_instance_t;
 
@@ -73,6 +75,32 @@ int XCloseDisplay(void *display)
 
 typedef void (*qapp_ctor)(void *, int *, char **, int);
 
+/*
+ * QGuiApplication::setDesktopFileName("vlc"): the Wayland app_id of the
+ * window. Qt 5 takes it from there, else from /proc/<pid>/exe, and VLC sets
+ * neither - the window came with an empty app_id. By "vlc" the desktop
+ * frames it: Qt 5 on wl_shm alone (no EGL buffer integration) draws no
+ * title bar of its own (QWaylandDisplay::supportsWindowDecoration).
+ * A QString is one pointer to its data; this one is never freed.
+ */
+static void desktop_file_name(void)
+{
+    void *core = dlopen("libQt5Core.so.5", RTLD_LAZY | RTLD_NOLOAD);
+    void *gui = dlopen("libQt5Gui.so.5", RTLD_LAZY | RTLD_NOLOAD);
+    void *(*latin1)(const char *, int) = NULL;
+    void (*set)(void *const *) = NULL;
+    if (core != NULL)
+        latin1 = (void *(*)(const char *, int))dlvsym(core, "_ZN7QString17fromLatin1_helperEPKci", "Qt_5");
+    if (gui != NULL)
+        set = (void (*)(void *const *))dlvsym(gui, "_ZN15QGuiApplication18setDesktopFileNameERK7QString", "Qt_5");
+    if (latin1 == NULL || set == NULL) {
+        fprintf(stderr, "fossai-vlc: no QGuiApplication::setDesktopFileName, the window has no app_id\n");
+        return;
+    }
+    void *name = latin1("vlc", 3);
+    set(&name);
+}
+
 static void qapp(const char *mangled, void *self, int *argc, char **argv, int flags)
 {
     const char *want = getenv("FOSSAI_VLC_QPA");
@@ -93,6 +121,7 @@ static void qapp(const char *mangled, void *self, int *argc, char **argv, int fl
         abort();
     }
     real(self, argc, argv, flags);
+    desktop_file_name();
 }
 
 void _ZN12QApplicationC2ERiPPci(void *self, int *argc, char **argv, int flags)
@@ -103,6 +132,22 @@ void _ZN12QApplicationC2ERiPPci(void *self, int *argc, char **argv, int flags)
 void _ZN12QApplicationC1ERiPPci(void *self, int *argc, char **argv, int flags)
 {
     qapp("_ZN12QApplicationC1ERiPPci", self, argc, argv, flags);
+}
+
+/* ---- vlc_memfd ---------------------------------------------------------- */
+
+/*
+ * The wl_shm video output keeps its pictures in vlc_memfd() of libvlccore:
+ * O_TMPFILE in /tmp, else a named file there, unlinked at once - a file of
+ * the disk mapped shared and written 30 times a second, which the Linux
+ * layer can only do through write-back to a file that no longer has a name.
+ * memfd_create is memory the Wayland server reads as is (like Qt's own
+ * buffers). Plugins resolve vlc_memfd here first: the executable is first
+ * in the global lookup scope.
+ */
+int vlc_memfd(void)
+{
+    return memfd_create("vlc", MFD_CLOEXEC);
 }
 
 /* ---- libvlc ------------------------------------------------------------- */
@@ -152,6 +197,10 @@ int main(int argc, char **argv)
     if (vlc_app_id != NULL)
         vlc_app_id(vlc, "org.videolan.vlc", VLC_VERSION, "vlc");
     int rc = 1;
+    /* As bin/vlc.c: the hotkeys interface first - it turns the key events of
+     * the Qt window (space, F, arrows...) into actions; without it the keys
+     * of the player did nothing. globalhotkeys is X11 only. */
+    vlc_add_intf(vlc, "hotkeys,none");
     if (vlc_add_intf(vlc, NULL) == 0) {
         vlc_play(vlc, -1, 0, NULL);
         vlc_wait(vlc);
