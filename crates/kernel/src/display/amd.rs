@@ -1143,7 +1143,15 @@ pub fn auto_task() {
                 crate::kprintln!("  amdgpu     : auto start: HW.TXT found, testing the hardware DRM backend");
                 let lines = hw::selftest();
                 let verdict = |what: &str| lines.iter().find(|l| l.contains(what)).map_or("no result", |l| if l.contains("PASSED") { "PASSED" } else { "FAILED" });
-                crate::kprintln!("==== AMD TEST: hw backend: {}, shader in VMID 1: {} ====", verdict("HW RESULT"), verdict("HW SHADER RESULT"));
+                crate::kprintln!(
+                    "==== AMD TEST: hw backend: {}, shader in VMID 1: {}, VRAM buffers: {} ====",
+                    verdict("HW RESULT"),
+                    verdict("HW SHADER RESULT"),
+                    verdict("HW VRAM RESULT")
+                );
+                if let Some(speed) = lines.iter().find(|l| l.contains("HW VRAM SPEED")) {
+                    crate::kprintln!("==== AMD TEST: {speed} ====");
+                }
                 crate::usb::stick_log::flush_now();
             }
             // The eighth marker (FOSSAI_AMD_RADV=1): RADV on the card. The live stick installs Debian and Proton

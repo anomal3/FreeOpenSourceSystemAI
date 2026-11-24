@@ -520,6 +520,9 @@ struct AmdBo {
     domain_flags: u64,
     map_handle: u64,
     frames: Vec<u64>,
+    /// Буфер в видеопамяти карты (`amdnode hw on`): смещение от начала VRAM; кадров системной памяти нет,
+    /// процессору он недоступен (ни `mmap`, ни dma-buf). `None` - буфер в системной памяти.
+    vram: Option<u64>,
     /// Память для `mmap`, пока её кто-то держит.
     mem: SpinLock<Weak<SharedMem>>,
     metadata: SpinLock<BoMetadata>,
@@ -527,6 +530,9 @@ struct AmdBo {
 
 impl Drop for AmdBo {
     fn drop(&mut self) {
+        if let Some(offset) = self.vram {
+            crate::display::amd::hw::vram_free(offset, self.size);
+        }
         crate::mm::frame::with(|pool| {
             for &frame in &self.frames {
                 // SAFETY: кадр выдан `AmdBo::new` и принадлежит только этому буферу;
@@ -537,8 +543,36 @@ impl Drop for AmdBo {
     }
 }
 
+/// `AMDGPU_GEM_CREATE_*`.
+const GEM_CPU_ACCESS_REQUIRED: u64 = 1 << 0;
+const GEM_VRAM_CLEARED: u64 = 1 << 3;
+
+/// Размещать ли буфер в видеопамяти: только на настоящей карте, только если он просит VRAM и не просит ничего,
+/// что требует процессора или обнуления (GTT/CPU в домене, CPU_ACCESS_REQUIRED, VRAM_CLEARED). Тогда это
+/// память «только для GPU» (картинки, цели рендера), которую RADV и DXVK держат в VRAM, а остальное -
+/// системная память, как и раньше.
+fn wants_vram(domains: u64, flags: u64) -> bool {
+    hw() && domains & DOMAIN_VRAM != 0 && domains & (DOMAIN_GTT | DOMAIN_CPU) == 0 && flags & (GEM_CPU_ACCESS_REQUIRED | GEM_VRAM_CLEARED) == 0
+}
+
 impl AmdBo {
     fn new(size: u64, domains: u64, domain_flags: u64) -> Result<Arc<Self>, i64> {
+        if wants_vram(domains, domain_flags) {
+            if let Some(offset) = crate::display::amd::hw::vram_alloc(size) {
+                let map_handle = NEXT_MAP.fetch_add(size + PAGE, Ordering::Relaxed);
+                return Ok(Arc::new(Self {
+                    size,
+                    domains,
+                    domain_flags,
+                    map_handle,
+                    frames: Vec::new(),
+                    vram: Some(offset),
+                    mem: SpinLock::new(Weak::new()),
+                    metadata: SpinLock::new(BoMetadata { flags: 0, tiling_info: 0, size_bytes: 0, data: [0; 64] }),
+                }));
+            }
+            // Видеопамять кончилась - как у Linux при нехватке VRAM: буфер уходит в системную память.
+        }
         let pages = (size / PAGE) as usize;
         let mut frames: Vec<u64> = Vec::new();
         if frames.try_reserve_exact(pages).is_err() {
@@ -574,6 +608,7 @@ impl AmdBo {
             domain_flags,
             map_handle,
             frames,
+            vram: None,
             mem: SpinLock::new(Weak::new()),
             metadata: SpinLock::new(BoMetadata { flags: 0, tiling_info: 0, size_bytes: 0, data: [0; 64] }),
         }))
@@ -581,7 +616,7 @@ impl AmdBo {
 
     /// Читать байты буфера со смещения `offset`; `false` — вышли за границу.
     fn read(&self, offset: u64, out: &mut [u8]) -> bool {
-        if offset.checked_add(out.len() as u64).is_none_or(|end| end > self.size) {
+        if self.vram.is_some() || offset.checked_add(out.len() as u64).is_none_or(|end| end > self.size) {
             return false;
         }
         let mut done = 0usize;
@@ -599,7 +634,7 @@ impl AmdBo {
 
     /// Писать байты в буфер со смещения `offset`; `false` — вышли за границу.
     fn write(&self, offset: u64, data: &[u8]) -> bool {
-        if offset.checked_add(data.len() as u64).is_none_or(|end| end > self.size) {
+        if self.vram.is_some() || offset.checked_add(data.len() as u64).is_none_or(|end| end > self.size) {
             return false;
         }
         let mut done = 0usize;
@@ -728,8 +763,9 @@ fn info_ioctl(file: &AmdFile, arg: usize) -> i64 {
         }
         INFO_MEMORY => {
             let heap = |total: u64| DrmAmdgpuHeapInfo { total_heap_size: total, usable_heap_size: total, heap_usage: 0, max_allocation: total * 3 / 4 };
+            let vram_used = crate::display::amd::hw::vram_usage().0;
             let memory = DrmAmdgpuMemoryInfo {
-                vram: heap(info.vram_bytes),
+                vram: DrmAmdgpuHeapInfo { heap_usage: vram_used, ..heap(info.vram_bytes) },
                 cpu_accessible_vram: heap(info.vram_visible_bytes),
                 gtt: heap(info.gtt_bytes),
             };
@@ -744,7 +780,8 @@ fn info_ioctl(file: &AmdFile, arg: usize) -> i64 {
             }),
         ),
         INFO_TIMESTAMP => reply(&request, &(crate::time::uptime_ms().saturating_mul(1_000_000) / 10).to_le_bytes()),
-        INFO_NUM_BYTES_MOVED | INFO_VRAM_USAGE | INFO_GTT_USAGE | INFO_VIS_VRAM_USAGE | INFO_NUM_EVICTIONS
+        INFO_VRAM_USAGE => reply(&request, &crate::display::amd::hw::vram_usage().0.to_le_bytes()),
+        INFO_NUM_BYTES_MOVED | INFO_GTT_USAGE | INFO_VIS_VRAM_USAGE | INFO_NUM_EVICTIONS
         | INFO_NUM_VRAM_CPU_PAGE_FAULTS => reply(&request, &0u64.to_le_bytes()),
         INFO_VRAM_LOST_COUNTER => reply(&request, &0u32.to_le_bytes()),
         // Остальное (датчики, VBIOS, видео-возможности, MAX_IBS…) RADV терпит как ошибку.
@@ -940,6 +977,10 @@ fn gem_mmap(file: &AmdFile, arg: usize) -> i64 {
 pub fn mmap_file(file: &AmdFile, offset: u64, len: u64) -> Result<(Arc<SharedMem>, u64), i64> {
     let bo = file.st.lock().bos.values().find(|bo| offset >= bo.map_handle && offset < bo.map_handle + bo.size).cloned();
     let Some(bo) = bo else { return Err(-e::EINVAL) };
+    // Буфер в видеопамяти процессору не отдаётся (Linux: NO_CPU_ACCESS - EPERM при mmap).
+    if bo.vram.is_some() {
+        return Err(-e::EPERM);
+    }
     let inside = offset - bo.map_handle;
     if inside % PAGE != 0 || inside.checked_add(len).is_none_or(|end| end > bo.size) {
         return Err(-e::EINVAL);
@@ -1401,6 +1442,10 @@ fn hw_run(view: &VaView, generation: u64, ibs: &[(u64, usize)]) -> Result<(), al
         for (start, size, bo, offset) in &view.maps {
             let first = (offset / PAGE) as usize;
             let count = (size / PAGE) as usize;
+            if let Some(base) = bo.vram {
+                hw::map_vram(*start, base + offset, count)?;
+                continue;
+            }
             let Some(frames) = bo.frames.get(first..first + count) else {
                 return Err(alloc::format!("mapping at {start:#x} is outside of its buffer"));
             };
@@ -1644,6 +1689,11 @@ fn prime_handle_to_fd(file: &AmdFile, arg: usize) -> i64 {
         return -e::EINVAL;
     }
     let Some(bo) = file.st.lock().bos.get(&args.handle).cloned() else { return -e::ENOENT };
+    // dma-buf читает процессор (сервер Wayland копирует кадры): буфер в видеопамяти отдать нельзя.
+    if bo.vram.is_some() {
+        crate::kprintln!("amdgpu: PRIME export of a VRAM-only buffer ({} bytes) refused: the compositor needs CPU access", bo.size);
+        return -e::EINVAL;
+    }
     let fd = super::install(Arc::new(AmdDmaBuf(bo)), false, args.flags & O_CLOEXEC != 0);
     if fd < 0 {
         return fd;
