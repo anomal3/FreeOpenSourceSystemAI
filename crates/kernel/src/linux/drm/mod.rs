@@ -41,6 +41,12 @@ mod vm;
 
 pub use sync::{FENCE_SPIN_US, FENCE_STEP_US, fence_bench, fence_fine_sleeps, fence_wait_stats};
 
+/// A fence wait as DRM ioctls do it (`fenceirq test`): `ready` until
+/// `deadline_ns` (uptime), waking on the GPU fence interrupt.
+pub fn fence_wait(deadline_ns: Option<u64>, mut ready: impl FnMut() -> bool) -> Result<(), i64> {
+    sync::wait_until(deadline_ns, || Ok(ready()))
+}
+
 /// perf-diag lines of the GPU layer for the window (hw-log17): where
 /// `VM_BIND` time goes, and the fence interrupt's state.
 #[must_use]

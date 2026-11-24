@@ -17940,3 +17940,71 @@ install,desktop-unknown,proton-rupor,usbstick,exfat -j 1`.
 **Осталось:** winedevice всё ещё снимается SIGSEGV при заблокированном
 сигнале на ntoskrnl.exe+0x28fce (hw-log18, 9 раз за 3 запуска Notepad++);
 Rupor - см. выше (дело установщика/клиента).
+
+## Proton стабильно, круг 2: маска сигналов от прежней задачи слота, счётчики прерывания забора (24.11, hw-log18) - **сделано, проверить на железе**
+
+Разбор - рабочая папка, `hw-log18-analysis.md`, п. 1.2-1.4.
+
+1. **winedevice.exe снимался своим же SIGSEGV (9 смертей в 3 запусках
+   Notepad++).** Отказ на `ntoskrnl.exe+0x28fce` нарочный: `call_driver_init`
+   Proton (дизассемблирован ntoskrnl.exe GE-Proton11-12) делает
+   `or $0xffff800000000000,(%rsp); jmp *%r8` - возврат из `DriverEntry`
+   падает в верхнюю половину, обработчик SIGSEGV Wine снимает биты. Linux при
+   синхронном отказе с ЗАБЛОКИРОВАННЫМ сигналом (`force_sig_info_to_task`)
+   сигнал разблокирует, но обработчик сбрасывает в SIG_DFL - процесс умирает
+   так же, как у нас; доставлять «по обработчику» нельзя, ядро здесь уже как
+   Linux. Ошибка была в маске: `0xfffffffe6ffad4f8` = всё, кроме
+   `server_block_set` Wine (HUP INT QUIT USR1 USR2 ALRM CHLD IO), KILL/STOP и
+   SIGCANCEL/SIGSETXID glibc. Так выглядит маска выходящего потока glibc
+   (`start_thread` перед выходом блокирует всё, кроме SIGSETXID), прошедшая
+   через `pthread_sigmask` и `call_init_thunk` Wine
+   (`SIG_UNBLOCK server_block_set`). Причина: `user::run` (программа, которую
+   запускает ядро - стол, `run` оболочки, init) не обнулял
+   `LINUX_SIGMASK/PENDING/ALTSTACK/CLEAR_TID` слота - bash `fossai-proton`,
+   попавший на слот умершего потока Wine (поздние запуски сеанса), начинал с
+   заблокированными SIGSEGV/SIGCHLD/SIGTERM, `fork`/`execve` (правильно)
+   несли маску всему дереву до winedevice. Слоты завершённых задач идут в
+   ход снова, только когда все ~1000 уже были заняты (и старейший первым), -
+   в hw-log18 это с задачи ~#1100: поэтому падали только поздние запуски
+   (#1830, #2051, #2312), а RuporSetup (#127) пережил тот же отказ. Исправлено:
+   `user::fresh_signal_state` в `run`; строка `user : #N got slot S with a
+   signal mask M left by its previous task: cleared` (первые 8). Заодно это
+   защищает родные программы с JIT (SpiderMonkey/Servo по `SYS_SIGACTION`):
+   их отказы тоже смотрят на эту маску. Проверка (`linux-debian`):
+   `linuxcheck --leave-masked` (3000 потоков выходят - таблица слотов
+   проходит круг, главный блокирует всё и ставит altstack), затем
+   `linuxcheck` первой строкой проверяет чистое начало, а ядро пишет `got
+   slot ... cleared`; `proton-winedevice` - три свежих префикса подряд, ни
+   одного `not delivered:`.
+2. **Прерывание забора GPU работает - врали счётчики.** «by irq 233 / by
+   timer 697547» в hw-log18: первое - счёт окна суждения (в `Live` `[irq]` и
+   `[late]` обнулялись каждые 256 ожиданий, поэтому всегда < 256), второе -
+   итог с загрузки, и в него попадали пробуждения прерыванием от ЧУЖОГО
+   забора (каждое прерывание nonstall будит всех ждущих). Пропущенных
+   прерываний 0-2 на 256 (`late`), т.е. >99 % ожиданий кончает прерывание.
+   Теперь в perf-diag/`fenceirq` - итоги с загрузки: «ended by the interrupt
+   with the fence done (interrupt to waiter N us avg, worst M us)», «found
+   the fence done only at the backstop timer», «woke by an interrupt for
+   another fence», «slept to the backstop with the fence pending» и отдельно
+   окно суждения. Логика отката не менялась (`fenceirq off` как был).
+   QEMU без NVIDIA: `fenceirq test N` (оболочка ядра) гоняет путь ожидания
+   `drm::sync::wait_until` в режиме `Live` против имитации прерывания
+   (задача ядра «завершает» забор через 0,1-3 мс и делает `signal(SRC_GPU)`,
+   в половине ожиданий сначала «чужое» прерывание); сценарий `hrsleep`. В
+   QEMU (TCG, 4 ЦП): 300 ожиданий, 292 кончило прерывание, от прерывания до
+   ждущего 31 мкс в среднем, 8 увидели забор только по страховочному таймеру
+   (таймер и имитация в одном проходе - особенность стенда), 95 пробуждений
+   чужим прерыванием посчитаны отдельно.
+3. **Uot: где CPU в пути отправки на GPU.** По hw-log18 путь отправки не
+   тормозит: `NOUVEAU_EXEC` 7 мкс, `VM_BIND` 13-24 мкс, ЦП свободен на
+   75-84 % (16 ядер). Время уходит в ожидание GPU
+   (`SYNCOBJ_TIMELINE_WAIT` ~500/с по 1,8-1,9 мс) и в показ: каждый кадр
+   игры стол копирует в кадровый буфер (`direct ... 2227 us each, 3637 Kpx`,
+   «0 frames scanned out of the client buffer») - 2,2 мс на кадр, у Windows
+   показ - переключение без копии. Это следующий кандидат (показ прямо из
+   буфера клиента для полноэкранной игры), не путь отправки.
+
+**Что смотреть в следующем журнале:** нет `fault vector 14 not delivered`
+у winedevice; строки `got slot ... cleared` (сколько раз маска осталась бы);
+в `fenceirq:` perf-diag - «ended by the interrupt ...» против «found the fence
+done only at the backstop» (пропуски) и «interrupt to waiter N us».

@@ -10275,6 +10275,13 @@ pub const ALL: &[Scenario] = &[
             Step::Await("hrbench: done", 30_000),
             Step::Line("hrsleep"),
             Step::Await("hrsleep: on;", 10_000),
+            // hw-log18: the fence wait path in `Live` mode against a simulated
+            // GPU fence interrupt (QEMU has no NVIDIA): waits must end by the
+            // interrupt; interrupts for another fence are counted apart.
+            Step::Line("fenceirq test 300"),
+            Step::Await("fenceirq test: 300 waits, 0 timed out", 120_000),
+            Step::Line("fenceirq"),
+            Step::Await("fenceirq: not set up", 10_000),
             Step::Absent("KERNEL PANIC"),
         ],
     },

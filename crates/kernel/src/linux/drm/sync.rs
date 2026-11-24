@@ -208,7 +208,7 @@ impl Object for SyncFile {
 /// that completes within it is seen within microseconds. Longer waits sleep
 /// as before.
 pub fn wait_until(deadline_ns: Option<u64>, mut ready: impl FnMut() -> Result<bool, i64>) -> Result<(), i64> {
-    use crate::display::nvidia_rm_intr::{self as fenceirq, End, Mode, SRC_GPU};
+    use crate::display::nvidia_rm_intr::{self as fenceirq, Mode, SRC_GPU};
     static KEY: u8 = 0;
     let started = crate::time::uptime_ns();
     let mut spin_ns = FENCE_SPIN_US.load(Ordering::Relaxed) * 1000;
@@ -227,12 +227,14 @@ pub fn wait_until(deadline_ns: Option<u64>, mut ready: impl FnMut() -> Result<bo
             WAITS[kind].fetch_add(1, Ordering::Relaxed);
             WAIT_NS[kind].fetch_add(crate::time::uptime_ns().saturating_sub(started), Ordering::Relaxed);
             if let Some(by_irq) = last {
-                fenceirq::after_wait(if by_irq { End::Irq } else { End::TimerDone });
+                fenceirq::after_wait(fenceirq::classify(by_irq, true));
             }
             return Ok(());
         }
-        if last.is_some() {
-            fenceirq::after_wait(End::Timer);
+        // hw-log18: a wake-up by the interrupt with the fence still pending
+        // (another channel finished) used to count as "by timer".
+        if let Some(by_irq) = last {
+            fenceirq::after_wait(fenceirq::classify(by_irq, false));
         }
         let now = crate::time::uptime_ns();
         if deadline_ns.is_some_and(|at| at <= now) {
