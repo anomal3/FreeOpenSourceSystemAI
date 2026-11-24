@@ -41,7 +41,7 @@ use fpk::{Header, Kind, Manifest, Rights};
 use osupdate::keys::Trusted;
 use user_progs::{
     Args, Dirent, Line, Path, close, create, exit, file_size, mkdir, open, println,
-    read, read_at, readdir, remove, stat, write,
+    read, read_at, readdir, remove, spawn, stat, wait, write,
 };
 use user_abi::Stat;
 
@@ -472,7 +472,23 @@ fn install_file(path: &str) -> i64 {
         .str(" may use ")
         .str(rights.write_names(&mut names))
         .end();
+    setup(name, manifest.field("setup"));
     0
+}
+
+/// `setup=` of the manifest (24.11.2026, VLC): a command run once after the
+/// files are in place, by whoever installs (the one who may write the
+/// package directory), and waited for - a cache the program cannot write
+/// itself later (VLC's `plugins.dat`: its plugins directory is read-only
+/// for the person who plays a video). Its failure does not undo the
+/// install: the program works without the cache, only slower.
+fn setup(name: &str, command: Option<&str>) {
+    let Some(command) = command.filter(|command| !command.is_empty()) else {
+        return;
+    };
+    Line::new().str("pkg: ").str(name).str(" setup: ").str(command).end();
+    let code = wait(spawn(command));
+    Line::new().str("pkg: ").str(name).str(" setup done, code ").signed(code).end();
 }
 
 // --- перечисление -----------------------------------------------------------
