@@ -1250,6 +1250,21 @@ case $WHAT in vsync)
         step d3d9-vsync-$vs 600 $B $P --vsync $vs --bench=20,d3dprobe9-vsync-$vs --dxvk $X 9 20
     done ;;
 esac
+case $WHAT in rpresent)
+    # Режимы показа vkcube на видеокарте (окно на столе, 300 кадров каждый): 0 IMMEDIATE (без VSync, возможен
+    # разрыв), 1 MAILBOX, 2 FIFO (VSync). Для глаза: какой из них мерцает.
+    for m in 0 1 2; do
+        step vkcube-present-mode$m 120 $B $P --run=vkcube --wsi wayland --present_mode $m --c 300
+    done ;;
+esac
+case $WHAT in tmnfvs)
+    # Trackmania с VSync: сравнить с замером без навязанного VSync (в нём видео мерцало).
+    if [ -f /opt/tmnf/bin/tmnf ]; then
+        step tmnf-vsync-on 900 $B /opt/tmnf/bin/tmnf $GPUFLAG --vsync on --bench=30
+    else
+        say "tmnf: package not installed - skipped"
+    fi ;;
+esac
 case $WHAT in all|tmnf)
     # 5. TMNF через DXVK на NVK: замер 60 с (`bench:` - к/с), игра снимается.
     if [ -x /opt/tmnf/bin/tmnf ] || [ -f /opt/tmnf/bin/tmnf ]; then

@@ -1213,6 +1213,7 @@ fn radv_auto() {
     // если на флешке есть игра, Trackmania с замером. Префикс Wine создаётся при первом запуске - минуты.
     if firmware_file("RADV.TXT").is_ok_and(|text| text.windows(3).any(|w| w == b"d3d")) {
         let mut steps: Vec<(&str, &str, u32)> = alloc::vec![
+            ("rpresent", "WATCH THE SCREEN: vkcube in 3 present modes (IMMEDIATE, MAILBOX, FIFO) - which one flickers?", 400),
             ("d3d", "Direct3D 9 on DXVK (the Wine prefix is created first)", 900),
             ("d3d11", "Direct3D 11 on DXVK", 600),
             ("d3d12", "Direct3D 12 on vkd3d-proton", 600),
@@ -1220,6 +1221,7 @@ fn radv_auto() {
         ];
         if matches!(crate::fs::list("/opt/tmnf/bin"), Some(Ok(_))) {
             steps.push(("tmnf", "Trackmania Nations Forever, 60 s benchmark", 1900));
+            steps.push(("tmnfvs", "WATCH THE SCREEN: Trackmania with VSync on (does it flicker now?)", 1000));
         }
         let total = steps.len();
         for (number, (what, title, limit)) in steps.into_iter().enumerate() {
