@@ -72,7 +72,7 @@ pub static FOLDERS: [Folder; 4] = [
 /// обхода: первые четыре строки («Терминал», «Параметры», «О системе»,
 /// «Файлы») стоят на своих местах с фазы С3 — на них считают нажатия
 /// сценарии стенда.
-pub static ENTRIES: [Entry; 25] = [
+pub static ENTRIES: [Entry; 26] = [
     Entry {
         key: "terminal",
         caption: "Терминал",
@@ -358,6 +358,19 @@ pub static ENTRIES: [Entry; 25] = [
         launch: Launch::Program("screenrec", ""),
         needs: "",
         group: "/bin/screenrec",
+    },
+    // «Фотографии» (24.11) — top level, as in Windows; last in the table so
+    // the rows the bench counts stay where they were.
+    Entry {
+        key: "photos",
+        caption: "Фотографии",
+        about: "просмотр фото и картинок",
+        folder: "",
+        art: "doc-image",
+        icon: Icon::Camera,
+        launch: Launch::Program("photos", ""),
+        needs: "",
+        group: "/bin/photos",
     },
 ];
 

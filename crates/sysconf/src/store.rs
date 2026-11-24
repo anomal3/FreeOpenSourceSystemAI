@@ -166,7 +166,27 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("filetypes/.svg/openwith/obsos", OBSOS),
     ("filetypes/.url/default", OBSOS),
     ("filetypes/.url/openwith/obsos", OBSOS),
+    // «Фотографии» (`/bin/photos`, 24.11): pictures its decoders read.
+    ("apps/photos/caption", "Фотографии"),
+    ("apps/photos/icon", "doc-image"),
+    ("filetypes/.jpg/default", PHOTOS),
+    ("filetypes/.jpg/openwith/photos", PHOTOS),
+    ("filetypes/.jpeg/default", PHOTOS),
+    ("filetypes/.jpeg/openwith/photos", PHOTOS),
+    ("filetypes/.jpe/default", PHOTOS),
+    ("filetypes/.jpe/openwith/photos", PHOTOS),
+    ("filetypes/.png/default", PHOTOS),
+    ("filetypes/.png/openwith/photos", PHOTOS),
+    ("filetypes/.bmp/default", PHOTOS),
+    ("filetypes/.bmp/openwith/photos", PHOTOS),
+    ("filetypes/.gif/default", PHOTOS),
+    ("filetypes/.gif/openwith/photos", PHOTOS),
+    ("filetypes/.qoi/default", PHOTOS),
+    ("filetypes/.qoi/openwith/photos", PHOTOS),
 ];
+
+/// The photo viewer of the system («Фотографии», 24.11).
+pub const PHOTOS: &str = "/bin/photos";
 
 /// The browser of the system.
 pub const OBSOS: &str = "/opt/obsos/bin/obsos";
