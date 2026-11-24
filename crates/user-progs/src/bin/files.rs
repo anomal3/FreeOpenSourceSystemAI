@@ -6305,6 +6305,10 @@ fn fstat_ok(fd: i64, out: &mut Stat) -> bool {
 // Запуск
 // ---------------------------------------------------------------------------
 
+/// Heap of the Files window (`--paste`, `--netlist` and `--properties` keep
+/// the default megabyte).
+const FILES_HEAP: usize = 4 * 1024 * 1024;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // SAFETY: значения пришли из `_start` ровно в том виде, в каком их положило
@@ -6330,6 +6334,10 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         user_progs::exit(paste_headless(dir));
     }
 
+    // The window wants more than the default megabyte (24.11): at 200 % on
+    // 2560×1440 theme icons of 96–128 points, the font and the rows ran it
+    // out («user: panic», exit 101). Asked before the first allocation.
+    user_progs::heap_size(FILES_HEAP);
     // Графика, формат точки и тема — у каркаса (`user_progs::app`, фаза С8).
     let info = app::start(&SPEC);
     // Путь с пробелом («Новая папка») приезжает несколькими аргументами:

@@ -371,6 +371,13 @@ pub fn heap_size(bytes: usize) -> bool {
     true
 }
 
+/// How big the program heap is (or will be once started): caches size
+/// themselves by it (24.11, theme icons).
+#[must_use]
+pub fn heap_capacity() -> usize {
+    HEAP_WANTED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Куча программы.
 ///
 /// # Почему без замка
@@ -2553,9 +2560,36 @@ pub fn exit(code: i64) -> ! {
 /// Печатает и завершается, а не останавливает машину: паника **программы** —
 /// это её дело, и система обязана её пережить. В этом и разница между кодом в
 /// ядре и кодом здесь.
+///
+/// The place and the message go into the line (24.11): a bare «user: panic»
+/// left nothing to look for. Formatted into a buffer on the stack — the
+/// panic may be the heap running out.
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
-    println("user: panic");
+fn panic(info: &PanicInfo<'_>) -> ! {
+    struct Line {
+        bytes: [u8; 320],
+        len: usize,
+    }
+    impl core::fmt::Write for Line {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let take = text.len().min(self.bytes.len() - self.len);
+            self.bytes[self.len..self.len + take].copy_from_slice(&text.as_bytes()[..take]);
+            self.len += take;
+            Ok(())
+        }
+    }
+    let mut line = Line { bytes: [0; 320], len: 0 };
+    let _ = core::fmt::Write::write_str(&mut line, "user: panic");
+    if let Some(at) = info.location() {
+        let _ = core::fmt::write(&mut line, format_args!(" at {}:{}:{}", at.file(), at.line(), at.column()));
+    }
+    let _ = core::fmt::write(&mut line, format_args!(": {}", info.message()));
+    // A cut in the middle of a letter keeps the whole letters before it.
+    let text = match core::str::from_utf8(&line.bytes[..line.len]) {
+        Ok(text) => text,
+        Err(error) => core::str::from_utf8(&line.bytes[..error.valid_up_to()]).unwrap_or("user: panic"),
+    };
+    println(text);
     exit(101)
 }
 
