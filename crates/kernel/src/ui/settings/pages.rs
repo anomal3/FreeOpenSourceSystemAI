@@ -1413,6 +1413,12 @@ fn time(pass: &mut Pass, x: i32, y: i32, w: u32) {
     y = row(pass, x, y, w, Some(Fi::Clock), "Текущее время", "", Ctl::Mono(&now), None);
     y = row(pass, x, y, w, Some(Fi::Calendar), "Источник времени", "Прошивка при загрузке и монотонный счётчик", Ctl::Value("UEFI GetTime"), None);
     y = row(pass, x, y, w, Some(Fi::Clock), "Установить время вручную", "Перевести часы прошивки эта система не умеет", Ctl::Value("Недоступно"), None);
+    // 24.11: what the battery clock keeps — Windows keeps local time there.
+    y = pass.group(x, y, w, "Аппаратные часы");
+    let local = crate::time::rtc_local();
+    y = row(pass, x, y, w, None, "Местное время", "Как в Windows: так часы ведёт компьютер, где есть Windows", Ctl::Radio(local), Some(Deed::RtcLocal(true)));
+    y = row(pass, x, y, w, None, "UTC", "Как в Linux и macOS", Ctl::Radio(!local), Some(Deed::RtcLocal(false)));
+    y = pass.note(x, y + ctx.px(4) as i32, w, "Если время из сети разойдётся с часами ровно на часовой пояс, настройка переключится сама.");
     y = pass.group(x, y, w, "Часовой пояс");
     let current = crate::time::offset_minutes();
     for minutes in crate::time::TIMEZONES {

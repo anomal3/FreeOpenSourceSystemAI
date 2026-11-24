@@ -416,6 +416,8 @@ enum Deed {
     IconTheme(u8),
     Layout(crate::input::keymap::Layout),
     Timezone(i32),
+    /// «Аппаратные часы»: местное время (`true`) или UTC (24.11).
+    RtcLocal(bool),
     NetDhcp,
     NetStatic,
     /// A switch of «Параметры общего доступа»: registry key and the new state.
@@ -1433,6 +1435,14 @@ impl SettingsView {
                     }
                     Err(err) => Report::bad(format!("раскладка включена, но не запомнена: {err}")),
                 });
+            }
+            Deed::RtcLocal(local) => {
+                let what = if local { "местное время" } else { "UTC" };
+                self.report = Some(match crate::time::set_rtc_local(local) {
+                    Ok(()) => Report::ok(format!("аппаратные часы: {what} — запомнено")),
+                    Err(err) => Report::bad(format!("аппаратные часы: {what} не записано: {err}")),
+                });
+                self.request = Some(Request::Panel);
             }
             Deed::Timezone(minutes) => {
                 let text = crate::time::zone_text(minutes);
