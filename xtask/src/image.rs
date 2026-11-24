@@ -381,6 +381,21 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     say!("на живую флешку не попал {}: нет файла", path.display());
                 }
             }
+            // VLC (24.11) — с `FOSSAI_WITH_VLC=1`; ядро ставит его следом за OBS.
+            // Он на bash корня Debian: без Proton корень едет сам.
+            if built.release && crate::vlc::enabled() {
+                let debian = format!("{}/DEBIAN.FPK", arch::PAYLOAD_PKG_DIR);
+                let path = crate::debian::package_path();
+                if !payload.iter().any(|item| item.path == debian) && path.is_file() {
+                    payload.push(read_payload(&debian, &path)?);
+                }
+                let path = crate::vlc::package_path();
+                if path.is_file() {
+                    payload.push(read_payload(&format!("{}/VLC.FPK", arch::PAYLOAD_PKG_DIR), &path)?);
+                } else {
+                    say!("на живую флешку не попал {}: нет файла", path.display());
+                }
+            }
         }
         Kind::Installer => {
             let installer = built.get(Component::Installer).ok_or_else(|| {

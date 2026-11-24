@@ -216,6 +216,15 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
         } else {
             say!("пакет obs пропущен: нет {} — собрать: cargo xtask thirdparty --only obs", path.display());
         }
+        // VLC (24.11) — двести мегабайт, только с `FOSSAI_WITH_VLC=1`.
+        let path = crate::vlc::package_path();
+        if !crate::vlc::enabled() {
+            say!("пакет vlc пропущен: FOSSAI_WITH_VLC=1");
+        } else if path.is_file() {
+            samples.push((crate::vlc::PACKAGE_FILE, fs::read(&path)?));
+        } else {
+            say!("пакет vlc пропущен: нет {} — собрать: cargo xtask thirdparty --only vlc", path.display());
+        }
     }
 
     let mut built = Vec::new();
@@ -232,7 +241,7 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
 /// Пакеты игр: только на установочный носитель, не в RAM-диск живой системы.
 /// Там же llama.cpp (фаза 70d) — по той же причине: десятки мегабайт.
 /// NetSurf (начато 03.11) — тоже: пять мегабайт, которые нужны не каждому.
-pub const GAMES: [&str; 12] = [
+pub const GAMES: [&str; 13] = [
     "freedoom-0.13.fpk",
     "sopwith-2.9.0.fpk",
     "netsurf-3.11.fpk",
@@ -244,6 +253,7 @@ pub const GAMES: [&str; 12] = [
     crate::proton::PACKAGE_FILE,
     crate::tmnf::PACKAGE_FILE,
     crate::obs::PACKAGE_FILE,
+    crate::vlc::PACKAGE_FILE,
     SERVO_PACKAGE,
 ];
 
@@ -812,7 +822,7 @@ pub fn place_updates(
         .lookup(&mut dev, ext2::ROOT_INODE, "media")
         .map_err(|err| anyhow::anyhow!("не удалось прочитать корень образа: {err}"))?;
     if let Some((dir, _)) = media {
-        for name in [crate::debian::PACKAGE_FILE, crate::chromium::PACKAGE_FILE, crate::java::PACKAGE_FILE, crate::wine::PACKAGE_FILE, crate::proton::PACKAGE_FILE, crate::tmnf::PACKAGE_FILE, crate::obs::PACKAGE_FILE, BIG_FILE_NAME] {
+        for name in [crate::debian::PACKAGE_FILE, crate::chromium::PACKAGE_FILE, crate::java::PACKAGE_FILE, crate::wine::PACKAGE_FILE, crate::proton::PACKAGE_FILE, crate::tmnf::PACKAGE_FILE, crate::obs::PACKAGE_FILE, crate::vlc::PACKAGE_FILE, BIG_FILE_NAME] {
             match fs.unlink(&mut dev, dir, name) {
                 Ok(()) => say!("стенд: /media/{name} убран, чтобы освободить место под обновления"),
                 Err(ext2::Error::NotFound) => {}

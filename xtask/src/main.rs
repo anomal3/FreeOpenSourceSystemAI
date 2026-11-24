@@ -46,6 +46,7 @@ mod obs;
 mod proton;
 mod tmnf;
 mod wine;
+mod vlc;
 mod rider;
 mod ruststd;
 mod screenmedia;

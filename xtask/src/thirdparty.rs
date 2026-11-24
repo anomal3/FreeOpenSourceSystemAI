@@ -128,6 +128,9 @@ enum How {
     /// OBS Studio из Debian 13 (23.11) и то, что он загружает, — см.
     /// [`crate::obs`].
     Obs,
+    /// VLC 3.0 из Debian 13 (24.11): стандартный видеоплеер — см.
+    /// [`crate::vlc`].
+    Vlc,
     /// NetSurf (начато 03.11): браузер и десяток его библиотек одним архивом,
     /// каждая — своим `buildsystem`; поверхность окна и патчи — в
     /// `ports/netsurf`. См. [`crate::netsurf`].
@@ -202,7 +205,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 28] = [
+const PROJECTS: [Project; 29] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -718,6 +721,17 @@ const PROJECTS: [Project; 28] = [
         how: How::Obs,
         installs: &[],
     },
+    // VLC 3.0 (24.11): vlc Debian 13 и его библиотеки; адреса и хеши — в
+    // `crate::vlc`, здесь — главный пакет.
+    Project {
+        name: "vlc",
+        version: "3.0",
+        url: "https://snapshot.debian.org/archive/debian/20261020T000000Z/pool/main/v/vlc/vlc-bin_3.0.23-0+deb13u1_amd64.deb",
+        sha256: "116a6af7bb48414475ae4ec9c852fd440370bfdb4604ad442df5697adf010ffe",
+        unpacked: "debian",
+        how: How::Vlc,
+        installs: &[],
+    },
     // 7-Zip 26.06 (24.11): консольный `7zz` — адрес и хеш в `crate::sevenzip`
     // (качает и собирает он сам; его же зовёт сборка образа).
     Project {
@@ -792,6 +806,16 @@ pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> 
             }
             for &arch in arches {
                 crate::obs::build(arch)?;
+            }
+            continue;
+        }
+        if project.how == How::Vlc {
+            if only.is_empty() && !crate::vlc::enabled() {
+                say!("vlc пропущен: FOSSAI_WITH_VLC=1 или --only vlc");
+                continue;
+            }
+            for &arch in arches {
+                crate::vlc::build(arch)?;
             }
             continue;
         }
@@ -1132,7 +1156,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         }
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
-        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java | How::Wine | How::Proton | How::Obs | How::SevenZip => {
+        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java | How::Wine | How::Proton | How::Obs | How::Vlc | How::SevenZip => {
             return Ok(());
         }
         How::NetSurf => crate::netsurf::build(source, &work, arch)?,
