@@ -315,7 +315,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 79] = [
+const PROGRAMS: [(&CStr16, &str); 80] = [
     // vDSO программ Linux (01.11.2026): время без входа в ядро. Не программа,
     // но едет тем же путём — так он есть и на установленной системе.
     (cstr16!("\\FREEOS\\BIN\\VDSO"), "vdso"),
@@ -388,6 +388,8 @@ const PROGRAMS: [(&CStr16, &str); 79] = [
     (cstr16!("\\FREEOS\\BIN\\WALLCONV"), "wallconv"),
     // «Запись экрана» (22.11): имя на носителе в 8.3 — `SCRNREC`.
     (cstr16!("\\FREEOS\\BIN\\SCRNREC"), "screenrec"),
+    // «Параметры значков рабочего стола» (24.11).
+    (cstr16!("\\FREEOS\\BIN\\DESKICON"), "deskicon"),
     // Окно «Открыть» / «Сохранить как» / «Выбор папки» для всех программ (20.11).
     (cstr16!("\\FREEOS\\BIN\\FILEDLG"), "filedlg"),
     // Системные инструменты (фаза П1/П2, 20.11) и «Администрирование» (П3):

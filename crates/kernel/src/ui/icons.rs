@@ -225,7 +225,13 @@ pub fn set_places(list: &str) {
 /// По чему значок узнаётся в файле мест: путь (файл стола, команда ярлыка),
 /// у системного — подпись.
 fn key_of(item: &Item) -> &str {
-    item.path.as_deref().unwrap_or(&item.label)
+    // System icons by their default name (24.11): a renamed one keeps its
+    // place.
+    match item.kind {
+        Kind::Trash(_) => super::trash::LABEL,
+        Kind::App(app) if item.path.is_none() => app.caption(),
+        _ => item.path.as_deref().unwrap_or(&item.label),
+    }
 }
 
 /// Подписи ярлыков, убранных со стола «Удалить ярлык», через `|`.
@@ -1136,7 +1142,7 @@ impl Icons {
                 mini_ui::image::draw_shortcut_arrow(back, tile);
             }
             // «О системе» — логотип FossAi на плитке (фаза 72a).
-            None if matches!(item.kind, Kind::App(App::About)) && super::appicon::logo_tile().is_some() => {
+            None if matches!(item.kind, Kind::App(App::About)) && super::appicon::logo_tile().is_some() && super::deskicons::chosen_art(super::deskicons::Special::About).is_none() => {
                 if let Some(logo) = super::appicon::logo_tile() {
                     logo.draw(back, tile);
                 }
@@ -1144,7 +1150,11 @@ impl Icons {
             None => {
                 // Значки макета (72d): у программы — свой, у папки и файла —
                 // по имени и расширению; нет такого — плитка со знаком.
+                // A system icon (24.11) — the picture chosen in «Параметры
+                // значков рабочего стола», or its own.
+                let chosen = super::deskicons::of_item(&item.kind, item.path.as_deref()).and_then(super::deskicons::art);
                 let design = match &item.kind {
+                    _ if chosen.is_some() => chosen.as_deref().and_then(super::appicon::design),
                     Kind::Folder => super::appicon::file_icon(&item.label, true),
                     Kind::File => super::appicon::file_icon(&item.label, false),
                     Kind::App(app) => super::appicon::design_for(app.icon()),
@@ -1304,26 +1314,35 @@ fn system_items() -> Vec<Item> {
     if theme::is_mobile() {
         return mobile_items();
     }
+    // System icons (24.11, «Параметры значков рабочего стола»): each shown or
+    // hidden, renamed, with its own picture — `deskicons`.
+    use super::deskicons::{self, Special};
     let mut out = Vec::new();
-    out.push(Item {
-        kind: Kind::Program(Icon::Disk),
-        label: COMPUTER_LABEL.to_string(),
-        path: Some(COMPUTER_COMMAND.to_string()),
-        shortcut: None,
-    });
-    out.extend(SYSTEM.iter().map(|app| Item {
-        kind: Kind::App(*app),
-        label: app.caption().to_string(),
-        path: None,
-        shortcut: None,
-    }));
+    for special in [Special::Computer, Special::User, Special::Network] {
+        if let Some(command) = special.command().filter(|_| deskicons::shown(special)) {
+            let icon = match special {
+                Special::Computer => Icon::Disk,
+                Special::User => Icon::Folder,
+                _ => Icon::Network,
+            };
+            out.push(Item { kind: Kind::Program(icon), label: deskicons::label(special), path: Some(command), shortcut: None });
+        }
+    }
+    let _ = (COMPUTER_LABEL, SYSTEM);
+    for (special, app) in [(Special::Terminal, App::Terminal), (Special::About, App::About), (Special::Control, App::Settings)] {
+        if deskicons::shown(special) {
+            out.push(Item { kind: Kind::App(app), label: deskicons::label(special), path: None, shortcut: None });
+        }
+    }
     // Корзина — последней из системных; её место запоминается по подписи.
-    out.push(Item {
-        kind: Kind::Trash(!super::trash::is_empty()),
-        label: super::trash::LABEL.to_string(),
-        path: None,
-        shortcut: None,
-    });
+    if deskicons::shown(Special::Trash) {
+        out.push(Item {
+            kind: Kind::Trash(!super::trash::is_empty()),
+            label: deskicons::label(Special::Trash),
+            path: None,
+            shortcut: None,
+        });
+    }
     // Браузер OBSOS (21.11, Роман: «браузер мне в сборку»): ярлык на столе,
     // когда пакет стоит (на живой флешке он встаёт сам после запуска стола —
     // значки перечитываются по `packages_changed`). После корзины: места

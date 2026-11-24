@@ -173,6 +173,10 @@ pub enum Action {
     TabCloseOthers,
     /// Унести вкладку в новое окно терминала.
     TabDetach,
+    /// «Скрыть с рабочего стола» — a system icon (24.11, `deskicons`).
+    HideIcon,
+    /// «Управление» of «Этот компьютер» — `/bin/compmgmt` (24.11).
+    Manage,
 }
 
 /// Какое подменю открывает пункт.
@@ -186,7 +190,9 @@ pub enum Sub {
 
 impl Action {
     /// Все пункты, какие бывают, — по ним считается размер поверхности.
-    const ALL: [Action; 41] = [
+    const ALL: [Action; 43] = [
+        Action::HideIcon,
+        Action::Manage,
         Action::TabRename,
         Action::TabClose,
         Action::TabCloseOthers,
@@ -230,8 +236,19 @@ impl Action {
         Action::RecentHeader,
     ];
 
-    /// Меню корзины (макет 12): открыть, очистить, свойства.
-    pub const ON_TRASH: [Action; 3] = [Action::Open, Action::EmptyTrash, Action::Properties];
+    /// Меню корзины (макет 12): открыть, очистить, свойства; 24.11 —
+    /// переименовать и скрыть, как у Windows.
+    pub const ON_TRASH: [Action; 5] = [Action::Open, Action::EmptyTrash, Action::Rename, Action::HideIcon, Action::Properties];
+
+    /// «Этот компьютер» (24.11, as in Windows): open, «Управление», rename,
+    /// hide, «Свойства» — the system page of «Параметры».
+    pub const ON_COMPUTER: [Action; 5] = [Action::Open, Action::Manage, Action::Rename, Action::HideIcon, Action::Properties];
+
+    /// The user's files and «Сеть» (24.11).
+    pub const ON_PLACE: [Action; 4] = [Action::Open, Action::Rename, Action::HideIcon, Action::Properties];
+
+    /// «Панель управления», «Терминал», «О системе» (24.11).
+    pub const ON_SYSTEM: [Action; 3] = [Action::Open, Action::Rename, Action::HideIcon];
 
     /// Пункты меню, открытого на пустом месте стола.
     /// Пункты меню, открытого на пустом месте стола.
@@ -393,6 +410,8 @@ impl Action {
             Action::TabClose => "Закрыть",
             Action::TabCloseOthers => "Закрыть другие",
             Action::TabDetach => "Переместить в новое окно",
+            Action::HideIcon => "Скрыть с рабочего стола",
+            Action::Manage => "Управление",
         }
     }
 
@@ -413,7 +432,8 @@ impl Action {
             | Action::OpenInTerminal
             | Action::Window(_)
             | Action::CloseWindow(_) => 0,
-            Action::Rename | Action::Delete | Action::DeleteShortcut | Action::CloseOne | Action::CloseAll | Action::EmptyTrash => 5,
+            Action::Rename | Action::Delete | Action::DeleteShortcut | Action::CloseOne | Action::CloseAll | Action::EmptyTrash | Action::HideIcon => 5,
+            Action::Manage => 0,
             Action::Properties => 6,
             Action::NewFolder | Action::NewTextFile | Action::NewShortcut | Action::Submenu(Sub::New) => 1,
             Action::Theme | Action::DisplaySettings | Action::Personalize => 2,
@@ -479,6 +499,8 @@ impl Action {
             Action::TabRename => None,
             Action::TabDetach => Some(Icon::Maximize),
             Action::TabClose | Action::TabCloseOthers => Some(Icon::Close),
+            Action::HideIcon => None,
+            Action::Manage => Some(Icon::Computer),
         }
     }
 
@@ -498,6 +520,7 @@ impl Action {
             Action::OpenInTerminal => Some(Fi::OpenTerminal),
             Action::Personalize => Some(Fi::Palette),
             Action::Refresh => Some(Fi::Refresh),
+            Action::HideIcon => Some(Fi::EyeOff),
             _ => None,
         }
     }

@@ -48,6 +48,7 @@ pub mod clipboard;
 pub mod compositor;
 pub mod context;
 pub mod deskcfg;
+pub mod deskicons;
 pub mod dialog;
 pub mod ending;
 pub mod icons;
@@ -2695,7 +2696,7 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
     // столу: иначе F2 принадлежит окну (у `mc` это меню).
     if event.code == KeyCode::F2 && DESK_FOCUS.load(Ordering::Relaxed) {
         if let Some(index) = desktop.icon_selection() {
-            if matches!(desktop.icon_kind(index), Some(icons::Kind::Folder | icons::Kind::File)) {
+            if matches!(desktop.icon_kind(index), Some(icons::Kind::Folder | icons::Kind::File)) || selected_special(desktop).is_some() {
                 desktop.start_icon_edit(index);
                 kprintln!("  desktop     : naming '{}'", desktop.icon_label(index).unwrap_or_default());
                 desktop.present();
@@ -3427,7 +3428,14 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                     }
                     // Меню по тому, во что целились (как в Windows): ярлык
                     // программы, системный значок, папка, файл.
+                    // System icons (24.11): rename, hide, properties.
+                    let special = desktop.icon_kind(index).and_then(|kind| deskicons::of_item(&kind, desktop.icon_path(index).as_deref()));
                     match desktop.icon_kind(index) {
+                        _ if special == Some(deskicons::Special::Computer) => (&context::Action::ON_COMPUTER[..], "icon (computer)"),
+                        _ if matches!(special, Some(deskicons::Special::User | deskicons::Special::Network)) => (&context::Action::ON_PLACE[..], "icon (place)"),
+                        _ if matches!(special, Some(deskicons::Special::Control | deskicons::Special::Terminal | deskicons::Special::About)) => {
+                            (&context::Action::ON_SYSTEM[..], "icon (system)")
+                        }
                         Some(icons::Kind::Program(_)) if desktop.icon_is_shortcut(index) => {
                             (&context::Action::ON_PROGRAM[..], "icon")
                         }
@@ -5442,6 +5450,11 @@ pub fn open_command(words: &str) -> Result<String, String> {
             });
             Ok(alloc::format!("settings {section:?}"))
         }
+        // «Параметры значков рабочего стола» (24.11).
+        "deskicons" => {
+            with_desktop(|desktop| open_desktop_icons_dialog(desktop));
+            Ok(String::from(what))
+        }
         "terminal" | "about" => {
             let app = if what == "terminal" { App::Terminal } else { App::About };
             with_desktop(|desktop| {
@@ -5710,6 +5723,11 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
             let Some(command) = desktop.icon_path(index) else {
                 return;
             };
+            // «Сеть» on the desktop (24.11): the network page of «Параметры».
+            if command == deskicons::NETWORK_COMMAND {
+                open_settings(desktop, Section::Network, &status_now());
+                return;
+            }
             // Ярлык программы Windows (21.11) — с правами пакета `proton`,
             // как из «Пуска».
             if command.contains(panel::PROTON_SCRIPT) {
@@ -5886,6 +5904,51 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         // имя, второе — подтверждения. Действие происходит в ответе на
         // клавишу, см. [`handle_context_key`].
         // «Переименовать» — поле на месте подписи, как F2.
+        // A system icon (24.11): its name lives in `desktop.cfg`.
+        context::Action::Rename if selected_special(desktop).is_some() => {
+            desktop.close_context();
+            kprintln!("  desktop     : context menu closed");
+            if let Some(index) = desktop.icon_selection() {
+                desktop.start_icon_edit(index);
+                kprintln!("  desktop     : naming '{}'", desktop.icon_label(index).unwrap_or_default());
+            }
+        }
+        context::Action::HideIcon => {
+            desktop.close_context();
+            if let Some(special) = selected_special(desktop) {
+                deskicons::set_shown(special, false);
+                desktop.reload_icons();
+                log_icons(desktop);
+                desktop.repaint_all();
+            }
+        }
+        context::Action::Manage => {
+            desktop.close_context();
+            run_choice(desktop, panel::Choice::Program("compmgmt", ""));
+            desktop.refresh_panel(status);
+        }
+        // «Свойства» of a system icon (24.11): «Этот компьютер» — the system
+        // page of «Параметры», «Сеть» — the network page, the user's files —
+        // facts of the folder.
+        context::Action::Properties if matches!(selected_special(desktop), Some(deskicons::Special::Computer | deskicons::Special::Network | deskicons::Special::User)) => {
+            match selected_special(desktop) {
+                Some(deskicons::Special::Computer) => {
+                    desktop.close_context();
+                    open_settings(desktop, Section::About, status);
+                }
+                Some(deskicons::Special::Network) => {
+                    desktop.close_context();
+                    open_settings(desktop, Section::Network, status);
+                }
+                _ => {
+                    let home = deskicons::home_dir();
+                    let label = desktop.icon_selection().and_then(|index| desktop.icon_label(index)).unwrap_or_default();
+                    let note = entry_facts(&home, &label);
+                    kprintln!("  desktop     : properties of '{home}': {note}");
+                    desktop.context_note(&note);
+                }
+            }
+        }
         context::Action::Rename => match selected_entry(desktop) {
             Some((_, label)) => {
                 desktop.close_context();
@@ -6294,7 +6357,22 @@ fn finish_icon_edit(desktop: &mut Compositor, accept: Option<String>) {
         return;
     };
     let (path, label) = (desktop.icon_path(index), desktop.icon_label(index).unwrap_or_default());
+    // A system icon (24.11): the new name goes to `desktop.cfg`, nothing on
+    // disk is renamed.
+    let special = desktop.icon_kind(index).and_then(|kind| deskicons::of_item(&kind, path.as_deref()));
     desktop.end_icon_edit();
+    if let Some(special) = special {
+        match accept {
+            Some(name) if !name.trim().is_empty() && name != label => {
+                deskicons::set_label(special, Some(&name));
+                desktop.reload_icons();
+                log_icons(desktop);
+            }
+            Some(_) => kprintln!("  desktop     : named '{label}'"),
+            None => kprintln!("  desktop     : naming '{label}' cancelled"),
+        }
+        return;
+    }
     match (accept, path) {
         (Some(name), Some(path)) if !name.is_empty() && name != label => match context::rename_entry(&path, &name) {
             Ok(target) => {
@@ -6357,6 +6435,20 @@ fn desktop_paste() {
         Ok(_) => kprintln!("  desktop     : pasting {} item(s){} into {dir}", paths.len(), if cut { " (cut)" } else { "" }),
         Err(err) => kprintln!("  desktop     : cannot paste: {err}"),
     }
+}
+
+/// «Параметры значков рабочего стола» (24.11): the dialog `/bin/deskicon`
+/// — checkboxes of the system icons, a preview, «Сменить значок…» and
+/// «Обычный значок». The entry point for «Персонализация».
+pub fn open_desktop_icons_dialog(desktop: &mut Compositor) {
+    start(desktop, "/bin/deskicon");
+    kprintln!("  desktop     : desktop icons dialog requested");
+}
+
+/// The system icon selected on the desktop (24.11, `deskicons`).
+fn selected_special(desktop: &Compositor) -> Option<deskicons::Special> {
+    let index = desktop.icon_selection()?;
+    deskicons::of_item(&desktop.icon_kind(index)?, desktop.icon_path(index).as_deref())
 }
 
 /// Что выбрано на столе, если это файл или каталог: путь и подпись.

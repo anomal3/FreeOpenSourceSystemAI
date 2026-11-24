@@ -104,6 +104,8 @@ pub fn adopt() {
     if let Some(list) = sysconf::value(text, "hidden_shortcuts") {
         super::icons::set_hidden(list);
     }
+    // System desktop icons: shown, names, pictures (24.11, `deskicons`).
+    super::deskicons::adopt(text);
     // Что показывает панель рядом с часами (фаза 69b).
     for (pref, key) in [
         (super::settings::PanelPref::Uptime, "panel_uptime"),

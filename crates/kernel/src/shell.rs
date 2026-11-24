@@ -2636,6 +2636,11 @@ fn ui_status(argument: &str) {
         ui::look::command(words);
         return;
     }
+    // System desktop icons (24.11): `ui deskicons [show|hide|icon|label KEY …]`.
+    if let Some(words) = argument.trim().strip_prefix("deskicons") {
+        ui::deskicons::command(words);
+        return;
+    }
     // Тема значков (22.11): `ui icons glossy|crisp`.
     if let Some(words) = argument.trim().strip_prefix("icons") {
         ui::appicon::command(words);

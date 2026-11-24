@@ -1563,7 +1563,9 @@ fn kernel_command(line: usize, len: usize, out: usize) -> i64 {
     // П3 (20.11): ещё «открой окно стола» (`ui open …` — «Администрирование»
     // открывает страницы «Параметров») и три читающие команды видеокарты
     // без аргументов (страница «Видеокарта и драйверы»).
-    let open_window = text.trim().starts_with("ui open ");
+    // 24.11: `ui deskicons …` — the desktop icons dialog (`/bin/deskicons`)
+    // changes only which system icons the desktop shows.
+    let open_window = text.trim().starts_with("ui open ") || text.trim().starts_with("ui deskicons");
     if !super::credentials().is_root() && !open_window && !matches!(text.trim(), "version" | "gpu" | "nvk" | "outputs") {
         return ERR_PERMISSION;
     }
