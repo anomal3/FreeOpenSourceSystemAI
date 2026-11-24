@@ -91,8 +91,20 @@ enum {
     ID_POS, ID_PSURF, ID_PXDG, ID_POPUP, ID_PPOOL, ID_PBUF, ID_TOKEN2, ID_CONFINE2, ID_SYNC4,
     /* G5 (22.11): one wl_output per monitor, xdg_output, enter/leave,
      * xdg_popup.reposition, outputs switched off and on. */
-    ID_XOMGR, ID_OUT0, ID_OUT1, ID_XOUT0, ID_XOUT1, ID_SYNC5, ID_POS2, ID_PPOOL2, ID_PBUF2, ID_OUT2, ID_SYNC6
+    ID_XOMGR, ID_OUT0, ID_OUT1, ID_XOUT0, ID_XOUT1, ID_SYNC5, ID_POS2, ID_PPOOL2, ID_PBUF2, ID_OUT2, ID_SYNC6,
+    /* Clipboard (24.11): wl_data_device_manager, the device, our source. */
+    ID_DDM, ID_DDEV, ID_SRC, ID_SYNC7,
+    /* ext_data_control_manager_v1 (Wine's clipboard sync) and its device. */
+    ID_DCM, ID_DCDEV
 };
+static uint32_t global_dcm, dc_offer;
+static int dc_text, dc_gnome, dc_sel, dc_files;
+/* Clipboard: the current offer and what it offers, the selection offer,
+ * keyboard enter serial, sends our source was asked for, cancelled. */
+static uint32_t global_ddm, cur_offer, sel_offer;
+static int cur_text, cur_utf8, cur_uri, cur_gnome, sel_text, sel_utf8, sel_uri, sel_gnome, sel_events, kb_serial;
+static int src_sends, src_cancelled, synced7;
+static const char *clip_text = "from-wayland-42";
 /* G5 outputs: registry names, what each bound one said (index 0/1 = ID_OUT0/1,
  * 2 = ID_OUT2 bound after the hotplug). */
 #define MAX_OUT 4
@@ -163,6 +175,8 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
             }
         }
         if (!strcmp(interface, "zxdg_output_manager_v1")) global_xomgr = name;
+        if (!strcmp(interface, "wl_data_device_manager")) global_ddm = name;
+        if (!strcmp(interface, "ext_data_control_manager_v1")) global_dcm = name;
     } else if (id == ID_REGISTRY && opcode == 1) {
         /* global_remove(name) */
         for (int i = 0; i < n_out; i++)
@@ -211,6 +225,49 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         int l = left_out == ID_OUT0 ? 0 : 1, r = 1 - l;
         on_right_only = outs[r].entered && !outs[l].entered;
         on_left_only = outs[l].entered && !outs[r].entered;
+    } else if (id == ID_DCDEV && opcode == 0) {
+        dc_offer = args[0];
+        dc_text = dc_gnome = 0;
+    } else if (dc_offer && id == dc_offer && opcode == 0) {
+        if (!strcmp((const char *)&args[1], "text/plain;charset=utf-8")) dc_text = 1;
+        if (!strcmp((const char *)&args[1], "x-special/gnome-copied-files")) dc_gnome = 1;
+    } else if (id == ID_DCDEV && opcode == 1) {
+        dc_sel = args[0] && args[0] == dc_offer && dc_text;
+        dc_files = args[0] && args[0] == dc_offer && dc_gnome;
+    } else if (id == ID_DDEV && opcode == 0) {
+        /* data_offer(id) - its mime types follow */
+        cur_offer = args[0];
+        cur_text = cur_utf8 = cur_uri = cur_gnome = 0;
+    } else if (cur_offer && id == cur_offer && opcode == 0) {
+        const char *mime = (const char *)&args[1];
+        if (!strcmp(mime, "text/plain;charset=utf-8")) cur_text = 1;
+        if (!strcmp(mime, "UTF8_STRING")) cur_utf8 = 1;
+        if (!strcmp(mime, "text/uri-list")) cur_uri = 1;
+        if (!strcmp(mime, "x-special/gnome-copied-files")) cur_gnome = 1;
+    } else if (id == ID_DDEV && opcode == 5) {
+        /* selection(offer or null) */
+        sel_offer = args[0];
+        sel_text = sel_offer && sel_offer == cur_offer && cur_text;
+        sel_utf8 = sel_offer && sel_offer == cur_offer && cur_utf8;
+        sel_uri = sel_offer && sel_offer == cur_offer && cur_uri;
+        sel_gnome = sel_offer && sel_offer == cur_offer && cur_gnome;
+        sel_events++;
+    } else if (id == ID_SRC && opcode == 1) {
+        /* send(mime, fd): write our selection and close */
+        const char *mime = (const char *)&args[1];
+        int fd = nfds > 0 ? fds[0] : -1;
+        if (nfds > 0) memmove(fds, fds + 1, sizeof(int) * (size_t)--nfds);
+        if (fd >= 0) {
+            const char *data = !strcmp(mime, "text/uri-list") ? "file:///tmp/clip%20test.txt\r\n" : clip_text;
+            ssize_t w = write(fd, data, strlen(data));
+            (void)w;
+            close(fd);
+        }
+        src_sends++;
+    } else if (id == ID_SRC && opcode == 2) {
+        src_cancelled = 1;
+    } else if (id == ID_SYNC7 && opcode == 0) {
+        synced7 = 1;
     } else if (id == ID_POPUP && opcode == 2) {
         repositioned_token = (int)args[0];
     } else if (id == ID_SYNC5 && opcode == 0) {
@@ -321,6 +378,7 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         if (fd >= 0) close(fd);
     } else if (id == ID_KEYBOARD && opcode == 1) {
         keyboard_in = 1;
+        kb_serial = (int)args[0];
     } else if (id == ID_KEYBOARD && opcode == 3) {
         if (args[2] == 30 && args[3] == 1) key_down = 1;
         if (args[2] == 30 && args[3] == 0 && key_down) key_up = 1;
@@ -913,6 +971,160 @@ static int g5(void) {
     return failed;
 }
 
+/* Receive the selection offer as `mime` through a pipe: what the owner wrote
+ * (NUL-terminated in `out`), or -1. The server writes asynchronously, so the
+ * pipe is read with a deadline. */
+static int clip_receive_from(uint32_t offer, uint32_t opcode, const char *mime, char *out, int room) {
+    int p[2];
+    if (!offer || pipe2(p, O_CLOEXEC) != 0) return -1;
+    begin(offer, opcode); /* receive(mime, fd) */
+    put_str(mime);
+    end_fd(p[1]);
+    close(p[1]);
+    int got = 0;
+    long until = now_ms() + 5000;
+    while (got < room - 1) {
+        struct pollfd pfd = {p[0], POLLIN, 0};
+        long left = until - now_ms();
+        if (left <= 0 || poll(&pfd, 1, (int)left) <= 0) break;
+        ssize_t n = read(p[0], out + got, (size_t)(room - 1 - got));
+        if (n <= 0) break;
+        got += (int)n;
+    }
+    close(p[0]);
+    out[got] = 0;
+    return got;
+}
+
+static int clip_receive(const char *mime, char *out, int room) {
+    return clip_receive_from(sel_offer, 1, mime, out, room);
+}
+
+/* `waylandcheck clip TEXT` (24.11): the one clipboard with native programs.
+ * The scenario `wayland-clipboard` puts TEXT on the system clipboard
+ * (`clip set`), clicks the window; the client must get it offered as
+ * text/plain;charset=utf-8 and UTF8_STRING and read it. Then the client sets
+ * its own selection (text + text/uri-list) - the server reads it onto the
+ * system clipboard (the scenario checks `clip`); then the scenario puts files
+ * on the system clipboard (`clip files`) - the client gets text/uri-list and
+ * its own source is cancelled. */
+static int clip(const char *expect) {
+    begin(ID_DISPLAY, 1);
+    put(ID_REGISTRY);
+    end();
+    begin(ID_DISPLAY, 0);
+    put(ID_SYNC);
+    end();
+    wait_for(&synced, 5000);
+    check(synced && global_compositor && global_shm && global_wm && global_seat && global_ddm,
+          "clip registry lists wl_data_device_manager");
+    check(global_dcm != 0, "clip registry lists ext_data_control_manager_v1");
+    bind_global(global_compositor, "wl_compositor", 4, ID_COMPOSITOR);
+    bind_global(global_shm, "wl_shm", 1, ID_SHM);
+    bind_global(global_wm, "xdg_wm_base", 2, ID_WM);
+    bind_global(global_seat, "wl_seat", 5, ID_SEAT);
+    bind_global(global_ddm, "wl_data_device_manager", 3, ID_DDM);
+    begin(ID_SEAT, 0);
+    put(ID_POINTER);
+    end();
+    begin(ID_SEAT, 1);
+    put(ID_KEYBOARD);
+    end();
+    begin(ID_DDM, 1); /* get_data_device(id, seat) */
+    put(ID_DDEV);
+    put(ID_SEAT);
+    end();
+    /* Data control: the selection comes at once, without keyboard focus. */
+    if (global_dcm) {
+        bind_global(global_dcm, "ext_data_control_manager_v1", 1, ID_DCM);
+        begin(ID_DCM, 1); /* get_data_device(id, seat) */
+        put(ID_DCDEV);
+        put(ID_SEAT);
+        end();
+        wait_for(&dc_sel, 3000);
+        check(dc_sel, "a data-control device gets the native selection without keyboard focus");
+        char dcbuf[256];
+        int n = clip_receive_from(dc_offer, 0, "text/plain;charset=utf-8", dcbuf, sizeof dcbuf);
+        check(n >= 0 && !strcmp(dcbuf, expect), "native clipboard text reaches the client through data control");
+    }
+    begin(ID_COMPOSITOR, 0);
+    put(ID_SURFACE);
+    end();
+    begin(ID_WM, 2);
+    put(ID_XDG);
+    put(ID_SURFACE);
+    end();
+    begin(ID_XDG, 1);
+    put(ID_TOPLEVEL);
+    end();
+    begin(ID_TOPLEVEL, 2);
+    put_str("waylandcheck");
+    end();
+    begin(ID_SURFACE, 6);
+    end();
+    wait_for(&configured, 5000);
+    begin(ID_XDG, 4);
+    put((uint32_t)configure_serial);
+    end();
+    shm_buffer(ID_POOL, ID_BUFFER, 320, 200, 0xff3060a0u);
+    show(ID_SURFACE, ID_BUFFER, 320, 200);
+    say("clip waiting for the keyboard");
+    wait_for(&keyboard_in, 60000);
+    check(keyboard_in, "clip the window gets the keyboard");
+    /* The selection comes right before wl_keyboard.enter. */
+    wait_for(&sel_text, 3000);
+    check(sel_text && sel_utf8, "native clipboard is offered as text/plain;charset=utf-8 and UTF8_STRING");
+    char buf[4096];
+    int got = clip_receive("text/plain;charset=utf-8", buf, sizeof buf);
+    printf("waylandcheck: clip received '%s'\n", got >= 0 ? buf : "");
+    check(got >= 0 && !strcmp(buf, expect), "native clipboard text reaches the client");
+    got = clip_receive("UTF8_STRING", buf, sizeof buf);
+    check(got >= 0 && !strcmp(buf, expect), "native clipboard text reaches the client as UTF8_STRING");
+
+    /* Our selection onto the system clipboard. */
+    begin(ID_DDM, 0); /* create_data_source */
+    put(ID_SRC);
+    end();
+    const char *mimes[] = {"text/plain;charset=utf-8", "UTF8_STRING", "text/uri-list"};
+    for (int i = 0; i < 3; i++) {
+        begin(ID_SRC, 0); /* offer */
+        put_str(mimes[i]);
+        end();
+    }
+    begin(ID_DDEV, 1); /* set_selection(source, serial) */
+    put(ID_SRC);
+    put((uint32_t)kb_serial);
+    end();
+    int two = 0;
+    long until = now_ms() + 5000;
+    while (src_sends < 2 && now_ms() < until) {
+        begin(ID_DISPLAY, 0);
+        put(ID_SYNC7);
+        end();
+        synced7 = 0;
+        wait_for(&synced7, 500);
+    }
+    two = src_sends >= 2;
+    check(two, "the server reads the client's selection (text and text/uri-list) right when it is set");
+    say("clip selection set");
+
+    /* Files from native programs come as text/uri-list. */
+    /* Only the system clipboard offers x-special/gnome-copied-files - our
+     * own selection (echoed back to us) does not. The scenario takes the
+     * keyboard away to type `clip files` into the shell, so the files come
+     * through the data-control device (no focus needed). */
+    wait_for(&dc_files, 120000);
+    check(dc_files, "native files are offered as text/uri-list");
+    got = clip_receive_from(dc_offer, 0, "text/uri-list", buf, sizeof buf);
+    printf("waylandcheck: clip uri-list '%s'\n", got >= 0 ? buf : "");
+    check(got > 0 && strstr(buf, "file:///etc/hostname\r\n") != NULL, "native files reach the client as file:// URIs");
+    check(src_cancelled, "the client's source is cancelled when native programs copy");
+    check(!protocol_error, "no protocol errors");
+    close(sock);
+    printf("waylandcheck: %d failed\n", failed);
+    return failed;
+}
+
 int main(int argc, char **argv) {
     const char *dir = getenv("XDG_RUNTIME_DIR");
     const char *display = getenv("WAYLAND_DISPLAY");
@@ -923,6 +1135,10 @@ int main(int argc, char **argv) {
     int connected = sock >= 0 && connect(sock, (struct sockaddr *)&addr, sizeof addr) == 0;
     if (argc > 1 && !strcmp(argv[1], "bench"))
         return connected ? bench(argc > 2 ? atoi(argv[2]) : 300) : 1;
+    if (argc > 1 && !strcmp(argv[1], "clip")) {
+        check(connected, "connect to the compositor");
+        return connected ? clip(argc > 2 ? argv[2] : "") : 1;
+    }
     if (argc > 1 && !strcmp(argv[1], "g5")) {
         check(connected, "connect to the compositor");
         return connected ? g5() : 1;

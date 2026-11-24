@@ -249,6 +249,11 @@ struct Editor {
     screen_map: RefCell<Vec<(usize, usize, usize, i32)>>,
     /// Панель «Найти» / «Заменить».
     find: Option<FindBar>,
+    /// Выделение мышью (24.11): зажатая кнопка, модификаторы последнего
+    /// щелчка и прошлый щелчок (время, точка, который по счёту).
+    press: Option<Press>,
+    click_mods: i32,
+    last_click: (u64, i32, i32, u8),
 }
 
 /// Панель поиска над текстом (Ctrl+F, Ctrl+H).
@@ -263,6 +268,32 @@ struct FindBar {
 
 /// Высота панели поиска.
 const FIND_H: u32 = 44;
+
+/// Чем мышь выделяет (24.11): знаками, словами (двойной щелчок), строками
+/// (тройной).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    Char,
+    Word,
+    Line,
+}
+
+/// Левая кнопка зажата в тексте: чем выделяем, что выделил щелчок (начало и
+/// конец), и где указатель — для прокрутки, пока он над или под текстом.
+#[derive(Clone, Copy)]
+struct Press {
+    unit: Unit,
+    origin: (Pos, Pos),
+    area: Rect,
+    ctx: Ctx,
+    x: i32,
+    y: i32,
+}
+
+/// Двойной и тройной щелчок: не дольше этого между щелчками ...
+const MULTI_CLICK_MS: u64 = 500;
+/// ... и не дальше этого (точки макета).
+const MULTI_CLICK_PX: u32 = 4;
 const F3: u32 = user_abi::WIN_KEY_F1 + 2;
 
 impl Editor {
@@ -297,6 +328,9 @@ impl Editor {
             wrap: false,
             screen_map: RefCell::new(Vec::new()),
             find: None,
+            press: None,
+            click_mods: 0,
+            last_click: (0, 0, 0, 0),
         };
         editor.load_font_settings();
         if let Some(path) = path {
@@ -1491,6 +1525,137 @@ impl Editor {
         to
     }
 
+    /// Место в тексте под точкой окна — по раскладке последней отрисовки.
+    /// Выше текста — первая показанная строка, ниже — последняя.
+    fn pos_at(&self, ctx: Ctx, plan: &Plan, x: i32, y: i32) -> Pos {
+        let metrics = self.metrics(ctx, plan);
+        let hit = {
+            let map = self.screen_map.borrow();
+            map.iter().rev().find(|(_, _, _, top)| y >= *top).or(map.first()).copied()
+        };
+        match hit {
+            Some((row, from, to, _)) => (row, self.col_at(&metrics, row, from, to, x)),
+            None => (self.top.min(self.lines.len() - 1), 0),
+        }
+    }
+
+    /// Слово под местом (двойной щелчок): буквы и цифры, пробелы подряд или
+    /// один знак препинания.
+    fn word_at(&self, pos: Pos) -> (Pos, Pos) {
+        let chars: Vec<char> = self.lines[pos.0].chars().collect();
+        if chars.is_empty() {
+            return (pos, pos);
+        }
+        let class = |ch: char| if ch.is_alphanumeric() || ch == '_' { 1 } else if ch.is_whitespace() { 0 } else { 2 };
+        let at = pos.1.min(chars.len() - 1);
+        let kind = class(chars[at]);
+        if kind == 2 {
+            return ((pos.0, at), (pos.0, at + 1));
+        }
+        let mut from = at;
+        while from > 0 && class(chars[from - 1]) == kind {
+            from -= 1;
+        }
+        let mut to = at + 1;
+        while to < chars.len() && class(chars[to]) == kind {
+            to += 1;
+        }
+        ((pos.0, from), (pos.0, to))
+    }
+
+    /// Строка целиком (тройной щелчок) — с переводом строки, если он есть.
+    fn line_span(&self, row: usize) -> (Pos, Pos) {
+        if row + 1 < self.lines.len() { ((row, 0), (row + 1, 0)) } else { ((row, 0), (row, self.line_len(row))) }
+    }
+
+    /// Тянуть выделение мышью до `pos`: знаками — каретка за указателем;
+    /// словами и строками — выделено всё от первого слова (строки) до
+    /// текущего, каретка — на подвижном конце.
+    fn extend_to(&mut self, pos: Pos) {
+        let Some(press) = self.press else {
+            return;
+        };
+        let span = match press.unit {
+            Unit::Char => {
+                self.row = pos.0.min(self.lines.len() - 1);
+                self.col = pos.1.min(self.line_len(self.row));
+                return;
+            }
+            Unit::Word => self.word_at(pos),
+            Unit::Line => self.line_span(pos.0),
+        };
+        let (origin_start, origin_end) = press.origin;
+        if span.0 < origin_start {
+            self.anchor = Some(origin_end);
+            (self.row, self.col) = span.0;
+        } else {
+            self.anchor = Some(origin_start);
+            (self.row, self.col) = span.1.max(origin_end);
+        }
+    }
+
+    /// Щелчок левой кнопкой в тексте: каретка, Shift — тянуть выделение до
+    /// точки, двойной — слово, тройной — строка; кнопка зажата — дальше
+    /// выделяет движение ([`App::drag`]).
+    fn press_text(&mut self, area: Rect, ctx: Ctx, plan: &Plan, x: i32, y: i32) {
+        let pos = self.pos_at(ctx, plan, x, y);
+        let now = user_progs::monotonic_ms();
+        let shift = self.click_mods & WIN_MOD_SHIFT != 0;
+        let (when, lx, ly, count) = self.last_click;
+        let near = (x - lx).unsigned_abs() <= ctx.px(MULTI_CLICK_PX) && (y - ly).unsigned_abs() <= ctx.px(MULTI_CLICK_PX);
+        let count = if !shift && near && now.saturating_sub(when) <= MULTI_CLICK_MS { count % 3 + 1 } else { 1 };
+        self.last_click = (now, x, y, count);
+        self.last_edit = EditKind::None;
+        let (unit, origin) = match count {
+            2 => (Unit::Word, self.word_at(pos)),
+            3 => (Unit::Line, self.line_span(pos.0)),
+            _ if shift => {
+                // Shift+щелчок: второй конец — прежняя каретка (или начало
+                // прежнего выделения).
+                let anchor = self.anchor.unwrap_or((self.row, self.col));
+                self.anchor = Some(anchor);
+                (Unit::Char, (anchor, anchor))
+            }
+            _ => {
+                self.anchor = Some(pos);
+                (Unit::Char, (pos, pos))
+            }
+        };
+        if unit != Unit::Char {
+            self.anchor = Some(origin.0);
+        }
+        (self.row, self.col) = if unit == Unit::Char { pos } else { origin.1 };
+        self.press = Some(Press { unit, origin, area, ctx, x, y });
+        if count > 1 {
+            println(&format!("notepad: {} selected by a {}-click", if count == 2 { "word" } else { "line" }, count));
+        }
+    }
+
+    /// Кнопка зажата, а указатель над или под текстом: прокрутить на строку
+    /// и тянуть выделение (зовётся с каждым витком цикла, ~30 мс).
+    fn drag_scroll(&mut self) -> bool {
+        let Some(press) = self.press else {
+            return false;
+        };
+        let plan = Plan::new(press.ctx, press.area);
+        let top_y = plan.text.y + self.find_h(press.ctx) as i32;
+        let rows = self.page_rows.get().max(1);
+        let row = if press.y < top_y && self.top > 0 {
+            self.top -= 1;
+            self.top
+        } else if press.y >= plan.text.bottom() && self.top + rows < self.lines.len() {
+            self.top += 1;
+            (self.top + rows - 1).min(self.lines.len() - 1)
+        } else {
+            return false;
+        };
+        let metrics = self.metrics(press.ctx, &plan);
+        let from = if self.wrap { 0 } else { self.left };
+        let col = self.col_at(&metrics, row, from, self.line_len(row), press.x);
+        self.extend_to((row, col));
+        true
+    }
+
     fn draw_text(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
         let p = ctx.palette;
         let metrics = self.metrics(ctx, plan);
@@ -1859,6 +2024,37 @@ impl App for Editor {
         true
     }
 
+    fn click_with(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32, mods: i32) -> bool {
+        self.click_mods = mods;
+        let handled = self.click(area, ctx, x, y);
+        self.click_mods = 0;
+        handled
+    }
+
+    /// Мышь тянет выделение (24.11).
+    fn drag(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        let Some(press) = self.press.as_mut() else {
+            return false;
+        };
+        (press.area, press.ctx, press.x, press.y) = (area, ctx, x, y);
+        let plan = Plan::new(ctx, area);
+        let pos = self.pos_at(ctx, &plan, x, y);
+        let before = (self.anchor, self.row, self.col);
+        self.extend_to(pos);
+        self.follow();
+        before != (self.anchor, self.row, self.col)
+    }
+
+    fn release(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
+        if self.press.take().is_none() {
+            return false;
+        }
+        if let Some(text) = self.selected_text() {
+            println(&format!("notepad: {} char(s) selected by the mouse", text.chars().count()));
+        }
+        true
+    }
+
     fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = Plan::new(ctx, area);
         if self.font_dialog.is_some() {
@@ -1914,14 +2110,8 @@ impl App for Editor {
             return self.find_click(ctx, &plan, x);
         }
         if plan.text.contains(x, y) {
-            let metrics = self.metrics(ctx, &plan);
             // Экранная строка под точкой — из раскладки последней отрисовки.
-            let hit = self.screen_map.borrow().iter().rev().find(|(_, _, _, top)| y >= *top).copied();
-            let (row, col) = match hit {
-                Some((row, from, to, _)) => (row, self.col_at(&metrics, row, from, to, x)),
-                None => (self.top, 0),
-            };
-            self.move_caret(row, col, false);
+            self.press_text(area, ctx, &plan, x, y);
             return true;
         }
         false
@@ -1949,6 +2139,9 @@ impl App for Editor {
 
     /// Ответ окна выбора файла (`/bin/filedlg`) — не дожидаясь его.
     fn step(&mut self) -> bool {
+        if self.drag_scroll() {
+            return true;
+        }
         let Some(outcome) = self.dialog.as_mut().and_then(Dialog::poll) else {
             return false;
         };

@@ -163,6 +163,8 @@ pub enum Action {
     Compress,
     Cut,
     Copy,
+    /// Вставить файлы из буфера обмена на стол (24.11).
+    Paste,
     /// Меню вкладки терминала (20.11): переименовать её прямо в полосе.
     TabRename,
     /// Закрыть вкладку.
@@ -184,7 +186,7 @@ pub enum Sub {
 
 impl Action {
     /// Все пункты, какие бывают, — по ним считается размер поверхности.
-    const ALL: [Action; 40] = [
+    const ALL: [Action; 41] = [
         Action::TabRename,
         Action::TabClose,
         Action::TabCloseOthers,
@@ -224,6 +226,7 @@ impl Action {
         Action::Compress,
         Action::Cut,
         Action::Copy,
+        Action::Paste,
         Action::RecentHeader,
     ];
 
@@ -240,7 +243,7 @@ impl Action {
     /// Макет 07: вид, сортировка, обновить; «Создать ›»; экран и
     /// персонализация; терминал. Тема — сверх макета, третьей в группе
     /// оформления.
-    pub const ON_DESKTOP: [Action; 8] = [
+    pub const ON_DESKTOP: [Action; 9] = [
         Action::Submenu(Sub::View),
         Action::Submenu(Sub::Sort),
         Action::Refresh,
@@ -249,6 +252,8 @@ impl Action {
         Action::Personalize,
         Action::Theme,
         Action::OpenInTerminal,
+        // В конце (24.11): номера пунктов выше знают сценарии стенда.
+        Action::Paste,
     ];
 
     /// Пункты меню, открытого на файле или каталоге стола.
@@ -383,6 +388,7 @@ impl Action {
             Action::Compress => "Сжать в архив",
             Action::Cut => "Вырезать",
             Action::Copy => "Копировать",
+            Action::Paste => "Вставить",
             Action::TabRename => "Переименовать",
             Action::TabClose => "Закрыть",
             Action::TabCloseOthers => "Закрыть другие",
@@ -412,7 +418,7 @@ impl Action {
             Action::NewFolder | Action::NewTextFile | Action::NewShortcut | Action::Submenu(Sub::New) => 1,
             Action::Theme | Action::DisplaySettings | Action::Personalize => 2,
             Action::Refresh | Action::Submenu(Sub::View) | Action::Submenu(Sub::Sort) => 7,
-            Action::Cut | Action::Copy => 8,
+            Action::Cut | Action::Copy | Action::Paste => 8,
             Action::Compress => 9,
             Action::PinTaskbar | Action::PinStart => 10,
             Action::ChooseProgram => 11,
@@ -469,7 +475,7 @@ impl Action {
             Action::RunAsAdmin => Some(Icon::Shield),
             Action::PinTaskbar | Action::PinStart | Action::PinQuick => None,
             Action::Compress => Some(Icon::Package),
-            Action::Cut | Action::Copy => None,
+            Action::Cut | Action::Copy | Action::Paste => None,
             Action::TabRename => None,
             Action::TabDetach => Some(Icon::Maximize),
             Action::TabClose | Action::TabCloseOthers => Some(Icon::Close),
@@ -482,6 +488,7 @@ impl Action {
         match self {
             Action::Cut => Some(Fi::Cut),
             Action::Copy => Some(Fi::Copy),
+            Action::Paste => Some(Fi::Paste),
             Action::Rename | Action::TabRename => Some(Fi::Rename),
             Action::Delete | Action::EmptyTrash | Action::DeleteShortcut => Some(Fi::Trash),
             Action::PinTaskbar | Action::PinStart | Action::PinQuick => Some(Fi::Pin),
@@ -503,6 +510,7 @@ impl Action {
             Action::Delete => Some("Del"),
             Action::Cut => Some("Ctrl+X"),
             Action::Copy => Some("Ctrl+C"),
+            Action::Paste => Some("Ctrl+V"),
             Action::Properties => Some("Alt+Enter"),
             _ => None,
         }
@@ -523,8 +531,6 @@ impl Action {
                 | Action::PinStart
                 | Action::PinQuick
                 | Action::Compress
-                | Action::Cut
-                | Action::Copy
                 | Action::RecentHeader
         )
     }

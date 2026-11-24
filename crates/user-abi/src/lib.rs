@@ -1592,6 +1592,17 @@ pub const SYS_CLIPBOARD: usize = 85;
 pub const CLIP_SET: usize = 1;
 /// [`SYS_CLIPBOARD`]: забрать.
 pub const CLIP_GET: usize = 2;
+/// [`SYS_CLIPBOARD`] (24.11): положить список файлов — `c` (копировать) или
+/// `m` (вырезать, вставка переносит), перевод строки, полные пути по одному
+/// в строке. Текстом буфера становятся пути; Wayland получает
+/// `text/uri-list`. Пустые пути — ошибка.
+pub const CLIP_SET_FILES: usize = 3;
+/// [`SYS_CLIPBOARD`] (24.11): забрать список файлов в той же форме; ответ —
+/// длина, ноль — файлов в буфере нет (там текст или пусто).
+pub const CLIP_GET_FILES: usize = 4;
+/// [`SYS_CLIPBOARD`] (24.11): номер изменения буфера (растёт при каждом) —
+/// без копирования содержимого.
+pub const CLIP_SEQ: usize = 5;
 /// Самый длинный текст буфера обмена.
 pub const CLIP_MAX: usize = 4 * 1024 * 1024;
 

@@ -1382,20 +1382,40 @@ impl Files {
         if paths.is_empty() {
             return false;
         }
-        let _ = clipboard_set(&paths.join("\n"));
+        // Общий буфер обмена системы (24.11): списком файлов — его видят
+        // другие окна «Файлов», стол и программы Wine (`text/uri-list`);
+        // текстом — пути (в Блокнот вставятся они).
+        if !user_progs::clipboard_set_files(&paths, cut) {
+            self.note = Some(String::from("Не удалось положить в буфер обмена"));
+            return true;
+        }
         println(&format!("files: {} {} item(s)", if cut { "cut" } else { "copied" }, paths.len()));
         self.note = Some(format!("{}: объектов {}", if cut { "Вырезано" } else { "Скопировано" }, paths.len()));
-        self.clip = Some((paths, cut));
         true
     }
 
-    /// Вставить из буфера «Файлов» в открытую папку.
+    /// Вставить файлы из буфера обмена системы в открытую папку.
     fn paste(&mut self) -> bool {
         if self.on_computer() {
             return false;
         }
         let dir = self.path.clone();
-        self.paste_into(dir)
+        if self.job.is_some() {
+            return false;
+        }
+        let Some((paths, cut)) = user_progs::clipboard_get_files() else {
+            self.note = Some(String::from("В буфере обмена нет файлов: сначала «Копировать» или «Вырезать»"));
+            return true;
+        };
+        println(&format!("files: pasting {} item(s) from the clipboard{}", paths.len(), if cut { " (cut)" } else { "" }));
+        self.clip = Some((paths, cut));
+        let done = self.paste_into(dir);
+        self.clip = None;
+        // Вырезанное перенесено — в буфере его больше нет (как в Windows).
+        if cut {
+            let _ = clipboard_set("");
+        }
+        done
     }
 
     /// Вставить буфер «Файлов» в папку `dir`.
@@ -3037,6 +3057,11 @@ impl Files {
 
     /// Указатель с зажатой кнопкой: тянуть строку, подсветить папку под ним.
     fn on_drag(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        // Выделение мышью в поле адреса (24.11).
+        if self.address.as_ref().is_some_and(Line::held) {
+            let text = address_text(ctx, &layout(ctx, area));
+            return self.address.as_mut().is_some_and(|line| line.drag(ctx.face(Role::Body), text.w, x - text.x));
+        }
         if self.tab_drag.is_some() {
             return self.drag_tab(ctx, area, x, y);
         }
@@ -3194,6 +3219,10 @@ impl Files {
     /// папке — перенести или скопировать туда, за окном — предложить
     /// другому окну «Файлов».
     fn on_release(&mut self) -> bool {
+        if let Some(line) = self.address.as_mut().filter(|line| line.held()) {
+            line.release();
+            return true;
+        }
         if self.col_drag.take().is_some() {
             println(&format!("files: columns {},{},{}", self.cols[0], self.cols[1], self.cols[2]));
             self.save_settings();
@@ -4093,7 +4122,7 @@ impl Files {
                 let has_target = !self.targets().is_empty() && !self.on_computer();
                 let enabled = match command {
                     Command::Rename | Command::Delete | Command::Cut | Command::Copy => has_target,
-                    Command::Paste => self.clip.is_some() && !self.on_computer(),
+                    Command::Paste => !self.on_computer() && user_progs::clipboard_get_files().is_some(),
                     Command::NewFolder => !self.on_computer(),
                     _ => true,
                 };
@@ -5485,6 +5514,14 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // ядро, — это и есть единственный допустимый источник по контракту `Args`.
     let args = unsafe { Args::new(argc, argv) };
 
+    // `files --paste DIR` (24.11): файлы из буфера обмена — в DIR без окна.
+    // Так вставляет стол (Ctrl+V, «Вставить»): копирование идёт отдельной
+    // задачей и стол не держит.
+    if args.get(1) == Some("--paste") {
+        let dir = (2..args.len()).filter_map(|index| args.get(index)).collect::<Vec<_>>().join(" ");
+        user_progs::exit(paste_headless(dir));
+    }
+
     // Графика, формат точки и тема — у каркаса (`user_progs::app`, фаза С8).
     let info = app::start(&SPEC);
     // Путь с пробелом («Новая папка») приезжает несколькими аргументами:
@@ -5509,6 +5546,30 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         view.report();
         view
     })
+}
+
+/// Вставить файлы из буфера обмена в `dir` без окна (`files --paste`).
+/// Код выхода — ноль, если всё перенесено или скопировано.
+fn paste_headless(dir: String) -> i64 {
+    if dir.is_empty() {
+        println("files: --paste needs a folder");
+        return 2;
+    }
+    let mut view = Files::new(dir.clone(), home_dir());
+    if user_progs::clipboard_get_files().is_none() {
+        println("files: paste: no files on the clipboard");
+        return 1;
+    }
+    view.paste();
+    while view.job.is_some() {
+        view.copy_step();
+        if let Some(error) = view.job.as_ref().and_then(|job| job.error.clone()) {
+            println(&format!("files: paste into {dir} failed: {error}"));
+            view.cancel_copy();
+            return 1;
+        }
+    }
+    0
 }
 
 /// Окно и цикл — у каркаса; здесь только то, чем «Файлы» отвечают на ввод.

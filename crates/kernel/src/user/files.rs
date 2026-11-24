@@ -221,6 +221,35 @@ impl Handle {
     pub fn of_node(node: Arc<dyn Node>, writable: bool) -> Self {
         Self(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), pos: crate::sync::Mutex::new(()), writable, entries: None, append: AtomicBool::new(false), ofd_locked: AtomicBool::new(false), path: None, wrote: AtomicBool::new(false) })))
     }
+
+    /// The write end of a kernel pipe as a descriptor for a program (a
+    /// blocking one, like a Linux `pipe`): the Wayland server hands it to the
+    /// owner of the selection with `wl_data_source.send` and reads the other
+    /// end itself (clipboard bridge, 24.11.2026).
+    #[must_use]
+    pub fn of_pipe_write(writer: pipe::Writer) -> Self {
+        Self(Slot::PipeWrite(writer, Mode::new(false)))
+    }
+
+    /// Write into this descriptor from the kernel without waiting (the
+    /// Wayland server writing the clipboard to a client's pipe). `Ok(n)` -
+    /// written; `Err(true)` - full right now; `Err(false)` - the reader is gone
+    /// or the descriptor cannot be written this way.
+    pub fn write_now(&self, data: &[u8]) -> Result<usize, bool> {
+        match &self.0 {
+            Slot::PipeWrite(writer, _) => match writer.write(data, false) {
+                Ok(n) => Ok(n),
+                Err(pipe::PipeError::WouldBlock) => Err(true),
+                Err(_) => Err(false),
+            },
+            Slot::Object(object, _) => match object.write(data) {
+                Ok(n) => Ok(n),
+                Err(code) if code == -11 => Err(true),
+                Err(_) => Err(false),
+            },
+            _ => Err(false),
+        }
+    }
 }
 
 /// `read`/`write` of regular files without the process lock (21.11.2026,

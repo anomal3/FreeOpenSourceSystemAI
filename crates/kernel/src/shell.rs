@@ -1182,6 +1182,9 @@ fn run_builtin(line: &str) -> bool {
             crate::user::trace::set(argument);
             sprintln!("  lxtrace: {}", if argument.is_empty() || argument == "off" { "off" } else { argument });
         }
+        // System clipboard (24.11): `clip` - show it, `clip set TEXT`,
+        // `clip files PATH...` (copied files), `clip cut PATH...`.
+        "clip" => clip_command(argument),
         // Запросы и события сервера Wayland — в серийную линию (`on`/`off`).
         #[cfg(target_arch = "x86_64")]
         "wltrace" => {
@@ -3130,6 +3133,32 @@ fn run_program(argument: &str) {
             }
         }
         Err(err) => sprintln!("  {path}: {err}"),
+    }
+}
+
+/// `clip`: the system clipboard (24.11) - show, set text, set files.
+fn clip_command(argument: &str) {
+    let (verb, rest) = argument.split_once(' ').unwrap_or((argument, ""));
+    match verb {
+        "" => {
+            let text = crate::ui::clipboard::text();
+            let shown: String = text.chars().take(200).map(|ch| if ch == '\n' { '|' } else { ch }).collect();
+            sprintln!("  clip text: {shown} ({} chars)", text.chars().count());
+            match crate::ui::clipboard::files() {
+                Some((files, cut)) => sprintln!("  clip files: {} ({}){}", files.join(" "), files.len(), if cut { " cut" } else { "" }),
+                None => sprintln!("  clip files: none"),
+            }
+        }
+        "set" => {
+            crate::ui::set_clipboard(String::from(rest));
+            sprintln!("  clip: text set ({} chars)", rest.chars().count());
+        }
+        "files" | "cut" => {
+            let paths: alloc::vec::Vec<String> = rest.split_whitespace().map(String::from).collect();
+            sprintln!("  clip: {} file(s) {}", paths.len(), if verb == "cut" { "cut" } else { "copied" });
+            crate::ui::clipboard::set_files(paths, verb == "cut");
+        }
+        _ => sprintln!("  usage: clip | clip set TEXT | clip files PATH... | clip cut PATH..."),
     }
 }
 

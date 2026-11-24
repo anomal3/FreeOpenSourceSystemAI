@@ -44,6 +44,7 @@
 // от ядра у них не было ни одной, так что переезд свёлся к переносу двух файлов.
 pub mod appicon;
 pub mod capture;
+pub mod clipboard;
 pub mod compositor;
 pub mod context;
 pub mod deskcfg;
@@ -491,19 +492,16 @@ fn hover_context(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
     }
 }
 
-/// Буфер обмена стола (терминал T5): Ctrl+Shift+C в терминале кладёт сюда
-/// выделенное, Ctrl+Shift+V и правая кнопка — набирают его.
-static CLIPBOARD: SpinLock<String> = SpinLock::new(String::new());
-
-/// Текст буфера обмена — копией (`SYS_CLIPBOARD`).
+/// Текст буфера обмена — копией (`SYS_CLIPBOARD`). Буфер один на систему,
+/// с Wayland вместе (24.11, [`clipboard`]).
 #[must_use]
 pub fn clipboard() -> String {
-    CLIPBOARD.lock().clone()
+    clipboard::text()
 }
 
 /// Положить текст в буфер обмена (`SYS_CLIPBOARD`).
 pub fn set_clipboard(text: String) {
-    *CLIPBOARD.lock() = text;
+    clipboard::set_text(text);
 }
 
 /// Левую кнопку нажали в терминале и держат: движение мыши тянет выделение.
@@ -2611,6 +2609,23 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
             }
         }
     }
+    // Ctrl+C / Ctrl+X / Ctrl+V на столе (24.11): значки — в буфер обмена
+    // системы, файлы из него — в каталог стола.
+    if DESK_FOCUS.load(Ordering::Relaxed)
+        && event.mods.contains(Modifiers::CTRL)
+        && !event.mods.contains(Modifiers::SHIFT)
+        && !event.mods.contains(Modifiers::ALT)
+        && !desktop.context_open()
+        && !desktop.menu_open()
+        && matches!(event.code, KeyCode::C | KeyCode::X | KeyCode::V)
+    {
+        if event.code == KeyCode::V {
+            desktop_paste();
+        } else {
+            desktop_to_clipboard(desktop, event.code == KeyCode::X);
+        }
+        return None;
+    }
 
     // Ctrl+Shift+Esc - диспетчер задач откуда угодно, как в Windows (20.11):
     // открытый поднимается, а не открывается второй.
@@ -3273,7 +3288,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                         } else {
                             window.term_clear_selection();
                             kprintln!("  terminal    : copied {} chars", selection.chars().count());
-                            *CLIPBOARD.lock() = selection;
+                            clipboard::set_text(selection);
                         }
                     } else if window.is_program() && (!window.fit || window.on_pixels(x, y)) {
                         let local = window.program_local(x, y);
@@ -3352,6 +3367,10 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
             // «Пуска» (20.11).
             if items.contains(&context::Action::PinTaskbar) {
                 desktop.context_set_off(alloc::vec![context::Action::PinTaskbar]);
+            }
+            // «Вставить» — серым, пока в буфере обмена нет файлов (24.11).
+            if items.contains(&context::Action::Paste) && clipboard::files().is_none() {
+                desktop.context_set_off(alloc::vec![context::Action::Paste]);
             }
             // Печатается **место, куда меню встало**, а не точка щелчка: у
             // края экрана оно сдвигается, чтобы не выехать, и стенд, целящийся
@@ -4496,7 +4515,7 @@ fn terminal_key(desktop: &mut Compositor, event: KeyEvent) -> bool {
         if !selection.is_empty() {
             window.term_clear_selection();
             kprintln!("  terminal    : copied {} chars", selection.chars().count());
-            *CLIPBOARD.lock() = selection;
+            clipboard::set_text(selection);
         }
         desktop.present();
         return true;
@@ -4536,8 +4555,7 @@ fn log_terminal_view(window: &Window) {
 /// Переводы строк становятся пробелами: вставка не должна запускать команды,
 /// которых человек не видел.
 fn paste_clipboard() {
-    let text: String = CLIPBOARD
-        .lock()
+    let text: String = clipboard::text()
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .take(PASTE_LIMIT)
@@ -5700,9 +5718,18 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         | context::Action::RunAsAdmin
         | context::Action::PinStart
         | context::Action::PinQuick
-        | context::Action::Compress
-        | context::Action::Cut
-        | context::Action::Copy => {}
+        | context::Action::Compress => {}
+        // Буфер обмена системы (24.11): значки стола — списком файлов.
+        context::Action::Cut | context::Action::Copy => {
+            desktop.close_context();
+            desktop_to_clipboard(desktop, action == context::Action::Cut);
+            desktop.refresh_panel(status);
+        }
+        context::Action::Paste => {
+            desktop.close_context();
+            desktop_paste();
+            desktop.refresh_panel(status);
+        }
         context::Action::Personalize => {
             desktop.close_context();
             // Как в Windows: «Персонализация» открывается на «Фоне» (22.11).
@@ -6160,6 +6187,41 @@ fn selected_entries(desktop: &Compositor) -> alloc::vec::Vec<(String, String)> {
         .filter(|index| matches!(desktop.icon_kind(*index), Some(icons::Kind::Folder | icons::Kind::File)))
         .filter_map(|index| Some((desktop.icon_path(index)?, desktop.icon_label(index)?)))
         .collect()
+}
+
+/// Выделенные значки стола (файлы, каталоги) — в буфер обмена системы
+/// списком файлов (24.11): «Вставить» в «Файлах», на столе, в Wine.
+fn desktop_to_clipboard(desktop: &mut Compositor, cut: bool) {
+    let mut paths: alloc::vec::Vec<String> = selected_entries(desktop).into_iter().map(|(path, _)| path).collect();
+    if paths.is_empty() {
+        if let Some((path, _)) = selected_entry(desktop) {
+            if desktop.icon_selection().is_some_and(|index| matches!(desktop.icon_kind(index), Some(icons::Kind::Folder | icons::Kind::File))) {
+                paths.push(path);
+            }
+        }
+    }
+    if paths.is_empty() {
+        return;
+    }
+    kprintln!("  desktop     : {} {} item(s) to the clipboard", if cut { "cut" } else { "copied" }, paths.len());
+    clipboard::set_files(paths, cut);
+}
+
+/// Файлы из буфера обмена — в каталог стола (24.11). Копирует «Файлы» без
+/// окна (`files --paste`): большой файл не держит стол, а значки появятся
+/// сами — каталог стола наблюдается.
+fn desktop_paste() {
+    let Some((paths, cut)) = clipboard::files() else {
+        kprintln!("  desktop     : paste: no files on the clipboard");
+        return;
+    };
+    let dir = context::desktop_dir();
+    let _ = context::ensure_dir(&dir);
+    let command = alloc::format!("/bin/files --paste {dir}");
+    match crate::user::spawn(&command, crate::user::session::credentials()) {
+        Ok(_) => kprintln!("  desktop     : pasting {} item(s){} into {dir}", paths.len(), if cut { " (cut)" } else { "" }),
+        Err(err) => kprintln!("  desktop     : cannot paste: {err}"),
+    }
 }
 
 /// Что выбрано на столе, если это файл или каталог: путь и подпись.

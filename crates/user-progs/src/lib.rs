@@ -1693,10 +1693,53 @@ pub fn clipboard_set(text: &str) -> bool {
 /// Текст буфера обмена стола.
 #[must_use]
 pub fn clipboard_get() -> alloc::string::String {
+    clipboard_read(user_abi::CLIP_GET)
+}
+
+/// Положить в буфер обмена файлы (24.11): `cut` — вырезаны (вставка их
+/// переносит). Текстом буфера становятся пути; программы Wayland (Wine)
+/// видят `text/uri-list`.
+pub fn clipboard_set_files(paths: &[alloc::string::String], cut: bool) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let mut wire = alloc::string::String::from(if cut { "m" } else { "c" });
+    for path in paths {
+        wire.push('\n');
+        wire.push_str(path);
+    }
+    // SAFETY: строка живёт в памяти программы, длина — её собственная.
+    let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, user_abi::CLIP_SET_FILES, wire.as_ptr() as usize, wire.len()) };
+    result == 0
+}
+
+/// Файлы в буфере обмена (24.11): пути и «вырезаны ли». `None` — файлов нет.
+#[must_use]
+pub fn clipboard_get_files() -> Option<(alloc::vec::Vec<alloc::string::String>, bool)> {
+    let wire = clipboard_read(user_abi::CLIP_GET_FILES);
+    let mut lines = wire.split('\n');
+    let cut = match lines.next()? {
+        "m" => true,
+        "c" => false,
+        _ => return None,
+    };
+    let paths: alloc::vec::Vec<alloc::string::String> = lines.filter(|line| !line.is_empty()).map(alloc::string::String::from).collect();
+    (!paths.is_empty()).then_some((paths, cut))
+}
+
+/// Номер изменения буфера обмена (растёт при каждом, 24.11).
+#[must_use]
+pub fn clipboard_seq() -> u32 {
+    // SAFETY: без памяти программы.
+    let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, user_abi::CLIP_SEQ, 0, 0) };
+    if result < 0 { 0 } else { result as u32 }
+}
+
+fn clipboard_read(action: usize) -> alloc::string::String {
     let mut buffer = alloc::vec![0u8; 4096];
     loop {
         // SAFETY: буфер живёт в памяти программы, длина — его собственная.
-        let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, user_abi::CLIP_GET, buffer.as_mut_ptr() as usize, buffer.len()) };
+        let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, action, buffer.as_mut_ptr() as usize, buffer.len()) };
         if result < 0 {
             return alloc::string::String::new();
         }

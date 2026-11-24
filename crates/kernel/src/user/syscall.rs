@@ -1367,7 +1367,7 @@ fn live_keys(ptr: usize, len: usize) -> i64 {
 /// `SYS_CLIPBOARD`: положить текст в буфер обмена стола или забрать его.
 fn clipboard(action: usize, ptr: usize, len: usize) -> i64 {
     match action {
-        user_abi::CLIP_SET => {
+        user_abi::CLIP_SET | user_abi::CLIP_SET_FILES => {
             if len > user_abi::CLIP_MAX || (len > 0 && !space::user_can(ptr, len, PageFlags::READ)) {
                 return ERR_BAD_ADDRESS;
             }
@@ -1379,11 +1379,21 @@ fn clipboard(action: usize, ptr: usize, len: usize) -> i64 {
             let Ok(text) = core::str::from_utf8(bytes) else {
                 return ERR_BAD_PATH;
             };
+            if action == user_abi::CLIP_SET_FILES {
+                return match crate::ui::clipboard::parse_files_wire(text) {
+                    Some((paths, cut)) if !paths.is_empty() => {
+                        crate::ui::clipboard::set_files(paths, cut);
+                        0
+                    }
+                    _ => ERR_BAD_PATH,
+                };
+            }
             crate::ui::set_clipboard(alloc::string::String::from(text));
             0
         }
-        user_abi::CLIP_GET => {
-            let text = crate::ui::clipboard();
+        user_abi::CLIP_SEQ => i64::from(crate::ui::clipboard::seq()),
+        user_abi::CLIP_GET | user_abi::CLIP_GET_FILES => {
+            let text = if action == user_abi::CLIP_GET { crate::ui::clipboard() } else { crate::ui::clipboard::files_wire() };
             let count = text.len().min(len);
             if count > 0 {
                 if !space::user_can(ptr, count, PageFlags::WRITE) {
