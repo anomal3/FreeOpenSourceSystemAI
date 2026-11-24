@@ -125,7 +125,10 @@ fn graceful(restart: bool) {
         sched::sleep_ms(80);
     }
 
+    // The Linux layer exists on x86_64 only.
+    #[cfg(target_arch = "x86_64")]
     let pids = crate::user::linux_processes();
+    #[cfg(target_arch = "x86_64")]
     if !pids.is_empty() {
         for pid in &pids {
             // SIGTERM.
