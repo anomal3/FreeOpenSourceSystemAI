@@ -28,6 +28,10 @@ pub(super) struct NetLoad {
 pub(super) struct NetLogin {
     task: i64,
     path: String,
+    /// `netlogon` has closed. A refusal of the same folder after that is
+    /// said, not asked again: `netlogon` answers 0 also on its cancel, and
+    /// asking anew would bring the window back for ever.
+    closed: bool,
 }
 
 /// Biggest answer file of the child (1024 rows of a long name).
@@ -130,6 +134,10 @@ impl Files {
             return;
         }
         self.net_load = None;
+        // The account asked for another folder no longer matters.
+        if self.net_login.as_ref().is_some_and(|login| login.closed && login.path != self.path) {
+            self.net_login = None;
+        }
         let seq = NETLIST_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let out = format!("/tmp/.files-net-{}-{seq}", user_progs::pid());
         let task = spawn(&format!("/bin/files --netlist {out} {}", self.path));
@@ -174,20 +182,26 @@ impl Files {
                 changed = true;
             }
         }
-        if let Some(login) = self.net_login.as_ref() {
-            let code = user_progs::wait_now(login.task);
-            if code != user_abi::ERR_AGAIN {
-                let login = self.net_login.take().expect("checked above");
-                println(&format!("files: netlogon for {} closed with {code}", login.path));
-                if login.path == self.path {
-                    if code == 0 {
-                        self.reload();
-                    } else {
-                        self.error = Some(format!("Нет доступа к {}: вход отменён", net_title(&login.path)));
-                    }
-                }
-                changed = true;
+        let finished = match self.net_login.as_mut().filter(|login| !login.closed) {
+            Some(login) => {
+                let code = user_progs::wait_now(login.task);
+                (code != user_abi::ERR_AGAIN).then(|| {
+                    login.closed = true;
+                    (login.path.clone(), code)
+                })
             }
+            None => None,
+        };
+        if let Some((path, code)) = finished {
+            println(&format!("files: netlogon for {path} closed with {code}"));
+            if path == self.path {
+                if code == 0 {
+                    self.reload();
+                } else {
+                    self.error = Some(format!("Нет доступа к {}: вход отменён", net_title(&path)));
+                }
+            }
+            changed = true;
         }
         changed
     }
@@ -195,11 +209,17 @@ impl Files {
     /// A network folder refused: a password is asked once (`netlogon`),
     /// anything else is said in words.
     fn net_refused(&mut self, code: i64) {
-        if code == user_abi::ERR_PERMISSION && self.net_login.is_none() {
+        if code == user_abi::ERR_PERMISSION {
+            if self.net_login.as_ref().is_some_and(|login| login.path == self.path) {
+                // Asked already and still refused: cancelled (or closed).
+                println(&format!("files: {} still refused after netlogon", self.path));
+                self.error = Some(format!("Нет доступа к {}: вход отменён", net_title(&self.path)));
+                return;
+            }
             let task = spawn(&format!("/bin/netlogon {}", self.path));
             if task >= 0 {
                 println(&format!("files: {} wants an account; netlogon is task {task}", self.path));
-                self.net_login = Some(NetLogin { task, path: self.path.clone() });
+                self.net_login = Some(NetLogin { task, path: self.path.clone(), closed: false });
                 return;
             }
         }
@@ -218,7 +238,7 @@ impl Files {
         if !is_net(&self.path) || self.error.is_some() {
             return false;
         }
-        let (title, hint) = if self.net_login.is_some() {
+        let (title, hint) = if self.net_login.as_ref().is_some_and(|login| !login.closed) {
             (format!("Вход в {}…", net_title(&self.path)), String::from("Введите имя и пароль в окне «Безопасность FossAi»"))
         } else if self.net_load.is_some() {
             if self.path == sysconf::winpath::NET {

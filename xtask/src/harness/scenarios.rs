@@ -20945,6 +20945,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await("settings", 15_000),
             Step::Wait(2_000),
             Step::Shot("05-sharing-settings"),
+            // Serial lines go to the focused window: close the settings.
+            Step::Key("alt-f4"),
+            Step::Wait(1_000),
             // «Файлы» (24.11): «Сеть» — the computers found; folders under
             // `/net` are read in the background; the address takes
             // `\\host\share`; a refusal brings the credentials window.
@@ -20972,7 +20975,10 @@ pub const ALL: &[Scenario] = &[
             Step::Shot("08-files-asks-password"),
             Step::Key("esc"),
             Step::Await("files: netlogon for /net/10.0.2.2 closed with", 15_000),
-            Step::Wait(1_500),
+            // netlogon answers 0 on its cancel too: the folder is read once
+            // more and its refusal is said, not asked again.
+            Step::Await("files: /net/10.0.2.2 still refused after netlogon", 30_000),
+            Step::Wait(1_000),
             Step::Shot("09-files-cancelled"),
             Step::Key("ctrl-l"),
             Step::Type("computer:"),
