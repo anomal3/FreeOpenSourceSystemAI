@@ -18150,3 +18150,74 @@ EGL_BAD_PARAMETER»: без вендора EGL glvnd WebKit 2.52 не живёт
   сразу после «install media» (и у сценария Proton) - отдельно разобрать.
 - Проверка: `set FOSSAI_WITH_RUPOR=1` и `cargo xtask thirdparty --only rupor`,
   затем `cargo xtask test -r -a x86_64 -s install,rupor-linux -j 1`.
+
+## Геймпады в играх Proton (24.11, Роман: «нет геймпада ни в одной игре Wine») - **сделано в QEMU, проверить на железе**
+
+**Почему не было.** Ядро не поднимало геймпад вовсе: у пада Xbox интерфейс
+производителя (класс 0xFF), а не HID, а HID-геймпад (DualShock 4, DualSense,
+простые DirectInput-пады) ядро считало «nothing the kernel can use» и бросало.
+В пакете Proton не было `winebus.so` (`SKIP_UNIX`), так что `winebus.sys` не
+работал, а без него у Wine нет ни XInput, ни DirectInput-джойстиков.
+
+**Как сделано.**
+- `crates/usb-hid`: `GamepadMap` - разбор дескриптора отчётов коллекций
+  Joystick/Gamepad/Multi-axis (оси X..Dial, газ/тормоз, шляпка, до 32 кнопок);
+  `pad.rs` - одно состояние для всех падов (`PadState`, раскладка Xbox 360 /
+  Linux `xpad`) и разбор отчётов Xbox 360 (проводной и приёмник беспроводных),
+  Xbox One/Series (GIP: «power on» и пакеты инициализации `xpad` по VID/PID,
+  Guide отдельным сообщением с подтверждением). Тесты на хосте: дескриптор
+  DualShock 4, простой пад, джойстик, отчёты 360 и GIP (`cargo test -p usb-hid`).
+- Ядро: `usb/gamepad.rs` - список падов (до 8), `Reader::Gamepad` для HID и
+  Xbox; xHCI поднимает интерфейс Xbox (`find_xbox`), его interrupt OUT
+  (`add_out_endpoint`) и шлёт туда пакеты пада (инициализация GIP, светодиод
+  360, ответы на Guide). HID-пады работают и на EHCI/OHCI (по дескриптору),
+  Xbox-пады - только на xHCI.
+- Слой Linux: `linux/evdev.rs` - каждый пад как `/dev/input/eventN`
+  «Microsoft X-Box 360 pad N» 28de:11ff, то есть виртуальный геймпад Steam
+  Input: в GE-Proton11 `winebus.sys` без SDL берёт из evdev только его
+  (`bus_udev.c`: остальные «deferred to a different backend») и делает из него
+  геймпад XInput. ioctl evdev, `poll`/`read` `input_event`, sysfs для libudev
+  (`/sys/class/input`, `/sys/devices/virtual/input/inputN/eventN`, `uevent`
+  с `ID_INPUT_JOYSTICK`, ссылки `subsystem`), `statfs` каталогов `/sys` -
+  `SYSFS_MAGIC` (иначе libudev 252 отказывает: `fd_is_fs_type`), `inotify`
+  на `/dev/input` (воткнули/выдернули на ходу). Пока пада нет, sysfs не
+  меняется вовсе.
+- Proton: `winebus.so` и `libudev1` в пакете, `fossai-proton` ставит
+  `PROTON_SPOOF_STEAMINPUT_VIDPID=1` - игра видит «Controller (XBOX 360 For
+  Windows)» 045e:028e.
+- Своё: команда `gamepad` (пады и их состояние; `gamepad log on` - каждое
+  изменение в журнал; `gamepad trace on` - что программы спрашивают у
+  `/dev/input` и его sysfs; `gamepad fake …` - пробный пад без железа),
+  группа «Игровые контроллеры» в «Параметры → USB-устройства», «Игровой
+  контроллер USB» в диспетчере устройств.
+
+**Поддержано:** Xbox 360 (проводной и совместимые «XInput»-пады: 8BitDo,
+Logitech F310/F710 в режиме X, PowerA ...), приёмник беспроводных Xbox 360
+(первый пад), Xbox One/Series по кабелю, DualShock 4, DualSense (USB), любые
+HID-геймпады и джойстики (кнопки как у DualShock/Logitech в режиме D: 1 X,
+2 A, 3 B, 4 Y, 5 LB, 6 RB, 7/8 курки, 9 Back, 10 Start, 11/12 стики, 13 Guide).
+
+**Проверено в QEMU** (настоящего геймпада у QEMU нет): `gamepad` (живой
+образ, `evdevprobe`: ioctl, sysfs как у libudev, событие A, отключение с
+`IN_DELETE`), `proton-gamepad` (после `install` с `FOSSAI_WITH_PROTON=1`
+`FOSSAI_TARGET_MIB=32768`): `d3dprobe.exe pad` видит пробный пад в
+DirectInput («Controller (XBOX 360 For Windows)») и в XInput (слот 0):
+кнопка A, стики (Y перевёрнут как у XUSB), курок, крестовина, отключение.
+
+**Что смотреть на железе (журнал).** При втыкании:
+`usb : Xbox 360 pad 045e:028e, interface 0, endpoint 1 IN (32-byte), OUT 2`
+(у HID - `report descriptor N bytes: gamepad, 6 axes, 14 buttons, hat`),
+затем `gamepad : pad 0 connected: … -> /dev/input/event0`. В игре:
+`gamepad : /dev/input/event0 opened by pid N` - Wine взял пад. `gamepad log on`
+в терминале - строка на каждое нажатие (доходят ли отчёты). Xbox One, который
+молчит: нет ли `the pad's OUT endpoint N failed`. Wine не видит пад -
+`gamepad trace on` до запуска игры.
+
+**Не сделано (TODO).** Вибрация (EV_FF -> пакет rumble 360/GIP; пакеты уже
+есть: `x360_rumble`, `gip_rumble`); hidraw для DualShock/DualSense (нативные
+отчёты для игр с библиотекой Sony, гироскоп, сенсор); Xbox-пады на EHCI/OHCI
+и 2-4-й пады приёмника 360; беспроводной адаптер Xbox One (нужна прошивка,
+как у `xone`); Switch Pro (рукопожатие по USB); своя раскладка для падов, у
+которых кнопки 1-4 идут в другом порядке; страница-тест с живой картинкой
+пада. Шум: PE-части `wineusb.sys`/`winebth.sys` по-прежнему пишут c0000135
+(их `.so` не кладутся).
