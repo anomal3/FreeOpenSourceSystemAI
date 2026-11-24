@@ -81,6 +81,7 @@ while :; do\n\
         --wined3d) MODE=; shift ;;\n\
         --dxvk) MODE=--dxvk; shift ;;\n\
         --nvk) GPU=nvk; shift ;;\n\
+        --radv) GPU=radv; shift ;;\n\
         --cpu) GPU=cpu; shift ;;\n\
         --720p) SIZE=1280x720; shift ;;\n\
         --1080p) SIZE=1920x1080; shift ;;\n\
@@ -104,12 +105,13 @@ WHY=\n\
 if [ \"$GPU\" = auto ]; then\n\
     if [ \"$FOSSAI_VULKAN\" = lvp ]; then GPU=cpu; WHY=\"FOSSAI_VULKAN=lvp\"\n\
     elif [ ! -e /dev/dri/renderD128 ]; then GPU=cpu; WHY=\"no /dev/dri/renderD128 (GPU driver not attached)\"\n\
+    elif D=$(cat /sys/class/drm/renderD128/device/uevent 2>/dev/null); [ \"${D#*DRIVER=amdgpu}\" != \"$D\" ] && [ -e /opt/proton/share/vulkan/icd.d/radeon_icd.x86_64.json ]; then GPU=radv; WHY=\"AMD render node /dev/dri/renderD128 present\"\n\
     elif [ ! -e /opt/proton/share/vulkan/icd.d/nouveau_icd.x86_64.json ]; then GPU=cpu; WHY=\"no NVK driver in the proton package\"\n\
     else GPU=nvk; WHY=\"render node /dev/dri/renderD128 present\"; fi\n\
 else\n\
     WHY=\"--$GPU given\"\n\
 fi\n\
-if [ \"$GPU\" = nvk ]; then MODE=--dxvk; export FOSSAI_VULKAN=nvk; fi\n\
+if [ \"$GPU\" = nvk ] || [ \"$GPU\" = radv ]; then MODE=--dxvk; export FOSSAI_VULKAN=$GPU; fi\n\
 if [ \"$GPU\" = cpu ] && [ -z \"$MODE\" ]; then export FOSSAI_VULKAN=lvp; fi\n\
 # `+fps` и у DXVK (20.11): Wine 11 считает кадры Vulkan в win32u, а\n\
 # fossai-proton раз в 5 с кладёт сводку в журнал ядра (/dev/kmsg).\n\
@@ -117,7 +119,7 @@ if [ \"$GPU\" = cpu ] && [ -z \"$MODE\" ]; then export FOSSAI_VULKAN=lvp; fi\n\
 export WINEDEBUG=${WINEDEBUG:-fixme-all,+fps}\n\
 A=()\n\
 [ -n \"$SIZE\" ] && A+=(\"--desktop=$SIZE\")\n\
-R=dxvk; [ -z \"$MODE\" ] && R=wined3d; [ \"$GPU\" = nvk ] && R=dxvk-nvk\n\
+R=dxvk; [ -z \"$MODE\" ] && R=wined3d; [ \"$GPU\" = nvk ] && R=dxvk-nvk; [ \"$GPU\" = radv ] && R=dxvk-radv\n\
 [ -n \"$BENCH\" ] && A+=(\"--bench=$BENCH,tmnf $R ${SIZE:-native}\")\n\
 klog \"tmnf: renderer $R ($WHY), Vulkan ${FOSSAI_VULKAN:-auto}, size ${SIZE:-native}\"\n\
 echo \"tmnf: starting TmForever.exe ($R, ${SIZE:-native size})\"\n\

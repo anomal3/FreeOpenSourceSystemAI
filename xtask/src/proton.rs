@@ -1167,7 +1167,7 @@ B=/opt/debian/bin/bash
 X=/opt/proton/share/fossai/d3dprobe.exe
 # Только NVK (fossai-proton читает FOSSAI_VULKAN до разбора `--env=`).
 D=$(cat /sys/class/drm/renderD128/device/uevent 2>/dev/null)
-if [ "${D#*DRIVER=amdgpu}" != "$D" ]; then export FOSSAI_VULKAN=radv; VKNAME=RADV; else export FOSSAI_VULKAN=nvk; VKNAME=NVK; fi
+if [ "${D#*DRIVER=amdgpu}" != "$D" ]; then export FOSSAI_VULKAN=radv; VKNAME=RADV; GPUFLAG=--radv; else export FOSSAI_VULKAN=nvk; VKNAME=NVK; GPUFLAG=--nvk; fi
 NVK=
 WHAT=${1:-all}
 VKFAIL=
@@ -1240,10 +1240,20 @@ case $WHAT in all|d3d)
     # 4. Direct3D 9 (как у TMNF) через DXVK на NVK: 20 с кадров, замер.
     step d3d9-dxvk-nvk 600 $B $P $NVK --bench=20,d3dprobe9-dxvk-nvk --dxvk $X 9 20 ;;
 esac
+case $WHAT in d3d11)
+    # Direct3D 11 через DXVK: 20 с кадров, замер (RADV на AMD; имя ступени - как у NVK).
+    step d3d11-dxvk 600 $B $P $NVK --bench=20,d3dprobe11-dxvk --dxvk $X 11 20 ;;
+esac
+case $WHAT in vsync)
+    # Direct3D 9 без VSync и с ним: без упора в частоту монитора видно, сколько карта успевает рисовать.
+    for vs in off on; do
+        step d3d9-vsync-$vs 600 $B $P --vsync $vs --bench=20,d3dprobe9-vsync-$vs --dxvk $X 9 20
+    done ;;
+esac
 case $WHAT in all|tmnf)
     # 5. TMNF через DXVK на NVK: замер 60 с (`bench:` - к/с), игра снимается.
     if [ -x /opt/tmnf/bin/tmnf ] || [ -f /opt/tmnf/bin/tmnf ]; then
-        step tmnf-nvk 1800 $B /opt/tmnf/bin/tmnf --nvk --bench=60
+        step tmnf-nvk 1800 $B /opt/tmnf/bin/tmnf $GPUFLAG --bench=60
     else
         say "tmnf: package not installed - skipped"
     fi ;;
