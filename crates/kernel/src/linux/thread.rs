@@ -211,11 +211,22 @@ pub fn thread_name(slot: usize) -> Option<alloc::string::String> {
 }
 
 /// `yieldnap N` (hw-log15): a thread that calls `sched_yield` in a tight
-/// loop (64 yields in a row, each within 200 us of the last) sleeps `N` us
-/// before each further yield; 0 - off (default: yield stays advisory and
-/// immediate, as in Linux; turn on to test on hardware whether D2R's
-/// getrusage+yield spinner gives its CPU back without losing frames).
-pub static YIELD_NAP_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// loop ([`YIELD_STREAK_MIN`] yields in a row, each within 200 us of the
+/// last) sleeps `N` us before each further yield; `yieldnap off` (0) - yield
+/// stays advisory and immediate, as in Linux.
+///
+/// On by default since 24.11.2026 (hw-log17): one D2R worker thread made
+/// 4.9-13.9 M `getrusage` and half as many `sched_yield` per 30 s - a whole
+/// CPU plus up to 514 k kick IPIs (every yield with work elsewhere kicks an
+/// idle CPU) and the scheduler-lock traffic that kept `mutex taken spinning`
+/// at 16-26 M. After about half a millisecond of uninterrupted spinning the
+/// thread naps 50 us per yield: ~20 k yields a second instead of ~450 k, and a
+/// spinner waiting for work notices it at most 50 us later.
+pub static YIELD_NAP_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(50);
+/// Rapid yields in a row before the naps start (24.11: 256, was 64 when the
+/// switch was off by default - a short yield burst of a lock handoff never
+/// reaches it).
+const YIELD_STREAK_MIN: u32 = 256;
 static YIELD_STREAK: [core::sync::atomic::AtomicU32; sched::MAX_TASKS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; sched::MAX_TASKS];
 static YIELD_LAST_NS: [core::sync::atomic::AtomicU64; sched::MAX_TASKS] =
@@ -239,7 +250,7 @@ pub fn yield_nap() {
         YIELD_STREAK[slot].store(0, Relaxed);
         0
     };
-    if streak >= 64 && sched::hrsleep::enabled() {
+    if streak >= YIELD_STREAK_MIN && sched::hrsleep::enabled() {
         YIELD_NAPS.fetch_add(1, Relaxed);
         sched::hrsleep::sleep_until_ns(now + nap * 1000, 0, 0, || false);
         YIELD_LAST_NS[slot].store(crate::time::uptime_ns(), Relaxed);
