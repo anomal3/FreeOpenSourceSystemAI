@@ -1185,6 +1185,12 @@ fn run_builtin(line: &str) -> bool {
         // System clipboard (24.11): `clip` - show it, `clip set TEXT`,
         // `clip files PATH...` (copied files), `clip cut PATH...`.
         "clip" => clip_command(argument),
+        // Settings store (24.11): `reg get|set|rm|list|path`.
+        "reg" => {
+            for line in crate::config::registry::shell_command(argument) {
+                sprintln!("{line}");
+            }
+        }
         // Запросы и события сервера Wayland — в серийную линию (`on`/`off`).
         #[cfg(target_arch = "x86_64")]
         "wltrace" => {

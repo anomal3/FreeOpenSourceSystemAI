@@ -225,6 +225,9 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_OPEN_WITH => open_with(a0, a1, a2),
         // 22.11: screen capture for the recorder (`/bin/screenrec`).
         user_abi::SYS_SCREENCAP => crate::ui::capture::syscall(a0, a1, a2),
+        // 24.11: settings store («реестр») and «Только чтение» of «Свойств».
+        user_abi::SYS_REGISTRY => registry(a0, a1, a2),
+        user_abi::SYS_CHMOD => chmod(a0, a1, a2),
         // 05.11.2026: время из сети (SNTP службы `dhcp`).
         user_abi::SYS_SETCLOCK => setclock(a0, a1, a2),
         user_abi::SYS_MODEM => modem(a0, a1, a2),
@@ -1410,6 +1413,96 @@ fn clipboard(action: usize, ptr: usize, len: usize) -> i64 {
 
 /// `SYS_OPEN_WITH` (22.11): программы для файла, их значки, выбор «всегда».
 fn open_with(action: usize, ptr: usize, len: usize) -> i64 {
+/// `SYS_REGISTRY` (24.11): the settings store — see the contract in
+/// `user_abi` and `config::registry`.
+fn registry(action: usize, ptr: usize, len: usize) -> i64 {
+    use crate::config::registry::{self as reg, Scope};
+    let input_len = action >> 32;
+    let action = action & 0xFFFF_FFFF;
+    if action == user_abi::REG_SEQ {
+        return reg::seq() as i64;
+    }
+    if len > (4 << 20) || input_len > len || input_len > 8192 || (len > 0 && !space::user_can(ptr, len, PageFlags::WRITE)) {
+        return ERR_BAD_ADDRESS;
+    }
+    let input = if input_len == 0 { alloc::string::String::new() } else {
+        // SAFETY: диапазон проверен по таблицам программы.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, input_len) };
+        match core::str::from_utf8(bytes) {
+            Ok(text) => alloc::string::String::from(text),
+            Err(_) => return ERR_BAD_PATH,
+        }
+    };
+    let scoped = |text: &str| -> Option<(Scope, alloc::string::String)> {
+        let (scope, rest) = text.split_once('\t')?;
+        Some((Scope::from_word(scope)?, alloc::string::String::from(rest)))
+    };
+    let output: alloc::string::String = match action {
+        user_abi::REG_GET => match reg::get(&input) {
+            Some(value) => value,
+            None => return ERR_NOT_FOUND,
+        },
+        user_abi::REG_GET_IN => {
+            let Some((scope, key)) = scoped(&input) else { return ERR_BAD_PATH };
+            match reg::get_in(scope, &key) {
+                Some(value) => value,
+                None => return ERR_NOT_FOUND,
+            }
+        }
+        user_abi::REG_LIST => {
+            let mut out = alloc::string::String::new();
+            for (key, value) in reg::list(None, &input) {
+                out.push_str(&key);
+                out.push('\t');
+                out.push_str(&value.replace(['\t', '\n'], " "));
+                out.push('\n');
+            }
+            out
+        }
+        user_abi::REG_SET | user_abi::REG_REMOVE => {
+            let Some((scope, rest)) = scoped(&input) else { return ERR_BAD_PATH };
+            if !reg::may_write(super::credentials(), scope) {
+                return ERR_PERMISSION;
+            }
+            let (key, value) = if action == user_abi::REG_SET {
+                match rest.split_once('\t') {
+                    Some((key, value)) => (key, Some(value)),
+                    None => return ERR_BAD_PATH,
+                }
+            } else {
+                (rest.as_str(), None)
+            };
+            return match reg::set(scope, key, value) {
+                Ok(()) => 0,
+                Err(reg::RegError::BadKey) => ERR_BAD_PATH,
+                Err(reg::RegError::Fs(err)) => vfs_errno(err),
+            };
+        }
+        _ => return ERR_UNSUPPORTED,
+    };
+    let bytes = output.as_bytes();
+    let count = bytes.len().min(len);
+    if count > 0 {
+        // SAFETY: диапазон проверен по таблицам программы на запись.
+        unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, count) }.copy_from_slice(&bytes[..count]);
+    }
+    bytes.len() as i64
+}
+
+/// `SYS_CHMOD` (24.11): права файла по пути — владельцу и root.
+fn chmod(ptr: usize, len: usize, mode: usize) -> i64 {
+    let mut buffer = [0u8; MAX_PATH];
+    let path = match copy_path(ptr, len, &mut buffer) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    match crate::fs::chmod_as(super::credentials(), path, (mode & 0o7777) as u16) {
+        Some(Ok(())) => 0,
+        Some(Err(err)) => vfs_errno(err),
+        None => ERR_NO_FILESYSTEM,
+    }
+}
+
     let input_len = action >> 32;
     let action = action & 0xFFFF_FFFF;
     if len > (8 << 20) || input_len > len || input_len > 4096 || (len > 0 && !space::user_can(ptr, len, PageFlags::WRITE)) {

@@ -43,6 +43,7 @@
 extern crate alloc;
 
 pub mod filetypes;
+pub mod store;
 pub mod winpath;
 
 use alloc::format;

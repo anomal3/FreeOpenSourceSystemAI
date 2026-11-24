@@ -15,8 +15,13 @@
 //!
 //! Программа Windows запускается `fossai-proton --with=ПРОГРАММА ФАЙЛ`:
 //! сценарий берёт префикс из пути программы и переводит путь файла в путь
-//! Windows (буква тома из `dosdevices` или `Z:`). Выбор «всегда» хранится
-//! строкой `open_with=` в `desktop.cfg`, как и раньше (`prefs`).
+//! Windows (буква тома из `dosdevices` или `Z:`). Выбор «всегда» с 24.11
+//! хранится в хранилище настроек (`config::registry`): ключ
+//! `filetypes/.ext/default` области пользователя (`~/.config/registry/
+//! filetypes.reg`); прежняя строка `open_with=` в `desktop.cfg` ещё читается.
+//! Умолчания системы — там же, в области `system` и встроенные (OBSOS для
+//! `.html .htm .xhtml .svg .url`); программы, зарегистрированные ключами
+//! `filetypes/.ext/openwith/<id>`, идут в список подходящих.
 //!
 //! «Файлы» (программа) получают тот же список вызовом
 //! [`user_abi::SYS_OPEN_WITH`], значки — картинками FIMG.
@@ -51,6 +56,15 @@ pub struct Handler {
 /// с `%20` вместо пробела: ядро делит строку по пробелам.
 #[must_use]
 pub fn line(command: &str, path: &str) -> String {
+    // Internet shortcut (`.url`, 24.11): a program registered for `.url` (the
+    // browser) gets the address inside, not the file.
+    if path.to_ascii_lowercase().ends_with(".url") && crate::config::registry::registered_programs("url").iter().any(|(_, known)| known == command) {
+        if let Some(Ok((bytes, _))) = crate::fs::read(path, 8192) {
+            if let Some(url) = sysconf::store::url_of_shortcut(&String::from_utf8_lossy(&bytes)).filter(|url| !url.contains(char::is_whitespace)) {
+                return alloc::format!("{command} {url}");
+            }
+        }
+    }
     if command.contains(super::panel::PROTON_SCRIPT) {
         alloc::format!("{command} {}", super::panel::pct(path))
     } else {
@@ -108,6 +122,19 @@ pub fn handlers(path: &str, all: bool) -> Vec<Handler> {
         let apps = super::winapps::scan();
         // Подходящие по реестру префиксов.
         if !ext.is_empty() {
+    // Programs registered in the settings store (24.11, `filetypes/.ext/
+    // openwith/<id>`, see `sysconf::store`): OBSOS for web pages, ports later.
+    if !ext.is_empty() {
+        for (id, command) in crate::config::registry::registered_programs(&ext) {
+            let caption = crate::config::registry::get(&alloc::format!("apps/{id}/caption")).unwrap_or_else(|| caption_of(command.split_whitespace().next().unwrap_or(&command)));
+            let icon = match crate::config::registry::get(&alloc::format!("apps/{id}/icon")) {
+                Some(icon) => alloc::format!("manifest:{icon}"),
+                None => alloc::format!("program:{}", command.split_whitespace().next().unwrap_or("")),
+            };
+            let windows = command.contains(super::panel::PROTON_SCRIPT);
+            push(&mut out, Handler { caption, command, icon, fits: true, chosen: false, windows });
+        }
+    }
             for prefix in super::winapps::prefixes() {
                 for (exe, args) in registered(&prefix, &ext, text) {
                     let app = apps.iter().find(|app| app.target.eq_ignore_ascii_case(&exe));

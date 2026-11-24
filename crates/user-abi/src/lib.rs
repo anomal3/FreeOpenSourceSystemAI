@@ -1811,6 +1811,34 @@ pub const OPENWITH_LIST: usize = 0;
 pub const OPENWITH_ICON: usize = 1;
 pub const OPENWITH_REMEMBER: usize = 2;
 
+/// Settings store, «реестр» (24.11): `(действие | длина_входа << 32, адрес
+/// буфера, длина буфера) -> длина ответа`, buffers as in [`SYS_OPEN_WITH`].
+/// Keys are `hive/path` (`filetypes/.txt/default`, `explorer/show_hidden`;
+/// the list and the file format — `sysconf::store`). A scope word is `user`
+/// or `system`.
+///
+/// * [`REG_GET`] — input `key`; answer: the value (user, else system, else
+///   built in); [`ERR_NOT_FOUND`] — not set.
+/// * [`REG_SET`] — input `scope\tkey\tvalue`; answer 0. The system scope is
+///   root's, the user scope — the session user's (else [`ERR_PERMISSION`]).
+/// * [`REG_REMOVE`] — input `scope\tkey`; answer 0.
+/// * [`REG_LIST`] — input `prefix` (`filetypes/.txt/`); answer: lines
+///   `key\tvalue\n`, merged like [`REG_GET`].
+/// * [`REG_SEQ`] — answer: change counter; it grows with every change, so a
+///   program re-reads its options only when it moved.
+/// * [`REG_GET_IN`] — input `scope\tkey`; the value of one scope only.
+pub const SYS_REGISTRY: usize = 97;
+pub const REG_GET: usize = 0;
+pub const REG_SET: usize = 1;
+pub const REG_REMOVE: usize = 2;
+pub const REG_LIST: usize = 3;
+pub const REG_SEQ: usize = 4;
+pub const REG_GET_IN: usize = 5;
+
+/// Change the rights of a file (24.11, «Свойства → Только чтение»):
+/// `(путь, длина, права) -> 0`. Owner or root, as `chmod`.
+pub const SYS_CHMOD: usize = 98;
+
 /// Screen capture for the recorder (22.11, `/bin/screenrec`):
 /// `(action, a1, a2) -> answer`. One capture at a time on the whole system.
 ///
@@ -3012,6 +3040,7 @@ mod tests {
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
             SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK, SYS_MODEM, SYS_FLOCK,
             SYS_FSWATCH, SYS_OPEN_WITH, SYS_SCREENCAP,
+            SYS_REGISTRY, SYS_CHMOD,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(

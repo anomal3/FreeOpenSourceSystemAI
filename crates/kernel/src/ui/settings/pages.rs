@@ -685,7 +685,7 @@ fn default_apps(pass: &mut Pass, x: i32, y: i32, w: u32) {
         };
         let kind = sysconf::filetypes::kind_of(&format!("file.{ext}"), false);
         let title = format!("{} (.{ext})", kind.name);
-        let note = if super::super::prefs::open_with(ext).is_some() { "выбрано вами" } else { "по умолчанию" };
+        let note = if super::super::prefs::chosen_by_person(ext) { "выбрано вами" } else { "по умолчанию" };
         // Одна программа — менять не на что; несколько — кнопка по кругу.
         y = if choices.len() > 1 {
             row(pass, x, y, w, Some(Fi::Apps), &title, note, Ctl::Button(name, Weight::Normal), Some(Deed::OpenWith(ext)))

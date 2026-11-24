@@ -30,6 +30,9 @@ use alloc::vec::Vec;
 
 use crate::fs;
 
+/// Settings store — keys `hive/path` in memory, a file per hive (24.11).
+pub mod registry;
+
 /// Где лежат правки человека.
 pub const ETC: &str = "/etc";
 

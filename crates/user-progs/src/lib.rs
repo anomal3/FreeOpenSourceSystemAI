@@ -1810,6 +1810,82 @@ pub unsafe fn screencap(action: usize, a1: usize, a2: usize) -> i64 {
     unsafe { syscall(user_abi::SYS_SCREENCAP, action, a1, a2) }
 }
 
+// ---- Settings store, «реестр» (24.11, [`user_abi::SYS_REGISTRY`]) ----------
+//
+// Keys `hive/path`, scopes `user` and `system`; names and the file format —
+// `sysconf::store`. Example (a port registering itself, as root):
+// `reg_set("system", "filetypes/.7z/openwith/7zip", "/opt/7zip/bin/7zfm")`.
+
+/// One call of the store: answer bytes or the error code.
+fn registry_call(action: usize, input: &[u8]) -> Result<alloc::vec::Vec<u8>, i64> {
+    let mut buffer = alloc::vec![0u8; input.len().max(4096)];
+    loop {
+        buffer[..input.len()].copy_from_slice(input);
+        // SAFETY: буфер живёт в памяти программы, длина — его собственная.
+        let result = unsafe { syscall(user_abi::SYS_REGISTRY, action | (input.len() << 32), buffer.as_mut_ptr() as usize, buffer.len()) };
+        if result < 0 {
+            return Err(result);
+        }
+        let total = result as usize;
+        if total <= buffer.len() {
+            buffer.truncate(total);
+            return Ok(buffer);
+        }
+        if total > (4 << 20) {
+            return Err(user_abi::ERR_NO_SPACE);
+        }
+        buffer.resize(total, 0);
+    }
+}
+
+/// Value of `key`: the person's, else the system's, else built in.
+#[must_use]
+pub fn reg_get(key: &str) -> Option<alloc::string::String> {
+    registry_call(user_abi::REG_GET, key.as_bytes()).ok().map(|bytes| alloc::string::String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Value of `key` in one scope (`user` or `system`).
+#[must_use]
+pub fn reg_get_in(scope: &str, key: &str) -> Option<alloc::string::String> {
+    registry_call(user_abi::REG_GET_IN, alloc::format!("{scope}\t{key}").as_bytes()).ok().map(|bytes| alloc::string::String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Set `key` in `scope`; `Err` — the error code (no rights, bad key).
+pub fn reg_set(scope: &str, key: &str, value: &str) -> Result<(), i64> {
+    registry_call(user_abi::REG_SET, alloc::format!("{scope}\t{key}\t{value}").as_bytes()).map(|_| ())
+}
+
+/// Remove `key` from `scope`.
+pub fn reg_remove(scope: &str, key: &str) -> Result<(), i64> {
+    registry_call(user_abi::REG_REMOVE, alloc::format!("{scope}\t{key}").as_bytes()).map(|_| ())
+}
+
+/// Keys under `prefix` with values (merged as [`reg_get`] reads them).
+#[must_use]
+pub fn reg_list(prefix: &str) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
+    let Ok(bytes) = registry_call(user_abi::REG_LIST, prefix.as_bytes()) else {
+        return alloc::vec::Vec::new();
+    };
+    alloc::string::String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(key, value)| (alloc::string::String::from(key), alloc::string::String::from(value))))
+        .collect()
+}
+
+/// Change counter of the store: re-read cached options when it moved.
+#[must_use]
+pub fn reg_seq() -> u64 {
+    // SAFETY: вызов без памяти программы.
+    let result = unsafe { syscall(user_abi::SYS_REGISTRY, user_abi::REG_SEQ, 0, 0) };
+    result.max(0) as u64
+}
+
+/// Rights of a file (`chmod`): owner or root.
+pub fn chmod(path: &str, mode: u32) -> i64 {
+    // SAFETY: путь живёт в памяти программы на время вызова.
+    unsafe { syscall(user_abi::SYS_CHMOD, path.as_ptr() as usize, path.len(), mode as usize) }
+}
+
 /// System sound loopback (23.11, [`user_abi::SOUND_LOOP_READ`]): frames from
 /// `request.from` (or from now, `u64::MAX`) into `out`, 4 bytes a frame.
 /// Answer — frames read (`request` says from which frame and what is now),
