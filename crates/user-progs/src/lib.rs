@@ -1810,18 +1810,6 @@ pub fn open_with_remember(ext: &str, command: &str) -> bool {
     open_with_call(user_abi::OPENWITH_REMEMBER, alloc::format!("{ext}\t{command}").as_bytes()).is_some()
 }
 
-/// Screen capture (22.11, [`user_abi::SYS_SCREENCAP`]): `action` is one of
-/// `CAP_*`, the arguments are as the contract says.
-///
-/// # Safety
-///
-/// Pointers in `a1`/`a2` must point at memory of this program of the size the
-/// action expects (a whole frame for `CAP_GRAB`).
-pub unsafe fn screencap(action: usize, a1: usize, a2: usize) -> i64 {
-    // SAFETY: the caller keeps the contract; the kernel checks the pages.
-    unsafe { syscall(user_abi::SYS_SCREENCAP, action, a1, a2) }
-}
-
 // ---- Settings store, «реестр» (24.11, [`user_abi::SYS_REGISTRY`]) ----------
 //
 // Keys `hive/path`, scopes `user` and `system`; names and the file format —
@@ -1896,6 +1884,18 @@ pub fn reg_seq() -> u64 {
 pub fn chmod(path: &str, mode: u32) -> i64 {
     // SAFETY: путь живёт в памяти программы на время вызова.
     unsafe { syscall(user_abi::SYS_CHMOD, path.as_ptr() as usize, path.len(), mode as usize) }
+}
+
+/// Screen capture (22.11, [`user_abi::SYS_SCREENCAP`]): `action` is one of
+/// `CAP_*`, the arguments are as the contract says.
+///
+/// # Safety
+///
+/// Pointers in `a1`/`a2` must point at memory of this program of the size the
+/// action expects (a whole frame for `CAP_GRAB`).
+pub unsafe fn screencap(action: usize, a1: usize, a2: usize) -> i64 {
+    // SAFETY: the caller keeps the contract; the kernel checks the pages.
+    unsafe { syscall(user_abi::SYS_SCREENCAP, action, a1, a2) }
 }
 
 /// System sound loopback (23.11, [`user_abi::SOUND_LOOP_READ`]): frames from

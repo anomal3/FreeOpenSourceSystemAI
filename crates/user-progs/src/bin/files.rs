@@ -6268,12 +6268,6 @@ impl App for Files {
         if matches!(code, user_abi::WIN_KEY_SHIFT | user_abi::WIN_KEY_ALT) {
             return false;
         }
-        // Меню вкладки: стрелки, Enter, всё прочее закрывает.
-        if let Some((index, x, y, selected)) = self.tab_menu {
-            match code {
-                WIN_KEY_UP => self.tab_menu = Some((index, x, y, selected.saturating_sub(1))),
-                WIN_KEY_DOWN => self.tab_menu = Some((index, x, y, (selected + 1).min(TAB_ENTRIES.len() - 1))),
-                ENTER => return self.run_tab_menu(index, selected),
         self.tip = None;
         // «Параметры папок» (24.11) — модальное окно.
         if self.options.is_some() {
@@ -6287,6 +6281,12 @@ impl App for Files {
         if code == user_abi::WIN_KEY_F1 + 1 && self.menu.is_none() && self.preview.is_none() && self.props.is_none() && !self.searching && self.address.is_none() {
             return self.run_command(Command::Rename);
         }
+        // Меню вкладки: стрелки, Enter, всё прочее закрывает.
+        if let Some((index, x, y, selected)) = self.tab_menu {
+            match code {
+                WIN_KEY_UP => self.tab_menu = Some((index, x, y, selected.saturating_sub(1))),
+                WIN_KEY_DOWN => self.tab_menu = Some((index, x, y, (selected + 1).min(TAB_ENTRIES.len() - 1))),
+                ENTER => return self.run_tab_menu(index, selected),
                 _ => self.tab_menu = None,
             }
             return true;
@@ -6321,12 +6321,6 @@ impl App for Files {
                 }
             }
         }
-        if let Some((command, selected)) = self.pop {
-            let count = self.pop_entries(command).len();
-            match code {
-                WIN_KEY_UP => self.pop = Some((command, selected.saturating_sub(1))),
-                WIN_KEY_DOWN => self.pop = Some((command, (selected + 1).min(count.saturating_sub(1)))),
-                ENTER => self.run_pop(command, selected),
         // Alt+V — меню «Вид» (24.11, как Alt+буква меню в Windows): в нём и
         // «Параметры папок…».
         if mods & WIN_MOD_ALT != 0 && char::from_u32(latin).is_some_and(|ch| ch.eq_ignore_ascii_case(&'v')) && self.menu.is_none() {
@@ -6334,6 +6328,12 @@ impl App for Files {
             println("files: view menu opened");
             return true;
         }
+        if let Some((command, selected)) = self.pop {
+            let count = self.pop_entries(command).len();
+            match code {
+                WIN_KEY_UP => self.pop = Some((command, selected.saturating_sub(1))),
+                WIN_KEY_DOWN => self.pop = Some((command, (selected + 1).min(count.saturating_sub(1)))),
+                ENTER => self.run_pop(command, selected),
                 _ => self.pop = None,
             }
             return true;
@@ -6535,12 +6535,6 @@ impl App for Files {
         let hot = self.hot_at(ctx, &plan, x, y);
         let changed = hot != self.hot;
         self.hot = hot;
-        // Подсветка звеньев адреса — строкой для стенда (21.11).
-        if changed {
-            match hot {
-                Hot::Crumb(index) => println(&format!("files: hover crumb {index}")),
-                Hot::Chevron(index) => println(&format!("files: hover chevron {index}")),
-                _ => {}
         // Всплывающая подсказка (24.11): строка под указателем — ждать, не
         // уйдёт ли он с неё; ушёл — подсказку убрать.
         let mut tip_gone = false;
@@ -6553,6 +6547,12 @@ impl App for Files {
         }
         // Окно «Параметры папок»: подсветка строки под указателем.
         let options = self.options.is_some();
+        // Подсветка звеньев адреса — строкой для стенда (21.11).
+        if changed {
+            match hot {
+                Hot::Crumb(index) => println(&format!("files: hover crumb {index}")),
+                Hot::Chevron(index) => println(&format!("files: hover chevron {index}")),
+                _ => {}
             }
         }
         bars | changed | tip_gone | options | self.hover_crumb_pop(ctx, area, &plan, x, y)
@@ -6560,13 +6560,13 @@ impl App for Files {
 
     fn leave(&mut self) -> bool {
         self.pointer = None;
+        self.tip = None;
         let changed = self.hot != Hot::Nothing;
         self.hot = Hot::Nothing;
         self.scroll.hover(None, 0, 0) | self.hscroll.hover(None, 0, 0) | changed
     }
 
     /// Средняя кнопка (20.11), как в Проводнике: по папке — открыть её в
-        self.tip = None;
     /// новой вкладке фоном, по вкладке — закрыть вкладку.
     fn click_middle(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = layout(ctx, area);
@@ -6591,16 +6591,16 @@ impl App for Files {
     /// показывает в заголовке, на панели задач и в миниатюрах. Так два окна
     /// «Файлов» различимы.
     fn title(&self) -> Option<String> {
+        // «Выводить полный путь в заголовке окна» (24.11).
+        if self.opts.full_path_title && !self.on_computer() {
+            return Some(format!("{TITLE}\x1f{}", self.path));
+        }
         Some(format!("{TITLE}\x1f{}", folder_title(&self.path, &self.home)))
     }
 
     fn wants_quit(&self) -> bool {
         self.quit
     }
-        // «Выводить полный путь в заголовке окна» (24.11).
-        if self.opts.full_path_title && !self.on_computer() {
-            return Some(format!("{TITLE}\x1f{}", self.path));
-        }
 
     fn after_input(&mut self) {
         self.report_if_moved();

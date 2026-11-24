@@ -225,11 +225,11 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_CLIPBOARD => clipboard(a0, a1, a2),
         // 22.11: «Открыть с помощью» для «Файлов» (программы Windows из Wine).
         user_abi::SYS_OPEN_WITH => open_with(a0, a1, a2),
-        // 22.11: screen capture for the recorder (`/bin/screenrec`).
-        user_abi::SYS_SCREENCAP => crate::ui::capture::syscall(a0, a1, a2),
         // 24.11: settings store («реестр») and «Только чтение» of «Свойств».
         user_abi::SYS_REGISTRY => registry(a0, a1, a2),
         user_abi::SYS_CHMOD => chmod(a0, a1, a2),
+        // 22.11: screen capture for the recorder (`/bin/screenrec`).
+        user_abi::SYS_SCREENCAP => crate::ui::capture::syscall(a0, a1, a2),
         // 05.11.2026: время из сети (SNTP службы `dhcp`).
         user_abi::SYS_SETCLOCK => setclock(a0, a1, a2),
         user_abi::SYS_MODEM => modem(a0, a1, a2),
@@ -1413,8 +1413,6 @@ fn clipboard(action: usize, ptr: usize, len: usize) -> i64 {
     }
 }
 
-/// `SYS_OPEN_WITH` (22.11): программы для файла, их значки, выбор «всегда».
-fn open_with(action: usize, ptr: usize, len: usize) -> i64 {
 /// `SYS_REGISTRY` (24.11): the settings store — see the contract in
 /// `user_abi` and `config::registry`.
 fn registry(action: usize, ptr: usize, len: usize) -> i64 {
@@ -1505,6 +1503,8 @@ fn chmod(ptr: usize, len: usize, mode: usize) -> i64 {
     }
 }
 
+/// `SYS_OPEN_WITH` (22.11): программы для файла, их значки, выбор «всегда».
+fn open_with(action: usize, ptr: usize, len: usize) -> i64 {
     let input_len = action >> 32;
     let action = action & 0xFFFF_FFFF;
     if len > (8 << 20) || input_len > len || input_len > 4096 || (len > 0 && !space::user_can(ptr, len, PageFlags::WRITE)) {

@@ -118,10 +118,6 @@ pub fn handlers(path: &str, all: bool) -> Vec<Handler> {
             windows: false,
         });
     }
-    if super::winapps::proton_present() {
-        let apps = super::winapps::scan();
-        // Подходящие по реестру префиксов.
-        if !ext.is_empty() {
     // Programs registered in the settings store (24.11, `filetypes/.ext/
     // openwith/<id>`, see `sysconf::store`): OBSOS for web pages, ports later.
     if !ext.is_empty() {
@@ -135,6 +131,10 @@ pub fn handlers(path: &str, all: bool) -> Vec<Handler> {
             push(&mut out, Handler { caption, command, icon, fits: true, chosen: false, windows });
         }
     }
+    if super::winapps::proton_present() {
+        let apps = super::winapps::scan();
+        // Подходящие по реестру префиксов.
+        if !ext.is_empty() {
             for prefix in super::winapps::prefixes() {
                 for (exe, args) in registered(&prefix, &ext, text) {
                     let app = apps.iter().find(|app| app.target.eq_ignore_ascii_case(&exe));
