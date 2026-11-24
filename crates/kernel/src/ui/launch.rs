@@ -175,6 +175,10 @@ pub fn note_spawn(task: u32, line: &str) {
         return;
     };
     crate::kprintln!("  launch      : '{name}' starting as #{task} -- splash shown");
+    // A perf-diag block now and another when the window opens (24.11,
+    // hw-log17: the 30 s blocks skipped the whole D2R launch).
+    #[cfg(target_arch = "x86_64")]
+    crate::linux::perfdiag::request_now();
     let mut launches = LAUNCHES.lock();
     if launches.try_reserve(1).is_err() {
         return;
@@ -219,6 +223,9 @@ pub fn window_opened(task: u32, job: Option<u32>) {
             launch.name,
             now.saturating_sub(launch.at_ms)
         );
+        drop(launches);
+        #[cfg(target_arch = "x86_64")]
+        crate::linux::perfdiag::request_now();
     }
 }
 
@@ -230,15 +237,16 @@ pub fn poll() {
         return;
     }
     let now = crate::time::uptime_ms();
-    for (root, phase, looked) in jobs {
-        if !looked {
-            let source = LAUNCHES.lock().iter().find(|launch| launch.root == root).map(|launch| launch.source.clone());
-            let icon = source.and_then(|source| find_icon(&source));
-            if let Some(launch) = LAUNCHES.lock().iter_mut().find(|launch| launch.root == root) {
-                launch.looked = true;
-                launch.icon = icon;
-            }
+    // Icons on their own task (24.11.2026, hw-log17 "the UI freezes when a
+    // game starts"): reading the PE resources of a game `.exe` on a USB disk
+    // that Wine is streaming the game from took the desktop-driving task
+    // along, and the splash and every frame waited for it.
+    if jobs.iter().any(|(_, _, looked)| !looked) && !ICON_WORKER.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        if crate::sched::spawn("launch-icons", icon_worker).is_err() {
+            ICON_WORKER.store(false, core::sync::atomic::Ordering::Release);
         }
+    }
+    for (root, phase, _) in jobs {
         if phase != Phase::Starting {
             continue;
         }
@@ -279,6 +287,32 @@ pub fn poll() {
             _ => {}
         }
     }
+}
+
+/// A `launch-icons` task is running (see [`icon_worker`]).
+static ICON_WORKER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Find the icons of the launches that have none yet, one by one, outside
+/// the desktop and its driving task; the splash shows the icon on its next
+/// frame.
+fn icon_worker() {
+    loop {
+        let next = LAUNCHES.lock().iter_mut().find(|launch| !launch.looked).map(|launch| {
+            launch.looked = true;
+            (launch.root, launch.source.clone())
+        });
+        let Some((root, source)) = next else { break };
+        let started = crate::time::uptime_ms();
+        let icon = find_icon(&source);
+        let spent = crate::time::uptime_ms().saturating_sub(started);
+        if spent >= 50 {
+            crate::kprintln!("  launch      : icon of #{root} read in {spent} ms (outside the desktop)");
+        }
+        if let Some(launch) = LAUNCHES.lock().iter_mut().find(|launch| launch.root == root) {
+            launch.icon = icon;
+        }
+    }
+    ICON_WORKER.store(false, core::sync::atomic::Ordering::Release);
 }
 
 /// Значок запуска.

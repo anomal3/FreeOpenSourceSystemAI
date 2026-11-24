@@ -58,6 +58,7 @@ pub mod prefs;
 pub mod saver;
 pub mod settings;
 pub mod flight;
+pub mod framegap;
 pub mod gesture;
 pub mod home;
 pub mod keyboard;
@@ -948,9 +949,10 @@ pub fn screen_size() -> (u32, u32) {
 /// Пока стол вынут, [`is_active`] отвечает «нет», и вывод уходит только в
 /// серийную линию. Это безопасно: стол трогают из одной задачи, а обработчики
 /// прерываний к нему не обращаются вовсе.
+#[track_caller]
 fn with_desktop<R>(action: impl FnOnce(&mut Compositor) -> R) -> Option<R> {
     let mut desktop = DESKTOP.lock().take()?;
-    let _held = Held::start();
+    let _held = Held::start(core::panic::Location::caller());
     // Вывод, отложенный, пока стол был у другого, — раньше своего действия:
     // иначе строки программы встали бы на экран не в том порядке, в каком она
     // их напечатала.
@@ -986,20 +988,22 @@ static HELD_WORST_BY: SpinLock<&'static str> = SpinLock::new("");
 static INPUT_WAIT_WORST_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Засекает удержание стола от взятия до возврата.
-struct Held(u64);
+struct Held(u64, &'static core::panic::Location<'static>);
 
 impl Held {
-    fn start() -> Self {
-        Self(crate::time::uptime_ns())
+    fn start(at: &'static core::panic::Location<'static>) -> Self {
+        Self(crate::time::uptime_ns(), at)
     }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let spent = crate::time::uptime_ns().saturating_sub(self.0);
+        let now = crate::time::uptime_ns();
+        let spent = now.saturating_sub(self.0);
         if HELD_WORST_NS.fetch_max(spent, Ordering::Relaxed) < spent {
             *HELD_WORST_BY.lock() = crate::sched::current_name();
         }
+        framegap::desktop_returned(self.0, now, self.1);
     }
 }
 
@@ -2281,8 +2285,10 @@ static WIFI_SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 pub fn tick() {
     // Запуски программ Windows (21.11): кончились ли, значки — вне замка
     // стола (см. `launch`).
+    framegap::phase(&"tick: launches, status");
     launch::poll();
     let status = status_now();
+    framegap::phase_end();
     let request = MODE_REQUEST.swap(0, core::sync::atomic::Ordering::Relaxed);
     let mut layout = LAYOUT_REQUEST.lock().take();
     // Настройки живой флешки вернулись после запуска стола (21.11).
@@ -2308,21 +2314,22 @@ pub fn tick() {
         // раскладка возвращается (как в Windows), а отсчёт на странице
         // перерисовывается раз в секунду.
         if let Some(window) = desktop.find(App::Settings) {
-            window.settings_tick();
+            framegap::step(&"settings tick", || window.settings_tick());
         }
-        desktop.refresh_panel(&status);
+        // Steps are timed (24.11, framegap): a long hold names the slowest.
+        framegap::step(&"refresh panel", || desktop.refresh_panel(&status));
         check_gesture_hold(desktop, &status);
-        desktop.reload_icons_if_packages_changed();
+        framegap::step(&"package icons", || desktop.reload_icons_if_packages_changed());
         // Каталог стола поменяли (20.11): программа сохранила туда файл,
         // терминал удалил — значки следом, без «Обновить».
-        if icons::desktop_folder_changed(desktop.icon_editing().is_none()) {
+        if framegap::step(&"desktop folder", || icons::desktop_folder_changed(desktop.icon_editing().is_none())) {
             desktop.reload_icons();
             let (total, entries) = desktop.icon_counts();
             kprintln!("  desktop     : desktop folder changed, icons {total}, {entries} from {}", context::desktop_dir());
             desktop.repaint_all();
         }
         // Фон (22.11, `wallpaper`): картинка перевелась — стол и «Фон» заново.
-        if wallpaper::poll() {
+        if framegap::step(&"wallpaper", wallpaper::poll) {
             desktop.repaint_all();
             if let Some(window) = desktop.find(App::Settings) {
                 window.refresh_settings();
@@ -2330,9 +2337,9 @@ pub fn tick() {
         }
         desktop.expire_toast();
         // Screen recorder (22.11): «Запись сохранена», a capture left behind.
-        capture::tick(desktop);
+        framegap::step(&"capture", || capture::tick(desktop));
         desktop.refresh_lock_clock();
-        watch_hung(desktop);
+        framegap::step(&"watch hung", || watch_hung(desktop));
         // Wi-Fi включается отдельной задачей: сменилось состояние —
         // перерисовать шторку и «Параметры», которые о нём говорят.
         // Адрес от DHCP — тоже повод: «Параметры» показывают IP подключения.
@@ -2343,7 +2350,7 @@ pub fn tick() {
                 window.refresh_settings();
             }
         }
-        desktop.present();
+        framegap::step(&"present", || desktop.present());
     });
     if restored && done.is_none() {
         PREFS_RESTORED.store(true, Ordering::Release);

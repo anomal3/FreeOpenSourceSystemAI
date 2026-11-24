@@ -312,13 +312,45 @@ fn package_signature() -> String {
     out
 }
 
+/// The last [`package_signature`], computed by the `icon-watch` task
+/// (24.11.2026). `ui::tick` asked for it every half second WITH the desktop
+/// taken: a directory listing of the package registry and of every Wine
+/// prefix's Start menu and desktop. With the file system busy - `pkg
+/// install`, Wine writing its prefix while a game starts - one listing
+/// waited up to 1.4 s (QEMU, the new `desktop : held` lines at
+/// `ui/mod.rs` tick), and no frame was composed meanwhile: the "whole UI
+/// freezes when a game starts" of hw-log17. Now the tick only compares
+/// strings.
+static SIGNATURE: crate::sync::SpinLock<Option<String>> = crate::sync::SpinLock::new(None);
+static WATCHING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn icon_watch() {
+    loop {
+        let signature = package_signature();
+        *SIGNATURE.lock() = Some(signature);
+        crate::sched::sleep_ms(1_000);
+    }
+}
+
+/// The current signature: the watcher's, or computed here when the watcher
+/// has not produced one yet (first look at boot).
+fn current_signature() -> String {
+    if !WATCHING.swap(true, core::sync::atomic::Ordering::AcqRel)
+        && crate::sched::spawn_daemon("icon-watch", icon_watch).is_err()
+    {
+        WATCHING.store(false, core::sync::atomic::Ordering::Release);
+    }
+    let cached = SIGNATURE.lock().clone();
+    cached.unwrap_or_else(package_signature)
+}
+
 impl Icons {
     /// Поставили или сняли пакет с тех пор, как значки читались (фаза 71i:
     /// значок Chromium появляется после `pkg install` сам). Спрашивает
     /// [`crate::ui::tick`] раз в секунду.
     #[must_use]
     pub fn packages_changed(&self) -> bool {
-        package_signature() != self.packages
+        current_signature() != self.packages
     }
 
     /// Масштаб стола сменился (20.11). Сетку перерисует следующий
@@ -486,7 +518,7 @@ impl Icons {
         self.edit = None;
         // Программы установленных пакетов, попросившие значок (`desktop=yes`
         // в манифесте, фаза 71i): после системных, до файлов стола.
-        self.packages = package_signature();
+        self.packages = current_signature();
         // Пакет могли поставить заново с другим значком.
         super::appicon::forget();
         for launcher in super::panel::list_packages().into_iter().filter(|launcher| launcher.desktop && !is_hidden(&launcher.caption)) {

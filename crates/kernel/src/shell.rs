@@ -1368,6 +1368,20 @@ fn run_builtin(line: &str) -> bool {
         // hw-log17: the GPU fence interrupt (nonstall -> wakes fence waiters);
         // `off` - fence waits poll in fine steps as before.
         "fenceirq" => sprintln!("  {}", crate::display::nvidia_rm_intr::command(argument)),
+        // hw-log17: desktop frame gaps / long desktop holds > 50 ms in the log.
+        "framegap" => {
+            match argument.trim() {
+                "on" => crate::ui::framegap::set_enabled(true),
+                "off" => crate::ui::framegap::set_enabled(false),
+                _ => {}
+            }
+            let (gaps, holds, worst) = crate::ui::framegap::stats();
+            sprintln!(
+                "  framegap: {}, {gaps} gap(s) and {holds} long hold(s) since boot, worst gap {} ms",
+                if crate::ui::framegap::enabled() { "on" } else { "off" },
+                worst / 1_000_000
+            );
+        }
         // hw-log15: a Linux thread spinning on sched_yield naps N us (0 - off).
         #[cfg(target_arch = "x86_64")]
         "yieldnap" => {
