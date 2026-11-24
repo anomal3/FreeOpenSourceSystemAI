@@ -347,10 +347,10 @@ fn write_atomic(scope: Scope, path: &str, text: &str) -> Result<(), VfsError> {
 // ---------------------------------------------------------------------------
 
 /// Is the program of a command line installed: its first word, if it is a
-/// path, names a file.
+/// path, names a file (a script run by a shell — the script, 24.11 VLC).
 #[must_use]
 pub fn program_exists(command: &str) -> bool {
-    match command.split_whitespace().next() {
+    match sysconf::store::command_program(command) {
         Some(program) if program.starts_with('/') => size_of(program).is_some(),
         Some(_) => true,
         None => false,

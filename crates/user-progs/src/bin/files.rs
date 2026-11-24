@@ -517,6 +517,10 @@ fn with_line(command: &str, path: &str) -> String {
     }
     if command.contains("fossai-proton") {
         format!("{command} {}", pct(path))
+    } else if path.contains(char::is_whitespace) && !path.contains('"') {
+        // A path with a space goes in quotes - the kernel hands it over as
+        // one word (`user::launch_words`), as the desktop does (24.11).
+        format!("{command} \"{path}\"")
     } else {
         format!("{command} {path}")
     }
@@ -7549,7 +7553,7 @@ fn chosen_program(name: &str) -> Option<String> {
         return None;
     }
     let key = sysconf::store::default_key(&ext);
-    let installed = |command: &String| match command.split_whitespace().next() {
+    let installed = |command: &String| match sysconf::store::command_program(command) {
         Some(program) if program.starts_with('/') => exists(program),
         Some(_) => true,
         None => false,

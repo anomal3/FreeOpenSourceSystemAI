@@ -231,10 +231,56 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("filetypes/.gif/openwith/photos", PHOTOS),
     ("filetypes/.qoi/default", PHOTOS),
     ("filetypes/.qoi/openwith/photos", PHOTOS),
+    // «Видеоплеер VLC» (пакет `vlc`, 24.11): video and sound files; skipped
+    // while the package is not installed (`command_program`).
+    ("filetypes/.mp4/default", VLC),
+    ("filetypes/.m4v/default", VLC),
+    ("filetypes/.mkv/default", VLC),
+    ("filetypes/.webm/default", VLC),
+    ("filetypes/.avi/default", VLC),
+    ("filetypes/.mov/default", VLC),
+    ("filetypes/.wmv/default", VLC),
+    ("filetypes/.flv/default", VLC),
+    ("filetypes/.ts/default", VLC),
+    ("filetypes/.m2ts/default", VLC),
+    ("filetypes/.mpg/default", VLC),
+    ("filetypes/.mpeg/default", VLC),
+    ("filetypes/.ogv/default", VLC),
+    ("filetypes/.3gp/default", VLC),
+    ("filetypes/.mp3/default", VLC),
+    ("filetypes/.flac/default", VLC),
+    ("filetypes/.ogg/default", VLC),
+    ("filetypes/.oga/default", VLC),
+    ("filetypes/.opus/default", VLC),
+    ("filetypes/.wav/default", VLC),
+    ("filetypes/.m4a/default", VLC),
+    ("filetypes/.aac/default", VLC),
+    ("filetypes/.wma/default", VLC),
+    ("filetypes/.mka/default", VLC),
 ];
 
 /// The photo viewer of the system («Фотографии», 24.11).
 pub const PHOTOS: &str = "/bin/photos";
+
+/// The video player of the system (VLC from Debian 13, package `vlc`,
+/// 24.11): a bash script, see [`command_program`].
+pub const VLC: &str = "/opt/debian/bin/bash /opt/vlc/bin/fossai-vlc";
+
+/// The file a command line runs: its first word, and for a script handed to
+/// a shell (`/opt/debian/bin/bash /opt/vlc/bin/fossai-vlc`) the script — the
+/// shell is there as long as Debian is, the script only with its package, so
+/// a default of a removed package is skipped.
+#[must_use]
+pub fn command_program(command: &str) -> Option<&str> {
+    let mut words = command.split_whitespace();
+    let first = words.next()?;
+    if first.ends_with("/bash") || first.ends_with("/sh") {
+        if let Some(script) = words.next().filter(|word| word.starts_with('/')) {
+            return Some(script);
+        }
+    }
+    Some(first)
+}
 
 /// The browser of the system.
 pub const OBSOS: &str = "/opt/obsos/bin/obsos";
