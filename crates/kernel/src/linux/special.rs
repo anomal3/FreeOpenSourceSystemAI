@@ -218,7 +218,15 @@ fn directory(path: &str) -> Option<Vec<(String, NodeKind)>> {
         }
         // `/proc/net`, `/sys/class/net/<имя>` (16.11.2026); `/dev/dri` и
         // каталоги sysfs узла DRM (NVK, 18.11.2026).
-        _ => super::netdev::directory(path).or_else(|| super::drm::sysfs::directory(path)),
+        // `/dev/input` and sysfs of the gamepads (24.11.2026); `/sys/class`
+        // gets `input` next to `net` while a pad is connected.
+        _ => {
+            let mut found = super::netdev::directory(path).or_else(|| super::drm::sysfs::directory(path));
+            if path == "/sys/class" && super::evdev::directory("/sys/class/input").is_some() {
+                found.get_or_insert_with(Vec::new).push((String::from("input"), NodeKind::Directory));
+            }
+            found.or_else(|| super::evdev::directory(path))
+        }
     }
 }
 
@@ -227,6 +235,7 @@ pub fn exists(path: &str) -> bool {
     matches!(path, "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random" | "/dev/kmsg")
         || text(path).is_some()
         || super::drm::sysfs::exists(path)
+        || super::evdev::exists(path)
 }
 
 /// Содержимое файла `/proc` или `/sys`.
@@ -242,6 +251,10 @@ fn text(path: &str) -> Option<String> {
     }
     // `/sys/dev/char/226:128/device/*` для libdrm (NVK, 18.11.2026).
     if let Some(text) = super::drm::sysfs::text(path) {
+        return Some(text);
+    }
+    // `/sys/devices/virtual/input/inputN/…` (gamepads, 24.11.2026).
+    if let Some(text) = super::evdev::text(path) {
         return Some(text);
     }
     let cpus = crate::smp::online().max(1);

@@ -362,6 +362,7 @@ fn russian(what: &str) -> String {
         "other device" => "Прочее устройство",
         "keyboard" => "Клавиатура USB",
         "mouse" => "Мышь USB",
+        "gamepad" => "Игровой контроллер USB",
         "tablet" => "Планшет USB",
         "disk" => "Диск",
         "processor" => "Процессор",

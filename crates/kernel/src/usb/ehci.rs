@@ -2044,7 +2044,7 @@ impl Controller {
             match device.reader {
                 Some(Reader::Keyboard(_)) => summary.keyboards += 1,
                 Some(Reader::Mouse(_)) => summary.mice += 1,
-                None => {}
+                _ => {}
             }
             summary.reports += device.reader.as_ref().map_or(0, Reader::reports);
             if let Some(slot) = summary.attached.iter_mut().find(|slot| slot.port == 0) {

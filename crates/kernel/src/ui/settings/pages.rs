@@ -326,6 +326,28 @@ impl SettingsView {
         if !any {
             y = pass.note(x, y, w, "Ни одного устройства USB не подключено.");
         }
+        // Геймпады (24.11.2026): что ядро видит сейчас - кнопки, стики,
+        // курки; игры Windows получают их как геймпад Xbox 360 (XInput).
+        let pads = crate::usb::gamepad::pads();
+        if !pads.is_empty() {
+            y = pass.group(x, y, w, "Игровые контроллеры");
+            for pad in pads {
+                let state = pad.state;
+                let desc = format!(
+                    "Кнопки: {} · левый стик {}, {} · правый {}, {} · курки {}, {} · для игр: /dev/input/event{}",
+                    state.pressed(),
+                    state.lx,
+                    state.ly,
+                    state.rx,
+                    state.ry,
+                    state.lt,
+                    state.rt,
+                    pad.index
+                );
+                let title = format!("{} ({:04x}:{:04x})", pad.name, pad.vendor, pad.product);
+                y = row(pass, x, y, w, Some(Fi::Usb), &title, &desc, Ctl::Chip("РАБОТАЕТ", Tone::Ok), None);
+            }
+        }
         y = pass.group(x, y, w, "Контроллеры");
         for line in self.cache.devices.lines().filter(|line| line.starts_with("pci\t") && line.contains("usb controller")) {
             let fields: Vec<&str> = line.split('\t').collect();
@@ -1569,6 +1591,8 @@ fn usb_kind_ru(kind: &str) -> String {
         "Планшет USB"
     } else if lower.contains("storage") || lower.contains("mass") {
         "Накопитель USB"
+    } else if lower.contains("gamepad") {
+        "Игровой контроллер USB"
     } else if lower.contains("hub") {
         "Концентратор USB"
     } else if lower.contains("net") || lower.contains("rndis") || lower.contains("ecm") {

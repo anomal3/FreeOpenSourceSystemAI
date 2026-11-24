@@ -837,7 +837,7 @@ impl Controller {
             match device.reader {
                 Some(Reader::Keyboard(_)) => keyboard = true,
                 Some(Reader::Mouse(_)) => mouse = true,
-                None => {}
+                _ => {}
             }
         }
         (keyboard, mouse)

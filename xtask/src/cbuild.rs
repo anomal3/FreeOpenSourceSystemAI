@@ -736,10 +736,11 @@ pub fn builtins(arch: Arch) -> PathBuf {
 /// Проверочные программы Linux (фаза 71a): исходники в `libc/linux`, путь в
 /// образе — `/compat/linux/bin/<имя>`.
 /// `drmprobe`/`nvkprobe` (18.11.2026) — узел DRM nouveau для NVK (общий
-/// `drmprobe.h` рядом).
-const LINUX_PROGRAMS: [&str; 16] = [
+/// `drmprobe.h` рядом). `evdevprobe` (24.11.2026) — геймпад `/dev/input/event0`
+/// и его sysfs так, как их читает `winebus.sys` Proton.
+const LINUX_PROGRAMS: [&str; 17] = [
     "hello", "futexv", "sigasync", "shmprobe", "wow32probe", "netlinkprobe", "ntsyncprobe", "heapgrow", "rwxprobe",
-    "futexlat", "hangprobe", "drmprobe", "nvkprobe", "forkpoll", "tlblat", "rdlat",
+    "futexlat", "hangprobe", "drmprobe", "nvkprobe", "forkpoll", "tlblat", "rdlat", "evdevprobe",
 ];
 
 /// Общие флаги проверочных программ Linux.

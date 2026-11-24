@@ -360,6 +360,40 @@ struct Device {
     /// клавиатурой внутри — драйвер обслуживает только наполовину, и без этого
     /// числа вторая половина невидима.
     interface: (u8, u8),
+    /// Interrupt OUT endpoint of an Xbox pad (24.11.2026): init, acks, LEDs.
+    out: Option<OutPipe>,
+}
+
+/// An interrupt OUT endpoint: its ring, doorbell target and a page of
+/// [`OUT_SLOT`]-byte packet slots used round-robin.
+struct OutPipe {
+    ring: Ring,
+    target: u8,
+    buffer: DmaBuffer,
+    next: usize,
+    sent: u64,
+}
+
+/// One packet of an OUT pipe (GIP packets are at most 64 bytes).
+const OUT_SLOT: usize = 64;
+
+impl OutPipe {
+    /// Queue `packet` and ring the doorbell.
+    fn send(&mut self, regs: &Registers, slot: u8, packet: &[u8]) {
+        let len = packet.len().min(OUT_SLOT);
+        let at = (self.next % (PAGE_SIZE / OUT_SLOT)) * OUT_SLOT;
+        self.next = self.next.wrapping_add(1);
+        // SAFETY: the buffer is a page; `at + len` stays inside it.
+        unsafe { core::ptr::copy_nonoverlapping(packet.as_ptr(), self.buffer.as_ptr::<u8>().add(at), len) };
+        self.ring.push(Trb {
+            parameter: self.buffer.phys().as_u64() + at as u64,
+            status: len as u32,
+            control: (ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT) | ring::TRB_IOC,
+        });
+        self.sent += 1;
+        // SAFETY: the descriptor is written before the doorbell.
+        unsafe { regs.ring_doorbell(slot, self.target) };
+    }
 }
 
 /// Где устройство стоит за хабом (фаза 68l).
@@ -436,6 +470,8 @@ enum Described {
     Hub(HubInterface),
     Storage(StorageInterface),
     Net(NetInterface),
+    /// Xbox pad on its vendor interface (24.11.2026).
+    Xbox(usb::gamepad::XboxInterface),
 }
 
 /// Сетевая функция USB (фаза 68p).
@@ -1532,6 +1568,7 @@ impl Controller {
             identity: (0, 0),
             described_by: 0,
             interface: (0, 0),
+            out: None,
         };
 
         // SAFETY: контракт функции; контексты выделены и обнулены.
@@ -1615,6 +1652,11 @@ impl Controller {
                 unsafe { self.bring_up_net(device, &found) }.map_err(|err| (Stage::Configure, err))?;
                 return Ok(0);
             }
+            Described::Xbox(found) => {
+                // SAFETY: см. выше.
+                unsafe { self.bring_up_xbox(device, &found) }.map_err(|err| (Stage::Configure, err))?;
+                return Ok(0);
+            }
         };
         let micros = interval_micros(endpoint_interval(speed, found.interval));
         kprintln!(
@@ -1642,8 +1684,9 @@ impl Controller {
         }
         .map_err(|err| (Stage::Configure, err))?;
         // SAFETY: см. выше.
-        let reader =
+        let mut reader =
             unsafe { self.enable_reports(device, &found) }.map_err(|err| (Stage::Enable, err))?;
+        reader.identify(device.identity.0, device.identity.1);
         let protocol = reader.protocol();
         kprintln!("  usb         : slot {slot} is a {}", reader.name());
 
@@ -1705,7 +1748,7 @@ impl Controller {
             // SAFETY: точка заведена, буфер свободен.
             unsafe { self.enable_interface(device, found) }
         });
-        let reader = match reader {
+        let mut reader = match reader {
             Ok(reader) => reader,
             Err(err) => {
                 // SAFETY: точка в контексте осталась без дескрипторов в кольце.
@@ -1716,6 +1759,7 @@ impl Controller {
                 return Err(err);
             }
         };
+        reader.identify(device.identity.0, device.identity.1);
         kprintln!(
             "  usb         : slot {} interface {} is a {} too, endpoint {} IN",
             device.slot,
@@ -1734,6 +1778,111 @@ impl Controller {
             described_by: found.report_len,
         });
         Ok(())
+    }
+
+    /// Bring up an Xbox pad (24.11.2026): its interrupt IN endpoint, the
+    /// configuration, the interrupt OUT endpoint (an Xbox One pad is silent
+    /// until it gets "power on" there), and the reader with its first packets.
+    ///
+    /// # Safety
+    ///
+    /// The device is addressed and described.
+    unsafe fn bring_up_xbox(&mut self, device: &mut Device, found: &usb::gamepad::XboxInterface) -> Result<(), XhciError> {
+        let (endpoint, packet, interval) = found.input;
+        kprintln!(
+            "  usb         : {} pad {:04x}:{:04x}, interface {}, endpoint {} IN ({}-byte), OUT {}",
+            found.kind.name(),
+            device.identity.0,
+            device.identity.1,
+            found.interface,
+            endpoint,
+            packet,
+            found.output.map_or(alloc::string::String::from("none"), |(out, _, _)| alloc::format!("{out}"))
+        );
+        // SAFETY: the contract of the function.
+        unsafe { self.configure_endpoint(device, endpoint, interval, packet, None) }?;
+        // SAFETY: the endpoint is configured.
+        unsafe {
+            self.control_transfer(device, [0, usb::REQ_SET_CONFIGURATION, found.configuration, 0, 0, 0, 0, 0], 0, false)
+        }?;
+        if let Some((out, out_packet, out_interval)) = found.output {
+            // SAFETY: configured; the report buffer is not in use yet.
+            match unsafe { self.add_out_endpoint(device, out, out_packet, out_interval) } {
+                Ok(pipe) => device.out = Some(pipe),
+                Err(err) => kprintln!("  usb         : the pad's OUT endpoint {out} failed: {err}"),
+            }
+        }
+        device.report_len = packet.clamp(1, PAGE_SIZE as u16);
+        device.described_by = 0;
+        device.interface = (found.interface, 1);
+        let mut reader = Reader::Gamepad(usb::gamepad::Gamepad::xbox(found.kind, device.identity.0, device.identity.1));
+        let slot = device.slot;
+        while let Some(packet) = reader.take_output() {
+            if let Some(pipe) = device.out.as_mut() {
+                pipe.send(&self.regs, slot, &packet);
+            }
+        }
+        device.reader = Some(reader);
+        Ok(())
+    }
+
+    /// Add an interrupt OUT endpoint to a configured device (the way
+    /// [`Controller::bring_up_extra`] adds an IN one).
+    ///
+    /// # Safety
+    ///
+    /// The device is configured.
+    unsafe fn add_out_endpoint(&mut self, device: &mut Device, endpoint: u8, packet: u16, b_interval: u8) -> Result<OutPipe, XhciError> {
+        let target = endpoint * 2;
+        let ring = Ring::new(dma::alloc(RING_ENTRIES * ring::TRB_LEN)?);
+        let buffer = match dma::alloc(PAGE_SIZE) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                // SAFETY: the ring was never given to the controller.
+                unsafe { dma::free(ring.buffer()) };
+                return Err(err.into());
+            }
+        };
+        let speed = device.speed;
+        // SAFETY: the contract of the function; the contexts exist.
+        unsafe {
+            self.clear_input(device);
+            self.write_context(&device.input, 0, 1, 1 | (1 << target));
+            for dword in 0..4 {
+                let value = self.read_context(&device.context, 0, dword);
+                self.write_context(&device.input, 1, dword, value);
+            }
+            let slot0 = self.read_context(&device.context, 0, 0);
+            let entries = ((slot0 >> 27) & 0x1F).max(u32::from(target));
+            self.write_context(&device.input, 1, 0, (slot0 & !(0x1F << 27)) | (entries << 27));
+            let index = usize::from(target) + 1;
+            let interval = endpoint_interval(speed, b_interval);
+            let packet = u32::from(packet);
+            self.write_context(&device.input, index, 0, u32::from(interval) << 16);
+            // Type 3 - Interrupt OUT; CErr 3.
+            self.write_context(&device.input, index, 1, (packet << 16) | (3 << 3) | (3 << 1));
+            let dequeue = ring.phys() | 1;
+            self.write_context(&device.input, index, 2, dequeue as u32);
+            self.write_context(&device.input, index, 3, (dequeue >> 32) as u32);
+            self.write_context(&device.input, index, 4, packet | (packet << 16));
+        }
+        // SAFETY: the input context is filled.
+        let configured = unsafe {
+            self.command_execute(Trb {
+                parameter: device.input.phys().as_u64(),
+                status: 0,
+                control: (ring::TRB_CONFIGURE_ENDPOINT << ring::TRB_TYPE_SHIFT) | (u32::from(device.slot) << 24),
+            })
+        };
+        if let Err(err) = configured {
+            // SAFETY: the endpoint was refused; nothing points at the memory.
+            unsafe {
+                dma::free(ring.buffer());
+                dma::free(&buffer);
+            }
+            return Err(err);
+        }
+        Ok(OutPipe { ring, target, buffer, next: 0, sent: 0 })
     }
 
     /// Поднять хаб: конфигурация, дескриптор хаба, точка прерываний, питание
@@ -2554,6 +2703,10 @@ impl Controller {
         if let Some(found) = find_net(bytes) {
             return Ok(Described::Net(found));
         }
+        // Xbox pads (24.11.2026): a vendor interface, not HID.
+        if let Some(found) = usb::gamepad::find_xbox(bytes) {
+            return Ok(Described::Xbox(found));
+        }
         if usb::find_hid(bytes).is_none() && configurations > 1 {
             // Сетевая функция бывает не в первой конфигурации: у адаптеров на
             // RTL8153 первая — своя, а CDC ECM — во второй.
@@ -2873,7 +3026,16 @@ impl Controller {
                 map.key_slots()
             );
         }
-        if parsed.pointer.is_none() && parsed.keyboard.is_none() {
+        if let Some(map) = parsed.gamepad {
+            kprintln!(
+                "  usb         : report descriptor {read} bytes: gamepad, {} axes, {} buttons{}, report id {}",
+                map.axis_count(),
+                map.button_count(),
+                if map.has_hat() { ", hat" } else { "" },
+                map.report_id
+            );
+        }
+        if parsed.pointer.is_none() && parsed.keyboard.is_none() && parsed.gamepad.is_none() {
             kprintln!("  usb         : report descriptor {read} bytes: nothing the kernel can use");
         }
 
@@ -3195,6 +3357,14 @@ impl Controller {
         let report = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), received) };
         if let Some(reader) = device.reader.as_mut() {
             reader.handle_report(report);
+            // Answers of an Xbox pad (acks, "power on" again after it
+            // re-announced itself) go out at once.
+            let slot = device.slot;
+            while let Some(packet) = reader.take_output() {
+                if let Some(pipe) = device.out.as_mut() {
+                    pipe.send(&self.regs, slot, &packet);
+                }
+            }
         }
     }
 
@@ -3533,6 +3703,10 @@ unsafe fn free_device(device: &Device) {
             dma::free(net.bulk_out.buffer());
             dma::free(&net.rx);
             dma::free(&net.tx);
+        }
+        if let Some(out) = &device.out {
+            dma::free(out.ring.buffer());
+            dma::free(&out.buffer);
         }
     }
 }

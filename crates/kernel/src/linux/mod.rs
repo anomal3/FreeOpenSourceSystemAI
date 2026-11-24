@@ -43,6 +43,7 @@ mod netdev;
 mod netlink;
 // Узел DRM nouveau для Mesa NVK (18.11.2026, `nvk-spec.md`).
 pub mod drm;
+pub(crate) mod evdev;
 mod fossaicap;
 pub mod ntsync;
 pub mod perfdiag;
@@ -617,6 +618,9 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::INOTIFY_INIT => ipc::inotify_init(0),
             nr::INOTIFY_INIT1 => ipc::inotify_init(a0),
             nr::INOTIFY_ADD_WATCH => match linux_path(AT_FDCWD, a1) {
+                // `/dev/input` (gamepads, 24.11.2026): its events come from the
+                // kernel, under this very name.
+                Ok(linux) if evdev::virtual_dir(&linux) => ipc::inotify_add_watch(a0, &linux, a2 as u32),
                 Ok(linux) => ipc::inotify_add_watch(a0, &fsops::place(&linux), a2 as u32),
                 Err(err) => err,
             },
@@ -846,6 +850,12 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
         Ok(path) => links::follow(&path),
         Err(err) => return err,
     };
+    // Gamepads (24.11.2026): `/dev/input/eventN`, and sysfs through
+    // `/sys/class/input/eventN`.
+    let linux = evdev::resolve(&linux).unwrap_or(linux);
+    if let Some(answer) = evdev::open(&linux, flags) {
+        return answer;
+    }
     if let Some(answer) = ipc::open_shm(&linux, flags) {
         return answer;
     }
@@ -1076,6 +1086,13 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
             return put_stat(out, S_IFLNK, 0o777, 0, 0, text.len() as u64, 0, ino_of(&linux));
         }
     }
+    // Links of the gamepads' sysfs (24.11.2026).
+    if let Some(text) = evdev::link(&linux) {
+        if !follow {
+            return put_stat(out, S_IFLNK, 0o777, 0, 0, text.len() as u64, 0, ino_of(&linux));
+        }
+    }
+    let linux = evdev::resolve(&linux).unwrap_or(linux);
     let mut linux = links::follow(&linux);
     // `/proc/self/exe` — ссылка на файл программы (фаза 71j): `realpath`
     // glibc идёт по ней, только если `lstat` назвал её ссылкой, — иначе
@@ -1121,6 +1138,9 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
     }
     // Узел DRM: `st_rdev` = 226:128 — по нему libdrm узнаёт устройство.
     if let Some(rdev) = drm::rdev(&linux) {
+        return put_stat(out, S_IFCHR, 0o666, 0, 0, 0, 0, rdev);
+    }
+    if let Some(rdev) = evdev::rdev(&linux) {
         return put_stat(out, S_IFCHR, 0o666, 0, 0, 0, 0, rdev);
     }
     if special::exists(&linux) {
@@ -1390,6 +1410,9 @@ fn readlink(dir: usize, ptr: usize, buf: usize, size: usize) -> i64 {
     }
     // Ссылки sysfs узла DRM (`…/device/subsystem` → `…/bus/pci`).
     if let Some(answer) = drm::readlink(&path, buf, size) {
+        return answer;
+    }
+    if let Some(answer) = evdev::readlink(&path, buf, size) {
         return answer;
     }
     if path == "/proc/self/exe" {
@@ -2173,6 +2196,10 @@ unsafe fn ioctl(fd: usize, request: usize, arg: usize) -> i64 {
     }
     // DRM nouveau, dma-buf, syncobj (NVK, 18.11.2026).
     if let Some(answer) = drm::ioctl(fd, request, arg) {
+        return answer;
+    }
+    // Gamepads `/dev/input/eventN` (24.11.2026).
+    if let Some(answer) = evdev::ioctl(fd, request, arg) {
         return answer;
     }
     // Звук ALSA (`/dev/snd`, шаг 7 Proton).

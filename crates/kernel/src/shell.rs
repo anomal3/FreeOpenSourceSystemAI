@@ -1569,6 +1569,13 @@ fn run_builtin(line: &str) -> bool {
                 wait_ns / waits.max(1) / 1000
             );
         }
+        // Gamepads (24.11.2026): the pads and their live state, `log on` -
+        // every change into the journal, `fake ...` - a test pad.
+        "gamepad" => {
+            for line in crate::usb::gamepad::shell(argument) {
+                sprintln!("{line}");
+            }
+        }
         // hw-log17: `usbwin KIB` caps a USB disk command (0 = the device's
         // whole window: 1 MiB on SuperSpeed); `usbwin big|small` - the
         // buffer of a disk plugged from now on (1 MiB or 128 KiB).
