@@ -17412,3 +17412,29 @@ TODO / не проверено:
   нет; стол принимает файлы только через буфер.
 - Ящик переноса вкладок «Файлов» на живой системе ходит через текст буфера и затирает список
   файлов в нём (редкий случай: без записываемого /tmp).
+
+## Итоговый прогон 24.11 (после ночи hw-log17) - **регрессия пройдена, образ для проверки на железе**
+Пакеты пересобраны из HEAD (`thirdparty -a x86_64 --only debian|proton|obs`), сборка `cargo xtask check`
+и `build -r` для x86_64 и aarch64 чистые. QEMU (через замок xt.ps1):
+- Live: desktop chrome start terminal files files-tabs tools filedlg fsnotify notepad multihead
+  multihead-ui appearance scale-live linux winapps mouse winsize icons wallpaper saver screenrec
+  screenrec-mp4 admin taskmgr smp threads kill tlblat rdlat schedq - ок.
+- Установленная система + Proton: install installed wayland wayland-classic wayland-flip
+  wayland-multihead wayland-wine-monitors proton proton-d3d proton-net proton-sound proton-sound-hda
+  proton-winedevice winapps-real proton-close - ок; OBS: install obs - ок; clipboard
+  wayland-clipboard exfat exfat-stream usbstick nvk-soft hrsleep - ок.
+- Правки по ходу: установщик не клал в `/bin` системные инструменты 20.11 (run, charmap, sysinfo,
+  eventlog, services, cleanmgr, admin, compmgmt, resmon, startup, autorun, cfgedit) - дописаны в
+  `PROGRAMS` (тест `installer_ships_every_program` был красным); сценарии notepad (окно
+  «Сохранить как» - отдельный /bin/filedlg, файлы прошлого прогона удаляются), taskmgr (служб
+  пять: + autostart), proton (пакет мог поставить раньше wayland-wine-monitors).
+
+Осталось (TODO):
+- `nvk-soft-vk`: vkcube на NVK поверх SoftGpu падает в `demo_draw` - CE BLOCKLINEAR не поддержан
+  в SoftGpu (известно с 20.11; vkprobe/vulkaninfo, то есть VM_BIND и заборы, проходят).
+- **btrfs: после `pkg remove proton` + `pkg install proton` (сценарий nvk-soft-vk) каждая
+  фиксация корня падает `commit FAILED (the volume uses a feature this implementation lacks)` -
+  изменения теряются** (дальше в той же цепочке notepad не находил сохранённый файл). Было и
+  23.11 (журналы paging-race/proton-hw14 того прогона), к ночным правкам не относится. Найти,
+  какая из проверок `Error::Unsupported` в `crates/btrfs/src/write.rs` срабатывает (журнал
+  причины), воспроизвести на хосте тестом из удаления/установки большого дерева.
