@@ -74,10 +74,10 @@ pub fn open(linux: &str, flags: usize) -> Option<i64> {
     const O_CLOEXEC: usize = 0o2_000_000;
     let object: Arc<dyn Object> = match linux {
         CONTROL_PATH => Arc::new(Control),
-        PCM_PATH => Arc::new(Pcm { state: Mutex::new(Stream::default()), capture: false }),
+        PCM_PATH => Arc::new(Pcm::new(false)),
         CAPTURE_PATH => {
             crate::sound::loopback::arm();
-            Arc::new(Pcm { state: Mutex::new(Stream { capture: true, ..Stream::default() }), capture: true })
+            Arc::new(Pcm::new(true))
         }
         _ => return None,
     };
@@ -321,6 +321,64 @@ impl Stream {
 struct Pcm {
     state: Mutex<Stream>,
     capture: bool,
+    /// Playback journal (24.11.2026, hw-log17: "no sound in any game", and
+    /// the log said nothing about whether a game played at all): frames
+    /// written, failed hand-overs to the card, and whether the start was
+    /// logged.
+    written: core::sync::atomic::AtomicU64,
+    feed_errors: core::sync::atomic::AtomicU64,
+    started: core::sync::atomic::AtomicBool,
+}
+
+/// Playback streams that have written something and are still open. More
+/// than one at a time is summed by nobody: the card gets both in turn.
+static PLAYING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+impl Pcm {
+    fn new(capture: bool) -> Self {
+        Self {
+            state: Mutex::new(Stream { capture, ..Stream::default() }),
+            capture,
+            written: core::sync::atomic::AtomicU64::new(0),
+            feed_errors: core::sync::atomic::AtomicU64::new(0),
+            started: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Where the sound goes, for the log.
+    fn card() -> &'static str {
+        if crate::virtio::snd::present() {
+            "virtio-snd"
+        } else if crate::sound::hda::present() {
+            "HDA"
+        } else {
+            "no card: recording tap only"
+        }
+    }
+}
+
+impl Drop for Pcm {
+    fn drop(&mut self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if self.capture || !self.started.load(Relaxed) {
+            return;
+        }
+        // The last stream closed without DRAIN (WASAPI closes so): play out
+        // and stop the card. HDA's controller loops its ring by itself, and
+        // without a feeder nobody zeroes the played periods - QEMU's WAV had
+        // the stale ring buzzing for 34 s after the program ended (24.11).
+        if PLAYING.fetch_sub(1, Relaxed) == 1 && crate::sound::present() {
+            let _ = crate::sound::drain();
+        }
+        let frames = self.written.load(Relaxed);
+        crate::kprintln!(
+            "  snd         : playback closed: {frames} frames ({}.{} s) to {}, {} failed hand-over(s)",
+            frames / RATE,
+            frames % RATE * 10 / RATE,
+            Self::card(),
+            self.feed_errors.load(Relaxed)
+        );
+    }
 }
 
 impl Object for Pcm {
@@ -438,21 +496,39 @@ fn admits(buf: &[u8], param: usize, lo: u32, hi: u32, open: bool) -> bool {
 
 /// `HW_REFINE`/`HW_PARAMS`: сузить запрос до нашего режима.
 fn refine(buf: &mut [u8]) -> Result<(), i64> {
-    if !refine_mask(buf, P_ACCESS, 3) // RW_INTERLEAVED
-        || !refine_mask(buf, P_FORMAT, 2) // S16_LE
-        || !refine_mask(buf, P_SUBFORMAT, 0)
-    {
-        return Err(-e::EINVAL);
+    // Which parameter a program asked for that we do not have - in the log,
+    // the first few times (24.11.2026: games' WASAPI got only "-22" from
+    // libasound; it was the access - conversion plugins want mmap).
+    let refused = |buf: &[u8], param: usize| {
+        static SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        // `mmap_emul` asks for mmap access first on every open - expected.
+        let mmap_probe = param == P_ACCESS && u32_at(buf, MASKS_AT) & (1 << 3) == 0;
+        if !mmap_probe && SHOWN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+            let what = if param < 8 {
+                alloc::format!("mask {:#x}", u32_at(buf, MASKS_AT + param * 32))
+            } else {
+                let (min, max, bits) = interval(buf, param);
+                alloc::format!("{min}..{max} (bits {bits:#x})")
+            };
+            crate::kprintln!("  snd         : hw params refused: parameter {param} asks {what}");
+        }
+        -e::EINVAL
+    };
+    for (param, bit) in [(P_ACCESS, 3), (P_FORMAT, 2), (P_SUBFORMAT, 0)] {
+        // RW_INTERLEAVED, S16_LE, standard subformat.
+        if !refine_mask(buf, param, bit) {
+            return Err(refused(buf, param));
+        }
     }
     for (param, value) in FIXED {
         if !admits(buf, param, value, value, false) {
-            return Err(-e::EINVAL);
+            return Err(refused(buf, param));
         }
         set_interval(buf, param, value, value, 4); // integer
     }
     for (param, value) in TIMES {
         if !admits(buf, param, value, value + 1, true) {
-            return Err(-e::EINVAL);
+            return Err(refused(buf, param));
         }
         set_interval(buf, param, value, value + 1, 3); // openmin | openmax
     }
@@ -664,8 +740,26 @@ impl Pcm {
             Ok(bytes) => bytes,
             Err(err) => return err,
         };
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            if take > 0 && !self.started.swap(true, Relaxed) {
+                let others = PLAYING.fetch_add(1, Relaxed);
+                let pid = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
+                crate::kprintln!(
+                    "  snd         : process {pid} ({}) starts playback, S16_LE 2 ch 48000 Hz -> {}{}",
+                    crate::sched::current(),
+                    Self::card(),
+                    if others > 0 { alloc::format!(", {others} other stream(s) playing - no mixer, they alternate") } else { alloc::string::String::new() }
+                );
+            }
+            self.written.fetch_add(take, Relaxed);
+        }
         if crate::sound::present() {
-            let _ = crate::sound::feed(&bytes);
+            if let Err(err) = crate::sound::feed(&bytes) {
+                if self.feed_errors.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == 0 {
+                    crate::kprintln!("  snd         : the card refused samples: {err}");
+                }
+            }
         } else {
             // No card: the clock keeps the pace, and the recording still
             // hears the program (23.11).
