@@ -2681,7 +2681,8 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
         // (22.11): a running capture is asked to stop, otherwise
         // `/bin/screenrec --record` starts with the saved settings.
         KeyCode::R if event.mods.contains(Modifiers::META) && event.mods.contains(Modifiers::ALT) => {
-            if capture::active() {
+            // A program's screen source (OBS, 24.11) is not a recording.
+            if capture::recording() {
                 capture::request_stop();
             } else {
                 run_choice(desktop, panel::Choice::Program("screenrec", "--record"));
@@ -5241,6 +5242,10 @@ pub fn taskbar_command(words: &str) {
     with_desktop(|desktop| {
         desktop.refresh_panel(&status);
         desktop.present();
+        // Where the tray icons are now (24.11) — the bench aims at them.
+        for spot in desktop.tray_spots() {
+            kprintln!("  desktop     : start spot {spot}");
+        }
     });
 }
 
@@ -6034,6 +6039,8 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
         TrayItem::Clock => traypop::Kind::Calendar,
         TrayItem::Volume => traypop::Kind::Volume,
         TrayItem::Bell => traypop::Kind::Quick,
+        // The chevron (24.11): the icons kept off the taskbar.
+        TrayItem::Overflow => traypop::Kind::Overflow,
         // The red recording indicator (22.11): a click stops the recording.
         TrayItem::Recording => {
             capture::request_stop();
@@ -6045,6 +6052,9 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
     desktop.close_tray_pop();
     if was != Some(kind) && desktop.open_tray_pop(kind, item) {
         kprintln!("  desktop     : tray popup {kind:?} opened");
+        for spot in desktop.tray_pop_spots() {
+            kprintln!("  desktop     : start spot {spot}");
+        }
     }
     desktop.refresh_panel(status);
 }
@@ -6106,6 +6116,12 @@ fn press_tray_pop(desktop: &mut Compositor, x: i32, y: i32, status: &Status) -> 
         }
         desktop.close_tray_pop();
         match action {
+            // An icon of the chevron's popup (24.11): as its click on the
+            // taskbar — its own window opens above the chevron.
+            traypop::Action::Item(item) => {
+                kprintln!("  desktop     : tray overflow item {item:?}");
+                tray_click(desktop, item, status);
+            }
             traypop::Action::Layout(layout) => {
                 keymap::set_layout(layout);
                 desktop.refresh_panel(status);

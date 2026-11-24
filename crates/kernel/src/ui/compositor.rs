@@ -4521,13 +4521,16 @@ impl Compositor {
     /// Открыть окно трея над значком `item`. `false` — не вышло.
     pub fn open_tray_pop(&mut self, kind: super::traypop::Kind, item: super::panel::TrayItem) -> bool {
         let Some(panel) = self.panel.as_ref() else { return false };
-        let Some(anchor) = panel.tray_rect(item) else { return false };
+        // An icon kept under the chevron (24.11) opens its window above the
+        // chevron.
+        let Some(anchor) = panel.tray_rect(item).or_else(|| panel.tray_rect(super::panel::TrayItem::Overflow)) else { return false };
         let panel_top = panel.home().y;
         let Some(mut pop) = super::traypop::TrayPop::new(kind, anchor, self.primary, panel_top, self.scale) else {
             return false;
         };
         pop.rect = self.beside_panel(pop.rect, anchor);
         self.mark_layer(pop.rect);
+        super::panel::set_overflow_open(kind == super::traypop::Kind::Overflow);
         self.tray_pop = Some(pop);
         true
     }
@@ -4536,6 +4539,7 @@ impl Compositor {
         if let Some(pop) = self.tray_pop.take() {
             self.mark_layer(pop.rect);
         }
+        super::panel::set_overflow_open(false);
     }
 
     #[must_use]
@@ -4565,6 +4569,18 @@ impl Compositor {
             None => return,
         };
         self.mark(rect);
+    }
+
+    /// Tray icons of the main panel as `tray:<item> at X,Y WxH` (24.11).
+    #[must_use]
+    pub fn tray_spots(&self) -> Vec<alloc::string::String> {
+        self.panel.as_ref().map(super::panel::Panel::tray_spots).unwrap_or_default()
+    }
+
+    /// Cells of the open tray popup as `traypop:<n> at X,Y WxH` (24.11).
+    #[must_use]
+    pub fn tray_pop_spots(&self) -> Vec<alloc::string::String> {
+        self.tray_pop.as_ref().map(super::traypop::TrayPop::spots).unwrap_or_default()
     }
 
     #[must_use]

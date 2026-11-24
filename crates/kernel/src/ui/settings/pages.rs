@@ -1016,12 +1016,28 @@ fn dock(pass: &mut Pass, x: i32, y: i32, w: u32) {
         y = row(pass, x, y, w, None, "Открепить все", "Останутся только кнопки открытых окон", Ctl::Button("Открепить", Weight::Normal), Some(Deed::Taskbar(TaskbarDeed::ClearPins)));
     }
 
+    // Tray icons (24.11, like Windows «Другие значки в области
+    // уведомлений»): on the taskbar or under the chevron ˄.
+    y = pass.group(x, y, w, "Значки в области уведомлений");
+    let dock = cfg.mode == Mode::Dock;
+    for icon in deskcfg::TrayIcon::ALL {
+        let on_bar = cfg.tray_hidden & icon.bit() == 0;
+        let (glyph, desc) = match icon {
+            deskcfg::TrayIcon::Recording => (Fi::Monitor, "Красная точка и время, пока идёт запись"),
+            deskcfg::TrayIcon::Network => (Fi::NetworkWired, "Подключение и параметры сети"),
+            deskcfg::TrayIcon::Volume => (Fi::Volume, "Громкость и звуковое устройство"),
+            deskcfg::TrayIcon::Layout => (Fi::Keyboard, "«РУС» или «ENG»; щелчок — выбор раскладки"),
+        };
+        let desc = if dock { "В Dock — всегда под стрелкой ˄" } else { desc };
+        y = row(pass, x, y, w, Some(glyph), icon.title(), desc, Ctl::Toggle(on_bar && !dock), (!dock).then_some(Deed::Taskbar(TaskbarDeed::TrayHidden(icon, on_bar))));
+    }
+    y = pass.note(x, y, w, "Выключенные значки — под стрелкой ˄ слева от часов: щелчок по ней показывает их.");
+
     y = pass.group(x, y, w, "Часы");
     let uptime = super::super::panel::shows(PanelPref::Uptime);
     y = row(pass, x, y, w, Some(Fi::Clock), "Показывать аптайм", "Время и время работы отвечают на разные вопросы", Ctl::Toggle(uptime), Some(Deed::Panel(PanelPref::Uptime, !uptime)));
     let date = super::super::panel::shows(PanelPref::Date);
     y = row(pass, x, y, w, Some(Fi::Calendar), "Показывать дату", "", Ctl::Toggle(date), Some(Deed::Panel(PanelPref::Date, !date)));
-    y = row(pass, x, y, w, Some(Fi::Keyboard), "Раскладка в трее", "Щелчок переключает, как Alt+Shift", Ctl::Value("Показывается"), None);
     y = pass.group(x, y, w, "Меню «Пуск»");
     nav_row(pass, x, y, w, Section::Start);
     let _ = p;

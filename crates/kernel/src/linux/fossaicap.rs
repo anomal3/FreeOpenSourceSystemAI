@@ -135,13 +135,16 @@ pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
     if (request >> 8) & 0xff != usize::from(b'F') {
         return Some(-e::ENOTTY);
     }
-    let capture = crate::ui::capture::syscall;
+    let capture = crate::ui::capture::source_syscall;
     Some(match request & 0xff {
         INFO => errno(capture(user_abi::CAP_INFO, arg, 0)),
         START => {
             let answer = errno(capture(user_abi::CAP_START, arg, 0));
             if answer == 0 {
                 device.started.store(true, Ordering::Relaxed);
+                // OBS's source captures for its preview whether it records
+                // or not: no red «recording» indicator for it (24.11).
+                crate::ui::capture::mark_shared();
             }
             answer
         }

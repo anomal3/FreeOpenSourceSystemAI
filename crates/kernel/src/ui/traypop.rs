@@ -27,6 +27,9 @@ pub enum Kind {
     Calendar,
     Volume,
     Quick,
+    /// The chevron's popup (24.11): a grid of the tray icons kept off the
+    /// taskbar, as in Windows.
+    Overflow,
 }
 
 /// Что делает строка окна.
@@ -44,7 +47,14 @@ pub enum Action {
     Settings,
     /// «Очистить» историю уведомлений.
     ClearNotes,
+    /// An icon in the chevron's popup — what a click on it on the taskbar
+    /// does.
+    Item(super::panel::TrayItem),
 }
+
+/// Cell of the chevron's popup (points at scale 1) and columns at most.
+const CELL_SIDE: u32 = 40;
+const CELL_COLUMNS: u32 = 4;
 
 /// Открытое окно трея.
 pub struct TrayPop {
@@ -98,6 +108,12 @@ impl TrayPop {
             }
             Kind::Network => (px(320), px(PAD + 28 + 8 + 52 + 16 + 32 + PAD)),
             Kind::Calendar => (px(CELL * 7 + PAD * 2), px(PAD + 28 + 18 + 12 + 24 + CELL_H * 6 + 8 + 32 + 12)),
+            Kind::Overflow => {
+                let count = super::panel::hidden_tray().len().max(1) as u32;
+                let columns = count.min(CELL_COLUMNS);
+                let rows = count.div_ceil(CELL_COLUMNS);
+                (px(CELL_SIDE * columns + 8 * 2), px(CELL_SIDE * rows + 8 * 2))
+            }
         };
         // Нижний предел не выше верхнего: на узком экране `clamp` иначе паникует.
         let low = area.x + px(12) as i32;
@@ -131,6 +147,12 @@ impl TrayPop {
         self.rows.iter().find(|(rect, _)| rect.contains(x, y)).map(|(_, action)| *action)
     }
 
+    /// Rows and cells as `traypop:<n> at X,Y WxH` (24.11, for the bench).
+    #[must_use]
+    pub fn spots(&self) -> Vec<String> {
+        self.rows.iter().enumerate().map(|(n, (rect, _))| alloc::format!("traypop:{n} at {},{} {}x{}", rect.x, rect.y, rect.w, rect.h)).collect()
+    }
+
     /// Громкость под точкой `x` экрана — для ползунка, который тянут.
     #[must_use]
     pub fn volume_at(&self, x: i32) -> Option<u8> {
@@ -159,6 +181,43 @@ impl TrayPop {
         let left = px(PAD) as i32;
         let inner_w = bounds.w - px(PAD * 2);
         match self.kind {
+            Kind::Overflow => {
+                // Each icon as on the taskbar, in a cell that lights up
+                // under the pointer like the panel's buttons (clip of 24.11).
+                let items = super::panel::hidden_tray();
+                let cell = px(CELL_SIDE);
+                let glyph = px(18);
+                for (n, item) in items.iter().enumerate() {
+                    let (col, row) = (n as u32 % CELL_COLUMNS, n as u32 / CELL_COLUMNS);
+                    let rect = Rect::new(px(8) as i32 + (col * cell) as i32, px(8) as i32 + (row * cell) as i32, cell, cell);
+                    let (gx, gy) = (rect.x + (cell as i32 - glyph as i32) / 2, rect.y + (cell as i32 - glyph as i32) / 2);
+                    match item {
+                        super::panel::TrayItem::Network => {
+                            let ink = if crate::net::has_address() { p.ink } else { p.ink3 };
+                            glyphicon::draw(s, Icon::Network, gx, gy, glyph, ink, 255);
+                        }
+                        super::panel::TrayItem::Volume => {
+                            let quiet = !crate::sound::present() || crate::sound::volume() == 0;
+                            let ink = if crate::sound::present() { p.ink } else { p.ink3 };
+                            iconset::draw(s, if quiet { Fi::VolumeOff } else { Fi::Volume }, gx, gy, glyph, ink, 255);
+                        }
+                        super::panel::TrayItem::Layout => {
+                            let tag = match crate::input::keymap::layout() {
+                                Layout::Ru => "РУС",
+                                Layout::Us => "ENG",
+                            };
+                            paint::text_centered(ctx, s, Role::Caption, rect, tag, p.ink);
+                        }
+                        super::panel::TrayItem::Recording => {
+                            let dot = px(12);
+                            let spot = Rect::new(rect.x + (cell as i32 - dot as i32) / 2, rect.y + (cell as i32 - dot as i32) / 2, dot, dot);
+                            draw::rounded(s, spot, dot / 2, p.bad, 255);
+                        }
+                        _ => {}
+                    }
+                    rows.push((rect.translate(ox, oy), Action::Item(*item)));
+                }
+            }
             Kind::Volume => {
                 let mut y = px(PAD) as i32;
                 let head = Rect::new(left, y, inner_w, px(28));

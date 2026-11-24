@@ -378,6 +378,50 @@ pub enum TrayItem {
     /// Screen recording runs (22.11): red dot and elapsed time; a click
     /// stops it.
     Recording,
+    /// The chevron (24.11): a popup with the icons kept off the taskbar.
+    Overflow,
+}
+
+impl TrayItem {
+    /// The setting behind a hideable icon.
+    #[must_use]
+    pub const fn icon(self) -> Option<deskcfg::TrayIcon> {
+        match self {
+            TrayItem::Recording => Some(deskcfg::TrayIcon::Recording),
+            TrayItem::Network => Some(deskcfg::TrayIcon::Network),
+            TrayItem::Volume => Some(deskcfg::TrayIcon::Volume),
+            TrayItem::Layout => Some(deskcfg::TrayIcon::Layout),
+            TrayItem::Clock | TrayItem::Bell | TrayItem::Overflow => None,
+        }
+    }
+}
+
+/// Tray icons that exist now but live under the chevron (24.11), in tray
+/// order. The recording indicator exists only while a recording runs.
+#[must_use]
+pub fn hidden_tray() -> Vec<TrayItem> {
+    [TrayItem::Recording, TrayItem::Network, TrayItem::Volume, TrayItem::Layout]
+        .into_iter()
+        .filter(|item| item.icon().is_some_and(deskcfg::tray_hidden))
+        .filter(|item| *item != TrayItem::Recording || super::capture::elapsed_s().is_some())
+        .collect()
+}
+
+/// Start is open (24.11): read without the desktop's lock by the input path
+/// (`ui::dispatch`), which then waits for a busy desktop longer.
+static START_OPEN: AtomicBool = AtomicBool::new(false);
+
+#[must_use]
+pub fn start_open() -> bool {
+    START_OPEN.load(Ordering::Relaxed)
+}
+
+/// The chevron's popup is open — the chevron is drawn pressed.
+static OVERFLOW_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// The compositor opened or closed the chevron's popup.
+pub fn set_overflow_open(open: bool) {
+    OVERFLOW_OPEN.store(open, Ordering::Relaxed);
 }
 
 /// Elapsed time of the screen recording for the tray: `0:07`, `12:34`,
@@ -1039,6 +1083,19 @@ impl Panel {
         self.tray.iter().find(|(known, _)| *known == item).map(|(_, rect)| rect.translate(self.rect.x, self.rect.y))
     }
 
+    /// Tray icons on the plate as `tray:<item> at X,Y WxH`, screen
+    /// coordinates (24.11, for the bench).
+    #[must_use]
+    pub fn tray_spots(&self) -> Vec<String> {
+        self.tray
+            .iter()
+            .map(|(item, rect)| {
+                let rect = rect.translate(self.rect.x, self.rect.y);
+                alloc::format!("tray:{} at {},{} {}x{}", alloc::format!("{item:?}").to_lowercase(), rect.x, rect.y, rect.w, rect.h)
+            })
+            .collect()
+    }
+
     pub fn anchor(&self, app: App) -> Option<Rect> {
         let local = if let Some(dock) = self.dock {
             if !dock.stack.is_empty() {
@@ -1218,10 +1275,25 @@ impl Panel {
         let caption = ctx.face(Role::Caption);
         let clock_w = body.width(&clock).max(date.as_deref().map_or(0, |date| caption.width(date)));
         let _ = mono;
-        // Сеть, звук, раскладка, часы, колокол (макет 05).
-        let mut status_w = (glyph + step) * 2 + body.width(lang) + step + clock_w + step + glyph;
+        // Сеть, звук, раскладка, часы, колокол (макет 05). Icons set to
+        // «hide» (24.11) live under the chevron at the left of the tray.
+        let on_bar = |icon: deskcfg::TrayIcon| !deskcfg::tray_hidden(icon);
+        let overflow = !hidden_tray().is_empty();
+        let mut status_w = clock_w + step + glyph;
+        if overflow {
+            status_w += glyph + step;
+        }
+        if on_bar(deskcfg::TrayIcon::Network) {
+            status_w += glyph + step;
+        }
+        if on_bar(deskcfg::TrayIcon::Volume) {
+            status_w += glyph + step;
+        }
+        if on_bar(deskcfg::TrayIcon::Layout) {
+            status_w += body.width(lang) + step;
+        }
         // Screen recording (22.11): red dot and elapsed time before the network.
-        let recording = super::capture::elapsed_s().map(recording_text);
+        let recording = super::capture::elapsed_s().filter(|_| on_bar(deskcfg::TrayIcon::Recording)).map(recording_text);
         let dot = ctx.px(10);
         let recording_w = recording.as_deref().map_or(0, |text| dot + ctx.px(6) + body.width(text) + step);
         status_w += recording_w;
@@ -1334,6 +1406,18 @@ impl Panel {
                 mini_ui::classic::shallow(&mut self.surface, well, t);
             }
 
+            // The chevron (24.11): hidden tray icons in a popup above it.
+            if overflow {
+                let button = Rect::new(x - half, plate.y + ctx.px(4) as i32, glyph + step, plate.h.saturating_sub(ctx.px(8)));
+                if OVERFLOW_OPEN.load(Ordering::Relaxed) {
+                    draw::rounded(&mut self.surface, button, m.round_row, p.hover2.color, p.hover2.alpha);
+                }
+                let icon = if self.cfg.edge == deskcfg::Edge::Top { Icon::ChevronDown } else { Icon::ChevronUp };
+                glyphicon::draw(&mut self.surface, icon, x, plate.y + (plate.h as i32 - glyph as i32) / 2, glyph, p.ink2, 255);
+                self.tray.push((TrayItem::Overflow, Rect::new(x - half, plate.y, glyph + step, plate.h)));
+                x += (glyph + step) as i32;
+            }
+
             // Screen recording (22.11): red dot and elapsed time.
             if let Some(text) = recording.as_deref() {
                 let spot = Rect::new(x, plate.y + (plate.h as i32 - dot as i32) / 2, dot, dot);
@@ -1348,55 +1432,42 @@ impl Panel {
             // когда карты нет или адрес не получен. Приглушённый, а не другой
             // значок: «нет сети» в наборе значков нет, а чужой значок сказал бы
             // не то. Разница между «нет карты» и «нет адреса» — в меню трея.
-            let net_ink = match status.net {
-                NetState::Up => p.ink,
-                NetState::NoAddress | NetState::Absent => p.ink3,
-            };
-            // Проводная сеть — монитор, как значок Ethernet в Windows (24.10:
-            // глобус с крестом читался как «нет сети» и при сети).
-            glyphicon::draw(
-                &mut self.surface,
-                Icon::Network,
-                x,
-                plate.y + (plate.h as i32 - glyph as i32) / 2,
-                glyph,
-                net_ink,
-                255,
-            );
-            // Область попадания шире значка на полшага в обе стороны: значок в
-            // четырнадцать точек — цель для меткого, а трей должен нажиматься
-            // с первого раза.
-            self.tray.push((
-                TrayItem::Network,
-                Rect::new(x - half, plate.y, glyph + step, plate.h),
-            ));
-            x += (glyph + step) as i32;
+            if on_bar(deskcfg::TrayIcon::Network) {
+                let net_ink = match status.net {
+                    NetState::Up => p.ink,
+                    NetState::NoAddress | NetState::Absent => p.ink3,
+                };
+                // Проводная сеть — монитор, как значок Ethernet в Windows (24.10:
+                // глобус с крестом читался как «нет сети» и при сети).
+                glyphicon::draw(&mut self.surface, Icon::Network, x, plate.y + (plate.h as i32 - glyph as i32) / 2, glyph, net_ink, 255);
+                // Область попадания шире значка на полшага в обе стороны: значок в
+                // четырнадцать точек — цель для меткого, а трей должен нажиматься
+                // с первого раза.
+                self.tray.push((TrayItem::Network, Rect::new(x - half, plate.y, glyph + step, plate.h)));
+                x += (glyph + step) as i32;
+            }
 
-            // Звук: перечёркнутый динамик — карты нет или звук на нуле.
-            let quiet = !crate::sound::present() || crate::sound::volume() == 0;
-            iconset::draw(
-                &mut self.surface,
-                if quiet { Fi::VolumeOff } else { Fi::Volume },
-                x,
-                plate.y + (plate.h as i32 - glyph as i32) / 2,
-                glyph,
-                if crate::sound::present() { p.ink } else { p.ink3 },
-                255,
-            );
-            self.tray.push((TrayItem::Volume, Rect::new(x - half, plate.y, glyph + step, plate.h)));
-            x += (glyph + step) as i32;
+            if on_bar(deskcfg::TrayIcon::Volume) {
+                // Звук: перечёркнутый динамик — карты нет или звук на нуле.
+                let quiet = !crate::sound::present() || crate::sound::volume() == 0;
+                iconset::draw(
+                    &mut self.surface,
+                    if quiet { Fi::VolumeOff } else { Fi::Volume },
+                    x,
+                    plate.y + (plate.h as i32 - glyph as i32) / 2,
+                    glyph,
+                    if crate::sound::present() { p.ink } else { p.ink3 },
+                    255,
+                );
+                self.tray.push((TrayItem::Volume, Rect::new(x - half, plate.y, glyph + step, plate.h)));
+                x += (glyph + step) as i32;
+            }
 
-            let width = paint::text(
-                ctx,
-                &mut self.surface,
-                Role::Body,
-                x,
-                paint::baseline(ctx, Role::Body, plate),
-                lang,
-                p.ink,
-            );
-            self.tray.push((TrayItem::Layout, Rect::new(x - half, plate.y, width + step, plate.h)));
-            x += (width + step) as i32;
+            if on_bar(deskcfg::TrayIcon::Layout) {
+                let width = paint::text(ctx, &mut self.surface, Role::Body, x, paint::baseline(ctx, Role::Body, plate), lang, p.ink);
+                self.tray.push((TrayItem::Layout, Rect::new(x - half, plate.y, width + step, plate.h)));
+                x += (width + step) as i32;
+            }
 
             // Часы и дата в две строки, прижаты вправо, как в Windows.
             let right = x + clock_w as i32;
@@ -1563,19 +1634,35 @@ impl Panel {
         let body = ctx.face(Role::Body);
         let lang = lang_tag();
         let (time, date) = short_clock(status);
-        let mut out = alloc::vec![(TrayItem::Network, glyph + step), (TrayItem::Volume, glyph + step)];
+        let on_bar = |icon: deskcfg::TrayIcon| !deskcfg::tray_hidden(icon);
+        let mut out = Vec::new();
+        // The chevron first (24.11): the Dock keeps every hideable icon
+        // under it.
+        if !hidden_tray().is_empty() {
+            out.push((TrayItem::Overflow, glyph + step));
+        }
         // Screen recording (22.11): a red dot first (the time is in its row
         // along a horizontal Dock only).
-        if let Some(seconds) = super::capture::elapsed_s() {
+        if let Some(seconds) = super::capture::elapsed_s().filter(|_| on_bar(deskcfg::TrayIcon::Recording)) {
             let len = if vertical { glyph + step } else { ctx.px(16) + caption.width(&recording_text(seconds)) + step };
-            out.insert(0, (TrayItem::Recording, len));
+            out.push((TrayItem::Recording, len));
+        }
+        if on_bar(deskcfg::TrayIcon::Network) {
+            out.push((TrayItem::Network, glyph + step));
+        }
+        if on_bar(deskcfg::TrayIcon::Volume) {
+            out.push((TrayItem::Volume, glyph + step));
         }
         if vertical {
-            out.push((TrayItem::Layout, u32::from(caption.line) + step));
+            if on_bar(deskcfg::TrayIcon::Layout) {
+                out.push((TrayItem::Layout, u32::from(caption.line) + step));
+            }
             let lines = if date.is_empty() { 1 } else { 2 };
             out.push((TrayItem::Clock, u32::from(caption.line) * lines + step));
         } else {
-            out.push((TrayItem::Layout, caption.width(lang) + step));
+            if on_bar(deskcfg::TrayIcon::Layout) {
+                out.push((TrayItem::Layout, caption.width(lang) + step));
+            }
             out.push((TrayItem::Clock, body.width(&time).max(caption.width(&date)) + step));
         }
         out.push((TrayItem::Bell, glyph + step));
@@ -1727,6 +1814,21 @@ impl Panel {
                 TrayItem::Bell => {
                     let (x, y) = center(glyph);
                     iconset::draw(&mut self.surface, Fi::Bell, x, y, glyph, p.ink2, 255);
+                }
+                TrayItem::Overflow => {
+                    if OVERFLOW_OPEN.load(Ordering::Relaxed) {
+                        let side = glyph + ctx.px(10);
+                        let (x, y) = center(side);
+                        draw::rounded(&mut self.surface, Rect::new(x, y, side, side), m.round_row, p.hover2.color, p.hover2.alpha);
+                    }
+                    // Points away from the edge: the popup opens that way.
+                    let icon = match self.cfg.edge {
+                        deskcfg::Edge::Top => Icon::ChevronDown,
+                        deskcfg::Edge::Left => Icon::ChevronRight,
+                        deskcfg::Edge::Right | deskcfg::Edge::Bottom => Icon::ChevronUp,
+                    };
+                    let (x, y) = center(glyph);
+                    glyphicon::draw(&mut self.surface, icon, x, y, glyph, p.ink2, 255);
                 }
                 TrayItem::Layout => {
                     paint::text_centered(ctx, &mut self.surface, Role::Caption, rect, lang_tag(), p.ink);
@@ -4732,6 +4834,8 @@ struct Fingerprint {
     layout: u8,
     /// Тема могла смениться, а вместе с ней все цвета плашки.
     dark: bool,
+    /// Tray icons under the chevron and whether its popup is open (24.11).
+    tray: u16,
 }
 
 impl Fingerprint {
@@ -4784,6 +4888,7 @@ impl Fingerprint {
             net: status.net as u8,
             layout: crate::input::keymap::layout() as u8,
             dark: theme::is_dark(),
+            tray: u16::from(deskcfg::taskbar().tray_hidden) | (u16::from(OVERFLOW_OPEN.load(Ordering::Relaxed)) << 8) | (u16::from(deskcfg::taskbar().mode == deskcfg::Mode::Dock) << 9),
         }
     }
 }

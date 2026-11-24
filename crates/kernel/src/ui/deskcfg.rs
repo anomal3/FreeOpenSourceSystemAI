@@ -99,10 +99,72 @@ pub struct Taskbar {
     /// Windows): `false` — на всех панелях все окна (по умолчанию: так ждёт
     /// Роман), `true` — только на панели монитора, где открыто окно.
     pub own: bool,
+    /// Tray icons kept under the chevron (24.11, like Windows «Другие значки
+    /// в области уведомлений»): bits of [`TrayIcon::bit`]. The Dock keeps all
+    /// of them under the chevron whatever is set here.
+    pub tray_hidden: u8,
+}
+
+/// A tray icon that can live on the taskbar or under the chevron (24.11).
+/// The clock and the bell always stay on the taskbar, as in Windows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrayIcon {
+    /// Screen recording indicator (only while a recording runs).
+    Recording,
+    Network,
+    Volume,
+    /// Input language («РУС»/«ENG»).
+    Layout,
+}
+
+impl TrayIcon {
+    pub const ALL: [TrayIcon; 4] = [TrayIcon::Recording, TrayIcon::Network, TrayIcon::Volume, TrayIcon::Layout];
+
+    #[must_use]
+    pub const fn bit(self) -> u8 {
+        match self {
+            TrayIcon::Recording => 1,
+            TrayIcon::Network => 2,
+            TrayIcon::Volume => 4,
+            TrayIcon::Layout => 8,
+        }
+    }
+
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            TrayIcon::Recording => "rec",
+            TrayIcon::Network => "net",
+            TrayIcon::Volume => "vol",
+            TrayIcon::Layout => "lang",
+        }
+    }
+
+    #[must_use]
+    pub const fn title(self) -> &'static str {
+        match self {
+            TrayIcon::Recording => "Запись экрана",
+            TrayIcon::Network => "Сеть",
+            TrayIcon::Volume => "Громкость",
+            TrayIcon::Layout => "Язык ввода",
+        }
+    }
+
+    #[must_use]
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|icon| icon.tag() == tag)
+    }
+}
+
+/// Is the tray icon under the chevron now (setting, or the Dock).
+#[must_use]
+pub fn tray_hidden(icon: TrayIcon) -> bool {
+    let cfg = taskbar();
+    cfg.mode == Mode::Dock || cfg.tray_hidden & icon.bit() != 0
 }
 
 impl Taskbar {
-    pub const DEFAULT: Self = Self { mode: Mode::Panel, edge: Edge::Bottom, autohide: false, icon: 40, small: false, all: false, own: false };
+    pub const DEFAULT: Self = Self { mode: Mode::Panel, edge: Edge::Bottom, autohide: false, icon: 40, small: false, all: false, own: false, tray_hidden: 0 };
 
     fn parse(text: &str) -> Self {
         let mut out = Self::DEFAULT;
@@ -120,6 +182,9 @@ impl Taskbar {
                 "small" => out.small = value == "on",
                 "monitors" => out.all = value == "all",
                 "buttons" => out.own = value == "own",
+                "tray_hide" => {
+                    out.tray_hidden = value.split(',').filter_map(TrayIcon::from_tag).fold(0, |bits, icon| bits | icon.bit());
+                }
                 "icon" => {
                     if let Ok(size) = value.parse::<u32>() {
                         out.icon = size.clamp(ICON_MIN, ICON_MAX);
@@ -132,15 +197,17 @@ impl Taskbar {
     }
 
     fn format(self) -> String {
+        let hidden: Vec<&str> = TrayIcon::ALL.iter().filter(|icon| self.tray_hidden & icon.bit() != 0).map(|icon| icon.tag()).collect();
         alloc::format!(
-            "mode:{} edge:{} autohide:{} icon:{} small:{} monitors:{} buttons:{}",
+            "mode:{} edge:{} autohide:{} icon:{} small:{} monitors:{} buttons:{} tray_hide:{}",
             if self.mode == Mode::Dock { "dock" } else { "panel" },
             self.edge.tag(),
             if self.autohide { "on" } else { "off" },
             self.icon,
             if self.small { "on" } else { "off" },
             if self.all { "all" } else { "main" },
-            if self.own { "own" } else { "all" }
+            if self.own { "own" } else { "all" },
+            if hidden.is_empty() { String::from("-") } else { hidden.join(",") }
         )
     }
 }
@@ -438,6 +505,8 @@ pub enum TaskbarDeed {
     /// Кнопки окон только на панели своего монитора (`true`) или на всех.
     OwnButtons(bool),
     ClearPins,
+    /// Tray icon under the chevron (`true`) or on the taskbar (24.11).
+    TrayHidden(TrayIcon, bool),
 }
 
 /// Что меняют «Параметры» на странице «Пуск».
@@ -488,6 +557,14 @@ pub fn apply_taskbar(deed: TaskbarDeed) -> (String, Result<(), crate::vfs::VfsEr
         TaskbarDeed::ClearPins => {
             return (String::from("закреплённые откреплены"), set_task_pins(Vec::new()));
         }
+        TaskbarDeed::TrayHidden(icon, hidden) => {
+            if hidden {
+                value.tray_hidden |= icon.bit();
+            } else {
+                value.tray_hidden &= !icon.bit();
+            }
+            alloc::format!("«{}» — {}", icon.title(), if hidden { "под стрелкой ˄" } else { "на панели задач" })
+        }
     };
     (text, set_taskbar(value))
 }
@@ -535,6 +612,17 @@ pub fn command(words: &str) -> Taskbar {
             "main" => value.all = false,
             "own" => value.own = true,
             "everywhere" => value.own = false,
+            // Tray icons (24.11): `hide:net`, `show:vol`, `hide:rec,lang`.
+            other if other.starts_with("hide:") || other.starts_with("show:") => {
+                let hide = other.starts_with("hide:");
+                for icon in other[5..].split(',').filter_map(TrayIcon::from_tag) {
+                    if hide {
+                        value.tray_hidden |= icon.bit();
+                    } else {
+                        value.tray_hidden &= !icon.bit();
+                    }
+                }
+            }
             other => {
                 if let Some(edge) = Edge::from_tag(other) {
                     value.edge = edge;
