@@ -4219,6 +4219,7 @@ fn run(
         })));
     }
     note_linux(slot, linux);
+    fresh_signal_state(slot);
     // Признак поднимается после того, как процесс попал в таблицу: обработчик
     // отказа читает его без лока и вправе увидеть `true` только тогда, когда
     // программу уже есть где найти.
@@ -4622,6 +4623,46 @@ pub static LINUX_PENDING: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::ne
 /// Запасной стек сигналов потока Linux (`sigaltstack`): начало и размер.
 pub static LINUX_ALTSTACK: [(AtomicUsize, AtomicUsize); sched::MAX_TASKS] =
     [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; sched::MAX_TASKS];
+
+/// A program started by the kernel (desktop, shell `run`, init) begins with
+/// no blocked or pending signals, no alternate signal stack and no
+/// `clear_tid` (24.11.2026, hw-log18). These per-slot values used to be left
+/// as the slot's previous task had them (finished slots are handed out
+/// again once all ~1000 were used, oldest first - in hw-log18 from about
+/// task #1100 on, which is why only the late launches failed): glibc blocks
+/// every signal but SIGSETXID in a thread that is exiting, so a program that
+/// got such a slot
+/// started with SIGSEGV, SIGCHLD, SIGTERM... blocked, and `fork`/`execve`
+/// passed the mask down the whole tree (as they must). Proton launched from
+/// the desktop that way had winedevice.exe threads with SIGSEGV blocked, and
+/// the deliberate fault of ntoskrnl's `call_driver_init` (return address
+/// ORed with 0xffff800000000000, repaired by Wine's SIGSEGV handler) killed
+/// the process: mask `0xfffffffe6ffad4f8` = everything but Wine's
+/// `server_block_set`. `fork`, `clone` and `execve` keep setting the mask
+/// they inherit, as in Linux.
+fn fresh_signal_state(slot: usize) {
+    if slot >= sched::MAX_TASKS {
+        return;
+    }
+    let stale = LINUX_SIGMASK[slot].swap(0, Ordering::Relaxed);
+    LINUX_PENDING[slot].store(0, Ordering::Relaxed);
+    LINUX_ALTSTACK[slot].0.store(0, Ordering::Relaxed);
+    LINUX_ALTSTACK[slot].1.store(0, Ordering::Relaxed);
+    LINUX_CLEAR_TID[slot].store(0, Ordering::Relaxed);
+    #[cfg(target_arch = "x86_64")]
+    crate::linux::signal::slot_reused(slot);
+    if stale != 0 && STALE_MASKS.fetch_add(1, Ordering::Relaxed) < 8 {
+        kprintln!(
+            "  user        : {} got slot {slot} with a signal mask {stale:#x} left by its previous task: cleared",
+            sched::current()
+        );
+    }
+}
+
+/// How many kernel-started programs got a slot whose previous task left a
+/// signal mask behind (cleared by [`fresh_signal_state`]; the first eight are
+/// logged).
+static STALE_MASKS: AtomicUsize = AtomicUsize::new(0);
 
 /// Что новая задача должна знать о потоке Linux (`clone`, фаза 71c).
 #[cfg(target_arch = "x86_64")]

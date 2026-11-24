@@ -9258,7 +9258,18 @@ pub const ALL: &[Scenario] = &[
             Step::Await("/opt/debian/bin/bash: exited with code 0", 30_000),
             // Фаза 71c: программа на glibc — потоки, сигналы, /proc, /dev,
             // каналы и каталоги (`libc/linux/check.c`).
+            // hw-log18: a program started by the system must not inherit the
+            // signal mask, pending set or altstack the slot's last task left
+            // (exiting glibc threads block everything; winedevice.exe died of
+            // its own SIGSEGV with SIGSEGV blocked). The first run leaves
+            // such slots behind, the second checks its start state.
+            Step::Line("run /opt/debian/usr/libexec/fossai/linuxcheck --leave-masked"),
+            Step::Await("linuxcheck: leaving 3000 ended threads and a masked main thread", 300_000),
+            Step::Await("/opt/debian/usr/libexec/fossai/linuxcheck: exited with code 0", 30_000),
             Step::Line("run /opt/debian/usr/libexec/fossai/linuxcheck"),
+            Step::Await("linuxcheck: ok a program started by the system has no blocked or pending signals and no altstack", 120_000),
+            // ...and it did get such a slot (the kernel cleared the mask).
+            Step::AwaitAny("left by its previous task: cleared", 10_000),
             Step::Await("linuxcheck: ok four threads and a mutex", 120_000),
             Step::Await("linuxcheck: ok __thread is per thread, join returns the value", 30_000),
             Step::Await("linuxcheck: ok timed wait ends at its deadline", 30_000),
@@ -10869,6 +10880,11 @@ pub const ALL: &[Scenario] = &[
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("power never"),
             Step::Await("screen off: never", 15_000),
+            // hw-log18: the second and third launches start their bash on
+            // slots that Wine threads of the first one left - glibc blocks
+            // every signal in an exiting thread, and that mask used to stay
+            // with the slot (winedevice.exe then ran with SIGSEGV blocked).
+            // The kernel now logs "got slot N with a signal mask ... cleared".
             Step::Line("run -b /opt/debian/bin/bash /opt/proton/bin/fossai-proton --fresh /opt/proton/share/fossai/d3dprobe.exe monitors"),
             Step::Await("d3dprobe: done, monitors", 900_000),
             Step::Wait(20_000),

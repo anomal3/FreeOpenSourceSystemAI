@@ -52,6 +52,10 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static long counter;
 static __thread int own;
 
+static void *end_at_once(void *arg) {
+    return arg;
+}
+
 static void *count_up(void *arg) {
     own = (int)(long)arg;
     for (int i = 0; i < 100000; i++) {
@@ -115,7 +119,40 @@ int main(int argc, char **argv) {
         int open = fcntl(atoi(argv[3]), F_GETFD) == 0;
         return closed && open ? 0 : 1;
     }
+    /* What a program started by the system finds (24.11.2026, hw-log18):
+     * nothing blocked, nothing pending, no alternate stack - whatever the
+     * task that had its slot before left behind. `--leave-masked` is that
+     * task: threads that end (glibc blocks every signal in an exiting
+     * thread), a main thread with everything blocked and an altstack. The
+     * kernel hands out slots of finished tasks only once all ~1000 were used
+     * (then the oldest first), so it ends 3000 threads: afterwards the oldest
+     * finished slots are its own. */
+    sigset_t initial, start_pending;
+    sigprocmask(SIG_BLOCK, NULL, &initial);
+    sigpending(&start_pending);
+    stack_t initial_alt;
+    sigaltstack(NULL, &initial_alt);
+    int clean = sigisemptyset(&initial) && sigisemptyset(&start_pending) && (initial_alt.ss_flags & SS_DISABLE);
+    if (argc == 2 && strcmp(argv[1], "--leave-masked") == 0) {
+        for (int round = 0; round < 375; round++) {
+            pthread_t ending[8];
+            for (int i = 0; i < 8; i++) pthread_create(&ending[i], NULL, end_at_once, NULL);
+            for (int i = 0; i < 8; i++) pthread_join(ending[i], NULL);
+        }
+        static char alt[65536];
+        stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt, .ss_flags = 0};
+        sigaltstack(&ss, NULL);
+        sigset_t all;
+        sigfillset(&all);
+        sigprocmask(SIG_BLOCK, &all, NULL);
+        raise(SIGUSR1);
+        printf("linuxcheck: leaving 3000 ended threads and a masked main thread\n");
+        fflush(stdout);
+        return 0;
+    }
     printf("linuxcheck: %s, glibc %s\n", argv[0], gnu_get_libc_version());
+    check(clean, "a program started by the system has no blocked or pending signals and no altstack");
+    if (argc == 2 && strcmp(argv[1], "--start-state") == 0) return failed;
 
     /* Потоки и замок: неатомарный счётчик сходится только под замком. */
     pthread_t threads[4];
