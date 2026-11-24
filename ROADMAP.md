@@ -18071,3 +18071,82 @@ Rupor - см. выше (дело установщика/клиента).
 у winedevice; строки `got slot ... cleared` (сколько раз маска осталась бы);
 в `fenceirq:` perf-diag - «ended by the interrupt ...» против «found the fence
 done only at the backstop» (пропуски) и «interrupt to waiter N us».
+
+## Rupor: Linux-клиент мессенджера Романа на FossAi (24-25.11) - **частично: окно и клиент .NET поднимаются в QEMU, WebKit ещё не рисует**
+
+Роман: «собери Linux-клиент Рупора и положи в FossAi». Клиент -
+`RuporAppAvalonia.Desktop` (.NET 9 self-contained, Avalonia 11.3 на X11,
+Blazor-интерфейс в WebKitGTK через `WebView.Avalonia.Linux.Cross`).
+
+**Путь - X11 через Xwayland (rootful), не Wayland.** У Avalonia 11.3 нет
+бэкенда Wayland, а WebView библиотеки сам ставит GTK на X11
+(`gdk_set_allowed_backends("x11")`), берёт XID окна GTK и вкладывает его в
+окно Avalonia (XReparentWindow). Поэтому: Xwayland 24.1 из Debian 13 -
+обычный клиент сервера Wayland ядра, rootful, одно окно стола «Рупор» (рамку
+рисует стол: `wayland.rs` `framed_app` - `set_app_id`
+`org.freedesktop.Xwayland`), внутри - свой мини-WM `rupor-wm`
+(`libc/linux/rupor-wm.c`, Xlib): главное окно клиента всегда во весь корень
+и следует за размером окна стола, остальные окна - как просили (по центру),
+фокус - новому окну. Rootless Xwayland с XWM в ядре - позже (см. TODO).
+
+**Пакет** `rupor-1.9.50.fpk` (`xtask/src/rupor.rs`, `cargo xtask thirdparty
+--only rupor`, на носитель - с `FOSSAI_WITH_RUPOR=1`; ~790 МиБ распакованно):
+- клиент: `dotnet publish` linux-x64 self-contained, не single-file, из копии
+  исходников в `build/toolchain/rupor/src` (репозиторий Романа не трогается;
+  его `global.json` требует SDK 10.0.102, копия собирается любым SDK) или
+  готовый каталог `FOSSAI_RUPOR_PUBLISH`; `wwwroot/Rupor.styles.css` берётся
+  из бандла scoped CSS (у Романа его нет ни в одной Linux-сборке: правило
+  csproj ищет файл не под тем именем);
+- замыкание `DT_NEEDED` по 143 пакетам trixie (снимок 20261020): Xwayland,
+  xkbcomp, bash, WebKitWebProcess/NetworkProcess, TLS-модуль GIO, родные
+  библиотеки клиента и то, что он открывает сам (libX11 и расширения, GTK 3,
+  WebKitGTK 4.1, ICU 76, OpenSSL, fontconfig); своя glibc 2.41, `PT_INTERP`
+  всех программ - на неё; Mesa (EGL, llvmpipe) - `mesa::add`;
+- клиент просит `libwebkit2gtk-4.0.so.37` (в Debian 13 только 4.1): своя
+  библиотека-заглушка с этим soname и `DT_NEEDED libwebkit2gtk-4.1.so.0`
+  (dlsym по её handle находит функции 4.1);
+- пути, зашитые в бинарники: каталог процессов WebKit в
+  `libwebkit2gtk-4.1.so.0` -> `/opt/rupor/lib/webkit2gtk-4.1`; в Xwayland
+  `/bin/sh` -> `/tmp/xs`, каталог xkbcomp `/usr/bin` -> `/tmp/xb`, заголовок
+  rootful-окна -> «Рупор» (запускатель кладёт туда bash и xkbcomp пакета:
+  `/bin/sh` корня Debian 12 не работает с glibc 2.41 в `LD_LIBRARY_PATH`);
+- запускатель `rupor` (bash корня Debian): Xwayland `-displayfd -geometry
+  (1280x800, меньше на малом мониторе) -shm -dumbSched -fp built-ins -xkbdir`,
+  rupor-wm, клиент с `LANG=ru_RU.UTF-8` (данные C.UTF-8 под этим именем в
+  `LOCPATH`), свой `XDG_RUNTIME_DIR` (`~/.cache/rupor/run`: `/run/user/0` -
+  только имя сокета Wayland, а .NET держит там именованные мьютексы), без
+  песочницы WebKit, без композитинга GPU; .NET - как у Rider (W^X выкл.,
+  предел кучи 4 ГиБ, без диагностики); «Пуск» - «Рупор» со значком из
+  `Rupor.ico`, права `windows files net jit`.
+
+**Слой Linux:** `setuid/setgid/setreuid/setregid/setresuid/setresgid` на свои
+же id - успех, иначе `EPERM` (Xwayland в дочернем процессе `Popen` перед
+xkbcomp сбрасывает права и без этого выходил с кодом 127: «XKB: Failed to
+compile keymap»).
+
+**Что проверено в QEMU** (сценарий `rupor-linux`, после `install` с
+`FOSSAI_WITH_RUPOR=1`, сеть в интернет): `pkg install rupor` (55 с),
+Xwayland поднимается и открывает окно стола «Рупор» 1200x580 с рамкой стола,
+xkbcomp компилирует раскладку, rupor-wm управляет экраном, клиент .NET
+стартует (CoreCLR, Avalonia X11, GTK 3), открывает главное окно 1280x800
+(rupor-wm растягивает его на корень) и окно GTK с WebView, запускает
+WebKitNetworkProcess и WebKitWebProcess. Прогон 25.11 (до Mesa) -
+WebKitWebProcess падал на «Could not create default EGL display:
+EGL_BAD_PARAMETER»: без вендора EGL glvnd WebKit 2.52 не живёт даже без
+композитинга. Добавлена Mesa (llvmpipe) - результат см. ниже/в журнале
+прогона.
+
+**Осталось (TODO):**
+- довести WebKit до экрана входа (после Mesa: EGL surfaceless/X11 на
+  llvmpipe; если не хватит - `WEBKIT_DISABLE_DMABUF_RENDERER`, GBM);
+  проверить вход/SignalR/картинки по https (glib-networking + корни ядра);
+- `setitimer` (38) в слое Linux нет - Xwayland без него сыпал предупреждения,
+  сейчас обходится `-dumbSched`; `get_mempolicy` (239), `pidfd_open` (434),
+  SysV `shmget` (29) - ENOSYS (MIT-SHM и NUMA не нужны, клиенты откатываются);
+- rootless Xwayland + XWM в композиторе (окна X как окна стола, меню и
+  уведомления Рупора - отдельными окнами), курсор X, буфер обмена X<->Wayland;
+- звонки (GStreamer-плагины WebKit, WebRTC), уведомления;
+- `install` с Proton+Rupor на одном носителе дважды повис в установщике
+  сразу после «install media» (и у сценария Proton) - отдельно разобрать.
+- Проверка: `set FOSSAI_WITH_RUPOR=1` и `cargo xtask thirdparty --only rupor`,
+  затем `cargo xtask test -r -a x86_64 -s install,rupor-linux -j 1`.

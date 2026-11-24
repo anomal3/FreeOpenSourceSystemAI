@@ -138,6 +138,9 @@ enum How {
     /// 7-Zip (24.11): своим `makefile.gcc` в своём каталоге (архив
     /// исходников плоский) — см. [`crate::sevenzip`].
     SevenZip,
+    /// Rupor (24.11): the Linux client of Roman's messenger, Xwayland and
+    /// WebKitGTK from Debian 13 - see [`crate::rupor`].
+    Rupor,
 }
 
 /// Что распаковывать из архива LLVM для [`How::LlvmRuntimes`]: сборка
@@ -205,7 +208,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 29] = [
+const PROJECTS: [Project; 30] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -743,6 +746,18 @@ const PROJECTS: [Project; 29] = [
         how: How::SevenZip,
         installs: &["bin/7zz"],
     },
+    // Rupor (24.11): the Linux client (dotnet publish of Roman's sources) in
+    // a rootful Xwayland; the Debian packages and their hashes are in
+    // `crate::rupor`, here - the main one (Xwayland).
+    Project {
+        name: "rupor",
+        version: crate::rupor::VERSION,
+        url: "https://snapshot.debian.org/archive/debian/20261020T000000Z/pool/main/x/xwayland/xwayland_24.1.6-1_amd64.deb",
+        sha256: crate::rupor::MAIN_DEB.1,
+        unpacked: "debian",
+        how: How::Rupor,
+        installs: &[],
+    },
 ];
 
 /// Собрать чужие проекты под все указанные архитектуры: все или только
@@ -822,6 +837,16 @@ pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> 
         if project.how == How::SevenZip {
             for &arch in arches {
                 crate::sevenzip::build(arch)?;
+            }
+            continue;
+        }
+        if project.how == How::Rupor {
+            if only.is_empty() && !crate::rupor::enabled() {
+                say!("rupor skipped: FOSSAI_WITH_RUPOR=1 or --only rupor");
+                continue;
+            }
+            for &arch in arches {
+                crate::rupor::build(arch)?;
             }
             continue;
         }
@@ -1156,7 +1181,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         }
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
-        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java | How::Wine | How::Proton | How::Obs | How::Vlc | How::SevenZip => {
+        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java | How::Wine | How::Proton | How::Obs | How::Vlc | How::SevenZip | How::Rupor => {
             return Ok(());
         }
         How::NetSurf => crate::netsurf::build(source, &work, arch)?,

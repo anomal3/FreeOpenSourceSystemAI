@@ -1223,6 +1223,17 @@ struct Win {
     /// not taken them yet (busy, or the window is not open).
     limits: ((u32, u32), (u32, u32)),
     limits_due: bool,
+    /// 24.11 (Rupor): the desktop draws the frame (title band, buttons) -
+    /// for clients that never draw one: rootful Xwayland ([`framed_app`]).
+    framed: bool,
+}
+
+/// Clients whose toplevel gets the desktop's frame, by `xdg_toplevel.set_app_id`
+/// (24.11, the Linux client of Rupor): rootful Xwayland draws no decorations
+/// without `-decorate` (libdecor), and its window is a whole X screen - a
+/// program window, not a client-side-decorated one like Chromium or Qt.
+fn framed_app(app_id: &str) -> bool {
+    app_id == "org.freedesktop.Xwayland"
 }
 
 /// Hand the size limits of a toplevel to the desktop. `true` — still due.
@@ -2364,6 +2375,14 @@ impl Client {
                             win.op_due = window_op(pid, win.slot, 11, at).then_some((11, at));
                         }
                     }
+                    // `set_app_id` (24.11): before the window opens - whether
+                    // the desktop frames it.
+                    3 => {
+                        let app_id = args.string()?;
+                        if let Some(win) = self.wins.iter_mut().find(|win| win.toplevel == id && win.open.is_none()) {
+                            win.framed = framed_app(&app_id);
+                        }
+                    }
                     5 | 6 | 9 | 10 | 12 | 13 => {
                         // `resize(seat, serial, edges)`: у Wayland верх 1, низ 2,
                         // лево 4, право 8 — у стола свои биты.
@@ -2896,6 +2915,7 @@ impl Client {
                     pace_at_ms: 0,
                     limits: ((0, 0), (0, 0)),
                     limits_due: false,
+                    framed: false,
                 });
             }
             2 => {
@@ -3596,7 +3616,7 @@ impl Client {
                 };
                 // Без рамки стола: заголовок, вкладки и кнопки рисует клиент
                 // (Chromium) — иначе выходит «окно в окне».
-                if crate::ui::open_window_framed(pid, win.slot, &win.title, pixels, false).is_err() {
+                if crate::ui::open_window_framed(pid, win.slot, &win.title, pixels, win.framed).is_err() {
                     return;
                 }
                 let _ = crate::ui::style_window(pid, win.slot, user_abi::WIN_STYLE_RESIZABLE);

@@ -666,7 +666,7 @@ const DOTNET: [(&CStr16, &str); 3] = [
 ///
 /// Их отсутствие — не отказ: пакеты собирает `xtask`, и носитель, собранный без
 /// них, остаётся годным установочным носителем.
-const PACKAGES: [(&CStr16, &str); 19] = [
+const PACKAGES: [(&CStr16, &str); 20] = [
     (cstr16!("\\FREEOS\\PKG\\HELLO.FPK"), "hello-1.0.fpk"),
     (cstr16!("\\FREEOS\\PKG\\EXTRA.FPK"), "extra-1.0.fpk"),
     // Программа WinForms пакетом (фаза N8).
@@ -704,6 +704,9 @@ const PACKAGES: [(&CStr16, &str); 19] = [
     (cstr16!("\\FREEOS\\PKG\\OBS.FPK"), "obs-30.fpk"),
     // VLC из Debian 13 (24.11.2026) — только если собран и `FOSSAI_WITH_VLC=1`.
     (cstr16!("\\FREEOS\\PKG\\VLC.FPK"), "vlc-3.0.fpk"),
+    // Rupor, the Linux client of Roman's messenger (24.11.2026) - only if
+    // built and `FOSSAI_WITH_RUPOR=1`.
+    (cstr16!("\\FREEOS\\PKG\\RUPOR.FPK"), "rupor-1.9.50.fpk"),
 ];
 
 /// Размер файла по данным файловой системы.

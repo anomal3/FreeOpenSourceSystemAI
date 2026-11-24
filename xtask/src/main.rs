@@ -48,6 +48,7 @@ mod tmnf;
 mod wine;
 mod vlc;
 mod rider;
+mod rupor;
 mod ruststd;
 mod screenmedia;
 mod sevenzip;
