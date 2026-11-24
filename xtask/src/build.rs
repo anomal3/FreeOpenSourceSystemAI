@@ -349,7 +349,7 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 64] = [
+pub const USER_PROGRAMS: [&str; 65] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sockfd", "sshd",
     "cat", "sysupdate", "fetch", "memtest", "filemap", "posix", "winshow", "sysmon", "files",
@@ -369,6 +369,8 @@ pub const USER_PROGRAMS: [&str; 64] = [
     "deskicon",
     // «Сетевые учётные данные»: \\host\share с вводом имени и пароля (24.11).
     "netlogon",
+    // «Фотографии»: просмотр фото (24.11).
+    "photos",
 ];
 
 /// Программы, которые в `/bin` **не** едут.

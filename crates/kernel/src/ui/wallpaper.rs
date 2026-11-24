@@ -735,9 +735,46 @@ fn start_convert(source: &str) {
     }
 }
 
+/// «Сделать фоном рабочего стола» from a program (24.11, «Фотографии»): the
+/// path of the picture in this key of the user scope of the settings store.
+/// The desktop takes it on its next tick, removes the key and applies the
+/// picture as «Параметры → Фон» would.
+pub const REQUEST_KEY: &str = "desktop/background_request";
+
+/// Store change counter last looked at for [`REQUEST_KEY`].
+static REQUEST_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Take a background asked by a program. `true` — the background changed.
+fn take_request() -> bool {
+    use crate::config::registry::{self, Scope};
+    let seq = registry::seq();
+    if REQUEST_SEQ.swap(seq, Ordering::Relaxed) == seq {
+        return false;
+    }
+    let Some(path) = registry::get_in(Scope::User, REQUEST_KEY) else {
+        return false;
+    };
+    let _ = registry::set(Scope::User, REQUEST_KEY, None);
+    REQUEST_SEQ.store(registry::seq(), Ordering::Relaxed);
+    let path = path.trim();
+    if !path.starts_with('/') || !matches!(crate::fs::read(path, 16), Some(Ok(_))) {
+        kprintln!("  desktop     : background asked for '{path}': no such file");
+        return false;
+    }
+    kprintln!("  desktop     : background asked by a program: {path}");
+    let (_, result) = apply(WallDeed::Image(String::from(path)));
+    if let Err(err) = result {
+        kprintln!("  desktop     : background {path} applied, not stored: {err}");
+    }
+    true
+}
+
 /// Работа вне кадра (из `ui::tick`): запустить перевод, дождаться его. `true`
 /// — фон сменился или сменилась строка состояния: перерисовать стол и «Фон».
 pub fn poll() -> bool {
+    if take_request() {
+        return true;
+    }
     let (wanted, job) = {
         let mut state = STATE.lock();
         let wanted = if state.job.is_none() { state.wanted.take() } else { None };
