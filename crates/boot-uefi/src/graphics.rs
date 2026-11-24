@@ -95,9 +95,13 @@ fn choose_mode(gop: &mut GraphicsOutput, policy: Policy) {
     // Просьба человека идёт первой, а список по умолчанию — за ней: если
     // прошивка такого режима не предлагает, выбор всё равно состоится, а не
     // оставит экран в том, что дала прошивка.
+    // Порядок по умолчанию: на эмуляторе (прошивка EDK II) - 1280x720, чтобы окно помещалось на экран
+    // разработчика; на настоящей машине - сначала 1920x1080 (24.11, Роман: <экран по умолчанию побольше>).
+    let emulator = alloc::format!("{}", uefi::system::firmware_vendor()).starts_with("EDK II");
+    let defaults: [(usize, usize); 3] = if emulator { WANTED_MODES } else { [(1920, 1080), (1280, 720), (1024, 768)] };
     let wanted = preferred
         .into_iter()
-        .chain(WANTED_MODES)
+        .chain(defaults)
         .collect::<alloc::vec::Vec<_>>();
     for (width, height) in wanted {
         // Режим забирается из итератора копией: итератор заимствует протокол, а
