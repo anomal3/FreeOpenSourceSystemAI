@@ -1009,6 +1009,8 @@ fn play(
 
     let mut captured: Option<String> = None;
     let mut captured2: Option<String> = None;
+    // Кадр звука гостя, с которого `Step::Tone` ищет тон (`Step::SoundMark`).
+    let mut sound_mark = 0usize;
     let fill = move |text: &str, captured: &Option<String>, second: &Option<String>| -> String {
         let text = match captured {
             Some(value) => text.replace("{}", value),
@@ -1686,13 +1688,18 @@ fn play(
             }
             Step::Tone(hz) => {
                 say!("  [{at:>6} мс] шаг {index}: в звуке гостя — тон {hz} Гц");
-                let (found, loud_ms) = tone::dominant(&sound_file(prefix))
+                let (found, loud_ms) = tone::dominant(&sound_file(prefix), sound_mark)
                     .with_context(|| format!("шаг {index}"))?;
                 say!("             {found} Гц, громко {loud_ms} мс");
                 let tolerance = (*hz / 50).max(5);
                 if found.abs_diff(*hz) > tolerance {
                     bail!("шаг {index}: в звуке {found} Гц, а не {hz}");
                 }
+            }
+            Step::SoundMark => {
+                // Нет файла — ещё ничего не звучало: метка в начале.
+                sound_mark = tone::frames(&sound_file(prefix)).unwrap_or(0);
+                say!("  [{at:>6} мс] шаг {index}: метка звука гостя на кадре {sound_mark}");
             }
             Step::Heard(min_ms) => {
                 say!("  [{at:>6} мс] шаг {index}: в звуке гостя слышно не меньше {min_ms} мс");
