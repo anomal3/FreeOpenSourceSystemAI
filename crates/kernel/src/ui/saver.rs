@@ -349,6 +349,15 @@ pub fn apply(deed: Deed) -> Result<String, String> {
         }
     };
     kprintln!("  settings    : saver {}", describe());
+    // The displays go dark before the saver is due: it would never show
+    // (hw-log18). Say it right away, not only on the page.
+    let off = crate::power::screen_off_after();
+    let said = if after() != 0 && off != 0 && off <= after() {
+        kprintln!("  saver       : screen off after {off} s comes before the saver ({} s) - it will not show", after());
+        format!("{said}; но экран гаснет раньше (через {}) — заставка не появится", after_text(off))
+    } else {
+        said
+    };
     match saved {
         Ok(()) => Ok(said),
         Err(err) => Err(format!("{said}, но не запомнено: {err}")),
@@ -753,10 +762,21 @@ fn finish(work: Work, took: u64) {
                 kprintln!("  saver       : photo {source} did not convert");
                 PREP.lock().failed.push(output);
             }
-            let mut prep = PREP.lock();
-            if prep.queue.is_empty() && !prep.dirty {
-                prep.urgent = false;
-                drop(prep);
+            // The guard must be gone before `refresh_settings`: redrawing
+            // Settings asks `preparing()`, which takes PREP again. With more
+            // photos queued the guard used to live on into the redraw - a
+            // self-deadlock on the spin lock with the desktop lock held, the
+            // whole OS hung right after the first photo was prepared
+            // (hw-log18: «Заставка» switched on with Settings open on «Питание»).
+            let all_done = {
+                let mut prep = PREP.lock();
+                let done = prep.queue.is_empty() && !prep.dirty;
+                if done {
+                    prep.urgent = false;
+                }
+                done
+            };
+            if all_done {
                 kprintln!("  saver       : all photos prepared");
             }
             refresh_settings();

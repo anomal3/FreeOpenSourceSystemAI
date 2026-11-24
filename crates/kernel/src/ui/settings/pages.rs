@@ -758,9 +758,15 @@ fn saver_rows(pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
         y = row(pass, x, y, w, Some(Fi::Lock), "Показывать экран блокировки при выходе", "Первое нажатие убирает заставку, дальше — вход", Ctl::Toggle(s.lock), Some(Deed::Saver(Sd::Lock(!s.lock))));
     }
     y = row(pass, x, y, w, Some(Fi::Eye), "Просмотр", "Показать заставку сейчас; любое движение её уберёт", Ctl::Button("Просмотр", Weight::Normal), Some(Deed::Saver(Sd::Preview)));
+    // hw-log18: screen off after 60 s, saver after 180 s - the saver never
+    // showed and nothing said why. The conflict is a row with the fix.
     let off = crate::power::screen_off_after();
     if s.enabled && off != 0 && off <= s.after {
-        y = pass.note(x, y + ctx.px(4) as i32, w, "Экран гаснет раньше, чем появится заставка: увеличьте срок гашения.");
+        let later = screen_off_options().into_iter().find(|&sec| sec == 0 || sec > s.after).unwrap_or(0);
+        let desc = format!("Экран гаснет через {}, а заставка — через {}", screen_off_text(off), saver::after_text(s.after));
+        let label = if later == 0 { String::from("Не гасить") } else { format!("Гасить через {}", screen_off_text(later)) };
+        y = row(pass, x, y, w, Some(Fi::Info), "Заставка не успеет появиться", &desc, Ctl::Button(&label, Weight::Primary), Some(Deed::ScreenOff(later)));
+        y = pass.note(x, y + ctx.px(4) as i32, w, "Срок гашения экрана — в «Система → Питание».");
     }
     y
 }
