@@ -5434,6 +5434,8 @@ impl Program {
         let exe = crate::linux_path::shown(&self.path);
         let (stack_low, stack_high) = self.linux_stack;
         let mut stack_done = false;
+        #[cfg(target_arch = "x86_64")]
+        let mut last_named: Option<(usize, alloc::string::String)> = None;
         for region in &self.mappings {
             // Стек главного потока — одной строкой: ленивая часть записана
             // областью, жадная — нет.
@@ -5444,13 +5446,40 @@ impl Program {
                 let _ = writeln!(out, "{stack_low:x}-{stack_high:x} rw-p 00000000 00:00 0 [stack]");
                 stack_done = true;
             }
+            // A mapped file by its own path (24.11.2026, VLC): the name
+            // `openat` saw for its node (`linux::mapnames`), the program file
+            // for its image window, nothing for an unremembered data file.
+            // Every file used to carry the program path, and VLC, which finds
+            // its plugins from the line of `libvlccore.so`, looked in
+            // `/opt/vlc/bin/vlc/plugins`.
+            #[cfg(target_arch = "x86_64")]
+            let mut image_name = |image: &ImageBacking| {
+                // A library is several regions in a row: one table walk.
+                let key = alloc::sync::Arc::as_ptr(&image.node) as *const () as usize;
+                if let Some((last, name)) = &last_named {
+                    if *last == key {
+                        return name.clone();
+                    }
+                }
+                let name = crate::linux::mapnames::name_of(&image.node).unwrap_or_else(|| {
+                    if region.base < WINDOW_BASE + IMAGE_LIMIT_BYTES {
+                        alloc::string::String::from(exe)
+                    } else {
+                        alloc::string::String::new()
+                    }
+                });
+                last_named = Some((key, name.clone()));
+                name
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let image_name = |_: &ImageBacking| alloc::string::String::from(exe);
             let (flags, name, offset) = match &region.source {
-                Source::Anonymous(anon) => (anon.flags, "", 0),
-                Source::ThreadStack => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, "", 0),
-                Source::Image(image) => (image.flags, exe, image.offset),
-                Source::Shared(shared) => (shared.flags, "/dev/shm", (shared.first * PAGE_SIZE) as u64),
-                Source::File(file) => (PageFlags::READ | PageFlags::USER, "", file.offset),
-                _ => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, "", 0),
+                Source::Anonymous(anon) => (anon.flags, alloc::string::String::new(), 0),
+                Source::ThreadStack => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, alloc::string::String::new(), 0),
+                Source::Image(image) => (image.flags, image_name(image), image.offset),
+                Source::Shared(shared) => (shared.flags, alloc::string::String::from("/dev/shm"), (shared.first * PAGE_SIZE) as u64),
+                Source::File(file) => (PageFlags::READ | PageFlags::USER, alloc::string::String::new(), file.offset),
+                _ => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, alloc::string::String::new(), 0),
             };
             // Устройство и номер узла у отображённого файла — настоящие, а не
             // `00:00 0` (31.10.2026): `jetbrainsd` Rider (GraalVM) ищет себя

@@ -879,6 +879,23 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
         Ok(path) => links::follow(&path),
         Err(err) => return err,
     };
+    // `O_TMPFILE` (VLC 24.11.2026): an unnamed file in a directory needs
+    // `linkat` from `/proc/self/fd` to ever get a name (Qt's `QSaveFile`),
+    // which the layer does not do - "the file system cannot", as Linux says
+    // for a file system without it. Qt (`QSaveFile`, `QTemporaryFile`),
+    // glibc `tmpfile` and VLC's `vlc_memfd` then take a named temporary
+    // file; `EINVAL` is "a real error" to Qt (its settings were not saved)
+    // and to VLC (no wl_shm video buffers).
+    const O_TMPFILE: usize = 0o20_000_000;
+    if flags & O_TMPFILE != 0 {
+        let cred = crate::user::credentials();
+        let native = crate::linux_path::resolve(&linux, cred);
+        return match crate::fs::resolve_as(cred, &native, Access::NONE) {
+            Some(Ok(node)) if node.metadata().kind == NodeKind::Directory => -e::EOPNOTSUPP,
+            Some(Ok(_)) => -e::ENOTDIR,
+            _ => -e::ENOENT,
+        };
+    }
     // Gamepads (24.11.2026): `/dev/input/eventN`, and sysfs through
     // `/sys/class/input/eventN`.
     let linux = evdev::resolve(&linux).unwrap_or(linux);
