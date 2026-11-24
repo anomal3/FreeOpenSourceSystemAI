@@ -73,8 +73,29 @@ pub(super) fn netlist_main(args: &Args) -> ! {
         }
         Err((code, _)) => text.push_str(&format!("err\t{code}\n")),
     }
+    println(&format!("files: netlist {path}: {}", text.lines().next().unwrap_or("")));
     let code = if write_file(out, text.as_bytes()).is_ok() { 0 } else { 1 };
     user_progs::exit(code)
+}
+
+/// The answer file of the child, read in 64 KiB pieces (one read of the
+/// whole [`NETLIST_LIMIT`] is refused by the kernel and read as nothing).
+fn read_answer(path: &str) -> String {
+    let fd = open(path);
+    if fd < 0 {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    let mut chunk = alloc::vec![0u8; 64 * 1024];
+    while bytes.len() < NETLIST_LIMIT {
+        let got = read(fd, &mut chunk);
+        if got <= 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..got as usize]);
+    }
+    close(fd);
+    String::from_utf8(bytes).unwrap_or_default()
 }
 
 /// Rows of a `--netlist` answer: `Ok((rows, dropped))` or the refusal.
@@ -132,7 +153,10 @@ impl Files {
             let code = user_progs::wait_now(load.task);
             if code != user_abi::ERR_AGAIN {
                 let load = self.net_load.take().expect("checked above");
-                let text = read_small_limit(&load.out, NETLIST_LIMIT).unwrap_or_default();
+                let text = read_answer(&load.out);
+                if text.is_empty() {
+                    println(&format!("files: netlist answer {} missing (child exit {code})", load.out));
+                }
                 let _ = remove(&load.out);
                 let took = monotonic_ms().saturating_sub(load.started);
                 if load.path == self.path {
