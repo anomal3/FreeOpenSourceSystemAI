@@ -9387,7 +9387,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("pkg install proton"),
-            Step::Await("pkg: installed proton 11, ", 2_400_000),
+            // В цепочке установленной системы пакет мог поставить сценарий,
+            // прошедший раньше (wayland-wine-monitors идёт перед proton).
+            Step::AwaitOneOf(&["pkg: installed proton 11, ", "is already installed"], 2_400_000),
             // Уведомление «установлен» съедало набор следующей строки.
             Step::Wait(10_000),
             // Первый запуск создаёт префикс (`wineboot`) — долго.
@@ -16318,6 +16320,11 @@ pub const ALL: &[Scenario] = &[
             // обязан сказать «новый файл».
             Step::Line("rm /home/roman/note.txt"),
             Step::Wait(1_000),
+            // То же для файлов дальше по сценарию: `main.rs` должен быть новым.
+            Step::Line("rm /home/roman/main.rs"),
+            Step::Wait(1_000),
+            Step::Line("rm /home/roman/copy.txt"),
+            Step::Wait(1_000),
             Step::Line("run -b /bin/notepad /home/roman/note.txt"),
             Step::Await("window      : 'Notepad' at", 30_000),
             Step::Await("notepad: new file /home/roman/note.txt", 15_000),
@@ -16380,7 +16387,9 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ctrl-z"),
             Step::Await("notepad: undo", 15_000),
             Step::Key("ctrl-shift-s"),
-            Step::Await("notepad: save dialog at /home/roman", 15_000),
+            // Окно «Сохранить как» — отдельная программа /bin/filedlg (20.11):
+            // её журнал Блокнот пересылает со своим префиксом.
+            Step::Await("notepad: filedlg: save at /home/roman", 15_000),
             Step::Wait(1_000),
             Step::Shot("03-save-as"),
             Step::Repeat("backspace", 8),
@@ -19008,8 +19017,9 @@ pub const ALL: &[Scenario] = &[
             // С фазы 69c разделы слева по макету: «Службы» шестые.
             Step::Key("6"),
             Step::Await("taskmgr: tab services", 15_000),
-            // Четыре: logger, dhcp, sshd и `drvd` (веха «драйверы», Д3).
-            Step::Await("taskmgr: services: 4 described, ", 15_000),
+            // Пять: logger, dhcp, sshd, `drvd` (веха «драйверы», Д3) и
+            // `autostart` (автозагрузка, фаза П3).
+            Step::Await("taskmgr: services: 5 described, ", 15_000),
             Step::Wait(800),
             Step::Shot("06-services"),
             Step::Key("alt-f4"),

@@ -315,7 +315,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 67] = [
+const PROGRAMS: [(&CStr16, &str); 79] = [
     // vDSO программ Linux (01.11.2026): время без входа в ядро. Не программа,
     // но едет тем же путём — так он есть и на установленной системе.
     (cstr16!("\\FREEOS\\BIN\\VDSO"), "vdso"),
@@ -390,6 +390,21 @@ const PROGRAMS: [(&CStr16, &str); 67] = [
     (cstr16!("\\FREEOS\\BIN\\SCRNREC"), "screenrec"),
     // Окно «Открыть» / «Сохранить как» / «Выбор папки» для всех программ (20.11).
     (cstr16!("\\FREEOS\\BIN\\FILEDLG"), "filedlg"),
+    // Системные инструменты (фаза П1/П2, 20.11) и «Администрирование» (П3):
+    // в `USER_PROGRAMS` они были с 20.11, сюда их не дописали — установленная
+    // система оставалась без них (ловит `installer_ships_every_program`).
+    (cstr16!("\\FREEOS\\BIN\\RUN"), "run"),
+    (cstr16!("\\FREEOS\\BIN\\CHARMAP"), "charmap"),
+    (cstr16!("\\FREEOS\\BIN\\SYSINFO"), "sysinfo"),
+    (cstr16!("\\FREEOS\\BIN\\EVENTLOG"), "eventlog"),
+    (cstr16!("\\FREEOS\\BIN\\SERVICES"), "services"),
+    (cstr16!("\\FREEOS\\BIN\\CLEANMGR"), "cleanmgr"),
+    (cstr16!("\\FREEOS\\BIN\\ADMIN"), "admin"),
+    (cstr16!("\\FREEOS\\BIN\\COMPMGMT"), "compmgmt"),
+    (cstr16!("\\FREEOS\\BIN\\RESMON"), "resmon"),
+    (cstr16!("\\FREEOS\\BIN\\STARTUP"), "startup"),
+    (cstr16!("\\FREEOS\\BIN\\AUTORUN"), "autorun"),
+    (cstr16!("\\FREEOS\\BIN\\CFGEDIT"), "cfgedit"),
     // Своя среда .NET (веха v0.7c, фаза N2).
     (cstr16!("\\FREEOS\\BIN\\DOTNET"), "dotnet"),
     (cstr16!("\\FREEOS\\BIN\\WINSHOW"), "winshow"),
