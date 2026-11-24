@@ -336,3 +336,181 @@ fn an_offset_at_the_edge_of_sixteen_bits_does_not_overflow() {
         let _ = map.decode(&[0x00, 0x00, 0x00, 0x00]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Gamepads (24.11.2026)
+// ---------------------------------------------------------------------------
+
+use crate::pad::{self, Gip, PadState, Wireless, decode_gip, decode_x360, decode_x360_wireless};
+
+/// DualShock 4 (054c:05c4), input report 1 and the first output and feature
+/// reports, as the pad sends it (`hid-sony` and every published dump): X/Y
+/// the left stick, Z/Rz the right one, a 4-bit hat, 14 buttons, a 6-bit
+/// counter of the vendor page, Rx/Ry the triggers.
+const DUALSHOCK4: &[u8] = &[
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
+    0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02, 0x09, 0x39, 0x15, 0x00, 0x25,
+    0x07, 0x35, 0x00, 0x46, 0x3b, 0x01, 0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42, 0x65, 0x00,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x0e, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0e, 0x81, 0x02,
+    0x06, 0x00, 0xff, 0x09, 0x20, 0x75, 0x06, 0x95, 0x01, 0x15, 0x00, 0x25, 0x7f, 0x81, 0x02, 0x05,
+    0x01, 0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+    0x06, 0x00, 0xff, 0x09, 0x21, 0x95, 0x36, 0x81, 0x02, 0x85, 0x05, 0x09, 0x22, 0x95, 0x1f, 0x91,
+    0x02, 0x85, 0x04, 0x09, 0x23, 0x95, 0x24, 0xb1, 0x02, 0xc0,
+];
+
+/// A plain DirectInput pad: four 8-bit axes X, Y, Z, Rz, a hat and twelve
+/// buttons, no report number, no analog triggers.
+const GENERIC_PAD: &[u8] = &[
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x04, 0x09,
+    0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x81, 0x02, 0x25, 0x07, 0x46, 0x3b, 0x01, 0x75, 0x04,
+    0x95, 0x01, 0x65, 0x14, 0x09, 0x39, 0x81, 0x42, 0x65, 0x00, 0x75, 0x01, 0x95, 0x0c, 0x25, 0x01,
+    0x45, 0x01, 0x05, 0x09, 0x19, 0x01, 0x29, 0x0c, 0x81, 0x02, 0xc0,
+];
+
+#[test]
+fn a_dualshock4_is_a_gamepad_with_its_own_layout() {
+    let parsed = parse(DUALSHOCK4);
+    assert!(parsed.pointer.is_none() && parsed.keyboard.is_none());
+    let map = parsed.gamepad.expect("DualShock 4 is a gamepad");
+    assert_eq!((map.report_id, map.usage), (1, 5));
+    assert_eq!(map.axis_count(), 6);
+    assert_eq!(map.button_count(), 14);
+    assert!(map.has_hat());
+    // Left stick centre-right/up, right stick right/centre, hat right,
+    // cross, L1, PS, R2 fully pressed.
+    let report = [0x01, 0x80, 0x00, 0xff, 0x80, 0x22, 0x01, 0x01, 0x00, 0xff];
+    let state = map.to_pad(&report).expect("report 1");
+    assert_eq!(
+        state,
+        PadState {
+            lx: 128,
+            ly: -32768,
+            rx: 32767,
+            ry: 128,
+            lt: 0,
+            rt: 255,
+            hat_x: 1,
+            hat_y: 0,
+            buttons: pad::BTN_A | pad::BTN_LB | pad::BTN_GUIDE,
+        }
+    );
+    // Hat "null state" (8): centred. Square and triangle: X and Y.
+    let state = map.to_pad(&[0x01, 0x80, 0x80, 0x80, 0x80, 0x98, 0x00, 0x00, 0x00, 0x00]).unwrap();
+    assert_eq!((state.hat_x, state.hat_y), (0, 0));
+    assert_eq!(state.buttons, pad::BTN_X | pad::BTN_Y);
+    // A report of another number is not the pad state.
+    assert!(map.to_pad(&[0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
+}
+
+#[test]
+fn a_generic_pad_gets_digital_triggers_from_buttons_7_and_8() {
+    let map = parse(GENERIC_PAD).gamepad.expect("a gamepad");
+    assert_eq!((map.report_id, map.axis_count(), map.button_count()), (0, 4, 12));
+    // Hat up-left (7), button 7 (LT) and 10 (Start).
+    let state = map.to_pad(&[0x00, 0xff, 0x80, 0x80, 0x07, 0x24]).unwrap();
+    assert_eq!((state.lx, state.ly), (-32768, 32767));
+    assert_eq!((state.hat_x, state.hat_y), (-1, -1));
+    assert_eq!((state.lt, state.rt), (255, 0));
+    assert_eq!(state.buttons, pad::BTN_START);
+}
+
+#[test]
+fn the_joystick_without_buttons_is_still_a_two_axis_pad() {
+    let map = parse(JOYSTICK).gamepad.expect("two axes");
+    assert_eq!(map.usage, 4);
+    let state = map.to_pad(&[0xff, 0x00]).unwrap();
+    assert_eq!((state.lx, state.ly), (32767, -32768));
+}
+
+#[test]
+fn mice_and_keyboards_are_not_gamepads() {
+    for descriptor in [QEMU_KEYBOARD, QEMU_MOUSE, QEMU_TABLET, VBOX_TABLET] {
+        assert!(parse(descriptor).gamepad.is_none());
+    }
+}
+
+#[test]
+fn xbox360_report() {
+    let mut report = [0u8; 20];
+    report[1] = 0x14;
+    report[2] = 0x11; // up, Start
+    report[3] = 0x34; // Guide, A, B
+    report[4] = 0x40;
+    report[5] = 0xff;
+    report[6..8].copy_from_slice(&0x1234i16.to_le_bytes());
+    report[8..10].copy_from_slice(&i16::MAX.to_le_bytes());
+    report[10..12].copy_from_slice(&i16::MIN.to_le_bytes());
+    let state = decode_x360(&report).unwrap();
+    assert_eq!(
+        state,
+        PadState {
+            lx: 0x1234,
+            ly: i16::MIN,
+            rx: i16::MIN,
+            ry: -1,
+            lt: 0x40,
+            rt: 0xff,
+            hat_x: 0,
+            hat_y: -1,
+            buttons: pad::BTN_START | pad::BTN_GUIDE | pad::BTN_A | pad::BTN_B,
+        }
+    );
+    // LED state message, not input.
+    assert!(decode_x360(&[0x01, 0x03, 0x0e, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
+    assert!(decode_x360(&report[..10]).is_none());
+}
+
+#[test]
+fn xbox360_wireless_messages() {
+    assert_eq!(decode_x360_wireless(&[0x08, 0x80]), Wireless::Presence(true));
+    assert_eq!(decode_x360_wireless(&[0x08, 0x00]), Wireless::Presence(false));
+    let mut packet = [0u8; 29];
+    packet[1] = 0x01;
+    packet[4 + 3] = 0x10; // A
+    assert!(matches!(decode_x360_wireless(&packet), Wireless::Input(state) if state.buttons == pad::BTN_A));
+}
+
+#[test]
+fn xbox_one_messages() {
+    let mut report = [0u8; 18];
+    report[0] = 0x20;
+    report[2] = 5;
+    report[3] = 0x0e;
+    report[4] = 0x14; // Start, A
+    report[5] = 0x11; // up, LB
+    report[6..8].copy_from_slice(&1023u16.to_le_bytes());
+    report[8..10].copy_from_slice(&512u16.to_le_bytes());
+    report[10..12].copy_from_slice(&i16::MIN.to_le_bytes());
+    report[14..16].copy_from_slice(&i16::MAX.to_le_bytes());
+    report[16..18].copy_from_slice(&1i16.to_le_bytes());
+    let Gip::Input(state) = decode_gip(&report) else { panic!("input") };
+    assert_eq!(
+        state,
+        PadState {
+            lx: i16::MIN,
+            ly: -1,
+            rx: i16::MAX,
+            ry: -2,
+            lt: 255,
+            rt: 128,
+            hat_x: 0,
+            hat_y: -1,
+            buttons: pad::BTN_START | pad::BTN_A | pad::BTN_LB,
+        }
+    );
+    assert_eq!(decode_gip(&[0x07, 0x30, 0x09, 0x02, 0x01, 0x5b]), Gip::Guide { pressed: true, ack: Some(9) });
+    assert_eq!(decode_gip(&[0x07, 0x20, 0x0a, 0x02, 0x00, 0x5b]), Gip::Guide { pressed: false, ack: None });
+    assert_eq!(decode_gip(&[0x02, 0x20, 0x01, 0x1c, 0x00]), Gip::Announce);
+    assert_eq!(pad::gip_ack(9)[2], 9);
+    // Power on for everyone, the S init for the One S.
+    assert_eq!(pad::gip_init(0x045e, 0x02dd).count(), 1);
+    assert_eq!(pad::gip_init(0x045e, 0x02ea).count(), 2);
+    assert_eq!(pad::gip_init(0x0e6f, 0x02a4).count(), 3);
+}
+
+#[test]
+fn pressed_buttons_by_name() {
+    let state = PadState { buttons: pad::BTN_A | pad::BTN_START, ..PadState::default() };
+    assert_eq!(std::format!("{}", state.pressed()), "A Start");
+    assert_eq!(std::format!("{}", PadState::default().pressed()), "-");
+}
