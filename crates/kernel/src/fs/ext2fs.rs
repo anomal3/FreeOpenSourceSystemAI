@@ -692,6 +692,18 @@ impl Node for Ext2Node {
         self.fs.change(&[Touched::Inode(number)], |disk, editor| editor.set_mode(disk, number, mode).map_err(convert))
     }
 
+    fn times(&self) -> crate::vfs::Times {
+        let inode = self.fs.inode(self.inode.number).unwrap_or_else(|_| self.inode.clone());
+        crate::vfs::Times { mtime: inode.mtime, atime: inode.atime, ctime: inode.ctime }
+    }
+
+    fn set_times(&self, atime: Option<u32>, mtime: Option<u32>) -> VfsResult<()> {
+        let number = self.inode.number;
+        self.fs.change(&[Touched::Inode(number)], |disk, editor| {
+            editor.set_times(disk, number, atime, mtime).map_err(convert)
+        })
+    }
+
     fn create(&self, name: &str, mode: u16, uid: u32, gid: u32) -> VfsResult<Box<dyn Node>> {
         let dir = self.inode.number;
         let number = self.fs.change(&[Touched::Entry(dir, name), Touched::Inode(dir)], |disk, editor| {

@@ -65,6 +65,9 @@ pub struct Inode {
     pub links: u32,
     /// Время последнего изменения, секунды эпохи Unix.
     pub mtime: i64,
+    /// Last access and last status change, Unix seconds (24.11).
+    pub atime: i64,
+    pub ctime: i64,
     /// Флаги inode. Наружу не выставляются: наружу от них нужно ровно одно —
     /// надо ли сверять суммы, и это решает сам крейт.
     flags: u64,
@@ -92,6 +95,8 @@ impl Inode {
             size: u64_at(raw, INODE_SIZE_FIELD),
             links: u32_at(raw, INODE_NLINK),
             mtime: u64_at(raw, INODE_MTIME) as i64,
+            atime: u64_at(raw, INODE_ATIME) as i64,
+            ctime: u64_at(raw, INODE_CTIME) as i64,
             flags: u64_at(raw, INODE_FLAGS),
         })
     }

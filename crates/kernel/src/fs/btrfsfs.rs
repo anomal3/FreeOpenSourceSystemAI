@@ -901,6 +901,19 @@ impl Node for BtrfsNode {
         self.fs.change(&[Touched::Inode(number)], |disk, writer, time| writer.set_mode(disk, number, mode, time))
     }
 
+    fn times(&self) -> crate::vfs::Times {
+        let inode = self.fs.inode(self.inode.number).unwrap_or_else(|_| self.inode.clone());
+        let clip = |seconds: i64| u32::try_from(seconds).unwrap_or(0);
+        crate::vfs::Times { mtime: clip(inode.mtime), atime: clip(inode.atime), ctime: clip(inode.ctime) }
+    }
+
+    fn set_times(&self, atime: Option<u32>, mtime: Option<u32>) -> VfsResult<()> {
+        let number = self.inode.number;
+        self.fs.change(&[Touched::Inode(number)], |disk, writer, time| {
+            writer.set_times(disk, number, atime.map(u64::from), mtime.map(u64::from), time)
+        })
+    }
+
     fn create(&self, name: &str, mode: u16, uid: u32, gid: u32) -> VfsResult<Box<dyn Node>> {
         let parent = self.inode.number;
         let number = self.fs.change(&[Touched::Entry(parent, name), Touched::Inode(parent)], |disk, writer, time| {

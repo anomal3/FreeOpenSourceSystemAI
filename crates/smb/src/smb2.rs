@@ -92,6 +92,7 @@ pub const ATTR_NORMAL: u32 = 0x0080;
 pub const INFO_FILE: u8 = 1;
 pub const INFO_FILESYSTEM: u8 = 2;
 pub const FILE_DIRECTORY_INFORMATION: u8 = 0x01;
+pub const FILE_BASIC_INFORMATION: u8 = 4;
 pub const FILE_RENAME_INFORMATION: u8 = 10;
 pub const FILE_DISPOSITION_INFORMATION: u8 = 13;
 pub const FILE_END_OF_FILE_INFORMATION: u8 = 20;

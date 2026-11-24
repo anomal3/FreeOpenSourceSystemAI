@@ -1149,6 +1149,12 @@ mod tests {
         );
         assert_eq!(core::mem::offset_of!(user_abi::Dirent, name_len), 28);
         assert_eq!(core::mem::offset_of!(user_abi::Dirent, name), 32);
+        // 24.11: file times.
+        assert_eq!(fields_of("freeos_statx"), ["size", "mode", "uid", "gid", "kind", "mtime", "atime", "ctime", "ino"]);
+        assert_eq!(size_of::<user_abi::StatX>(), 56);
+        assert_eq!(core::mem::offset_of!(user_abi::StatX, mtime), 24);
+        assert_eq!(fields_of("freeos_file_times"), ["atime", "mtime"]);
+        assert_eq!(size_of::<user_abi::FileTimes>(), 16);
         assert_eq!(fields_of("freeos_pollfd"), ["fd", "wanted", "ready"]);
         // Фаза 65b: сведения о сокете и о сети.
         assert_eq!(
@@ -1262,6 +1268,8 @@ mod tests {
             "FD_NONBLOCK" => abi::FD_NONBLOCK,
             "SYS_FLOCK" => abi::SYS_FLOCK as i64,
             "SYS_CHMOD" => abi::SYS_CHMOD as i64,
+            "SYS_STATX" => abi::SYS_STATX as i64,
+            "SYS_UTIMES" => abi::SYS_UTIMES as i64,
             "FLOCK_GETLK" => abi::FLOCK_GETLK as i64,
             "FLOCK_SETLK" => abi::FLOCK_SETLK as i64,
             "FLOCK_SETLKW" => abi::FLOCK_SETLKW as i64,

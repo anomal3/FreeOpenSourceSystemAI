@@ -228,6 +228,9 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         // 24.11: settings store («реестр») and «Только чтение» of «Свойств».
         user_abi::SYS_REGISTRY => registry(a0, a1, a2),
         user_abi::SYS_CHMOD => chmod(a0, a1, a2),
+        // 24.11: file times for programs (`st_mtime`, `utimensat`).
+        user_abi::SYS_STATX => statx(a0, a1, a2),
+        user_abi::SYS_UTIMES => utimes(a0, a1, a2),
         // 22.11: screen capture for the recorder (`/bin/screenrec`).
         user_abi::SYS_SCREENCAP => crate::ui::capture::syscall(a0, a1, a2),
         // 05.11.2026: время из сети (SNTP службы `dhcp`).
@@ -1500,6 +1503,102 @@ fn chmod(ptr: usize, len: usize, mode: usize) -> i64 {
         Some(Ok(())) => 0,
         Some(Err(err)) => vfs_errno(err),
         None => ERR_NO_FILESYSTEM,
+    }
+}
+
+/// The node behind a path (`len > 0`) or a descriptor (`len == 0`) — for
+/// [`statx`] and [`utimes`]. Pipes, sockets and standard streams have no node.
+fn node_of(ptr: usize, len: usize) -> Result<alloc::sync::Arc<dyn crate::vfs::Node>, i64> {
+    if len == 0 {
+        return match super::with_current(|program| program.files.file_or_dir(ptr)) {
+            Some(Ok(node)) => Ok(node),
+            Some(Err(err)) => Err(errno(err)),
+            None => Err(ERR_NO_PROGRAM),
+        };
+    }
+    let mut buffer = [0u8; MAX_PATH];
+    let path = copy_path(ptr, len, &mut buffer)?;
+    match crate::fs::resolve_as(super::credentials(), path, Access::NONE) {
+        Some(Ok(node)) => Ok(alloc::sync::Arc::from(node)),
+        Some(Err(err)) => Err(vfs_errno(err)),
+        None => Err(ERR_NO_FILESYSTEM),
+    }
+}
+
+/// `SYS_STATX` (24.11): [`user_abi::StatX`] of a path or a descriptor.
+fn statx(ptr: usize, len: usize, out: usize) -> i64 {
+    if out % align_of::<user_abi::StatX>() != 0 || !space::user_can(out, size_of::<user_abi::StatX>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    let value = match node_of(ptr, len) {
+        Ok(node) => {
+            let meta = node.metadata();
+            let times = node.times();
+            user_abi::StatX {
+                size: meta.size,
+                mode: u32::from(meta.mode),
+                uid: meta.uid,
+                gid: meta.gid,
+                kind: match meta.kind {
+                    NodeKind::File => KIND_FILE,
+                    NodeKind::Directory => KIND_DIRECTORY,
+                },
+                mtime: i64::from(times.mtime),
+                atime: i64::from(times.atime),
+                ctime: i64::from(times.ctime),
+                ino: node.file_id().map_or(0, |(_, number)| number),
+            }
+        }
+        // A descriptor without a node: the kind from `fstat`, no times.
+        Err(err) if len == 0 => {
+            let kind = match super::with_current(|program| program.files.describe(ptr)) {
+                Some(Ok(info)) => match info.kind {
+                    files::FdKind::Socket => user_abi::KIND_SOCKET,
+                    _ => KIND_PIPE,
+                },
+                _ => return err,
+            };
+            user_abi::StatX { kind, ..Default::default() }
+        }
+        Err(err) => return err,
+    };
+    // SAFETY: alignment and the writable range were checked above.
+    unsafe { core::ptr::write(out as *mut user_abi::StatX, value) };
+    0
+}
+
+/// `SYS_UTIMES` (24.11): access/modification time of a path or descriptor.
+fn utimes(ptr: usize, len: usize, times: usize) -> i64 {
+    let wanted = if times == 0 {
+        user_abi::FileTimes { atime: user_abi::TIME_NOW, mtime: user_abi::TIME_NOW }
+    } else {
+        if !space::user_can(times, size_of::<user_abi::FileTimes>(), PageFlags::READ) {
+            return ERR_BAD_ADDRESS;
+        }
+        // SAFETY: the range is readable by the program (checked above).
+        unsafe { core::ptr::read_unaligned(times as *const user_abi::FileTimes) }
+    };
+    let node = match node_of(ptr, len) {
+        Ok(node) => node,
+        Err(err) => return err,
+    };
+    let now = crate::time::now_unix_u32();
+    let pick = |value: i64| match value {
+        user_abi::TIME_OMIT => Ok(None),
+        user_abi::TIME_NOW => Ok(Some(now)),
+        // The file systems keep 32-bit seconds (ext2); earlier than 1970 or
+        // after 2106 is clamped rather than refused — 7-Zip goes on either way.
+        seconds => Ok::<_, i64>(Some(seconds.clamp(0, i64::from(u32::MAX)) as u32)),
+    };
+    let (Ok(atime), Ok(mtime)) = (pick(wanted.atime), pick(wanted.mtime)) else {
+        return ERR_UNSUPPORTED;
+    };
+    if atime.is_none() && mtime.is_none() {
+        return 0;
+    }
+    match crate::fs::set_times_node(super::credentials(), &*node, atime, mtime) {
+        Ok(()) => 0,
+        Err(err) => vfs_errno(err),
     }
 }
 

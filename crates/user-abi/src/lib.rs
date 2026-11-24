@@ -1839,6 +1839,54 @@ pub const REG_GET_IN: usize = 5;
 /// `(путь, длина, права) -> 0`. Owner or root, as `chmod`.
 pub const SYS_CHMOD: usize = 98;
 
+/// Everything about a file, times included (24.11: `stat` of the C library
+/// had no `st_mtime`, and 7-Zip stamped archives made here with 1970):
+/// `(путь, длина, out: *mut StatX) -> 0`. `длина == 0` — `путь` is a
+/// descriptor (`fstat`). [`SYS_STAT`]/[`SYS_FSTAT`] stay as they were: their
+/// [`Stat`] is fixed in programs already built.
+pub const SYS_STATX: usize = 99;
+
+/// Set the access and modification time of a file (24.11, `utimensat`,
+/// `futimens`, `utime`; 7-Zip restores the times of extracted files):
+/// `(путь, длина, times: *const FileTimes) -> 0`. `длина == 0` — `путь` is a
+/// descriptor; `times == 0` — both «now». Owner or root, as `chmod`; a file
+/// system without stored times answers [`ERR_UNSUPPORTED`].
+pub const SYS_UTIMES: usize = 100;
+
+/// Answer of [`SYS_STATX`]. Times are seconds of the Unix epoch, UTC; zero —
+/// unknown (a file system without times, a file made without a clock).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatX {
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// [`KIND_FILE`], [`KIND_DIRECTORY`], [`KIND_PIPE`]…, as in [`Stat`].
+    pub kind: u32,
+    /// Last content change.
+    pub mtime: i64,
+    /// Last access (= `mtime` where the file system keeps no access time).
+    pub atime: i64,
+    /// Last status change (ext2, btrfs) or creation (FAT, exFAT, SMB).
+    pub ctime: i64,
+    /// Number of the file on its volume (0 — none): `st_ino`.
+    pub ino: u64,
+}
+
+/// Input of [`SYS_UTIMES`]: Unix seconds, or [`TIME_NOW`] / [`TIME_OMIT`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileTimes {
+    pub atime: i64,
+    pub mtime: i64,
+}
+
+/// [`FileTimes`]: set this time to «now» (`UTIME_NOW`).
+pub const TIME_NOW: i64 = i64::MIN;
+/// [`FileTimes`]: leave this time as it is (`UTIME_OMIT`).
+pub const TIME_OMIT: i64 = i64::MIN + 1;
+
 /// Screen capture for the recorder (22.11, `/bin/screenrec`):
 /// `(action, a1, a2) -> answer`. One capture at a time on the whole system.
 ///
@@ -3085,7 +3133,7 @@ mod tests {
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
             SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK, SYS_MODEM, SYS_FLOCK,
             SYS_FSWATCH, SYS_OPEN_WITH, SYS_SCREENCAP, SYS_WINLIMITS,
-            SYS_REGISTRY, SYS_CHMOD,
+            SYS_REGISTRY, SYS_CHMOD, SYS_STATX, SYS_UTIMES,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(

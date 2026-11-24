@@ -1238,6 +1238,35 @@ impl Writer {
         Ok(())
     }
 
+    /// Set the access and/or modification time (`utimensat`, 24.11); `None`
+    /// keeps the value, nanoseconds become zero. `ctime` becomes `time`.
+    pub fn set_times(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        number: u64,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+        time: u64,
+    ) -> Result<()> {
+        if self.broken {
+            return Err(Error::Aborted);
+        }
+        self.ensure_objects(dev, &[number])?;
+        let generation = self.generation + 1;
+        let raw = self.inode_mut(number)?;
+        for (field, value) in [(INODE_ATIME, atime), (INODE_MTIME, mtime)] {
+            if let Some(value) = value {
+                put_u64(raw, field, value);
+                put_u32(raw, field + 8, 0);
+            }
+        }
+        put_u64(raw, INODE_TRANSID, generation);
+        put_u64(raw, INODE_CTIME, time);
+        put_u32(raw, INODE_CTIME + 8, 0);
+        self.time = time;
+        Ok(())
+    }
+
     // --- операции над деревом ФС ---------------------------------------------
 
     /// Переписать отрезок обычного файла на новом месте.

@@ -1091,6 +1091,34 @@ pub fn stat(path: &str, out: &mut Stat) -> i64 {
     }
 }
 
+/// Everything about a file, times included (24.11, `SYS_STATX`).
+pub fn statx(path: &str, out: &mut user_abi::StatX) -> i64 {
+    if path.is_empty() {
+        return user_abi::ERR_BAD_PATH;
+    }
+    // SAFETY: the path and the answer are in the program's memory; `StatX`
+    // is aligned by its type.
+    unsafe { syscall(user_abi::SYS_STATX, path.as_ptr() as usize, path.len(), core::ptr::from_mut(out) as usize) }
+}
+
+/// Modification time of a file, Unix seconds UTC (0 — unknown or no file).
+#[must_use]
+pub fn mtime_of(path: &str) -> i64 {
+    let mut info = user_abi::StatX::default();
+    if statx(path, &mut info) < 0 { 0 } else { info.mtime }
+}
+
+/// Set the access/modification time of a file (24.11, `SYS_UTIMES`);
+/// [`user_abi::TIME_NOW`] / [`user_abi::TIME_OMIT`] are understood.
+pub fn set_times(path: &str, atime: i64, mtime: i64) -> i64 {
+    if path.is_empty() {
+        return user_abi::ERR_BAD_PATH;
+    }
+    let times = user_abi::FileTimes { atime, mtime };
+    // SAFETY: the path and the times are in the program's memory.
+    unsafe { syscall(user_abi::SYS_UTIMES, path.as_ptr() as usize, path.len(), core::ptr::from_ref(&times) as usize) }
+}
+
 /// От чьего имени исполняется программа.
 #[must_use]
 pub fn uid() -> u32 {

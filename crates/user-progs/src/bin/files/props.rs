@@ -22,6 +22,7 @@
 //! не длиннее 255 байт).
 
 use super::*;
+use user_progs::statx;
 
 /// Паспорт окна: имя латиницей — для стенда.
 const SPEC: Spec = Spec { name: "fileprops", title: "Properties", period_ms: 1_000 };
@@ -42,6 +43,8 @@ struct Item {
     directory: bool,
     size: u64,
     mtime: u32,
+    /// Last access (24.11); shown when it differs from `mtime`.
+    atime: u32,
     mode: u32,
     uid: u32,
     gid: u32,
@@ -126,24 +129,16 @@ struct Props {
     pointer: Option<(i32, i32)>,
 }
 
-/// Время изменения `path` — из записи его каталога.
-fn mtime_of(path: &str) -> u32 {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let fd = open(&parent_of(path));
-    if fd < 0 {
-        return 0;
+/// Modification and access time of `path` (24.11: `SYS_STATX`; before
+/// that — the modification time from the entry of its folder, the only time
+/// the kernel gave out).
+fn times_of(path: &str) -> (u32, u32) {
+    let mut info = user_abi::StatX::default();
+    if statx(path, &mut info) < 0 {
+        return (0, 0);
     }
-    let mut entry = Dirent::default();
-    let mut found = 0;
-    while readdir_raw(fd, &mut entry) > 0 {
-        let len = (entry.name_len as usize).min(entry.name.len());
-        if &entry.name[..len] == name.as_bytes() {
-            found = entry.mtime;
-            break;
-        }
-    }
-    close(fd);
-    found
+    let clip = |seconds: i64| u32::try_from(seconds).unwrap_or(0);
+    (clip(info.mtime), clip(info.atime))
 }
 
 fn item_of(path: &str) -> Option<Item> {
@@ -152,12 +147,14 @@ fn item_of(path: &str) -> Option<Item> {
         return None;
     }
     let name = if path == "/" { String::from("/") } else { path.rsplit('/').next().unwrap_or(path).to_string() };
+    let (mtime, atime) = times_of(path);
     Some(Item {
         path: path.to_string(),
         name,
         directory: info.kind == KIND_DIRECTORY,
         size: info.size,
-        mtime: mtime_of(path),
+        mtime,
+        atime,
         mode: info.mode,
         uid: info.uid,
         gid: info.gid,
@@ -325,6 +322,9 @@ impl Props {
                 out.push(Row::Sep);
                 if one.mtime != 0 {
                     out.push(Row::Field("Изменён", long_date(one.mtime, self.offset)));
+                }
+                if one.atime != 0 && one.atime != one.mtime {
+                    out.push(Row::Field("Открыт", long_date(one.atime, self.offset)));
                 }
                 out.push(Row::Sep);
                 out.push(Row::Attributes);

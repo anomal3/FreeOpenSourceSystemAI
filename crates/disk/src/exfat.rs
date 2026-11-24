@@ -1314,6 +1314,25 @@ impl<D: BlockDevice> Volume<D> {
         Ok(n)
     }
 
+    /// Set the access and/or modification time of a file or directory
+    /// (`utimensat`, 24.11); `None` keeps the value.
+    pub fn set_times(&mut self, node: &Node, accessed: Option<u64>, modified: Option<u64>) -> Result<Node> {
+        let mut n = self.refresh(node)?;
+        if n.pos.is_none() {
+            // The root directory has no entry set to keep times in.
+            return Ok(n);
+        }
+        self.begin_write()?;
+        if let Some(accessed) = accessed {
+            n.accessed = accessed;
+        }
+        if let Some(modified) = modified {
+            n.modified = modified;
+        }
+        self.update_set(&n)?;
+        Ok(n)
+    }
+
     /// Записать поля узла в его набор записей.
     fn update_set(&mut self, node: &Node) -> Result<()> {
         let Some(pos) = node.pos else {

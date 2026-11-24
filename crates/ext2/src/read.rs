@@ -51,6 +51,10 @@ pub struct Inode {
     pub links: u16,
     /// Время последнего изменения, секунды эпохи Unix.
     pub mtime: u32,
+    /// Last access (`i_atime`) and last status change (`i_ctime`), Unix
+    /// seconds (24.11: `stat` of native programs, `utimensat`).
+    pub atime: u32,
+    pub ctime: u32,
     blocks: [u32; BLOCK_POINTERS],
 }
 
@@ -314,6 +318,8 @@ impl Ext2 {
             size,
             links: u16_at(raw, 26),
             mtime: u32_at(raw, 16),
+            atime: u32_at(raw, 8),
+            ctime: u32_at(raw, 12),
             blocks,
         })
     }

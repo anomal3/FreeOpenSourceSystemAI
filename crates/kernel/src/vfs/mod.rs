@@ -179,12 +179,39 @@ pub struct DirEntry {
     pub mtime: u32,
 }
 
+/// The three times of a file (24.11): seconds of the Unix epoch, UTC; zero is
+/// «unknown», as in [`Metadata::mtime`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Times {
+    /// Last content change — the same number as [`Metadata::mtime`].
+    pub mtime: u32,
+    /// Last access. File systems that do not keep it answer `mtime`.
+    pub atime: u32,
+    /// Last status change (ext2/btrfs) or creation (FAT, exFAT, SMB —
+    /// Windows keeps no status-change time). Defaults to `mtime`.
+    pub ctime: u32,
+}
+
 /// Узел файловой системы — файл или каталог.
 ///
 /// Возвращается в `Box`, а не по значению: конкретный тип узла зависит от
 /// реализации ФС, а вызывающий обязан работать с любой.
 pub trait Node: Send + Sync {
     fn metadata(&self) -> Metadata;
+
+    /// All the times of the node (24.11, native `stat`). The default — for
+    /// file systems that keep one time — repeats [`Metadata::mtime`].
+    fn times(&self) -> Times {
+        let mtime = self.metadata().mtime;
+        Times { mtime, atime: mtime, ctime: mtime }
+    }
+
+    /// Set the access and/or modification time (`utimensat`, `futimens`:
+    /// 7-Zip restores the times of extracted files; 24.11). `None` keeps the
+    /// value. A file system without stored times refuses.
+    fn set_times(&self, _atime: Option<u32>, _mtime: Option<u32>) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
 
     /// Прочитать до `buf.len()` байт, начиная со смещения. Возвращает, сколько
     /// прочитано: у конца файла это меньше запрошенного, и это не ошибка.

@@ -793,6 +793,35 @@ impl Node for SmbNode {
         Ok(())
     }
 
+    fn times(&self) -> crate::vfs::Times {
+        let clip = |seconds: u64| seconds.min(u64::from(u32::MAX)) as u32;
+        match &self.info {
+            Some(info) => {
+                let mtime = clip(info.mtime);
+                let or = |value: u64| if value == 0 { mtime } else { clip(value) };
+                crate::vfs::Times { mtime, atime: or(info.atime), ctime: or(info.btime) }
+            }
+            None => crate::vfs::Times::default(),
+        }
+    }
+
+    fn set_times(&self, atime: Option<u32>, mtime: Option<u32>) -> VfsResult<()> {
+        let (atime, mtime) = (atime.map(u64::from), mtime.map(u64::from));
+        let result = if self.is_dir() {
+            let path = self.path.clone();
+            with(&self.host, Some(&self.share), |client, tree, _| {
+                client.set_path_times(tree.ok_or(SmbError::Io)?, &path, true, atime, mtime)
+            })
+        } else {
+            // Through the node's own handle: a write handle closed later must
+            // not be the last word on the time (the server stops updating it
+            // on a handle whose time was set explicitly).
+            self.with_handle(true, |client, tree, id| client.set_times(tree, id, atime, mtime))
+        };
+        invalidate(&self.host, &self.share);
+        result
+    }
+
     fn create(&self, name: &str, _mode: u16, _uid: u32, _gid: u32) -> VfsResult<Box<dyn Node>> {
         let path = join(&self.path, name);
         let opened = with(&self.host, Some(&self.share), |client, tree, generation| {

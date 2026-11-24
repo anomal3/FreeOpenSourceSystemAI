@@ -500,7 +500,13 @@ pub(crate) struct InodeData {
     /// Блоков по 512 байт — так считает поле `i_blocks`, вопреки названию.
     pub(crate) sectors: u32,
     pub(crate) blocks: [u32; BLOCK_POINTERS],
+    /// Last status change (`i_ctime`). Every edit moves it.
     pub(crate) time: u32,
+    /// Last access (`i_atime`) and last content change (`i_mtime`): separate
+    /// since 24.11 — `utimensat` (7-Zip restoring the times of extracted
+    /// files) sets them without the edit time, and `chmod` moves only `ctime`.
+    pub(crate) atime: u32,
+    pub(crate) mtime: u32,
     /// Время удаления. Ноль у живого inode; у освобождённого `e2fsck` требует
     /// ненулевого — иначе он считает его «deleted inode referenced».
     pub(crate) deleted: u32,
@@ -517,6 +523,8 @@ impl InodeData {
             sectors: 0,
             blocks: [0; BLOCK_POINTERS],
             time,
+            atime: time,
+            mtime: time,
             deleted: 0,
         }
     }
@@ -526,9 +534,9 @@ impl InodeData {
         put_u16(out, 0, self.mode);
         put_u16(out, 2, self.uid as u16);
         put_u32(out, 4, self.size as u32);
-        put_u32(out, 8, self.time);
+        put_u32(out, 8, self.atime);
         put_u32(out, 12, self.time);
-        put_u32(out, 16, self.time);
+        put_u32(out, 16, self.mtime);
         put_u32(out, 20, self.deleted);
         put_u16(out, 24, self.gid as u16);
         put_u16(out, 26, self.links);
@@ -571,7 +579,9 @@ impl InodeData {
             links: u16_at(raw, 26),
             sectors: u32_at(raw, 28),
             blocks,
-            time: u32_at(raw, 8),
+            time: u32_at(raw, 12),
+            atime: u32_at(raw, 8),
+            mtime: u32_at(raw, 16),
             deleted: u32_at(raw, 20),
         }
     }

@@ -376,22 +376,61 @@ int fstatat(int dir, const char *path, struct stat *out, int flags) {
     return full == NULL ? -1 : stat(full, out);
 }
 
-/* Времена файла ядро не ставит (см. `utime`): `ENOSYS`. 7-Zip такой отказ
- * пропускает — распакованный файл получает время распаковки. */
+/* Времена файла (24.11) — `SYS_UTIMES`: путь (или дескриптор при длине 0) и
+ * пара «доступ, изменение» в секундах; `UTIME_NOW`/`UTIME_OMIT` — как в POSIX.
+ * Доли секунды отбрасываются: ext2 хранит целые секунды. 7-Zip так ставит
+ * распакованным файлам их время из архива. */
+#ifndef UTIME_NOW
+#define UTIME_NOW ((1l << 30) - 1l)
+#endif
+#ifndef UTIME_OMIT
+#define UTIME_OMIT ((1l << 30) - 2l)
+#endif
+
+static int64_t file_time(const struct timespec *t) {
+    if (t->tv_nsec == UTIME_NOW) {
+        return FREEOS_TIME_NOW;
+    }
+    if (t->tv_nsec == UTIME_OMIT) {
+        return FREEOS_TIME_OMIT;
+    }
+    return (int64_t)t->tv_sec;
+}
+
+static int set_times(long target, long len, const struct timespec times[2]) {
+    struct freeos_file_times wanted;
+    long arg = 0;
+    if (times != NULL) {
+        wanted.atime = file_time(&times[0]);
+        wanted.mtime = file_time(&times[1]);
+        arg = (long)&wanted;
+    }
+    long code = freeos_syscall(SYS_UTIMES, target, len, arg);
+    return code < 0 ? freeos_set_errno(code) : 0;
+}
+
 int utimensat(int dir, const char *path, const struct timespec times[2], int flags) {
-    (void)dir;
-    (void)path;
-    (void)times;
     (void)flags;
-    errno = ENOSYS;
-    return -1;
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = at_path(dir, path, buf);
+    if (full == NULL) {
+        return -1;
+    }
+    return set_times((long)full, (long)strlen(full), times);
 }
 
 int futimens(int fd, const struct timespec times[2]) {
-    (void)fd;
-    (void)times;
-    errno = ENOSYS;
-    return -1;
+    return set_times(fd, 0, times);
+}
+
+/* `utimes`/`utime` — те же времена в старых видах. */
+int freeos_set_path_times(const char *path, const struct timespec times[2]) {
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = freeos_path(path, buf);
+    if (full == NULL) {
+        return -1;
+    }
+    return set_times((long)full, (long)strlen(full), times);
 }
 
 /* Маска прав новых файлов (24.11, 7-Zip): ядро её не применяет — права
@@ -622,10 +661,14 @@ int fchown(int fd, uid_t owner, gid_t group) {
 }
 
 int utimes(const char *path, const struct timeval times[2]) {
-    (void)path;
-    (void)times;
-    errno = ENOSYS;
-    return -1;
+    if (times == NULL) {
+        return freeos_set_path_times(path, NULL);
+    }
+    struct timespec both[2] = {
+        {times[0].tv_sec, times[0].tv_usec * 1000},
+        {times[1].tv_sec, times[1].tv_usec * 1000},
+    };
+    return freeos_set_path_times(path, both);
 }
 
 int link(const char *target, const char *path) {

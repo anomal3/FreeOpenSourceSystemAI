@@ -358,6 +358,16 @@ pub fn chmod_node(cred: Credentials, node: &dyn Node, mode: u16) -> VfsResult<()
     node.chmod(mode)
 }
 
+/// Set the access/modification time of a node (24.11, `utimensat`): owner
+/// and root, as `chmod` (Linux also lets a writer set «now»; programs here
+/// set times of files they made, so the owner rule covers them).
+pub fn set_times_node(cred: Credentials, node: &dyn Node, atime: Option<u32>, mtime: Option<u32>) -> VfsResult<()> {
+    if cred.uid != 0 && node.metadata().uid != cred.uid {
+        return Err(VfsError::PermissionDenied);
+    }
+    node.set_times(atime, mtime)
+}
+
 pub fn mkdir_as(cred: Credentials, path: &str, mode: u16) -> Option<VfsResult<()>> {
     let (parent, name) = match split_parent(path) {
         Ok(pair) => pair,

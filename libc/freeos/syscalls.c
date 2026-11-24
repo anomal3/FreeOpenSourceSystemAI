@@ -273,9 +273,28 @@ static void fill_stat(struct stat *out, const struct freeos_stat *info) {
     out->st_blocks = (blkcnt_t)((info->size + 511) / 512);
 }
 
+/* Ответ `SYS_STATX` (24.11): то же, что `fill_stat`, и времена с номером
+ * файла. До этого `st_mtime` оставался нулём, и 7-Zip ставил в архивы,
+ * собранные здесь, 1970 год. */
+static void fill_statx(struct stat *out, const struct freeos_statx *info) {
+    struct freeos_stat short_info = {info->size, info->mode, info->uid, info->gid, info->kind};
+    fill_stat(out, &short_info);
+    out->st_mtime = (time_t)info->mtime;
+    out->st_atime = (time_t)info->atime;
+    out->st_ctime = (time_t)info->ctime;
+    out->st_ino = (ino_t)info->ino;
+    out->st_nlink = 1;
+}
+
 int fstat(int fd, struct stat *out) {
+    struct freeos_statx full;
+    long code = freeos_syscall(SYS_STATX, fd, 0, (long)&full);
+    if (code == 0) {
+        fill_statx(out, &full);
+        return 0;
+    }
     struct freeos_stat info;
-    long code = freeos_syscall(SYS_FSTAT, fd, (long)&info, 0);
+    code = freeos_syscall(SYS_FSTAT, fd, (long)&info, 0);
     if (code < 0) {
         return freeos_set_errno(code);
     }
@@ -289,12 +308,12 @@ int stat(const char *path, struct stat *out) {
     if (full == NULL) {
         return -1;
     }
-    struct freeos_stat info;
-    long code = freeos_syscall(SYS_STAT, (long)full, (long)strlen(full), (long)&info);
+    struct freeos_statx info;
+    long code = freeos_syscall(SYS_STATX, (long)full, (long)strlen(full), (long)&info);
     if (code < 0) {
         return freeos_set_errno(code);
     }
-    fill_stat(out, &info);
+    fill_statx(out, &info);
     return 0;
 }
 

@@ -52,6 +52,9 @@ pub struct FileInfo {
     pub attributes: u32,
     /// Last write, Unix seconds (0 unknown).
     pub mtime: u64,
+    /// Last access and creation, Unix seconds (0 unknown; 24.11).
+    pub atime: u64,
+    pub btime: u64,
 }
 
 impl FileInfo {
@@ -345,6 +348,8 @@ impl<T: Transport> Client<T> {
                 size: u64_at(b, 48).unwrap_or(0),
                 attributes: u32_at(b, 56).unwrap_or(0),
                 mtime: filetime_to_unix(u64_at(b, 24).unwrap_or(0)),
+                atime: filetime_to_unix(u64_at(b, 16).unwrap_or(0)),
+                btime: filetime_to_unix(u64_at(b, 8).unwrap_or(0)),
             },
         })
     }
@@ -444,6 +449,26 @@ impl<T: Transport> Client<T> {
     /// Change the length of an open file.
     pub fn set_size(&mut self, tree: Tree, file: FileId, size: u64) -> Result<(), Error> {
         self.set_info(tree, file, smb2::FILE_END_OF_FILE_INFORMATION, &size.to_le_bytes())
+    }
+
+    /// Set the last access and/or last write time of an open file (Unix
+    /// seconds; `None` keeps it): FileBasicInformation with zeros in the
+    /// fields not to change (24.11, `utimensat`).
+    pub fn set_times(&mut self, tree: Tree, file: FileId, atime: Option<u64>, mtime: Option<u64>) -> Result<(), Error> {
+        let stamp = |value: Option<u64>| value.map_or(0, crate::wire::unix_to_filetime);
+        let mut data = Writer::new();
+        data.u64(0).u64(stamp(atime)).u64(stamp(mtime)).u64(0).u32(0).u32(0);
+        self.set_info(tree, file, smb2::FILE_BASIC_INFORMATION, &data.buf)
+    }
+
+    /// [`Client::set_times`] by path — for a directory or a file not open.
+    pub fn set_path_times(&mut self, tree: Tree, path: &str, directory: bool, atime: Option<u64>, mtime: Option<u64>) -> Result<(), Error> {
+        let options = if directory { smb2::FILE_DIRECTORY_FILE } else { smb2::FILE_NON_DIRECTORY_FILE };
+        let access = smb2::FILE_READ_ATTRIBUTES | smb2::FILE_WRITE_ATTRIBUTES | smb2::SYNCHRONIZE;
+        let opened = self.create(tree, path, access, smb2::FILE_OPEN, options, 0)?;
+        let result = self.set_times(tree, opened.id, atime, mtime);
+        let closed = self.close(tree, opened.id);
+        result.and(closed)
     }
 
     /// Delete a file or an empty directory.
@@ -657,6 +682,8 @@ pub fn parse_directory(data: &[u8], out: &mut Vec<FileInfo>) -> Result<(), Error
                 size: u64_at(entry, 40).unwrap_or(0),
                 attributes: u32_at(entry, 56).unwrap_or(0),
                 mtime: filetime_to_unix(u64_at(entry, 24).unwrap_or(0)),
+                atime: filetime_to_unix(u64_at(entry, 16).unwrap_or(0)),
+                btime: filetime_to_unix(u64_at(entry, 8).unwrap_or(0)),
             });
         }
         if next == 0 {
