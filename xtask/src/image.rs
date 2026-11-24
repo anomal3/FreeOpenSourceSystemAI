@@ -330,11 +330,12 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // The sixth marker (FOSSAI_AMD_SHADER=1): golden registers and the first compute shader (P6).
             // The eighth marker (FOSSAI_AMD_RADV=1): after the live stick has installed Proton into RAM
             // (FOSSAI_WITH_PROTON=1), the kernel runs vkprobe and vulkaninfo through RADV on the card.
-            if std::env::var("FOSSAI_AMD_RADV").is_ok_and(|v| v == "1") {
+            // FOSSAI_AMD_RADV=2: после vkprobe/vulkaninfo/vkcube ещё Direct3D 9 через DXVK (префикс Wine - минуты).
+            if let Some(mode) = std::env::var("FOSSAI_AMD_RADV").ok().filter(|v| v == "1" || v == "2") {
                 payload.push(Payload {
                     path: String::from("FREEOS/AMD/RADV.TXT"),
-                    data: b"radv\n".to_vec(),
-                    source: PathBuf::from("(FOSSAI_AMD_RADV=1)"),
+                    data: if mode == "2" { b"radv d3d\n".to_vec() } else { b"radv\n".to_vec() },
+                    source: PathBuf::from(format!("(FOSSAI_AMD_RADV={mode})")),
                 });
             }
             // The seventh marker (FOSSAI_AMD_HW=1): the hardware DRM backend self-test (VMID 1 over 64 GiB).

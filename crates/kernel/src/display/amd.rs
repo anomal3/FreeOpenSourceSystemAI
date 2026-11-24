@@ -1201,6 +1201,25 @@ fn radv_auto() {
         }
     }
     crate::usb::stick_log::flush_now();
+    // Маркер `radv d3d` (FOSSAI_AMD_RADV=2): ещё Direct3D 9 через DXVK на RADV (`d3dprobe`, 20 с кадров).
+    // Префикс Wine создаётся при первом запуске - на настоящем процессоре это минуты.
+    if firmware_file("RADV.TXT").is_ok_and(|text| text.windows(3).any(|w| w == b"d3d")) {
+        crate::kprintln!("==== AMD TEST: DXVK (Direct3D 9) on RADV. The Wine prefix is created first - up to 10 min, WAIT. ====");
+        crate::kprintln!("  amdgpu     : radv: {}", super::nvidia_gametest::start("hw amd -- d3d"));
+        let mut ticks = 0u32;
+        while super::nvidia_gametest::running() {
+            crate::sched::sleep_ms(1000);
+            ticks += 1;
+            if ticks % 15 == 0 {
+                crate::kprintln!("  amdgpu     : radv: DXVK check still running ({ticks} s of up to 900)");
+            }
+            if ticks > 900 {
+                crate::kprintln!("==== AMD TEST: the DXVK check ran over 15 min - giving up waiting (the log keeps what it has). ====");
+                break;
+            }
+        }
+        crate::usb::stick_log::flush_now();
+    }
     crate::kprintln!("==== AMD TEST: FINISHED. You can power off now. The result is in FREEOS\\LOG.TXT (gametest| lines). ====");
     crate::usb::stick_log::flush_now();
 }
