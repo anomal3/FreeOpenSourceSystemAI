@@ -621,6 +621,9 @@ struct OutputInfo {
     name: String,
     description: String,
     primary: bool,
+    /// 24.11: the number of the monitor — its place in the registry plus
+    /// one, as «Параметры → Дисплей» and the «Определить» plates show it.
+    number: u32,
 }
 
 impl OutputInfo {
@@ -654,6 +657,7 @@ fn refresh_outputs(now: u64) {
     let lit: Vec<&crate::display::outputs::Output> = registry.iter().filter(|o| o.enabled && o.current.is_some()).collect();
     // The registry keeps the primary at 0,0; normalised anyway.
     let origin = lit.iter().find(|o| o.primary).map_or((0, 0), |o| (o.x, o.y));
+    let number_of = |o: &crate::display::outputs::Output| registry.iter().position(|r| core::ptr::eq(r, o)).map_or(1, |i| i as u32 + 1);
     let mut table = OUTPUT_TABLE.lock();
     table.checked_ms = now.max(1);
     let mut list: Vec<OutputInfo> = Vec::new();
@@ -705,6 +709,7 @@ fn refresh_outputs(now: u64) {
             name,
             description,
             primary: o.primary,
+            number: number_of(o),
         });
     }
     // No registry (one firmware screen): the primary screen as it is.
@@ -726,6 +731,7 @@ fn refresh_outputs(now: u64) {
                 name: String::from("FB-1"),
                 description: String::from("FossAi Screen (FB-1)"),
                 primary: true,
+                number: 1,
             });
         }
     }
@@ -748,9 +754,11 @@ fn refresh_outputs(now: u64) {
 
 /// Monitors as `read` of `/dev/fossai-capture` hands them (OBS «Захват
 /// экрана FossAi», 24.11): one line per monitor, the primary first,
-/// `x\ty\tw\th\tprimary\tname\tdescription\n` - the place in desktop
-/// (capture) coordinates, `primary` 1/0, the same connector name as
-/// `wl_output.name` (what Qt and OBS call the screen).
+/// `x\ty\tw\th\tprimary\tname\tdescription\tnumber\n` - the place in
+/// desktop (capture) coordinates, `primary` 1/0, the same connector name as
+/// `wl_output.name` (what Qt and OBS call the screen) and (24.11) the number
+/// «Параметры → Дисплей» and the «Определить» plates show (`read` of a
+/// shell keeps it in the last variable with the description).
 #[must_use]
 pub fn monitor_lines() -> String {
     refresh_outputs(crate::time::uptime_ms());
@@ -762,14 +770,15 @@ pub fn monitor_lines() -> String {
     let mut text = String::new();
     for o in order {
         text.push_str(&alloc::format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             o.x - left,
             o.y - top,
             o.w,
             o.h,
             u8::from(o.primary),
             o.name,
-            o.description.replace(['\t', '\n'], " ")
+            o.description.replace(['\t', '\n'], " "),
+            o.number
         ));
     }
     text
@@ -1209,6 +1218,18 @@ struct Win {
     /// up (ms): pacing follows the window's own monitor.
     pace_us: u64,
     pace_at_ms: u64,
+    /// 24.11 (WM SDK): `xdg_toplevel.set_min_size` / `set_max_size` in
+    /// pixels, `(min, max)`; zero — no limit. `limits_due` — the desktop has
+    /// not taken them yet (busy, or the window is not open).
+    limits: ((u32, u32), (u32, u32)),
+    limits_due: bool,
+}
+
+/// Hand the size limits of a toplevel to the desktop. `true` — still due.
+fn send_limits(pid: u32, win: &Win) -> bool {
+    let (min, max) = win.limits;
+    let limits = crate::ui::window::SizeLimits { min, max, logical: false };
+    matches!(crate::ui::limit_window(pid, win.slot, limits), Err(crate::ui::WindowError::Busy))
 }
 
 /// Всплывающее окно стола за `xdg_popup`.
@@ -1608,6 +1629,9 @@ impl Client {
                 }
                 if win.title_due && win.open.is_some() {
                     win.title_due = crate::ui::title_window(self.pid, win.slot, &win.title).is_err();
+                }
+                if win.limits_due && win.open.is_some() {
+                    win.limits_due = send_limits(self.pid, win);
                 }
             }
             for index in 0..self.pops.len() {
@@ -2312,6 +2336,24 @@ impl Client {
                             win.full_output = output;
                         }
                     }
+                    // 24.11 (WM SDK): `set_max_size` (7) / `set_min_size` (8)
+                    // — the desktop keeps the window inside them on resize,
+                    // snap and maximize. Before the window opens — kept and
+                    // handed over when it opens.
+                    7 | 8 => {
+                        let (w, h) = (args.i32()?.max(0) as u32, args.i32()?.max(0) as u32);
+                        let pid = self.pid;
+                        if let Some(win) = self.wins.iter_mut().find(|win| win.toplevel == id) {
+                            let changed = if opcode == 7 {
+                                core::mem::replace(&mut win.limits.1, (w, h)) != (w, h)
+                            } else {
+                                core::mem::replace(&mut win.limits.0, (w, h)) != (w, h)
+                            };
+                            if changed || win.limits_due {
+                                win.limits_due = win.open.is_none() || send_limits(pid, win);
+                            }
+                        }
+                    }
                     // G5: `set_fullscreen(output)` - on the monitor asked
                     // (Wine: the one the game is on in its coordinates).
                     11 => {
@@ -2852,6 +2894,8 @@ impl Client {
                     hold_until_us: 0,
                     pace_us: 0,
                     pace_at_ms: 0,
+                    limits: ((0, 0), (0, 0)),
+                    limits_due: false,
                 });
             }
             2 => {
@@ -3559,6 +3603,9 @@ impl Client {
                 let _ = crate::ui::raw_keys_window(pid, win.slot);
                 kprintln!("  wayland     : #{pid} window '{}' {gw}x{gh}", win.title);
                 win.open = Some((gw, gh));
+                if win.limits_due {
+                    win.limits_due = send_limits(pid, win);
+                }
                 // G5: `wl_surface.enter` for its monitor right away.
                 self.enter_checked_ms = 0;
                 if core::mem::take(&mut win.want_full) {

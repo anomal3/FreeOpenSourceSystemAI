@@ -15,10 +15,12 @@
 //! | `FOSSAI_CAP_STOP` (`F`, 4)  | —                                        | 0           |
 //! | `FOSSAI_CAP_STATUS` (`F`,5) | `CapStatus` out                          | 0           |
 //! | `FOSSAI_CAP_WINDOWS` (`F`,6)| `{u64 buf; u64 len}` in — window lines   | bytes       |
+//! | `FOSSAI_CAP_IDENTIFY` (`F`,7)| the argument itself: ms (0 — 3 s)       | 0           |
 //!
 //! `read` (24.11) hands the monitors as text, one line per monitor, the
-//! primary first: `x\ty\tw\th\tprimary\tname\tdescription` (desktop
-//! coordinates, the `wl_output` connector name) — for OBS's monitor list and
+//! primary first: `x\ty\tw\th\tprimary\tname\tdescription\tnumber` (desktop
+//! coordinates, the `wl_output` connector name, the number of «Параметры →
+//! Дисплей» and of the «Определить» plates) — for OBS's monitor list and
 //! for the launcher (`fossai-obs` sizes the canvas by the primary monitor);
 //! the text is taken at the first `read` of an open, then read to the end.
 //!
@@ -50,6 +52,8 @@ const GRAB: usize = 3;
 const STOP: usize = 4;
 const STATUS: usize = 5;
 const WINDOWS: usize = 6;
+/// 24.11: «Определить» — number plates on the monitors.
+const IDENTIFY: usize = 7;
 
 /// One open of the node.
 struct Device {
@@ -161,6 +165,7 @@ pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
             Ok([buf, len]) => errno(capture(user_abi::CAP_WINDOWS, buf as usize, len as usize)),
             Err(err) => err,
         },
+        IDENTIFY => errno(capture(user_abi::CAP_IDENTIFY, arg, 0)),
         _ => -e::ENOTTY,
     })
 }

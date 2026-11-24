@@ -2664,6 +2664,11 @@ fn ui_status(argument: &str) {
         }
         return;
     }
+    // «Определить» (24.11): `ui identify [ms]` — number plates on the monitors.
+    if let Some(word) = argument.trim().strip_prefix("identify") {
+        ui::identify_monitors(word.trim().parse().unwrap_or(0));
+        return;
+    }
     // Масштаб стола на ходу (20.11): `ui scale auto|100|125|150|175|200`.
     if let Some(word) = argument.trim().strip_prefix("scale") {
         ui::scale_command(word.trim());

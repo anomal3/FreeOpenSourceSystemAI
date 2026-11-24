@@ -1102,6 +1102,12 @@ impl Manager {
 }
 
 impl App for Manager {
+    /// Smallest window (24.11, WM SDK): the toolbar, the device tree with
+    /// names and the card of the chosen device with its tabs.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(640, 420)
+    }
+
     fn key(&mut self, code: u32) -> bool {
         if self.searching {
             match code {

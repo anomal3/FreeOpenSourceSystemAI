@@ -3003,6 +3003,13 @@ pub fn style_window(slot: u32, flags: u32) -> Result<(), WindowError> {
     crate::ui::style_window(sched::current().as_u32(), slot, flags).map_err(WindowError::Desktop)
 }
 
+/// Size limits of the window `slot` of the current program (24.11), content
+/// size in layout points.
+pub fn limit_window(slot: u32, min: (u32, u32), max: (u32, u32)) -> Result<(), WindowError> {
+    let limits = crate::ui::window::SizeLimits { min, max, logical: true };
+    crate::ui::limit_window(sched::current().as_u32(), slot, limits).map_err(WindowError::Desktop)
+}
+
 /// Форма указателя над окном `slot` текущей программы (09.11.2026).
 pub fn cursor_window(slot: u32, shape: crate::ui::pointer::Shape) -> Result<(), WindowError> {
     crate::ui::cursor_window(sched::current().as_u32(), slot, shape).map_err(WindowError::Desktop)

@@ -654,6 +654,11 @@ fn last_area() -> (Ctx, Rect) {
 }
 
 impl App for Admin {
+    /// Smallest window (24.11, WM SDK): the 248-point section list and a page of rows.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(640, 420)
+    }
+
     fn key(&mut self, code: u32) -> bool {
         match code {
             ENTER => {

@@ -1842,6 +1842,12 @@ impl Editor {
 }
 
 impl App for Editor {
+    /// Smallest window (24.11, WM SDK): the menu row, a few lines of text and
+    /// the status line with the syntax switch.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(480, 260)
+    }
+
     fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
         let p = ctx.palette;
         s.fill(area, theme::window_bg());
@@ -1854,9 +1860,17 @@ impl App for Editor {
             Some(note) => note.clone(),
             None => String::from("Ctrl+S — сохранить    Ctrl+O — открыть    Ctrl+Z — отменить"),
         };
-        kit::status_bar(ctx, s, plan.status, &left);
         let right = format!("Строка {}, столбец {}  ·  UTF-8  ·  строк {}", self.row + 1, self.col + 1, self.lines.len());
-        paint::text_right(ctx, s, Role::Caption, plan.lang.x - ctx.px(14) as i32, paint::baseline(ctx, Role::Caption, plan.status), &right, p.ink4);
+        // 24.11: a narrow window keeps the hint left of the position, and
+        // drops the position when even it does not fit (they overlapped).
+        let right_x = plan.lang.x - ctx.px(14) as i32 - ctx.face(Role::Caption).width(&right) as i32;
+        let show_right = right_x > plan.status.x + ctx.px(120) as i32;
+        let left_end = if show_right { right_x - ctx.px(12) as i32 } else { plan.lang.x };
+        kit::status_bar(ctx, s, plan.status, "");
+        kit::status_bar(ctx, s, Rect::new(plan.status.x, plan.status.y, (left_end - plan.status.x).max(0) as u32, plan.status.h), &left);
+        if show_right {
+            paint::text_right(ctx, s, Role::Caption, plan.lang.x - ctx.px(14) as i32, paint::baseline(ctx, Role::Caption, plan.status), &right, p.ink4);
+        }
         draw::vline(s, plan.lang.x, plan.lang.y + ctx.px(6) as i32, plan.lang.h - ctx.px(12), p.line.color, p.line.alpha);
         if self.lang_menu.is_some() {
             draw::blend_rect(s, plan.lang, p.hover1.color, p.hover1.alpha);

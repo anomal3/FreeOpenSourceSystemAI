@@ -651,6 +651,11 @@ impl CharMap {
 }
 
 impl App for CharMap {
+    /// Smallest window (24.11, WM SDK): the 210-point block list, the glyph grid and the 270-point card.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(740, 460)
+    }
+
     fn key_with(&mut self, code: u32, mods: i32, latin: u32) -> bool {
         let ctrl = mods & user_abi::WIN_MOD_CTRL != 0;
         if code == CTRL_C || ctrl && (latin == 'c' as u32 || latin == 'C' as u32) {

@@ -2418,6 +2418,15 @@ pub fn tick() {
             }
         }
         desktop.expire_toast();
+        // «Определить» (24.11): plates asked by «Параметры» or OBS.
+        let identify = IDENTIFY_MS.swap(0, Ordering::Relaxed);
+        if identify != 0 {
+            let numbers: Vec<_> = crate::display::outputs::list().into_iter().enumerate().map(|(i, o)| (o.backend, i as u32 + 1, o.name)).collect();
+            if !desktop.start_identify(&numbers, identify) {
+                kprintln!("  desktop     : identify: no monitor to show the numbers on");
+            }
+        }
+        desktop.expire_identify();
         // Screen recorder (22.11): «Запись сохранена», a capture left behind.
         framegap::step(&"capture", || capture::tick(desktop));
         desktop.refresh_lock_clock();
@@ -7368,6 +7377,63 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
                 kprintln!("  desktop     : '{}' placed at the Start button {x},{y}", name_of(desktop, app));
                 log_window(desktop, app, focused);
             }
+            desktop.repaint_all();
+        }
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// «Определить» asked (24.11): how long to show the plates, ms; zero — not
+/// asked. Taken by the next desktop tick — the caller may be inside the
+/// desktop already («Параметры») or in a system call (OBS).
+static IDENTIFY_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Show the number of every monitor on it for `ms` (0 — 3 s), like
+/// «Определить» in Windows: «Параметры → Дисплей», OBS through
+/// `/dev/fossai-capture` and `user_abi::CAP_IDENTIFY`.
+pub fn identify_monitors(ms: u64) {
+    let ms = if ms == 0 { 3_000 } else { ms.clamp(500, 15_000) };
+    IDENTIFY_MS.store(ms, Ordering::Relaxed);
+    kprintln!("  desktop     : identify asked for {ms} ms");
+}
+
+/// Size limits of a program window (24.11, WM SDK: `user_abi::SYS_WINLIMITS`
+/// and `xdg_toplevel.set_min_size/set_max_size`). A window outside the new
+/// limits is resized into them at once (the program is asked to redraw).
+pub fn limit_window(task: u32, slot: u32, limits: window::SizeLimits) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let focused = desktop.focused_app() == Some(app);
+        let name = name_of(desktop, app);
+        let Some(window) = desktop.find(app) else {
+            return Err(WindowError::NoWindow);
+        };
+        if !window.set_limits(limits) {
+            return Ok(());
+        }
+        window.draw_decorations(focused);
+        let l = window.limits();
+        kprintln!(
+            "  desktop     : '{name}' size limits min {}x{} max {}x{}{}{}",
+            l.min.0,
+            l.min.1,
+            l.max.0,
+            l.max.1,
+            if l.logical { " points" } else { " px" },
+            if l.fixed() { ", fixed size" } else { "" }
+        );
+        let before = window.rect;
+        if !window.fullscreen && window.resizable() {
+            let (w, h) = window.clamp_size(before.w, before.h);
+            if (w, h) != (before.w, before.h) && window.resize(w, h) {
+                window.draw_decorations(focused);
+            }
+        }
+        if desktop.rect_of(app).is_some_and(|rect| rect != before) {
+            kprintln!("  desktop     : '{name}' resized into its limits");
+            log_window(desktop, app, focused);
             desktop.repaint_all();
         }
         desktop.present();

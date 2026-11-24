@@ -1862,6 +1862,40 @@ pub const SYS_CHMOD: usize = 98;
 /// * [`CAP_WINDOWS`] — `a1`/`a2` = text buffer: windows top first, lines
 ///   `x\ty\tw\th\tname\n`; answer — bytes written.
 pub const SYS_SCREENCAP: usize = 95;
+
+/// Size limits of a window (24.11, WM SDK): `(id, min, max) -> 0`.
+///
+/// `min` and `max` are content sizes (without the title band and frame) in
+/// **layout points** — the same units as `ctx.px(n)` takes: the desktop
+/// multiplies them by the scale of the window, so a limit keeps its look at
+/// 100 % and 200 % and on a monitor with another scale. Each is packed by
+/// [`pack_size`]; a zero side means «no limit on this side». `min == max` —
+/// a fixed-size window: no resizing, no «Развернуть» (like a Windows dialog
+/// without `WS_THICKFRAME`).
+///
+/// The desktop keeps the window inside them everywhere it changes the size:
+/// dragging an edge, snapping to a half, maximizing (a window with a maximum
+/// smaller than the monitor is maximized to its maximum at the top-left
+/// corner of the work area, as in Windows), restoring and a scale change.
+/// A window smaller than the new minimum grows at once (the program gets
+/// [`WIN_RESIZE`]). The phone ignores the limits: its windows are the
+/// screen. Wayland clients get the same through
+/// `xdg_toplevel.set_min_size/set_max_size` (in pixels there).
+pub const SYS_WINLIMITS: usize = 96;
+
+/// A size `w`×`h` (each up to 65535) in one argument of [`SYS_WINLIMITS`].
+#[must_use]
+pub const fn pack_size(w: u32, h: u32) -> usize {
+    let w = if w > 0xFFFF { 0xFFFF } else { w };
+    let h = if h > 0xFFFF { 0xFFFF } else { h };
+    ((w as usize) << 16) | h as usize
+}
+
+/// Back from [`pack_size`].
+#[must_use]
+pub const fn unpack_size(v: usize) -> (u32, u32) {
+    (((v >> 16) & 0xFFFF) as u32, (v & 0xFFFF) as u32)
+}
 pub const CAP_INFO: usize = 0;
 pub const CAP_START: usize = 1;
 pub const CAP_GRAB: usize = 2;
@@ -1869,6 +1903,11 @@ pub const CAP_STOP: usize = 3;
 pub const CAP_STATUS: usize = 4;
 pub const CAP_REQUEST_STOP: usize = 5;
 pub const CAP_WINDOWS: usize = 6;
+/// [`SYS_SCREENCAP`] (24.11, «Определить» like Windows): show a big number
+/// plate on every monitor for `a1` ms (0 — 3 s). The number is the one
+/// «Параметры → Дисплей» shows (the place of the monitor in the registry),
+/// so the lists of OBS and of the settings agree with what is on the screens.
+pub const CAP_IDENTIFY: usize = 7;
 
 /// [`CapSpec::flags`]: draw the pointer into the frames.
 pub const CAP_POINTER: u32 = 1;
@@ -3039,7 +3078,7 @@ mod tests {
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
             SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK, SYS_MODEM, SYS_FLOCK,
-            SYS_FSWATCH, SYS_OPEN_WITH, SYS_SCREENCAP,
+            SYS_FSWATCH, SYS_OPEN_WITH, SYS_SCREENCAP, SYS_WINLIMITS,
             SYS_REGISTRY, SYS_CHMOD,
         ];
         for (at, number) in numbers.iter().enumerate() {

@@ -195,6 +195,8 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_WINRESIZE => winresize(a0 as i64, a1),
         // Фаза 62b: окно говорит, что умеет, — размер у него меняет человек.
         user_abi::SYS_WINSTYLE => winstyle(a0 as i64, a1),
+        // 24.11: smallest and largest size of the window (WM SDK).
+        user_abi::SYS_WINLIMITS => winlimits(a0 as i64, a1, a2),
         // 09.11.2026: форма указателя над окном (браузер: ссылки, поля).
         user_abi::SYS_WINCURSOR => wincursor(a0 as i64, a1),
         // 09.11.2026: часовой пояс для программ (JavaScript `Date`).
@@ -2552,6 +2554,22 @@ fn winstyle(id: i64, flags: usize) -> i64 {
         return ERR_UNSUPPORTED;
     }
     match super::style_window(slot, flags as u32) {
+        Ok(()) => 0,
+        Err(err) => window_errno(err),
+    }
+}
+
+/// `winlimits(id, min, max) -> 0` (24.11): content size limits in layout
+/// points, packed by `user_abi::pack_size`; zero side — no limit.
+fn winlimits(id: i64, min: usize, max: usize) -> i64 {
+    let slot = match own_window(id) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
+    if (min | max) >> 32 != 0 {
+        return ERR_UNSUPPORTED;
+    }
+    match super::limit_window(slot, user_abi::unpack_size(min), user_abi::unpack_size(max)) {
         Ok(()) => 0,
         Err(err) => window_errno(err),
     }

@@ -297,6 +297,11 @@ pub fn syscall(action: usize, a1: usize, a2: usize) -> i64 {
             0
         }
         user_abi::CAP_WINDOWS => windows(a1, a2),
+        // 24.11: «Определить» — number plates on the monitors.
+        user_abi::CAP_IDENTIFY => {
+            super::identify_monitors(a1 as u64);
+            0
+        }
         _ => ERR_UNSUPPORTED,
     }
 }

@@ -120,6 +120,13 @@ impl Snap {
     }
 }
 
+/// «Определить» (24.11): number plates on the monitors and when they go.
+struct Identify {
+    until_ms: u64,
+    /// Place on the desktop and the plate.
+    plates: Vec<(Rect, Surface)>,
+}
+
 /// Монитор стола: экран, в который выводятся собранные полосы, и его место
 /// на общем столе.
 ///
@@ -336,6 +343,9 @@ pub struct Compositor {
     saver: Option<super::saver::Shown>,
     /// Уведомление (72h-2) и пакеты, о которых стол уже знает.
     toast: Option<super::toast::Toast>,
+    /// «Определить» (24.11, like Windows): number plates on the monitors
+    /// until a moment.
+    identify: Option<Identify>,
     /// Заставка запуска программы Windows (21.11, `ui::launch`).
     splash: super::launch::Splash,
     known_packages: Option<Vec<alloc::string::String>>,
@@ -559,6 +569,7 @@ impl Compositor {
             tray_pop: None,
             ending: None,
             toast: None,
+            identify: None,
             splash: super::launch::Splash::default(),
             known_packages: None,
             lock: None,
@@ -2472,6 +2483,77 @@ impl Compositor {
         Some((toast.start, toast.rights))
     }
 
+    /// «Определить» (24.11, like Windows): a big number plate in the lower
+    /// left corner of every monitor for `ms`. `numbers` — `(backend, number,
+    /// name)` of each monitor in the registry: the number is the one
+    /// «Параметры → Дисплей» and OBS show, the name tells two monitors of
+    /// the same model apart. `false` — no monitor to show it on.
+    pub fn start_identify(&mut self, numbers: &[(crate::display::outputs::Backend, u32, alloc::string::String)], ms: u64) -> bool {
+        self.close_identify();
+        let ctx = mini_ui::paint::Ctx::scaled(self.scale);
+        let mut plates = Vec::new();
+        let mut lines = Vec::new();
+        let outputs: Vec<(Rect, crate::display::outputs::Backend)> = self.outputs.iter().map(|out| (out.rect, out.backend)).collect();
+        for (index, (mon, backend)) in outputs.into_iter().enumerate() {
+            let (number, name) = match numbers.iter().find(|(b, ..)| *b == backend) {
+                Some((_, number, name)) => (*number, name.clone()),
+                None => (index as u32 + 1, alloc::format!("{backend:?}")),
+            };
+            let digits = alloc::format!("{number}");
+            let size = (mon.h / 6).clamp(ctx.px(80), ctx.px(220));
+            let face = mini_ui::typeface::display_face(size);
+            let caption = alloc::format!("{name} · {}×{}", mon.w, mon.h);
+            let cap_face = ctx.face(mini_ui::typeface::Role::Body);
+            let pad = ctx.px(28);
+            let w = face.width(&digits).max(cap_face.width(&caption)).max(size) + 2 * pad;
+            let cap_h = u32::from(cap_face.line);
+            let h = u32::from(face.line) + cap_h + ctx.px(6) + 2 * ctx.px(18);
+            let work = self.work_rect_of(index);
+            let margin = ctx.px(40) as i32;
+            let x = mon.x + margin;
+            let y = (work.bottom().min(mon.bottom()) - margin - h as i32).max(mon.y);
+            let Some(mut surface) = Surface::new(w, h, Color::rgb(0x1B, 0x1E, 0x25)) else {
+                continue;
+            };
+            // An accent strip on the left, the number white, the name grey.
+            let accent = ctx.palette.acc;
+            surface.fill(Rect::new(0, 0, ctx.px(6), h), accent);
+            let white = Color::rgb(0xFF, 0xFF, 0xFF);
+            let nx = (w as i32 - face.width(&digits) as i32) / 2;
+            mini_ui::typeface::draw(&mut surface, face, nx, ctx.px(18) as i32, &digits, white, 255);
+            let cx = (w as i32 - cap_face.width(&caption) as i32) / 2;
+            let band = Rect::new(0, (ctx.px(18) + u32::from(face.line) + ctx.px(6)) as i32, w, cap_h);
+            mini_ui::paint::text(ctx, &mut surface, mini_ui::typeface::Role::Body, cx, mini_ui::paint::baseline(ctx, mini_ui::typeface::Role::Body, band), &caption, Color::rgb(0xC8, 0xCC, 0xD4));
+            let rect = Rect::new(x, y, w, h);
+            self.mark_layer(rect);
+            lines.push(alloc::format!("{number} '{name}' {}x{} at {},{}", mon.w, mon.h, mon.x, mon.y));
+            plates.push((rect, surface));
+        }
+        if plates.is_empty() {
+            return false;
+        }
+        crate::kprintln!("  desktop     : identify monitors for {} ms: {}", ms, lines.join("; "));
+        self.identify = Some(Identify { until_ms: crate::time::uptime_ms() + ms, plates });
+        true
+    }
+
+    /// Take the number plates off the monitors.
+    pub fn close_identify(&mut self) {
+        if let Some(identify) = self.identify.take() {
+            for (rect, _) in identify.plates {
+                self.mark_layer(rect);
+            }
+        }
+    }
+
+    /// The number plates are gone when their time is up.
+    pub fn expire_identify(&mut self) {
+        if self.identify.as_ref().is_some_and(|identify| crate::time::uptime_ms() >= identify.until_ms) {
+            self.close_identify();
+            crate::kprintln!("  desktop     : identify plates gone");
+        }
+    }
+
     /// Убрать уведомление, если вышел его срок.
     pub fn expire_toast(&mut self) {
         if self.toast.as_ref().is_some_and(|toast| crate::time::uptime_ms() >= toast.until_ms) {
@@ -2710,7 +2792,9 @@ impl Compositor {
             }
             self.close_snap_layouts();
         }
-        let next = if theme::is_mobile() || self.drag_resizes || self.drag.is_none() {
+        // A window of one size (24.11, WM SDK) does not snap, as in Windows.
+        let snaps = self.drag.and_then(|app| self.index_of(app)).and_then(|index| self.windows.get(index)).is_some_and(|window| window.can_maximize());
+        let next = if theme::is_mobile() || self.drag_resizes || self.drag.is_none() || !snaps {
             None
         } else {
             self.snap_zone(x, y)
@@ -2798,7 +2882,7 @@ impl Compositor {
             return false;
         };
         let before = window.rect;
-        if !window.snap_to(target, previous, maximize) {
+        if !window.can_maximize() || !window.snap_to(target, previous, maximize) {
             return false;
         }
         window.draw_decorations(focused);
@@ -3089,6 +3173,11 @@ impl Compositor {
         // Окно во весь экран не разворачивают и не возвращают: его размер —
         // монитор, пока программа сама не выйдет из этого режима.
         if self.windows.get(index).is_some_and(|window| window.fullscreen) {
+            return false;
+        }
+        // «Развернуть» is greyed out for a window that cannot change size
+        // (24.11): neither the button nor Win+Up nor a client request.
+        if self.windows.get(index).is_some_and(|window| !window.is_maximized() && !window.can_maximize()) {
             return false;
         }
         let mut area = match self.windows.get(index) {
@@ -4120,8 +4209,21 @@ impl Compositor {
         // Контур (20.11): пока тянут, меняется только рамка; размер —
         // при отпускании ([`Self::settle_drag`]).
         if !self.settling && self.drag_resizes && self.drag.is_some() && super::look::outline_drag() {
-            if let Some((_, x, y, w, h)) = self.pending_size {
-                self.set_outline(Some(Rect::new(x, y, w.max(1) as u32, h.max(1) as u32)));
+            if let Some((app, x, y, w, h)) = self.pending_size {
+                // The outline obeys the size limits too (24.11): it stops
+                // where the window would, the fixed side stays put.
+                let edges = self.resize_edges;
+                let outline = match self.index_of(app).and_then(|index| self.windows.get(index)) {
+                    Some(window) => {
+                        let before = window.rect;
+                        let (cw, ch) = window.clamp_size(w.max(1) as u32, h.max(1) as u32);
+                        let cx = if edges & super::window::EDGE_LEFT != 0 { before.right() - cw as i32 } else { x };
+                        let cy = if edges & super::window::EDGE_TOP != 0 { before.bottom() - ch as i32 } else { y };
+                        Rect::new(cx, cy, cw, ch)
+                    }
+                    None => Rect::new(x, y, w.max(1) as u32, h.max(1) as u32),
+                };
+                self.set_outline(Some(outline));
             }
             return;
         }
@@ -5323,6 +5425,7 @@ impl Compositor {
             || self.thumbs.is_some()
             || self.tray_pop.is_some()
             || self.snap_pop.is_some()
+            || self.identify.is_some()
             || self.menu_open()
             || self.context.as_ref().is_some_and(|menu| menu.is_open())
             || self.keyboard.as_ref().is_some_and(|keyboard| keyboard.is_visible())
@@ -6228,6 +6331,15 @@ impl Compositor {
             let r = theme::R_WINDOW * self.scale;
             self.drop_shadow(back, toast.rect, band, dy, r);
             self.stack(back, toast.surface(), toast.rect, band, dy, r);
+        }
+        // «Определить» (24.11): the number plate of every monitor, over
+        // windows and the panel.
+        if let Some(identify) = self.identify.as_ref() {
+            let r = theme::R_WINDOW * self.scale;
+            for (rect, surface) in &identify.plates {
+                self.drop_shadow(back, *rect, band, dy, r);
+                self.stack(back, surface, *rect, band, dy, r);
+            }
         }
         if let Some((surface, rect)) = self.splash.layer() {
             let r = theme::R_WINDOW * self.scale;

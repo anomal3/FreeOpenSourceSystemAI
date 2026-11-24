@@ -487,6 +487,11 @@ impl Manager {
 }
 
 impl App for Manager {
+    /// Smallest window (24.11, WM SDK): the 250-point tree and a table beside it.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(680, 420)
+    }
+
     fn key(&mut self, code: u32) -> bool {
         let page = self.visible.get().max(1) as isize;
         let index = Page::ALL.iter().position(|p| *p == self.page).unwrap_or(0);

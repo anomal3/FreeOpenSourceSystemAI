@@ -458,6 +458,8 @@ enum Deed {
     DisplaysKeep,
     /// «Отменить изменения» там же.
     DisplaysRevert,
+    /// «Определить» (24.11): number plates on the monitors.
+    DisplaysIdentify,
 }
 
 /// Что меняют на странице «Оформление» и в «Глубине цвета».
@@ -1602,6 +1604,10 @@ impl SettingsView {
                 // Фокус — на «Сохранить»: Enter сразу отвечает «да».
                 self.action = 0;
                 self.scroll = 0;
+            }
+            Deed::DisplaysIdentify => {
+                kprintln!("  settings    : identify displays");
+                crate::ui::identify_monitors(0);
             }
             Deed::DisplaysCancel => {
                 self.displays = displays::Displays::load();

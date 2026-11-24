@@ -257,6 +257,18 @@ impl Window {
         insist(|| unsafe { syscall(user_abi::SYS_WINSTYLE, self.id as usize, flags as usize, 0) })
     }
 
+    /// Size limits of the window content (24.11, WM SDK,
+    /// [`user_abi::SYS_WINLIMITS`]): `min` and `max` in layout points (what
+    /// `ctx.px` takes), zero side — no limit, `min == max` — one fixed size.
+    /// The desktop keeps the window inside them on resize, snap, maximize and
+    /// scale changes. Programs of the [`app`] frame say it through
+    /// [`app::App::size_limits`] instead.
+    pub fn set_size_limits(&self, min: (u32, u32), max: (u32, u32)) -> i64 {
+        let (min, max) = (user_abi::pack_size(min.0, min.1), user_abi::pack_size(max.0, max.1));
+        // SAFETY: аргументы — числа.
+        insist(|| unsafe { syscall(user_abi::SYS_WINLIMITS, self.id as usize, min, max) })
+    }
+
     /// Назначить окну владельца ([`user_abi::SYS_WINOWNER`]): окно этой же
     /// программы или (20.11) другой программы того же пользователя; флаги —
     /// `WIN_OWNER_MODAL`, `WIN_OWNER_CENTER`.

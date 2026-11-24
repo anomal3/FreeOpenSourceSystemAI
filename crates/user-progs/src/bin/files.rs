@@ -6246,6 +6246,12 @@ impl App for Files {
         self.render(s, area, ctx);
     }
 
+    /// Smallest window (24.11, WM SDK): tabs, the command bar, the address
+    /// row, the side list and a table (wider ones scroll sideways).
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(560, 380)
+    }
+
     fn key(&mut self, code: u32) -> bool {
         self.on_key(code)
     }

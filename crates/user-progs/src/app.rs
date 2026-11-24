@@ -196,9 +196,57 @@ pub trait App {
     fn window_style(&self) -> u32 {
         0
     }
+
+    /// Size limits of the window (24.11, WM SDK): `(min, max)` content size
+    /// in layout points (what `ctx.px` takes — the desktop multiplies them by
+    /// the scale); a zero side — no limit; `min == max` — one fixed size (no
+    /// edges to drag, «Развернуть» greyed out, no snapping).
+    ///
+    /// The frame asks after every frame and tells the desktop
+    /// (`Window::set_size_limits`) only when the answer changed, so a program
+    /// may make them depend on its state. The desktop keeps the window inside
+    /// them on edge dragging, snapping, maximizing (a window with a maximum
+    /// is maximized to it, top-left of the work area, as in Windows),
+    /// restoring and scale changes. Lay out so that nothing overlaps at the
+    /// minimum: that is the contract.
+    fn size_limits(&self) -> SizeLimits {
+        SizeLimits::min(DEFAULT_MIN.0, DEFAULT_MIN.1)
+    }
 }
 
-/// Самое маленькое окно, до которого программу каркаса можно сжать.
+/// Size limits of an [`App`] window: content size in layout points; zero —
+/// no limit on that side.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SizeLimits {
+    pub min: (u32, u32),
+    pub max: (u32, u32),
+}
+
+impl SizeLimits {
+    /// Only a minimum.
+    #[must_use]
+    pub const fn min(w: u32, h: u32) -> Self {
+        Self { min: (w, h), max: (0, 0) }
+    }
+
+    /// A minimum and a maximum.
+    #[must_use]
+    pub const fn between(min: (u32, u32), max: (u32, u32)) -> Self {
+        Self { min, max }
+    }
+
+    /// One size, like a Windows dialog without a sizing frame.
+    #[must_use]
+    pub const fn fixed(w: u32, h: u32) -> Self {
+        Self { min: (w, h), max: (w, h) }
+    }
+}
+
+/// Smallest content of a frame program that did not say (layout points).
+pub const DEFAULT_MIN: (u32, u32) = (320, 200);
+
+/// Самое маленькое окно, до которого программу каркаса можно сжать (точки
+/// экрана; предел в точках макета — [`App::size_limits`]).
 const MIN_W: u32 = 320;
 const MIN_H: u32 = 200;
 
@@ -396,6 +444,9 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
     } else if app.resizable() {
         let _ = window.set_resizable(true);
     }
+    // Size limits (24.11, WM SDK) — now and whenever the program changes them.
+    let mut limits = app.size_limits();
+    let _ = window.set_size_limits(limits.min, limits.max);
 
     let mut dark = info.flags & SYSINFO_DARK != 0;
     let mut next = monotonic_ms() + spec.period_ms;
@@ -535,6 +586,10 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
             if window.commit() >= 0 {
                 dirty = false;
                 frames += 1;
+            }
+            let fresh_limits = app.size_limits();
+            if fresh_limits != limits && window.set_size_limits(fresh_limits.min, fresh_limits.max) >= 0 {
+                limits = fresh_limits;
             }
             if let Some(title) = app.title() {
                 if shown_title.as_deref() != Some(title.as_str()) && window.set_title(&title) >= 0 {

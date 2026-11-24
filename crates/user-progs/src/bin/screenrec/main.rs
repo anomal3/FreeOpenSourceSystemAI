@@ -971,14 +971,23 @@ struct Recorder {
     note: Option<String>,
     dialog: Option<Dialog>,
     started_at: u64,
+    /// Scale of the desktop: the window size is laid out in it (24.11).
+    scale: mini_ui::Scale,
+    /// Rows closer (a 720p screen leaves the window ~520 points).
+    compact: bool,
 }
 
+/// Width of the recorder window, layout points (24.11: the window has one
+/// size, like the Snipping Tool bar — its rows are laid out for it).
+const WINDOW_W: u32 = 800;
+
 impl Recorder {
-    fn new() -> Self {
+    fn new(scale: mini_ui::Scale, compact: bool) -> Self {
         let settings = Settings::load();
         let info = cap_info().unwrap_or_default();
         let last = read_text(&last_path_file(), 4096).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-        let mut recorder = Self { settings, info, window: None, window_turn: 0, status: cap_status(), next_poll: 0, last, note: None, dialog: None, started_at: 0 };
+        let mut recorder =
+            Self { settings, info, window: None, window_turn: 0, status: cap_status(), next_poll: 0, last, note: None, dialog: None, started_at: 0, scale, compact };
         if let Area::Rect(x, y, w, h) = recorder.settings.area {
             recorder.window = Some(((x, y, w, h), String::from("область")));
         }
@@ -1008,6 +1017,19 @@ impl Recorder {
         self.status.active != 0
     }
 
+    /// Height the rows need at the desktop scale, layout points (24.11): the
+    /// window is exactly that high — MP4 (two more rows) makes it taller.
+    fn natural_h(&self) -> u32 {
+        let ctx = Ctx::scaled(self.scale);
+        let (controls, _, folder_row) = self.controls(ctx, Rect::new(0, 0, ctx.px(WINDOW_W), ctx.px(2000)));
+        let mut bottom = controls.iter().map(|c| c.rect.bottom()).max().unwrap_or(0);
+        // Room for the warning under «Папка» (the folder is in memory)
+        // always: the window would jump when it comes and goes.
+        bottom = bottom.max(folder_row.bottom() + ctx.px(26) as i32);
+        let px = bottom.max(0) as u32 + ctx.px(if self.compact { 16 } else { 24 }) + ctx.px(theme::STATUS_H);
+        (px * 100).div_ceil(self.scale.pct().max(1))
+    }
+
     fn controls(&self, ctx: Ctx, area: Rect) -> (Vec<Control>, Vec<(String, i32)>, Rect) {
         let pad = ctx.px(24) as i32;
         let label_w = ctx.px(130) as i32;
@@ -1017,7 +1039,7 @@ impl Recorder {
         let mut controls = Vec::new();
         let mut labels = Vec::new();
         // A 720p screen leaves the window ~520 points: rows closer there.
-        let compact = area.h < ctx.px(620);
+        let compact = self.compact;
         let mut y = area.y + ctx.px(if compact { 82 } else { 96 }) as i32;
         let row_gap = ctx.px(if compact { 6 } else { 14 }) as i32;
         let right = area.right() - pad;
@@ -1221,7 +1243,15 @@ impl App for Recorder {
         dirty
     }
 
-    fn tick(&mut self, _info: &user_progs::SysInfo) -> bool {
+    /// 24.11: one size, laid out for it (Roman: stretched, the rows stayed
+    /// where they were) — no edges, «Развернуть» greyed, no snapping.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::fixed(WINDOW_W, self.natural_h())
+    }
+
+    fn tick(&mut self, info: &user_progs::SysInfo) -> bool {
+        // The desktop scale may change on the fly (the size follows it).
+        self.scale = app::ui_scale(info);
         // Monitors may come and go.
         if let Some(info) = cap_info() {
             let changed = info.count != self.info.count || info.desk_w != self.info.desk_w || info.desk_h != self.info.desk_h;
@@ -1401,6 +1431,12 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         }
     }
     let info = app::start(&SPEC);
-    let size = app::window_size(&info, (800, 660));
-    app::run(&SPEC, &info, size, |_, _| Recorder::new())
+    let scale = app::ui_scale(&info);
+    // A screen that leaves less than 640 points under the window title
+    // (720p) gets the closer rows; the window is then as high as they are.
+    let work_pts = info.screen_h.saturating_sub((theme::PANEL_H + theme::TITLE_H) * scale) * 100 / scale.pct().max(1);
+    let compact = work_pts < 660;
+    let height: u32 = if compact { 560 } else { 640 };
+    let size = (WINDOW_W * scale, height * scale);
+    app::run(&SPEC, &info, size, move |_, _| Recorder::new(scale, compact))
 }

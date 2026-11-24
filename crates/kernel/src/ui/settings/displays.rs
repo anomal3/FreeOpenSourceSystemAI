@@ -667,10 +667,20 @@ impl Displays {
         let total: u32 = buttons.iter().map(|(_, label, _)| kit::button_width(ctx, label) + ctx.px(10)).sum();
         let mut bx = strip.right() - total as i32 + ctx.px(10) as i32;
         let shown = pass.visible(strip);
+        // «Определить» (24.11, like Windows): the number of every monitor on
+        // it for 3 s — the numbers of this canvas.
+        let identify = "Определить";
+        let iw = kit::button_width(ctx, identify);
+        let irect = Rect::new(x, strip.y, iw, button_h);
+        // A mouse target only: the keyboard order of the page (monitors,
+        // «Применить», «Отмена», …) stays as scenarios and people know it.
         if shown {
+            pass.hit(irect, kit::Spot::Deed(Deed::DisplaysIdentify));
+            pass.on(|s| paint::button(ctx, s, irect, Weight::Normal, identify, false));
             let hint = "Выберите дисплей; перетащите его или Ctrl+стрелки";
-            let room = (bx - x - ctx.px(16) as i32).max(0) as u32;
-            pass.text(Role::Caption, x + ctx.px(2) as i32, paint::baseline(ctx, Role::Caption, strip), room, hint, p.ink4);
+            let hx = irect.right() + ctx.px(12) as i32;
+            let room = (bx - hx - ctx.px(16) as i32).max(0) as u32;
+            pass.text(Role::Caption, hx, paint::baseline(ctx, Role::Caption, strip), room, hint, p.ink4);
         }
         for (deed, label, weight) in buttons {
             let bw = kit::button_width(ctx, label);

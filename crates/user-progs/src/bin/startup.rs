@@ -590,6 +590,11 @@ impl Startup {
 }
 
 impl App for Startup {
+    /// Smallest window (24.11, WM SDK): the table and its switches.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(560, 360)
+    }
+
     fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
         s.fill(area, theme::window_bg());
         let plan = Plan::new(ctx, area);
