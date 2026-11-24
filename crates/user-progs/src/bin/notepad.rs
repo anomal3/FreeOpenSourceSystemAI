@@ -2354,7 +2354,13 @@ fn error_text(code: i64) -> &'static str {
 pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // SAFETY: значения — те, что ядро передало в `_start`.
     let args = unsafe { Args::new(argc, argv) };
-    let path = args.get(1).map(String::from);
+    // Ядро делит строку запуска по пробелам, кавычек не зная: путь
+    // «/root/Desktop/Новый текстовый документ.txt» со стола приходит тремя
+    // словами. До 24.11 Блокнот брал первое — открывал «/root/Desktop/Новый»
+    // и сохранял туда: на столе появлялся «неизвестный файл» без расширения
+    // (hw-log18). Путь — все слова через пробел, как у «Файлов».
+    let words: Vec<&str> = (1..args.len()).filter_map(|index| args.get(index)).collect();
+    let path = (!words.is_empty()).then(|| words.join(" "));
     let info = app::start(&SPEC);
     // Один размер на глаз на 1280×720 и 2560×1440 (20.11), а не две трети
     // экрана.

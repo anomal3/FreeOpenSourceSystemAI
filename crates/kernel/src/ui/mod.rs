@@ -441,7 +441,7 @@ fn open_file(desktop: &mut Compositor, command: &str, path: &str) {
         run_choice(desktop, panel::proton_choice(openwith::line(command, path)));
         return;
     }
-    start(desktop, &alloc::format!("{command} {path}"));
+    start(desktop, &openwith::line(command, path));
 }
 
 /// Закрыть окно так же, как его крестик: окно программы закрывает она сама.
@@ -2728,6 +2728,19 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
         } else {
             desktop_to_clipboard(desktop, event.code == KeyCode::X);
         }
+        return None;
+    }
+    // Delete на столе (24.11, Роман: «неизвестный файл не удалить») — меню
+    // подписывало «Удалить  Del», а клавиши стол не знал.
+    if event.code == KeyCode::Delete
+        && DESK_FOCUS.load(Ordering::Relaxed)
+        && !event.mods.contains(Modifiers::CTRL)
+        && !event.mods.contains(Modifiers::ALT)
+        && !desktop.context_open()
+        && !desktop.menu_open()
+        && desktop_delete_key(desktop)
+    {
+        desktop.present();
         return None;
     }
 
@@ -6426,6 +6439,31 @@ fn selected_entries(desktop: &Compositor) -> alloc::vec::Vec<(String, String)> {
         .filter(|index| matches!(desktop.icon_kind(*index), Some(icons::Kind::Folder | icons::Kind::File)))
         .filter_map(|index| Some((desktop.icon_path(index)?, desktop.icon_label(index)?)))
         .collect()
+}
+
+/// Клавиша Delete на столе: выделенные файлы и каталоги — тем же окном
+/// «Удаление файла», что пункт меню «Удалить». `false` — удалять нечего
+/// (выделен системный значок или ярлык программы).
+fn desktop_delete_key(desktop: &mut Compositor) -> bool {
+    let mut entries = selected_entries(desktop);
+    if entries.is_empty() && desktop.icon_selection().is_some_and(|index| matches!(desktop.icon_kind(index), Some(icons::Kind::Folder | icons::Kind::File))) {
+        entries.extend(selected_entry(desktop));
+    }
+    let question = match entries.as_slice() {
+        [] => return false,
+        [(_, label)] => alloc::format!("Удалить «{label}»?"),
+        many => alloc::format!("Удалить объекты ({})?", many.len()),
+    };
+    kprintln!("  desktop     : Delete key on {} item(s)", entries.len());
+    *DELETE_PENDING.lock() = entries;
+    EMPTY_PENDING.store(false, Ordering::Relaxed);
+    let rect = layout(desktop, App::DeleteAsk);
+    if let Some(window) = Window::dialog(App::DeleteAsk, rect, desktop.scale(), Dialog::Delete { question, forever: false }) {
+        desktop.push(window);
+        kprintln!("  desktop     : opened '{}'", App::DeleteAsk.title());
+        log_focus(desktop);
+    }
+    true
 }
 
 /// Выделенные значки стола (файлы, каталоги) — в буфер обмена системы

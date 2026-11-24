@@ -5589,6 +5589,28 @@ extern "C" fn thread_entry(arg: usize) -> ! {
     sched::exit_current_with(code)
 }
 
+/// Слова строки запуска: делит пробел; слово, начатое кавычкой, тянется до
+/// закрывающей кавычки (сами кавычки не входят). Без закрывающей — до конца.
+pub fn launch_words(line: &str) -> impl Iterator<Item = &str> {
+    let mut rest = line;
+    core::iter::from_fn(move || {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return None;
+        }
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"').unwrap_or(inner.len());
+            let word = &inner[..end];
+            rest = inner.get(end + 1..).unwrap_or("");
+            return Some(word);
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..end];
+        rest = &rest[end..];
+        Some(word)
+    })
+}
+
 /// Точка входа задачи, исполняющей программу.
 extern "C" fn program_entry(arg: usize) -> ! {
     // Задача начинает исполняться с запрещёнными прерываниями: их запретил
@@ -5618,7 +5640,10 @@ extern "C" fn program_entry(arg: usize) -> ! {
     // живёт ровно столько, сколько эта задача. Первое слово — путь, остальные —
     // аргументы программы; кавычек и экранирования нет, и обещать их, сделав
     // разбиение по пробелам, было бы хуже, чем не обещать.
-    let mut words = line.split_whitespace();
+    // Кавычки (24.11, hw-log18): слово в `"…"` — одно, с пробелами внутри
+    // (стол открывает «/root/Desktop/Новый текстовый документ.txt»). Строки
+    // без кавычек делятся как раньше.
+    let mut words = launch_words(line);
     let path = words.next().unwrap_or("");
     let mut args: [&str; MAX_ARGS] = [""; MAX_ARGS];
     let mut argc = 0;

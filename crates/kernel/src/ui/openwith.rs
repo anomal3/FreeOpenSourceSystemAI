@@ -67,6 +67,10 @@ pub fn line(command: &str, path: &str) -> String {
     }
     if command.contains(super::panel::PROTON_SCRIPT) {
         alloc::format!("{command} {}", super::panel::pct(path))
+    } else if path.contains(char::is_whitespace) && !path.contains('"') {
+        // Своя программа (24.11): путь с пробелом — в кавычках, ядро отдаёт
+        // его одним аргументом (`user::launch_words`).
+        alloc::format!("{command} \"{path}\"")
     } else {
         alloc::format!("{command} {path}")
     }
