@@ -5746,9 +5746,11 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
             let Some(command) = desktop.icon_path(index) else {
                 return;
             };
-            // «Сеть» on the desktop (24.11): the network page of «Параметры».
+            // «Сеть» on the desktop: «Файлы» at `/net` — the computers of
+            // the network and their shared folders (SMB, 24.11), as Windows'
+            // «Сеть» opens Explorer.
             if command == deskicons::NETWORK_COMMAND {
-                open_settings(desktop, Section::Network, &status_now());
+                start(desktop, deskicons::NETWORK_FILES);
                 return;
             }
             // Ярлык программы Windows (21.11) — с правами пакета `proton`,

@@ -41,9 +41,11 @@ pub const ALL: [Special; 7] = [Special::Computer, Special::User, Special::Networ
 
 /// Command of «Этот компьютер» — «Файлы» on the computer page.
 pub const COMPUTER_COMMAND: &str = "/bin/files computer:";
-/// Command of «Сеть»: the network page of «Параметры» (network places of
-/// other machines are not browsed yet — ROADMAP).
+/// Command of «Сеть»: kept in saved icons; opening runs [`NETWORK_FILES`]
+/// (until 24.11 — the network page of «Параметры»).
 pub const NETWORK_COMMAND: &str = "special:network";
+/// What «Сеть» opens: «Файлы» at `/net` (SMB computers and shares, 24.11).
+pub const NETWORK_FILES: &str = "/bin/files /net";
 
 impl Special {
     #[must_use]

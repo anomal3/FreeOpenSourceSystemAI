@@ -53,6 +53,10 @@ extern crate alloc;
 /// `src/bin/` сборка считает программами.
 #[path = "files/props.rs"]
 mod props;
+/// «Сеть» (24.11): `/net`, shared folders over SMB — `files/net.rs`.
+#[path = "files/net.rs"]
+mod net;
+use net::{is_net, net_level, net_title, volume_art};
 
 use alloc::collections::BTreeSet;
 use alloc::format;
@@ -999,6 +1003,10 @@ struct Files {
     tip: Option<Tip>,
     /// Закреплённое место тянут, чтобы переставить (24.11).
     pin_drag: Option<PinDrag>,
+    /// A network folder is being read by a child (24.11, `files/net.rs`).
+    net_load: Option<net::NetLoad>,
+    /// `netlogon` asks for the account of the open network folder.
+    net_login: Option<net::NetLogin>,
 }
 
 /// Что под указателем подсвечено.
@@ -1313,6 +1321,8 @@ impl Files {
             options: None,
             tip: None,
             pin_drag: None,
+            net_load: None,
+            net_login: None,
         };
         view.load_settings();
         view.load_options();
@@ -1548,51 +1558,61 @@ impl Files {
         self.error = None;
 
         if self.on_computer() {
-            self.rows = list_volumes();
+            self.rows = computer_rows();
+            return;
+        }
+        // A network folder is read in the background (24.11): connecting to
+        // a computer can take seconds.
+        if is_net(&self.path) {
+            self.start_net_load();
             return;
         }
 
         match list_dir(&self.path) {
-            Ok((rows, dropped)) => {
-                // Служебные деревья сворачиваются здесь, а не при отрисовке:
-                // иначе стрелка вниз ходила бы по невидимым строкам, и выделение
-                // пропадало бы на ровном месте.
-                self.rows = if self.friendly {
-                    rows.into_iter()
-                        .filter(|row| !sysconf::winpath::is_folded(&join(&self.path, &row.name)))
-                        .collect()
-                } else {
-                    rows
-                };
-                self.dropped = dropped;
-                if !self.hidden {
-                    self.rows.retain(|row| !row.name.starts_with('.'));
-                }
-                // Каталоги наверх, дальше — как выбрано (по умолчанию по имени):
-                // порядок записей в ext2 — это порядок вставки, то есть для
-                // человека случайный.
-                let (key, descending) = (self.sort, self.descending);
-                self.rows.sort_by(|a, b| {
-                    let order = match key {
-                        SortKey::Name => a.name.cmp(&b.name),
-                        SortKey::Date => a.mtime.cmp(&b.mtime).then_with(|| a.name.cmp(&b.name)),
-                        SortKey::Kind => file_kind(&a.name, a.directory).1.cmp(file_kind(&b.name, b.directory).1).then_with(|| a.name.cmp(&b.name)),
-                        SortKey::Size => a.size.cmp(&b.size).then_with(|| a.name.cmp(&b.name)),
-                    };
-                    b.directory.cmp(&a.directory).then(if descending { order.reverse() } else { order })
-                });
-                // Поиск (72g): остаются записи, в имени которых есть набранное.
-                if !self.query.is_empty() {
-                    let query = self.query.to_lowercase();
-                    let path = self.path.clone();
-                    let friendly = self.friendly;
-                    self.rows.retain(|row| {
-                        let shown = if friendly { sysconf::winpath::label(&join(&path, &row.name)).unwrap_or(&row.name) } else { &row.name };
-                        row.name.to_lowercase().contains(&query) || shown.to_lowercase().contains(&query)
-                    });
-                }
-            }
+            Ok((rows, dropped)) => self.adopt_rows(rows, dropped),
             Err(text) => self.error = Some(text),
+        }
+    }
+
+    /// Rows of the open folder, as read: folded trees, hidden files, order,
+    /// search.
+    fn adopt_rows(&mut self, rows: Vec<Row>, dropped: usize) {
+        // Служебные деревья сворачиваются здесь, а не при отрисовке:
+        // иначе стрелка вниз ходила бы по невидимым строкам, и выделение
+        // пропадало бы на ровном месте.
+        self.rows = if self.friendly {
+            rows.into_iter()
+                .filter(|row| !sysconf::winpath::is_folded(&join(&self.path, &row.name)))
+                .collect()
+        } else {
+            rows
+        };
+        self.dropped = dropped;
+        if !self.hidden {
+            self.rows.retain(|row| !row.name.starts_with('.'));
+        }
+        // Каталоги наверх, дальше — как выбрано (по умолчанию по имени):
+        // порядок записей в ext2 — это порядок вставки, то есть для
+        // человека случайный.
+        let (key, descending) = (self.sort, self.descending);
+        self.rows.sort_by(|a, b| {
+            let order = match key {
+                SortKey::Name => a.name.cmp(&b.name),
+                SortKey::Date => a.mtime.cmp(&b.mtime).then_with(|| a.name.cmp(&b.name)),
+                SortKey::Kind => file_kind(&a.name, a.directory).1.cmp(file_kind(&b.name, b.directory).1).then_with(|| a.name.cmp(&b.name)),
+                SortKey::Size => a.size.cmp(&b.size).then_with(|| a.name.cmp(&b.name)),
+            };
+            b.directory.cmp(&a.directory).then(if descending { order.reverse() } else { order })
+        });
+        // Поиск (72g): остаются записи, в имени которых есть набранное.
+        if !self.query.is_empty() {
+            let query = self.query.to_lowercase();
+            let path = self.path.clone();
+            let friendly = self.friendly;
+            self.rows.retain(|row| {
+                let shown = if friendly { sysconf::winpath::label(&join(&path, &row.name)).unwrap_or(&row.name) } else { &row.name };
+                row.name.to_lowercase().contains(&query) || shown.to_lowercase().contains(&query)
+            });
         }
     }
 
@@ -4045,6 +4065,8 @@ impl Files {
             self.draw_preview(surface, ctx, &plan, preview);
         } else if self.on_computer() && self.error.is_none() {
             self.draw_computer(surface, ctx, &plan);
+        } else if self.draw_net_state(surface, ctx, &plan) {
+            // «Сеть»: loading, the password window, nobody found (24.11).
         } else if self.view == ViewMode::Tiles {
             self.draw_tiles(surface, ctx, &plan);
         } else if self.view == ViewMode::List {
@@ -4090,14 +4112,19 @@ impl Files {
         let per_row = ((room + gap) / (ctx.px(250) + gap)).max(1);
         let tile_w = (room.saturating_sub(gap * (per_row - 1)) / per_row).min(ctx.px(330));
         let tile_h = ctx.px(60);
-        let cards: Vec<Rect> = (0..self.rows.len())
+        // «Сеть» (24.11) is the last row and stands under its own heading.
+        let disks = self.rows.iter().filter(|row| row.name != sysconf::winpath::NET).count();
+        let mut cards: Vec<Rect> = (0..disks)
             .map(|index| {
                 let (column, line) = (index as u32 % per_row, index as u32 / per_row);
                 Rect::new(area.x + pad + (column * (tile_w + gap)) as i32, top + (line * (tile_h + gap)) as i32, tile_w, tile_h)
             })
             .collect();
-        let lines = (self.rows.len() as u32).div_ceil(per_row).max(1);
+        let lines = (disks as u32).div_ceil(per_row).max(1);
         let net_head = top + (lines * (tile_h + gap)) as i32 + ctx.px(12) as i32;
+        for index in 0..self.rows.len() - disks {
+            cards.push(Rect::new(area.x + pad + (index as u32 * (tile_w + gap)) as i32, net_head + ctx.px(32) as i32, tile_w, tile_h));
+        }
         (cards, disks_head, net_head)
     }
 
@@ -4130,7 +4157,7 @@ impl Files {
             paint::row(ctx, s, *card, state);
             let side = ctx.px(44);
             let icon = Rect::new(card.x + ctx.px(8) as i32, card.y + (card.h as i32 - side as i32) / 2, side, side);
-            let art = if row.name == "/" { "place-system-disk" } else if row.name.starts_with("/usb") { "place-usb-stick" } else { "place-local-disk" };
+            let art = volume_art(&row.name);
             if !draw_design_icon(&self.icons, s, icon, art) {
                 paint::icon_tile(ctx, s, icon, Icon::Disk, Tone::Accent, true);
             }
@@ -4139,7 +4166,9 @@ impl Files {
             let mut ty = card.y + ctx.px(6) as i32;
             paint::text_clipped(ctx, s, Role::Body, tx, ty, room, &volume_title(&row.name, &row.label), p.ink);
             ty += i32::from(ctx.face(Role::Body).line) + ctx.px(3) as i32;
-            if row.size > 0 {
+            if row.name == sysconf::winpath::NET {
+                paint::text_clipped(ctx, s, Role::Caption, tx, ty, room, "Компьютеры и общие папки (SMB)", p.ink3);
+            } else if row.size > 0 {
                 let used = row.size.saturating_sub(row.free);
                 let percent = (used * 100 / row.size.max(1)).min(100);
                 let bar = Rect::new(tx, ty, room, ctx.px(12));
@@ -4158,9 +4187,12 @@ impl Files {
                 paint::text_clipped(ctx, s, Role::Caption, tx, ty, room, &format!("{} · место не считается", row.volume), p.ink4);
             }
         }
-        // Сетевые расположения (24.11): общих папок (SMB) система пока не
-        // подключает — раздел есть и честно пуст.
-        if net_head + ctx.px(60) as i32 <= area.bottom() {
+        // Сетевые расположения (24.11): «Сеть» — `/net`, компьютеры и их
+        // общие папки (SMB); без неё (ядро без сети) — честно пусто.
+        let has_net = self.rows.iter().any(|row| row.name == sysconf::winpath::NET);
+        if has_net && net_head < area.bottom() {
+            Self::section_head(ctx, s, x, net_head, "Сетевые расположения");
+        } else if net_head + ctx.px(60) as i32 <= area.bottom() {
             Self::section_head(ctx, s, x, net_head, "Сетевые расположения");
             let y = net_head + ctx.px(32) as i32;
             let room = area.w.saturating_sub(ctx.px(56));
@@ -4409,11 +4441,7 @@ impl Files {
             );
             // Картинка темы без плитки (22.11, Роман: «синий квадрат с синей
             // папкой» не нужен); плитка — только если картинки нет.
-            let kind_icon = if row.is_volume() {
-                if row.name == "/" { "place-system-disk" } else if row.name.starts_with("/usb") { "place-usb-stick" } else { "place-local-disk" }
-            } else {
-                file_kind(&row.name, row.directory).0
-            };
+            let kind_icon = self.row_art(row).0;
             if !draw_design_icon(&self.icons, s, tile, kind_icon) {
                 let (icon, tone, filled) = row.icon();
                 paint::icon_tile(ctx, s, tile, icon, tone, filled);
@@ -4589,7 +4617,14 @@ impl Files {
             if row.mtime != 0 {
                 out.push(format!("Дата изменения: {}", date_text(row.mtime, self.offset)));
             }
-            if self.opts.folder_size_tips {
+            // Computers and shared folders (24.11): their kind, and no walk —
+            // over the network it could hold the window.
+            if let Some(level @ (0 | 1)) = net_level(&self.path) {
+                out.push(String::from(if level == 0 { "Компьютер в сети" } else { "Общая папка" }));
+                out.push(net_title(&join(&self.path, &row.name)));
+                return out;
+            }
+            if self.opts.folder_size_tips && !is_net(&self.path) {
                 let summary = folder_summary(&join(&self.path, &row.name), TIP_WALK_LIMIT);
                 if summary.files + summary.dirs == 0 && summary.complete {
                     out.push(String::from("Пустая папка"));
@@ -4873,11 +4908,7 @@ impl Files {
 
             let side = ctx.px(18);
             let icon = Rect::new(rect.x + ctx.px(8) as i32, rect.y + (rect.h as i32 - side as i32) / 2, side, side);
-            let (kind_icon, kind_name) = if row.is_volume() {
-                (if row.name == "/" { "place-system-disk" } else if row.name.starts_with("/usb") { "place-usb-stick" } else { "place-local-disk" }, "Диск")
-            } else {
-                file_kind(&row.name, row.directory)
-            };
+            let (kind_icon, kind_name) = self.row_art(row);
             if !draw_design_icon(&self.icons, s, icon, kind_icon) {
                 let (glyph, tone, filled) = row.icon();
                 paint::icon_tile(ctx, s, icon, glyph, tone, filled);
@@ -5352,6 +5383,16 @@ fn breadcrumb(path: &str, home: &str) -> Vec<(String, String)> {
         out.push((String::from("Этот компьютер"), String::from(COMPUTER)));
         return out;
     }
+    // «Сеть › HOST › папка › …» (24.11).
+    if let Some(rest) = path.strip_prefix(sysconf::winpath::NET).filter(|rest| rest.is_empty() || rest.starts_with('/')) {
+        out.push((String::from("Сеть"), String::from(sysconf::winpath::NET)));
+        let mut current = String::from(sysconf::winpath::NET);
+        for part in rest.split('/').filter(|part| !part.is_empty()) {
+            current = format!("{current}/{part}");
+            out.push((part.to_string(), current.clone()));
+        }
+        return out;
+    }
     let (mut current, rest) = if path == home || path.starts_with(&format!("{home}/")) {
         out.push((String::from("Главная"), home.to_string()));
         (home.to_string(), &path[home.len()..])
@@ -5440,6 +5481,10 @@ fn places(home: &str, pinned: &[String]) -> Vec<(Option<&'static str>, String, O
             out.push((None, String::from(disk), None));
         }
     }
+    // «Сеть» (24.11), as in Explorer's navigation pane.
+    if is_directory(sysconf::winpath::NET) {
+        out.push((None, String::from(sysconf::winpath::NET), None));
+    }
     out.push((None, format!("{home}/.local/share/Trash/files"), None));
     out
 }
@@ -5461,6 +5506,7 @@ fn place_title<'a>(path: &'a str, home: &str) -> &'a str {
         _ if path == "/usb2" => "USB-накопитель 3",
         _ if path == "/usb3" => "USB-накопитель 4",
         _ if path == "/data" => "Данные",
+        _ if path == sysconf::winpath::NET => "Сеть",
         _ if path.ends_with("/.local/share/Trash/files") => "Корзина",
         "Desktop" => "Рабочий стол",
         "Downloads" => "Загрузки",
@@ -5483,6 +5529,7 @@ fn place_icon(path: &str, home: &str) -> &'static str {
         "/" => "place-system-disk",
         "/usb" | "/usb1" | "/usb2" | "/usb3" => "place-usb-stick",
         "/data" => "place-local-disk",
+        sysconf::winpath::NET => "network",
         _ if path.ends_with("/.local/share/Trash/files") => {
             if dir_has_entries(path) { "place-trash-full" } else { "place-trash-empty" }
         }
@@ -5495,6 +5542,7 @@ fn place_icon(path: &str, home: &str) -> &'static str {
 fn volume_title(point: &str, label: &str) -> String {
     match point {
         "/" => String::from("Системный диск"),
+        sysconf::winpath::NET => String::from("Сеть"),
         "/data" => String::from("Данные (/data)"),
         other if !label.is_empty() => format!("{label} ({other})"),
         other if other.starts_with("/usb") => format!("USB-накопитель ({other})"),
@@ -5582,6 +5630,16 @@ fn list_volumes() -> Vec<Row> {
             }
             out
         })
+}
+
+/// «Этот компьютер»: the disks, then «Сеть» (24.11) — `/net` is not a disk
+/// tile but the network place, last, under «Сетевые расположения».
+fn computer_rows() -> Vec<Row> {
+    let mut rows: Vec<Row> = list_volumes().into_iter().filter(|row| row.name != sysconf::winpath::NET).collect();
+    if is_directory(sysconf::winpath::NET) {
+        rows.push(Row::volume(sysconf::winpath::NET, "SMB", 0, 0));
+    }
+    rows
 }
 
 /// Время работы в виде `Ч:ММ:СС`.
@@ -6003,9 +6061,17 @@ fn trash_origin(text: &str) -> Option<String> {
 /// Ошибка — текстом, а не кодом: показывать её человеку всё равно строкой, а
 /// перевод кода в слова в одном месте лучше, чем в трёх.
 fn list_dir(path: &str) -> Result<(Vec<Row>, usize), String> {
+    list_dir_code(path).map_err(|(code, opening)| {
+        if opening { format!("cannot open {path}: error {code}") } else { format!("cannot read {path}: error {code}") }
+    })
+}
+
+/// [`list_dir`] with the refusal as a code (and whether it was the open):
+/// `ERR_PERMISSION` under `/net` means «ask for a password» (24.11).
+fn list_dir_code(path: &str) -> Result<(Vec<Row>, usize), (i64, bool)> {
     let fd = open(path);
     if fd < 0 {
-        return Err(format!("cannot open {path}: error {fd}"));
+        return Err((fd, true));
     }
     let program = path == "/bin" || path.ends_with("/bin");
     let mut rows = Vec::new();
@@ -6019,7 +6085,7 @@ fn list_dir(path: &str) -> Result<(Vec<Row>, usize), String> {
         }
         if step < 0 {
             close(fd);
-            return Err(format!("cannot read {path}: error {step}"));
+            return Err((step, false));
         }
         // Имя пришло из-за границы доверия: длина — поле структуры, а байты —
         // содержимое носителя. И то и другое проверяется, а не берётся на веру:
@@ -6244,6 +6310,12 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // `files --properties ПУТЬ…` (24.11): окно «Свойства».
     if args.get(1) == Some("--properties") {
         props::run(&args, 2);
+    }
+
+    // `files --netlist OUT PATH` (24.11): a network folder read for a
+    // window, in the background (`files/net.rs`).
+    if args.get(1) == Some("--netlist") {
+        net::netlist_main(&args);
     }
 
     // `files --paste DIR` (24.11): файлы из буфера обмена — в DIR без окна.
@@ -6486,7 +6558,7 @@ impl App for Files {
         } else {
             false
         };
-        options | self.tip_step() | self.copy_step() | self.offer_step() | self.watch_drop() | self.item_offer_step() | self.watch_items() | self.watch_step()
+        options | self.net_step() | self.tip_step() | self.copy_step() | self.offer_step() | self.watch_drop() | self.item_offer_step() | self.watch_items() | self.watch_step()
     }
 
     fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
@@ -7382,7 +7454,7 @@ impl Files {
             paint::row(ctx, s, rect, state);
             let side = ctx.px(16);
             let icon = Rect::new(rect.x + ctx.px(8) as i32, rect.y + (rect.h as i32 - side as i32) / 2, side, side);
-            let (kind_icon, _) = file_kind(&row.name, row.directory);
+            let (kind_icon, _) = self.row_art(row);
             if !draw_design_icon(&self.icons, s, icon, kind_icon) {
                 let (glyph, tone, filled) = row.icon();
                 paint::icon_tile(ctx, s, icon, glyph, tone, filled);
@@ -7510,6 +7582,12 @@ fn starting_dir(argument: Option<&str>) -> String {
     if path == COMPUTER {
         return String::from(COMPUTER);
     }
+    // `\\host\share` and `/net/…` (24.11): opened as is — the window reads
+    // it in the background, asks for a password if needed.
+    let path = &*sysconf::winpath::to_unix(path);
+    if is_net(path) {
+        return path.trim_end_matches('/').to_string();
+    }
     let mut info = Stat::default();
     if stat(path, &mut info) >= 0 && info.kind == KIND_DIRECTORY {
         return path.to_string();
@@ -7577,6 +7655,11 @@ fn resolve_address(text: &str, here: &str, home: &str) -> Option<String> {
     if text == "Этот компьютер" || text == COMPUTER {
         return Some(String::from(COMPUTER));
     }
+    if text == "Сеть" {
+        return Some(String::from(sysconf::winpath::NET));
+    }
+    // `\\host\share` → `/net/host/share`, `C:\…` → `/…` (24.11).
+    let text = &*sysconf::winpath::to_unix(text);
     let raw = if text == "~" {
         home.to_string()
     } else if let Some(rest) = text.strip_prefix("~/") {
@@ -7710,7 +7793,13 @@ impl Files {
 
     /// Начать правку адреса текстом: весь путь выделен, как в Проводнике.
     fn edit_address(&mut self) {
-        let text = if self.on_computer() { String::from("Этот компьютер") } else { self.path.clone() };
+        let text = if self.on_computer() {
+            String::from("Этот компьютер")
+        } else if is_net(&self.path) {
+            net_title(&self.path)
+        } else {
+            self.path.clone()
+        };
         self.address = Some(Line::selected(&text));
         self.crumb_pop = None;
         self.searching = false;
@@ -7724,7 +7813,9 @@ impl Files {
             self.address = None;
             return true;
         };
-        if target == COMPUTER || is_directory(&target) {
+        // A network path is not asked first (24.11): that can take seconds or
+        // want a password — the folder answers when it is read.
+        if target == COMPUTER || is_net(&target) || is_directory(&target) {
             self.address = None;
             println(&format!("files: address -> '{target}'"));
             if target == self.path {
@@ -7793,7 +7884,15 @@ impl Files {
     /// Подпапки `path` для списка у шеврона; у «Этого компьютера» — тома.
     fn subfolders(&self, path: &str) -> Vec<(String, String)> {
         if path == COMPUTER {
-            return list_volumes().into_iter().map(|row| (volume_title(&row.name, &row.label), row.name.clone())).collect();
+            return computer_rows().into_iter().map(|row| (volume_title(&row.name, &row.label), row.name.clone())).collect();
+        }
+        // Under `/net` only what is already read (24.11): another listing
+        // here could hold the window for seconds.
+        if is_net(path) {
+            if path != self.path {
+                return Vec::new();
+            }
+            return self.rows.iter().filter(|row| row.directory).map(|row| (row.name.clone(), join(path, &row.name))).collect();
         }
         let Ok((rows, _)) = list_dir(path) else {
             return Vec::new();
