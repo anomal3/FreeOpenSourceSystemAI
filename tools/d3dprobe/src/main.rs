@@ -1,5 +1,9 @@
 //! Проба DirectX для Proton в FossAi (12.11.2026, шаг 6 плана Proton).
 //!
+//! `d3dprobe.exe pad [секунды]` (24.11) - gamepads as games see them: the
+//! DirectInput game controllers, then XInput slots 0-3 polled every 10 ms;
+//! every change of a slot is a line `d3dprobe: xinput N buttons 0x.... lt ..`.
+//!
 //! `d3dprobe.exe monitors` (G5, 22.11) - `EnumDisplayMonitors` and the virtual
 //! screen as Wine sees them (one line per monitor).
 //!
@@ -593,8 +597,81 @@ fn monitors() {
     );
 }
 
+/// One DirectInput game controller (`d3dprobe pad`).
+unsafe extern "system" fn dinput_device(
+    instance: *mut windows::Win32::Devices::HumanInterfaceDevice::DIDEVICEINSTANCEW,
+    count: *mut core::ffi::c_void,
+) -> windows::core::BOOL {
+    let instance = unsafe { &*instance };
+    let name = &instance.tszProductName;
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    let product = instance.guidProduct.data1;
+    eprintln!(
+        "d3dprobe: dinput controller '{}' {:04x}:{:04x} type {:#x}",
+        String::from_utf16_lossy(&name[..len]),
+        product & 0xffff,
+        product >> 16,
+        instance.dwDevType
+    );
+    unsafe { *(count as *mut u32) += 1 };
+    true.into()
+}
+
+/// `d3dprobe.exe pad [seconds]` (24.11): DirectInput game controllers, then
+/// XInput slots 0-3 polled for `seconds`; every change is one line.
+fn pad(seconds: u64) {
+    use windows::Win32::Devices::HumanInterfaceDevice::{DirectInput8Create, IDirectInput8W, DI8DEVCLASS_GAMECTRL, DIEDFL_ATTACHEDONLY};
+    use windows::Win32::UI::Input::XboxController::{XInputGetState, XINPUT_STATE};
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap_or_default();
+        let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
+        match DirectInput8Create(instance.into(), 0x0800, &IDirectInput8W::IID, &mut raw, None) {
+            Ok(()) => {
+                let input = IDirectInput8W::from_raw(raw);
+                let mut count: u32 = 0;
+                let listed = input.EnumDevices(DI8DEVCLASS_GAMECTRL, Some(dinput_device), &mut count as *mut u32 as *mut _, DIEDFL_ATTACHEDONLY);
+                eprintln!("d3dprobe: dinput {count} game controller(s){}", if listed.is_ok() { "" } else { " (EnumDevices failed)" });
+            }
+            Err(err) => eprintln!("d3dprobe: dinput unavailable: {err}"),
+        }
+    }
+    let start = Instant::now();
+    let mut last: [Option<(u16, u8, u8, i16, i16, i16, i16)>; 4] = [None; 4];
+    while start.elapsed() < Duration::from_secs(seconds) {
+        for (slot, seen) in last.iter_mut().enumerate() {
+            let mut state = XINPUT_STATE::default();
+            let now = if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
+                let g = state.Gamepad;
+                Some((g.wButtons.0, g.bLeftTrigger, g.bRightTrigger, g.sThumbLX, g.sThumbLY, g.sThumbRX, g.sThumbRY))
+            } else {
+                None
+            };
+            if now == *seen {
+                continue;
+            }
+            match (now, seen.is_some()) {
+                (Some(_), false) => eprintln!("d3dprobe: xinput {slot} connected"),
+                (None, true) => eprintln!("d3dprobe: xinput {slot} disconnected"),
+                _ => {}
+            }
+            if let Some((buttons, lt, rt, lx, ly, rx, ry)) = now {
+                eprintln!("d3dprobe: xinput {slot} buttons {buttons:#06x} lt {lt} rt {rt} lx {lx} ly {ly} rx {rx} ry {ry}");
+            }
+            *seen = now;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("pad") {
+        let seconds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
+        eprintln!("d3dprobe: start, pad");
+        pad(seconds);
+        eprintln!("d3dprobe: done, pad");
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("monitors") {
         eprintln!("d3dprobe: start, monitors");
         monitors();

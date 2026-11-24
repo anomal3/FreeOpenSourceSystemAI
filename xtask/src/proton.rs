@@ -105,7 +105,8 @@ const SKIP_UNIX: &[&str] = &[
     "winepulse.so",
     "winegstreamer.so",
     "wineusb.so",
-    "winebus.so",
+    // `winebus.so` is taken (24.11.2026, gamepads): it reads the kernel's
+    // `/dev/input/eventN` through libudev (`linux/evdev.rs`).
     "gphoto2.so",
     "sane.so",
     "opencl.so",
@@ -129,8 +130,10 @@ const SKIP_UNIX: &[&str] = &[
 const DLOPEN: [&str; 3] = ["libfreetype.so.6", "libfontconfig.so.1", "libgnutls.so.30"];
 
 /// Свои пакеты Debian (снимок 20261020, `Packages` bookworm) сверх
-/// `wine::PACKAGES`: GnuTLS и то, на чём он стоит.
-const PACKAGES: [(&str, &str); 8] = [
+/// `wine::PACKAGES`: GnuTLS и то, на чём он стоит; libudev - для
+/// `winebus.so` (gamepads, 24.11.2026: it reads sysfs itself, no udevd).
+const PACKAGES: [(&str, &str); 9] = [
+    ("pool/main/s/systemd/libudev1_252.39-1~deb12u2_amd64.deb", "6f7e08f11c4809d2e5998c775f7b423ab5ec2ce0309494b4a2615037052245e2"),
     ("pool/main/g/gnutls28/libgnutls30_3.7.9-2+deb12u7_amd64.deb", "30abec8c824feb1d2d7e9000a34083cccd19d139625e1b21547e3ac53b922f8e"),
     ("pool/main/g/gmp/libgmp10_6.2.1+dfsg1-1.1_amd64.deb", "187aedef2ed763f425c1e523753b9719677633c7eede660401739e9c893482bd"),
     ("pool/main/libi/libidn2/libidn2-0_2.3.3-1+b1_amd64.deb", "d50716d5824083d667427817d506b45d3f59dc77e1ca52de000f3f62d4918afa"),
@@ -535,6 +538,10 @@ pub fn build(arch: Arch) -> Result<()> {
         # (16.11): ядро отвечает netlink, SIOCGIF* и /proc/net.\n\
         export WINEDLLOVERRIDES=\"mscoree,mshtml,tabtip.exe=${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}\"\n\
         export WINEDEBUG=${WINEDEBUG:-fixme-all}\n\
+        # Геймпады (24.11.2026): ядро показывает каждый как виртуальный\n\
+        # геймпад Steam Input (28de:11ff, `/dev/input/eventN`), winebus делает\n\
+        # из него геймпад XInput; игре он виден как Xbox 360 (045e:028e).\n\
+        export PROTON_SPOOF_STEAMINPUT_VIDPID=${PROTON_SPOOF_STEAMINPUT_VIDPID:-1}\n\
         # `/tmp` у FossAi переживает перезагрузку: сокет wineserver прошлой\n\
         # загрузки остаётся обычным файлом, и Wine падает «is not a socket».\n\
         for s in /tmp/.wine-*/server-*/socket; do [ -e \"$s\" ] && [ ! -S \"$s\" ] && LD_LIBRARY_PATH= rm -f \"$s\"; done\n\
