@@ -11332,9 +11332,13 @@ RADV (compute на кольце GFX) на карте возможен.
 был убит клиентской libwayland («listener function for opcode 5 of wl_pointer is NULL»): сервер
 слал `wl_pointer.frame` клиентам, связавшимся с `wl_seat` версии < 5; исправлено (`frame` только с
 версии 5). Ошибок `CS on the card failed` не было. На экране теста — строки `==== AMD TEST`.
-**Дальше:** `vkcube`/кадры на экран с карты (после правки `frame`), DXVK поверх RADV на железе
-(`gpu gametest hw -- d3d`), fence-ожидание без опроса и прерывания (IH), clear-state для графики
-(draw), SDMA/compute-очереди, VRAM-домен буферов (сейчас вся память — системная).
+**Флешка 0.8.23 (после правки `frame`): `vkcube` PASS — 600 кадров за 10,1 с (59 к/с, FIFO под
+монитор), `gametest: summary: 3 passed, 0 failed` (`vkprobe`, `vulkaninfo`, `vkcube`) на реальной RX 590:
+то есть draw-вызовы RADV (графический конвейер, вращающийся куб) тоже исполняются картой через наш
+слой DRM, кадры уходят dmabuf-буферами (PRIME AMD) на экран Wayland.**
+**Дальше:** DXVK поверх RADV на железе (`gpu gametest hw -- d3d`, нужен префикс Wine), fence-ожидание
+без опроса и прерывания (IH), SDMA/compute-очереди, VRAM-домен буферов (сейчас вся память —
+системная; влияет на скорость), пропускная способность (замер к/с в играх).
 
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для
