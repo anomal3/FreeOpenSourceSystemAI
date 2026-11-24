@@ -1069,6 +1069,14 @@ name = "slots"
 version = "0.8.0"
 
 [[package]]
+name = "smb"
+version = "0.8.0"
+dependencies = [
+ "hmac",
+ "sha2",
+]
+
+[[package]]
 name = "ssh"
 version = "0.8.0"
 dependencies = [
