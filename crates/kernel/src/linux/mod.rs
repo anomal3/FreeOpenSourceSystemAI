@@ -36,6 +36,7 @@ mod poll;
 mod fsops;
 pub(crate) mod ipc;
 mod links;
+pub mod mapnames;
 pub mod recent;
 mod net;
 mod netdev;
@@ -927,6 +928,14 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     const O_APPEND: usize = 0o2000;
     if flags & O_APPEND != 0 {
         crate::user::with_current(|program| program.files.set_append(fd, true));
+    }
+    // Names of libraries for the diagnostic lines (24.11.2026, hw-log17).
+    if !directory && mapnames::wanted(&linux) {
+        crate::user::with_current(|program| {
+            if let Ok(node) = program.files.file_or_dir(fd) {
+                mapnames::remember(&node, &linux);
+            }
+        });
     }
     if directory {
         crate::user::with_current(|program| {

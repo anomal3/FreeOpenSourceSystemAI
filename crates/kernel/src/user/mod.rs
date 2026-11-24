@@ -3909,6 +3909,9 @@ fn load(
             Some(Err(err)) => return Err(Error::Read(err)),
             None => return Err(Error::NoFilesystem),
         };
+        // The loader by name in the diagnostic lines (24.11, mapnames).
+        #[cfg(target_arch = "x86_64")]
+        crate::linux::mapnames::remember(&interp_node, interp_path);
         let (interp_header, interp_len) = read_header(&*interp_node)?;
         let interp = elf::Image::parse(&interp_header, interp_len).map_err(Error::Elf)?;
         if !interp.position_independent || interp.interp().is_some() {
@@ -4659,6 +4662,7 @@ pub fn spawn_linux_thread(regs: arch::TrapFrame, tls: u64, clear_tid: usize, set
             if let Some((slot, _)) = sched::lookup(id) {
                 LINUX_SIGMASK[slot].store(mask, Ordering::Relaxed);
                 LINUX_PENDING[slot].store(0, Ordering::Relaxed);
+                crate::linux::signal::slot_reused(slot);
             }
             for at in set_tid {
                 if at != 0 && space::user_can(at, 4, PageFlags::WRITE) {
@@ -5044,6 +5048,7 @@ extern "C" fn linux_fork_entry(arg: usize) -> ! {
     }
     note_linux(slot, linux);
     LINUX_SIGMASK[slot].store(start.mask, Ordering::Relaxed);
+    crate::linux::signal::slot_reused(slot);
     LINUX_PENDING[slot].store(0, Ordering::Relaxed);
     LINUX_ALTSTACK[slot].0.store(start.altstack.0, Ordering::Relaxed);
     LINUX_ALTSTACK[slot].1.store(start.altstack.1, Ordering::Relaxed);
@@ -5263,6 +5268,23 @@ impl Program {
         let region = self.mappings.iter().find(|region| region.base <= addr && addr < region.end())?;
         match &region.source {
             Source::Image(image) => Some(((addr - region.base) as u64 + image.offset, image.node.metadata().size)),
+            _ => None,
+        }
+    }
+
+    /// The file mapped at `addr` as a path for the log (24.11.2026,
+    /// hw-log17): the name `openat` saw for its node
+    /// ([`crate::linux::mapnames`]), `None` - not a file or not remembered.
+    #[cfg(target_arch = "x86_64")]
+    pub fn image_name_at(&self, addr: usize) -> Option<alloc::string::String> {
+        let region = self.mappings.iter().find(|region| region.base <= addr && addr < region.end())?;
+        match &region.source {
+            // Not opened by `openat`: the program file itself (`execve`; its
+            // loader is remembered in `load`).
+            Source::Image(image) => crate::linux::mapnames::name_of(&image.node).or_else(|| {
+                (region.base < WINDOW_BASE + IMAGE_LIMIT_BYTES)
+                    .then(|| alloc::string::String::from(crate::linux_path::shown(&self.path)))
+            }),
             _ => None,
         }
     }
@@ -6615,6 +6637,40 @@ pub unsafe fn check_kill() {
     // действительно исполняется, значит `enter_user` на стеке и вернуться есть
     // куда.
     unsafe { arch::return_to_kernel(user_abi::EXIT_KILLED) }
+}
+
+/// A thread (not the main one) of a Linux process dies of signal `sig` that
+/// nobody handles - a fault with no handler (or with the signal blocked), or
+/// a signal whose default action is to end the process (24.11.2026). Linux
+/// ends the whole thread group then; we ended only the thread, and the rest
+/// of the process lived on: OBS whose AAC encoder thread crashed in `free()`
+/// on exit stayed alive without a window, burning a CPU. Now the process is
+/// told to end like `exit_group`, with `128 + sig` and the wait status
+/// "killed by `sig`" for its parent; the calling thread ends right after
+/// (its caller returns to the kernel). Programs with their own handler never
+/// get here - the signal goes to the handler (Wine catches its SIGSEGVs).
+#[cfg(target_arch = "x86_64")]
+pub fn linux_thread_died_of_signal(sig: u8) {
+    let main = with_current(|program| {
+        if !program.linux || program.linux_pid == 0 || program.linux_pid == sched::current().as_u32() {
+            return None;
+        }
+        if program.linux_exit.is_none() {
+            program.linux_signal = Some(sig);
+            program.linux_exit = Some(128 + i64::from(sig));
+        }
+        program.kill_requested = true;
+        Some(program.linux_pid)
+    })
+    .flatten();
+    if let Some(main) = main {
+        kprintln!(
+            "  linux       : thread {} died of signal {sig}: process #{main} ends with it (as in Linux)",
+            sched::current()
+        );
+        sched::wake_input();
+        sched::wake(sched::TaskId::new(main));
+    }
 }
 
 /// Снять программу после отказа.

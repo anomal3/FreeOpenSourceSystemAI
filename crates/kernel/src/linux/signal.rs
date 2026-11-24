@@ -76,6 +76,24 @@ pub fn sigprocmask(how: usize, set: usize, old: usize, _size: usize) -> i64 {
     const SIG_SETMASK: usize = 2;
     let slot = sched::current_slot();
     let now = LINUX_SIGMASK[slot].load(Ordering::Relaxed);
+    // The new set is read before the old one is written (24.11.2026), as
+    // Linux does: `set` and `oldset` may be the same buffer, and writing
+    // first turned such a call into "keep the old mask".
+    let next = if set != 0 {
+        if !space::user_can(set, 8, PageFlags::READ) {
+            return -e::EFAULT;
+        }
+        // SAFETY: проверено строкой выше.
+        let value = unsafe { core::ptr::read_unaligned(set as *const u64) };
+        Some(match how {
+            SIG_BLOCK => now | value,
+            SIG_UNBLOCK => now & !value,
+            SIG_SETMASK => value,
+            _ => return -e::EINVAL,
+        })
+    } else {
+        None
+    };
     if old != 0 {
         if !space::user_can(old, 8, PageFlags::WRITE) {
             return -e::EFAULT;
@@ -83,18 +101,7 @@ pub fn sigprocmask(how: usize, set: usize, old: usize, _size: usize) -> i64 {
         // SAFETY: проверено строкой выше.
         unsafe { core::ptr::write_unaligned(old as *mut u64, now) };
     }
-    if set != 0 {
-        if !space::user_can(set, 8, PageFlags::READ) {
-            return -e::EFAULT;
-        }
-        // SAFETY: проверено строкой выше.
-        let value = unsafe { core::ptr::read_unaligned(set as *const u64) };
-        let next = match how {
-            SIG_BLOCK => now | value,
-            SIG_UNBLOCK => now & !value,
-            SIG_SETMASK => value,
-            _ => return -e::EINVAL,
-        };
+    if let Some(next) = next {
         LINUX_SIGMASK[slot].store(next & !UNBLOCKABLE, Ordering::Relaxed);
     }
     0
@@ -104,6 +111,23 @@ pub fn sigprocmask(how: usize, set: usize, old: usize, _size: usize) -> i64 {
 pub fn sigaltstack(new: usize, old: usize) -> i64 {
     const SS_DISABLE: u32 = 2;
     let slot = sched::current_slot();
+    // New read before old written (24.11.2026, as Linux: same buffer allowed).
+    let next = if new != 0 {
+        if !space::user_can(new, 24, PageFlags::READ) {
+            return -e::EFAULT;
+        }
+        // SAFETY: проверено строкой выше.
+        let (sp, flags, size) = unsafe {
+            (
+                core::ptr::read_unaligned(new as *const u64),
+                core::ptr::read_unaligned((new + 8) as *const u32),
+                core::ptr::read_unaligned((new + 16) as *const u64),
+            )
+        };
+        Some(if flags & SS_DISABLE != 0 { (0, 0) } else { (sp as usize, size as usize) })
+    } else {
+        None
+    };
     if old != 0 {
         if !space::user_can(old, 24, PageFlags::WRITE) {
             return -e::EFAULT;
@@ -117,19 +141,7 @@ pub fn sigaltstack(new: usize, old: usize) -> i64 {
             core::ptr::write_unaligned((old + 16) as *mut u64, size as u64);
         }
     }
-    if new != 0 {
-        if !space::user_can(new, 24, PageFlags::READ) {
-            return -e::EFAULT;
-        }
-        // SAFETY: проверено строкой выше.
-        let (sp, flags, size) = unsafe {
-            (
-                core::ptr::read_unaligned(new as *const u64),
-                core::ptr::read_unaligned((new + 8) as *const u32),
-                core::ptr::read_unaligned((new + 16) as *const u64),
-            )
-        };
-        let (sp, size) = if flags & SS_DISABLE != 0 { (0, 0) } else { (sp as usize, size as usize) };
+    if let Some((sp, size)) = next {
         LINUX_ALTSTACK[slot].0.store(sp, Ordering::Relaxed);
         LINUX_ALTSTACK[slot].1.store(size, Ordering::Relaxed);
     }
@@ -300,6 +312,15 @@ fn ignored_by_default(sig: usize) -> bool {
 /// такой (маска без `SIGKILL` и `SIGSTOP` никогда не бывает полной).
 static SUSPENDED_MASK: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::new(NO_MASK) }; sched::MAX_TASKS];
 const NO_MASK: u64 = u64::MAX;
+
+/// A new thread or process takes `slot` (24.11.2026): a mask that a dead
+/// task left behind in `rt_sigsuspend` (it ended before its handler ran)
+/// must not become the new task's mask at its first signal.
+pub fn slot_reused(slot: usize) {
+    if let Some(mask) = SUSPENDED_MASK.get(slot) {
+        mask.store(NO_MASK, Ordering::Relaxed);
+    }
+}
 
 /// Выбросить пришедшие незаблокированные сигналы, которые ничего не делают
 /// (`SIG_IGN` и пропускаемые по умолчанию): ожидание сигнала их не замечает.
@@ -499,6 +520,8 @@ pub fn deliver(frame: &mut crate::arch::TrapFrame) {
                 frame.rip
             );
             crate::user::with_current(|program| program.linux_signal = Some(sig as u8));
+            // A thread's fatal signal ends its whole process (24.11.2026).
+            crate::user::linux_thread_died_of_signal(sig as u8);
             // SAFETY: из системного вызова третьего кольца.
             unsafe { crate::arch::return_to_kernel(128 + sig as i64) }
         }
@@ -575,7 +598,11 @@ pub fn deliver_fault(frame: &mut crate::arch::TrapFrame, vector: u8, addr: usize
         16 | 19 => (SIGFPE, 7, frame.rip),
         // BUS_ADRALN.
         17 => (SIGBUS, 1, addr as u64),
-        _ => return false,
+        _ => {
+            dump_unhandled(frame, vector, addr, "no signal for this exception");
+            crate::user::linux_thread_died_of_signal(SIGSEGV as u8);
+            return false;
+        }
     };
     // Программа Linux — по своему `rt_sigaction`; родная — по
     // `SYS_SIGACTION` (09.11.2026, JIT SpiderMonkey). Таблица одна.
@@ -585,6 +612,21 @@ pub fn deliver_fault(frame: &mut crate::arch::TrapFrame, vector: u8, addr: usize
     let slot = sched::current_slot();
     let mask = LINUX_SIGMASK[slot].load(Ordering::Relaxed);
     if action.handler == 0 || action.handler == SIG_IGN || mask & bit(sig) != 0 {
+        // Why the program dies instead of getting its signal (24.11.2026,
+        // hw-log17: two winedevice.exe threads died on the jump to
+        // 0xffff80dfff6b8fce that Wine catches in every other start).
+        let why = if action.handler == 0 {
+            alloc::format!("signal {sig} has no handler")
+        } else if action.handler == SIG_IGN {
+            alloc::format!("signal {sig} is ignored")
+        } else {
+            alloc::format!("signal {sig} is blocked (handler {:#x}, flags {:#x})", action.handler, action.flags)
+        };
+        dump_unhandled(frame, vector, addr, &why);
+        // The thread is killed by the caller (`user::faulted`); its process
+        // goes with it, as in Linux (a blocked or ignored synchronous fault
+        // signal is fatal there too).
+        crate::user::linux_thread_died_of_signal(sig as u8);
         return false;
     }
     // Переход по нулевому адресу (фаза 71j: Wine молча глотает такие сбои в
@@ -633,11 +675,114 @@ pub fn deliver_fault(frame: &mut crate::arch::TrapFrame, vector: u8, addr: usize
                 frame.error,
                 frame.rip
             );
+            // A jump into the kernel half (24.11, hw-log17): where the same
+            // address without the direct-map base lies, and who jumped
+            // (the return address on the stack).
+            if addr >= 1 << 47 {
+                crate::kprintln!("  linux       : {} jump into the kernel half: {}", sched::current(), jump_story(frame));
+            }
         }
     }
     let fault = Fault { code, addr: at, trapno: u64::from(vector), err: frame.error };
     enter_handler(frame, slot, sig, action, action.handler, mask, mask, Some(fault));
     true
+}
+
+/// Where `addr` lies in the program: `file +offset` (with the file's name
+/// when `openat` saw it), or `-` when no file is mapped there.
+fn place_of(addr: u64) -> alloc::string::String {
+    crate::user::with_current(|program| {
+        let (off, len) = program.image_at(addr as usize)?;
+        let name = program.image_name_at(addr as usize);
+        Some(match name {
+            Some(path) => alloc::format!("{}+{off:#x}", super::mapnames::short(&path)),
+            None => alloc::format!("file of {len} bytes +{off:#x}"),
+        })
+    })
+    .flatten()
+    .unwrap_or_else(|| alloc::string::String::from("-"))
+}
+
+/// Read a user qword, `None` when it is not readable.
+fn user_qword(at: u64) -> Option<u64> {
+    let at = at as usize;
+    // SAFETY: checked for reading in the space of the running program.
+    space::user_can(at, 8, PageFlags::READ).then(|| unsafe { core::ptr::read_unaligned(at as *const u64) })
+}
+
+/// A jump into the kernel half: the address minus the kernel direct-map base
+/// (a user address turned into a kernel one?) and the return address on the
+/// stack (who called).
+fn jump_story(frame: &crate::arch::TrapFrame) -> alloc::string::String {
+    let rip = frame.rip;
+    let low = rip.wrapping_sub(crate::mm::PHYS_MAP_BASE as u64);
+    let ret = user_qword(frame.rsp).unwrap_or(0);
+    alloc::format!(
+        "rip {rip:#x} = direct-map base + {low:#x} ({}); [rsp] {ret:#x} ({}); rsp {:#x}",
+        place_of(low),
+        place_of(ret),
+        frame.rsp
+    )
+}
+
+/// A fault the program does not get as a signal (24.11.2026, hw-log17):
+/// before it is killed - why, all registers, FS/GS bases, the signal masks
+/// and the 16 qwords at the stack pointer with the files they point into.
+/// The bare "killed by #PF at X" line could not tell a bad jump from a bad
+/// signal mask.
+fn dump_unhandled(frame: &crate::arch::TrapFrame, vector: u8, addr: usize, why: &str) {
+    use core::fmt::Write;
+    let slot = sched::current_slot();
+    let f = frame;
+    let (fs, gs) = crate::sched::current_bases();
+    crate::kprintln!(
+        "  linux       : {} fault vector {vector} not delivered: {why}; address {addr:#x}, error {:#x}",
+        sched::current(),
+        f.error
+    );
+    crate::kprintln!(
+        "  linux       : regs rip {:#x} ({}) rsp {:#x} rbp {:#x} rflags {:#x} cs {:#x} ss {:#x} fs.base {fs:#x} gs.base {gs:#x}",
+        f.rip,
+        place_of(f.rip),
+        f.rsp,
+        f.rbp,
+        f.rflags,
+        f.cs,
+        f.ss
+    );
+    crate::kprintln!(
+        "  linux       : regs rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} r8 {:#x} r9 {:#x} r10 {:#x} r11 {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}",
+        f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi, f.r8, f.r9, f.r10, f.r11, f.r12, f.r13, f.r14, f.r15
+    );
+    crate::kprintln!(
+        "  linux       : signals blocked {:#x} pending {:#x} suspended-mask {:#x}, altstack {:#x}+{:#x}",
+        LINUX_SIGMASK[slot].load(Ordering::Relaxed),
+        LINUX_PENDING[slot].load(Ordering::Relaxed),
+        SUSPENDED_MASK[slot].load(Ordering::Relaxed),
+        LINUX_ALTSTACK[slot].0.load(Ordering::Relaxed),
+        LINUX_ALTSTACK[slot].1.load(Ordering::Relaxed)
+    );
+    if f.rip >= 1 << 47 {
+        crate::kprintln!("  linux       : jump into the kernel half: {}", jump_story(f));
+    }
+    let mut line = alloc::string::String::new();
+    for i in 0..16u64 {
+        let at = f.rsp.wrapping_add(i * 8);
+        match user_qword(at) {
+            Some(value) => {
+                let _ = write!(line, " {value:#x}");
+                let place = place_of(value);
+                if place != "-" {
+                    let _ = write!(line, "<{place}>");
+                }
+            }
+            None => {
+                line.push_str(" ?");
+                break;
+            }
+        }
+    }
+    crate::kprintln!("  linux       : stack at {:#x}:{line}", f.rsp);
 }
 
 /// Область `FXSAVE` в кадре сигнала — `uc_mcontext.fpregs` у Linux.

@@ -286,9 +286,14 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
             let (_, hits, ret, rip, off, len, slot) = **site;
             let task = crate::sched::slot_task_name(slot).unwrap_or("?");
             let thread = super::thread::thread_name(slot).map_or_else(String::new, |own| alloc::format!(" '{own}'"));
+            // The file by name (24.11, hw-log17: "765224 bytes" had to be
+            // guessed as Wine's ntdll.so).
+            let file = crate::user::process_at(slot)
+                .and_then(|process| process.lock().image_name_at(ret as usize))
+                .map_or_else(String::new, |path| alloc::format!(" {}", super::mapnames::short(&path)));
             let _ = write!(
                 line,
-                " {}% ret {ret:#x} (file +{off:#x} of {len} bytes) rip {rip:#x} task {task}{thread} slot {slot} tid {},",
+                " {}% ret {ret:#x} (file{file} +{off:#x} of {len} bytes) rip {rip:#x} task {task}{thread} slot {slot} tid {},",
                 hits * 100 / total,
                 crate::sched::slot_task_id(slot).unwrap_or(0),
             );
