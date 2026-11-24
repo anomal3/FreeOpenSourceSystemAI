@@ -1380,15 +1380,22 @@ struct CsPlan {
 /// Если в железе стоит адресное пространство с поколением `generation`, снять его: PTE не должны
 /// пережить кадры, на которые указывают (GPU простаивает - отправка синхронная).
 fn hw_forget(generation: u64) {
+    // Не под рукой у чужой отправки: пока IB идёт, таблицы трогать нельзя (DXVK - много потоков: один
+    // отправляет, другой делает GEM_VA; без замка GPU падал с ошибкой страницы на адресе своего IB).
+    let _exec = HW_EXEC.lock();
     if HW_GEN.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
         crate::display::amd::hw::clear();
     }
 }
 
+/// Одна отправка на железо за раз: перестройка таблиц, IB и ожидание fence - под этим замком.
+static HW_EXEC: Mutex<()> = Mutex::new(());
+
 /// Исполнение на железе: поставить адресное пространство файла в VMID 1 (если там чужое или оно
 /// менялось) и отправить буферы по очереди.
 fn hw_run(view: &VaView, generation: u64, ibs: &[(u64, usize)]) -> Result<(), alloc::string::String> {
     use crate::display::amd::hw;
+    let _exec = HW_EXEC.lock();
     if HW_GEN.load(Ordering::Acquire) != generation {
         hw::clear();
         for (start, size, bo, offset) in &view.maps {
@@ -1402,7 +1409,15 @@ fn hw_run(view: &VaView, generation: u64, ibs: &[(u64, usize)]) -> Result<(), al
         HW_GEN.store(generation, Ordering::Release);
     }
     for &(va, dwords) in ibs {
-        hw::submit(va, dwords)?;
+        hw::submit(va, dwords).map_err(|why| {
+            let near = view
+                .maps
+                .iter()
+                .filter(|(start, ..)| *start <= va)
+                .max_by_key(|(start, ..)| *start)
+                .map_or_else(|| alloc::string::String::from("none below"), |(start, size, ..)| alloc::format!("{start:#x}+{size:#x}"));
+            alloc::format!("{why}; the IB VA is {} a mapping, {} mappings, nearest below: {near}", if view.locate(va, 4).is_some() { "inside" } else { "NOT inside" }, view.maps.len())
+        })?;
     }
     Ok(())
 }
