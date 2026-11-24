@@ -608,6 +608,14 @@ export DXVK_STATE_CACHE_PATH=${DXVK_STATE_CACHE_PATH:-$C/dxvk}
 export DXVK_LOG_PATH=${DXVK_LOG_PATH:-$C/log}
 # Кеш конвейеров vkd3d-proton (Direct3D 12, 20.11) - туда же.
 export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$C/vkd3d}
+# .NET 5+ (24.11, hw-log18: Rupor Updater - .NET 8, Avalonia - ended with
+# code 3 at once): on Windows the runtime loads icu.dll; Wine's icu.dll only
+# forwards to icuuc68/icuin68, which Proton does not ship, so the lookup of
+# `u_charsToUChars` fails and the runtime's ICU shim calls abort() (code 3,
+# `err:module:find_forwarded_export ... icuuc68`). With USENLS the runtime
+# does not touch ICU and uses the NLS functions of kernel32 (Wine has them):
+# cultures, sorting and formats keep working (unlike InvariantGlobalization).
+export DOTNET_SYSTEM_GLOBALIZATION_USENLS=${DOTNET_SYSTEM_GLOBALIZATION_USENLS:-1}
 LD_LIBRARY_PATH= mkdir -p "$MESA_SHADER_CACHE_DIR" "$DXVK_SHADER_CACHE_PATH" "$DXVK_LOG_PATH" "$VKD3D_SHADER_CACHE_PATH"
 # Потоки рисования llvmpipe/lavapipe (P3/P9): без переменной Mesa берёт все
 # ЦП (16 на Ryzen 8 ядер/16 потоков), и каждый кадр будит 16 потоков через
@@ -800,24 +808,36 @@ case "$1" in
         done < "$f"
         # `Exec=env WINEPREFIX="…" wine …start.exe /Unix ПУТЬ`: winemenubuilder
         # экранирует пробел и прочее как `\\ `, обратную косую - как `\\\\`.
-        case $x in *' /Unix '*|*' /unix '*) ;; *) echo "fossai-proton: no /Unix in $f: $x"; exit 1 ;; esac
-        x=${x#* /[Uu]nix }; u=; i=0
+        # Proton's winemenubuilder writes `Exec="C:\\\\…\\\\Updater" ""` (the
+        # program itself, no start.exe) - 24.11, Rupor's desktop shortcut:
+        # this ended with code 1 before. Run that Windows path via `start`.
+        win=
+        case $x in
+            *' /Unix '*|*' /unix '*) x=${x#* /[Uu]nix } ;;
+            '"'[A-Za-z]:*) x=${x#\"}; x=${x%%\"*}; win=1 ;;
+            *) klog "fossai-proton: no /Unix nor a Windows path in $f: $x"; exit 1 ;;
+        esac
+        u=; i=0
         while [ $i -lt ${#x} ]; do
             if [ "${x:i:4}" = '\\\\' ]; then u+='\'; i=$((i + 4))
             elif [ "${x:i:2}" = '\\' ]; then u+=${x:i+2:1}; i=$((i + 3))
             elif [ "${x:i:1}" = '\' ]; then u+=${x:i+1:1}; i=$((i + 2))
-            elif [ "${x:i:1}" = ' ' ]; then break
+            elif [ "${x:i:1}" = ' ' ] && [ -z "$win" ]; then break
             else u+=${x:i:1}; i=$((i + 1)); fi
         done
         [ -n "$w" ] && cd "$w" 2>/dev/null
         klog "fossai-proton: shortcut $f -> $u (prefix $WINEPREFIX)"
+        if [ -n "$win" ]; then
+            set -- start /wait "$u" "$@"
+        else
         tmnf_handoff "$u" "$@"
         # Ярлык .exe при узле видеокарты - через DXVK/vkd3d-proton, как `--open`.
         case "${u,,}" in
             *.exe) if [ -e /dev/dri/renderD128 ]; then set -- --dxvk start /wait /unix "$u" "$@"; else set -- start /wait /unix "$u" "$@"; fi
                 game_args "$u"; [ ${#GA[@]} -gt 0 ] && set -- "$@" "${GA[@]}" ;;
             *) set -- start /wait /unix "$u" "$@" ;;
-        esac ;;
+        esac
+        fi ;;
 esac
 # `--d2r[=КАТАЛОГ|=ПУТЬ.exe] [КЛЮЧИ ИГРЫ]` (20.11) - Diablo II Resurrected
 # (Direct3D 12): без пути - первый D2R.exe в /usb../D2RLAN и /usb../*
