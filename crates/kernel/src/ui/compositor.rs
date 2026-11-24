@@ -2326,7 +2326,8 @@ impl Compositor {
         // Обои основного монитора, в координатах самой картинки.
         if theme::is_mobile() {
             self.draw_background(&mut surface, full, 0);
-        } else {
+        } else if !super::wallpaper::paint_lock(&mut surface) {
+            // Свой фон экрана блокировки (24.11) не выбран или ещё готовится.
             self.draw_wall_on(&mut surface, full, full, 0);
         }
         lock.draw(&mut surface, self.scale);
@@ -2370,6 +2371,7 @@ impl Compositor {
             super::lock::Outcome::Redraw => self.redraw_lock(),
             super::lock::Outcome::Unlock => {
                 self.lock = None;
+                super::wallpaper::lock_done();
                 self.repaint_all();
             }
             _ => {}

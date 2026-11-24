@@ -2639,6 +2639,11 @@ fn ui_status(argument: &str) {
         ui::start_command(words);
         return;
     }
+    // Фон экрана блокировки (24.11): `ui lockbg same|fossai|color RRGGBB|image PATH`.
+    if let Some(words) = argument.trim().strip_prefix("lockbg") {
+        ui::wallpaper::lock_command(words);
+        return;
+    }
     // Окно стола по просьбе программы (П3, 20.11): `ui open settings
     // network`, `ui open terminal` — «Администрирование», «Выполнить».
     if let Some(words) = argument.trim().strip_prefix("open") {

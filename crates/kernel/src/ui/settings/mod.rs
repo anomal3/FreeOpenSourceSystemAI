@@ -69,6 +69,8 @@ pub enum Section {
     Colors,
     /// «Оформление» (20.11): наборы «Современный»/«Простой» и эффекты.
     Appearance,
+    /// «Экран блокировки» (24.11): свой фон и заставка.
+    LockScreen,
     Dock,
     /// «Пуск» (20.11): ширина, разделы, закреплённые.
     Start,
@@ -105,7 +107,7 @@ const NAV: [Section; 13] = [
 ];
 
 /// Все страницы — для поиска.
-const ALL: [Section; 26] = [
+const ALL: [Section; 27] = [
     Section::Home,
     Section::System,
     Section::Display,
@@ -120,6 +122,7 @@ const ALL: [Section; 26] = [
     Section::Wallpaper,
     Section::Colors,
     Section::Appearance,
+    Section::LockScreen,
     Section::Dock,
     Section::Start,
     Section::Explorer,
@@ -151,7 +154,8 @@ impl Section {
             Section::Personal => "Персонализация",
             Section::Wallpaper => "Фон",
             Section::Colors => "Цвета",
-            Section::Appearance => "Оформление",
+            Section::Appearance => "Темы",
+            Section::LockScreen => "Экран блокировки",
             Section::Dock => "Dock и панель задач",
             Section::Start => "Пуск",
             Section::Explorer => "Проводник",
@@ -171,6 +175,7 @@ impl Section {
     const fn heading(self) -> &'static str {
         match self {
             Section::Privacy => "Конфиденциальность и безопасность",
+            Section::Appearance => "Темы и оформление",
             other => other.title(),
         }
     }
@@ -182,7 +187,7 @@ impl Section {
                 Some(Section::System)
             }
             Section::Keyboard | Section::Usb => Some(Section::Devices),
-            Section::Wallpaper | Section::Colors | Section::Appearance => Some(Section::Personal),
+            Section::Wallpaper | Section::Colors | Section::Appearance | Section::LockScreen => Some(Section::Personal),
             Section::Start => Some(Section::Dock),
             Section::Packages | Section::Services | Section::DefaultApps => Some(Section::Apps),
             _ => None,
@@ -211,6 +216,7 @@ impl Section {
             Section::Personal | Section::Colors => Fi::Palette,
             Section::Wallpaper => Fi::Image,
             Section::Appearance => Fi::Sliders,
+            Section::LockScreen => Fi::Lock,
             Section::Dock => Fi::Dock,
             Section::Start => Fi::Apps,
             Section::Explorer => Fi::Folder,
@@ -262,10 +268,11 @@ impl Section {
             Section::Keyboard => "Раскладка и горячие клавиши",
             Section::Usb => "Подключённые устройства и контроллеры",
             Section::Network => "Адрес: по DHCP или постоянный",
-            Section::Personal => "Фон, цвета, тема, оформление",
+            Section::Personal => "Тема, фон, цвета, экран блокировки, панель задач",
             Section::Wallpaper => "Картинка, цвет и расположение",
             Section::Colors => "Тема, акцентный цвет, заголовок окна",
-            Section::Appearance => "Современный или простой вид, эффекты, контур окна",
+            Section::Appearance => "Современный, простой или классический вид, стиль значков, эффекты",
+            Section::LockScreen => "Фон экрана блокировки, заставка",
             Section::Dock => "Вид, сторона экрана, автоскрытие, значки",
             Section::Start => "Ширина, разделы и закреплённые программы",
             Section::Explorer => "Файловый менеджер",
@@ -294,10 +301,11 @@ impl Section {
             Section::Keyboard => "клавиатура раскладка горячие клавиши alt shift",
             Section::Usb => "usb xhci ehci ohci контроллер мышь планшет",
             Section::Network => "сеть адрес dhcp шлюз ip mac dns",
-            Section::Personal => "персонализация оформление",
+            Section::Personal => "персонализация оформление тема темы",
             Section::Wallpaper => "фон обои градиент картинка цвет",
             Section::Colors => "цвета тема тёмная светлая акцент заголовок",
-            Section::Appearance => "оформление интерфейс вид эффекты анимация сворачивание открытие тени прозрачность размытие подсмотр контур перетаскивание простой классический современный быстродействие",
+            Section::LockScreen => "экран блокировки фон заставка часы вход win+l картинка",
+            Section::Appearance => "темы стиль значков значки оформление интерфейс вид эффекты анимация сворачивание открытие тени прозрачность размытие подсмотр контур перетаскивание простой классический современный быстродействие",
             Section::Dock => "панель задач dock аптайм дата часы расположение скрывать автоскрытие сверху слева справа значки мониторы дисплеи кнопки окон",
             Section::Start => "пуск меню закреплённые недавние все программы ширина широкий",
             Section::Explorer => "проводник файлы папки files",
@@ -362,6 +370,8 @@ pub enum Request {
     Panel,
     /// Сменился выбор масштаба — применить ко всему столу сразу (20.11).
     Scale,
+    /// Открыть окно «Значки рабочего стола» (24.11, «Персонализация»).
+    DesktopIcons,
 }
 
 /// Что делает пункт, по которому нажали.
@@ -381,6 +391,12 @@ enum Deed {
     ScreenOff(u32),
     /// Заставка (22.11, `saver`).
     Saver(super::saver::Deed),
+    /// «Подробная загрузка» (24.11): журнал вместо логотипа со следующей загрузки.
+    BootLog(bool),
+    /// Плитка «Выберите тему» в «Персонализации» (24.11): номер в `pages::THEMES`.
+    ThemeSet(u8),
+    /// «Значки рабочего стола» (24.11): окно оболочки стола.
+    DesktopIcons,
     Panel(PanelPref, bool),
     /// Панель задач и Dock (20.11, `deskcfg`).
     Taskbar(super::deskcfg::TaskbarDeed),
@@ -1276,6 +1292,33 @@ impl SettingsView {
             }
             Deed::Saver(deed) => {
                 self.report = Some(match super::saver::apply(deed) {
+                    Ok(said) => Report::ok(said),
+                    Err(said) => Report::bad(said),
+                });
+            }
+            Deed::ThemeSet(index) => {
+                let Some(&(wall, dark, accent, name)) = pages::THEMES.get(usize::from(index)) else {
+                    return;
+                };
+                let mut changed = super::wallpaper::use_preset();
+                changed |= theme::set_wallpaper(wall);
+                changed |= theme::set_dark(dark);
+                changed |= theme::set_accent(accent);
+                if changed {
+                    self.theme_changed = true;
+                }
+                let result = super::prefs::store_wallpaper(wall).and_then(|()| super::prefs::store_theme(dark)).and_then(|()| super::prefs::store_accent(accent));
+                kprintln!("  settings    : theme '{name}' ({}, {}, {})", wall.tag(), if dark { "dark" } else { "light" }, accent.tag());
+                self.report = Some(match result {
+                    Ok(()) => Report::ok(format!("тема «{name}» применена и запомнена")),
+                    Err(err) => Report::bad(format!("тема применена, но не запомнена: {err}")),
+                });
+            }
+            Deed::DesktopIcons => {
+                self.request = Some(Request::DesktopIcons);
+            }
+            Deed::BootLog(on) => {
+                self.report = Some(match super::prefs::set_boot_verbose(on) {
                     Ok(said) => Report::ok(said),
                     Err(said) => Report::bad(said),
                 });

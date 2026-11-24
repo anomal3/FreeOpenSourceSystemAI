@@ -2328,6 +2328,10 @@ pub fn tick() {
         }
         // Фон (22.11, `wallpaper`): картинка перевелась — стол и «Фон» заново.
         if framegap::step(&"wallpaper", wallpaper::poll) {
+            // Картинка экрана блокировки могла дойти, пока он на экране.
+            if desktop.locked() {
+                desktop.redraw_lock();
+            }
             desktop.repaint_all();
             if let Some(window) = desktop.find(App::Settings) {
                 window.refresh_settings();
@@ -5296,6 +5300,7 @@ fn section_named(name: &str) -> Option<Section> {
         "wallpaper" | "personalization-background" | "background" => Section::Wallpaper,
         "colors" | "personalization-colors" => Section::Colors,
         "appearance" | "themes" | "personalization-themes" => Section::Appearance,
+        "lockscreen" | "lock" | "personalization-lock" | "screensaver" => Section::LockScreen,
         "dock" | "taskbar" => Section::Dock,
         "start" | "personalization-start" => Section::Start,
         "explorer" | "folders" => Section::Explorer,
@@ -6137,6 +6142,9 @@ fn settings_request(desktop: &mut Compositor, request: settings::Request, status
         settings::Request::Restart => launch(desktop, App::Restart),
         settings::Request::Panel => {}
         settings::Request::Scale => apply_scale(desktop, status),
+        // «Персонализация → Значки рабочего стола»: the dialog of the
+        // desktop shell (`/bin/deskicon`, `open_desktop_icons_dialog`).
+        settings::Request::DesktopIcons => start(desktop, "/bin/deskicon"),
     }
     kprintln!("  desktop     : settings asked for {request:?}");
     desktop.refresh_panel(status);
