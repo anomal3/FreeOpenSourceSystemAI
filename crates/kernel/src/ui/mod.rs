@@ -6012,9 +6012,25 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
                 desktop.context_note(&alloc::format!("{}: объектов {count}, {}", trash::LABEL, human_size(bytes)));
                 kprintln!("  desktop     : trash has {count} items, {bytes} bytes");
             } else if let Some((path, label)) = selected_entry(desktop) {
-                let note = entry_facts(&path, &label);
-                kprintln!("  desktop     : properties of '{path}': {note}");
-                desktop.context_note(&note);
+                // Окно «Свойства» «Файлов» (24.11): имя, тип, «Открывать с
+                // помощью», размер, атрибуты — как у Проводника. Строка
+                // запуска не длиннее 255 байт: что не влезло, не попадает.
+                let mut entries = selected_entries(desktop);
+                if entries.is_empty() {
+                    entries.push((path.clone(), label.clone()));
+                }
+                let mut line = String::from("/bin/files --properties");
+                for (path, _) in &entries {
+                    let word = panel::pct(path);
+                    if line.len() + word.len() + 1 > 250 {
+                        break;
+                    }
+                    line.push(' ');
+                    line.push_str(&word);
+                }
+                desktop.close_context();
+                kprintln!("  desktop     : properties of '{path}' ({} item(s))", entries.len());
+                start(desktop, &line);
             }
         }
         context::Action::NewFolder | context::Action::NewTextFile => {

@@ -133,8 +133,38 @@ pub struct Edit {
     pub index: usize,
     /// Что набрано.
     pub text: String,
-    /// Имя выделено целиком: первая же буква заменяет его, Backspace стирает.
-    pub all: bool,
+    /// Каретка — номер символа (24.11: правят и в середине имени).
+    pub caret: usize,
+    /// Другой конец выделения; `None` — выделения нет. Сначала выделено
+    /// имя без расширения (как F2 в Проводнике): первая же буква заменяет
+    /// его, расширение остаётся.
+    pub anchor: Option<usize>,
+    /// Скрытое расширение известного типа (24.11, «Параметры папок»): в поле
+    /// его нет, к имени оно допишется.
+    pub suffix: String,
+}
+
+impl Edit {
+    /// Выделенное: от и до (символы).
+    fn range(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        (anchor != self.caret).then(|| (anchor.min(self.caret), anchor.max(self.caret)))
+    }
+
+    fn byte(&self, at: usize) -> usize {
+        self.text.char_indices().nth(at).map_or(self.text.len(), |(index, _)| index)
+    }
+
+    /// Стереть выделенное; `true` — было что.
+    fn take_selection(&mut self) -> bool {
+        let range = self.range();
+        self.anchor = None;
+        let Some((from, to)) = range else { return false };
+        let (a, b) = (self.byte(from), self.byte(to));
+        self.text.replace_range(a..b, "");
+        self.caret = from;
+        true
+    }
 }
 
 /// Чем кончилась клавиша в поле имени.
@@ -258,6 +288,30 @@ fn is_hidden(label: &str) -> bool {
     HIDDEN.lock().split('|').any(|item| !item.is_empty() && item == label)
 }
 
+/// «Параметры папок» (24.11, хранилище настроек, `explorer/…`), которые
+/// касаются стола: показывать ли скрытые файлы и расширения известных типов.
+static SHOW_HIDDEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static HIDE_EXT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Счётчик хранилища, при котором они прочитаны.
+static OPTIONS_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Перечитать «Параметры папок». `true` — сменились.
+fn refresh_folder_options() -> bool {
+    use core::sync::atomic::Ordering;
+    let seq = crate::config::registry::seq();
+    if OPTIONS_SEQ.swap(seq, Ordering::Relaxed) == seq {
+        return false;
+    }
+    let options = sysconf::store::FolderOptions::read(crate::config::registry::get);
+    let hidden = SHOW_HIDDEN.swap(options.show_hidden, Ordering::Relaxed) != options.show_hidden;
+    let ext = HIDE_EXT.swap(options.hide_known_ext, Ordering::Relaxed) != options.hide_known_ext;
+    hidden || ext
+}
+
+fn hide_known_ext() -> bool {
+    HIDE_EXT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Наблюдение за каталогом стола (20.11, [`crate::fs::notify`]): каталог и
 /// очередь событий; `true` — событие пришло, а перечитать ещё не удалось.
 static DESK_WATCH: crate::sync::SpinLock<Option<(String, Arc<crate::fs::notify::Queue>, bool)>> = crate::sync::SpinLock::new(None);
@@ -287,6 +341,10 @@ pub fn desktop_folder_changed(can: bool) -> bool {
         return false;
     };
     let events = queue.drain();
+    // «Параметры папок» сменили (24.11): стол перечитывается тем же путём.
+    if refresh_folder_options() {
+        *pending = true;
+    }
     let leaf = dir.rsplit('/').next().unwrap_or("");
     // Каталог стола наблюдается первым (номер 1); у родителя — только
     // события о самом каталоге стола.
@@ -562,9 +620,14 @@ impl Icons {
             return;
         };
 
+        // Скрытые (имя с точки) — только если так выбрано в «Параметрах
+        // папок» (24.11).
+        refresh_folder_options();
+        let show_hidden = SHOW_HIDDEN.load(core::sync::atomic::Ordering::Relaxed);
         let mut rows: Vec<(bool, String)> = entries
             .into_iter()
             .filter(|entry| entry.name != "." && entry.name != "..")
+            .filter(|entry| show_hidden || !entry.name.starts_with('.'))
             .map(|entry| (entry.kind == NodeKind::Directory, entry.name))
             .collect();
         // Каталоги наверх, дальше по имени: порядок записей в ext2 — это
@@ -802,9 +865,14 @@ impl Icons {
         let Some(item) = self.items.get(index) else {
             return Rect::EMPTY;
         };
-        let text = item.label.clone();
+        let label = item.label.clone();
+        let directory = matches!(item.kind, Kind::Folder);
+        // Скрытое расширение (24.11) в поле не показывается.
+        let shown = sysconf::store::shown_name(&label, directory, hide_known_ext());
+        let (text, suffix) = (String::from(shown), String::from(&label[shown.len()..]));
+        let stem = if suffix.is_empty() { sysconf::store::stem_chars(&text, directory) } else { text.chars().count() };
         let mut damage = self.select(Some(index));
-        self.edit = Some(Edit { index, text, all: true });
+        self.edit = Some(Edit { index, text, caret: stem, anchor: (stem > 0).then_some(0), suffix });
         self.rebuild();
         damage = damage.union(&self.cell(index));
         damage
@@ -833,14 +901,20 @@ impl Icons {
             return EditReply::Ignored;
         };
         let reply = match code {
-            KeyCode::Enter => return EditReply::Commit(edit.text.trim().to_string()),
+            KeyCode::Enter => return EditReply::Commit(alloc::format!("{}{}", edit.text.trim(), edit.suffix)),
             KeyCode::Escape => return EditReply::Cancel,
             KeyCode::Backspace => {
-                if edit.all {
-                    edit.text.clear();
-                    edit.all = false;
-                } else {
-                    edit.text.pop();
+                if !edit.take_selection() && edit.caret > 0 {
+                    let (a, b) = (edit.byte(edit.caret - 1), edit.byte(edit.caret));
+                    edit.text.replace_range(a..b, "");
+                    edit.caret -= 1;
+                }
+                EditReply::Changed
+            }
+            KeyCode::Delete => {
+                if !edit.take_selection() && edit.caret < edit.text.chars().count() {
+                    let (a, b) = (edit.byte(edit.caret), edit.byte(edit.caret + 1));
+                    edit.text.replace_range(a..b, "");
                 }
                 EditReply::Changed
             }
@@ -848,27 +922,50 @@ impl Icons {
             // в полях Windows.
             KeyCode::U if ctrl => {
                 edit.text.clear();
-                edit.all = false;
+                edit.caret = 0;
+                edit.anchor = None;
                 EditReply::Changed
             }
             KeyCode::A if ctrl => {
-                edit.all = true;
+                edit.anchor = Some(0);
+                edit.caret = edit.text.chars().count();
                 EditReply::Changed
             }
-            // Стрелки снимают выделение: дальше правят с конца имени.
-            KeyCode::Left | KeyCode::Right | KeyCode::End | KeyCode::Home => {
-                edit.all = false;
+            // Стрелки снимают выделение и двигают каретку (24.11).
+            KeyCode::Left => {
+                edit.caret = match edit.range() {
+                    Some((from, _)) => from,
+                    None => edit.caret.saturating_sub(1),
+                };
+                edit.anchor = None;
+                EditReply::Changed
+            }
+            KeyCode::Right => {
+                edit.caret = match edit.range() {
+                    Some((_, to)) => to,
+                    None => (edit.caret + 1).min(edit.text.chars().count()),
+                };
+                edit.anchor = None;
+                EditReply::Changed
+            }
+            KeyCode::Home => {
+                edit.caret = 0;
+                edit.anchor = None;
+                EditReply::Changed
+            }
+            KeyCode::End => {
+                edit.caret = edit.text.chars().count();
+                edit.anchor = None;
                 EditReply::Changed
             }
             _ => match ch {
                 // Косая черта — это путь, а не имя.
                 Some(ch) if !ctrl && ch != '/' && !ch.is_control() => {
-                    if edit.all {
-                        edit.text.clear();
-                        edit.all = false;
-                    }
+                    edit.take_selection();
                     if edit.text.chars().count() < 255 {
-                        edit.text.push(ch);
+                        let at = edit.byte(edit.caret);
+                        edit.text.insert(at, ch);
+                        edit.caret += 1;
                     }
                     EditReply::Changed
                 }
@@ -1203,30 +1300,42 @@ impl Icons {
             draw::rounded(back, field, ctx.px(3), p.sunk.color, 255);
             draw::rounded_stroke(back, field, ctx.px(3), p.acc, 255);
             let room = field.w.saturating_sub(ctx.px(8));
-            // Не влезает — видно хвост: правят и набирают с конца.
-            let mut shown = edit.text.as_str();
-            while face.width(shown) > room && !shown.is_empty() {
-                let mut chars = shown.chars();
-                chars.next();
-                shown = chars.as_str();
+            // Не влезает — сдвинуть так, чтобы каретка была видна.
+            let chars: Vec<char> = edit.text.chars().collect();
+            let width_of = |from: usize, to: usize| -> u32 { face.width(&chars[from.min(to)..to].iter().collect::<String>()) };
+            let mut first = 0;
+            while first < edit.caret && width_of(first, edit.caret.min(chars.len())) > room {
+                first += 1;
             }
+            let shown: String = chars[first.min(chars.len())..].iter().collect();
             let text_x = field.x + ctx.px(4) as i32;
-            let width = face.width(shown);
-            if edit.all && !shown.is_empty() {
-                let mark = Rect::new(text_x - 1, y, width + 2, step);
-                draw::blend_rect(back, mark, p.acc, 200);
-                paint::text_clipped(ctx, back, Role::Label, text_x, y, room, shown, p.acc_ink);
-            } else {
-                paint::text_clipped(ctx, back, Role::Label, text_x, y, room, shown, p.ink);
-                // Каретка — за последней буквой.
-                let caret_x = text_x + width as i32 + 1;
-                draw::vline(back, caret_x, y, step, p.ink, 255);
+            let x_of = |at: usize| text_x + width_of(first, at.max(first).min(chars.len())).min(room) as i32;
+            match edit.range() {
+                Some((from, to)) => {
+                    let (a, b) = (x_of(from), x_of(to));
+                    if b > a {
+                        draw::blend_rect(back, Rect::new(a - 1, y, (b - a) as u32 + 2, step), p.acc, 200);
+                    }
+                    // До выделения и после — обычным цветом, выделенное —
+                    // светлым по акценту.
+                    let (from, to) = (from.max(first).min(chars.len()), to.max(first).min(chars.len()));
+                    let part = |at: usize, until: usize| -> String { chars[at..until].iter().collect() };
+                    paint::text_clipped(ctx, back, Role::Label, text_x, y, (a - text_x).max(0) as u32 + 1, &part(first.min(chars.len()), from), p.ink);
+                    paint::text_clipped(ctx, back, Role::Label, a, y, (b - a).max(0) as u32 + 1, &part(from, to), p.acc_ink);
+                    paint::text_clipped(ctx, back, Role::Label, b, y, (text_x + room as i32 - b).max(0) as u32, &part(to, chars.len()), p.ink);
+                }
+                None => {
+                    paint::text_clipped(ctx, back, Role::Label, text_x, y, room, &shown, p.ink);
+                    draw::vline(back, x_of(edit.caret) + 1, y, step, p.ink, 255);
+                }
             }
             return;
         }
         // У ярлыка Windows расширения `.lnk` не видно, как в Проводнике.
         let label = match item.kind {
             Kind::File if item.shortcut.is_some() => item.label.strip_suffix(".lnk").or_else(|| item.label.strip_suffix(".LNK")).unwrap_or(&item.label),
+            // «Скрывать расширения для известных типов файлов» (24.11).
+            Kind::File => sysconf::store::shown_name(&item.label, false, hide_known_ext()),
             _ => item.label.as_str(),
         };
         let (first, second) = wrap(ctx, label, room);
