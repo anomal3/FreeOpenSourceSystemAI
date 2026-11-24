@@ -13,8 +13,9 @@
 //! — «всё выполнено», как сигнальный с ошибкой забор Linux). Ответ берётся
 //! из кэша канала ([`ChanCore::completed`]): его можно спрашивать под
 //! замком объекта, а освежают его ожидания ([`refresh`]) — вне замков,
-//! вопросом к бэкенду. Прерываний нет (v1): ожидание — опрос раз в
-//! миллисекунду.
+//! вопросом к бэкенду. Ожидание — короткий опрос, затем сон, который
+//! будит прерывание GPU (`display::nvidia_rm_intr`, `fenceirq`) или шаг
+//! таймера, если прерывания нет.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -207,18 +208,31 @@ impl Object for SyncFile {
 /// that completes within it is seen within microseconds. Longer waits sleep
 /// as before.
 pub fn wait_until(deadline_ns: Option<u64>, mut ready: impl FnMut() -> Result<bool, i64>) -> Result<(), i64> {
+    use crate::display::nvidia_rm_intr::{self as fenceirq, End, Mode, SRC_GPU};
     static KEY: u8 = 0;
     let started = crate::time::uptime_ns();
-    let spin_ns = FENCE_SPIN_US.load(Ordering::Relaxed) * 1000;
+    let mut spin_ns = FENCE_SPIN_US.load(Ordering::Relaxed) * 1000;
     let mut slept = false;
     let mut step = FENCE_STEP_US.load(Ordering::Relaxed).max(1);
+    // How the last sleep ended (GPU fence interrupt, 24.11): `None` - no
+    // sleep yet or the interrupt is not in use.
+    let mut last: Option<bool> = None;
     loop {
+        // Read before checking: an interrupt after this read ends the sleep.
+        let mode = fenceirq::mode();
+        let seen = crate::sched::hrsleep::generation(SRC_GPU);
         refresh();
         if ready()? {
             let kind = usize::from(slept);
             WAITS[kind].fetch_add(1, Ordering::Relaxed);
             WAIT_NS[kind].fetch_add(crate::time::uptime_ns().saturating_sub(started), Ordering::Relaxed);
+            if let Some(by_irq) = last {
+                fenceirq::after_wait(if by_irq { End::Irq } else { End::TimerDone });
+            }
             return Ok(());
+        }
+        if last.is_some() {
+            fenceirq::after_wait(End::Timer);
         }
         let now = crate::time::uptime_ns();
         if deadline_ns.is_some_and(|at| at <= now) {
@@ -226,6 +240,11 @@ pub fn wait_until(deadline_ns: Option<u64>, mut ready: impl FnMut() -> Result<bo
         }
         if crate::linux::signal::pending() || crate::user::kill_pending() {
             return Err(-e::EINTR);
+        }
+        // With the interrupt live a short poll is enough: the wake-up costs
+        // microseconds, not a 50-200 us step.
+        if mode == Mode::Live {
+            spin_ns = spin_ns.min(FENCE_IRQ_SPIN_US * 1000);
         }
         if now.saturating_sub(started) < spin_ns {
             crate::sched::yield_now();
@@ -242,22 +261,40 @@ pub fn wait_until(deadline_ns: Option<u64>, mut ready: impl FnMut() -> Result<bo
         // 1.85 ms. Fine sleeps (hrsleep: one-shot timer) in short steps that
         // grow 50 -> 100 -> 200 us: a fence that needs 0.3 ms of GPU time
         // now costs ~0.35 ms, and a long wait costs a few wake-ups per ms.
+        // hw-log17: the GPU fence interrupt (`fenceirq`) ends the sleep when
+        // a channel finishes; live, the step is only a backstop.
         let step_us = FENCE_STEP_US.load(Ordering::Relaxed);
         if step_us != 0 && crate::sched::hrsleep::enabled() {
             let now = crate::time::uptime_ns();
-            let mut at = now + step * 1000;
+            let (len_us, sources) = match mode {
+                Mode::Live => (FENCE_IRQ_BACKSTOP_US, SRC_GPU),
+                Mode::Trial => (step, SRC_GPU),
+                Mode::Off => (step, 0),
+            };
+            let mut at = now + len_us * 1000;
             if let Some(limit) = deadline_ns {
                 at = at.min(limit);
             }
             FINE_SLEEPS.fetch_add(1, Ordering::Relaxed);
-            crate::sched::hrsleep::sleep_until_ns(at, 0, 0, || false);
-            step = (step * 2).min(step_us * 4);
+            crate::sched::hrsleep::sleep_until_ns(at, sources, seen, || false);
+            last = (sources != 0).then(|| crate::sched::hrsleep::generation(SRC_GPU) != seen);
+            if mode != Mode::Live {
+                step = (step * 2).min(step_us * 4);
+            }
             continue;
         }
+        last = None;
         let until = crate::time::uptime_ms() + 1;
         crate::sched::block_on_futex(core::ptr::addr_of!(KEY) as usize, Some(until), || false);
     }
 }
+
+/// Poll window of a fence wait while the GPU fence interrupt is live, us.
+const FENCE_IRQ_SPIN_US: u64 = 20;
+/// Backstop sleep of a fence wait while the interrupt is live, us (a missed
+/// interrupt costs at most this; `fenceirq` counts such waits and falls
+/// back if they are many).
+const FENCE_IRQ_BACKSTOP_US: u64 = 1000;
 
 /// How long a fence wait polls before it sleeps, us (`fencespin N`, 0 - sleep
 /// at once, as before).

@@ -110,6 +110,16 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
         ));
     }
 
+    // H.264 и Opus записи экрана (23.11) — до программ: `/bin/screenrec`
+    // компонует библиотеку, если она есть в sysroot (`user-progs/build.rs`).
+    // Нет набора или сети — строка, а запись пишет только AVI.
+    if opts.kernel || opts.initrd {
+        match crate::screenmedia::ensure(opts.arch) {
+            Ok(library) => say!("screenrec-media: {}", library.display()),
+            Err(err) => say!("screenrec-media пропущена (запись экрана — только AVI): {err:#}"),
+        }
+    }
+
     // Программы собираются вместе с ядром: программа и ядро связаны номерами
     // системных вызовов, и собранная порознь пара разъезжается молча.
     let programs: Vec<(&'static str, PathBuf)> = if opts.kernel || opts.initrd {

@@ -423,24 +423,40 @@ impl Volume {
     ///
     /// `f` вызывается с удержанным замком, поэтому обязана быть короткой: это
     /// копирование нескольких байт, не более.
+    ///
+    /// hw-log17: the device read of a miss went on under the cache's spin
+    /// lock - one slow USB transfer of the stick kept interrupts off for
+    /// 166 ms on that CPU, and every CPU wanting the FAT cache spun. Now a
+    /// miss reads into its own buffer with no lock held and then takes a slot;
+    /// if another reader brought the same sector in meanwhile, its copy is
+    /// used (the volume is read-only, both copies are the same).
     fn with_sector<R>(&self, sector: u64, f: impl FnOnce(&[u8]) -> R) -> VfsResult<R> {
-        let mut cache = self.cache.lock();
-
-        if let Some(hit) = cache.slots.iter().position(|slot| slot.sector == Some(sector)) {
-            return Ok(f(&cache.slots[hit].data));
+        {
+            let cache = self.cache.lock();
+            if let Some(hit) = cache.slots.iter().position(|slot| slot.sector == Some(sector)) {
+                return Ok(f(&cache.slots[hit].data));
+            }
         }
 
+        let mut buf = alloc_buf(self.geometry.bytes_per_sector as usize)?;
+        self.read_sectors(sector, &mut buf)?;
+
+        let mut cache = self.cache.lock();
+        if let Some(hit) = cache.slots.iter().position(|slot| slot.sector == Some(sector)) {
+            let result = f(&cache.slots[hit].data);
+            drop(cache);
+            drop(buf);
+            return Ok(result);
+        }
         let index = cache.victim;
         cache.victim = (index + 1) % CACHE_SLOTS;
-        // Слот помечается пустым до чтения: если устройство откажет, в кеше не
-        // должно остаться содержимое прошлого сектора под новым номером.
-        cache.slots[index].sector = None;
-        let mut buf = core::mem::take(&mut cache.slots[index].data);
-        let result = self.read_sectors(sector, &mut buf);
-        cache.slots[index].data = buf;
-        result?;
+        let old = core::mem::replace(&mut cache.slots[index].data, buf);
         cache.slots[index].sector = Some(sector);
-        Ok(f(&cache.slots[index].data))
+        let result = f(&cache.slots[index].data);
+        drop(cache);
+        // The old buffer goes back to the heap with no lock held.
+        drop(old);
+        Ok(result)
     }
 
     /// Элемент таблицы FAT для кластера.

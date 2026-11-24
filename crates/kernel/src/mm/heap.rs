@@ -87,6 +87,9 @@ struct KernelHeap {
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap { inner: SpinLock::new(None) };
 
+/// The heap is initialised (`inner` is `Some` from then on, forever).
+static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Мелкие блоки — по классам размеров (фаза 74): 16, 32 … 2048 байт.
 ///
 /// Список свободного у `linked_list_allocator` — один на всё, и поиск в нём
@@ -163,7 +166,11 @@ enum Outcome {
 unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if let Some(class) = class_of(layout) {
-            if self.inner.lock().is_some() {
+            // hw-log14/17: checking `inner` for every small block took the
+            // heap lock, and while a large allocation walked the free list
+            // (first fit) small allocations on other CPUs spun here with
+            // interrupts off for 7-11 ms (serial input lost characters).
+            if READY.load(core::sync::atomic::Ordering::Acquire) {
                 return small_alloc(class);
             }
         }
@@ -348,6 +355,7 @@ pub unsafe fn init() -> Result<HeapStats, HeapError> {
     let heap = unsafe { Heap::new(HEAP_BASE as *mut u8, crate::mm::heap_size()) };
     let stats = HeapStats { size: heap.size(), used: heap.used(), free: heap.free() };
     *slot = Some(heap);
+    READY.store(true, core::sync::atomic::Ordering::Release);
     Ok(stats)
 }
 

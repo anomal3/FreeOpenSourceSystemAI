@@ -330,11 +330,123 @@ pub struct Line {
     pub text: String,
     caret: usize,
     anchor: Option<usize>,
+    /// Левая кнопка зажата в поле (24.11): движение тянет выделение.
+    held: bool,
+    /// Прошлый щелчок: время, точка, который по счёту (двойной — слово,
+    /// тройной — всё).
+    last: (u64, i32, u8),
 }
+
+// ---- Буфер обмена и часы для полей ввода (24.11) ---------------------------
+//
+// Набор без системных вызовов: буфер обмена и время ему даёт программа —
+// `user_progs` ставит их при запуске каждой программы. Не поставлены (тесты
+// на машине сборки) — копирование и вставка молчат, двойного щелчка нет.
+
+static CLIP_GET: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static CLIP_SET: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static NOW_MS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Дать полям ввода буфер обмена системы и часы (миллисекунды).
+pub fn set_line_hooks(get: fn() -> String, set: fn(&str) -> bool, now_ms: fn() -> u64) {
+    use core::sync::atomic::Ordering;
+    CLIP_GET.store(get as usize, Ordering::Relaxed);
+    CLIP_SET.store(set as usize, Ordering::Relaxed);
+    NOW_MS.store(now_ms as usize, Ordering::Relaxed);
+}
+
+fn clip_get() -> Option<String> {
+    let raw = CLIP_GET.load(core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: число положил `set_line_hooks` из указателя на функцию ровно
+    // этого типа.
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: см. выше.
+    let get = unsafe { core::mem::transmute::<usize, fn() -> String>(raw) };
+    Some(get())
+}
+
+fn clip_set(text: &str) -> bool {
+    let raw = CLIP_SET.load(core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: как у `clip_get`.
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: как у `clip_get`.
+    let set = unsafe { core::mem::transmute::<usize, fn(&str) -> bool>(raw) };
+    set(text)
+}
+
+fn now_ms() -> u64 {
+    let raw = NOW_MS.load(core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: как у `clip_get`.
+    if raw == 0 {
+        return 0;
+    }
+    // SAFETY: как у `clip_get`.
+    let now = unsafe { core::mem::transmute::<usize, fn() -> u64>(raw) };
+    now()
+}
+
+/// Двойной щелчок в поле: не дольше этого между щелчками.
+const MULTI_CLICK_MS: u64 = 500;
+
+/// `Insert` из договора клавиш (Ctrl+Insert, Shift+Insert).
+const KEY_INSERT: u32 = KEY_NAMED + 11;
 
 impl Line {
     pub fn new(text: &str) -> Self {
-        Self { text: text.to_string(), caret: text.chars().count(), anchor: None }
+        Self { text: text.to_string(), caret: text.chars().count(), anchor: None, held: false, last: (0, 0, 0) }
+    }
+
+    /// Выделенный текст; `None` — ничего не выделено.
+    #[must_use]
+    pub fn selection(&self) -> Option<String> {
+        let (from, to) = self.range()?;
+        Some(self.text.chars().skip(from).take(to - from).collect())
+    }
+
+    /// Вставить строку в каретку вместо выделенного (переводы строк и
+    /// прочие управляющие — пробелами: поле в одну строку).
+    pub fn insert_str(&mut self, text: &str) {
+        self.take_selection();
+        for ch in text.chars() {
+            let ch = if ch.is_control() { ' ' } else { ch };
+            if self.text.len() + ch.len_utf8() > MAX_FIELD {
+                break;
+            }
+            let at = self.byte(self.caret);
+            self.text.insert(at, ch);
+            self.caret += 1;
+        }
+    }
+
+    /// Ctrl+C/X/V (и Ctrl+Insert, Shift+Insert, Shift+Delete) через буфер
+    /// обмена системы. `None` — клавиша не про буфер.
+    fn clipboard_key(&mut self, code: u32, ctrl: bool, shift: bool, latin: u32) -> Option<bool> {
+        let copy = (ctrl && latin_is(latin, 'c')) || (ctrl && code == KEY_INSERT);
+        let cut = (ctrl && latin_is(latin, 'x')) || (shift && !ctrl && code == KEY_DELETE);
+        let paste = (ctrl && latin_is(latin, 'v')) || (shift && !ctrl && code == KEY_INSERT);
+        if copy || cut {
+            if let Some(text) = self.selection() {
+                clip_set(&text);
+                if cut {
+                    self.take_selection();
+                    return Some(true);
+                }
+            }
+            return Some(false);
+        }
+        if paste {
+            let text = clip_get().unwrap_or_default();
+            if text.is_empty() {
+                return Some(false);
+            }
+            self.insert_str(&text);
+            return Some(true);
+        }
+        None
     }
 
     /// Строка, выделенная целиком (имя по умолчанию, адрес при правке).
@@ -398,6 +510,9 @@ impl Line {
     pub fn key(&mut self, code: u32, mods: i32, latin: u32) -> Option<bool> {
         let shift = mods & MOD_SHIFT != 0;
         let ctrl = mods & MOD_CTRL != 0;
+        if let Some(changed) = self.clipboard_key(code, ctrl, shift, latin) {
+            return Some(changed);
+        }
         match code {
             BACKSPACE => {
                 if !self.take_selection() && self.caret > 0 {
@@ -465,8 +580,8 @@ impl Line {
         }
     }
 
-    /// Каретку — к точке `x` (от левого края текста).
-    pub fn click(&mut self, face: &Face, room: u32, x: i32) {
+    /// Символ под точкой `x` (от левого края текста).
+    fn at_x(&self, face: &Face, room: u32, x: i32) -> usize {
         let first = self.first_shown(face, room);
         let mut pen = 0i32;
         let mut at = first;
@@ -478,8 +593,82 @@ impl Line {
             pen += w;
             at += 1;
         }
-        self.anchor = None;
-        self.caret = at.min(self.len());
+        at.min(self.len())
+    }
+
+    /// Каретку — к точке `x` (от левого края текста). Двойной щелчок —
+    /// слово, тройной — всё (24.11); кнопка зажата — движение тянет
+    /// выделение ([`Line::drag`]).
+    pub fn click(&mut self, face: &Face, room: u32, x: i32) {
+        self.click_with(face, room, x, false);
+    }
+
+    /// То же с Shift: тянуть выделение от прежней каретки до точки.
+    pub fn click_with(&mut self, face: &Face, room: u32, x: i32, shift: bool) {
+        let at = self.at_x(face, room, x);
+        let now = now_ms();
+        let (when, lx, count) = self.last;
+        let count = if !shift && now != 0 && now.saturating_sub(when) <= MULTI_CLICK_MS && (x - lx).abs() <= 4 { count % 3 + 1 } else { 1 };
+        self.last = (now, x, count);
+        self.held = true;
+        match count {
+            2 => {
+                let chars: Vec<char> = self.text.chars().collect();
+                let word = |ch: char| ch.is_alphanumeric() || ch == '_';
+                let probe = at.min(chars.len().saturating_sub(1));
+                let kind = chars.get(probe).is_some_and(|ch| word(*ch));
+                let mut from = probe;
+                while from > 0 && word(chars[from - 1]) == kind {
+                    from -= 1;
+                }
+                let mut to = probe;
+                while to < chars.len() && word(chars[to]) == kind {
+                    to += 1;
+                }
+                self.anchor = Some(from);
+                self.caret = to.max(from);
+            }
+            3 => {
+                self.anchor = Some(0);
+                self.caret = self.len();
+            }
+            _ if shift => {
+                if self.anchor.is_none() {
+                    self.anchor = Some(self.caret);
+                }
+                self.caret = at;
+            }
+            _ => {
+                self.anchor = Some(at);
+                self.caret = at;
+            }
+        }
+    }
+
+    /// Указатель движется с зажатой кнопкой: каретка за ним, выделение — от
+    /// места щелчка. `true` — что-то сменилось.
+    pub fn drag(&mut self, face: &Face, room: u32, x: i32) -> bool {
+        if !self.held {
+            return false;
+        }
+        let at = if x < 0 { self.first_shown(face, room).saturating_sub(1) } else { self.at_x(face, room, x) };
+        if self.anchor.is_none() {
+            self.anchor = Some(self.caret);
+        }
+        let changed = at != self.caret;
+        self.caret = at;
+        changed
+    }
+
+    /// Кнопку отпустили.
+    pub fn release(&mut self) {
+        self.held = false;
+    }
+
+    /// Зажата ли кнопка в этом поле.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.held
     }
 
     /// Нарисовать текст в `rect` (уже с полями): выделение, каретку.
@@ -1424,6 +1613,21 @@ impl FileDialog {
 
     /// Указатель движется с зажатой кнопкой: ползунок прокрутки.
     pub fn drag(&mut self, ctx: Ctx, area: Rect, x: i32, y: i32) -> bool {
+        // Выделение мышью в поле ввода (24.11).
+        if self.address.as_ref().is_some_and(Line::held) || self.search.held() || self.name.held() {
+            let lay = Layout::new(ctx, area, self);
+            let face = ctx.face(Role::Body);
+            if let Some(line) = self.address.as_mut().filter(|line| line.held()) {
+                let field = lay.address_text(ctx);
+                return line.drag(face, field.w, x - field.x);
+            }
+            if self.search.held() {
+                let field = lay.search_text(ctx);
+                return self.search.drag(face, field.w, x - field.x);
+            }
+            let field = field_text(ctx, lay.name);
+            return self.name.drag(face, field.w, x - field.x);
+        }
         if !self.scroll.dragging() {
             return false;
         }
@@ -1438,6 +1642,11 @@ impl FileDialog {
     /// Кнопку отпустили.
     pub fn release(&mut self) {
         self.scroll.release();
+        if let Some(line) = self.address.as_mut() {
+            line.release();
+        }
+        self.search.release();
+        self.name.release();
     }
 
     /// Указатель движется без нажатых кнопок (20.11): подсветить строку,

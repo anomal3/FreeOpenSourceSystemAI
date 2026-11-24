@@ -458,6 +458,83 @@ fn tone(hz: u32, seconds: u32) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// `d3dprobe.exe wasapi ГЦ СЕКУНДЫ` (24.11.2026, hw-log17 "no sound in any
+/// game"): the way games play - WASAPI in shared mode, event-driven, in the
+/// device's mix format (float 32 in Wine), the default render endpoint of
+/// mmdevapi. `tone` (waveOut) goes through winmm's own buffering; games
+/// (FMOD, Wwise, XAudio2) talk to `IAudioClient` directly like this.
+fn wasapi_tone(hz: u32, seconds: u32) -> std::result::Result<(), String> {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::Media::Audio::{
+        eConsole, eRender, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator, MMDeviceEnumerator,
+        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    let fail = |what: &str, err: windows::core::Error| format!("{what}: {err}");
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok().map_err(|e| fail("CoInitializeEx", e))?;
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| fail("MMDeviceEnumerator", e))?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).map_err(|e| fail("GetDefaultAudioEndpoint", e))?;
+        let client: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| fail("Activate IAudioClient", e))?;
+        let format = client.GetMixFormat().map_err(|e| fail("GetMixFormat", e))?;
+        let f = *format;
+        let (tag, channels, rate, bits) = (f.wFormatTag, usize::from(f.nChannels), f.nSamplesPerSec, f.wBitsPerSample);
+        eprintln!("d3dprobe: wasapi mix format tag {tag:#x}, {channels} ch, {rate} Hz, {bits} bit");
+        let float = bits == 32 && (tag == 3 || tag == 0xFFFE);
+        if !float && bits != 16 {
+            return Err(format!("mix format {bits} bit tag {tag:#x} not handled"));
+        }
+        let event = CreateEventW(None, false, false, None).map_err(|e| fail("CreateEventW", e))?;
+        // 20 ms buffer, like FMOD's default.
+        client
+            .Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 200_000, 0, format, None)
+            .map_err(|e| fail("IAudioClient::Initialize", e))?;
+        client.SetEventHandle(event).map_err(|e| fail("SetEventHandle", e))?;
+        let size = client.GetBufferSize().map_err(|e| fail("GetBufferSize", e))?;
+        let render: IAudioRenderClient = client.GetService().map_err(|e| fail("GetService IAudioRenderClient", e))?;
+        client.Start().map_err(|e| fail("Start", e))?;
+        eprintln!("d3dprobe: wasapi started, buffer {size} frames, tone {hz} Hz for {seconds} s");
+        let total = u64::from(rate) * u64::from(seconds);
+        let mut done = 0u64;
+        let mut events = 0u64;
+        let start = Instant::now();
+        while done < total {
+            if WaitForSingleObject(event, 2000) != WAIT_OBJECT_0 {
+                return Err(format!("no buffer event for 2 s after {done} frames"));
+            }
+            events += 1;
+            let padding = client.GetCurrentPadding().map_err(|e| fail("GetCurrentPadding", e))?;
+            let n = size.saturating_sub(padding);
+            if n == 0 {
+                continue;
+            }
+            let data = render.GetBuffer(n).map_err(|e| fail("GetBuffer", e))?;
+            for i in 0..n as usize {
+                let t = (done + i as u64) as f32 / rate as f32;
+                let v = (t * hz as f32 * std::f32::consts::TAU).sin() * 0.25;
+                for c in 0..channels {
+                    if float {
+                        *(data as *mut f32).add(i * channels + c) = v;
+                    } else {
+                        *(data as *mut i16).add(i * channels + c) = (v * 32767.0) as i16;
+                    }
+                }
+            }
+            render.ReleaseBuffer(n, 0).map_err(|e| fail("ReleaseBuffer", e))?;
+            done += u64::from(n);
+        }
+        // Let the last buffer play out.
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = client.Stop();
+        eprintln!("d3dprobe: wasapi tone played in {:.1} s ({events} events)", start.elapsed().as_secs_f64());
+        CoTaskMemFree(Some(format as *const _));
+        let _ = CloseHandle(event);
+    }
+    Ok(())
+}
+
 /// One monitor of `EnumDisplayMonitors` (G5, 22.11).
 unsafe extern "system" fn monitor_line(
     monitor: windows::Win32::Graphics::Gdi::HMONITOR,
@@ -541,6 +618,17 @@ fn main() {
             std::process::exit(1);
         }
         eprintln!("d3dprobe: done, tone");
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("wasapi") {
+        let hz = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(440);
+        let seconds = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+        eprintln!("d3dprobe: start, wasapi");
+        if let Err(err) = wasapi_tone(hz, seconds) {
+            eprintln!("d3dprobe: error {err}");
+            std::process::exit(1);
+        }
+        eprintln!("d3dprobe: done, wasapi");
         return;
     }
     let api = args.get(1).map(String::as_str).unwrap_or("11");

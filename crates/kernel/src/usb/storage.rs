@@ -179,7 +179,11 @@ fn live_packages(mount: &str) {
 
 /// Порядок установки пакетов живой флешки (кого нет в списке — в конце).
 /// Приложения Craft — по 8 знаков имени файла 8.3 (`GRIDCRAF.FPK`).
-const LIVE_ORDER: [&str; 8] = ["obsos", "gridcraf", "wordcraf", "pdfcraft", "mailcraf", "debian", "proton", "tmnf"];
+/// 23.11: сначала Debian, Proton и OBS Studio (`obs`, своя glibc), потом
+/// игра и остальное — пакеты ставятся строго по одному, память `/opt`
+/// растёт только под распакованное.
+const LIVE_ORDER: [&str; 9] =
+    ["debian", "proton", "obs", "tmnf", "obsos", "gridcraf", "wordcraf", "pdfcraft", "mailcraf"];
 
 static LIVE_QUEUE: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
 static LIVE_RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -448,7 +452,7 @@ impl UsbDisk {
             Direction::In(buf) => (buf.len(), true),
             Direction::Out(buf) => (buf.len(), false),
         };
-        xhci::with_storage_buffers(handle, |command, _, window| {
+        xhci::with_storage_buffers(handle, |command, _, _| {
             command.fill(0);
             command[0..4].copy_from_slice(&CBW_SIGNATURE.to_le_bytes());
             command[4..8].copy_from_slice(&tag.to_le_bytes());
@@ -456,11 +460,11 @@ impl UsbDisk {
             command[12] = if dir_in { 0x80 } else { 0 };
             command[14] = cb.len() as u8;
             command[15..15 + cb.len()].copy_from_slice(cb);
-            if let Direction::Out(buf) = &data {
-                window[..buf.len()].copy_from_slice(buf);
-            }
         })
         .ok_or(Error::Bulk(BulkError::Gone))?;
+        if let Direction::Out(buf) = &data {
+            window_copy(handle, buf.len(), |window, range| window[range.clone()].copy_from_slice(&buf[range]))?;
+        }
 
         if let Err(err) = xhci::storage_bulk(handle, false, StorageBuffer::Command, 31) {
             xhci::storage_reset(handle);
@@ -480,11 +484,11 @@ impl UsbDisk {
             Err(BulkError::Stalled) => xhci::storage_bulk(handle, true, StorageBuffer::Status, 13)?,
             Err(err) => return Err(err.into()),
         };
-        let (signature, echoed, code) = xhci::with_storage_buffers(handle, |_, csw, window| {
-            if let Direction::In(buf) = &mut data {
-                let len = buf.len();
-                buf.copy_from_slice(&window[..len]);
-            }
+        if let Direction::In(buf) = &mut data {
+            let len = buf.len();
+            window_copy(handle, len, |window, range| buf[range.clone()].copy_from_slice(&window[range]))?;
+        }
+        let (signature, echoed, code) = xhci::with_storage_buffers(handle, |_, csw, _| {
             (
                 u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]),
                 u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]),
@@ -525,8 +529,57 @@ impl UsbDisk {
 
     /// Сколько секторов в одной команде.
     fn batch(&self) -> usize {
-        (self.window / self.sector_size as usize).max(1)
+        let cap = WINDOW_CAP.load(core::sync::atomic::Ordering::Relaxed);
+        let window = if cap == 0 { self.window } else { self.window.min(cap) };
+        (window / self.sector_size as usize).max(1)
     }
+}
+
+/// `usbwin KIB` (hw-log17): the longest USB disk command in bytes, 0 = the
+/// whole data window of the device (1 MiB on SuperSpeed, else 128 KiB).
+/// `usbwin 128` gives the commands of before 24.11.
+pub static WINDOW_CAP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `usbslow FIXED_US MBPS` (tests, hw-log17): a USB disk read command lasts
+/// at least FIXED_US plus its bytes at MBPS (MB/s) - QEMU's disk answers at
+/// once, a real one does not (the Netac SSD of hw-log17: ~0.15 ms per
+/// command and ~250 MB/s). The device stays held meanwhile, as a real busy
+/// disk. 0 0 = off (default).
+pub static SLOW_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static SLOW_MBPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn pace(started: u64, bytes: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (fixed, rate) = (SLOW_US.load(Relaxed), SLOW_MBPS.load(Relaxed));
+    if fixed == 0 && rate == 0 {
+        return;
+    }
+    let transfer = if rate == 0 { 0 } else { bytes as u64 * 1000 / rate };
+    let deadline = started + fixed * 1000 + transfer;
+    // A spin, not a sleep: QEMU's timers on a Windows host fire ~15 ms
+    // late, which would make every command that long.
+    while crate::time::uptime_ns() < deadline {
+        core::hint::spin_loop();
+    }
+}
+
+/// hw-log17: the data window is reached under the controllers' spin lock
+/// (interrupts off); a 1 MiB command is copied in 128 KiB pieces, each under
+/// its own short hold.
+const COPY_PIECE: usize = 128 * 1024;
+
+fn window_copy(
+    handle: StorageHandle,
+    len: usize,
+    mut f: impl FnMut(&mut [u8], core::ops::Range<usize>),
+) -> Result<(), Error> {
+    let mut at = 0;
+    while at < len {
+        let end = len.min(at + COPY_PIECE);
+        xhci::with_storage_buffers(handle, |_, _, window| f(window, at..end)).ok_or(Error::Bulk(BulkError::Gone))?;
+        at = end;
+    }
+    Ok(())
 }
 
 /// Направление фазы данных.
@@ -562,10 +615,13 @@ impl disk::BlockDevice for UsbDisk {
         for (index, chunk) in buf.chunks_mut(batch * sector).enumerate() {
             let at = lba + (index * batch) as u64;
             let count = (chunk.len() / sector) as u32;
+            let started = crate::time::uptime_ns();
+            let bytes = chunk.len();
             self.rw(at, count, Direction::In(chunk)).map_err(|err| {
                 kprintln!("  usb-storage : reading LBA {at}: {err}");
                 disk::Error::Io
             })?;
+            pace(started, bytes);
         }
         Ok(())
     }

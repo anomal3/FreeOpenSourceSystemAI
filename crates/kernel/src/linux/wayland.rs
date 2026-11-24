@@ -101,6 +101,157 @@ enum ToOwner {
 }
 
 static TO_OWNER: Mutex<Vec<(u64, ToOwner)>> = Mutex::new(Vec::new());
+
+// ---- one clipboard with native programs (24.11.2026) ----------------------------
+//
+// The selection's owner `NATIVE` is the system clipboard
+// ([`crate::ui::clipboard`]): what the terminal, Notepad or Files copied is
+// offered to Wayland clients, and the server itself writes it into the pipe of
+// `wl_data_offer.receive`. A client's own selection is read at once when it is
+// set - the server asks the client (`wl_data_source.send`) to write the text
+// and the `text/uri-list` into kernel pipes and puts what arrives on the
+// system clipboard (Roman, 23.11: text copied in Notepad++ under Proton did
+// not paste into the terminal).
+
+/// Owner number of the system clipboard (clients are numbered from 1).
+const NATIVE: u64 = 0;
+
+/// The system clipboard changed: the server takes the selection over on its
+/// next round ([`take_native`]). A flag, not a lock - the desktop calls this
+/// holding its spin lock.
+static NATIVE_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// What a client's selection is being read as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FetchKind {
+    Text,
+    Files,
+}
+
+/// A client's selection being read through a pipe.
+struct Fetch {
+    reader: crate::user::pipe::Reader,
+    kind: FetchKind,
+    data: Vec<u8>,
+    done: bool,
+}
+
+/// Reads of the current client selection (all of one `set_selection`) and when
+/// to give up on them.
+static FETCHES: Mutex<(Vec<Fetch>, u64)> = Mutex::new((Vec::new(), 0));
+
+/// The system clipboard being written to a client's `receive` pipe.
+struct Feed {
+    fd: Handle,
+    data: Vec<u8>,
+    at: usize,
+    until: u64,
+}
+
+static FEEDS: Mutex<Vec<Feed>> = Mutex::new(Vec::new());
+
+/// How long a client gets to write its selection (and to read ours).
+const CLIP_WAIT_MS: u64 = 5_000;
+
+/// The system clipboard changed (text or files from a native program): offer
+/// it to Wayland clients. Safe to call under any lock.
+pub fn native_clipboard_changed() {
+    NATIVE_DIRTY.store(true, Ordering::Release);
+    crate::io_events::notify();
+}
+
+/// The system clipboard as a selection; `None` - it is empty.
+fn native_selection() -> Option<Selection> {
+    let mimes = crate::ui::clipboard::offered_mimes();
+    (!mimes.is_empty()).then_some(Selection { owner: NATIVE, source: 0, mimes })
+}
+
+/// The selection becomes the system clipboard's (the previous owner hears
+/// `cancelled`); reads of the old client selection are dropped.
+fn take_native() {
+    let mut selection = SELECTION.lock();
+    if let Some(old) = selection.take() {
+        if old.owner != NATIVE {
+            TO_OWNER.lock().push((old.owner, ToOwner::Cancelled { source: old.source }));
+        }
+    }
+    *selection = native_selection();
+    SELECTION_GEN.fetch_add(1, Ordering::AcqRel);
+    drop(selection);
+    FETCHES.lock().0.clear();
+}
+
+/// Pipes of the clipboard bridge, one round: read what clients write about
+/// their selection, write ours to clients that asked. `true` - still busy.
+fn pump_clipboard(now: u64) -> bool {
+    if NATIVE_DIRTY.swap(false, Ordering::AcqRel) {
+        take_native();
+    }
+    let mut busy = false;
+    {
+        let mut fetches = FETCHES.lock();
+        if !fetches.0.is_empty() {
+            let deadline = fetches.1;
+            let mut chunk = [0u8; 4096];
+            for fetch in fetches.0.iter_mut().filter(|fetch| !fetch.done) {
+                loop {
+                    match fetch.reader.read(&mut chunk, false) {
+                        Ok(0) => {
+                            fetch.done = true;
+                            break;
+                        }
+                        Ok(n) => {
+                            if fetch.data.len() + n > user_abi::CLIP_MAX {
+                                fetch.done = true;
+                                break;
+                            }
+                            fetch.data.extend_from_slice(&chunk[..n]);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            let all = fetches.0.iter().all(|fetch| fetch.done);
+            if all || now >= deadline {
+                let list = core::mem::take(&mut fetches.0);
+                drop(fetches);
+                let mut text = None;
+                let mut files = None;
+                for fetch in list.into_iter().filter(|fetch| fetch.done) {
+                    match fetch.kind {
+                        FetchKind::Text => text = Some(String::from_utf8_lossy(&fetch.data).replace('\0', "")),
+                        FetchKind::Files => files = Some(crate::ui::clipboard::parse_uri_list(&String::from_utf8_lossy(&fetch.data))),
+                    }
+                }
+                let files = files.filter(|files| !files.is_empty());
+                if text.is_some() || files.is_some() {
+                    kprintln!(
+                        "  wayland     : clipboard from a client: {} chars, {} file(s)",
+                        text.as_ref().map_or(0, |text| text.chars().count()),
+                        files.as_ref().map_or(0, Vec::len)
+                    );
+                    crate::ui::clipboard::set_from_wayland(text, files);
+                } else if !all {
+                    kprintln!("  wayland     : clipboard from a client: nothing came in {CLIP_WAIT_MS} ms");
+                }
+            } else {
+                busy = true;
+            }
+        }
+    }
+    let mut feeds = FEEDS.lock();
+    feeds.retain_mut(|feed| {
+        while feed.at < feed.data.len() {
+            match feed.fd.write_now(&feed.data[feed.at..]) {
+                Ok(0) | Err(true) => return now < feed.until,
+                Ok(n) => feed.at += n,
+                Err(false) => return false,
+            }
+        }
+        false
+    });
+    busy || !feeds.is_empty()
+}
 /// Номер клиента для буфера обмена: у одного процесса бывает несколько
 /// соединений, и номер процесса их не различает.
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
@@ -284,6 +435,10 @@ fn run() {
         if graves {
             due = 0;
         }
+        // Clipboard bridge (24.11): native changes, pipes to and from clients.
+        if pump_clipboard(now) {
+            due = due.min(now + 4);
+        }
         crate::io_events::wait(seen, Some(due.clamp(now + 1, now + 16)));
     }
 }
@@ -367,7 +522,7 @@ impl Args<'_> {
 // ---- объекты --------------------------------------------------------------------
 
 /// Глобальные объекты: номер в реестре, интерфейс, версия.
-const GLOBALS: [(u32, &str, u32); 16] = [
+const GLOBALS: [(u32, &str, u32); 18] = [
     (1, "wl_compositor", 4),
     (2, "wl_subcompositor", 1),
     (3, "wl_shm", 1),
@@ -421,6 +576,13 @@ const GLOBALS: [(u32, &str, u32); 16] = [
     // (winewayland) places monitors by these - without them all of them sat
     // at 0,0 and it kept only one.
     (17, "zxdg_output_manager_v1", 3),
+    // Clipboard managers (24.11): Wine's winewayland syncs the Windows
+    // clipboard through data control ("compositor doesn't support optional
+    // ext_data_control_manager_v1 (clipboard functionality will be
+    // limited)"); a data-control device sees the selection without keyboard
+    // focus and may set it. Both names, the same objects.
+    (18, "ext_data_control_manager_v1", 1),
+    (19, "zwlr_data_control_manager_v1", 2),
 ];
 
 // ---- мониторы (G5, 22.11) ----------------------------------------------------------
@@ -582,6 +744,35 @@ fn refresh_outputs(now: u64) {
         table.list = list;
         table.generation = table.generation.wrapping_add(1);
     }
+}
+
+/// Monitors as `read` of `/dev/fossai-capture` hands them (OBS «Захват
+/// экрана FossAi», 24.11): one line per monitor, the primary first,
+/// `x\ty\tw\th\tprimary\tname\tdescription\n` - the place in desktop
+/// (capture) coordinates, `primary` 1/0, the same connector name as
+/// `wl_output.name` (what Qt and OBS call the screen).
+#[must_use]
+pub fn monitor_lines() -> String {
+    refresh_outputs(crate::time::uptime_ms());
+    let table = OUTPUT_TABLE.lock();
+    let left = table.list.iter().map(|o| o.x).min().unwrap_or(0);
+    let top = table.list.iter().map(|o| o.y).min().unwrap_or(0);
+    let mut order: Vec<&OutputInfo> = table.list.iter().collect();
+    order.sort_by_key(|o| (!o.primary, o.x, o.y));
+    let mut text = String::new();
+    for o in order {
+        text.push_str(&alloc::format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            o.x - left,
+            o.y - top,
+            o.w,
+            o.h,
+            u8::from(o.primary),
+            o.name,
+            o.description.replace(['\t', '\n'], " ")
+        ));
+    }
+    text
 }
 
 /// Physical size of a `w`x`h` screen at 96 dots per inch, mm.
@@ -1078,6 +1269,13 @@ enum Obj {
     DataDevice,
     /// Предложение выделения, которое сервер прислал клиенту.
     DataOffer,
+    /// Data control (24.11): `ext_data_control_manager_v1` /
+    /// `zwlr_data_control_manager_v1` (`true` - the wlr one), its source with
+    /// the offered types, device and offer.
+    DcManager(bool),
+    DcSource(Vec<String>),
+    DcDevice,
+    DcOffer,
     Viewporter,
     /// `wp_viewport` поверхности с этим номером.
     Viewport(u32),
@@ -1135,6 +1333,11 @@ impl Obj {
             Self::DataSource(_) => "wl_data_source",
             Self::DataDevice => "wl_data_device",
             Self::DataOffer => "wl_data_offer",
+            Self::DcManager(false) => "ext_data_control_manager_v1",
+            Self::DcManager(true) => "zwlr_data_control_manager_v1",
+            Self::DcSource(_) => "ext_data_control_source_v1",
+            Self::DcDevice => "ext_data_control_device_v1",
+            Self::DcOffer => "ext_data_control_offer_v1",
             Self::Viewporter => "wp_viewporter",
             Self::Viewport(_) => "wp_viewport",
             Self::Dmabuf => "zwp_linux_dmabuf_v1",
@@ -1198,6 +1401,9 @@ struct Client {
     key: u64,
     /// Какое поколение выделения клиент уже видел ([`SELECTION_GEN`]).
     selection_seen: u32,
+    /// The same for data-control devices (24.11): they hear every change,
+    /// focus or not.
+    control_seen: u32,
     /// Следующий номер объекта, созданного сервером (`wl_data_offer`):
     /// сервер нумерует свои с `0xff000000`.
     next_server_id: u32,
@@ -1284,6 +1490,7 @@ impl Client {
             group: 0,
             key: NEXT_KEY.fetch_add(1, Ordering::Relaxed),
             selection_seen: SELECTION_GEN.load(Ordering::Acquire),
+            control_seen: SELECTION_GEN.load(Ordering::Acquire),
             next_server_id: 0xff00_0000,
             keys_down: Vec::new(),
             seat_version: 1,
@@ -1381,6 +1588,7 @@ impl Client {
         }
         if !self.broken {
             self.sync_selection();
+            self.sync_control();
             self.serve_owner();
             self.window_events(time);
             self.popup_events(time);
@@ -1768,15 +1976,62 @@ impl Client {
                         self.fail(id, 2, "receive without a descriptor");
                         return Ok(());
                     };
-                    // Канал — владельцу выделения; нет владельца — канал
-                    // закроется здесь, и клиент прочтёт пустоту.
-                    if let Some(owner) = SELECTION.lock().as_ref().map(|selection| (selection.owner, selection.source)) {
-                        TO_OWNER.lock().push((owner.0, ToOwner::Send { source: owner.1, mime, fd }));
-                        crate::io_events::notify();
-                    }
+                    self.receive_selection(mime, fd);
                 }
                 2 => self.delete(id),
                 _ => {}
+            },
+            // Data control (24.11): `create_data_source(id)`,
+            // `get_data_device(id, seat)`, `destroy`.
+            Obj::DcManager(_) => match opcode {
+                0 => {
+                    let new = args.u32()?;
+                    self.objects.insert(new, Obj::DcSource(Vec::new()));
+                }
+                1 => {
+                    let new = args.u32()?;
+                    self.objects.insert(new, Obj::DcDevice);
+                    // The current selection on the next round.
+                    self.control_seen = SELECTION_GEN.load(Ordering::Acquire).wrapping_sub(1);
+                }
+                _ => self.delete(id),
+            },
+            // `offer(mime)`, `destroy`.
+            Obj::DcSource(_) => match opcode {
+                0 => {
+                    let mime = args.string()?;
+                    if let Some(Obj::DcSource(mimes)) = self.objects.get_mut(&id) {
+                        if mimes.len() < 32 && !mimes.contains(&mime) {
+                            mimes.push(mime);
+                        }
+                    }
+                }
+                _ => {
+                    self.forget_source(id);
+                    self.delete(id);
+                }
+            },
+            // `set_selection(source or null)`, `destroy`,
+            // `set_primary_selection` (no primary selection here).
+            Obj::DcDevice => match opcode {
+                0 => {
+                    let source = args.u32()?;
+                    self.set_selection(source);
+                }
+                1 => self.delete(id),
+                _ => {}
+            },
+            // `receive(mime, fd)`, `destroy`.
+            Obj::DcOffer => match opcode {
+                0 => {
+                    let mime = args.string()?;
+                    let Some(fd) = self.fds.pop_front() else {
+                        self.fail(id, 2, "receive without a descriptor");
+                        return Ok(());
+                    };
+                    self.receive_selection(mime, fd);
+                }
+                _ => self.delete(id),
             },
             // `destroy`, `get_viewport(id, surface)`.
             Obj::Viewporter => match opcode {
@@ -2201,6 +2456,8 @@ impl Client {
             14 => Obj::Activation,
             15 => Obj::FractionalManager,
             16 => Obj::IdleInhibitManager,
+            18 => Obj::DcManager(false),
+            19 => Obj::DcManager(true),
             _ => Obj::XdgOutputManager(version),
         };
         self.objects.insert(new, object);
@@ -3715,9 +3972,11 @@ impl Client {
             self.close_win(0);
         }
         // Ушедший клиент не напишет своё выделение никому.
+        // The system clipboard keeps what was read from it (24.11) and takes
+        // the selection over.
         let mut selection = SELECTION.lock();
         if selection.as_ref().is_some_and(|held| held.owner == self.key) {
-            *selection = None;
+            *selection = native_selection();
             SELECTION_GEN.fetch_add(1, Ordering::AcqRel);
         }
         drop(selection);
@@ -3729,7 +3988,7 @@ impl Client {
     /// источник больше не нужен.
     fn set_selection(&mut self, source: u32) {
         let mimes = match self.objects.get(&source) {
-            Some(Obj::DataSource(mimes)) => Some(mimes.clone()),
+            Some(Obj::DataSource(mimes) | Obj::DcSource(mimes)) => Some(mimes.clone()),
             _ => None,
         };
         let mut selection = SELECTION.lock();
@@ -3737,31 +3996,74 @@ impl Client {
             // Чужое выделение снимать «ничем» нельзя.
             return;
         }
+        let same = selection.as_ref().is_some_and(|old| old.owner == self.key && old.source == source);
         if let Some(old) = selection.take() {
-            if !(old.owner == self.key && old.source == source) {
+            if !(old.owner == self.key && old.source == source) && old.owner != NATIVE {
                 TO_OWNER.lock().push((old.owner, ToOwner::Cancelled { source: old.source }));
             }
         }
-        *selection = mimes.map(|mimes| Selection { owner: self.key, source, mimes });
+        // Cleared - the system clipboard (what was read from the client)
+        // stays offered.
+        *selection = match &mimes {
+            Some(mimes) => Some(Selection { owner: self.key, source, mimes: mimes.clone() }),
+            None => native_selection(),
+        };
         SELECTION_GEN.fetch_add(1, Ordering::AcqRel);
         drop(selection);
+        if let Some(mimes) = mimes.filter(|_| !same) {
+            self.fetch_selection(source, &mimes);
+        }
         crate::io_events::notify();
     }
 
-    /// Источник уничтожен — если выделение было на нём, оно пропадает.
+    /// The client's new selection onto the system clipboard (24.11): ask it to
+    /// write the text and the file list into kernel pipes; [`pump_clipboard`]
+    /// reads them.
+    fn fetch_selection(&mut self, source: u32, mimes: &[String]) {
+        let text = crate::ui::clipboard::TEXT_MIMES.iter().find_map(|want| mimes.iter().find(|mime| mime.eq_ignore_ascii_case(want)));
+        let uris = mimes.iter().find(|mime| mime.as_str() == "text/uri-list");
+        // `send` is event 1 of wl_data_source, 0 of a data-control source.
+        let send = if matches!(self.objects.get(&source), Some(Obj::DcSource(_))) { 0 } else { 1 };
+        let mut fetches = FETCHES.lock();
+        fetches.0.clear();
+        fetches.1 = crate::time::uptime_ms() + CLIP_WAIT_MS;
+        for (mime, kind) in [(text, FetchKind::Text), (uris, FetchKind::Files)] {
+            let Some(mime) = mime.cloned() else {
+                continue;
+            };
+            let Ok((reader, writer)) = crate::user::pipe::create() else {
+                continue;
+            };
+            self.out_fds.push(Handle::of_pipe_write(writer));
+            self.send(Msg::new(source, send).str(&mime));
+            fetches.0.push(Fetch { reader, kind, data: Vec::new(), done: false });
+        }
+        if !fetches.0.is_empty() {
+            kprintln!("  wayland     : reading the selection of client #{} ({})", self.pid, mimes.join(", "));
+        }
+    }
+
+    /// Источник уничтожен — если выделение было на нём, оно пропадает
+    /// (остаётся системный буфер — то, что из него прочитано).
     fn forget_source(&mut self, source: u32) {
         let mut selection = SELECTION.lock();
         if selection.as_ref().is_some_and(|held| held.owner == self.key && held.source == source) {
-            *selection = None;
+            *selection = native_selection();
             SELECTION_GEN.fetch_add(1, Ordering::AcqRel);
         }
     }
 
     /// Выделение сменилось — каждому `wl_data_device` клиента новое
     /// предложение (`data_offer`, форматы, `selection`) или «пусто».
+    ///
+    /// Только клиенту с фокусом клавиатуры (как велит протокол: `selection`
+    /// приходит перед `wl_keyboard.enter` и пока фокус у клиента), остальным —
+    /// при входе фокуса ([`Self::keyboard_enter`]). Qt 6 (OBS, 23.11) падал
+    /// на `selection` в первом обмене: его обработчик зовёт буфер обмена
+    /// платформы, которой ещё нет.
     fn sync_selection(&mut self) {
         let generation = SELECTION_GEN.load(Ordering::Acquire);
-        if generation == self.selection_seen {
+        if generation == self.selection_seen || self.keyboard_on.is_none() {
             return;
         }
         self.selection_seen = generation;
@@ -3787,6 +4089,58 @@ impl Client {
         }
     }
 
+    /// `receive(mime, fd)` of an offer (wl_data_offer or data control):
+    /// the pipe goes to the selection's owner; the system clipboard is written
+    /// by the server itself; no owner - the pipe closes here (empty read).
+    fn receive_selection(&mut self, mime: String, fd: Handle) {
+        let owner = SELECTION.lock().as_ref().map(|selection| (selection.owner, selection.source));
+        match owner {
+            Some((NATIVE, _)) => {
+                if let Some(data) = crate::ui::clipboard::bytes_for(&mime) {
+                    kprintln!("  wayland     : clipboard to client #{} as {mime}: {} bytes", self.pid, data.len());
+                    FEEDS.lock().push(Feed { fd, data, at: 0, until: crate::time::uptime_ms() + CLIP_WAIT_MS });
+                    crate::io_events::notify();
+                }
+            }
+            Some(owner) => {
+                TO_OWNER.lock().push((owner.0, ToOwner::Send { source: owner.1, mime, fd }));
+                crate::io_events::notify();
+            }
+            None => {}
+        }
+    }
+
+    /// The selection changed - every data-control device of the client hears
+    /// it at once, focus or not (24.11): `data_offer`, the offer's types,
+    /// `selection`.
+    fn sync_control(&mut self) {
+        let generation = SELECTION_GEN.load(Ordering::Acquire);
+        if generation == self.control_seen {
+            return;
+        }
+        self.control_seen = generation;
+        let devices: Vec<u32> = self.objects.iter().filter(|(_, obj)| matches!(obj, Obj::DcDevice)).map(|(id, _)| *id).collect();
+        if devices.is_empty() {
+            return;
+        }
+        let mimes = SELECTION.lock().as_ref().map(|selection| selection.mimes.clone());
+        for device in devices {
+            match &mimes {
+                Some(mimes) => {
+                    let offer = self.next_server_id;
+                    self.next_server_id = self.next_server_id.wrapping_add(1).max(0xff00_0000);
+                    self.objects.insert(offer, Obj::DcOffer);
+                    self.send(Msg::new(device, 0).u32(offer));
+                    for mime in mimes {
+                        self.send(Msg::new(offer, 0).str(mime));
+                    }
+                    self.send(Msg::new(device, 1).u32(offer));
+                }
+                None => self.send(Msg::new(device, 1).u32(0)),
+            }
+        }
+    }
+
     /// Просьбы к этому клиенту как к владельцу выделения: написать данные в
     /// канал (`send`) или забыть источник (`cancelled`).
     fn serve_owner(&mut self) {
@@ -3802,17 +4156,22 @@ impl Client {
         };
         for request in mine {
             match request {
-                ToOwner::Send { source, mime, fd } => {
-                    if matches!(self.objects.get(&source), Some(Obj::DataSource(_))) {
+                ToOwner::Send { source, mime, fd } => match self.objects.get(&source) {
+                    Some(Obj::DataSource(_)) => {
                         self.out_fds.push(fd);
                         self.send(Msg::new(source, 1).str(&mime));
                     }
-                }
-                ToOwner::Cancelled { source } => {
-                    if matches!(self.objects.get(&source), Some(Obj::DataSource(_))) {
-                        self.send(Msg::new(source, 2));
+                    Some(Obj::DcSource(_)) => {
+                        self.out_fds.push(fd);
+                        self.send(Msg::new(source, 0).str(&mime));
                     }
-                }
+                    _ => {}
+                },
+                ToOwner::Cancelled { source } => match self.objects.get(&source) {
+                    Some(Obj::DataSource(_)) => self.send(Msg::new(source, 2)),
+                    Some(Obj::DcSource(_)) => self.send(Msg::new(source, 1)),
+                    _ => {}
+                },
             }
         }
     }
@@ -4029,6 +4388,8 @@ impl Client {
             self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 2).u32(serial).u32(old));
         }
         self.keyboard_on = Some(surface);
+        // Выделение — перед `enter` (см. `sync_selection`).
+        self.sync_selection();
         self.mods_down = 0;
         self.keys_down.clear();
         self.group = layout_group();

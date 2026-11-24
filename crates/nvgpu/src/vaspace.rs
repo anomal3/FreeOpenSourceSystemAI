@@ -105,6 +105,19 @@ pub struct VaSpace {
     maps: BTreeMap<u64, Mapping>,
     /// Разреженные области: начало -> конец.
     regions: BTreeMap<u64, u64>,
+    /// How many mappings each buffer has (hw-log17: `bo_mapped` scanned all
+    /// mappings for every held buffer after every VM_BIND - quadratic, 5-15
+    /// ms per call late in a D2R session). Kept in step by [`VaSpace::put_map`].
+    counts: BTreeMap<BoHandle, u32>,
+}
+
+/// One change of a batch, to undo it if a later operation fails (a batch is
+/// atomic; cloning the whole space per call cost O(mappings)).
+enum Undo {
+    /// The mapping at `va` was this before (`None` - there was none).
+    Map(u64, Option<Mapping>),
+    /// The sparse region starting here ended there before (`None` - none).
+    Region(u64, Option<u64>),
 }
 
 impl VaSpace {
@@ -115,7 +128,7 @@ impl VaSpace {
         if end > NVK_VA_LIMIT || kernel_addr % PAGE != 0 || kernel_size % PAGE != 0 {
             return Err(Errno::EINVAL);
         }
-        Ok(VaSpace { kernel: (kernel_addr, kernel_size), maps: BTreeMap::new(), regions: BTreeMap::new() })
+        Ok(VaSpace { kernel: (kernel_addr, kernel_size), maps: BTreeMap::new(), regions: BTreeMap::new(), counts: BTreeMap::new() })
     }
 
     pub fn mappings(&self) -> impl Iterator<Item = (u64, &Mapping)> {
@@ -126,9 +139,71 @@ impl VaSpace {
         self.regions.iter().map(|(&s, &e)| (s, e))
     }
 
-    /// Отображён ли где-нибудь буфер (держать его живым).
+    /// Отображён ли где-нибудь буфер (держать его живым). O(log n).
     pub fn bo_mapped(&self, bo: BoHandle) -> bool {
-        self.maps.values().any(|m| m.bo == bo)
+        self.counts.contains_key(&bo)
+    }
+
+    /// How many mappings the buffer has.
+    pub fn bo_mappings(&self, bo: BoHandle) -> u32 {
+        self.counts.get(&bo).copied().unwrap_or(0)
+    }
+
+    /// Buffers with at least one mapping.
+    pub fn mapped_bos(&self) -> usize {
+        self.counts.len()
+    }
+
+    /// Put `m` at `va` (`None` - remove), keeping [`Self::counts`]; returns
+    /// what was there.
+    fn put_map(&mut self, va: u64, m: Option<Mapping>) -> Option<Mapping> {
+        let old = match m {
+            Some(m) => {
+                *self.counts.entry(m.bo).or_insert(0) += 1;
+                self.maps.insert(va, m)
+            }
+            None => self.maps.remove(&va),
+        };
+        if let Some(o) = old {
+            if let Some(n) = self.counts.get_mut(&o.bo) {
+                *n -= 1;
+                if *n == 0 {
+                    self.counts.remove(&o.bo);
+                }
+            }
+        }
+        old
+    }
+
+    /// [`Self::put_map`] with an undo record.
+    fn set_map(&mut self, va: u64, m: Option<Mapping>, undo: &mut Vec<Undo>) {
+        let old = self.put_map(va, m);
+        undo.push(Undo::Map(va, old));
+    }
+
+    fn set_region(&mut self, start: u64, end: Option<u64>, undo: &mut Vec<Undo>) {
+        let old = match end {
+            Some(e) => self.regions.insert(start, e),
+            None => self.regions.remove(&start),
+        };
+        undo.push(Undo::Region(start, old));
+    }
+
+    /// Undo a failed batch (newest change first).
+    fn rollback(&mut self, undo: Vec<Undo>) {
+        for u in undo.into_iter().rev() {
+            match u {
+                Undo::Map(va, old) => {
+                    self.put_map(va, old);
+                }
+                Undo::Region(start, old) => {
+                    match old {
+                        Some(e) => self.regions.insert(start, e),
+                        None => self.regions.remove(&start),
+                    };
+                }
+            }
+        }
     }
 
     /// Что отображено по адресу.
@@ -172,24 +247,24 @@ impl VaSpace {
     }
 
     /// Вырезать `[va, end)` из отображений (края режутся).
-    fn cut(&mut self, va: u64, end: u64) -> bool {
+    fn cut(&mut self, va: u64, end: u64, undo: &mut Vec<Undo>) -> bool {
         let mut hit = false;
         // Отображение, начинающееся раньше и заходящее внутрь.
         if let Some((&s, &m)) = self.maps.range(..va).next_back() {
             if m.end > va {
                 hit = true;
-                self.maps.insert(s, Mapping { end: va, ..m });
+                self.set_map(s, Some(Mapping { end: va, ..m }), undo);
                 if m.end > end {
-                    self.maps.insert(end, Mapping { bo_off: m.bo_off + (end - s), ..m });
+                    self.set_map(end, Some(Mapping { bo_off: m.bo_off + (end - s), ..m }), undo);
                 }
             }
         }
-        let inside: Vec<u64> = self.maps.range(va..end).map(|(&s, _)| s).collect();
-        for s in inside {
+        let inside: Vec<(u64, Mapping)> = self.maps.range(va..end).map(|(&s, &m)| (s, m)).collect();
+        for (s, m) in inside {
             hit = true;
-            let m = self.maps.remove(&s).unwrap();
+            self.set_map(s, None, undo);
             if m.end > end {
-                self.maps.insert(end, Mapping { bo_off: m.bo_off + (end - s), ..m });
+                self.set_map(end, Some(Mapping { bo_off: m.bo_off + (end - s), ..m }), undo);
             }
         }
         hit
@@ -217,7 +292,7 @@ impl VaSpace {
         }
     }
 
-    fn op(&mut self, op: &BindOp, out: &mut Vec<Action>) -> Result<(), Errno> {
+    fn op(&mut self, op: &BindOp, out: &mut Vec<Action>, undo: &mut Vec<Undo>) -> Result<(), Errno> {
         match *op {
             BindOp::Map { va, len, bo, bo_off, bo_size, kind } => {
                 if bo_off % PAGE != 0 || bo_off >= bo_size || len > bo_size - bo_off {
@@ -230,13 +305,13 @@ impl VaSpace {
                         return Err(Errno::ENOSPC);
                     }
                 }
-                self.cut(va, end);
-                self.maps.insert(va, Mapping { end, bo, bo_off, kind });
+                self.cut(va, end, undo);
+                self.set_map(va, Some(Mapping { end, bo, bo_off, kind }), undo);
                 out.push(Action::Map { va, len, bo, bo_off, kind });
             }
             BindOp::Unmap { va, len } => {
                 let end = self.check_range(va, len)?;
-                self.cut(va, end);
+                self.cut(va, end, undo);
                 self.clear_actions(va, end, out);
             }
             BindOp::SparseCreate { va, len } => {
@@ -247,7 +322,7 @@ impl VaSpace {
                 if self.any_mapping(va, end) {
                     return Err(Errno::ENOSPC);
                 }
-                self.regions.insert(va, end);
+                self.set_region(va, Some(end), undo);
                 out.push(Action::Sparse { va, len, on: true });
             }
             BindOp::SparseDestroy { va, len } => {
@@ -255,8 +330,8 @@ impl VaSpace {
                 if self.regions.get(&va) != Some(&end) {
                     return Err(Errno::ENOENT);
                 }
-                self.cut(va, end);
-                self.regions.remove(&va);
+                self.cut(va, end, undo);
+                self.set_region(va, None, undo);
                 out.push(Action::Sparse { va, len, on: false });
             }
         }
@@ -265,13 +340,32 @@ impl VaSpace {
 
     /// Проверить и выполнить пачку операций. При ошибке состояние прежнее.
     pub fn bind(&mut self, ops: &[BindOp]) -> Result<Vec<Action>, Errno> {
-        let mut next = self.clone();
+        self.bind_released(ops).map(|(actions, _)| actions)
+    }
+
+    /// [`Self::bind`], plus the buffers that had mappings before the batch
+    /// and have none after it (the caller drops its references to them once
+    /// the actions are applied and the TLB is flushed). Cost: O(changes x
+    /// log n), not O(all mappings).
+    pub fn bind_released(&mut self, ops: &[BindOp]) -> Result<(Vec<Action>, Vec<BoHandle>), Errno> {
         let mut out = Vec::new();
+        let mut undo = Vec::new();
         for op in ops {
-            next.op(op, &mut out)?;
+            if let Err(err) = self.op(op, &mut out, &mut undo) {
+                self.rollback(undo);
+                return Err(err);
+            }
         }
-        *self = next;
-        Ok(out)
+        let mut released: Vec<BoHandle> = undo
+            .iter()
+            .filter_map(|u| match u {
+                Undo::Map(_, Some(old)) if !self.counts.contains_key(&old.bo) => Some(old.bo),
+                _ => None,
+            })
+            .collect();
+        released.sort_unstable();
+        released.dedup();
+        Ok((out, released))
     }
 
     /// Всё снять (закрытие файла): действия, после которых в пространстве
@@ -286,6 +380,7 @@ impl VaSpace {
         }
         self.maps.clear();
         self.regions.clear();
+        self.counts.clear();
         out
     }
 }
@@ -377,6 +472,61 @@ mod tests {
         assert_eq!(v.regions().count(), 0);
         let a = v.clear();
         assert_eq!(a, [Action::Unmap { va: 0x2000_0000, len: 0x1000, restore_sparse: false }]);
+    }
+
+    /// Counts must equal a recount over the mappings.
+    fn check_counts(v: &VaSpace) {
+        let mut want: BTreeMap<BoHandle, u32> = BTreeMap::new();
+        for (_, m) in v.mappings() {
+            *want.entry(m.bo).or_insert(0) += 1;
+        }
+        assert_eq!(v.counts, want);
+    }
+
+    #[test]
+    fn counts_and_released() {
+        let b3 = BoHandle(3);
+        let mut v = VaSpace::new(1 << 39, 1 << 39).unwrap();
+        let (_, rel) = v.bind_released(&[map(0x10000, 0x8000, B1, 0), map(0x20000, 0x1000, B2, 0)]).unwrap();
+        assert!(rel.is_empty());
+        check_counts(&v);
+        // Split B1 in two pieces: still mapped, nothing released.
+        let (_, rel) = v.bind_released(&[map(0x12000, 0x1000, b3, 0)]).unwrap();
+        assert!(rel.is_empty());
+        assert_eq!(v.bo_mappings(B1), 2);
+        check_counts(&v);
+        // Replace B2 entirely: B2 released.
+        let (_, rel) = v.bind_released(&[map(0x20000, 0x1000, b3, 0)]).unwrap();
+        assert_eq!(rel, [B2]);
+        assert!(!v.bo_mapped(B2));
+        check_counts(&v);
+        // Unmap B1 and remap it in one batch: not released.
+        let (_, rel) = v.bind_released(&[BindOp::Unmap { va: 0x10000, len: 0x8000 }, map(0x40000, 0x1000, B1, 0)]).unwrap();
+        assert!(rel.is_empty());
+        check_counts(&v);
+        let (_, rel) = v.bind_released(&[BindOp::Unmap { va: 0, len: 0x10_0000 }]).unwrap();
+        assert_eq!(rel, [B1, b3]);
+        assert_eq!(v.mapped_bos(), 0);
+        check_counts(&v);
+    }
+
+    #[test]
+    fn rollback_restores_everything() {
+        let mut v = VaSpace::new(1 << 39, 1 << 39).unwrap();
+        let r = 0x1_0000_0000u64;
+        v.bind(&[BindOp::SparseCreate { va: r, len: 0x10_0000 }, map(0x10000, 0x8000, B1, 0), map(r + 0x2000, 0x2000, B2, 0)]).unwrap();
+        let before = v.clone();
+        // Cuts B1, splits it, destroys the region (and B2 inside), then fails.
+        let bad = [
+            map(0x12000, 0x1000, B2, 0),
+            BindOp::Unmap { va: 0x14000, len: 0x1000 },
+            BindOp::SparseDestroy { va: r, len: 0x10_0000 },
+            BindOp::SparseCreate { va: 0x2000_0000, len: 0x1000 },
+            map(0x1800, 0x1000, B1, 0),
+        ];
+        assert_eq!(v.bind(&bad), Err(Errno::EINVAL));
+        assert_eq!(v, before);
+        check_counts(&v);
     }
 
     #[test]

@@ -236,6 +236,9 @@ pub fn start(spec: &Spec) -> SysInfo {
         }
     };
     mini_ui::use_raw_format(info.pixel_format);
+    // Поля ввода набора (адрес, поиск, имя файла) — с буфером обмена системы
+    // и двойным щелчком (24.11).
+    mini_ui::filedlg::set_line_hooks(crate::clipboard_get, crate::clipboard_set, monotonic_ms);
     theme::set_dark(info.flags & SYSINFO_DARK != 0);
     theme::set_classic(info.flags & user_abi::SYSINFO_CLASSIC != 0);
     crate::icons::set_theme(user_abi::sysinfo_icon_theme(info.flags));

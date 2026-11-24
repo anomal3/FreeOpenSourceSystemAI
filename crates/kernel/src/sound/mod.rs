@@ -6,6 +6,7 @@
 //! говорят только с этим модулем. Если есть обе, звук идёт в virtio-snd.
 
 pub mod hda;
+pub mod loopback;
 
 use crate::pci;
 use crate::virtio::{self, VirtioError};
@@ -67,15 +68,27 @@ pub fn set_volume(value: u8) {
 }
 
 /// Отдать отсчёты карте: ждёт места, хвост меньше периода копится.
+///
+/// Копия каждого периода уходит в отвод для записи ([`loopback`], 23.11) —
+/// до громкости и перед тем, как период ждёт места в карте: так время копии
+/// идёт за временем звука.
 pub fn feed(bytes: &[u8]) -> Result<(), SoundError> {
     let volume = u32::from(volume());
     if volume >= 100 {
-        return feed_raw(bytes);
+        if !loopback::armed() {
+            return feed_raw(bytes);
+        }
+        for chunk in bytes.chunks(PERIOD) {
+            loopback::tap(chunk);
+            feed_raw(chunk)?;
+        }
+        return Ok(());
     }
     // Тише — копией по кускам: отсчёты программы не трогаются.
     let factor = volume * volume; // из 10 000
     let mut scaled = [0u8; PERIOD];
     for chunk in bytes.chunks(PERIOD) {
+        loopback::tap(chunk);
         let len = chunk.len() & !1;
         for (out, pair) in scaled[..len].chunks_exact_mut(2).zip(chunk[..len].chunks_exact(2)) {
             let sample = i32::from(i16::from_le_bytes([pair[0], pair[1]]));

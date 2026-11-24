@@ -255,7 +255,7 @@ fn vm_init(file: &DrmFile, arg: usize) -> i64 {
     }
     match super::vm::Vm::new(&file.gpu, addr, size) {
         Ok(vm) => {
-            st.vm = Some(vm);
+            st.vm = Some(Arc::new(vm));
             0
         }
         Err(err) => err,
@@ -312,6 +312,14 @@ fn signal_syncs(sigs: &[SyncRef], fence: &Fence) {
 }
 
 fn vm_bind(file: &DrmFile, arg: usize) -> i64 {
+    let started = crate::time::uptime_ns();
+    let answer = vm_bind_timed(file, arg, started);
+    super::vm::call_done(crate::time::uptime_ns() - started);
+    answer
+}
+
+fn vm_bind_timed(file: &DrmFile, arg: usize, started: u64) -> i64 {
+    use super::vm::{Phase, add};
     let Ok(args) = get::<VmBind>(arg) else { return -e::EFAULT };
     if args.flags & !BIND_RUN_ASYNC != 0 {
         return -e::EINVAL;
@@ -335,7 +343,7 @@ fn vm_bind(file: &DrmFile, arg: usize) -> i64 {
     // ищутся по ручкам сейчас, ссылки на них держит пачка.
     let mut parsed = Vec::with_capacity(ops.len());
     let mut bos = Vec::new();
-    {
+    let vm = {
         let st = file.st.lock();
         for op in &ops {
             let mut found = None;
@@ -355,15 +363,20 @@ fn vm_bind(file: &DrmFile, arg: usize) -> i64 {
             }
             bos.extend(found);
         }
-    }
-    if let Err(err) = wait_syncs(&waits, None) {
+        st.vm.clone()
+    };
+    let Some(vm) = vm else { return -e::ENOSYS };
+    let parsed_at = crate::time::uptime_ns();
+    add(Phase::Parse, parsed_at - started);
+    let waited = wait_syncs(&waits, None);
+    add(Phase::Wait, crate::time::uptime_ns() - parsed_at);
+    if let Err(err) = waited {
         return err;
     }
-    let result = {
-        let mut st = file.st.lock();
-        let Some(vm) = st.vm.as_mut() else { return -e::ENOSYS };
-        vm.bind(&parsed, bos)
-    };
+    // hw-log17: the bind used to run under `file.st`, so EXEC (`chan()`)
+    // and every other ioctl of the file waited behind it (EXEC worst = bind
+    // worst, 58-114 ms). The space has its own lock now.
+    let result = vm.bind(&parsed, bos);
     match result {
         Ok(()) => {
             signal_syncs(&sigs, &Fence::signaled());

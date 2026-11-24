@@ -1308,7 +1308,7 @@ impl SettingsView {
             }
             Deed::Look(deed) => {
                 use super::look;
-                let title_before = super::window::Window::title_height(mini_ui::Scale::ONE);
+                let title_before = super::window::Window::chrome_key();
                 let (text, result) = match deed {
                     LookDeed::Preset(preset) => {
                         look::apply_preset(preset);
@@ -1326,7 +1326,7 @@ impl SettingsView {
                 // Перерисовать всё: рамки окон, тени, кадр в новой глубине.
                 self.theme_changed = true;
                 // Классика — другая высота заголовка (22.11): окна пересобрать.
-                if super::window::Window::title_height(mini_ui::Scale::ONE) != title_before {
+                if super::window::Window::chrome_key() != title_before {
                     self.title_changed = true;
                 }
                 kprintln!("  settings    : look {}", look::describe());

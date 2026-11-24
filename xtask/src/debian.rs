@@ -184,15 +184,20 @@ fn make_sysroot(cache: &std::path::Path) -> Result<PathBuf> {
 /// Загрузчик в программе — `/lib64/ld-linux-x86-64.so.2`; пакет при желании
 /// переписывает его на свой.
 pub(crate) fn build_glibc_probe(source: &str) -> Result<Vec<u8>> {
-    let sysroot = sdk::root().join("debian-sysroot");
-    let sysroot = if sysroot.join("usr/lib/x86_64-linux-gnu/Scrt1.o").is_file() {
-        sysroot
-    } else {
-        let cache = sdk::root().join("thirdparty/debian");
-        fs::create_dir_all(&cache)?;
-        make_sysroot(&cache)?
-    };
+    let sysroot = glibc_sysroot()?;
     Ok(fs::read(build_check(&sysroot, source)?)?)
+}
+
+/// Sysroot glibc Debian 12 для сборки: готовый или разложенный заново (модуль
+/// OBS `obs-fossai.so`, 23.11.2026).
+pub(crate) fn glibc_sysroot() -> Result<PathBuf> {
+    let sysroot = sdk::root().join("debian-sysroot");
+    if sysroot.join("usr/lib/x86_64-linux-gnu/Scrt1.o").is_file() {
+        return Ok(sysroot);
+    }
+    let cache = sdk::root().join("thirdparty/debian");
+    fs::create_dir_all(&cache)?;
+    make_sysroot(&cache)
 }
 
 /// Скачать (или взять из кеша) пакеты, сверить хеши и разложить в `root`.

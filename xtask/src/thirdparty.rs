@@ -125,6 +125,9 @@ enum How {
     Wine,
     /// GE-Proton (12.11) без Steam и свои зависимости — см. [`crate::proton`].
     Proton,
+    /// OBS Studio из Debian 13 (23.11) и то, что он загружает, — см.
+    /// [`crate::obs`].
+    Obs,
     /// NetSurf (начато 03.11): браузер и десяток его библиотек одним архивом,
     /// каждая — своим `buildsystem`; поверхность окна и патчи — в
     /// `ports/netsurf`. См. [`crate::netsurf`].
@@ -196,7 +199,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 26] = [
+const PROJECTS: [Project; 27] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -701,6 +704,17 @@ const PROJECTS: [Project; 26] = [
         how: How::Proton,
         installs: &[],
     },
+    // OBS Studio (23.11): obs-studio Debian 13 и его библиотеки; адреса и
+    // хеши — в `crate::obs`, здесь — главный пакет.
+    Project {
+        name: "obs",
+        version: "30",
+        url: "https://snapshot.debian.org/archive/debian/20261020T000000Z/pool/main/o/obs-studio/obs-studio_30.2.3+dfsg-3_amd64.deb",
+        sha256: "25c24a956f35db063d847dc5797c79ce50eb7931842d6b8201f22b9cfe16d2ee",
+        unpacked: "debian",
+        how: How::Obs,
+        installs: &[],
+    },
 ];
 
 /// Собрать чужие проекты под все указанные архитектуры: все или только
@@ -755,6 +769,16 @@ pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> 
             }
             // Игра на нём (шаг 8): Trackmania Nations Forever.
             crate::tmnf::build()?;
+            continue;
+        }
+        if project.how == How::Obs {
+            if only.is_empty() && !crate::obs::enabled() {
+                say!("obs пропущен: FOSSAI_WITH_OBS=1 или --only obs");
+                continue;
+            }
+            for &arch in arches {
+                crate::obs::build(arch)?;
+            }
             continue;
         }
         let source = fetch(project, refresh)?;
@@ -1088,7 +1112,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         }
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
-        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java | How::Wine | How::Proton => {
+        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java | How::Wine | How::Proton | How::Obs => {
             return Ok(());
         }
         How::NetSurf => crate::netsurf::build(source, &work, arch)?,

@@ -228,9 +228,10 @@ fn panel_h(log: &str) -> i32 {
     if classic(log) { 28 } else { PANEL_H }
 }
 
-/// Высота полосы заголовка: у классики — 24 (`window::CLASSIC_TITLE`).
+/// Высота полосы заголовка: у классики — 23 (`window::CLASSIC_TITLE`: рамка
+/// 4 + заголовок 18 + 1, 23.11).
 fn title_h(log: &str) -> i32 {
-    if classic(log) { 24 } else { TITLE_H }
+    if classic(log) { 23 } else { TITLE_H }
 }
 
 /// Середина кнопки заголовка, считая справа налево.
@@ -238,9 +239,10 @@ fn title_button(log: &str, title: &str, from_right: i32) -> Result<(i32, i32)> {
     let rect = window(log, title)?;
     let scale = ui_scale(log)?;
     if classic(log) {
-        // Классика: кнопки 16 группой, закрыть — в 5 от края и на 2 правее
-        // остальных (`Window::title_button`).
-        let right = rect.x + rect.w - 5 * scale;
+        // Классика: кнопки 16 группой, закрыть — в 6 от края (рамка 4 и 2
+        // внутри заголовка; у развёрнутого — 2) и на 2 правее остальных
+        // (`Window::title_button`).
+        let right = rect.x + rect.w - 6 * scale;
         let x = if from_right == 0 { right - 8 * scale } else { right - 16 * scale - 2 * scale - 16 * scale * from_right + 8 * scale };
         return Ok((x, rect.y + 12 * scale));
     }
@@ -395,14 +397,18 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         }
         Aim::Maximize(title) => title_button(log, title, 1)?,
         Aim::Minimize(title) => title_button(log, title, 2)?,
+        // Классика (23.11): уголка нет — тянут за угол рамки 4 точки.
         Aim::Grip(title) => {
             let rect = window(log, title)?;
-            (rect.x + rect.w - 8, rect.y + rect.h - 8)
+            let inset = if classic(log) { 2 } else { 8 };
+            (rect.x + rect.w - inset, rect.y + rect.h - inset)
         }
+        // От угла содержимого: у классики оно внутри рамки 4 точки.
         Aim::Content(title, dx, dy) => {
             let rect = window(log, title)?;
             let scale = ui_scale(log)?;
-            (rect.x + dx, rect.y + title_h(log) * scale + dy)
+            let frame = if classic(log) { 4 * scale } else { 0 };
+            (rect.x + frame + dx, rect.y + title_h(log) * scale + dy)
         }
         // Пустое место: середина экрана по ширине и треть по высоте — там нет
         // ни значков (они слева), ни панели (она внизу). Окна к этому моменту

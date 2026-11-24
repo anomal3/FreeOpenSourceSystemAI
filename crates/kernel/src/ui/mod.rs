@@ -44,6 +44,7 @@
 // от ядра у них не было ни одной, так что переезд свёлся к переносу двух файлов.
 pub mod appicon;
 pub mod capture;
+pub mod clipboard;
 pub mod compositor;
 pub mod context;
 pub mod deskcfg;
@@ -58,6 +59,7 @@ pub mod prefs;
 pub mod saver;
 pub mod settings;
 pub mod flight;
+pub mod framegap;
 pub mod gesture;
 pub mod home;
 pub mod keyboard;
@@ -490,19 +492,16 @@ fn hover_context(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
     }
 }
 
-/// Буфер обмена стола (терминал T5): Ctrl+Shift+C в терминале кладёт сюда
-/// выделенное, Ctrl+Shift+V и правая кнопка — набирают его.
-static CLIPBOARD: SpinLock<String> = SpinLock::new(String::new());
-
-/// Текст буфера обмена — копией (`SYS_CLIPBOARD`).
+/// Текст буфера обмена — копией (`SYS_CLIPBOARD`). Буфер один на систему,
+/// с Wayland вместе (24.11, [`clipboard`]).
 #[must_use]
 pub fn clipboard() -> String {
-    CLIPBOARD.lock().clone()
+    clipboard::text()
 }
 
 /// Положить текст в буфер обмена (`SYS_CLIPBOARD`).
 pub fn set_clipboard(text: String) {
-    *CLIPBOARD.lock() = text;
+    clipboard::set_text(text);
 }
 
 /// Левую кнопку нажали в терминале и держат: движение мыши тянет выделение.
@@ -948,9 +947,10 @@ pub fn screen_size() -> (u32, u32) {
 /// Пока стол вынут, [`is_active`] отвечает «нет», и вывод уходит только в
 /// серийную линию. Это безопасно: стол трогают из одной задачи, а обработчики
 /// прерываний к нему не обращаются вовсе.
+#[track_caller]
 fn with_desktop<R>(action: impl FnOnce(&mut Compositor) -> R) -> Option<R> {
     let mut desktop = DESKTOP.lock().take()?;
-    let _held = Held::start();
+    let _held = Held::start(core::panic::Location::caller());
     // Вывод, отложенный, пока стол был у другого, — раньше своего действия:
     // иначе строки программы встали бы на экран не в том порядке, в каком она
     // их напечатала.
@@ -986,20 +986,22 @@ static HELD_WORST_BY: SpinLock<&'static str> = SpinLock::new("");
 static INPUT_WAIT_WORST_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Засекает удержание стола от взятия до возврата.
-struct Held(u64);
+struct Held(u64, &'static core::panic::Location<'static>);
 
 impl Held {
-    fn start() -> Self {
-        Self(crate::time::uptime_ns())
+    fn start(at: &'static core::panic::Location<'static>) -> Self {
+        Self(crate::time::uptime_ns(), at)
     }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let spent = crate::time::uptime_ns().saturating_sub(self.0);
+        let now = crate::time::uptime_ns();
+        let spent = now.saturating_sub(self.0);
         if HELD_WORST_NS.fetch_max(spent, Ordering::Relaxed) < spent {
             *HELD_WORST_BY.lock() = crate::sched::current_name();
         }
+        framegap::desktop_returned(self.0, now, self.1);
     }
 }
 
@@ -2281,10 +2283,12 @@ static WIFI_SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 pub fn tick() {
     // Запуски программ Windows (21.11): кончились ли, значки — вне замка
     // стола (см. `launch`).
+    framegap::phase(&"tick: launches, status");
     launch::poll();
     let status = status_now();
+    framegap::phase_end();
     let request = MODE_REQUEST.swap(0, core::sync::atomic::Ordering::Relaxed);
-    let layout = LAYOUT_REQUEST.lock().take();
+    let mut layout = LAYOUT_REQUEST.lock().take();
     // Настройки живой флешки вернулись после запуска стола (21.11).
     let restored = PREFS_RESTORED.swap(false, Ordering::AcqRel);
     if restored {
@@ -2297,7 +2301,7 @@ pub fn tick() {
         if request != 0 {
             change_mode(desktop, ((request >> 32) as u32, request as u32), &status);
         }
-        if let Some(plan) = layout {
+        if let Some(plan) = layout.take() {
             match run_layout(desktop, plan, &status) {
                 Ok(()) => kprintln!("  desktop     : layout applied"),
                 Err(why) => kprintln!("  desktop     : layout refused: {why}"),
@@ -2308,21 +2312,22 @@ pub fn tick() {
         // раскладка возвращается (как в Windows), а отсчёт на странице
         // перерисовывается раз в секунду.
         if let Some(window) = desktop.find(App::Settings) {
-            window.settings_tick();
+            framegap::step(&"settings tick", || window.settings_tick());
         }
-        desktop.refresh_panel(&status);
+        // Steps are timed (24.11, framegap): a long hold names the slowest.
+        framegap::step(&"refresh panel", || desktop.refresh_panel(&status));
         check_gesture_hold(desktop, &status);
-        desktop.reload_icons_if_packages_changed();
+        framegap::step(&"package icons", || desktop.reload_icons_if_packages_changed());
         // Каталог стола поменяли (20.11): программа сохранила туда файл,
         // терминал удалил — значки следом, без «Обновить».
-        if icons::desktop_folder_changed(desktop.icon_editing().is_none()) {
+        if framegap::step(&"desktop folder", || icons::desktop_folder_changed(desktop.icon_editing().is_none())) {
             desktop.reload_icons();
             let (total, entries) = desktop.icon_counts();
             kprintln!("  desktop     : desktop folder changed, icons {total}, {entries} from {}", context::desktop_dir());
             desktop.repaint_all();
         }
         // Фон (22.11, `wallpaper`): картинка перевелась — стол и «Фон» заново.
-        if wallpaper::poll() {
+        if framegap::step(&"wallpaper", wallpaper::poll) {
             desktop.repaint_all();
             if let Some(window) = desktop.find(App::Settings) {
                 window.refresh_settings();
@@ -2330,9 +2335,9 @@ pub fn tick() {
         }
         desktop.expire_toast();
         // Screen recorder (22.11): «Запись сохранена», a capture left behind.
-        capture::tick(desktop);
+        framegap::step(&"capture", || capture::tick(desktop));
         desktop.refresh_lock_clock();
-        watch_hung(desktop);
+        framegap::step(&"watch hung", || watch_hung(desktop));
         // Wi-Fi включается отдельной задачей: сменилось состояние —
         // перерисовать шторку и «Параметры», которые о нём говорят.
         // Адрес от DHCP — тоже повод: «Параметры» показывают IP подключения.
@@ -2343,10 +2348,24 @@ pub fn tick() {
                 window.refresh_settings();
             }
         }
-        desktop.present();
+        framegap::step(&"present", || desktop.present());
     });
     if restored && done.is_none() {
         PREFS_RESTORED.store(true, Ordering::Release);
+    }
+    // Стол был занят (или ещё не поднят) — заказы не теряются, а ждут
+    // следующего `tick` (23.11: второй монитор QEMU, подключённый при
+    // загрузке, так и не попал на стол — заказ раскладки пропал).
+    if done.is_none() {
+        if let Some(plan) = layout.take() {
+            let mut slot = LAYOUT_REQUEST.lock();
+            if slot.is_none() {
+                *slot = Some(plan);
+            }
+        }
+        if request != 0 {
+            let _ = MODE_REQUEST.compare_exchange(0, request, Ordering::Relaxed, Ordering::Relaxed);
+        }
     }
     // «Завершить программу» — вне замка стола: снятие задачи берёт свои.
     let task = HUNG_KILL.swap(0, Ordering::Relaxed);
@@ -2589,6 +2608,23 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
                 return None;
             }
         }
+    }
+    // Ctrl+C / Ctrl+X / Ctrl+V на столе (24.11): значки — в буфер обмена
+    // системы, файлы из него — в каталог стола.
+    if DESK_FOCUS.load(Ordering::Relaxed)
+        && event.mods.contains(Modifiers::CTRL)
+        && !event.mods.contains(Modifiers::SHIFT)
+        && !event.mods.contains(Modifiers::ALT)
+        && !desktop.context_open()
+        && !desktop.menu_open()
+        && matches!(event.code, KeyCode::C | KeyCode::X | KeyCode::V)
+    {
+        if event.code == KeyCode::V {
+            desktop_paste();
+        } else {
+            desktop_to_clipboard(desktop, event.code == KeyCode::X);
+        }
+        return None;
     }
 
     // Ctrl+Shift+Esc - диспетчер задач откуда угодно, как в Windows (20.11):
@@ -3252,7 +3288,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                         } else {
                             window.term_clear_selection();
                             kprintln!("  terminal    : copied {} chars", selection.chars().count());
-                            *CLIPBOARD.lock() = selection;
+                            clipboard::set_text(selection);
                         }
                     } else if window.is_program() && (!window.fit || window.on_pixels(x, y)) {
                         let local = window.program_local(x, y);
@@ -3331,6 +3367,10 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
             // «Пуска» (20.11).
             if items.contains(&context::Action::PinTaskbar) {
                 desktop.context_set_off(alloc::vec![context::Action::PinTaskbar]);
+            }
+            // «Вставить» — серым, пока в буфере обмена нет файлов (24.11).
+            if items.contains(&context::Action::Paste) && clipboard::files().is_none() {
+                desktop.context_set_off(alloc::vec![context::Action::Paste]);
             }
             // Печатается **место, куда меню встало**, а не точка щелчка: у
             // края экрана оно сдвигается, чтобы не выехать, и стенд, целящийся
@@ -4475,7 +4515,7 @@ fn terminal_key(desktop: &mut Compositor, event: KeyEvent) -> bool {
         if !selection.is_empty() {
             window.term_clear_selection();
             kprintln!("  terminal    : copied {} chars", selection.chars().count());
-            *CLIPBOARD.lock() = selection;
+            clipboard::set_text(selection);
         }
         desktop.present();
         return true;
@@ -4515,8 +4555,7 @@ fn log_terminal_view(window: &Window) {
 /// Переводы строк становятся пробелами: вставка не должна запускать команды,
 /// которых человек не видел.
 fn paste_clipboard() {
-    let text: String = CLIPBOARD
-        .lock()
+    let text: String = clipboard::text()
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .take(PASTE_LIMIT)
@@ -5679,9 +5718,18 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         | context::Action::RunAsAdmin
         | context::Action::PinStart
         | context::Action::PinQuick
-        | context::Action::Compress
-        | context::Action::Cut
-        | context::Action::Copy => {}
+        | context::Action::Compress => {}
+        // Буфер обмена системы (24.11): значки стола — списком файлов.
+        context::Action::Cut | context::Action::Copy => {
+            desktop.close_context();
+            desktop_to_clipboard(desktop, action == context::Action::Cut);
+            desktop.refresh_panel(status);
+        }
+        context::Action::Paste => {
+            desktop.close_context();
+            desktop_paste();
+            desktop.refresh_panel(status);
+        }
         context::Action::Personalize => {
             desktop.close_context();
             // Как в Windows: «Персонализация» открывается на «Фоне» (22.11).
@@ -6141,6 +6189,41 @@ fn selected_entries(desktop: &Compositor) -> alloc::vec::Vec<(String, String)> {
         .collect()
 }
 
+/// Выделенные значки стола (файлы, каталоги) — в буфер обмена системы
+/// списком файлов (24.11): «Вставить» в «Файлах», на столе, в Wine.
+fn desktop_to_clipboard(desktop: &mut Compositor, cut: bool) {
+    let mut paths: alloc::vec::Vec<String> = selected_entries(desktop).into_iter().map(|(path, _)| path).collect();
+    if paths.is_empty() {
+        if let Some((path, _)) = selected_entry(desktop) {
+            if desktop.icon_selection().is_some_and(|index| matches!(desktop.icon_kind(index), Some(icons::Kind::Folder | icons::Kind::File))) {
+                paths.push(path);
+            }
+        }
+    }
+    if paths.is_empty() {
+        return;
+    }
+    kprintln!("  desktop     : {} {} item(s) to the clipboard", if cut { "cut" } else { "copied" }, paths.len());
+    clipboard::set_files(paths, cut);
+}
+
+/// Файлы из буфера обмена — в каталог стола (24.11). Копирует «Файлы» без
+/// окна (`files --paste`): большой файл не держит стол, а значки появятся
+/// сами — каталог стола наблюдается.
+fn desktop_paste() {
+    let Some((paths, cut)) = clipboard::files() else {
+        kprintln!("  desktop     : paste: no files on the clipboard");
+        return;
+    };
+    let dir = context::desktop_dir();
+    let _ = context::ensure_dir(&dir);
+    let command = alloc::format!("/bin/files --paste {dir}");
+    match crate::user::spawn(&command, crate::user::session::credentials()) {
+        Ok(_) => kprintln!("  desktop     : pasting {} item(s){} into {dir}", paths.len(), if cut { " (cut)" } else { "" }),
+        Err(err) => kprintln!("  desktop     : cannot paste: {err}"),
+    }
+}
+
 /// Что выбрано на столе, если это файл или каталог: путь и подпись.
 ///
 /// Системный значок сюда не попадает: у него нет пути, а переименовать
@@ -6439,7 +6522,10 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         // Окно выше поверхности на полосу заголовка: программа просит место
         // **под содержимое**, а полосу рисует ядро. Считать иначе значило бы
         // отдавать ей окно, в котором её же рисунок наполовину под заголовком.
-        let full_h = if framed { h.saturating_add(Window::title_height(scale)) } else { h };
+        // Classic (23.11): plus the Windows 98 frame on the sides and below.
+        let (chrome_w, chrome_h) = if framed { Window::chrome_for(scale) } else { (0, 0) };
+        let full_w = w.saturating_add(chrome_w);
+        let full_h = h.saturating_add(chrome_h);
         // Окно программы открывается на основном мониторе, по центру его
         // рабочей области.
         let p = desktop.primary_work();
@@ -6456,9 +6542,9 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         } else {
             // По центру; второе окно на том же месте — каскадом (20.11).
             desktop.cascade(Rect::new(
-                p.x + ((screen.saturating_sub(w)) / 2) as i32,
+                p.x + ((screen.saturating_sub(full_w)) / 2) as i32,
                 p.y + ((work.saturating_sub(full_h)) / 2) as i32,
-                w,
+                full_w,
                 full_h,
             ))
         };
@@ -7192,4 +7278,15 @@ fn log_window(desktop: &Compositor, app: App, focused: bool) {
         rect.h,
         if focused { " (focused)" } else { "" }
     );
+    // A framed program window (23.11): the size of its content - the program
+    // pixels - and the side frame around it (classic look: 4 px outside).
+    if let Some(window) = desktop.peek(app).filter(|window| window.is_program() && !window.frameless && !window.popup) {
+        let (w, h) = window.program_size();
+        kprintln!(
+            "  window      : '{}' content {w}x{h} frame {} bar {}",
+            own.as_deref().unwrap_or(app.title()),
+            window.frame(),
+            window.bar()
+        );
+    }
 }

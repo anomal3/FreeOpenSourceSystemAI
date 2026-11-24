@@ -53,6 +53,24 @@ const READAHEAD: u64 = 512 * 1024;
 /// a miss plus its read-ahead is one disk command, and a USB command costs
 /// its round trip whatever its length up to that.
 pub static READAHEAD_RANDOM: AtomicU64 = AtomicU64::new(124 * 1024);
+/// Asynchronous read-ahead of a sequential reader, bytes (`exfatra async
+/// KIB`, 0 = off). hw-log17: a sequential reader stopped for the disk every
+/// [`READAHEAD`] bytes; now, while it reads, the `exfat-ra` task brings the
+/// next window into the cache, so the reader finds it there.
+pub static READAHEAD_ASYNC: AtomicU64 = AtomicU64::new(2 * 1024 * 1024);
+/// One disk read of the `exfat-ra` task: a reader that misses waits behind
+/// at most this much of somebody else's read-ahead.
+const AHEAD_PIECE: u64 = 256 * 1024;
+/// The piece once the reader has caught up with the task and waits for it
+/// (it reads faster than the disk): fewer commands and wake-ups, as a
+/// synchronous reader with 1 MiB commands (QEMU `exfat-stream`, think 0:
+/// 110 MB/s with 256 KiB pieces vs 178 MB/s without read-ahead).
+const AHEAD_PIECE_HURRY: u64 = 1024 * 1024;
+/// Read-ahead requests waiting for the task, at most.
+const AHEAD_QUEUE: usize = 16;
+/// Sequential streams remembered per open file (threads reading one file
+/// through a shared descriptor interleave their streams).
+const STREAMS: usize = 4;
 /// File data reads (pieces): count, ns, those that went to the disk and
 /// the bytes they read (data + read-ahead) - perf-diag.
 static READS: AtomicU64 = AtomicU64::new(0);
@@ -72,6 +90,244 @@ pub fn read_stats() -> (u64, u64, u64, u64, u64) {
         MISS_NS.load(Ordering::Relaxed),
         MISS_BYTES.load(Ordering::Relaxed),
     )
+}
+
+/// Asynchronous read-ahead: requests, bytes the task read from the disk,
+/// times a reader waited for it and their ns.
+static AHEAD_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static AHEAD_BYTES: AtomicU64 = AtomicU64::new(0);
+static AHEAD_WAITS: AtomicU64 = AtomicU64::new(0);
+static AHEAD_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// `(read-ahead requests, bytes read by the task, reader waits, their ns)`.
+#[must_use]
+pub fn ahead_stats() -> (u64, u64, u64, u64) {
+    (
+        AHEAD_REQUESTS.load(Ordering::Relaxed),
+        AHEAD_BYTES.load(Ordering::Relaxed),
+        AHEAD_WAITS.load(Ordering::Relaxed),
+        AHEAD_WAIT_NS.load(Ordering::Relaxed),
+    )
+}
+
+/// perf-diag (hw-log17): USB disk commands by their data stage (the
+/// transfer count of the "disk" line includes CBW/CSW) and the asynchronous
+/// read-ahead since the previous call; `None` - nothing happened.
+pub fn perf_line(secs: u64) -> Option<String> {
+    static LAST: SpinLock<[u64; 7]> = SpinLock::new([0; 7]);
+    let (commands, command_ns) = crate::usb::xhci::storage_data_stats();
+    let (_, _, usb_bytes, _) = crate::usb::xhci::storage_stats();
+    let (requests, bytes, waits, wait_ns) = ahead_stats();
+    let now = [commands, command_ns, requests, bytes, waits, wait_ns, usb_bytes];
+    let d: [u64; 7] = {
+        let mut last = LAST.lock();
+        let d = core::array::from_fn(|i| now[i].saturating_sub(last[i]));
+        *last = now;
+        d
+    };
+    if d[0] == 0 && d[2] == 0 {
+        return None;
+    }
+    Some(alloc::format!(
+        "{secs} s disk commands: {} usb data stages ({} us, {} KiB each, cap {} KiB); async read-ahead {} requests, {} KiB read, readers waited {} times ({} us each), exfatra async {} KiB",
+        d[0],
+        d[1] / d[0].max(1) / 1000,
+        d[6] / d[0].max(1) / 1024,
+        crate::usb::storage::WINDOW_CAP.load(Ordering::Relaxed) / 1024,
+        d[2],
+        d[3] / 1024,
+        d[4],
+        d[5] / d[4].max(1) / 1000,
+        READAHEAD_ASYNC.load(Ordering::Relaxed) / 1024,
+    ))
+}
+
+/// Mounted volumes (for [`drop_caches`]).
+static VOLUMES: SpinLock<Vec<alloc::sync::Weak<Inner>>> = SpinLock::new(Vec::new());
+
+/// Forget the clean cached blocks of every exFAT volume (`exfatcache drop`:
+/// a cold read again for a measurement). Returns how many volumes.
+pub fn drop_caches() -> usize {
+    let volumes: Vec<Arc<Inner>> = VOLUMES.lock().iter().filter_map(alloc::sync::Weak::upgrade).collect();
+    for inner in &volumes {
+        inner.volume.lock().device_mut().drop_clean();
+    }
+    volumes.len()
+}
+
+/// Read-ahead state of an open file, shared with the `exfat-ra` task.
+#[derive(Default)]
+struct Ahead {
+    /// A request of this file waits in the queue.
+    queued: AtomicBool,
+    /// The task works on a request of this file: `[from, to)`, read up to
+    /// `done`.
+    running: AtomicBool,
+    /// A reader waited for the running request: larger pieces.
+    hurry: AtomicBool,
+    /// Times a reader waited for the task.
+    waits: AtomicU64,
+    from: AtomicU64,
+    to: AtomicU64,
+    done: AtomicU64,
+}
+
+impl Ahead {
+    fn key(&self) -> usize {
+        core::ptr::from_ref(self) as usize
+    }
+}
+
+/// One request: bring `[from, to)` of `node` into the cache.
+struct AheadRequest {
+    fs: Arc<Inner>,
+    node: exfat::Node,
+    generation: u64,
+    from: u64,
+    to: u64,
+    ahead: Arc<Ahead>,
+}
+
+static AHEAD: SpinLock<alloc::collections::VecDeque<AheadRequest>> =
+    SpinLock::new(alloc::collections::VecDeque::new());
+static AHEAD_TASK: AtomicBool = AtomicBool::new(false);
+static AHEAD_KEY: u8 = 0;
+
+fn ahead_key() -> usize {
+    core::ptr::addr_of!(AHEAD_KEY) as usize
+}
+
+/// Queue a request; `false` - the queue is full or the task did not start.
+fn ahead_push(request: AheadRequest) -> bool {
+    if !AHEAD_TASK.swap(true, Ordering::AcqRel) {
+        if crate::sched::spawn_daemon("exfat-ra", ahead_task).is_err() {
+            AHEAD_TASK.store(false, Ordering::Release);
+            return false;
+        }
+    }
+    {
+        let mut queue = AHEAD.lock();
+        if queue.len() >= AHEAD_QUEUE || queue.try_reserve(1).is_err() {
+            return false;
+        }
+        queue.push_back(request);
+    }
+    crate::sched::wake_futex(ahead_key(), 0);
+    true
+}
+
+/// The `exfat-ra` task: requests one by one, each in [`AHEAD_PIECE`]s.
+fn ahead_task() {
+    loop {
+        let next = AHEAD.lock().pop_front();
+        let Some(request) = next else {
+            crate::sched::block_on_futex(ahead_key(), Some(crate::time::uptime_ms() + 1000), || {
+                !AHEAD.lock().is_empty()
+            });
+            continue;
+        };
+        let AheadRequest { fs, node, generation, from, to, ahead } = request;
+        ahead.from.store(from, Ordering::Relaxed);
+        ahead.to.store(to, Ordering::Relaxed);
+        ahead.done.store(from, Ordering::Relaxed);
+        // `hurry` stays from the previous request of the file while its
+        // reader keeps catching up; a request nobody waited for clears it.
+        let waits = ahead.waits.load(Ordering::Relaxed);
+        ahead.running.store(true, Ordering::Release);
+        ahead.queued.store(false, Ordering::Release);
+        let mut cursor = Cursor::default();
+        let mut at = from;
+        while at < to {
+            let piece = if ahead.hurry.load(Ordering::Relaxed) { AHEAD_PIECE_HURRY } else { AHEAD_PIECE };
+            let take = (to - at).min(piece);
+            if fetch(&fs, &node, generation, at, take, &mut cursor).is_err() {
+                break;
+            }
+            at += take;
+            ahead.done.store(at, Ordering::Release);
+            crate::sched::wake_futex(ahead.key(), 0);
+        }
+        if ahead.waits.load(Ordering::Relaxed) == waits {
+            ahead.hurry.store(false, Ordering::Relaxed);
+        }
+        ahead.running.store(false, Ordering::Release);
+        crate::sched::wake_futex(ahead.key(), 0);
+    }
+}
+
+/// Bring `[at, at + len)` of `node` into the block cache (the task's read):
+/// the plan and the cache lookup under the volume lock, the disk read
+/// without it, the blocks adopted only if nobody wrote there meanwhile.
+fn fetch(fs: &Inner, node: &exfat::Node, generation: u64, at: u64, len: u64, cursor: &mut Cursor) -> VfsResult<()> {
+    let (base, sector, volume_bytes) = fs.geometry;
+    if sector == 0 || BLOCK % sector != 0 {
+        return Err(VfsError::Unsupported);
+    }
+    let mut blocks: Vec<u64> = Vec::new();
+    let since = {
+        let mut volume = fs.volume.lock();
+        if fs.generation() != generation || !fast() {
+            return Err(VfsError::Io);
+        }
+        let (extents, _, _) = volume.plan_read(node, at, len, cursor).map_err(convert)?;
+        let dev = volume.device_mut();
+        for (start, length) in extents {
+            let end = start + length;
+            if end.div_ceil(BLOCK) * BLOCK > volume_bytes {
+                break;
+            }
+            let mut k = start / BLOCK;
+            while k * BLOCK < end {
+                if blocks.last() != Some(&k) && !dev.holds(base + k * BLOCK / sector) {
+                    blocks.try_reserve(1).map_err(|_| VfsError::OutOfMemory)?;
+                    blocks.push(k);
+                }
+                k += 1;
+            }
+        }
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        if !blocks.iter().all(|k| dev.clean_on_media(base + k * BLOCK / sector, BLOCK as usize)) {
+            return Err(VfsError::Io);
+        }
+        dev.generation()
+    };
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut runs: Vec<(u64, usize)> = Vec::new();
+    for &k in &blocks {
+        match runs.last_mut() {
+            Some((first, count)) if *first + *count as u64 == k => *count += 1,
+            _ => runs.push((k, 1)),
+        }
+    }
+    let mut data: Vec<u8> = Vec::new();
+    data.try_reserve_exact(blocks.len() * BLOCK as usize).map_err(|_| VfsError::OutOfMemory)?;
+    data.resize(blocks.len() * BLOCK as usize, 0);
+    let mut lane = fs.lane.clone();
+    let mut offset = 0usize;
+    for &(first, count) in &runs {
+        let bytes = count * BLOCK as usize;
+        lane.read(base + first * BLOCK / sector, &mut data[offset..offset + bytes]).map_err(|_| VfsError::Io)?;
+        offset += bytes;
+    }
+    AHEAD_BYTES.fetch_add(data.len() as u64, Ordering::Relaxed);
+    let mut volume = fs.volume.lock();
+    let dev = volume.device_mut();
+    if runs
+        .iter()
+        .any(|&(first, count)| dev.written_since(since, base + first * BLOCK / sector, count as u64 * BLOCK / sector))
+    {
+        return Err(VfsError::Io);
+    }
+    let mut offset = 0usize;
+    for &(first, count) in &runs {
+        let bytes = count * BLOCK as usize;
+        dev.adopt(base + first * BLOCK / sector, &data[offset..offset + bytes]);
+        offset += bytes;
+    }
+    Ok(())
 }
 /// Больше стольких узлов во всех запомненных каталогах — кэш сбрасывается
 /// (куча ядра общая и небольшая).
@@ -198,14 +454,22 @@ impl ExfatFs {
         let volume = Volume::mount(Cached::new(device), first_lba, sectors, read_only)?;
         let geometry = volume.geometry();
         let upcase = volume.upcase_table().to_vec();
-        Ok(Self(Arc::new(Inner {
+        let inner = Arc::new(Inner {
             volume: Mutex::new(volume),
             lane,
             geometry,
             upcase,
             generation: AtomicU64::new(0),
             dirs: SpinLock::new(DirCache { generation: 0, nodes: 0, dirs: BTreeMap::new() }),
-        })))
+        });
+        {
+            let mut volumes = VOLUMES.lock();
+            volumes.retain(|weak| weak.strong_count() > 0);
+            if volumes.try_reserve(1).is_ok() {
+                volumes.push(Arc::downgrade(&inner));
+            }
+        }
+        Ok(Self(inner))
     }
 
     #[must_use]
@@ -325,13 +589,110 @@ struct ExfatNode {
     /// Снимок набора записей и номер изменения тома, при котором он снят.
     node: SpinLock<(exfat::Node, u64)>,
     cursor: SpinLock<Cursor>,
-    /// Где кончилось прошлое чтение (для упреждающего).
-    next: AtomicU64,
+    /// Где кончились прошлые чтения (для упреждающего): до [`STREAMS`]
+    /// потоков `(next, asked)` - where a stream's last read ended and up to
+    /// where asynchronous read-ahead was asked for it.
+    streams: SpinLock<([(u64, u64); STREAMS], usize)>,
+    ahead: Arc<Ahead>,
 }
 
 impl ExfatNode {
     fn new(fs: Arc<Inner>, node: exfat::Node, generation: u64) -> Self {
-        Self { fs, node: SpinLock::new((node, generation)), cursor: SpinLock::new(Cursor::default()), next: AtomicU64::new(u64::MAX) }
+        Self {
+            fs,
+            node: SpinLock::new((node, generation)),
+            cursor: SpinLock::new(Cursor::default()),
+            streams: SpinLock::new(([(u64::MAX, 0); STREAMS], 0)),
+            ahead: Arc::new(Ahead::default()),
+        }
+    }
+
+    /// Does a read at `offset` continue one of the streams?
+    fn sequential(&self, offset: u64) -> bool {
+        self.streams.lock().0.iter().any(|(next, _)| *next == offset)
+    }
+
+    /// A read `[from, to)` is done: its stream moves on (or a new one
+    /// replaces the oldest).
+    fn advance(&self, from: u64, to: u64) {
+        let mut guard = self.streams.lock();
+        let (streams, victim) = &mut *guard;
+        if let Some(stream) = streams.iter_mut().find(|(next, _)| *next == from) {
+            stream.0 = to;
+            return;
+        }
+        streams[*victim] = (to, 0);
+        *victim = (*victim + 1) % STREAMS;
+    }
+
+    /// After a sequential read that ended at `end`: ask the `exfat-ra` task
+    /// for the next [`READAHEAD_ASYNC`] bytes unless at least half of them
+    /// is already asked for.
+    fn schedule_ahead(&self, end: u64) {
+        let window = READAHEAD_ASYNC.load(Ordering::Relaxed);
+        if window == 0 || !fast() || self.ahead.queued.load(Ordering::Acquire) {
+            return;
+        }
+        let asked = {
+            let guard = self.streams.lock();
+            match guard.0.iter().find(|(next, _)| *next == end) {
+                Some((_, asked)) => *asked,
+                None => return,
+            }
+        };
+        if asked >= end + window / 2 {
+            return;
+        }
+        let Some(node) = self.current() else {
+            return;
+        };
+        let to = (end + window).min(node.valid);
+        let from = asked.max(end);
+        if node.is_dir() || from >= to {
+            return;
+        }
+        self.ahead.queued.store(true, Ordering::Release);
+        let request = AheadRequest {
+            fs: Arc::clone(&self.fs),
+            node,
+            generation: self.fs.generation(),
+            from,
+            to,
+            ahead: Arc::clone(&self.ahead),
+        };
+        if ahead_push(request) {
+            AHEAD_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            if let Some(stream) = self.streams.lock().0.iter_mut().find(|(next, _)| *next == end) {
+                stream.1 = to;
+            }
+        } else {
+            self.ahead.queued.store(false, Ordering::Release);
+        }
+    }
+
+    /// The task is reading `[offset, offset + len)` of this file right now:
+    /// wait for it (up to 200 ms) instead of reading the same blocks twice.
+    fn wait_ahead(&self, offset: u64, len: u64) {
+        let ahead = &*self.ahead;
+        let need = |ahead: &Ahead| {
+            if !ahead.running.load(Ordering::Acquire) {
+                return false;
+            }
+            let (from, to) = (ahead.from.load(Ordering::Relaxed), ahead.to.load(Ordering::Relaxed));
+            offset >= from && offset < to && ahead.done.load(Ordering::Acquire) < (offset + len).min(to)
+        };
+        if !need(ahead) {
+            return;
+        }
+        ahead.hurry.store(true, Ordering::Relaxed);
+        ahead.waits.fetch_add(1, Ordering::Relaxed);
+        let started = crate::time::uptime_ns();
+        let until = crate::time::uptime_ms() + 200;
+        while need(ahead) && crate::time::uptime_ms() < until {
+            crate::sched::block_on_futex(ahead.key(), Some(until), || !need(ahead));
+        }
+        AHEAD_WAITS.fetch_add(1, Ordering::Relaxed);
+        AHEAD_WAIT_NS.fetch_add(crate::time::uptime_ns().saturating_sub(started), Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> exfat::Node {
@@ -406,7 +767,7 @@ impl ExfatNode {
     fn read_piece(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         let fs = &*self.fs;
         let (base, sector, volume_bytes) = fs.geometry;
-        let sequential = self.next.load(Ordering::Relaxed) == offset;
+        let sequential = self.sequential(offset);
         // Блоки тома (по 4 КиБ от начала тома), которых нет в кэше: нужные
         // для чтения и упреждаемые.
         let mut wanted: Vec<u64> = Vec::new();
@@ -461,7 +822,7 @@ impl ExfatNode {
                 let mut cursor = *self.cursor.lock();
                 let read = volume.read(&node, offset, buf, &mut cursor).map_err(convert)?;
                 *self.cursor.lock() = cursor;
-                self.next.store(offset + read as u64, Ordering::Relaxed);
+                self.advance(offset, offset + read as u64);
                 return Ok(read);
             }
             // Упреждающее чтение: был пропуск или чтение идёт подряд, а
@@ -505,7 +866,7 @@ impl ExfatNode {
             }
             if wanted.is_empty() && ahead.is_empty() {
                 buf[from_disk as usize..total as usize].fill(0);
-                self.next.store(end_of_read, Ordering::Relaxed);
+                self.advance(offset, end_of_read);
                 return Ok(total as usize);
             }
             let dev = volume.device_mut();
@@ -518,7 +879,7 @@ impl ExfatNode {
                 let mut cursor = *self.cursor.lock();
                 let read = volume.read(&node, offset, buf, &mut cursor).map_err(convert)?;
                 *self.cursor.lock() = cursor;
-                self.next.store(offset + read as u64, Ordering::Relaxed);
+                self.advance(offset, offset + read as u64);
                 return Ok(read);
             }
             (extents, from_disk, total, since)
@@ -561,7 +922,7 @@ impl ExfatNode {
             let mut cursor = *self.cursor.lock();
             let read = volume.read(&node, offset, buf, &mut cursor).map_err(convert)?;
             *self.cursor.lock() = cursor;
-            self.next.store(offset + read as u64, Ordering::Relaxed);
+            self.advance(offset, offset + read as u64);
             return Ok(read);
         }
         let dev = volume.device_mut();
@@ -594,7 +955,7 @@ impl ExfatNode {
             done += len as usize;
         }
         buf[from_disk as usize..total as usize].fill(0);
-        self.next.store(offset + total, Ordering::Relaxed);
+        self.advance(offset, offset + total);
         Ok(total as usize)
     }
 }
@@ -634,9 +995,12 @@ impl Node for ExfatNode {
         let mut done = 0usize;
         while done < buf.len() {
             let take = (buf.len() - done).min(PIECE);
+            let at = offset + done as u64;
             let started = crate::time::uptime_ns();
+            self.wait_ahead(at, take as u64);
+            let sequential = self.sequential(at);
             let misses = MISSES.load(Ordering::Relaxed);
-            let read = self.read_piece(offset + done as u64, &mut buf[done..done + take]);
+            let read = self.read_piece(at, &mut buf[done..done + take]);
             let took = crate::time::uptime_ns().saturating_sub(started);
             READS.fetch_add(1, Ordering::Relaxed);
             READ_NS.fetch_add(took, Ordering::Relaxed);
@@ -644,6 +1008,9 @@ impl Node for ExfatNode {
                 MISS_NS.fetch_add(took, Ordering::Relaxed);
             }
             let read = read?;
+            if sequential && read > 0 {
+                self.schedule_ahead(at + read as u64);
+            }
             done += read;
             if read < take {
                 break;

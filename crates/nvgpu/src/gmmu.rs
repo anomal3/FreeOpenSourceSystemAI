@@ -32,7 +32,7 @@
 //! Таблицы, которые записал RM (диапазон «server reserved»), [`Gmmu`] не
 //! освобождает: он помнит только свои.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use crate::Errno;
@@ -256,6 +256,11 @@ pub struct Gmmu {
     table_target: Target,
     /// Таблицы, которые выделили мы (RM-овские здесь не появляются).
     owned: BTreeSet<u64>,
+    /// PD0 and PT tables already found, by `(level, va >> span of the level
+    /// above)` (hw-log17: every 2 MiB of a VM_BIND walked PD3..PD0 again -
+    /// eight uncached reads over BAR1). A pointer to a lower table is never
+    /// rewritten once set (only `destroy` frees tables), so entries stay true.
+    found: BTreeMap<(u8, u64), u64>,
 }
 
 impl Gmmu {
@@ -268,7 +273,7 @@ impl Gmmu {
         let pd3 = mem.alloc_table().ok_or(Errno::ENOMEM)?;
         let mut owned = BTreeSet::new();
         owned.insert(pd3);
-        Ok(Gmmu { pd3, table_target, owned })
+        Ok(Gmmu { pd3, table_target, owned, found: BTreeMap::new() })
     }
 
     /// Физический адрес PD3 (для блока экземпляра и сброса TLB).
@@ -315,8 +320,23 @@ impl Gmmu {
     /// Пройти от PD3 к таблице уровня `want` (PD2..PT), создавая
     /// недостающие при `create`. `Ok(None)` — нет и не создавали.
     fn table_for(&mut self, mem: &mut dyn PtMem, va: u64, want: usize, create: bool) -> Result<Option<u64>, Errno> {
+        let key = (want as u8, va >> LEVELS[want.max(1) - 1].shift);
+        let cached = want >= PD0;
+        if cached {
+            if let Some(&t) = self.found.get(&key) {
+                return Ok(Some(t));
+            }
+        }
+        let pd0_key = (PD0 as u8, va >> LEVELS[PD1].shift);
         let mut table = self.pd3;
-        for lvl in PD3..want {
+        let mut from = PD3;
+        if want == PT {
+            if let Some(&t) = self.found.get(&pd0_key) {
+                table = t;
+                from = PD0;
+            }
+        }
+        for lvl in from..want {
             let p = Self::ptr_addr(table, lvl, va);
             match decode_pde(mem.read64(p)) {
                 Some((next, _)) => table = next,
@@ -338,6 +358,12 @@ impl Gmmu {
                     table = next;
                 }
             }
+            if lvl + 1 == PD0 {
+                self.found.insert(pd0_key, table);
+            }
+        }
+        if cached {
+            self.found.insert(key, table);
         }
         Ok(Some(table))
     }
@@ -653,6 +679,44 @@ pub(crate) mod tests {
         let n = g.table_count();
         g.destroy(&mut m);
         assert!(m.live.is_empty(), "все {n} таблиц освобождены");
+    }
+
+    /// A second map in the same 2 MiB does not walk the tree again (each
+    /// read is an uncached BAR1 read on the card).
+    #[test]
+    fn found_tables_are_not_walked_again() {
+        struct Counting(TestMem, core::cell::Cell<u32>);
+        impl PtMem for Counting {
+            fn read64(&self, addr: u64) -> u64 {
+                self.1.set(self.1.get() + 1);
+                self.0.read64(addr)
+            }
+            fn write64(&mut self, addr: u64, v: u64) {
+                self.0.write64(addr, v);
+            }
+            fn alloc_table(&mut self) -> Option<u64> {
+                self.0.alloc_table()
+            }
+            fn free_table(&mut self, addr: u64) {
+                self.0.free_table(addr);
+            }
+        }
+        let mut m = Counting(TestMem::new(), core::cell::Cell::new(0));
+        let mut g = Gmmu::new(&mut m).unwrap();
+        let a = PteAttrs::user(Target::Vram, 0);
+        g.map_contig(&mut m, 0x4000_0000, 0x40_0000, 0x1000_0000, a).unwrap();
+        m.1.set(0);
+        g.map_contig(&mut m, 0x4000_1000, 0x1000, 0x2000_0000, a).unwrap();
+        g.unmap(&mut m, 0x4000_2000, 0x1000).unwrap();
+        // Unmap still reads the two halves of the PD0 entry, nothing above it.
+        assert_eq!(m.1.get(), 2);
+        match g.translate(&m, 0x4000_1000) {
+            Walk::Mapped { phys, .. } => assert_eq!(phys, 0x2000_0000),
+            w => panic!("{w:?}"),
+        }
+        assert_eq!(g.translate(&m, 0x4000_2000), Walk::Unmapped);
+        g.destroy(&mut m);
+        assert!(m.0.live.is_empty());
     }
 
     #[test]

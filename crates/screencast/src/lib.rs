@@ -1,15 +1,18 @@
 //! Screen recording building blocks (22.11): a baseline JPEG encoder and an
-//! AVI (MJPEG, OpenDML) writer.
+//! AVI (MJPEG, OpenDML) writer; since 23.11 also the H.264 + Opus path —
+//! colour conversion to I420 ([`yuv`]), the encoders through C ([`media`]:
+//! openh264 and libopus, built by `xtask` into `libscreenrec-media.a`) and
+//! an MP4 writer ([`mp4`]).
 //!
-//! Why MJPEG in AVI first: every frame is independent, so frames are encoded
-//! in parallel by worker threads with no shared state, the encoder is small
-//! enough to own (no C++ port), and the file plays in Windows (Films & TV,
-//! Media Player), VLC, mpv and ffmpeg. Browsers do not play AVI — H.264 in MP4
-//! is the next milestone (see ROADMAP, «Запись экрана»).
+//! MP4 with H.264 and Opus is what the recorder writes by default: it plays
+//! everywhere, browsers and phones included. MJPEG in AVI stays as the
+//! «Совместимость» format: every frame independent, no C code, plays in
+//! Windows, VLC, mpv and ffmpeg.
 //!
-//! Both parts are allocation-free on the hot path: [`jpeg::Encoder::encode`]
-//! writes into a caller buffer with a caller scratch, so worker threads of a
-//! program whose heap is single-threaded never touch the heap.
+//! Hot paths are allocation-free: [`jpeg::Encoder::encode`] and
+//! [`yuv::Converter::convert`] write into caller buffers with caller scratch,
+//! so worker threads of a program whose heap is single-threaded never touch
+//! the heap.
 
 #![no_std]
 
@@ -19,3 +22,9 @@ extern crate std;
 
 pub mod avi;
 pub mod jpeg;
+pub mod media;
+pub mod mp4;
+pub mod yuv;
+
+#[cfg(all(test, screencast_media))]
+mod media_tests;

@@ -277,10 +277,15 @@ fn text(path: &str) -> Option<String> {
     match path {
         "/proc/cpuinfo" => {
             let mut out = String::new();
+            // `physical id`, `siblings`, `core id` (23.11): libobs считает ядра
+            // по парам `physical id` + `cpu cores` и без `physical id` падал
+            // (`strstr` с NULL). Один корпус, каждый ЦП — своё ядро; `siblings`
+            // = `cpu cores` — без SMT, как и прежде для `fossai-proton`.
             for cpu in 0..cpus {
                 out.push_str(&format!(
                     "processor\t: {cpu}\nvendor_id\t: FossAi\nmodel name\t: FossAi virtual CPU\n\
-                     cpu MHz\t\t: 0.000\ncpu cores\t: {cpus}\nflags\t\t: {}\n\n",
+                     cpu MHz\t\t: 0.000\nphysical id\t: 0\nsiblings\t: {cpus}\ncore id\t\t: {cpu}\n\
+                     cpu cores\t: {cpus}\nflags\t\t: {}\n\n",
                     cpu_flags()
                 ));
             }

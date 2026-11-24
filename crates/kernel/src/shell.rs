@@ -1183,6 +1183,9 @@ fn run_builtin(line: &str) -> bool {
             crate::user::trace::set(argument);
             sprintln!("  lxtrace: {}", if argument.is_empty() || argument == "off" { "off" } else { argument });
         }
+        // System clipboard (24.11): `clip` - show it, `clip set TEXT`,
+        // `clip files PATH...` (copied files), `clip cut PATH...`.
+        "clip" => clip_command(argument),
         // Запросы и события сервера Wayland — в серийную линию (`on`/`off`).
         #[cfg(target_arch = "x86_64")]
         "wltrace" => {
@@ -1387,6 +1390,23 @@ fn run_builtin(line: &str) -> bool {
             }
             sprintln!("  fencestep: {} us", crate::linux::drm::FENCE_STEP_US.load(Relaxed));
         }
+        // hw-log17: the GPU fence interrupt (nonstall -> wakes fence waiters);
+        // `off` - fence waits poll in fine steps as before.
+        "fenceirq" => sprintln!("  {}", crate::display::nvidia_rm_intr::command(argument)),
+        // hw-log17: desktop frame gaps / long desktop holds > 50 ms in the log.
+        "framegap" => {
+            match argument.trim() {
+                "on" => crate::ui::framegap::set_enabled(true),
+                "off" => crate::ui::framegap::set_enabled(false),
+                _ => {}
+            }
+            let (gaps, holds, worst) = crate::ui::framegap::stats();
+            sprintln!(
+                "  framegap: {}, {gaps} gap(s) and {holds} long hold(s) since boot, worst gap {} ms",
+                if crate::ui::framegap::enabled() { "on" } else { "off" },
+                worst / 1_000_000
+            );
+        }
         // hw-log15: a Linux thread spinning on sched_yield naps N us (0 - off).
         #[cfg(target_arch = "x86_64")]
         "yieldnap" => {
@@ -1543,14 +1563,76 @@ fn run_builtin(line: &str) -> bool {
         // hw-log15: read-ahead after a random miss on exFAT, KiB.
         "exfatra" => {
             use core::sync::atomic::Ordering::Relaxed;
-            match argument.trim() {
-                "" => {}
-                value => match value.parse::<u64>() {
+            // hw-log17: `exfatra async KIB` - asynchronous read-ahead of
+            // sequential readers (0 = off).
+            match argument.trim().split_once(' ').map_or((argument.trim(), ""), |(a, b)| (a, b.trim())) {
+                ("", _) => {}
+                ("async", value) => match value.parse::<u64>() {
+                    Ok(kib) => fs::exfatfs::READAHEAD_ASYNC.store(kib.min(64 * 1024) * 1024, Relaxed),
+                    Err(_) => sprintln!("  exfatra: usage `exfatra async KIB`"),
+                },
+                (value, _) => match value.parse::<u64>() {
                     Ok(kib) => fs::exfatfs::READAHEAD_RANDOM.store(kib.min(1024) * 1024, Relaxed),
-                    Err(_) => sprintln!("  exfatra: usage `exfatra [KIB]`"),
+                    Err(_) => sprintln!("  exfatra: usage `exfatra [KIB]` or `exfatra async KIB`"),
                 },
             }
-            sprintln!("  exfatra: {} KiB", fs::exfatfs::READAHEAD_RANDOM.load(Relaxed) / 1024);
+            let (requests, bytes, waits, wait_ns) = fs::exfatfs::ahead_stats();
+            sprintln!(
+                "  exfatra: {} KiB, async {} KiB; {requests} async requests, {} KiB, {waits} waits ({} us each)",
+                fs::exfatfs::READAHEAD_RANDOM.load(Relaxed) / 1024,
+                fs::exfatfs::READAHEAD_ASYNC.load(Relaxed) / 1024,
+                bytes / 1024,
+                wait_ns / waits.max(1) / 1000
+            );
+        }
+        // hw-log17: `usbwin KIB` caps a USB disk command (0 = the device's
+        // whole window: 1 MiB on SuperSpeed); `usbwin big|small` - the
+        // buffer of a disk plugged from now on (1 MiB or 128 KiB).
+        "usbwin" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "big" => crate::usb::xhci::STORAGE_BIG.store(true, Relaxed),
+                "small" => crate::usb::xhci::STORAGE_BIG.store(false, Relaxed),
+                value => match value.parse::<usize>() {
+                    Ok(kib) => crate::usb::storage::WINDOW_CAP.store(kib.min(4096) * 1024, Relaxed),
+                    Err(_) => sprintln!("  usbwin: usage `usbwin [KIB|big|small]`"),
+                },
+            }
+            let (commands, ns) = crate::usb::xhci::storage_data_stats();
+            sprintln!(
+                "  usbwin: cap {} KiB (0 = whole window), new disks {}; {commands} commands, {} us each",
+                crate::usb::storage::WINDOW_CAP.load(Relaxed) / 1024,
+                if crate::usb::xhci::STORAGE_BIG.load(Relaxed) { "big" } else { "small" },
+                ns / commands.max(1) / 1000
+            );
+        }
+        // hw-log17 (tests): `usbslow FIXED_US MBPS` - a USB disk read command
+        // lasts at least that long (a QEMU disk answers at once); `0 0` off.
+        "usbslow" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            let mut words = argument.split_whitespace().map(str::parse::<u64>);
+            match (words.next(), words.next()) {
+                (None, _) => {}
+                (Some(Ok(fixed)), Some(Ok(rate))) => {
+                    crate::usb::storage::SLOW_US.store(fixed.min(100_000), Relaxed);
+                    crate::usb::storage::SLOW_MBPS.store(rate, Relaxed);
+                }
+                _ => sprintln!("  usbslow: usage `usbslow FIXED_US MBPS`"),
+            }
+            sprintln!(
+                "  usbslow: {} us + {} MB/s per read command",
+                crate::usb::storage::SLOW_US.load(Relaxed),
+                crate::usb::storage::SLOW_MBPS.load(Relaxed)
+            );
+        }
+        "seqbench" => {
+            let mut words = argument.split_whitespace();
+            match (words.next().and_then(human_path), words.next().map(str::parse::<u64>)) {
+                (Some(path), None) => seqbench(&path, 0),
+                (Some(path), Some(Ok(think))) => seqbench(&path, think),
+                _ => sprintln!("  usage: seqbench <file> [think_us]"),
+            }
         }
         // hw-log15: USB disk transfers wait for the xHCI interrupt (`irq`) or
         // poll and yield as before 22.11 (`poll`).
@@ -1571,6 +1653,10 @@ fn run_builtin(line: &str) -> bool {
             );
         }
         "exfatcache" => match argument {
+            "drop" => {
+                let volumes = fs::exfatfs::drop_caches();
+                sprintln!("  exfat: clean cache dropped on {volumes} volume(s)");
+            }
             "on" | "off" => {
                 fs::exfatfs::set_fast(argument == "on");
                 sprintln!("  exfat: fast path {argument}");
@@ -1743,19 +1829,16 @@ fn run_builtin(line: &str) -> bool {
             sprintln!("  finishing the session");
             return true;
         }
-        // Не команда — может быть программой. Оболочка ищет её в `/bin`, как
-        // это делает всякая оболочка со своим `PATH`; списка каталогов у нас
-        // пока нет, и он не нужен — программы лежат в одном месте.
+        // Не команда — может быть программой. Оболочка ищет её в `/bin`, а
+        // потом в `bin` пакетов (`/opt/<pkg>/bin`, 24.11), как это делает
+        // всякая оболочка со своим `PATH` (см. [`find_program`]).
         //
         // Написать `mc` вместо `run /bin/mc` — не удобство ради удобства:
         // человек, знающий имя программы, не обязан знать ещё и путь к ней и
         // слово `run`. Отказ при этом остаётся честным: если файла нет, так и
         // говорится, и говорится про **имя**, а не про придуманный путь.
         other => {
-            let path = alloc::format!("/bin/{other}");
-            if fs::resolve_as(user::session::credentials(), &path, Access::NONE)
-                .is_some_and(|result| result.is_ok())
-            {
+            if let Some(path) = find_program(other) {
                 let line = if argument.is_empty() {
                     path
                 } else {
@@ -1768,6 +1851,46 @@ fn run_builtin(line: &str) -> bool {
         }
     }
     false
+}
+
+/// Программа по имени (24.11): `/bin/<name>`, затем `bin` пакетов —
+/// `/opt/<pkg>/bin/<name>` по алфавиту пакетов (свой `PATH`: `fossai-obs`,
+/// `fossai-proton`, `obs` набираются именем, без `run` и пути). Ответ —
+/// начало командной строки: сценарий с `#!` (`fossai-obs` — сценарий bash)
+/// запускается своим интерпретатором, `/bin/bash` и `/bin/sh` сценариев
+/// Linux — это bash корня Debian (`/opt/debian/bin/bash`): у ядра `#!`
+/// разбирает только `execve` слоя Linux, а не запуск из оболочки.
+fn find_program(name: &str) -> Option<String> {
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        return None;
+    }
+    let cred = user::session::credentials();
+    let exists = |path: &str| fs::resolve_as(cred, path, Access::NONE).is_some_and(|result| result.is_ok());
+    let native = alloc::format!("/bin/{name}");
+    if exists(&native) {
+        return Some(native);
+    }
+    let mut packages: alloc::vec::Vec<String> = match fs::list("/opt") {
+        Some(Ok(entries)) => entries.into_iter().filter(|entry| entry.kind == NodeKind::Directory).map(|entry| entry.name).collect(),
+        _ => return None,
+    };
+    packages.sort();
+    let path = packages.iter().map(|pkg| alloc::format!("/opt/{pkg}/bin/{name}")).find(|path| exists(path))?;
+    let head = match fs::read(&path, 128) {
+        Some(Ok((bytes, _))) => bytes,
+        _ => return Some(path),
+    };
+    let Some(first) = head.strip_prefix(b"#!") else {
+        return Some(path);
+    };
+    let first = core::str::from_utf8(first.split(|&b| b == b'\n').next().unwrap_or(&[])).unwrap_or("").trim();
+    let interp = first.split_whitespace().next().unwrap_or("");
+    let interp = match interp {
+        "/bin/bash" | "/bin/sh" | "/usr/bin/bash" if exists("/opt/debian/bin/bash") => String::from("/opt/debian/bin/bash"),
+        "" => return Some(path),
+        other => String::from(other),
+    };
+    Some(alloc::format!("{interp} {path}"))
 }
 
 /// Канарейка стека ядра: показать состояние и — по отдельному слову —
@@ -3097,6 +3220,18 @@ fn run_program(argument: &str) {
         sprintln!("  usage: run [-b] <path> [args]");
         return;
     }
+    // `run -b fossai-obs --gpu`: имя без пути ищется, как у команды (24.11).
+    let found;
+    let line = match line.split_once(' ').map_or((line, ""), |(name, rest)| (name, rest)) {
+        (name, rest) if !name.contains('/') && !line.contains('|') => match find_program(name) {
+            Some(path) => {
+                found = if rest.is_empty() { path } else { alloc::format!("{path} {rest}") };
+                found.as_str()
+            }
+            None => line,
+        },
+        _ => line,
+    };
 
     // Вертикальная черта — это канал, и разбирает её оболочка, а не ядро:
     // ядру предъявляют уже готовые концы. Одна черта, а не сколько угодно:
@@ -3121,6 +3256,32 @@ fn run_program(argument: &str) {
             }
         }
         Err(err) => sprintln!("  {path}: {err}"),
+    }
+}
+
+/// `clip`: the system clipboard (24.11) - show, set text, set files.
+fn clip_command(argument: &str) {
+    let (verb, rest) = argument.split_once(' ').unwrap_or((argument, ""));
+    match verb {
+        "" => {
+            let text = crate::ui::clipboard::text();
+            let shown: String = text.chars().take(200).map(|ch| if ch == '\n' { '|' } else { ch }).collect();
+            sprintln!("  clip text: {shown} ({} chars)", text.chars().count());
+            match crate::ui::clipboard::files() {
+                Some((files, cut)) => sprintln!("  clip files: {} ({}){}", files.join(" "), files.len(), if cut { " cut" } else { "" }),
+                None => sprintln!("  clip files: none"),
+            }
+        }
+        "set" => {
+            crate::ui::set_clipboard(String::from(rest));
+            sprintln!("  clip: text set ({} chars)", rest.chars().count());
+        }
+        "files" | "cut" => {
+            let paths: alloc::vec::Vec<String> = rest.split_whitespace().map(String::from).collect();
+            sprintln!("  clip: {} file(s) {}", paths.len(), if verb == "cut" { "cut" } else { "copied" });
+            crate::ui::clipboard::set_files(paths, verb == "cut");
+        }
+        _ => sprintln!("  usage: clip | clip set TEXT | clip files PATH... | clip cut PATH..."),
     }
 }
 
@@ -3688,6 +3849,51 @@ fn fsbench(path: &str) {
         mbs(seq[1]),
         seq[1].1 / 1_000_000,
         random_avg / 1000
+    );
+}
+
+/// `seqbench <file> [think_us]` (hw-log17): a cold sequential read of a file
+/// in 64 KiB pieces with `think_us` of work after each (a game decoding what
+/// it streams): MB/s, how many reads waited for the disk (> 300 us) and for
+/// how long, the longest read. The clean exFAT cache is dropped first.
+fn seqbench(path: &str, think_us: u64) {
+    let cred = user::session::credentials();
+    let node = match fs::resolve_as(cred, path, Access::READ) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return sprintln!("  {path}: {err}"),
+        None => return sprintln!("  no filesystem is mounted"),
+    };
+    fs::exfatfs::drop_caches();
+    let mut buf = alloc::vec![0u8; 64 << 10];
+    let (mut offset, mut reads, mut stalls, mut stall_ns, mut worst) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let started = time::uptime_ns();
+    loop {
+        let t = time::uptime_ns();
+        let n = match node.read_at(offset, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) => return sprintln!("  {path}: {err} at byte {offset}"),
+        };
+        let took = time::uptime_ns() - t;
+        reads += 1;
+        worst = worst.max(took);
+        if took > 300_000 {
+            stalls += 1;
+            stall_ns += took;
+        }
+        offset += n as u64;
+        let until = time::uptime_ns() + think_us * 1000;
+        while think_us > 0 && time::uptime_ns() < until {
+            core::hint::spin_loop();
+        }
+    }
+    let total = (time::uptime_ns() - started).max(1);
+    sprintln!(
+        "  seqbench: {path} {offset} bytes, think {think_us} us: {} MB/s ({} ms), {reads} reads, {stalls} waited for the disk ({} ms), worst {} us",
+        offset * 1000 / total,
+        total / 1_000_000,
+        stall_ns / 1_000_000,
+        worst / 1000
     );
 }
 

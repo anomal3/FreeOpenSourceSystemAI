@@ -1693,10 +1693,53 @@ pub fn clipboard_set(text: &str) -> bool {
 /// Текст буфера обмена стола.
 #[must_use]
 pub fn clipboard_get() -> alloc::string::String {
+    clipboard_read(user_abi::CLIP_GET)
+}
+
+/// Положить в буфер обмена файлы (24.11): `cut` — вырезаны (вставка их
+/// переносит). Текстом буфера становятся пути; программы Wayland (Wine)
+/// видят `text/uri-list`.
+pub fn clipboard_set_files(paths: &[alloc::string::String], cut: bool) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let mut wire = alloc::string::String::from(if cut { "m" } else { "c" });
+    for path in paths {
+        wire.push('\n');
+        wire.push_str(path);
+    }
+    // SAFETY: строка живёт в памяти программы, длина — её собственная.
+    let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, user_abi::CLIP_SET_FILES, wire.as_ptr() as usize, wire.len()) };
+    result == 0
+}
+
+/// Файлы в буфере обмена (24.11): пути и «вырезаны ли». `None` — файлов нет.
+#[must_use]
+pub fn clipboard_get_files() -> Option<(alloc::vec::Vec<alloc::string::String>, bool)> {
+    let wire = clipboard_read(user_abi::CLIP_GET_FILES);
+    let mut lines = wire.split('\n');
+    let cut = match lines.next()? {
+        "m" => true,
+        "c" => false,
+        _ => return None,
+    };
+    let paths: alloc::vec::Vec<alloc::string::String> = lines.filter(|line| !line.is_empty()).map(alloc::string::String::from).collect();
+    (!paths.is_empty()).then_some((paths, cut))
+}
+
+/// Номер изменения буфера обмена (растёт при каждом, 24.11).
+#[must_use]
+pub fn clipboard_seq() -> u32 {
+    // SAFETY: без памяти программы.
+    let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, user_abi::CLIP_SEQ, 0, 0) };
+    if result < 0 { 0 } else { result as u32 }
+}
+
+fn clipboard_read(action: usize) -> alloc::string::String {
     let mut buffer = alloc::vec![0u8; 4096];
     loop {
         // SAFETY: буфер живёт в памяти программы, длина — его собственная.
-        let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, user_abi::CLIP_GET, buffer.as_mut_ptr() as usize, buffer.len()) };
+        let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, action, buffer.as_mut_ptr() as usize, buffer.len()) };
         if result < 0 {
             return alloc::string::String::new();
         }
@@ -1765,6 +1808,20 @@ pub fn open_with_remember(ext: &str, command: &str) -> bool {
 pub unsafe fn screencap(action: usize, a1: usize, a2: usize) -> i64 {
     // SAFETY: the caller keeps the contract; the kernel checks the pages.
     unsafe { syscall(user_abi::SYS_SCREENCAP, action, a1, a2) }
+}
+
+/// System sound loopback (23.11, [`user_abi::SOUND_LOOP_READ`]): frames from
+/// `request.from` (or from now, `u64::MAX`) into `out`, 4 bytes a frame.
+/// Answer — frames read (`request` says from which frame and what is now),
+/// negative — error.
+pub fn sound_loop_read(request: &mut user_abi::SoundLoop, out: &mut [u8]) -> i64 {
+    request.buf = out.as_mut_ptr() as u64;
+    request.cap = (out.len() / 4).min(u32::MAX as usize) as u32;
+    request.got = 0;
+    // SAFETY: the structure and the buffer live in this program; the kernel
+    // writes at most `cap` frames.
+    let r = unsafe { syscall(user_abi::SYS_SOUND, user_abi::SOUND_LOOP_READ, core::ptr::from_mut(request) as usize, 0) };
+    if r < 0 { r } else { i64::from(request.got) }
 }
 
 /// Исполнить команду оболочки ядра (фаза 68o). `out` — не короче
@@ -2270,6 +2327,20 @@ pub fn futex_wait(word: &core::sync::atomic::AtomicU32, expected: u32) -> Option
     match result {
         0 => Some(true),
         FUTEX_CHANGED => Some(false),
+        _ => None,
+    }
+}
+
+/// [`futex_wait`] with a limit of `ms` milliseconds (23.11, the C runtime of
+/// `/bin/screenrec`: `sem_timedwait`). `Some(true)` — woken, `Some(false)` —
+/// the word was different or the time ran out.
+pub fn futex_wait_for(word: &core::sync::atomic::AtomicU32, expected: u32, ms: u64) -> Option<bool> {
+    let addr = core::ptr::from_ref(word) as usize;
+    // SAFETY: the call does not write into the program; the address is its own word.
+    let result = unsafe { syscall(SYS_FUTEX_WAIT, addr, expected as usize, ms.max(1) as usize) };
+    match result {
+        0 => Some(true),
+        FUTEX_CHANGED | user_abi::FUTEX_TIMED_OUT => Some(false),
         _ => None,
     }
 }

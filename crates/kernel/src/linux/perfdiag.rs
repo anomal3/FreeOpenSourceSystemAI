@@ -286,9 +286,14 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
             let (_, hits, ret, rip, off, len, slot) = **site;
             let task = crate::sched::slot_task_name(slot).unwrap_or("?");
             let thread = super::thread::thread_name(slot).map_or_else(String::new, |own| alloc::format!(" '{own}'"));
+            // The file by name (24.11, hw-log17: "765224 bytes" had to be
+            // guessed as Wine's ntdll.so).
+            let file = crate::user::process_at(slot)
+                .and_then(|process| process.lock().image_name_at(ret as usize))
+                .map_or_else(String::new, |path| alloc::format!(" {}", super::mapnames::short(&path)));
             let _ = write!(
                 line,
-                " {}% ret {ret:#x} (file +{off:#x} of {len} bytes) rip {rip:#x} task {task}{thread} slot {slot} tid {},",
+                " {}% ret {ret:#x} (file{file} +{off:#x} of {len} bytes) rip {rip:#x} task {task}{thread} slot {slot} tid {},",
                 hits * 100 / total,
                 crate::sched::slot_task_id(slot).unwrap_or(0),
             );
@@ -409,9 +414,11 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
     }
     let _ = write!(
         line,
-        ", {slow_total} slow (>0.5 ms) since boot; wait queues {} sleeps {} woken by key; idle rounds without the lock {}; zeroed frames {} from cpu caches, {} refills; yields without the lock {} since boot",
+        ", {slow_total} slow (>0.5 ms) since boot; wait queues {} sleeps {} woken by key; idle rounds without the lock {}; zeroed frames {} from cpu caches, {} refills; yields without the lock {} since boot, yield naps {} (yieldnap {} us)",
         g2[0], g2[1], g2[2], g2[3], g2[4],
         crate::sched::fast_yields(),
+        super::thread::YIELD_NAPS.load(Ordering::Relaxed),
+        super::thread::YIELD_NAP_US.load(Ordering::Relaxed),
     );
     // 22.11: `schedq` mode and its picks since boot.
     let (percpu, local, stolen, lost, locked) = crate::sched::percpu_stats();
@@ -443,6 +450,11 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
         );
     }
 
+    // hw-log17: VM_BIND phases and the GPU fence interrupt.
+    for line in super::drm::perf_lines(secs) {
+        kprintln!("  perf-diag   : {line}");
+    }
+
     // hw-log15: game disk reads - exFAT reads served from the cache vs from
     // the disk, and the USB transfers under them.
     {
@@ -462,6 +474,10 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
                 disk[8],
                 if crate::usb::xhci::STORAGE_IRQ_WAIT.load(Ordering::Relaxed) { "irq" } else { "poll" },
             );
+        }
+        // hw-log17: real command size and the asynchronous read-ahead.
+        if let Some(line) = crate::fs::exfatfs::perf_line(secs) {
+            kprintln!("  perf-diag   : {line}");
         }
     }
 

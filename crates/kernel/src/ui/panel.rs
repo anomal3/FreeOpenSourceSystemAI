@@ -2206,6 +2206,22 @@ pub(super) fn list_packages() -> Vec<Launcher> {
             icon: String::from(sysconf::value(text, "icon").unwrap_or("package")),
             opens: String::from(sysconf::value(text, "opens").unwrap_or("")),
         });
+        // Second way to start the same program (`start2`/`caption2`, 24.11:
+        // «OBS Studio (видеокарта)»): one more line of «Пуск», named
+        // `<pkg>:2` (icons by `/opt/<pkg>` still find the package), never on
+        // the desktop.
+        if let (Some(start), Some(caption)) = (sysconf::value(text, "start2").filter(|line| !line.is_empty()), sysconf::value(text, "caption2")) {
+            launchers.push(Launcher {
+                name: alloc::format!("{name}:2"),
+                caption: String::from(caption),
+                about: String::from(sysconf::value(text, "about2").unwrap_or(about)),
+                start: String::from(start),
+                rights,
+                desktop: false,
+                icon: String::from(sysconf::value(text, "icon").unwrap_or("package")),
+                opens: String::new(),
+            });
+        }
     }
     launchers.sort_by(|a, b| a.name.cmp(&b.name));
     launchers

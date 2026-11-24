@@ -74,22 +74,49 @@ pub fn keep(file: (usize, u64), offset: u64, want: usize, frame: PhysAddr) {
     }
 }
 
+/// Pages handled per hold of the cache lock (hw-log14/17: `forget` of a
+/// file with thousands of cached pages, and `shrink` walking the whole
+/// cache, kept interrupts off for 7-11 ms - serial input lost characters).
+const BATCH: usize = 64;
+/// Entries `shrink` looks at per hold of the lock.
+const SCAN: usize = 1024;
+
 /// Забыть страницы файла: его переписали, усекли или удалили.
+///
+/// In batches of [`BATCH`]: the pages leave the map under the lock, and
+/// their frames are released after it (nobody can `take` a page that is
+/// no longer in the map).
 pub fn forget(file: (usize, u64)) {
-    let mut cache = CACHE.lock();
-    let gone: alloc::vec::Vec<Key> = cache.range((file, 0, 0)..=(file, u64::MAX, usize::MAX)).map(|(key, _)| *key).collect();
-    if gone.is_empty() {
-        return;
-    }
-    crate::mm::frame::with(|frames| {
-        for key in &gone {
-            if let Some(frame) = cache.remove(key) {
-                // SAFETY: кэш — один из владельцев кадра; `free` снимает его,
-                // и кадр уходит в пул, только если других владельцев нет.
-                unsafe { frames.free(frame) };
+    let range = (file, 0, 0)..=(file, u64::MAX, usize::MAX);
+    loop {
+        let mut gone = [PhysAddr::new(0); BATCH];
+        let mut count = 0;
+        {
+            let mut cache = CACHE.lock();
+            while count < BATCH {
+                let Some(key) = cache.range(range.clone()).next().map(|(key, _)| *key) else {
+                    break;
+                };
+                if let Some(frame) = cache.remove(&key) {
+                    gone[count] = frame;
+                    count += 1;
+                }
             }
         }
-    });
+        if count == 0 {
+            return;
+        }
+        crate::mm::frame::with(|frames| {
+            for frame in &gone[..count] {
+                // SAFETY: кэш — один из владельцев кадра; `free` снимает его,
+                // и кадр уходит в пул, только если других владельцев нет.
+                unsafe { frames.free(*frame) };
+            }
+        });
+        if count < BATCH {
+            return;
+        }
+    }
 }
 
 /// Забыть страницы всех файлов тома: его память о незафиксированном пропала
@@ -109,20 +136,46 @@ pub fn forget_volume(volume: usize) {
 
 /// Отдать до `want` кадров, которые держит только кэш (память на исходе).
 /// Возвращает, сколько отдано.
+///
+/// Looks at [`SCAN`] entries per hold of the lock (it used to `retain`
+/// over the whole map at once - millions of entries on a big machine).
 pub fn shrink(want: usize) -> usize {
-    let mut cache = CACHE.lock();
+    use core::ops::Bound;
     let mut freed = 0;
-    crate::mm::frame::with(|frames| {
-        cache.retain(|_, frame| {
-            if freed >= want || frames.is_shared(*frame) {
-                return true;
+    let mut from: Bound<Key> = Bound::Unbounded;
+    while freed < want {
+        let mut cache = CACHE.lock();
+        let mut victims = [((0usize, 0u64), 0u64, 0usize); BATCH];
+        let mut count = 0;
+        let mut seen = 0;
+        let mut last = None;
+        crate::mm::frame::with(|frames| {
+            for (key, frame) in cache.range((from, Bound::Unbounded)) {
+                last = Some(*key);
+                seen += 1;
+                if !frames.is_shared(*frame) {
+                    victims[count] = *key;
+                    count += 1;
+                }
+                if count == BATCH || freed + count >= want || seen >= SCAN {
+                    break;
+                }
             }
-            // SAFETY: владелец один — кэш; кадр не отображён никем.
-            unsafe { frames.free(*frame) };
-            freed += 1;
-            false
+            for key in &victims[..count] {
+                if let Some(frame) = cache.remove(key) {
+                    // SAFETY: владелец один — кэш (проверено под этим же
+                    // замком); кадр не отображён никем.
+                    unsafe { frames.free(frame) };
+                }
+            }
         });
-    });
+        drop(cache);
+        freed += count;
+        match last {
+            Some(key) => from = Bound::Excluded(key),
+            None => break,
+        }
+    }
     freed
 }
 

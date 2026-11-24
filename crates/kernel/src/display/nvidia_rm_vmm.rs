@@ -246,12 +246,16 @@ impl Vmm {
         self.gmmu.as_mut().ok_or_else(|| "address space destroyed".into())
     }
 
+    // map_sys / map_vram / unmap write through the WC window and do not wait
+    // for the writes: `flush_tlb` does it once per batch (hw-log17: one
+    // read-back over BAR1 per action of a VM_BIND). Whoever changes tables
+    // must call `flush_tlb` before the GPU may rely on them.
+
     /// Отобразить кадры памяти машины (по 4 КиБ) с `va`.
     pub(crate) fn map_sys(&mut self, va: u64, frames: &[u64], priv_: bool, ro: bool, kind: u8) -> Res<()> {
         let len = frames.len() as u64 * PAGE;
         self.check_range(va, len)?;
         self.tables()?.map(&mut VramPt, va, len, attrs(Aper::Sys, priv_, ro, kind), |i| frames[i as usize]).map_err(e2s)?;
-        vram::flush(self.pd3);
         Ok(())
     }
 
@@ -259,7 +263,6 @@ impl Vmm {
     pub(crate) fn map_vram(&mut self, va: u64, phys: u64, len: u64, priv_: bool, ro: bool, kind: u8) -> Res<()> {
         self.check_range(va, len)?;
         self.tables()?.map_contig(&mut VramPt, va, len, phys, attrs(Aper::Vram, priv_, ro, kind)).map_err(e2s)?;
-        vram::flush(self.pd3);
         Ok(())
     }
 
@@ -267,7 +270,6 @@ impl Vmm {
     pub(crate) fn unmap(&mut self, va: u64, len: u64, sparse: bool) -> Res<()> {
         self.check_range(va, len)?;
         self.tables()?.fill(&mut VramPt, va, len, sparse).map_err(e2s)?;
-        vram::flush(self.pd3);
         Ok(())
     }
 
@@ -294,6 +296,9 @@ impl Vmm {
     /// Сбросить TLB по этому корню (`tu102_vmm_flush`): 0xb830a0 = PDB >> 8,
     /// 0xb830a4 = 0, 0xb830b0 = 0x80000001 (PAGE_ALL), ждать бит 31 (2 с).
     pub(crate) fn flush_tlb(&self, log: &mut Log) -> bool {
+        // The table writes of the batch reach the card first (WC window:
+        // barrier and a read-back).
+        vram::flush(self.pd3);
         let Ok((_, bar)) = super::nvidia_rm_info::card() else { return false };
         let _guard = TLB.lock();
         for (reg, v) in gmmu::tlb::sequence(self.pd3) {

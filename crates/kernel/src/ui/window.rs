@@ -629,9 +629,14 @@ const MIN_H: u32 = 120;
 /// в квадрат, половина которого приходится на срез, мышью нельзя.
 const GRIP: u32 = 20;
 
-/// Высота полосы заголовка классической рамки при 100 %: кромка окна и
-/// поле 3, синий заголовок 20, поле под ним 1 (22.11).
-pub const CLASSIC_TITLE: u32 = 24;
+/// Classic (Windows 98) caption band at 100 %: blue caption 18 and the face
+/// line under it 1 (23.11; `SM_CYCAPTION` = 19).
+pub const CLASSIC_CAPTION: u32 = 19;
+/// Height of the whole classic title band of a framed window at 100 %: the
+/// 4 px frame on top ([`Window::classic_frame`]) and [`CLASSIC_CAPTION`].
+/// At 150-200 % the frame is 8 (bevel rows are 2 px there).
+pub const CLASSIC_TITLE: u32 = 23;
+const _: () = assert!(CLASSIC_TITLE == 4 + CLASSIC_CAPTION);
 /// Кнопка заголовка классики: 16×14, как у Windows 98.
 const CLASSIC_BTN_W: u32 = 16;
 const CLASSIC_BTN_H: u32 = 14;
@@ -651,9 +656,10 @@ impl Window {
         let back = mini_ui::text::TERM_BG;
         let mut surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
         let strip = app.is_terminal() && !theme::is_mobile();
-        surface.fill(content_area(&surface, Window::title_height(scale)), back);
+        let (top, side) = (Window::title_height(scale), Window::frame_for(scale));
+        surface.fill(content_area(&surface, top, side), back);
         let grid = TextGrid::new(
-            grid_area(&surface, scale, strip),
+            grid_area(&surface, scale, strip, top, side),
             ctx.face(Role::Mono),
             mini_ui::text::TERM_FG,
             back,
@@ -734,10 +740,11 @@ impl Window {
         Some(window)
     }
 
-    /// Высота полосы заголовка **этого** окна: у всплывающего её нет.
+    /// Высота полосы заголовка **этого** окна: у всплывающего её нет; у
+    /// развёрнутого в классике - без рамки сверху (23.11).
     #[must_use]
     pub fn bar(&self) -> u32 {
-        if self.popup || self.frameless { 0 } else { Self::title_height(self.scale) }
+        self.bar_at(self.scale)
     }
 
     fn wrap(
@@ -817,7 +824,7 @@ impl Window {
     /// действиями: окно шире экрана на телефоне с проверкой переполнений
     /// иначе остановило бы ядро на вычитании.
     fn pixels_at(&self) -> (i32, i32) {
-        let area = content_area(&self.surface, self.bar());
+        let area = content_area(&self.surface, self.bar(), self.frame());
         match &self.content {
             Content::Program(view) if self.fit => {
                 let dx = area.w.saturating_sub(view.pixels.width()) / 2;
@@ -863,10 +870,86 @@ impl Window {
     pub fn title_height(scale: mini_ui::Scale) -> u32 {
         // Классика (22.11): рамка 3 + заголовок 20 + 1 — как у Windows 98
         // (там 18 под шрифт 8 пт), а не полоса современного вида.
+        // 23.11: the band starts with the separate 4 px window frame.
         if Self::classic() {
-            return CLASSIC_TITLE * scale;
+            return Self::classic_frame(scale) + CLASSIC_CAPTION * scale;
         }
         theme::title_h() * scale
+    }
+
+    /// Width of the Windows 98 window frame at `scale` (23.11): two bevel
+    /// rows (#DFDFDF/black outside, white/#808080 inside) and two face rows,
+    /// each [`mini_ui::classic::unit`] thick - 4 px at 100-125 %, 8 at
+    /// 150-200 %. The frame lies OUTSIDE the content: the window is wider than
+    /// the content by two frames and taller by the title band and one frame.
+    #[must_use]
+    pub fn classic_frame(scale: mini_ui::Scale) -> u32 {
+        4 * mini_ui::classic::unit(scale)
+    }
+
+    /// Frame width of a new framed window at `scale` (classic look: the
+    /// Windows 98 frame, otherwise none).
+    #[must_use]
+    pub fn frame_for(scale: mini_ui::Scale) -> u32 {
+        if Self::classic() { Self::classic_frame(scale) } else { 0 }
+    }
+
+    /// How much bigger than its content a new framed window is: `(w, h)`.
+    #[must_use]
+    pub fn chrome_for(scale: mini_ui::Scale) -> (u32, u32) {
+        let frame = Self::frame_for(scale);
+        (2 * frame, Self::title_height(scale) + frame)
+    }
+
+    /// Side frame of THIS window at `scale`: the classic frame, except for
+    /// popups, frameless windows, the phone frame (`fit`), fullscreen and
+    /// maximized windows (Windows 98 puts a maximized window's frame
+    /// off-screen; here it is not drawn, and the caption touches the screen
+    /// edges).
+    fn frame_at(&self, scale: mini_ui::Scale) -> u32 {
+        if !Self::classic() || self.popup || self.frameless || self.fit || self.fullscreen || self.is_maximized() {
+            0
+        } else {
+            Self::classic_frame(scale)
+        }
+    }
+
+    /// Side frame of this window (see [`Self::frame_at`]).
+    #[must_use]
+    pub fn frame(&self) -> u32 {
+        self.frame_at(self.scale)
+    }
+
+    /// Title band of this window at `scale`: none for popups and frameless
+    /// windows; classic without the frame - only the caption.
+    fn bar_at(&self, scale: mini_ui::Scale) -> u32 {
+        if self.popup || self.frameless {
+            0
+        } else if Self::classic() && self.frame_at(scale) == 0 {
+            CLASSIC_CAPTION * scale
+        } else {
+            Self::title_height(scale)
+        }
+    }
+
+    /// How much bigger than its content this window is at `scale`: `(w, h)`.
+    fn chrome_at(&self, scale: mini_ui::Scale) -> (u32, u32) {
+        let frame = self.frame_at(scale);
+        (2 * frame, self.bar_at(scale) + frame)
+    }
+
+    /// Content size of this window if it were `w`x`h` (in its current state).
+    #[must_use]
+    pub fn content_of(&self, w: u32, h: u32) -> (u32, u32) {
+        let (cw, ch) = self.chrome_at(self.scale);
+        (w.saturating_sub(cw), h.saturating_sub(ch))
+    }
+
+    /// Classic frame layout key: the look changed it when this differs - the
+    /// windows are rebuilt ([`super::compositor::Compositor::retitle_all`]).
+    #[must_use]
+    pub fn chrome_key() -> (u32, u32) {
+        (Self::title_height(mini_ui::Scale::ONE), Self::frame_for(mini_ui::Scale::ONE))
     }
 
     /// Вкладки терминала — своей полосой под заголовком, а не в нём: на
@@ -901,14 +984,34 @@ impl Window {
         let asked = view.asked;
         let stale = asked.is_some_and(|size| size != answer)
             && view.events.iter().any(|event| event.kind == user_abi::WIN_RESIZE);
+        let self_sized = asked.is_none() && !self.fit;
+        // The state changes come first (23.11): they decide whether the
+        // classic frame is shown, and with it the window size around the
+        // pixels. Undone if there is no memory for the new window.
+        let saved = (self.restore, self.fullscreen, self.full_from);
+        // Развёрнутое окно помнит, куда вернуться, пока размер ему выбирает
+        // стол. Размер, который программа выбрала сама, не спросясь, — это уже
+        // не развёрнутое окно, и возвращать его некуда.
+        if self_sized {
+            self.restore = None;
+        }
+        // Окно во весь экран, ставшее по своей воле другого размера, из
+        // полноэкранного режима вышло (игра переключилась в окно). Ответ на
+        // просьбу стола — нет: он и есть размер монитора, пусть и с опозданием.
+        if self_sized && self.fullscreen && answer != self.full_size {
+            self.fullscreen = false;
+            self.full_from = None;
+        }
         // Рамку, которую держит стол (телефон, [`Self::fit`]), пиксели не
         // меняют: ответ ложится в неё по центру или срезается.
         let (w, h) = if stale || self.fit {
             (self.rect.w, self.rect.h)
         } else {
-            (answer.0, answer.1 + self.bar())
+            let (cw, ch) = self.chrome_at(self.scale);
+            (answer.0 + cw, answer.1 + ch)
         };
         let Some(surface) = Surface::new(w, h, theme::window_bg()) else {
+            (self.restore, self.fullscreen, self.full_from) = saved;
             return false;
         };
         if let Content::Program(view) = &mut self.content {
@@ -920,20 +1023,7 @@ impl Window {
         self.surface = surface;
         self.rect.w = w;
         self.rect.h = h;
-        // Развёрнутое окно помнит, куда вернуться, пока размер ему выбирает
-        // стол. Размер, который программа выбрала сама, не спросясь, — это уже
-        // не развёрнутое окно, и возвращать его некуда.
-        if asked.is_none() && !self.fit {
-            self.restore = None;
-        }
-        self.self_sized = asked.is_none() && !self.fit;
-        // Окно во весь экран, ставшее по своей воле другого размера, из
-        // полноэкранного режима вышло (игра переключилась в окно). Ответ на
-        // просьбу стола — нет: он и есть размер монитора, пусть и с опозданием.
-        if self.self_sized && self.fullscreen && answer != self.full_size {
-            self.fullscreen = false;
-            self.full_from = None;
-        }
+        self.self_sized = self_sized;
         self.redraw_content();
         self.draw_decorations(focused);
         self.damage = Rect::new(0, 0, w, h);
@@ -996,7 +1086,7 @@ impl Window {
         // Рамка стола (телефон, 05.11): программа, сказавшая «умею», сразу
         // получает просьбу заполнить её — так окно открывается во весь экран.
         if resizable && self.fit {
-            let (w, h) = (self.rect.w, self.rect.h.saturating_sub(self.bar()));
+            let (w, h) = self.content_of(self.rect.w, self.rect.h);
             if (w, h) != (self.program_size().0, self.program_size().1) {
                 self.ask_resize(w, h);
             }
@@ -1038,7 +1128,6 @@ impl Window {
     /// окна — ровно на разницу высот заголовка. Окна ядра пересобираются как
     /// при изменении размера: их содержимое рисует себя от области заново.
     pub fn retitle(&mut self) -> bool {
-        let title = self.bar();
         // Рамка стола размер держит: пересобирается поверхность того же
         // размера, а программе уходит новая высота содержимого.
         if self.fit {
@@ -1046,12 +1135,23 @@ impl Window {
             return self.rebuild(w, h);
         }
         if let Content::Program(view) = &self.content {
-            let h = view.pixels.height() + title;
-            let w = self.rect.w;
+            // 23.11: a maximized, snapped or fullscreen window keeps its place
+            // on the screen - the program is asked for the new content size
+            // (Wayland: a configure) instead of the window growing past the
+            // work area.
+            if view.resizable && (self.is_maximized() || self.is_snapped() || self.fullscreen) {
+                let (w, h) = (self.rect.w, self.rect.h);
+                return self.rebuild(w, h);
+            }
+            // Otherwise the content keeps its size, and the window grows or
+            // shrinks around it by the change of the frame and title band.
+            let (cw, ch) = self.chrome_at(self.scale);
+            let (w, h) = (view.pixels.width() + cw, view.pixels.height() + ch);
             let Some(surface) = Surface::new(w, h, theme::window_bg()) else {
                 return false;
             };
             self.surface = surface;
+            self.rect.w = w;
             self.rect.h = h;
             self.commit(None);
             self.draw_decorations(false);
@@ -1087,12 +1187,15 @@ impl Window {
             restore.h = scale.rescale(restore.h, old);
         }
         let w = scale.rescale(self.rect.w, old);
-        let bar_old = Self::title_height(old);
+        let (cw_old, ch_old) = self.chrome_at(old);
+        let (cw, ch) = self.chrome_at(scale);
         let fits = self.fit;
         match &self.content {
             Content::Program(view) if view.resizable && !fits => {
-                let content_h = self.rect.h.saturating_sub(if self.popup || self.frameless { 0 } else { bar_old });
-                let h = scale.rescale(content_h, old) + self.bar();
+                let content_w = self.rect.w.saturating_sub(cw_old);
+                let content_h = self.rect.h.saturating_sub(ch_old);
+                let w = scale.rescale(content_w, old) + cw;
+                let h = scale.rescale(content_h, old) + ch;
                 self.rebuild(w, h)
             }
             Content::Program(_) => self.retitle(),
@@ -1122,14 +1225,15 @@ impl Window {
             // «свернуть» и «развернуть» вплотную, «закрыть» на 2 точки
             // правее. Место нажатия — во всю высоту полосы, рисуется кнопка
             // внутри ([`Self::classic_knob`]).
+            // 23.11: 2 px inside the caption, which is inside the frame.
             let ctx = self.ctx();
             let w = ctx.px(CLASSIC_BTN_W) as i32;
-            let right = self.surface.width() as i32 - ctx.px(5) as i32;
+            let right = self.surface.width() as i32 - self.frame() as i32 - ctx.px(2) as i32;
             let x = match from_right {
                 0 => right - w,
                 n => right - w - ctx.px(2) as i32 - w * n as i32,
             };
-            return Rect::new(x, 0, w as u32, Self::title_height(scale));
+            return Rect::new(x, 0, w as u32, self.bar());
         }
         let width = theme::TITLE_BTN * scale;
         let step = width + theme::TITLE_GAP * scale;
@@ -1233,6 +1337,15 @@ impl Window {
         if self.popup || self.frameless {
             return Some(Hit::Body);
         }
+        // The classic frame (23.11) of a window whose size cannot change: not
+        // the content - it is dragged like the title.
+        let frame = self.frame() as i32;
+        if frame > 0 {
+            let (w, h) = (self.rect.w as i32, self.rect.h as i32);
+            if local.0 < frame || local.1 < frame || local.0 >= w - frame || local.1 >= h - frame {
+                return Some(Hit::Title);
+            }
+        }
         if self.close_button().contains(local.0, local.1) {
             return Some(Hit::Close);
         }
@@ -1263,7 +1376,7 @@ impl Window {
         if self.has_keyboard_button() && self.keyboard_button().contains(local.0, local.1) {
             return Some(Hit::Keyboard);
         }
-        let title_bottom = Self::title_height(self.scale) as i32;
+        let title_bottom = self.bar() as i32;
         if local.1 < title_bottom {
             return Some(Hit::Title);
         }
@@ -1286,7 +1399,7 @@ impl Window {
         // Уголок проверяется после заголовка: у окна ростом с полосу заголовка
         // они пересекаются, и таскать такое окно важнее, чем тянуть его за
         // размер.
-        if self.resizable() && !self.fit && !self.is_maximized() && !self.fullscreen && self.resize_grip().contains(local.0, local.1) {
+        if self.resizable() && !self.fit && !self.is_maximized() && !self.fullscreen && !Self::classic() && self.resize_grip().contains(local.0, local.1) {
             return Some(Hit::Resize(EDGE_RIGHT | EDGE_BOTTOM));
         }
         Some(Hit::Body)
@@ -1295,8 +1408,16 @@ impl Window {
     /// Какие края окна под точкой `local` (координаты окна): полоса
     /// [`EDGE_GRAB`] у каждой стороны, у углов — вдвое шире вдоль стороны.
     fn edges_at(&self, x: i32, y: i32) -> u8 {
-        let grab = ((EDGE_GRAB * self.scale) as i32).max(3);
-        let corner = grab * 3;
+        // Classic (23.11): exactly the Windows 98 frame - it lies outside the
+        // content, and the content keeps its clicks; corners reach along the
+        // sides as far as the caption (like `HTTOPLEFT` and friends).
+        let frame = self.frame() as i32;
+        let (grab, corner) = if frame > 0 {
+            (frame, frame + (CLASSIC_CAPTION * self.scale) as i32)
+        } else {
+            let grab = ((EDGE_GRAB * self.scale) as i32).max(3);
+            (grab, grab * 3)
+        };
         let (w, h) = (self.rect.w as i32, self.rect.h as i32);
         let mut edges = 0;
         if x < grab {
@@ -1333,7 +1454,9 @@ impl Window {
         // точки легли бы поверх её рисунка.
         // Рамку стола на телефоне (`fit`) не тянут вовсе: её размер — экран.
         // Развёрнутое окно за уголок не тянут (20.11) — и уголка у него нет.
-        if !self.resizable() || self.frameless || self.fit || self.is_maximized() {
+        // Classic (23.11): the frame is what is dragged, as in Windows 98 -
+        // no dots over the content.
+        if !self.resizable() || self.frameless || self.fit || self.is_maximized() || Self::classic() {
             return;
         }
         let ctx = self.ctx();
@@ -1368,8 +1491,7 @@ impl Window {
         }
         let ctx = self.ctx();
         let p = ctx.palette;
-        let scale = self.scale;
-        let title_h = Self::title_height(scale);
+        let title_h = self.bar();
         let bounds = self.surface.bounds();
         let radius = self.corner_radius();
         let bar = Rect::new(0, 0, bounds.w, title_h);
@@ -1558,8 +1680,11 @@ impl Window {
         self.paint_title_buttons(focused);
         // Обводка — заново, но на основу, а не поверх прежней (см.
         // [`EdgeBook`]): кнопки только что залиты, остальной периметр
-        // остаётся каким был.
-        self.paint_edge(focused);
+        // остаётся каким был. The classic frame lies apart from the
+        // buttons (23.11) and stays as it is.
+        if !Self::classic() {
+            self.paint_edge(focused);
+        }
         let row = self.leftmost_button().union(&self.close_button());
         self.damage = self.damage.union(&row);
     }
@@ -1570,13 +1695,16 @@ impl Window {
         if self.popup || self.frameless {
             return;
         }
+        if Self::classic() {
+            self.paint_classic_frame(focused);
+            return;
+        }
         let ctx = self.ctx();
         let p = ctx.palette;
         let radius = self.corner_radius();
         let ink = if focused { p.line3 } else { p.line2 };
         let bounds = self.surface.bounds();
         let (w, h) = (bounds.w, bounds.h);
-        let bevel_t = mini_ui::classic::unit(self.scale);
         let Self { surface, edge: book, .. } = &mut *self;
         book.focused = focused;
         if (book.w, book.h, book.radius) != (w, h, radius) {
@@ -1594,7 +1722,6 @@ impl Window {
             book.h = h;
             book.radius = radius;
         }
-        let classic = Self::classic();
         // Первый проход: основа под каждой точкой — прежняя, если точка
         // хранит нарисованное обводкой, иначе её нынешнее значение.
         // `drawn` до второго прохода хранит то, что было в точке до вызова.
@@ -1611,13 +1738,7 @@ impl Window {
             surface.row_mut(y)[x as usize] = book.base[i];
             i += 1;
         });
-        if classic {
-            // Объёмная кромка в две точки, как у окон Windows 98 (20.11;
-            // 22.11 — цвета Windows 98 и толщина по масштабу).
-            mini_ui::classic::raised(surface, bounds, bevel_t);
-        } else {
-            draw::rounded_stroke(surface, bounds, radius, ink.color, ink.alpha);
-        }
+        draw::rounded_stroke(surface, bounds, radius, ink.color, ink.alpha);
         let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
         let mut i = 0usize;
         edge_points(w, h, radius, |x, y| {
@@ -1650,12 +1771,45 @@ impl Window {
         super::look::on(super::look::Flag::Classic) && !theme::is_mobile()
     }
 
-    /// Синяя полоса классического заголовка: в 3 точках от краёв окна (2 —
-    /// кромка, 1 — грань), до последней строки полосы.
+    /// The Windows 98 window frame (23.11), OUTSIDE the content: the outer
+    /// bevel row #DFDFDF (top, left) / black (bottom, right), the inner one
+    /// white / #808080, then face rows up to the content and the caption.
+    /// Nothing of the content lies under it, so it is simply drawn (no
+    /// [`EdgeBook`]). A maximized or fullscreen window has no frame.
+    fn paint_classic_frame(&mut self, focused: bool) {
+        self.edge.focused = focused;
+        // The book does not cover this frame: after a switch back to the
+        // modern look it starts afresh.
+        self.edge.w = 0;
+        let frame = self.frame();
+        if frame == 0 {
+            return;
+        }
+        let t = mini_ui::classic::unit(self.scale);
+        let bounds = self.surface.bounds();
+        let (w, h) = (bounds.w, bounds.h);
+        let f = frame as i32;
+        let strips = [
+            Rect::new(0, 0, w, frame),
+            Rect::new(0, 0, frame, h),
+            Rect::new(w as i32 - f, 0, frame, h),
+            Rect::new(0, h as i32 - f, w, frame),
+        ];
+        for strip in strips {
+            self.surface.fill(strip, theme::win98::FACE);
+        }
+        mini_ui::classic::raised(&mut self.surface, bounds, t);
+        for strip in strips {
+            self.damage = self.damage.union(&strip);
+        }
+    }
+
+    /// Синяя полоса классического заголовка (23.11): внутри рамки, 18 точек
+    /// высотой; у окна без рамки (развёрнутого) — от края до края сверху.
     fn caption_rect(&self) -> Rect {
         let ctx = self.ctx();
-        let inset = ctx.px(3);
-        let h = Self::title_height(self.scale).saturating_sub(inset + ctx.px(1));
+        let inset = self.frame();
+        let h = (CLASSIC_CAPTION * self.scale).saturating_sub(ctx.px(1));
         Rect::new(inset as i32, inset as i32, self.surface.width().saturating_sub(inset * 2), h)
     }
 
@@ -1671,7 +1825,9 @@ impl Window {
     /// Задевает ли прямоугольник поверхности место обводки (с запасом на
     /// углы): тогда после копии пикселей её надо положить заново.
     fn touches_edge(&self, rect: Rect) -> bool {
-        if self.popup || self.frameless || rect.is_empty() {
+        // The classic frame (23.11) lies outside the content: copies never
+        // reach it.
+        if self.popup || self.frameless || rect.is_empty() || Self::classic() {
             return false;
         }
         let c = (self.corner_radius() + 1) as i32;
@@ -1685,7 +1841,7 @@ impl Window {
     /// содержимое. Разделение не косметическое: фокус живёт у композитора, и
     /// окно, взявшееся угадывать его само, ошибётся на первом же переключении.
     pub fn restyle(&mut self) {
-        let bar = self.bar();
+        let (bar, side) = (self.bar(), self.frame());
         match &mut self.content {
             Content::Text(grid) => {
                 // Заливается вся область содержимого, а не только сетка: в
@@ -1693,7 +1849,7 @@ impl Window {
                 // внизу — несколько точек, а то и полтора десятка — иначе
                 // остаётся полосой прежней темы под самой рамкой. Цвета
                 // терминала от темы не зависят (T5).
-                let area = content_area(&self.surface, bar);
+                let area = content_area(&self.surface, bar, side);
                 self.surface.fill(area, mini_ui::text::TERM_BG);
                 grid.recolor(&mut self.surface, mini_ui::text::TERM_FG, mini_ui::text::TERM_BG);
                 grid.take_damage();
@@ -1738,7 +1894,7 @@ impl Window {
             return false;
         }
         let ctx = self.ctx();
-        let area = grid_area(&self.surface, self.scale, true);
+        let area = grid_area(&self.surface, self.scale, true, self.bar(), self.frame());
         let Some(mut grid) = TextGrid::new(area, ctx.face(Role::Mono), mini_ui::text::TERM_FG, mini_ui::text::TERM_BG) else {
             return false;
         };
@@ -1767,7 +1923,7 @@ impl Window {
         incoming.session = self.session;
         self.tabs.push(incoming);
         self.session = session;
-        let area = content_area(&self.surface, self.bar() + self.strip_h());
+        let area = content_area(&self.surface, self.bar() + self.strip_h(), self.frame());
         self.surface.fill(area, mini_ui::text::TERM_BG);
         if let Content::Text(grid) = &mut self.content {
             grid.show(&mut self.surface);
@@ -1836,7 +1992,7 @@ impl Window {
         }
         let session = self.session;
         let ctx = self.ctx();
-        let area = grid_area(&self.surface, self.scale, true);
+        let area = grid_area(&self.surface, self.scale, true, self.bar(), self.frame());
         let blank = TextGrid::new(area, ctx.face(Role::Mono), mini_ui::text::TERM_FG, mini_ui::text::TERM_BG)?;
         let Content::Text(current) = &mut self.content else {
             return None;
@@ -1861,7 +2017,7 @@ impl Window {
         let LooseTab { session, mut grid, title, renamed } = tab;
         grid.hide();
         // Сетка привязана к точкам прежнего окна: здесь у неё своя область.
-        let area = grid_area(&self.surface, self.scale, true);
+        let area = grid_area(&self.surface, self.scale, true, self.bar(), self.frame());
         let _ = grid.rebind(&mut self.surface, area);
         self.tabs.push(TermTab { session, grid });
         self.tab_order.push(session);
@@ -1883,9 +2039,9 @@ impl Window {
             return Err(tab);
         }
         let LooseTab { session, mut grid, title, renamed } = tab;
-        let area = grid_area(&self.surface, self.scale, true);
+        let area = grid_area(&self.surface, self.scale, true, self.bar(), self.frame());
         let _ = grid.rebind(&mut self.surface, area);
-        let back = content_area(&self.surface, self.bar());
+        let back = content_area(&self.surface, self.bar(), self.frame());
         self.surface.fill(back, mini_ui::text::TERM_BG);
         if let Content::Text(current) = &mut self.content {
             *current = grid;
@@ -1947,8 +2103,8 @@ impl Window {
             return false;
         }
         let (lx, ly) = (x - self.rect.x, y - self.rect.y);
-        let top = if Self::separate_strip() { Self::title_height(self.scale) as i32 } else { 0 };
-        let h = if Self::separate_strip() { self.ctx().px(STRIP_H) } else { Self::title_height(self.scale) };
+        let top = if Self::separate_strip() { self.bar() as i32 } else { 0 };
+        let h = if Self::separate_strip() { self.ctx().px(STRIP_H) } else { self.bar() };
         ly >= top && ly < top + h as i32 && lx < self.minimize_button().x
     }
 
@@ -2086,7 +2242,9 @@ impl Window {
             let title = Self::title_height(self.scale);
             (0, title, ctx.px(8), (self.minimize_button().x - ctx.px(8) as i32).max(0) as u32)
         } else {
-            (Self::title_height(self.scale) as i32, ctx.px(STRIP_H), ctx.px(6), self.surface.width().saturating_sub(ctx.px(6)))
+            // Classic (23.11): under the title band, inside the frame.
+            let side = self.frame();
+            (self.bar() as i32, ctx.px(STRIP_H), side + ctx.px(6), self.surface.width().saturating_sub(side + ctx.px(6)))
         };
         let plus_w = ctx.px(28);
         let count = self.tab_order.len().max(1) as u32;
@@ -2114,8 +2272,8 @@ impl Window {
         let ctx = self.ctx();
         let p = ctx.palette;
         let strip = if Self::separate_strip() {
-            let top = Self::title_height(self.scale) as i32;
-            let strip = Rect::new(0, top, self.surface.width(), ctx.px(STRIP_H));
+            let (top, side) = (self.bar() as i32, self.frame());
+            let strip = Rect::new(side as i32, top, self.surface.width().saturating_sub(2 * side), ctx.px(STRIP_H));
             self.surface.fill(strip, ctx.flat(p.tb2));
             strip
         } else {
@@ -2385,7 +2543,7 @@ impl Window {
         if matches!(self.content, Content::Text(_)) {
             return;
         }
-        let area = content_area(&self.surface, self.bar());
+        let area = content_area(&self.surface, self.bar(), self.frame());
         let at = self.pixels_at();
         let ctx = self.ctx();
         // Содержимое рисуется поверх прежнего, и заливка обязательна: список,
@@ -2412,9 +2570,12 @@ impl Window {
             }
         }
         self.damage = self.damage.union(&area);
-        // Заливка стёрла обводку по бокам и снизу.
-        let focused = self.edge.focused;
-        self.paint_edge(focused);
+        // Заливка стёрла обводку по бокам и снизу (the classic frame lies
+        // outside the filled area, 23.11).
+        if !Self::classic() {
+            let focused = self.edge.focused;
+            self.paint_edge(focused);
+        }
     }
 
     /// Показать в «Параметрах» раздел экрана.
@@ -2479,7 +2640,7 @@ impl Window {
     /// `true` — содержимое им воспользовалось и окно перерисовано. Текстовые
     /// окна щелчков не разбирают: в них нечего выбирать мышью.
     pub fn handle_click(&mut self, x: i32, y: i32) -> bool {
-        let area = content_area(&self.surface, self.bar());
+        let area = content_area(&self.surface, self.bar(), self.frame());
         let ctx = self.ctx();
         let local = (x - self.rect.x, y - self.rect.y);
         let used = match &mut self.content {
@@ -2730,10 +2891,11 @@ impl Window {
         let Some(mut surface) = Surface::new(w, h, theme::window_bg()) else {
             return false;
         };
-        let inner = grid_area(&surface, self.scale, !self.tab_order.is_empty());
+        let (top, side) = (self.bar(), self.frame());
+        let inner = grid_area(&surface, self.scale, !self.tab_order.is_empty(), top, side);
         match &mut self.content {
             Content::Text(grid) => {
-                surface.fill(content_area(&surface, Self::title_height(self.scale)), mini_ui::text::TERM_BG);
+                surface.fill(content_area(&surface, top, side), mini_ui::text::TERM_BG);
                 if !grid.rebind(&mut surface, inner) {
                     return false;
                 }
@@ -2766,7 +2928,8 @@ impl Window {
         self.draw_decorations(false);
         self.damage = Rect::new(0, 0, w, h);
         if self.is_program() && self.resizable() {
-            self.ask_resize(w, h.saturating_sub(self.bar()));
+            let (cw, ch) = self.content_of(w, h);
+            self.ask_resize(cw, ch);
         }
         true
     }
@@ -2884,7 +3047,17 @@ impl Window {
     /// Забыть, что окно развёрнуто, оставив его размер и место (его сдвинули
     /// клавишами): кнопка снова предлагает «развернуть».
     pub fn forget_maximized(&mut self, focused: bool) {
-        if self.restore.take().is_some() {
+        let chrome = self.chrome_at(self.scale);
+        if let Some(rect) = self.restore.take() {
+            // Classic (23.11): the frame comes back - the window is rebuilt
+            // around a smaller content (the program is asked for it).
+            if self.chrome_at(self.scale) != chrome {
+                let (w, h) = (self.rect.w, self.rect.h);
+                if !self.rebuild(w, h) {
+                    self.restore = Some(rect);
+                    return;
+                }
+            }
             self.draw_decorations(focused);
         }
     }
@@ -2895,7 +3068,7 @@ impl Window {
     /// просьба исполнена.
     pub fn ask_configure(&mut self) {
         if self.is_program() && self.resizable() {
-            let (w, h) = (self.rect.w, self.rect.h.saturating_sub(self.bar()));
+            let (w, h) = self.content_of(self.rect.w, self.rect.h);
             self.ask_resize(w, h);
         }
     }
@@ -2917,7 +3090,7 @@ impl Window {
         self.rect.x = area.x;
         self.rect.y = area.y;
         self.full_from = Some(previous);
-        self.full_size = (area.w, area.h.saturating_sub(self.bar()));
+        self.full_size = self.content_of(area.w, area.h);
         self.ask_configure();
         true
     }
@@ -3030,7 +3203,7 @@ impl Window {
         let Content::Program(view) = &self.content else {
             return;
         };
-        let content = content_area(&self.surface, self.bar());
+        let content = content_area(&self.surface, self.bar(), self.frame());
         let origin = self.pixels_at();
         let whole = view.pixels.bounds();
         let src = area.unwrap_or(whole).intersect(&whole);
@@ -3238,12 +3411,12 @@ fn own(text: &str) -> Option<String> {
 /// которая обязана доходить до края окна, до него не доходит.
 /// Где лежит сетка терминала: область содержимого без полосы вкладок и с
 /// полем в четыре точки.
-fn grid_area(surface: &Surface, scale: mini_ui::Scale, strip: bool) -> Rect {
+fn grid_area(surface: &Surface, scale: mini_ui::Scale, strip: bool, bar: u32, side: u32) -> Rect {
     let ctx = Ctx::scaled(scale);
     // С 72h вкладки ПК — в заголовке (макет 15), своя полоса только у
-    // телефона.
-    let top = Window::title_height(scale) + if strip && Window::separate_strip() { ctx.px(STRIP_H) } else { 0 };
-    let mut area = content_area(surface, top).shrink(ctx.px(4));
+    // телефона (и в классике).
+    let top = bar + if strip && Window::separate_strip() { ctx.px(STRIP_H) } else { 0 };
+    let mut area = content_area(surface, top, side).shrink(ctx.px(4));
     // Справа — поле под уголок размера (20.11). Сетка прокручивается
     // сдвигом пикселей (`Surface::scroll_up`), и точки уголка, лежавшие в
     // её прямоугольнике, уезжали вверх с каждой строкой вывода — вдоль
@@ -3278,11 +3451,13 @@ fn make_opaque(surface: &mut Surface, rect: Rect) {
     }
 }
 
-fn content_area(surface: &Surface, top: u32) -> Rect {
+/// The content below the title band `top` and inside the side frame `side`
+/// (the classic Windows 98 frame, 23.11; 0 otherwise).
+fn content_area(surface: &Surface, top: u32, side: u32) -> Rect {
     Rect::new(
-        0,
+        side as i32,
         top as i32,
-        surface.width(),
-        surface.height().saturating_sub(top),
+        surface.width().saturating_sub(2 * side),
+        surface.height().saturating_sub(top + side),
     )
 }

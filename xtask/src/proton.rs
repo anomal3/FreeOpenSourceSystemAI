@@ -62,12 +62,20 @@ pub const SHA256: &str = "0595159e417c3dbbfb7cc3ae0d3ed15a617cc607aa23ef756ea790
 const ROOT: &str = "GE-Proton11-12-x86_64/files/";
 
 /// Что из `files/` не кладётся (префиксы путей).
-const SKIP_PREFIXES: [&str; 10] = [
+const SKIP_PREFIXES: [&str; 12] = [
     // Драйвер X11 целиком (12.11): без `winex11.so` его PE-часть всё равно
     // грузится, `explorer` выбирает x11 первым по списку и остаётся без
     // окна («no driver could be loaded») — до `wayland` дело не доходит.
     "lib/wine/x86_64-windows/winex11.drv",
     "lib/wine/i386-windows/winex11.drv",
+    // Звук PulseAudio (24.11, hw-log17): `winepulse.so` не кладётся (нет
+    // libpulse и сервера), а PE-часть грузилась первой по списку mmdevapi
+    // («pulse,alsa,...») — `load_driver Unable to load UNIX functions:
+    // c0000135` в каждой игре, и по журналу казалось, что звука нет вовсе.
+    // Звук идёт через `winealsa` (следующий по списку); без PE-части pulse
+    // mmdevapi берёт его сразу и молча.
+    "lib/wine/x86_64-windows/winepulse.drv",
+    "lib/wine/i386-windows/winepulse.drv",
     // wine-mono и Gecko: .NET — своим `clr-vm`, HTML-движок не нужен; в
     // скрипте они и так выключены (`mscoree,mshtml=`).
     "share/wine/mono/",
@@ -250,6 +258,10 @@ pub fn save_template(disk: &std::path::Path, guest_dir: &str, name: &str) -> Res
     Ok(())
 }
 
+/// Файлы шаблона префикса, которые в пакет не кладутся (пути от корня
+/// префикса), - и которые `fossai-proton` убирает из готовых префиксов.
+const PREFIX_SKIP: [&str; 2] = ["drive_c/windows/system32/winepulse.drv", "drive_c/windows/syswow64/winepulse.drv"];
+
 /// Шаблон префикса в пакет: файлы — `share/fossai/prefix/…`, пустые каталоги
 /// и ссылки (их у fpk нет) — списком `share/fossai/prefix.list` (`d путь`,
 /// `l путь цель`), его разбирает `fossai-proton`. `false` — снимка нет.
@@ -273,6 +285,12 @@ fn add_template(name: &str, files: &mut Vec<(String, Vec<u8>, u32)>) -> Result<b
                 let mode = u32::from_str_radix(mode, 8).unwrap_or(0o644);
                 let data = blob.get(at..at + size).with_context(|| format!("{}: короче списка", blob_path.display()))?;
                 at += size;
+                // Копии PE-части pulse в префиксе (24.11): Wine грузит их как
+                // встроенные из system32 и без `winepulse.so` (не кладётся)
+                // отвечает mmdevapi `c0000135` - см. SKIP_PREFIXES.
+                if PREFIX_SKIP.iter().any(|skip| path.eq_ignore_ascii_case(skip)) {
+                    continue;
+                }
                 // Каталоги файла — уже не пустые.
                 let mut dir = *path;
                 while let Some((up, _)) = dir.rsplit_once('/') {
@@ -476,6 +494,14 @@ pub fn build(arch: Arch) -> Result<()> {
 
     // OpenGL и Vulkan на процессоре (шаги 5-6, 12.11).
     crate::mesa::add(&cache, &mut files, patch_interp)?;
+    // Звук игр (24.11, hw-log17 «звука нет ни в одной игре»): WASAPI игр -
+    // формат микшера float32, и `plug` ставит перевод формата, а его модули
+    // пишут в устройство только через mmap (ALSA: `Unable to set hw params:
+    // -22`, IAudioClient::Initialize 0x8889000F). ALSA ядра даёт только
+    // RW_INTERLEAVED - между ними `mmap_emul` libasound (mmap поверх
+    // writei/readi). waveOut (16 бит, без перевода) шёл и так.
+    let alsa = "pcm.fossai_rw { type mmap_emul slave.pcm \"hw:0,0\" }\npcm.!default { type plug slave.pcm \"fossai_rw\" }\n";
+    files.push((String::from("share/alsa/fossai-proton.conf"), alsa.as_bytes().to_vec(), 0o644));
 
     let script = concat!("#!/bin/bash\n\
         # GE-Proton (12.11.2026): программы и игры Windows без Steam, окна —\n\
@@ -516,7 +542,9 @@ pub fn build(arch: Arch) -> Result<()> {
         export WINE_USE_EGL=${WINE_USE_EGL:-1}\n\
         # Звук: libasound со своими настройками (ALSA ядра, `plug` поверх hw:0,0).\n\
         export ALSA_CONFIG_DIR=$P/share/alsa\n\
-        export ALSA_CONFIG_PATH=$P/share/alsa/alsa.conf:$P/share/alsa/fossai.conf\n\
+        # `fossai-proton.conf` (24.11): plug поверх mmap_emul - перевод формата\n\
+        # (float32 игр) без mmap в ядре.\n\
+        export ALSA_CONFIG_PATH=$P/share/alsa/alsa.conf:$P/share/alsa/fossai.conf:$P/share/alsa/fossai-proton.conf\n\
         export XKB_CONFIG_ROOT=$P/share/X11/xkb\n\
         # OpenGL и Vulkan на процессоре (Mesa trixie, 12.11): EGL через glvnd,\n\
         # llvmpipe и lavapipe.\n\
@@ -627,26 +655,67 @@ unpct() { local e=${1//\%/\\x}; printf -v U '%b' "$e"; }
 klog() { echo "$1"; [ -w /dev/kmsg ] && echo "$1" > /dev/kmsg; }
 # Журнал игры Unity (22.11, Uot «сервер не отвечает»): `Player.log` в
 # `ПРЕФИКС/drive_c/users/*/AppData/LocalLow/КОМПАНИЯ/ИГРА/`, изменённый за этот
-# запуск, - строки о сети, TLS, исключениях и версии движка в журнал ядра (не
-# больше 18: ядро берёт 20 строк /dev/kmsg в секунду). Весь файл - там же.
+# запуск, - строки о сети, TLS, исключениях, версии движка и (24.11, Case88:
+# чёрный экран, `Kernel 'KDepthDownsample8DualUav' not found` 21 тыс. раз)
+# о графике - выбранный API и уровень (`Direct3D:`, `Version:`, `Renderer:`),
+# GfxDevice, Vulkan, неподдержанные шейдеры и ядра. Каждая строка - один раз,
+# с числом повторов (`(x21511)`): повторы одной ошибки больше не съедают
+# место. Не больше 36 разных строк, по 15 в секунду (ядро берёт 20 строк
+# /dev/kmsg в секунду). Весь файл - там же.
 unity_log() {
-    local f line k=0 more=0
+    local f line k n
     [ -e /dev/kmsg ] || return 0
     for f in "$WINEPREFIX"/drive_c/users/*/AppData/LocalLow/*/*/Player.log; do
         [ -f "$f" ] && [ "$f" -nt "$C/run.mark" ] || continue
         printf 'proton: Unity log %s\n' "${f#"$WINEPREFIX"/}" > /dev/kmsg
+        local -A cnt=()
+        local -a order=()
         while IFS= read -r line; do
+            line=${line%$'\r'}
             case $line in
-                *'Initialize engine version'*|*'Curl error'*|*SSL*|*TLS*|*ertificate*|*'Cannot connect'*|*'Cannot resolve'*|*'Unable to'*|*'Request timeout'*|*xception*|*'Нет связи'*)
-                    if [ $k -lt 18 ]; then
-                        k=$((k + 1)); printf 'proton: Player.log: %.300s\n' "${line%$'\r'}" > /dev/kmsg
-                    else
-                        more=$((more + 1))
-                    fi ;;
+                *'Initialize engine version'*|*Direct3D*|*'Version:'*|*'Renderer:'*|*'Vendor:'*|*'VRAM:'*|*'Driver:'*|*GfxDevice*|*Vulkan*|*'feature level'*|*'Feature level'*|*hader*|*'Kernel '*|*ompute*|*'not supported'*|*nsupported*|*WARNING*|*ERROR*|*'Curl error'*|*SSL*|*TLS*|*ertificate*|*'Cannot connect'*|*'Cannot resolve'*|*'Unable to'*|*'Request timeout'*|*xception*|*'Нет связи'*)
+                    line=${line:0:300}
+                    n=${cnt[$line]}
+                    if [ -z "$n" ]; then cnt[$line]=1; order+=("$line"); else cnt[$line]=$((n + 1)); fi ;;
             esac
         done < "$f"
-        [ $more -gt 0 ] && printf 'proton: Player.log: %d more such line(s)\n' $more > /dev/kmsg
+        k=0
+        for line in "${order[@]}"; do
+            [ $k -ge 36 ] && break
+            k=$((k + 1)); n=${cnt[$line]}
+            if [ "$n" -gt 1 ]; then printf 'proton: Player.log: %s (x%d)\n' "$line" "$n"; else printf 'proton: Player.log: %s\n' "$line"; fi > /dev/kmsg
+            [ $((k % 15)) -eq 0 ] && LD_LIBRARY_PATH= sleep 1
+        done
+        [ ${#order[@]} -gt 36 ] && printf 'proton: Player.log: %d more distinct line(s)\n' $((${#order[@]} - 36)) > /dev/kmsg
+        unset cnt order
     done
+}
+# Свои ключи и переменные игры (24.11, Case88): файл
+# ~/.config/fossai-proton/games, строки `ИМЯ.exe СЛОВА…` (`#` - заметка; имя -
+# без пути, без учёта регистра латиницы). Слово вида ИМЯ=ЗНАЧЕНИЕ - переменная
+# окружения (`DXVK_FILTER_DEVICE_NAME=NVIDIA`), остальные - ключи игре
+# (`-force-d3d11`, `-force-vulkan`). Пример: `Дело 88.exe -force-d3d11`.
+# Работает для запуска из «Файлов» и «Пуска» (`--open`, `--shortcut`).
+GA=()
+game_args() {
+    local cfg=$HOME/.config/fossai-proton/games n=${1##*/} l k r w
+    GA=()
+    [ -f "$cfg" ] || return 0
+    n=${n,,}
+    while IFS= read -r l || [ -n "$l" ]; do
+        l=${l%$'\r'}
+        case $l in ''|'#'*) continue ;; esac
+        case ${l,,} in *.exe*) ;; *) continue ;; esac
+        k=${l,,}; k=${k%%.exe*}.exe
+        [ "$k" = "$n" ] || continue
+        r=${l:${#k}}
+        set -f
+        for w in $r; do
+            case $w in [A-Za-z_]*=*) export "$w" ;; *) GA+=("$w") ;; esac
+        done
+        set +f
+        klog "fossai-proton: settings for ${1##*/} from $cfg:$r"
+    done < "$cfg"
 }
 # Установленная TMNF (`ПРЕФИКС/drive_c/TmNationsForever/TmForever.exe`) из
 # «Файлов» или ярлыка «Пуска» (winemenubuilder установщика) - тем же путём,
@@ -688,6 +757,7 @@ case "$1" in
         esac
         r=Wine; [ -e /dev/dri/renderD128 ] || r="Wine (no GPU node: wined3d on the CPU)"; [ "$1" = --dxvk ] && r="DXVK/vkd3d-proton (GPU node present)"
         case "$1" in --d2r=*) r="D2R launcher" ;; esac
+        case "$1|${f,,}" in --d2r=*) ;; *.exe) game_args "$f"; [ ${#GA[@]} -gt 0 ] && set -- "$@" "${GA[@]}" ;; esac
         klog "fossai-proton: open $f via $r" ;;
     # `--with=ПРОГРАММА.exe ФАЙЛ…` (22.11) - «Открыть с помощью»: программа
     # Windows из префикса (префикс - по её пути) открывает файлы; их пути
@@ -748,7 +818,8 @@ case "$1" in
         tmnf_handoff "$u" "$@"
         # Ярлык .exe при узле видеокарты - через DXVK/vkd3d-proton, как `--open`.
         case "${u,,}" in
-            *.exe) if [ -e /dev/dri/renderD128 ]; then set -- --dxvk start /wait /unix "$u" "$@"; else set -- start /wait /unix "$u" "$@"; fi ;;
+            *.exe) if [ -e /dev/dri/renderD128 ]; then set -- --dxvk start /wait /unix "$u" "$@"; else set -- start /wait /unix "$u" "$@"; fi
+                game_args "$u"; [ ${#GA[@]} -gt 0 ] && set -- "$@" "${GA[@]}" ;;
             *) set -- start /wait /unix "$u" "$@" ;;
         esac ;;
 esac
@@ -891,6 +962,12 @@ drives() {
     for k in "${!lk[@]}"; do printf '%s\t%s\n' "${lk[$k]}" "$k" >> "$map"; done
 }
 case "$1" in --server-debug=*) ;; *) drives ;; esac
+# Звук (24.11, hw-log17): PE-копия pulse в префиксе грузилась как встроенная
+# и без `winepulse.so` давала mmdevapi `c0000135` - убрать и из префиксов,
+# созданных раньше (новые шаблон уже без неё); mmdevapi берёт winealsa.
+for x in "$WINEPREFIX"/drive_c/windows/system32/winepulse.drv "$WINEPREFIX"/drive_c/windows/syswow64/winepulse.drv; do
+    [ -e "$x" ] && LD_LIBRARY_PATH= rm -f "$x"
+done
 "#, "\
         # `--prefix` - только приготовить префикс (`bin/tmnf`).\n\
         case \"$1\" in --prefix) exit 0 ;; esac\n\
@@ -920,7 +997,10 @@ fi
 if [ -z "$B" ]; then
     [ -e /dev/kmsg ] || exec $W "$@"
     p=${1##*/}; p=${p##*\\}; [ "$p" = explorer ] && { p=${3##*/}; p=${p##*\\}; }
-    : > "$C/run.mark" 2>/dev/null
+    # Метка запуска - новым файлом (24.11, hw-log17): `: >` по уже пустому
+    # файлу время изменения не двигал, и `Player.log` Case88 печатался после
+    # каждого следующего запуска любой игры.
+    LD_LIBRARY_PATH= rm -f "$C/run.mark"; : > "$C/run.mark" 2>/dev/null
     $W "$@" 2>&1 | {
         n=0; sum=0; lo=; hi=0; t=$SECONDS; k=0
         while IFS= read -r line; do
@@ -940,7 +1020,7 @@ if [ -z "$B" ]; then
                     # режим показа, ошибки. Полные журналы - $DXVK_LOG_PATH.
                     if [ $k -lt 200 ]; then
                         case $line in
-                            *'DXVK: v'*|*'Found device:'*|*'Present mode:'*|*'Buffer size:'*|*'vkd3d-proton - build'*|err:*|*':err:'*|*'DEVICE_LOST'*|*'DXVK: Failed'*)
+                            *'DXVK: v'*|*'Found device:'*|*'Present mode:'*|*'Buffer size:'*|*'vkd3d-proton - build'*|err:*|*':err:'*|*'DEVICE_LOST'*|*'DXVK: Failed'*|*'feature level'*|*FEATURE_LEVEL*|*'not suitable'*|*'Unsupported'*)
                                 k=$((k + 1)); printf 'proton: %s: %.300s\n' "$p" "$line" > /dev/kmsg ;;
                         esac
                     fi ;;
