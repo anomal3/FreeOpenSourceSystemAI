@@ -82,6 +82,31 @@ const AXES: [(u16, i32, i32, i32, i32); 8] = [
     (ABS_HAT0X, -1, 1, 0, 0),
     (ABS_HAT0Y, -1, 1, 0, 0),
 ];
+/// `gamepad trace on`: every look of a program at `/sys/…/input…` and
+/// `/dev/input` into the journal (first [`TRACE_LINES`]) - what libudev asks
+/// and what it got.
+static TRACE: AtomicBool = AtomicBool::new(false);
+static TRACED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+const TRACE_LINES: usize = 400;
+
+/// Switch [`TRACE`] (`gamepad trace on|off`).
+pub fn set_trace(on: bool) {
+    TRACED.store(0, Ordering::Relaxed);
+    TRACE.store(on, Ordering::Relaxed);
+}
+
+/// A traced look: `what` (`dir`, `text`, `link`, `path`) of `path` and the answer.
+fn trace(what: &str, path: &str, found: bool) {
+    if !TRACE.load(Ordering::Relaxed) || !(path.starts_with("/sys") || path.starts_with(DIR)) {
+        return;
+    }
+    if TRACED.fetch_add(1, Ordering::Relaxed) >= TRACE_LINES {
+        return;
+    }
+    let pid = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
+    crate::kprintln!("  gamepad     : trace pid {pid} {what} {path} -> {}", if found { "yes" } else { "no" });
+}
+
 /// Size of `struct input_event` on x86-64: `timeval` and type, code, value.
 const EVENT_LEN: usize = 24;
 /// Most events waiting for one reader; beyond - `SYN_DROPPED`.
@@ -412,6 +437,12 @@ fn in_device(path: &str) -> Option<(usize, &str)> {
 /// changes for other programs).
 #[must_use]
 pub fn directory(path: &str) -> Option<Vec<(String, NodeKind)>> {
+    let found = directory_of(path);
+    trace("dir", path, found.is_some());
+    found
+}
+
+fn directory_of(path: &str) -> Option<Vec<(String, NodeKind)>> {
     let file = |name: String| (name, NodeKind::File);
     let dir = |name: &str| (String::from(name), NodeKind::Directory);
     if path == DIR {
@@ -466,6 +497,12 @@ const ABS_WORD: &str = "3003f";
 /// Text of a sysfs file; `None` - not ours.
 #[must_use]
 pub fn text(path: &str) -> Option<String> {
+    let found = text_of(path);
+    trace("text", path, found.is_some());
+    found
+}
+
+fn text_of(path: &str) -> Option<String> {
     let (index, rest) = in_device(path)?;
     let event = format!("event{index}");
     let minor = MINOR_BASE + index as u64;
@@ -533,6 +570,7 @@ pub fn link(path: &str) -> Option<String> {
 /// them. `None` - no link of ours on the way.
 #[must_use]
 pub fn resolve(path: &str) -> Option<String> {
+    trace("path", path, true);
     let mut path = String::from(path);
     let mut changed = false;
     if let Some(rest) = path.strip_prefix(CLASS).and_then(|rest| rest.strip_prefix('/')) {
@@ -561,7 +599,9 @@ pub fn exists(path: &str) -> bool {
 
 /// `readlink` of our sysfs links; `None` - not ours.
 pub fn readlink(path: &str, buf: usize, size: usize) -> Option<i64> {
-    let target = link(path)?;
+    let target = link(path);
+    trace("readlink", path, target.is_some());
+    let target = target?;
     let len = target.len().min(size);
     Some(match super::ipc::write_user(buf, &target.as_bytes()[..len]) {
         Ok(()) => len as i64,

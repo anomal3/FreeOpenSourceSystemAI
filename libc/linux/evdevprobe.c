@@ -28,7 +28,7 @@ __asm__(".section .note.ABI-tag, \"a\", @note\n"
 enum {
     SYS_read = 0, SYS_write = 1, SYS_open = 2, SYS_close = 3, SYS_stat = 4, SYS_fstat = 5, SYS_poll = 7,
     SYS_ioctl = 16, SYS_readlink = 89, SYS_getdents64 = 217, SYS_exit_group = 231, SYS_inotify_add_watch = 254,
-    SYS_openat = 257, SYS_faccessat = 269, SYS_inotify_init1 = 294,
+    SYS_openat = 257, SYS_faccessat = 269, SYS_inotify_init1 = 294, SYS_fstatfs = 138,
 };
 enum { ENOENT = 2, EAGAIN = 11, ENODEV = 19, EINVAL = 22 };
 enum { O_RDONLY = 0, O_RDWR = 2, O_NONBLOCK = 04000, O_DIRECTORY = 0200000, O_NOFOLLOW = 0400000, O_PATH = 010000000 };
@@ -250,6 +250,10 @@ void start_c(u64 *sp) {
         }
         check(good, "openat O_PATH|O_NOFOLLOW walks /sys/devices/virtual/input/input0/event0");
         check(good && sys4(SYS_faccessat, at, "uevent", 0, 0) == 0, "faccessat(event0 dir, uevent)");
+        /* `fd_is_fs_type(fd, SYSFS_MAGIC)`: libudev refuses directories off sysfs. */
+        u64 fs[15];
+        memset(fs, 0, sizeof fs);
+        check(good && sys3(SYS_fstatfs, at, fs, 0) == 0 && fs[0] == 0x62656572, "fstatfs of the event0 dir is SYSFS_MAGIC");
         if (at >= 0) sys3(SYS_close, at, 0, 0);
         i64 up = sys3(SYS_open, "/sys/devices/virtual/input", O_PATH | O_DIRECTORY, 0);
         check(up >= 0 && sys4(SYS_faccessat, up, "uevent", 0, 0) == -ENOENT, "faccessat(virtual/input, uevent) is ENOENT (not a device)");

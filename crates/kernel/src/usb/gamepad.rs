@@ -444,6 +444,9 @@ pub fn shell(argument: &str) -> Vec<String> {
     match words.as_slice() {
         [] => {}
         ["log", on @ ("on" | "off")] => LOG.store(*on == "on", Ordering::Relaxed),
+        // What programs ask of `/dev/input` and its sysfs (libudev of Wine).
+        #[cfg(target_arch = "x86_64")]
+        ["trace", on @ ("on" | "off")] => crate::linux::evdev::set_trace(*on == "on"),
         ["fake"] | ["fake", "on"] => {
             let mut fake = FAKE.lock();
             if fake.is_none() {
