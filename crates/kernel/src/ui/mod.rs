@@ -7334,6 +7334,9 @@ pub fn resize_window(task: u32, slot: u32, pixels: Surface) -> Result<(), Window
     .unwrap_or_else(|| Err(unavailable()))
 }
 
+/// Program windows that asked for fullscreen (`WIN_STYLE_FULLSCREEN`).
+static FULL_ASKED: crate::sync::SpinLock<alloc::vec::Vec<(u32, u32)>> = crate::sync::SpinLock::new(alloc::vec::Vec::new());
+
 /// Запомнить, что умеет окно программы (фаза 62b, `user_abi::SYS_WINSTYLE`).
 pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError> {
     let app = App::Program(task, slot);
@@ -7379,6 +7382,22 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
                 log_window(desktop, app, focused);
             }
             desktop.repaint_all();
+        }
+        // Fullscreen asked by the program itself (24.11, F11 in «Фотографии»);
+        // only a change of the request acts — the other style calls of a
+        // window made fullscreen otherwise (monitor-sized) leave it so.
+        let full = flags & user_abi::WIN_STYLE_FULLSCREEN != 0;
+        let asked = FULL_ASKED.lock().contains(&(task, slot));
+        if full != asked {
+            if full {
+                FULL_ASKED.lock().push((task, slot));
+            } else {
+                FULL_ASKED.lock().retain(|known| *known != (task, slot));
+            }
+            if desktop.set_fullscreen(app, full) {
+                kprintln!("  desktop     : '{}' {} fullscreen at its request", name_of(desktop, app), if full { "is" } else { "left" });
+                desktop.repaint_all();
+            }
         }
         desktop.present();
         Ok(())

@@ -1982,6 +1982,12 @@ pub const WIN_STYLE_DIALOG: u32 = 2;
 /// момент вызова; окно, которое человек уже сдвинул, тоже переедет.
 pub const WIN_STYLE_AT_START: u32 = 4;
 
+/// [`SYS_WINSTYLE`] (24.11, F11 in «Фотографии»): the window takes its whole
+/// monitor without the frame, above the taskbar; the program gets
+/// [`WIN_RESIZE`] with the monitor size. A later call without the flag puts
+/// the window back where it stood.
+pub const WIN_STYLE_FULLSCREEN: u32 = 8;
+
 /// Ответ [`SYS_THREAD_INFO`].
 ///
 /// `stack_low..stack_high` — вся память стека, которой поток вправе

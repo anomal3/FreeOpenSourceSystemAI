@@ -964,10 +964,12 @@ impl Window {
         self.frame_at(self.scale)
     }
 
-    /// Title band of this window at `scale`: none for popups and frameless
-    /// windows; classic without the frame - only the caption.
+    /// Title band of this window at `scale`: none for popups, frameless and
+    /// fullscreen windows (24.11: F11 of a program window — the picture,
+    /// not a caption, at the top); classic without the frame - only the
+    /// caption.
     fn bar_at(&self, scale: mini_ui::Scale) -> u32 {
-        if self.popup || self.frameless {
+        if self.popup || self.frameless || self.fullscreen {
             0
         } else if Self::classic() && self.frame_at(scale) == 0 {
             CLASSIC_CAPTION * scale

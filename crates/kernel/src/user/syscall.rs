@@ -2549,7 +2549,7 @@ fn winstyle(id: i64, flags: usize) -> i64 {
     // Незнакомый флаг — отказ целиком, а не выполненная знакомая часть:
     // программа, попросившая больше, чем ядро умеет, должна узнать об этом
     // сразу, а не по окну, которое ведёт себя не так, как она рассчитывала.
-    let known = user_abi::WIN_STYLE_RESIZABLE | user_abi::WIN_STYLE_DIALOG | user_abi::WIN_STYLE_AT_START;
+    let known = user_abi::WIN_STYLE_RESIZABLE | user_abi::WIN_STYLE_DIALOG | user_abi::WIN_STYLE_AT_START | user_abi::WIN_STYLE_FULLSCREEN;
     if flags & !(known as usize) != 0 {
         return ERR_UNSUPPORTED;
     }

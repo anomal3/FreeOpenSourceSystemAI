@@ -212,6 +212,14 @@ pub trait App {
     fn size_limits(&self) -> SizeLimits {
         SizeLimits::min(DEFAULT_MIN.0, DEFAULT_MIN.1)
     }
+
+    /// Whole monitor, without the frame and the taskbar (24.11, F11 in
+    /// «Фотографии»): the frame asks after every frame and tells the desktop
+    /// (`user_abi::WIN_STYLE_FULLSCREEN`) only when the answer changed; the
+    /// new size comes as an ordinary resize.
+    fn fullscreen(&self) -> bool {
+        false
+    }
 }
 
 /// Size limits of an [`App`] window: content size in layout points; zero —
@@ -447,6 +455,9 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
     // Size limits (24.11, WM SDK) — now and whenever the program changes them.
     let mut limits = app.size_limits();
     let _ = window.set_size_limits(limits.min, limits.max);
+    // Fullscreen (24.11) — the style flags with it or without it.
+    let base_style = style | if app.resizable() { user_abi::WIN_STYLE_RESIZABLE } else { 0 };
+    let mut full = false;
 
     let mut dark = info.flags & SYSINFO_DARK != 0;
     let mut next = monotonic_ms() + spec.period_ms;
@@ -590,6 +601,14 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
             let fresh_limits = app.size_limits();
             if fresh_limits != limits && window.set_size_limits(fresh_limits.min, fresh_limits.max) >= 0 {
                 limits = fresh_limits;
+            }
+            let want_full = app.fullscreen();
+            if want_full != full {
+                let flags = base_style | if want_full { user_abi::WIN_STYLE_FULLSCREEN } else { 0 };
+                if window.set_style(flags) >= 0 {
+                    println(&format!("{}: fullscreen {}", spec.name, if want_full { "asked" } else { "left" }));
+                }
+                full = want_full;
             }
             if let Some(title) = app.title() {
                 if shown_title.as_deref() != Some(title.as_str()) && window.set_title(&title) >= 0 {
