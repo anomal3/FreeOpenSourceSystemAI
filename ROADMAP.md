@@ -17784,3 +17784,87 @@ AVI), как панель «Ножниц»: не растягивается, н�
 `waylandcheck` или OBS/Wine - Qt и winewayland шлют `set_min/max_size`); кнопка OBS
 «Определить» (модуль только собран `clang -fsyntax-only`; для образа - `thirdparty --only
 obs` и сценарий `obs` с FOSSAI_WITH_OBS=1); 2560x1440 и 125-175 % на железе.
+
+## Rupor под Proton, «неизвестный файл» на столе, медленный USB-диск (24.11, hw-log18) - **сделано, проверить на железе**
+
+**1. RuporSetup.exe (Inno Setup 6.3, «Rupor 0.2»).** Установщик кладёт в
+`%LOCALAPPDATA%\Rupor` только `Rupor.exe` (заглушка-apphost без `Rupor.dll`),
+`Updater.exe` (.NET 8, Avalonia, single-file) и `version.txt` = 1; сам клиент
+качает Updater с `update.blueboxproduction.ru/rupor/patch/` (`version.txt` на
+сервере - 51). Ярлык стола - `Desktop\Rupor.exe.lnk` -> `{app}\Updater`
+**без** `.exe`, ярлык «Пуска» - `Rupor.lnk` -> `Rupor.exe`.
+- Нет значка на столе: `winapps::target_of` не находил файла `Updater` и
+  считал ярлык ярлыком удалённой программы. Теперь цель без расширения
+  ищется как `.exe/.com/.bat/.cmd` (как `CreateProcess`); `.desktop`
+  winemenubuilder с тем же именем, что ярлык стола, больше не даёт лишнюю
+  строку «Rupor.exe» в «Пуске». `fossai-proton --shortcut` понимает и
+  `Exec="C:\\…\\Updater" ""` (такой пишет winemenubuilder Proton для ярлыка
+  стола; раньше - код 1 сразу).
+- Не запускалось: Updater (.NET 8) кончался кодом 3 за 0,1 с - рантайм .NET
+  на Windows грузит `icu.dll`, у Wine она лишь пересылает в
+  `icuuc68/icuin68`, которых в Proton нет, и ICU-прослойка рантайма делает
+  `abort()` (код 3). `fossai-proton` ставит
+  `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1` (NLS kernel32 Wine; культуры и
+  форматы работают, в отличие от Invariant). Updater открывает окно, качает
+  `1_2.patch` (38 МБ) и распаковывает 557 файлов из своей папки.
+- Дальше - ошибки самого Rupor, не наши (проверено в QEMU и разбором
+  `Updater/Models/CsUpdater.cs`): патч `1_2` помечает `Rupor.dll` как
+  «изменённый» (ждёт старую версию), а установщик её не кладёт -> «Ошибка
+  патча, файл повреждён Rupor.dll», Updater уходит в «чистое обновление»
+  (`update.zip`, версия 45), а `ApplyPatch`/`FatalPath` не ждутся (async void)
+  и `StartRupor` запускает клиент раньше конца распаковки. Клиент -
+  framework-dependent .NET 9 (`Rupor.runtimeconfig.json`: Microsoft.NETCore.App
+  9.0.0) на WinUI 3 / Windows App SDK + WebView2 + MudBlazor (MAUI Blazor
+  Hybrid): без .NET 9 Desktop Runtime в префиксе - «You must install .NET
+  Desktop Runtime»; WinUI 3 и WebView2 под Wine не работают, так что
+  настольный клиент Rupor под Proton не заработает и после установки
+  рантайма. Для FossAi у Rupor есть PWA (`web.pynop.online`) и
+  Avalonia/Linux-клиент. Что поправить в Rupor: пересобрать установщик с
+  текущим клиентом (или `version.txt` = 0 и полная загрузка), ждать
+  `ApplyPatch`, запускать клиент после распаковки.
+- Сценарий `proton-rupor` (сеть, после `install` с `FOSSAI_WITH_PROTON=1`):
+  скачивает установщик, ставит `/VERYSILENT /TASKS=desktopicon`, `winapps`
+  видит `Rupor.exe [desktop]` -> `Updater.exe`, значок на столе (снимок
+  01), Updater через `--open` открывает окно и качает патч (02, 03), строк
+  `icuuc68` нет.
+
+**2. «Неизвестный файл» на столе, который не удалить.** Ядро делит строку
+запуска по пробелам, а стол открывал `.txt` строкой `/bin/notepad
+/root/Desktop/Новый текстовый документ.txt`; Блокнот брал первое слово,
+открывал и сохранял `/root/Desktop/Новый` - файл без расширения. Удалить
+его Роман пробовал клавишей Delete - стол её не знал (в меню подпись «Del»
+была). Теперь: ядро понимает кавычки в строке запуска (`user::launch_words`:
+`"…"` - одно слово, строки без кавычек делятся как раньше), стол и «Открыть
+с помощью» берут путь с пробелом в кавычки (`openwith::line`), Блокнот
+склеивает все слова пути (как «Файлы»), Delete на столе спрашивает тем же
+окном «Удаление файла» и кладёт в корзину (файлы и папки, не системные
+значки). Сценарий `desktop-unknown`: путь с пробелами, сохранение,
+удаление клавишей файла без расширения, открытого в Блокноте.
+
+**3. «Открыл другой диск в Notepad++ - всё замедлилось».** Не Wine: игровой
+USB-диск (Netac, /usb1) отвечал на чтения `Failed(4)` и не отвечал на
+управляющие запросы; каждое неудачное чтение - сброс Bulk-Only и обеих
+точек целиком под спин-замком контроллеров (три таймаута по 500 мс,
+1,5 с с запрещёнными прерываниями: клавиатура и мышь замирали), и так по
+5 попыток файловой системы на кластер. Теперь `storage_reset` берёт замок
+на каждый шаг отдельно, `Reset Endpoint`/`Set TR Dequeue` - только по
+состоянию точки (Halted/Stopped, без «context state error»), не ответил
+сам сброс - без `CLEAR_FEATURE`, и диск 3 с «не отвечает»: передачи
+отказывают сразу (`NotAnswering`), диалог получает EIO за микросекунды.
+Ошибка фазы данных/состояния (не Stall) теперь тоже ведёт к Reset Recovery
+(раньше следующая команда ждала остановленное кольцо). **В QEMU не
+воспроизводится** (нет сбоев передачи) - проверить на железе тем же диском:
+журнал `usb-storage : reset in N ms, the disk does not answer`, irq-off
+не больше ~0,5 с.
+
+**Стенд:** с пакетами Proton+TMNF+OBSOS+Craft корень установки на диске
+20 ГиБ (слот ~4,3 ГиБ) почти полон, и установщик в QEMU копирует пакеты
+десятки минут (ext2 ищет свободные блоки) - шаг `install` не укладывался в
+15 мин. Цепочки с Proton гонять с `FOSSAI_TARGET_MIB=32768` (install за
+6 мин); таймаут шага поднят до 30 мин. Проверка: `set FOSSAI_WITH_PROTON=1`,
+`FOSSAI_TARGET_MIB=32768`, `cargo xtask test -r -a x86_64 -s
+install,desktop-unknown,proton-rupor,usbstick,exfat -j 1`.
+
+**Осталось:** winedevice всё ещё снимается SIGSEGV при заблокированном
+сигнале на ntoskrnl.exe+0x28fce (hw-log18, 9 раз за 3 запуска Notepad++);
+Rupor - см. выше (дело установщика/клиента).
