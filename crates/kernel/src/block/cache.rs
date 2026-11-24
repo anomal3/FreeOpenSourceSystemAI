@@ -187,6 +187,24 @@ impl<D: disk::BlockDevice> Cached<D> {
         false
     }
 
+    /// Is the whole [`MAX_UNIT`] block at `lba` in the cache (no copy; for
+    /// read-ahead that only needs to know what is missing).
+    pub fn holds(&self, lba: u64) -> bool {
+        self.index.get(&lba).is_some_and(|&slot| self.entries[slot].len == MAX_UNIT)
+    }
+
+    /// Forget every clean block (the frames stay for reuse): the next read
+    /// goes to the media again (`exfatcache drop`, measurements).
+    pub fn drop_clean(&mut self) {
+        for entry in &mut self.entries {
+            if !entry.dirty && entry.lba != u64::MAX {
+                self.index.remove(&entry.lba);
+                entry.lba = u64::MAX;
+                entry.used = false;
+            }
+        }
+    }
+
     /// Можно ли читать `[lba, lba + bytes)` (блоки по [`MAX_UNIT`], которых
     /// нет в кэше) с носителя мимо кэша: грязного другой геометрии рядом нет.
     /// Грязный блок той же геометрии лежит в кэше и отдаётся [`Cached::peek`].

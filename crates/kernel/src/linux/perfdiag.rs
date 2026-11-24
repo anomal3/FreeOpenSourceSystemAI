@@ -475,6 +475,10 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
                 if crate::usb::xhci::STORAGE_IRQ_WAIT.load(Ordering::Relaxed) { "irq" } else { "poll" },
             );
         }
+        // hw-log17: real command size and the asynchronous read-ahead.
+        if let Some(line) = crate::fs::exfatfs::perf_line(secs) {
+            kprintln!("  perf-diag   : {line}");
+        }
     }
 
     // 3. Процессоры и очередь.

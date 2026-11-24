@@ -115,6 +115,26 @@ static LOGGED: AtomicU64 = AtomicU64::new(0);
 /// терминалу, а не окну, и последовательность, разорванная пополам чужой
 /// перерисовкой, обязана доехать целой.
 pub fn feed(session: usize, mut window: Option<&mut Window>, text: &str) {
+    // hw-log17: a whole chunk of kernel-log text was parsed and drawn under
+    // the parser's spin lock - 4.4 ms with interrupts off. Now in pieces of
+    // [`FEED_PIECE`] bytes (cut at character boundaries), the lock taken per
+    // piece; the parser keeps its state between them, as between calls.
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut cut = rest.len().min(FEED_PIECE);
+        while !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let (piece, tail) = rest.split_at(cut);
+        feed_piece(session, window.as_deref_mut(), piece);
+        rest = tail;
+    }
+}
+
+/// See [`feed`].
+const FEED_PIECE: usize = 1024;
+
+fn feed_piece(session: usize, mut window: Option<&mut Window>, text: &str) {
     let mut parser = PARSER[session.min(crate::sched::MAX_SESSIONS - 1)].lock();
 
     // Печатаемые куски копятся и уходят в окно одной строкой: вывод по символу

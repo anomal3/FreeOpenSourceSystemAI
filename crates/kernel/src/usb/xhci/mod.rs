@@ -511,6 +511,9 @@ struct Storage {
     /// Буфер данных. Одна передача — внутри окна `window`, не пересекающего
     /// границу 64 КиБ: так дескриптор передачи всегда один и цепочки не нужны.
     data: DmaBuffer,
+    /// hw-log17: the 1 MiB buffer of a SuperSpeed disk - contiguous frames
+    /// outside the 4 MiB DMA window (base, frames); `data` is then empty.
+    big: Option<(crate::mm::PhysAddr, usize)>,
     window: (usize, usize),
     /// Адрес дескриптора, завершения которого ждут, и само завершение: код и
     /// остаток. Ставит [`Controller::handle_transfer_event`], кто бы ни
@@ -524,12 +527,38 @@ struct Storage {
     td_closed: bool,
 }
 
+impl Storage {
+    /// The data buffer: the big frames or the DMA-window buffer.
+    fn data_ptr(&self) -> *mut u8 {
+        match self.big {
+            Some((base, _)) => base.to_direct_map().as_usize() as *mut u8,
+            // SAFETY: the buffer is mapped while the device is listed.
+            None => unsafe { self.data.as_ptr::<u8>() },
+        }
+    }
+
+    fn data_phys(&self) -> u64 {
+        self.big.map_or_else(|| self.data.phys().as_u64(), |(base, _)| base.as_u64())
+    }
+}
+
 /// Размер буфера данных накопителя (hw-log15: 128 KiB, was 32 KiB - every
 /// command of a USB disk costs a round trip; 32 KiB if 128 do not fit).
 const STORAGE_BUFFER: usize = 128 * 1024;
 const STORAGE_BUFFER_SMALL: usize = 32 * 1024;
-/// Most TRBs in one storage transfer (128 KiB over 64 KiB boundaries: 3).
-const STORAGE_TD_MAX: usize = 4;
+/// hw-log17: SuperSpeed disks get 1 MiB per command, like Linux usb-storage
+/// (max_sectors 2048 for USB 3): a 128 KiB command paid CBW + CSW round
+/// trips for every 128 KiB (57 k transfers per 30 s on D2R's disk). The
+/// buffer is 64 KiB-aligned contiguous frames outside the DMA window (that
+/// window is 4 MiB for all devices; x86_64 DMA is cache-coherent).
+const STORAGE_BUFFER_SUPER: usize = 1024 * 1024;
+/// Most TRBs in one storage transfer (1 MiB over 64 KiB boundaries: 16-17).
+const STORAGE_TD_MAX: usize = STORAGE_BUFFER_SUPER / 0x1_0000 + 2;
+/// `usbwin big|small` (hw-log17): new SuperSpeed disks get the 1 MiB buffer
+/// (`big`, default) or the 128 KiB one as before (`small`, takes effect when
+/// a disk is plugged). The command size is also capped at run time by
+/// `usbwin KIB` (`usb::storage::WINDOW_CAP`).
+pub static STORAGE_BIG: AtomicBool = AtomicBool::new(true);
 /// Где в странице устройства лежат блоки команды (CBW) и состояния (CSW).
 const STORAGE_CBW_OFFSET: usize = 0;
 const STORAGE_CSW_OFFSET: usize = 512;
@@ -1800,13 +1829,26 @@ impl Controller {
         }?;
         let in_target = (found.bulk_in & 0x0F) * 2 + 1;
         let out_target = (found.bulk_out & 0x0F) * 2;
-        let data = match dma::alloc(STORAGE_BUFFER) {
-            Ok(data) => data,
-            Err(_) => dma::alloc(STORAGE_BUFFER_SMALL)?,
+        let big = if cfg!(target_arch = "x86_64")
+            && device.speed >= regs::SPEED_SUPER
+            && STORAGE_BIG.load(Ordering::Relaxed)
+        {
+            let frames = STORAGE_BUFFER_SUPER / PAGE_SIZE;
+            crate::mm::frame::with(|f| f.allocate_aligned(frames, 0x1_0000 / PAGE_SIZE)).flatten().map(|base| (base, frames))
+        } else {
+            None
+        };
+        let data = if big.is_some() {
+            dma::alloc(0)?
+        } else {
+            match dma::alloc(STORAGE_BUFFER) {
+                Ok(data) => data,
+                Err(_) => dma::alloc(STORAGE_BUFFER_SMALL)?,
+            }
         };
         // The whole buffer is the window (hw-log15): a transfer crossing a
         // 64 KiB boundary is a chain of TRBs (`storage_bulk`).
-        let window = (0, data.len());
+        let window = (0, big.map_or(data.len(), |(_, frames)| frames * PAGE_SIZE));
         // Состояние ставится до команды: при её отказе буферы вернёт
         // `free_device`.
         device.storage = Some(Storage {
@@ -1816,6 +1858,7 @@ impl Controller {
             in_target,
             out_target,
             data,
+            big,
             window,
             awaited: 0,
             done: None,
@@ -3448,6 +3491,9 @@ unsafe fn free_device(device: &Device) {
             dma::free(storage.bulk_in.buffer());
             dma::free(storage.bulk_out.buffer());
             dma::free(&storage.data);
+            if let Some((base, frames)) = storage.big {
+                crate::mm::frame::with(|f| f.free_contiguous(base, frames));
+            }
         }
         for entry in &device.extra {
             dma::free(entry.interrupt.buffer());
@@ -4199,7 +4245,7 @@ pub fn with_storage_buffers<R>(
             (
                 core::slice::from_raw_parts_mut(page.add(STORAGE_CBW_OFFSET), 31),
                 core::slice::from_raw_parts_mut(page.add(STORAGE_CSW_OFFSET), 13),
-                core::slice::from_raw_parts_mut(storage.data.as_ptr::<u8>().add(storage.window.0), storage.window.1),
+                core::slice::from_raw_parts_mut(storage.data_ptr().add(storage.window.0), storage.window.1),
             )
         };
         Some(f(command, status, data))
@@ -4232,7 +4278,7 @@ pub fn storage_bulk(handle: StorageHandle, dir_in: bool, buffer: StorageBuffer, 
             let phys = match buffer {
                 StorageBuffer::Command => page + STORAGE_CBW_OFFSET as u64,
                 StorageBuffer::Status => page + STORAGE_CSW_OFFSET as u64,
-                StorageBuffer::Data => storage.data.phys().as_u64() + storage.window.0 as u64,
+                StorageBuffer::Data => storage.data_phys() + storage.window.0 as u64,
             };
             let len = match buffer {
                 StorageBuffer::Data => len.min(storage.window.1),
@@ -4308,8 +4354,13 @@ pub fn storage_bulk(handle: StorageHandle, dir_in: bool, buffer: StorageBuffer, 
         && crate::sched::preemption_on()
         && crate::sched::hrsleep::enabled();
     let finish = |result: Result<usize, BulkError>| {
+        let took = crate::time::uptime_ns().saturating_sub(started);
         STORAGE_BULKS.fetch_add(1, Ordering::Relaxed);
-        STORAGE_BULK_NS.fetch_add(crate::time::uptime_ns().saturating_sub(started), Ordering::Relaxed);
+        STORAGE_BULK_NS.fetch_add(took, Ordering::Relaxed);
+        if matches!(buffer, StorageBuffer::Data) {
+            STORAGE_DATA_BULKS.fetch_add(1, Ordering::Relaxed);
+            STORAGE_DATA_NS.fetch_add(took, Ordering::Relaxed);
+        }
         if let Ok(bytes) = result {
             STORAGE_BULK_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
         }
@@ -4373,6 +4424,17 @@ static STORAGE_BULKS: AtomicU64 = AtomicU64::new(0);
 static STORAGE_BULK_NS: AtomicU64 = AtomicU64::new(0);
 static STORAGE_BULK_BYTES: AtomicU64 = AtomicU64::new(0);
 static STORAGE_SLEEPS: AtomicU64 = AtomicU64::new(0);
+/// hw-log17: the data stages alone (the bulk count above includes the
+/// 31-byte CBW and 13-byte CSW of every command, so "KiB each" was a third
+/// of the real command size).
+static STORAGE_DATA_BULKS: AtomicU64 = AtomicU64::new(0);
+static STORAGE_DATA_NS: AtomicU64 = AtomicU64::new(0);
+
+/// `(data stages, their ns)` of USB disk commands since boot.
+#[must_use]
+pub fn storage_data_stats() -> (u64, u64) {
+    (STORAGE_DATA_BULKS.load(Ordering::Relaxed), STORAGE_DATA_NS.load(Ordering::Relaxed))
+}
 
 /// `(bulk transfers, their ns, bytes, sleeps)` of USB disks since boot.
 #[must_use]

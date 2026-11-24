@@ -1538,14 +1538,76 @@ fn run_builtin(line: &str) -> bool {
         // hw-log15: read-ahead after a random miss on exFAT, KiB.
         "exfatra" => {
             use core::sync::atomic::Ordering::Relaxed;
-            match argument.trim() {
-                "" => {}
-                value => match value.parse::<u64>() {
+            // hw-log17: `exfatra async KIB` - asynchronous read-ahead of
+            // sequential readers (0 = off).
+            match argument.trim().split_once(' ').map_or((argument.trim(), ""), |(a, b)| (a, b.trim())) {
+                ("", _) => {}
+                ("async", value) => match value.parse::<u64>() {
+                    Ok(kib) => fs::exfatfs::READAHEAD_ASYNC.store(kib.min(64 * 1024) * 1024, Relaxed),
+                    Err(_) => sprintln!("  exfatra: usage `exfatra async KIB`"),
+                },
+                (value, _) => match value.parse::<u64>() {
                     Ok(kib) => fs::exfatfs::READAHEAD_RANDOM.store(kib.min(1024) * 1024, Relaxed),
-                    Err(_) => sprintln!("  exfatra: usage `exfatra [KIB]`"),
+                    Err(_) => sprintln!("  exfatra: usage `exfatra [KIB]` or `exfatra async KIB`"),
                 },
             }
-            sprintln!("  exfatra: {} KiB", fs::exfatfs::READAHEAD_RANDOM.load(Relaxed) / 1024);
+            let (requests, bytes, waits, wait_ns) = fs::exfatfs::ahead_stats();
+            sprintln!(
+                "  exfatra: {} KiB, async {} KiB; {requests} async requests, {} KiB, {waits} waits ({} us each)",
+                fs::exfatfs::READAHEAD_RANDOM.load(Relaxed) / 1024,
+                fs::exfatfs::READAHEAD_ASYNC.load(Relaxed) / 1024,
+                bytes / 1024,
+                wait_ns / waits.max(1) / 1000
+            );
+        }
+        // hw-log17: `usbwin KIB` caps a USB disk command (0 = the device's
+        // whole window: 1 MiB on SuperSpeed); `usbwin big|small` - the
+        // buffer of a disk plugged from now on (1 MiB or 128 KiB).
+        "usbwin" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            match argument.trim() {
+                "" => {}
+                "big" => crate::usb::xhci::STORAGE_BIG.store(true, Relaxed),
+                "small" => crate::usb::xhci::STORAGE_BIG.store(false, Relaxed),
+                value => match value.parse::<usize>() {
+                    Ok(kib) => crate::usb::storage::WINDOW_CAP.store(kib.min(4096) * 1024, Relaxed),
+                    Err(_) => sprintln!("  usbwin: usage `usbwin [KIB|big|small]`"),
+                },
+            }
+            let (commands, ns) = crate::usb::xhci::storage_data_stats();
+            sprintln!(
+                "  usbwin: cap {} KiB (0 = whole window), new disks {}; {commands} commands, {} us each",
+                crate::usb::storage::WINDOW_CAP.load(Relaxed) / 1024,
+                if crate::usb::xhci::STORAGE_BIG.load(Relaxed) { "big" } else { "small" },
+                ns / commands.max(1) / 1000
+            );
+        }
+        // hw-log17 (tests): `usbslow FIXED_US MBPS` - a USB disk read command
+        // lasts at least that long (a QEMU disk answers at once); `0 0` off.
+        "usbslow" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            let mut words = argument.split_whitespace().map(str::parse::<u64>);
+            match (words.next(), words.next()) {
+                (None, _) => {}
+                (Some(Ok(fixed)), Some(Ok(rate))) => {
+                    crate::usb::storage::SLOW_US.store(fixed.min(100_000), Relaxed);
+                    crate::usb::storage::SLOW_MBPS.store(rate, Relaxed);
+                }
+                _ => sprintln!("  usbslow: usage `usbslow FIXED_US MBPS`"),
+            }
+            sprintln!(
+                "  usbslow: {} us + {} MB/s per read command",
+                crate::usb::storage::SLOW_US.load(Relaxed),
+                crate::usb::storage::SLOW_MBPS.load(Relaxed)
+            );
+        }
+        "seqbench" => {
+            let mut words = argument.split_whitespace();
+            match (words.next().and_then(human_path), words.next().map(str::parse::<u64>)) {
+                (Some(path), None) => seqbench(&path, 0),
+                (Some(path), Some(Ok(think))) => seqbench(&path, think),
+                _ => sprintln!("  usage: seqbench <file> [think_us]"),
+            }
         }
         // hw-log15: USB disk transfers wait for the xHCI interrupt (`irq`) or
         // poll and yield as before 22.11 (`poll`).
@@ -1566,6 +1628,10 @@ fn run_builtin(line: &str) -> bool {
             );
         }
         "exfatcache" => match argument {
+            "drop" => {
+                let volumes = fs::exfatfs::drop_caches();
+                sprintln!("  exfat: clean cache dropped on {volumes} volume(s)");
+            }
             "on" | "off" => {
                 fs::exfatfs::set_fast(argument == "on");
                 sprintln!("  exfat: fast path {argument}");
@@ -3643,6 +3709,51 @@ fn fsbench(path: &str) {
         mbs(seq[1]),
         seq[1].1 / 1_000_000,
         random_avg / 1000
+    );
+}
+
+/// `seqbench <file> [think_us]` (hw-log17): a cold sequential read of a file
+/// in 64 KiB pieces with `think_us` of work after each (a game decoding what
+/// it streams): MB/s, how many reads waited for the disk (> 300 us) and for
+/// how long, the longest read. The clean exFAT cache is dropped first.
+fn seqbench(path: &str, think_us: u64) {
+    let cred = user::session::credentials();
+    let node = match fs::resolve_as(cred, path, Access::READ) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return sprintln!("  {path}: {err}"),
+        None => return sprintln!("  no filesystem is mounted"),
+    };
+    fs::exfatfs::drop_caches();
+    let mut buf = alloc::vec![0u8; 64 << 10];
+    let (mut offset, mut reads, mut stalls, mut stall_ns, mut worst) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let started = time::uptime_ns();
+    loop {
+        let t = time::uptime_ns();
+        let n = match node.read_at(offset, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) => return sprintln!("  {path}: {err} at byte {offset}"),
+        };
+        let took = time::uptime_ns() - t;
+        reads += 1;
+        worst = worst.max(took);
+        if took > 300_000 {
+            stalls += 1;
+            stall_ns += took;
+        }
+        offset += n as u64;
+        let until = time::uptime_ns() + think_us * 1000;
+        while think_us > 0 && time::uptime_ns() < until {
+            core::hint::spin_loop();
+        }
+    }
+    let total = (time::uptime_ns() - started).max(1);
+    sprintln!(
+        "  seqbench: {path} {offset} bytes, think {think_us} us: {} MB/s ({} ms), {reads} reads, {stalls} waited for the disk ({} ms), worst {} us",
+        offset * 1000 / total,
+        total / 1_000_000,
+        stall_ns / 1_000_000,
+        worst / 1000
     );
 }
 
