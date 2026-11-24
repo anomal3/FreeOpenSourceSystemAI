@@ -3109,6 +3109,18 @@ fn run_program(argument: &str) {
         sprintln!("  usage: run [-b] <path> [args]");
         return;
     }
+    // `run -b fossai-obs --gpu`: имя без пути ищется, как у команды (24.11).
+    let found;
+    let line = match line.split_once(' ').map_or((line, ""), |(name, rest)| (name, rest)) {
+        (name, rest) if !name.contains('/') && !line.contains('|') => match find_program(name) {
+            Some(path) => {
+                found = if rest.is_empty() { path } else { alloc::format!("{path} {rest}") };
+                found.as_str()
+            }
+            None => line,
+        },
+        _ => line,
+    };
 
     // Вертикальная черта — это канал, и разбирает её оболочка, а не ядро:
     // ядру предъявляют уже готовые концы. Одна черта, а не сколько угодно:
@@ -3176,18 +3188,6 @@ fn run_pipeline(left: &str, right: &str, background: bool) {
         sprintln!("  usage: run <path> [args] | <path> [args]");
         return;
     }
-    // `run -b fossai-obs --gpu`: имя без пути ищется, как у команды (24.11).
-    let found;
-    let line = match line.split_once(' ').map_or((line, ""), |(name, rest)| (name, rest)) {
-        (name, rest) if !name.contains('/') && !line.contains('|') => match find_program(name) {
-            Some(path) => {
-                found = if rest.is_empty() { path } else { alloc::format!("{path} {rest}") };
-                found.as_str()
-            }
-            None => line,
-        },
-        _ => line,
-    };
 
     let (reader, writer) = match user::pipe::create() {
         Ok(ends) => ends,
