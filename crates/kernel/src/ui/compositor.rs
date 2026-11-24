@@ -328,6 +328,8 @@ pub struct Compositor {
     thumbs: Option<super::thumbs::Thumbs>,
     /// Окно трея (72h-1).
     tray_pop: Option<super::traypop::TrayPop>,
+    /// «Завершение работы» screen (24.11): over everything on every monitor.
+    ending: Option<super::ending::Screen>,
     /// Экран блокировки (72h-4) и его готовая картинка во весь экран.
     lock: Option<(super::lock::Lock, Surface)>,
     /// Screensaver (22.11, `saver`): over everything, the lock screen too.
@@ -555,6 +557,7 @@ impl Compositor {
             peek_back: None,
             thumbs: None,
             tray_pop: None,
+            ending: None,
             toast: None,
             splash: super::launch::Splash::default(),
             known_packages: None,
@@ -2377,6 +2380,47 @@ impl Compositor {
             _ => {}
         }
         outcome
+    }
+
+    /// Show the «Завершение работы» / «Перезагрузка» screen (24.11) on every
+    /// monitor; the pointer hides.
+    pub fn begin_ending(&mut self, restart: bool) {
+        if self.ending.is_some() {
+            return;
+        }
+        self.ending = Some(super::ending::Screen::new(restart, self.scale));
+        if self.hw_cursor {
+            let (x, y) = self.pointer.position();
+            crate::display::cursor_visible(false, x, y);
+        }
+        self.repaint_all();
+    }
+
+    /// Next spinner frame of the ending screen (and a new note under it).
+    pub fn ending_tick(&mut self, note: Option<&str>) {
+        let outputs: Vec<Rect> = self.outputs.iter().map(|out| out.rect).collect();
+        let Some(screen) = self.ending.as_mut() else { return };
+        screen.tick(note);
+        let parts: Vec<Rect> = screen.damage(&outputs).collect();
+        for part in parts {
+            self.mark(part);
+        }
+    }
+
+    #[must_use]
+    pub const fn ending(&self) -> bool {
+        self.ending.is_some()
+    }
+
+    /// Take the ending screen away (the machine refused to go down).
+    pub fn cancel_ending(&mut self) {
+        if self.ending.take().is_some() {
+            if self.hw_cursor {
+                let (x, y) = self.pointer.position();
+                crate::display::cursor_visible(true, x, y);
+            }
+            self.repaint_all();
+        }
     }
 
     /// Screensaver (22.11, `saver`): show `shown` (`None` - take it away);
@@ -5159,6 +5203,8 @@ impl Compositor {
         self.advance_flight();
         let shade_moving = self.advance_shade();
         let taskbar_moving = self.advance_taskbar();
+        // A Start popup fading in (24.11).
+        let taskbar_moving = taskbar_moving | self.menu.as_mut().is_some_and(Menu::tick_anim);
         // Наплыв подсмотра и отсчёт до макетов прилипания (20.11).
         let peek_moving = self.advance_peek();
         let snap_waiting = self.advance_snap_layouts();
@@ -5264,6 +5310,7 @@ impl Compositor {
         if !DIRECT.load(core::sync::atomic::Ordering::Relaxed)
             || theme::is_mobile()
             || self.lock.is_some()
+            || self.ending.is_some()
             || self.flight.is_some()
             || self.scene.is_some()
             || self.peek.is_some()
@@ -5946,6 +5993,12 @@ impl Compositor {
     /// тень окна ложится на всё, что ниже него, и не задевает то, что выше.
     fn compose_band(&self, back: &mut Surface, band: Rect) {
         let dy = -band.y;
+        // «Завершение работы» (24.11) closes everything on every monitor.
+        if let Some(screen) = self.ending.as_ref() {
+            let outputs: Vec<Rect> = self.outputs.iter().map(|out| out.rect).collect();
+            screen.compose(back, band, dy, &outputs);
+            return;
+        }
         // The screensaver (22.11) closes everything, the pointer too.
         if let Some(saver) = self.saver.as_ref() {
             saver.compose(back, band, dy);

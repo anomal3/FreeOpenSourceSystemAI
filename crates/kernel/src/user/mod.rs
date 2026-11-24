@@ -6540,6 +6540,71 @@ pub fn end_program_group(id: sched::TaskId) -> Result<usize, KillError> {
     Ok(ended)
 }
 
+/// Each live process once: its first slot and the process (24.11, graceful
+/// shutdown).
+fn live_processes() -> Vec<(usize, Arc<Mutex<Program>>)> {
+    let table: Vec<(usize, Arc<Mutex<Program>>)> = {
+        let table = PROGRAMS.lock();
+        table.iter().enumerate().filter_map(|(slot, entry)| entry.as_ref().map(|p| (slot, Arc::clone(p)))).collect()
+    };
+    let mut out: Vec<(usize, Arc<Mutex<Program>>)> = Vec::new();
+    for (slot, process) in table {
+        if out.iter().any(|(_, known)| Arc::ptr_eq(known, &process)) {
+            continue;
+        }
+        if sched::id_of_slot(slot).and_then(sched::lookup).is_some_and(|(_, state)| state == sched::TaskState::Finished) {
+            continue;
+        }
+        out.push((slot, process));
+    }
+    out
+}
+
+/// Linux processes alive now — their pids (24.11, graceful shutdown).
+#[must_use]
+pub fn linux_processes() -> Vec<u32> {
+    live_processes()
+        .into_iter()
+        .filter_map(|(_, process)| {
+            let program = process.lock();
+            (program.linux && !program.ending && program.linux_pid != 0).then_some(program.linux_pid)
+        })
+        .collect()
+}
+
+/// Native programs alive now that a graceful shutdown stops: task and path.
+/// A program that holds a device as its driver (Д1) is left to the power-off
+/// — the volumes may still need it for the last flush.
+#[must_use]
+pub fn native_programs() -> Vec<(sched::TaskId, alloc::string::String)> {
+    live_processes()
+        .into_iter()
+        .filter_map(|(slot, process)| {
+            let program = process.lock();
+            if program.linux || program.ending || program.devices.iter().any(Option::is_some) {
+                return None;
+            }
+            Some((sched::id_of_slot(slot)?, program.path.clone()))
+        })
+        .collect()
+}
+
+/// Stop the native programs (services, 24.11): `init` first, so that it
+/// restarts none of them, then the others, the newest first. Answer — how
+/// many were asked.
+pub fn stop_native_programs() -> usize {
+    let mut programs = native_programs();
+    programs.sort_by_key(|(id, path)| (!path.ends_with("/init"), core::cmp::Reverse(id.as_u32())));
+    let mut asked = 0;
+    for (id, path) in programs {
+        if request_kill(id).is_ok() {
+            kprintln!("  user        : stopping {id} {path}");
+            asked += 1;
+        }
+    }
+    asked
+}
+
 /// Снять остальные потоки процесса, чей главный поток в слоте `slot` только
 /// что вышел (фаза 60).
 ///

@@ -66,6 +66,109 @@ static REQUEST: AtomicU8 = AtomicU8::new(0);
 const PRESENT: u8 = 1 << 0;
 const RESTART: u8 = 1 << 1;
 const FROM_DESKTOP: u8 = 1 << 2;
+/// Close programs first (24.11): see [`graceful`].
+const GRACEFUL: u8 = 1 << 3;
+
+/// Ask for a graceful shutdown or restart (24.11, Start's power menu without
+/// Shift): programs are asked to close and given time, Linux processes get
+/// `SIGTERM`, services are stopped, then the volumes are flushed and the
+/// machine goes down as by [`request`]. Callable under the desktop's lock.
+pub fn request_graceful(restart: bool) {
+    let mut code = PRESENT | FROM_DESKTOP | GRACEFUL;
+    if restart {
+        code |= RESTART;
+    }
+    REQUEST.store(code, Ordering::Release);
+    sched::wake_irq(IRQ_SOURCE);
+}
+
+/// How long program windows get to close, Linux processes to end after
+/// `SIGTERM`, and services after being stopped (ms).
+const WINDOWS_MS: u64 = 10_000;
+const LINUX_MS: u64 = 5_000;
+const SERVICES_MS: u64 = 3_000;
+
+/// Close what runs before the machine goes down (24.11, Roman: «как в
+/// Windows»). In order:
+///
+/// 1. The black «Завершение работы» / «Перезагрузка» screen on every monitor
+///    (`ui::ending`), and every program window asked to close as by its
+///    cross: native programs read `WIN_CLOSE` and save, Wayland clients get
+///    `xdg_toplevel.close`, Wine/Proton windows get `WM_CLOSE` through it.
+///    Up to [`WINDOWS_MS`] for them to go.
+/// 2. `SIGTERM` to every Linux process (what systemd does): Wine processes
+///    end, `wineserver` writes the registry of its prefix on `SIGTERM`, a
+///    shell's children end. Up to [`LINUX_MS`].
+/// 3. Native programs — services (`init` first, so that it restarts nothing,
+///    then the rest, newest first). Up to [`SERVICES_MS`].
+///
+/// Then [`shut_down`] flushes and marks the volumes clean and powers off.
+/// What is still running after a step's time is left to the power-off — the
+/// screen says what it waits for.
+fn graceful(restart: bool) {
+    let what = if restart { "restart" } else { "shutdown" };
+    let asked = crate::ui::begin_ending(restart).unwrap_or(0);
+    announce!("  power       : graceful {what}: {asked} program window(s) asked to close");
+    let started = crate::time::uptime_ms();
+    loop {
+        let left = crate::ui::ending_tick(None);
+        if left == 0 {
+            announce!("  power       : program windows closed in {} ms", crate::time::uptime_ms() - started);
+            break;
+        }
+        if crate::time::uptime_ms() - started >= WINDOWS_MS {
+            announce!("  power       : {left} program window(s) did not close in {} s", WINDOWS_MS / 1000);
+            break;
+        }
+        let note = alloc::format!("Закрываются программы: {left}");
+        crate::ui::ending_tick(Some(&note));
+        sched::sleep_ms(80);
+    }
+
+    let pids = crate::user::linux_processes();
+    if !pids.is_empty() {
+        for pid in &pids {
+            // SIGTERM.
+            crate::linux::signal::send_to_process(*pid, 15, false);
+        }
+        announce!("  power       : SIGTERM sent to {} Linux process(es)", pids.len());
+        let started = crate::time::uptime_ms();
+        loop {
+            let left = crate::user::linux_processes().len();
+            if left == 0 {
+                announce!("  power       : Linux processes ended in {} ms", crate::time::uptime_ms() - started);
+                break;
+            }
+            if crate::time::uptime_ms() - started >= LINUX_MS {
+                announce!("  power       : {left} Linux process(es) still running after {} s", LINUX_MS / 1000);
+                break;
+            }
+            let note = alloc::format!("Завершаются процессы: {left}");
+            crate::ui::ending_tick(Some(&note));
+            sched::sleep_ms(80);
+        }
+    }
+
+    let stopped = crate::user::stop_native_programs();
+    if stopped > 0 {
+        announce!("  power       : {stopped} service(s) and program(s) asked to stop");
+        let started = crate::time::uptime_ms();
+        loop {
+            let left = crate::user::native_programs().len();
+            if left == 0 {
+                announce!("  power       : services stopped in {} ms", crate::time::uptime_ms() - started);
+                break;
+            }
+            if crate::time::uptime_ms() - started >= SERVICES_MS {
+                announce!("  power       : {left} service(s) still running after {} s", SERVICES_MS / 1000);
+                break;
+            }
+            crate::ui::ending_tick(Some("Останавливаются службы"));
+            sched::sleep_ms(80);
+        }
+    }
+    crate::ui::ending_tick(Some(""));
+}
 
 /// Попросить систему выключиться (или перезагрузиться).
 ///
@@ -88,8 +191,8 @@ pub fn request(restart: bool, source: Source) {
     sched::wake_irq(IRQ_SOURCE);
 }
 
-/// Забрать просьбу, если она есть.
-fn take() -> Option<(bool, Source)> {
+/// Забрать просьбу, если она есть: перезагрузка, источник, мягко ли.
+fn take() -> Option<(bool, Source, bool)> {
     let code = REQUEST.swap(0, Ordering::AcqRel);
     if code & PRESENT == 0 {
         return None;
@@ -99,7 +202,7 @@ fn take() -> Option<(bool, Source)> {
     } else {
         Source::PowerButton
     };
-    Some((code & RESTART != 0, source))
+    Some((code & RESTART != 0, source, code & GRACEFUL != 0))
 }
 
 /// Служебная задача: ждёт просьбы и исполняет её.
@@ -111,12 +214,19 @@ pub fn service_task() {
         sched::block_on_irq(IRQ_SOURCE, || {
             REQUEST.load(Ordering::Acquire) & PRESENT != 0
         });
-        if let Some((restart, source)) = take() {
+        if let Some((restart, source, soft)) = take() {
             match source {
                 Source::PowerButton => announce!("  power       : power button pressed"),
                 Source::Desktop => announce!("  power       : confirmed in the start menu"),
             }
+            if soft {
+                graceful(restart);
+            }
             shut_down(restart);
+            // Still here — the machine did not go down: the desktop back.
+            if soft {
+                crate::ui::cancel_ending();
+            }
         }
     }
 }

@@ -49,6 +49,7 @@ pub mod compositor;
 pub mod context;
 pub mod deskcfg;
 pub mod dialog;
+pub mod ending;
 pub mod icons;
 pub mod lock;
 pub mod look;
@@ -2261,6 +2262,84 @@ pub fn lock_now() -> bool {
     .is_some()
 }
 
+/// `with_desktop` for the shutdown task (24.11): it may wait — retries while
+/// the desktop is busy composing, up to about two seconds.
+fn with_desktop_waiting<T>(mut work: impl FnMut(&mut Compositor) -> T) -> Option<T> {
+    for _ in 0..1000 {
+        if let Some(answer) = with_desktop(&mut work) {
+            return Some(answer);
+        }
+        if !graphics() {
+            return None;
+        }
+        crate::sched::sleep_ms(2);
+    }
+    None
+}
+
+/// Program windows open now (`App::Program`): their apps.
+fn program_windows(desktop: &Compositor) -> alloc::vec::Vec<App> {
+    let mut apps = alloc::vec::Vec::new();
+    let mut index = 0;
+    while let Some(app) = desktop.app_at(index) {
+        if matches!(app, App::Program(..)) {
+            apps.push(app);
+        }
+        index += 1;
+    }
+    apps
+}
+
+/// Graceful shutdown, first step (24.11, `power::graceful`): the black
+/// «Завершение работы» / «Перезагрузка» screen on every monitor, and every
+/// program window asked to close exactly as by its cross (native programs
+/// get `WIN_CLOSE`, Wayland clients `xdg_toplevel.close`, Wine windows
+/// `WM_CLOSE` through it). Answer — how many windows were asked; `None` —
+/// no desktop.
+pub fn begin_ending(restart: bool) -> Option<usize> {
+    with_desktop_waiting(|desktop| {
+        if desktop.menu_open() {
+            if let Some(menu) = desktop.menu_mut() {
+                menu.close();
+            }
+            desktop.mark_menu_area();
+        }
+        desktop.close_tray_pop();
+        if desktop.context_open() {
+            desktop.close_context();
+        }
+        desktop.begin_ending(restart);
+        let apps = program_windows(desktop);
+        for app in &apps {
+            let name = name_of(desktop, *app);
+            if request_close(desktop, *app) {
+                kprintln!("  desktop     : ending: close requested of '{name}'");
+            }
+        }
+        desktop.present();
+        apps.len()
+    })
+}
+
+/// The machine refused to go down (24.11): the desktop comes back.
+pub fn cancel_ending() {
+    with_desktop_waiting(|desktop| {
+        desktop.cancel_ending();
+        desktop.present();
+    });
+}
+
+/// Graceful shutdown, while waiting (24.11): next frame of the spinner, a
+/// note under the words; answer — program windows still open.
+pub fn ending_tick(note: Option<&str>) -> usize {
+    with_desktop_waiting(|desktop| {
+        desktop.ending_tick(note);
+        desktop.present();
+        program_windows(desktop).len()
+    })
+    .unwrap_or(0)
+}
+
 pub fn set_screen_off(off: bool) -> bool {
     let status = if off { None } else { Some(status_now()) };
     with_desktop(|desktop| {
@@ -2446,7 +2525,8 @@ pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
     let defer = crate::input::has_events();
     let since = crate::time::uptime_ns();
     let _waiting = InputWaiting;
-    for attempt in 0..INPUT_TRIES {
+    let mut attempt = 0;
+    loop {
         let answer = with_desktop(|desktop| {
             desktop.set_deferred(defer);
             let answer = dispatch_on(desktop, event, &status);
@@ -2467,10 +2547,16 @@ pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
         }
         // Стол вынут из-под замка: кто-то собирает кадр. Ждём — см.
         // [`INPUT_TRIES`], — но только между попытками, а не после последней.
-        if attempt + 1 < INPUT_TRIES {
-            INPUT_WAITING.store(true, Ordering::Relaxed);
-            crate::sched::sleep_ms(INPUT_PAUSE_MS);
+        // With Start open (24.11) a key is a letter of its search: it waits
+        // for the desktop longer instead of landing in the window under Start
+        // (Roman: Win, then typing — the letters went to the focused window).
+        attempt += 1;
+        let limit = if panel::start_open() { INPUT_TRIES * 8 } else { INPUT_TRIES };
+        if attempt >= limit {
+            break;
         }
+        INPUT_WAITING.store(true, Ordering::Relaxed);
+        crate::sched::sleep_ms(INPUT_PAUSE_MS);
     }
     // Не дождались. Событие всё-таки уходит оболочке: она есть всегда, а
     // потерять нажатие молча — худшее из возможного.
@@ -2505,6 +2591,10 @@ const INPUT_TRIES: u32 = 250;
 const INPUT_PAUSE_MS: u64 = 2;
 
 fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
+    // «Завершение работы» (24.11) takes no input.
+    if desktop.ending() {
+        return None;
+    }
     // The key that ends the screensaver or wakes the dark screen (22.11) is
     // not delivered, nor its release.
     let saver_up = desktop.saver_showing();
@@ -3096,6 +3186,10 @@ pub fn swallow_wake_touch() {
 }
 
 fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
+    // «Завершение работы» (24.11) takes no input.
+    if desktop.ending() {
+        return;
+    }
     // The screensaver (22.11) ends on the first motion or click, which goes
     // no further.
     let saver_up = desktop.saver_showing();
@@ -4402,8 +4496,13 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
         kprintln!("  desktop     : closed '{}'", app.title());
     }
     match (app.confirms_power(), answer) {
+        // Programs are asked to close first (24.11); Shift held — at once.
         (Some(restart), Answer::Confirm) => {
-            crate::power::request(restart, crate::power::Source::Desktop);
+            if crate::input::modifiers().contains(Modifiers::SHIFT) {
+                crate::power::request(restart, crate::power::Source::Desktop);
+            } else {
+                crate::power::request_graceful(restart);
+            }
         }
         (Some(_), Answer::Close) => kprintln!("  desktop     : '{}' cancelled", app.title()),
         _ => {}
@@ -5492,6 +5591,18 @@ fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
         panel::Choice::Lock => {
             desktop.lock_screen();
             kprintln!("  desktop     : locked");
+        }
+        // Start's power menu (24.11): without Shift programs are asked to
+        // close first (`power::request_graceful`); with Shift — at once.
+        panel::Choice::Power { restart, force } => {
+            let what = if restart { "restart" } else { "shut down" };
+            if force {
+                kprintln!("  desktop     : {what} at once (Shift)");
+                crate::power::request(restart, crate::power::Source::Desktop);
+            } else {
+                kprintln!("  desktop     : {what} requested, closing programs first");
+                crate::power::request_graceful(restart);
+            }
         }
         panel::Choice::Recent(command, path) => {
             kprintln!("  desktop     : opening recent '{path}'");
