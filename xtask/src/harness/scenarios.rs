@@ -5796,9 +5796,11 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_500),
             Step::Shot("09-custom-fill"),
             // Расположение: своя картинка — седьмой пункт (на нём фокус),
-            // «Обзор…» — восьмой, «Заполнение» — девятый, «По размеру» —
-            // десятый.
-            Step::Repeat("down", 3),
+            // «Обзор…» — восьмой, флажок «Также для экрана блокировки» (24.11,
+            // 8a0196c) — девятый, «Заполнение» — десятый, «По размеру» —
+            // одиннадцатый. Страница не пишет в журнал, где фокус, — счёт
+            // проверяет строка выбранного расположения сразу за ним.
+            Step::Repeat("down", 4),
             Step::Key("ret"),
             Step::Await("settings    : background fit fit", 15_000),
             Step::Await("desktop     : wallpaper 480x360 fit -> 1280x720", 30_000),
@@ -5819,8 +5821,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : wallpaper 480x360 center -> 1280x720", 30_000),
             Step::Wait(1_500),
             Step::Shot("13-custom-center"),
-            // BMP через «Обзор…» и «Замостить».
-            Step::Repeat("up", 5),
+            // BMP через «Обзор…» (через флажок) и «Замостить».
+            Step::Repeat("up", 6),
             Step::Key("ret"),
             Step::Await("window      : 'File dialog' at", 30_000),
             Step::Wait(1_000),
@@ -5829,7 +5831,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("desktop     : wallpaper picked /usr/share/wallpapers/test/tile.bmp", 60_000),
             Step::Await("desktop     : wallpaper 96x96 center -> 1280x720", 30_000),
-            Step::Repeat("down", 4),
+            Step::Repeat("down", 5),
             Step::Key("ret"),
             Step::Await("desktop     : wallpaper 96x96 tile -> 1280x720", 30_000),
             Step::Wait(1_500),
@@ -5841,13 +5843,13 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_500),
             Step::Shot("15-color"),
             // Градиент «Океан» и обратно FossAi. Плитки своей картинки больше
-            // нет: «Океан» — четырнадцатый пункт, фокус — на девятнадцатом.
+            // нет: «Океан» — пятнадцатый пункт, фокус — на двадцатом.
             Step::Repeat("up", 5),
             Step::Key("ret"),
             Step::Await("settings    : wallpaper ocean saved", 15_000),
             Step::Wait(1_500),
             Step::Shot("16-ocean"),
-            Step::Repeat("up", 13),
+            Step::Repeat("up", 14),
             Step::Key("ret"),
             Step::Await("settings    : wallpaper fossai saved", 15_000),
             // Галерея — «Долина» — и стол без окна.
@@ -5856,8 +5858,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : wallpaper 1320x720 tile -> 1280x720", 30_000),
             Step::Wait(1_000),
             Step::Shot("17-valley-tile"),
-            // «Заполнение» — шестой пункт от «Долины» (картинки своей уже нет).
-            Step::Repeat("down", 6),
+            // «Заполнение» — седьмой пункт от «Долины» (картинки своей уже
+            // нет; между «Обзором…» и ним — флажок экрана блокировки).
+            Step::Repeat("down", 7),
             Step::Key("ret"),
             Step::Await("desktop     : wallpaper 1320x720 fill -> 1280x720", 30_000),
             Step::Key("alt-f4"),
@@ -8587,8 +8590,10 @@ pub const ALL: &[Scenario] = &[
             Step::Key("alt-f4"),
             Step::Await("notepad: closing on request", 15_000),
             Step::Await("desktop     : closed the window of ", 15_000),
-            Step::Line("cat /etc/desktop.cfg"),
-            Step::Await("open_with=txt:/bin/notepad", 15_000),
+            // «Всегда открывать» — в хранилище настроек (328dbdd), область
+            // человека; desktop.cfg open_with= только читается.
+            Step::Line("reg get filetypes/.txt/default"),
+            Step::Await("reg: filetypes/.txt/default = /bin/notepad", 15_000),
             // Убрать за собой: в корзину и очистить — стол снова пуст.
             Step::Aim(Aim::Icon(4)),
             Step::RightClick,
@@ -11255,8 +11260,11 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(2_000),
             Step::Line("power never"),
             Step::Await("screen off: never", 15_000),
-            // A fresh install has no ~/Desktop until something is put there
-            // (the icon counts below assume a fresh `install`).
+            // A fresh install has no ~/Desktop until something is put there.
+            // Icons are counted by the desktop folder (", M from") and aimed
+            // from the end: the folder's files come last, after the system
+            // icons, packages and Wine shortcuts (FossDemo of `winapps-real`
+            // made "icons 5" a 6).
             Step::Line("mkdir /home/roman/Desktop"),
             Step::Wait(1_000),
             // Desktop launch line of a file with spaces (as `open_file` builds it).
@@ -11269,7 +11277,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("alt-f4"),
             Step::Await("notepad: closing on request", 15_000),
             Step::Await("desktop     : closed the window of ", 15_000),
-            Step::AwaitAny("icons 5, 1 from /home/roman/Desktop", 15_000),
+            Step::AwaitAny(", 1 from /home/roman/Desktop", 15_000),
             Step::Line("ls /home/roman/Desktop"),
             Step::Await("My text note.txt", 15_000),
             // The desktop's own launch line now quotes a path with spaces
@@ -11282,7 +11290,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : closed the window of ", 15_000),
             // A file without an extension, open in Notepad while it is deleted.
             Step::Line("echo unknown > /home/roman/Desktop/unknownfile"),
-            Step::AwaitAny("icons 6, 2 from /home/roman/Desktop", 15_000),
+            Step::AwaitAny(", 2 from /home/roman/Desktop", 15_000),
             Step::Line("run -b /bin/notepad /home/roman/Desktop/unknownfile"),
             Step::Await("notepad: opened /home/roman/Desktop/unknownfile", 30_000),
             Step::Wait(1_500),
@@ -11290,8 +11298,8 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Minimize("Terminal")),
             Step::Click,
             Step::Await("desktop     : minimized 'Terminal'", 15_000),
-            // Icons: 4 system ones, then 'My text note.txt', 'unknownfile'.
-            Step::Aim(Aim::Icon(5)),
+            // The last two icons: 'My text note.txt', 'unknownfile'.
+            Step::Aim(Aim::IconFromEnd(0)),
             Step::Click,
             Step::Wait(800),
             Step::Key("delete"),
@@ -11300,18 +11308,18 @@ pub const ALL: &[Scenario] = &[
             Step::Shot("01-delete-unknown"),
             Step::Key("y"),
             Step::Await("desktop     : deleted '/home/roman/Desktop/unknownfile' to the trash as 'unknownfile'", 15_000),
-            Step::Await("icons 5, 1 from /home/roman/Desktop", 15_000),
+            Step::Await(", 1 from /home/roman/Desktop", 15_000),
             Step::Wait(1_000),
             Step::Shot("02-after-delete"),
             // The text note goes the same way (the menu path is in `installed`).
-            Step::Aim(Aim::Icon(4)),
+            Step::Aim(Aim::IconFromEnd(0)),
             Step::Click,
             Step::Wait(800),
             Step::Key("delete"),
             Step::Await("desktop     : Delete key on 1 item(s)", 15_000),
             Step::Key("y"),
             Step::Await("desktop     : deleted '/home/roman/Desktop/My text note.txt' to the trash as 'My text note.txt'", 15_000),
-            Step::Await("icons 4, 0 from /home/roman/Desktop", 15_000),
+            Step::Await(", 0 from /home/roman/Desktop", 15_000),
             Step::Absent("KERNEL PANIC"),
         ],
     },
@@ -12379,8 +12387,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("linux: ok getrandom", 15_000),
             Step::Await("linux: ok openat, read and fstat of the program itself", 15_000),
             Step::Await("linux: ok a missing file is ENOENT", 15_000),
-            Step::Await("linux: 0 failed", 15_000),
-            Step::Await("exited with code 0", 15_000),
+            // Итог — кодом выхода (он и есть число проваленных): строку
+            // `linux: 0 failed` на линии однажды разорвал вывод init.
+            Step::AwaitAny("/compat/linux/bin/hello: exited with code 0", 15_000),
+            Step::Absent("linux: FAILED"),
             // Та же программа с фиксированным адресом `0x400000` — в нижней
             // половине, которую ядро отдало программам (31.10.2026).
             Step::Line("run /compat/linux/bin/hello-fixed one two"),
@@ -12388,8 +12398,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("linux: ok AT_PHDR points at the program headers", 15_000),
             Step::Await("linux: ok brk grows by a megabyte", 15_000),
             Step::Await("linux: ok anonymous mmap and munmap", 15_000),
-            Step::Await("linux: 0 failed", 15_000),
-            Step::Await("exited with code 0", 15_000),
+            Step::AwaitAny("/compat/linux/bin/hello-fixed: exited with code 0", 15_000),
+            Step::Absent("linux: FAILED"),
             // fsync Wine/Proton (12.11): `futex_waitv` и `FUTEX_WAKE_OP`.
             Step::Line("run /compat/linux/bin/futexv"),
             Step::Await("futexv: ok a changed word is EAGAIN", 30_000),
@@ -21222,7 +21232,13 @@ const SEVENZIP_STEPS: &[Step] = &[
     Step::Key("alt-f4"),
     Step::Await("archiver: closing on request", 15_000),
     Step::Await("/bin/archiver: exited with code", 15_000),
-    Step::Wait(1_500),
+    // Фокус вернулся «Файлам»: строку терминала набрали бы в них (так
+    // сценарий не проходил с e6269e1) — окно закрывается, ввод — терминалу.
+    Step::Wait(1_000),
+    Step::Key("alt-f4"),
+    Step::Await("files: closing on request", 15_000),
+    Step::Await("desktop     : focus 'Terminal'", 15_000),
+    Step::Wait(1_000),
     Step::Line("run -b /bin/files /data/z/t.7z"),
     Step::Await("window      : 'Files' at", 30_000),
     Step::Wait(1_500),
