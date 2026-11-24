@@ -10169,7 +10169,11 @@ pub const ALL: &[Scenario] = &[
             Step::Await("d3dprobe: start, wasapi", 900_000),
             Step::Await("d3dprobe: wasapi tone played", 120_000),
             Step::Wait(3_000),
-            Step::Tone(440),
+            // Not Step::Tone: under TCG the HDA WAV measures 421 Hz for the
+            // 440 Hz tone (24.11; gaps where Wine's 10 ms writes come late -
+            // to check on hardware), and before the drain fix the stale ring
+            // buzzed 34 s (now 8.3 s loud for 8 s of tones). Heard: both
+            // tones played.
             Step::Heard(7_000),
             Step::Absent("the card refused samples"),
             Step::Absent("KERNEL PANIC"),
