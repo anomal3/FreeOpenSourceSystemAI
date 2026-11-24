@@ -127,6 +127,33 @@ fn choose_mode(gop: &mut GraphicsOutput, policy: Policy) {
             Err(err) => println!("  [gop] cannot switch to {width}x{height} ({err:?})"),
         }
     }
+    // Ни одного из привычных режимов нет (так бывает у видеокарт со своей прошивкой GOP: она предлагает
+    // 800x600 и редкие размеры). На настоящей машине берём самый большой из предложенных, до 2560x1600:
+    // 800x600 на большом мониторе - то, что хотелось исправить (24.11, Роман).
+    if !emulator {
+        let mut best = (0usize, 0usize);
+        let mut offered = 0usize;
+        for mode in gop.modes() {
+            let (w, h) = mode.info().resolution();
+            if !matches!(mode.info().pixel_format(), GopPixelFormat::Rgb | GopPixelFormat::Bgr) {
+                continue;
+            }
+            offered += 1;
+            if w <= 2560 && h <= 1600 && w * h > best.0 * best.1 {
+                best = (w, h);
+            }
+        }
+        println!("  [gop] none of the usual modes; the firmware offers {offered} RGB/BGR modes, largest up to 2560x1600: {}x{}", best.0, best.1);
+        if best != (0, 0) && best != gop.current_mode_info().resolution() {
+            let found = gop.modes().find(|mode| mode.info().resolution() == best && matches!(mode.info().pixel_format(), GopPixelFormat::Rgb | GopPixelFormat::Bgr));
+            if let Some(mode) = found {
+                match gop.set_mode(&mode) {
+                    Ok(()) => println!("  [gop] switched to {}x{}", best.0, best.1),
+                    Err(err) => println!("  [gop] cannot switch to {}x{} ({err:?})", best.0, best.1),
+                }
+            }
+        }
+    }
 }
 
 /// Напечатать, в каком режиме прошивка и какие режимы она предлагает.
