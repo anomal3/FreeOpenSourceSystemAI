@@ -42,6 +42,21 @@ pub fn is_text(name: &str) -> bool {
     TEXT.contains(&extension(name).as_str())
 }
 
+/// Архивы, которые открывает «Архиватор 7-Zip» (`/bin/archiver`, 24.11):
+/// по умолчанию — двойным щелчком, и пункты «Извлечь все…», «Извлечь
+/// сюда» в «Файлах». `.iso` здесь нет: образ диска 7-Zip тоже читает, но
+/// тип у него свой («Образ диска»), и забирать его архиватор не должен.
+pub const ARCHIVES: [&str; 21] = [
+    "7z", "zip", "rar", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "zst", "lzma", "cab", "arj", "lzh", "wim", "cpio",
+    "rpm", "deb", "z", "001",
+];
+
+/// Архив ли это — по расширению ([`ARCHIVES`]).
+#[must_use]
+pub fn is_archive(name: &str) -> bool {
+    ARCHIVES.contains(&extension(name).as_str())
+}
+
 /// Тип записи по имени, как в Проводнике.
 #[must_use]
 pub fn kind_of(name: &str, directory: bool) -> Kind {
@@ -66,7 +81,8 @@ pub fn kind_of(name: &str, directory: bool) -> Kind {
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "fimg" | "qoi" => ("doc-image", "Изображение"),
         "mp4" | "mkv" | "avi" | "webm" | "mov" => ("doc-video", "Видео"),
         "mp3" | "wav" | "ogg" | "flac" => ("doc-audio", "Звук"),
-        "zip" | "tar" | "gz" | "xz" | "7z" | "rar" | "deb" => ("doc-archive", "Архив"),
+        "zip" | "tar" | "gz" | "xz" | "7z" | "rar" | "deb" | "tgz" | "bz2" | "tbz2" | "txz" | "zst" | "lzma" | "cab" | "arj"
+        | "lzh" | "wim" | "cpio" | "rpm" | "z" => ("doc-archive", "Архив"),
         "rs" | "c" | "h" | "cpp" | "py" | "js" | "lua" | "cs" | "sh" | "html" | "css" | "json" | "toml" | "yaml" | "yml"
         | "xml" => ("doc-code", "Исходный код"),
         "exe" | "dll" | "elf" => ("doc-executable", "Приложение"),
@@ -122,6 +138,8 @@ mod tests {
         assert_eq!(kind_of("a.lua", false).icon, "doc-code");
         assert_eq!(kind_of("Загрузки", true).icon, "folder-downloads");
         assert!(is_text("main.lua") && !is_text("Makefile") && !is_text("a.png"));
+        assert!(is_archive("Фото.7Z") && is_archive("src.tar.gz") && is_archive("a.tgz") && !is_archive("disk.iso") && !is_archive("7z"));
+        assert_eq!(kind_of("backup.tbz2", false).icon, "doc-archive");
     }
 
     #[test]

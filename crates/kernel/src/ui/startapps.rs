@@ -72,7 +72,7 @@ pub static FOLDERS: [Folder; 4] = [
 /// обхода: первые четыре строки («Терминал», «Параметры», «О системе»,
 /// «Файлы») стоят на своих местах с фазы С3 — на них считают нажатия
 /// сценарии стенда.
-pub static ENTRIES: [Entry; 26] = [
+pub static ENTRIES: [Entry; 27] = [
     Entry {
         key: "terminal",
         caption: "Терминал",
@@ -232,6 +232,18 @@ pub static ENTRIES: [Entry; 26] = [
         launch: Launch::Program("sysinfo", ""),
         needs: "",
         group: "/bin/sysinfo",
+    },
+    // «Архиватор 7-Zip» (24.11): окно над `/bin/7zz`; строки нет без `7zz`.
+    Entry {
+        key: "archiver",
+        caption: "Архиватор 7-Zip",
+        about: "архивы 7z, zip, rar, tar, gz и другие",
+        folder: "folder:utils",
+        art: "",
+        icon: Icon::Package,
+        launch: Launch::Program("archiver", ""),
+        needs: "/bin/7zz",
+        group: "/bin/archiver",
     },
     // «Администрирование» (П3, 20.11) — первой строкой папки: центр, из
     // которого открывается всё остальное (ещё кнопка у питания и Win+X).

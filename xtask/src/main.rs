@@ -49,6 +49,7 @@ mod wine;
 mod rider;
 mod ruststd;
 mod screenmedia;
+mod sevenzip;
 mod statefs;
 mod debian;
 mod fimg;

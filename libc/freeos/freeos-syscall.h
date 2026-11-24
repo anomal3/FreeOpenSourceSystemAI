@@ -82,6 +82,8 @@
 #define SYS_SOUND 82
 /* Блокировки файлов: fcntl F_GETLK/F_SETLK/F_SETLKW и flock (08.11.2026). */
 #define SYS_FLOCK 88
+/* Права файла по пути (24.11): `chmod` libc. */
+#define SYS_CHMOD 98
 
 /* ── Значения, которые эти вызовы принимают и возвращают ──────────────────── */
 

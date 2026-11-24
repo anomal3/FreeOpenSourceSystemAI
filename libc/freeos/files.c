@@ -366,6 +366,49 @@ int fchmodat(int dir, const char *path, mode_t mode, int flags) {
     return full == NULL ? -1 : chmod(full, mode);
 }
 
+/* `fstatat` (24.11, 7-Zip обходит каталог `fstatat(dirfd(dir), имя)`): путь от
+ * каталога — как у остальных `*at`; ссылок нет, `AT_SYMLINK_NOFOLLOW` ничего
+ * не меняет. */
+int fstatat(int dir, const char *path, struct stat *out, int flags) {
+    (void)flags;
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = at_path(dir, path, buf);
+    return full == NULL ? -1 : stat(full, out);
+}
+
+/* Времена файла ядро не ставит (см. `utime`): `ENOSYS`. 7-Zip такой отказ
+ * пропускает — распакованный файл получает время распаковки. */
+int utimensat(int dir, const char *path, const struct timespec times[2], int flags) {
+    (void)dir;
+    (void)path;
+    (void)times;
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+int futimens(int fd, const struct timespec times[2]) {
+    (void)fd;
+    (void)times;
+    errno = ENOSYS;
+    return -1;
+}
+
+/* Маска прав новых файлов (24.11, 7-Zip): ядро её не применяет — права
+ * задаёт сам `open`/`mkdir`, — но программа вправе спросить и поставить свою;
+ * значение живёт в процессе, по умолчанию 022, как у Linux. */
+static mode_t file_mask = 022;
+
+mode_t umask(mode_t mask) {
+    mode_t old = file_mask;
+    file_mask = mask & 0777;
+    return old;
+}
+
+/* Родителя процесса ядро не называет: вызова нет. 1 — «init», как у
+ * осиротевшего процесса в Linux (7-Zip смешивает его в имя временного файла). */
+pid_t getppid(void) { return 1; }
+
 /* `renameat` и `renameat2` (08.11.2026, rustix у Servo): пути от каталогов —
  * как у остальных `*at`. Флаги `renameat2` (`RENAME_NOREPLACE`,
  * `RENAME_EXCHANGE`) ядро не умеет — `EINVAL`, а не тихо обычное
@@ -522,14 +565,27 @@ char *realpath(const char *path, char *resolved) {
     return resolved;
 }
 
-/* Права, время и жёсткие ссылки файла ядро пока менять не умеет: у него нет
- * таких вызовов. Отказ `ENOSYS`, а не успех, — программа, поставившая права
- * «только владельцу», обязана узнать, что они остались прежними. */
+/* Права по пути — `SYS_CHMOD` (24.11; владельцу и root). FAT и exFAT прав
+ * Unix не хранят: там ответ — успех без действия, как у Linux на vfat с
+ * `quiet`, иначе 7-Zip, распаковывая на флешку, считал бы ошибкой каждый
+ * файл.
+ *
+ * Время и жёсткие ссылки ядро менять не умеет: у него нет таких вызовов.
+ * Отказ `ENOSYS`, а не успех, — программа, поставившая время, обязана узнать,
+ * что оно осталось прежним. По дескриптору прав тоже нет (пути у
+ * дескриптора libc не знает) — `fchmod` отвечает `ENOSYS`, и программы
+ * (7-Zip) повторяют `chmod` по пути. */
 int chmod(const char *path, mode_t mode) {
-    (void)path;
-    (void)mode;
-    errno = ENOSYS;
-    return -1;
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = freeos_path(path, buf);
+    if (full == NULL) {
+        return -1;
+    }
+    long code = freeos_syscall(SYS_CHMOD, (long)full, (long)strlen(full), (long)(mode & 07777));
+    if (code == FREEOS_ERR_UNSUPPORTED) {
+        return 0;
+    }
+    return code < 0 ? freeos_set_errno(code) : 0;
 }
 
 int fchmod(int fd, mode_t mode) {

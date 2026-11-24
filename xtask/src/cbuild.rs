@@ -239,7 +239,7 @@ pub const C_PROGRAMS: [CProgram; 12] = [
 ///
 /// `curl` (фаза 65d) — программа самого curl 8.23 поверх libcurl, mbedTLS и
 /// zlib, собранная его `configure`.
-pub const FOREIGN_PROGRAMS: [&str; 3] = ["lua", "mono", "curl"];
+pub const FOREIGN_PROGRAMS: [&str; 4] = ["lua", "mono", "curl", crate::sevenzip::PROGRAM];
 
 /// Библиотеки классов Mono, которые едут в образ рядом с `/bin/mono` (фаза 60):
 /// имя сборки и каталог в образе.
@@ -1261,6 +1261,7 @@ mod tests {
             "FDCTL_FLAGS" => abi::FDCTL_FLAGS as i64,
             "FD_NONBLOCK" => abi::FD_NONBLOCK,
             "SYS_FLOCK" => abi::SYS_FLOCK as i64,
+            "SYS_CHMOD" => abi::SYS_CHMOD as i64,
             "FLOCK_GETLK" => abi::FLOCK_GETLK as i64,
             "FLOCK_SETLK" => abi::FLOCK_SETLK as i64,
             "FLOCK_SETLKW" => abi::FLOCK_SETLKW as i64,

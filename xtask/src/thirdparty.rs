@@ -132,6 +132,9 @@ enum How {
     /// каждая — своим `buildsystem`; поверхность окна и патчи — в
     /// `ports/netsurf`. См. [`crate::netsurf`].
     NetSurf,
+    /// 7-Zip (24.11): своим `makefile.gcc` в своём каталоге (архив
+    /// исходников плоский) — см. [`crate::sevenzip`].
+    SevenZip,
 }
 
 /// Что распаковывать из архива LLVM для [`How::LlvmRuntimes`]: сборка
@@ -199,7 +202,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 27] = [
+const PROJECTS: [Project; 28] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -715,6 +718,17 @@ const PROJECTS: [Project; 27] = [
         how: How::Obs,
         installs: &[],
     },
+    // 7-Zip 26.06 (24.11): консольный `7zz` — адрес и хеш в `crate::sevenzip`
+    // (качает и собирает он сам; его же зовёт сборка образа).
+    Project {
+        name: "7zip",
+        version: crate::sevenzip::VERSION,
+        url: "https://github.com/ip7z/7zip/releases/download/26.06/7z2606-src.tar.xz",
+        sha256: "a4e374c8f864f51df48c2cfd0e1413ec3b2ea030deae852d6a655402ebb61ac4",
+        unpacked: "7zip-26.06",
+        how: How::SevenZip,
+        installs: &["bin/7zz"],
+    },
 ];
 
 /// Собрать чужие проекты под все указанные архитектуры: все или только
@@ -778,6 +792,12 @@ pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> 
             }
             for &arch in arches {
                 crate::obs::build(arch)?;
+            }
+            continue;
+        }
+        if project.how == How::SevenZip {
+            for &arch in arches {
+                crate::sevenzip::build(arch)?;
             }
             continue;
         }
@@ -1112,7 +1132,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         }
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
-        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java | How::Wine | How::Proton | How::Obs => {
+        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java | How::Wine | How::Proton | How::Obs | How::SevenZip => {
             return Ok(());
         }
         How::NetSurf => crate::netsurf::build(source, &work, arch)?,

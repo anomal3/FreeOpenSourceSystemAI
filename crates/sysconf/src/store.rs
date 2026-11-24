@@ -166,6 +166,54 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("filetypes/.svg/openwith/obsos", OBSOS),
     ("filetypes/.url/default", OBSOS),
     ("filetypes/.url/openwith/obsos", OBSOS),
+    // «Архиватор 7-Zip» (`/bin/archiver` над `/bin/7zz`, 24.11): архивы —
+    // `sysconf::filetypes::ARCHIVES`; `.iso` остаётся «Образом диска».
+    ("apps/archiver/caption", "Архиватор 7-Zip"),
+    ("apps/archiver/icon", "doc-archive"),
+    ("filetypes/.7z/default", ARCHIVER),
+    ("filetypes/.7z/openwith/archiver", ARCHIVER),
+    ("filetypes/.zip/default", ARCHIVER),
+    ("filetypes/.zip/openwith/archiver", ARCHIVER),
+    ("filetypes/.rar/default", ARCHIVER),
+    ("filetypes/.rar/openwith/archiver", ARCHIVER),
+    ("filetypes/.tar/default", ARCHIVER),
+    ("filetypes/.tar/openwith/archiver", ARCHIVER),
+    ("filetypes/.gz/default", ARCHIVER),
+    ("filetypes/.gz/openwith/archiver", ARCHIVER),
+    ("filetypes/.tgz/default", ARCHIVER),
+    ("filetypes/.tgz/openwith/archiver", ARCHIVER),
+    ("filetypes/.bz2/default", ARCHIVER),
+    ("filetypes/.bz2/openwith/archiver", ARCHIVER),
+    ("filetypes/.tbz2/default", ARCHIVER),
+    ("filetypes/.tbz2/openwith/archiver", ARCHIVER),
+    ("filetypes/.xz/default", ARCHIVER),
+    ("filetypes/.xz/openwith/archiver", ARCHIVER),
+    ("filetypes/.txz/default", ARCHIVER),
+    ("filetypes/.txz/openwith/archiver", ARCHIVER),
+    ("filetypes/.zst/default", ARCHIVER),
+    ("filetypes/.zst/openwith/archiver", ARCHIVER),
+    ("filetypes/.lzma/default", ARCHIVER),
+    ("filetypes/.lzma/openwith/archiver", ARCHIVER),
+    ("filetypes/.cab/default", ARCHIVER),
+    ("filetypes/.cab/openwith/archiver", ARCHIVER),
+    ("filetypes/.arj/default", ARCHIVER),
+    ("filetypes/.arj/openwith/archiver", ARCHIVER),
+    ("filetypes/.lzh/default", ARCHIVER),
+    ("filetypes/.lzh/openwith/archiver", ARCHIVER),
+    ("filetypes/.wim/default", ARCHIVER),
+    ("filetypes/.wim/openwith/archiver", ARCHIVER),
+    ("filetypes/.cpio/default", ARCHIVER),
+    ("filetypes/.cpio/openwith/archiver", ARCHIVER),
+    ("filetypes/.rpm/default", ARCHIVER),
+    ("filetypes/.rpm/openwith/archiver", ARCHIVER),
+    ("filetypes/.deb/default", ARCHIVER),
+    ("filetypes/.deb/openwith/archiver", ARCHIVER),
+    ("filetypes/.z/default", ARCHIVER),
+    ("filetypes/.z/openwith/archiver", ARCHIVER),
+    ("filetypes/.001/default", ARCHIVER),
+    ("filetypes/.001/openwith/archiver", ARCHIVER),
+    // Образ диска 7-Zip тоже открывает — только в «Открыть с помощью».
+    ("filetypes/.iso/openwith/archiver", ARCHIVER),
     // «Фотографии» (`/bin/photos`, 24.11): pictures its decoders read.
     ("apps/photos/caption", "Фотографии"),
     ("apps/photos/icon", "doc-image"),
@@ -190,6 +238,9 @@ pub const PHOTOS: &str = "/bin/photos";
 
 /// The browser of the system.
 pub const OBSOS: &str = "/opt/obsos/bin/obsos";
+
+/// The archiver of the system (7-Zip, 24.11).
+pub const ARCHIVER: &str = "/bin/archiver";
 
 /// Built-in value of `key`.
 #[must_use]
@@ -389,6 +440,12 @@ mod tests {
         assert_eq!(split_key("explorer/a=b"), None);
         assert_eq!(split_key("nohive"), None);
         assert_eq!(builtin("filetypes/.html/default"), Some(OBSOS));
+        assert_eq!(builtin("filetypes/.7z/default"), Some(ARCHIVER));
+        assert_eq!(builtin("filetypes/.iso/default"), None);
+        for ext in crate::filetypes::ARCHIVES {
+            assert_eq!(builtin(&default_key(ext)), Some(ARCHIVER), "{ext}");
+            assert_eq!(builtin(&alloc::format!("{}archiver", openwith_prefix(ext))), Some(ARCHIVER), "{ext}");
+        }
         assert_eq!(default_key("svg"), "filetypes/.svg/default");
     }
 

@@ -1848,6 +1848,12 @@ fn find_program(name: &str) -> Option<String> {
     if name.is_empty() || name.contains('/') || name.starts_with('.') {
         return None;
     }
+    // `7z` и `7za` — привычные имена 7-Zip; программа в образе одна, `7zz`
+    // (24.11): все форматы внутри.
+    let name = match name {
+        "7z" | "7za" | "7zr" => "7zz",
+        other => other,
+    };
     let cred = user::session::credentials();
     let exists = |path: &str| fs::resolve_as(cred, path, Access::NONE).is_some_and(|result| result.is_ok());
     let native = alloc::format!("/bin/{name}");

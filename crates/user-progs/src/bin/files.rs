@@ -313,6 +313,13 @@ enum MenuItem {
     /// «Закрепить на панели быстрого доступа» / «Открепить…» (24.11).
     Pin,
     Unpin,
+    /// 7-Zip (24.11, `/bin/archiver`): у архива — «Извлечь все…» и «Извлечь
+    /// сюда», у всего — «Добавить в архив…» и «Сжать в ZIP-файл». Пункты —
+    /// в конце меню, своей группой: стенды считают строки сверху.
+    ExtractAll,
+    ExtractHere,
+    AddToArchive,
+    CompressZip,
 }
 
 impl MenuItem {
@@ -373,6 +380,10 @@ impl MenuItem {
             MenuItem::Paste => "Вставить",
             MenuItem::Pin => "Закрепить на панели быстрого доступа",
             MenuItem::Unpin => "Открепить от панели быстрого доступа",
+            MenuItem::ExtractAll => "Извлечь все…",
+            MenuItem::ExtractHere => "Извлечь сюда",
+            MenuItem::AddToArchive => "Добавить в архив…",
+            MenuItem::CompressZip => "Сжать в ZIP-файл",
         }
     }
 
@@ -389,6 +400,7 @@ impl MenuItem {
             MenuItem::Restore => Some(Icon::Back),
             MenuItem::EmptyTrash => Some(Icon::Close),
             MenuItem::Paste | MenuItem::Pin | MenuItem::Unpin => None,
+            MenuItem::ExtractAll | MenuItem::ExtractHere | MenuItem::AddToArchive | MenuItem::CompressZip => Some(Icon::Package),
         }
     }
 
@@ -408,6 +420,7 @@ impl MenuItem {
             MenuItem::CopyPath | MenuItem::Properties => 1,
             MenuItem::NewFolder | MenuItem::NewTextFile => 2,
             MenuItem::Refresh | MenuItem::Paste => 3,
+            MenuItem::ExtractAll | MenuItem::ExtractHere | MenuItem::AddToArchive | MenuItem::CompressZip => 4,
         }
     }
 
@@ -2272,6 +2285,15 @@ impl Files {
                 }
             }
         }
+        // 7-Zip (24.11): пункты архиватора — в конце меню файла и папки.
+        if let Some(row) = target.and_then(|index| self.rows.get(index)).filter(|row| !row.is_volume() && !self.in_trash()) {
+            if exists("/bin/archiver") && exists("/bin/7zz") {
+                if !row.directory && sysconf::filetypes::is_archive(&row.name) {
+                    items.extend([MenuItem::ExtractAll, MenuItem::ExtractHere]);
+                }
+                items.extend([MenuItem::AddToArchive, MenuItem::CompressZip]);
+            }
+        }
         self.menu = Some(Menu {
             x,
             y,
@@ -2565,6 +2587,53 @@ impl Files {
                     menu.mode = MenuMode::Confirm(0);
                 }
             }
+            MenuItem::ExtractAll | MenuItem::ExtractHere | MenuItem::AddToArchive | MenuItem::CompressZip => {
+                self.close_menu();
+                self.archiver(item, target);
+            }
+        }
+    }
+
+    /// Пункт 7-Zip (24.11): `/bin/archiver --extract|--extract-here|--add|
+    /// --zip` с отмеченными (если строка среди них) или с одной строкой.
+    fn archiver(&mut self, item: MenuItem, target: Option<usize>) {
+        let paths: Vec<String> = match target {
+            Some(index) if self.picked.len() > 1 && self.picked.contains(&index) => {
+                self.picked.iter().filter_map(|index| self.rows.get(*index)).map(|row| self.row_path(row)).collect()
+            }
+            Some(index) => self.rows.get(index).map(|row| self.row_path(row)).into_iter().collect(),
+            None => Vec::new(),
+        };
+        let paths: Vec<String> = match item {
+            // Извлекают только архивы.
+            MenuItem::ExtractAll | MenuItem::ExtractHere => paths.into_iter().filter(|path| sysconf::filetypes::is_archive(path)).collect(),
+            _ => paths,
+        };
+        let Some(first) = paths.first().cloned() else { return };
+        let verb = match item {
+            MenuItem::ExtractAll => "--extract",
+            MenuItem::ExtractHere => "--extract-here",
+            MenuItem::AddToArchive => "--add",
+            _ => "--zip",
+        };
+        let paths = if item == MenuItem::ExtractAll { alloc::vec![first] } else { paths };
+        let mut line = format!("/bin/archiver {verb}");
+        for path in &paths {
+            line.push(' ');
+            line.push_str(&pct(path));
+        }
+        // Строка запуска — до 255 байт: длинный список уходит файлом.
+        if line.len() > 250 {
+            let file = format!("/tmp/.files-7zip-{}", monotonic_ms());
+            let _ = make_dirs("/tmp");
+            if write_file(&file, paths.join("\n").as_bytes()).is_ok() {
+                line = format!("/bin/archiver {verb} @{file}");
+            }
+        }
+        let id = spawn(&line);
+        println(&format!("files: 7-Zip {verb} for {} item(s) ({id})", paths.len()));
+        if id < 0 {
+            self.note = Some(format!("Не удалось запустить архиватор: {}", error_text(id)));
         }
     }
 

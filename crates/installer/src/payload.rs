@@ -315,7 +315,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 82] = [
+const PROGRAMS: [(&CStr16, &str); 84] = [
     // vDSO программ Linux (01.11.2026): время без входа в ядро. Не программа,
     // но едет тем же путём — так он есть и на установленной системе.
     (cstr16!("\\FREEOS\\BIN\\VDSO"), "vdso"),
@@ -454,6 +454,11 @@ const PROGRAMS: [(&CStr16, &str); 82] = [
     // curl 8.23 (фаза 65d): HTTP и HTTPS из командной строки, корни — из
     // `/etc/ca.pem`. Едет, только если собран `cargo xtask thirdparty`.
     (cstr16!("\\FREEOS\\BIN\\CURL"), "curl"),
+    // 7-Zip 26.06 (24.11): консольный `7zz` из исходников 7-zip.org — его
+    // зовёт окно архиватора. Едет, только если собран (`xtask/src/sevenzip.rs`).
+    (cstr16!("\\FREEOS\\BIN\\7ZZ"), "7zz"),
+    // «Архиватор 7-Zip» — окно над `7zz` (24.11).
+    (cstr16!("\\FREEOS\\BIN\\ARCHIVER"), "archiver"),
 ];
 
 /// Эталонные настройки на носителе и их пути в корневом образе.
