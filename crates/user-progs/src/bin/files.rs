@@ -3113,7 +3113,7 @@ impl Files {
         let mut rows: Vec<(&'static str, String)> = Vec::new();
         if self.on_computer() {
             rows.push(("Тип", String::from("Этот компьютер")));
-            rows.push(("Томов", format!("{}", self.rows.len())));
+            rows.push(("Томов", format!("{}", self.volume_count())));
             if let Some(info) = sysinfo() {
                 rows.push((
                     "Память",
@@ -5042,7 +5042,7 @@ impl Files {
         } else if self.error.is_some() {
             parts.push(String::from("Стрелка влево — назад    Backspace — вверх"));
         } else if self.on_computer() {
-            parts.push(format!("Томов: {}", self.rows.len()));
+            parts.push(format!("Томов: {}", self.volume_count()));
         } else {
             parts.push(kit::items_text(self.rows.len()));
             let targets = self.targets();
@@ -6777,21 +6777,33 @@ impl Files {
     fn report(&self) {
         match &self.error {
             Some(text) => println(&format!("files: {} failed: {text}", self.path)),
+            // «Сеть» (`/net`) is a row here but not a volume: it stands under
+            // «Сетевые расположения» and is named after the selection.
             None if self.on_computer() => println(&format!(
-                "files: this computer has {} volume(s), selected '{}'",
-                self.rows.len(),
-                self.selected_name()
+                "files: this computer has {} volume(s), selected '{}'{}",
+                self.volume_count(),
+                self.selected_name(),
+                if self.volume_count() < self.rows.len() { ", network place 'Сеть'" } else { "" }
             )),
+            // The row number too (24.11): «the wheel keeps the selection on
+            // the first row» was checked by the first name, which every new
+            // program in /bin could change.
             None => println(&format!(
-                "files: {} has {} entries, selected '{}'",
+                "files: {} has {} entries, selected '{}' (row {})",
                 self.path,
                 self.rows.len(),
-                self.selected_name()
+                self.selected_name(),
+                self.selected + 1
             )),
         }
     }
 
     /// Имя выбранной строки, либо прочерк, если выбирать не из чего.
+    /// Volumes of «Этот компьютер»: its rows without «Сеть» (24.11).
+    fn volume_count(&self) -> usize {
+        self.rows.iter().filter(|row| row.name != sysconf::winpath::NET).count()
+    }
+
     fn selected_name(&self) -> &str {
         match self.rows.get(self.selected) {
             Some(row) => &row.name,

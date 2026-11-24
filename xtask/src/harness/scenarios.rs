@@ -19650,15 +19650,16 @@ pub const ALL: &[Scenario] = &[
             // Свойства — шестой пункт меню записи (с 22.11 вторым идёт
             // «Открыть с помощью…»). Клавиша меню у QEMU зовётся
             // `compose`: это она даёт `E0 5D` и usage 0x65; `menu` у него —
-            // другая, мультимедийная. Первая строка `/bin` — `admin`
-            // (358b067; до него была `ask`).
+            // другая, мультимедийная. Первая строка `/bin` — какая есть
+            // (была `ask`, потом `admin`, с e6269e1 — `7zz`): имя не
+            // проверяется.
             Step::Key("compose"),
-            Step::Await("files: menu opened for 'admin'", 15_000),
+            Step::Await("files: menu opened for '", 15_000),
             Step::Repeat("down", 5),
             Step::Key("ret"),
             // С 24.11 «Свойства» — отдельное окно (`files --properties`).
             Step::Await("fileprops: window 'Properties' opened", 15_000),
-            Step::Await("files: properties of 'admin'", 15_000),
+            Step::Await("files: properties of '", 15_000),
             Step::Wait(1_500),
             Step::Shot("08-properties"),
             // Вкладка «Подробно» (макет 14): владелец, группа, права.
@@ -19942,10 +19943,10 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::FilesBody),
             Step::Wheel(-5),
             Step::Await("files: scrolled to ", 15_000),
-            // Первая строка `/bin` по алфавиту — `admin` («Администрирование»,
-            // 358b067); до него была `ask`. Новая программа на «a» раньше
-            // `admin` сдвинет и это имя.
-            Step::Await("entries, selected 'admin'", 15_000),
+            // Выделение — всё та же первая строка: по её номеру, а не по
+            // имени (первым по алфавиту был `ask`, потом `admin`, с e6269e1 —
+            // `7zz`; каждая новая программа сдвигала бы и это имя).
+            Step::Await("' (row 1)", 15_000),
             Step::Wait(1_500),
             Step::Shot("02-wheel-keeps-selection"),
             // Клавиша двигает выделение, и вид едет за ним.
