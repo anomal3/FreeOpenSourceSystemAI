@@ -9095,8 +9095,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("waylandcheck: ok native clipboard text reaches the client through data control", 30_000),
             Step::Await("waylandcheck: clip waiting for the keyboard", 30_000),
             Step::Painted("waylandcheck"),
-            Step::Aim(Aim::Title("waylandcheck")),
-            Step::Click,
+            // A new window gets the keyboard by itself; no click on it (a
+            // press inside a Wayland surface keeps the pointer there).
             Step::Await("waylandcheck: ok clip the window gets the keyboard", 30_000),
             Step::Await("waylandcheck: ok native clipboard is offered as text/plain;charset=utf-8 and UTF8_STRING", 30_000),
             Step::Await("waylandcheck: ok native clipboard text reaches the client", 30_000),
@@ -9104,11 +9104,11 @@ pub const ALL: &[Scenario] = &[
             Step::Await("waylandcheck: ok the server reads the client's selection", 30_000),
             Step::Await("waylandcheck: clip selection set", 30_000),
             Step::AwaitAny("wayland     : clipboard from a client: 15 chars, 1 file(s)", 15_000),
-            // Serial lines are typed into the focused window: focus the
-            // desktop (a click on its first icon).
-            Step::Aim(Aim::Icon(0)),
-            Step::Click,
-            Step::Wait(1_000),
+            // Serial lines are typed into the focused window: the client
+            // closes its window (keeps the connection) after setting its
+            // selection.
+            Step::AwaitAny("waylandcheck: clip window closed", 30_000),
+            Step::Wait(3_000),
             Step::Line("clip"),
             Step::Await("clip text: from-wayland-42 (15 chars)", 15_000),
             Step::Await("clip files: /tmp/clip test.txt (1)", 15_000),
@@ -9423,7 +9423,7 @@ pub const ALL: &[Scenario] = &[
         big_file: false,
         ssh_key: false,
         memory: "8G",
-        extra: &["-cpu", "max", "-smp", "4"],
+        extra: &["-cpu", "max", "-smp", "4", "-device", "virtio-gpu-pci,id=gpu0,max_outputs=2,edid=on,xres=1280,yres=800"],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),
@@ -9559,7 +9559,7 @@ pub const ALL: &[Scenario] = &[
         big_file: false,
         ssh_key: false,
         memory: "8G",
-        extra: &["-cpu", "max", "-smp", "4", "-device", "virtio-gpu-pci,id=gpu0,max_outputs=2,edid=on,xres=1280,yres=800"],
+        extra: &["-cpu", "max", "-smp", "4"],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),

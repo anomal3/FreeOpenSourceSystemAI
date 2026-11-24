@@ -1107,6 +1107,16 @@ static int clip(const char *expect) {
     two = src_sends >= 2;
     check(two, "the server reads the client's selection (text and text/uri-list) right when it is set");
     say("clip selection set");
+    /* Give the keyboard back (the scenario types `clip` into the shell):
+     * the window goes away, the connection stays; the files come through
+     * data control, which needs no window and no focus. */
+    begin(ID_TOPLEVEL, 0); /* destroy */
+    end();
+    begin(ID_XDG, 0); /* destroy */
+    end();
+    begin(ID_SURFACE, 0); /* destroy */
+    end();
+    say("clip window closed");
 
     /* Files from native programs come as text/uri-list. */
     /* Only the system clipboard offers x-special/gnome-copied-files - our
