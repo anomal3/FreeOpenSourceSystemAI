@@ -11319,9 +11319,22 @@ GART, fence/IB/VM, шейдер, HW. `amdnode hw on` направляет `CS` �
 PASSED`** — `SH_MEM_*` VMID 1..15 как в `gfx_v8_0_constants_init` (SH_MEM_CONFIG 0x378, BASES
 0x2000), шейдер libdrm на странице с VA 12 ГиБ, IB из пользовательского VA, `buffer_store_dword`
 записал 42 по VA 10 ГиБ, флаг 99 после `CS_PARTIAL_FLUSH`: то есть путь `vkCmdFillBuffer`
-RADV (compute на кольце GFX) на карте возможен. **Дальше:** запуск RADV на железе из
-установленной системы с Proton (`amdnode hw on`, `gpu gametest ... vk`), fence-ожидание без опроса,
-clear-state для графики (draw), SDMA/compute-очереди, прерывания (IH).
+RADV (compute на кольце GFX) на карте возможен.
+
+**A4, шаг 5 (24.11): RADV РАБОТАЕТ НА РЕАЛЬНОЙ RX 590 (флешка 0.8.22, без диска).** Живая флешка
+с `FOSSAI_WITH_PROTON=1` ставит Debian и Proton в память сама (5 с и 107 с), маркер `RADV.TXT`
+(`FOSSAI_AMD_RADV=1`) дожидается этого и гонит `gpu gametest hw -- vk` на настоящем узле
+(`amdnode hw on`, `CS` в кольцо GFX). Результат по `LOG.TXT`: `vulkaninfo` PASS — устройство
+`AMD Radeon Graphics (RADV POLARIS10)`, DISCRETE_GPU, 1002:6fdf, driverID RADV, Mesa 25.0.7;
+`vkprobe` **0 failed**: `vkCreateDevice`, пустая отправка, `vkCmdFillBuffer` + `vkCmdCopyBuffer`
+1 МиБ — compute-шейдеры RADV исполнены картой, данные прочитаны обратно точно. `vkcube`
+дошёл до окна и четырёх dmabuf-буферов (PRIME на AMD работает с сервером Wayland, показ 59 к/с), но
+был убит клиентской libwayland («listener function for opcode 5 of wl_pointer is NULL»): сервер
+слал `wl_pointer.frame` клиентам, связавшимся с `wl_seat` версии < 5; исправлено (`frame` только с
+версии 5). Ошибок `CS on the card failed` не было. На экране теста — строки `==== AMD TEST`.
+**Дальше:** `vkcube`/кадры на экран с карты (после правки `frame`), DXVK поверх RADV на железе
+(`gpu gametest hw -- d3d`), fence-ожидание без опроса и прерывания (IH), clear-state для графики
+(draw), SDMA/compute-очереди, VRAM-домен буферов (сейчас вся память — системная).
 
 **A4, подготовка (17.11):** `docs/AMD_A4_CALLS.md` — точный список обращений
 libdrm/RADV (Debian 13: Mesa 25.0.7, libdrm 2.4.124) к ядру: файлы sysfs для

@@ -4531,7 +4531,12 @@ impl Client {
         let serial = self.next_serial();
         for pointer in pointers {
             self.send(make(pointer, serial));
-            self.send(Msg::new(pointer, 5));
+            // `wl_pointer.frame` есть с версии 5 `wl_seat`: клиент, который связался с меньшей версией
+            // (vkcube), слушателя `frame` не ставит, и libwayland убивает его
+            // «listener function for opcode 5 of wl_pointer is NULL» (24.11, RADV на RX 590).
+            if self.seat_version >= 5 {
+                self.send(Msg::new(pointer, 5));
+            }
         }
     }
 }
