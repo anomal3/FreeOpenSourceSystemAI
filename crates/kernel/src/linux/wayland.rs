@@ -1232,8 +1232,12 @@ struct Win {
 /// (24.11, the Linux client of Rupor): rootful Xwayland draws no decorations
 /// without `-decorate` (libdecor), and its window is a whole X screen - a
 /// program window, not a client-side-decorated one like Chromium or Qt.
+///
+/// VLC (24.11, `vlc` - fossai-vlc sets it): Qt 5 on wl_shm alone draws no
+/// decorations either (`QWaylandDisplay::supportsWindowDecoration` wants an
+/// EGL buffer integration), and its window had no title bar to drag or close.
 fn framed_app(app_id: &str) -> bool {
-    app_id == "org.freedesktop.Xwayland"
+    matches!(app_id, "org.freedesktop.Xwayland" | "vlc")
 }
 
 /// Hand the size limits of a toplevel to the desktop. `true` — still due.
@@ -1924,6 +1928,7 @@ impl Client {
                 if opcode == 0 {
                     self.delete(id);
                     crate::power::inhibit(false);
+                    kprintln!("  wayland     : client #{} lets the screensaver run again", self.pid);
                 }
             }
             Obj::Callback | Obj::Region | Obj::Output { .. } | Obj::Keyboard => {
