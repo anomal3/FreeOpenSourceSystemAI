@@ -469,14 +469,26 @@ impl UsbDisk {
             // просили, или отказал; точка уже сброшена, а итог скажет CSW.
             match xhci::storage_bulk(handle, dir_in, StorageBuffer::Data, length) {
                 Ok(_) | Err(BulkError::Stalled) => {}
-                Err(err) => return Err(err.into()),
+                // hw-log18: a transaction error halts the xHCI endpoint; without
+                // Reset Recovery the next command waited on a halted ring.
+                Err(err) => {
+                    if matches!(err, BulkError::Failed(_) | BulkError::Timeout) {
+                        xhci::storage_reset(handle);
+                    }
+                    return Err(err.into());
+                }
             }
         }
         let status = match xhci::storage_bulk(handle, true, StorageBuffer::Status, 13) {
             Ok(read) => read,
             // Остановка вместо CSW — попытка ещё одна, после сброса точки.
             Err(BulkError::Stalled) => xhci::storage_bulk(handle, true, StorageBuffer::Status, 13)?,
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                if matches!(err, BulkError::Failed(_) | BulkError::Timeout) {
+                    xhci::storage_reset(handle);
+                }
+                return Err(err.into());
+            }
         };
         if let Direction::In(buf) = &mut data {
             let len = buf.len();
