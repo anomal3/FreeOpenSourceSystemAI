@@ -33,6 +33,7 @@ pub mod ext2fs;
 pub mod fat;
 // Блокировки файлов (08.11.2026): fcntl F_*LK и flock для всех программ.
 pub mod locks;
+pub mod netfs;
 // Наблюдение за каталогами (20.11): события создания, удаления, записи.
 pub mod notify;
 pub mod ramvol;

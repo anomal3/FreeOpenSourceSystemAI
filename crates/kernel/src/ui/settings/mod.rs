@@ -64,6 +64,8 @@ pub enum Section {
     Keyboard,
     Usb,
     Network,
+    /// «Параметры общего доступа» (24.11): network discovery, sharing.
+    Sharing,
     Personal,
     Wallpaper,
     Colors,
@@ -107,7 +109,7 @@ const NAV: [Section; 13] = [
 ];
 
 /// Все страницы — для поиска.
-const ALL: [Section; 27] = [
+const ALL: [Section; 28] = [
     Section::Home,
     Section::System,
     Section::Display,
@@ -118,6 +120,7 @@ const ALL: [Section; 27] = [
     Section::Keyboard,
     Section::Usb,
     Section::Network,
+    Section::Sharing,
     Section::Personal,
     Section::Wallpaper,
     Section::Colors,
@@ -151,6 +154,7 @@ impl Section {
             Section::Keyboard => "Клавиатура",
             Section::Usb => "USB-устройства",
             Section::Network => "Сеть",
+            Section::Sharing => "Параметры общего доступа",
             Section::Personal => "Персонализация",
             Section::Wallpaper => "Фон",
             Section::Colors => "Цвета",
@@ -187,6 +191,7 @@ impl Section {
                 Some(Section::System)
             }
             Section::Keyboard | Section::Usb => Some(Section::Devices),
+            Section::Sharing => Some(Section::Network),
             Section::Wallpaper | Section::Colors | Section::Appearance | Section::LockScreen => Some(Section::Personal),
             Section::Start => Some(Section::Dock),
             Section::Packages | Section::Services | Section::DefaultApps => Some(Section::Apps),
@@ -213,6 +218,7 @@ impl Section {
             Section::Devices | Section::Keyboard => Fi::Keyboard,
             Section::Usb => Fi::Usb,
             Section::Network => Fi::Globe,
+            Section::Sharing => Fi::Server,
             Section::Personal | Section::Colors => Fi::Palette,
             Section::Wallpaper => Fi::Image,
             Section::Appearance => Fi::Sliders,
@@ -268,6 +274,7 @@ impl Section {
             Section::Keyboard => "Раскладка и горячие клавиши",
             Section::Usb => "Подключённые устройства и контроллеры",
             Section::Network => "Адрес: по DHCP или постоянный",
+            Section::Sharing => "Сетевое обнаружение, общий доступ к файлам, парольная защита",
             Section::Personal => "Тема, фон, цвета, экран блокировки, панель задач",
             Section::Wallpaper => "Картинка, цвет и расположение",
             Section::Colors => "Тема, акцентный цвет, заголовок окна",
@@ -301,6 +308,7 @@ impl Section {
             Section::Keyboard => "клавиатура раскладка горячие клавиши alt shift",
             Section::Usb => "usb xhci ehci ohci контроллер мышь планшет",
             Section::Network => "сеть адрес dhcp шлюз ip mac dns",
+            Section::Sharing => "общий доступ сетевое обнаружение компьютеры сети smb общие папки парольная защита netbios",
             Section::Personal => "персонализация оформление тема темы",
             Section::Wallpaper => "фон обои градиент картинка цвет",
             Section::Colors => "цвета тема тёмная светлая акцент заголовок",
@@ -410,6 +418,10 @@ enum Deed {
     Timezone(i32),
     NetDhcp,
     NetStatic,
+    /// A switch of «Параметры общего доступа»: registry key and the new state.
+    Share(&'static str, bool),
+    /// Open a computer of the network (`/net/<name>`) — `netlogon --open`.
+    NetOpen(String),
     /// Включить Wi-Fi (`crate::wifi::enable`, 03.11).
     WifiOn,
     /// Выключить Wi-Fi (04.11: включить было можно, выключить — нет).
@@ -1319,6 +1331,17 @@ impl SettingsView {
             Deed::DesktopIcons => {
                 self.request = Some(Request::DesktopIcons);
             }
+            Deed::Share(key, on) => {
+                crate::net::lan::set_flag(key, on);
+                kprintln!("  settings    : {key} = {}", if on { "on" } else { "off" });
+                self.report = Some(Report::ok(String::from(match (key, on) {
+                    (crate::net::lan::KEY_DISCOVERY, true) => "сетевое обнаружение включено",
+                    (crate::net::lan::KEY_DISCOVERY, false) => "сетевое обнаружение выключено: компьютер не ищет других и не отвечает на своё имя",
+                    (crate::net::lan::KEY_PASSWORD_PROTECTED, true) => "парольная защита включена",
+                    (crate::net::lan::KEY_PASSWORD_PROTECTED, false) => "парольная защита выключена",
+                    _ => "сохранено",
+                })));
+            }
             Deed::BootLog(on) => {
                 self.report = Some(match super::prefs::set_boot_verbose(on) {
                     Ok(said) => Report::ok(said),
@@ -1565,6 +1588,7 @@ impl SettingsView {
             Deed::Restart => self.request = Some(Request::Restart),
             Deed::Launch(path) => self.report = Some(pages::run(path, path)),
             Deed::Run(line) => self.report = Some(pages::run(&line, "Proton")),
+            Deed::NetOpen(path) => self.report = Some(pages::run(&format!("/bin/netlogon --open {path}"), "Обзор сети")),
             Deed::PickOutput(index) => {
                 self.displays.select(index);
                 kprintln!("  settings    : display {} selected", index + 1);

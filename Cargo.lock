@@ -668,6 +668,7 @@ dependencies = [
  "nvgpu",
  "osupdate",
  "slots",
+ "smb",
  "swipe",
  "sysconf",
  "usb-hid",

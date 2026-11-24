@@ -5417,6 +5417,7 @@ fn section_named(name: &str) -> Option<Section> {
         "keyboard" | "typing" | "regionlanguage" | "language" => Section::Keyboard,
         "usb" | "autoplay" => Section::Usb,
         "network" | "network-status" | "network-ethernet" | "network-wifi" | "network-proxy" => Section::Network,
+        "sharing" | "advancedsharing" | "network-advancedsharing" | "network-advancedsettings" => Section::Sharing,
         "personal" | "personalization" => Section::Personal,
         "wallpaper" | "personalization-background" | "background" => Section::Wallpaper,
         "colors" | "personalization-colors" => Section::Colors,

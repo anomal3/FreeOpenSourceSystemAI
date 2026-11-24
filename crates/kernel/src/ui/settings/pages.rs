@@ -46,6 +46,7 @@ impl SettingsView {
             Section::Keyboard => keyboard(pass, x, y, w),
             Section::Usb => self.usb(pass, x, y, w),
             Section::Network => self.network(pass, x, y, w),
+            Section::Sharing => sharing(pass, x, y, w),
             Section::Personal => personal(pass, x, y, w),
             Section::Wallpaper => super::background::page(pass, x, y, w),
             Section::LockScreen => {
@@ -352,7 +353,9 @@ impl SettingsView {
         // телефоне это единственная связь, и искать её ниже карты Ethernet,
         // которой нет, человек не станет.
         let wifi = crate::wifi::state();
-        let mut y = y;
+        // «Параметры общего доступа» (24.11) — первой строкой, как ссылка
+        // «Дополнительные параметры общего доступа» в Windows.
+        let mut y = nav_row(pass, x, y, w, Section::Sharing);
         if wifi != crate::wifi::State::Absent {
             y = pass.group(x, y, w, "Wi-Fi");
             // Тумблер — как у телефонов: включён, пока блок не выключен.
@@ -1247,6 +1250,88 @@ fn mode_card(pass: &mut Pass, rect: Rect, mode: super::super::deskcfg::Mode, edg
     let ty = shot.bottom() + ctx.px(10) as i32;
     pass.text(Role::Strong, rect.x + pad as i32, ty, rect.w - pad * 2, title, p.ink);
     pass.text(Role::Caption, rect.x + pad as i32, ty + line_h(ctx, Role::Strong) + ctx.px(2) as i32, rect.w - pad * 2, desc, p.ink3);
+}
+
+/// «Параметры общего доступа» (Roman 24.11, like Windows' advanced sharing
+/// settings) — only switches that do something here.
+fn sharing(pass: &mut Pass, x: i32, y: i32, w: u32) {
+    use crate::net::lan;
+    let ctx = pass.ctx;
+    let discovery = lan::discovery_enabled();
+    let mut y = pass.group(x, y, w, "Эта сеть");
+    y = row(
+        pass,
+        x,
+        y,
+        w,
+        Some(Fi::Search),
+        "Сетевое обнаружение",
+        "Находить компьютеры сети и отвечать на имя FOSSAI",
+        Ctl::Toggle(discovery),
+        Some(Deed::Share(lan::KEY_DISCOVERY, !discovery)),
+    );
+    y = row(
+        pass,
+        x,
+        y,
+        w,
+        Some(Fi::FolderOpen),
+        "Общий доступ к файлам и принтерам",
+        "Свои папки для других — сервер SMB будет позже",
+        Ctl::Value("Недоступно"),
+        None,
+    );
+    y = pass.group(x, y, w, "Все сети");
+    let protected = lan::password_protected();
+    y = row(
+        pass,
+        x,
+        y,
+        w,
+        Some(Fi::Lock),
+        "Общий доступ с парольной защитой",
+        "Свои общие папки — только по учётной записи и паролю",
+        Ctl::Toggle(protected),
+        Some(Deed::Share(lan::KEY_PASSWORD_PROTECTED, !protected)),
+    );
+    y = row(
+        pass,
+        x,
+        y,
+        w,
+        Some(Fi::ShieldCheck),
+        "Подключения общего доступа к файлам",
+        "SMB 2–3.1.1, NTLMv2, подпись; шифрования SMB 3 пока нет",
+        Ctl::Value("С подписью"),
+        None,
+    );
+    y = pass.group(x, y, w, "Компьютеры в сети");
+    if !discovery {
+        y = pass.note(x, y, w, "Сетевое обнаружение выключено. Открыть компьютер по имени или адресу можно и так: Win+R → \\\\имя.");
+    } else {
+        let hosts = lan::hosts();
+        if hosts.is_empty() {
+            y = pass.note(x, y, w, "Пока никого не найдено — поиск идёт раз в минуту. Компьютер по адресу: Win+R → \\\\192.168.1.10.");
+        }
+        for host in hosts.iter().take(32) {
+            let address = format!("{}", host.address);
+            let title = if host.name.is_empty() { address.clone() } else { host.name.clone() };
+            let desc = if host.files { format!("{address} · общие папки") } else { address.clone() };
+            let target = if host.name.is_empty() { address.clone() } else { host.name.clone() };
+            y = row(pass, x, y, w, Some(Fi::Monitor), &title, &desc, Ctl::Button("Открыть", Weight::Normal), Some(Deed::NetOpen(format!("/net/{target}"))));
+        }
+    }
+    let saved = crate::config::exists("netcreds").is_some();
+    pass.note(
+        x,
+        y + ctx.px(4) as i32,
+        w,
+        if saved {
+            "Запомненные учётные данные лежат в /etc/netcreds (только root, без паролей — хеш NT)."
+        } else {
+            "Учётные данные спрашиваются при первом входе; «Запомнить» сохраняет их без пароля (хеш NT, только root)."
+        },
+    );
 }
 
 fn explorer(pass: &mut Pass, x: i32, y: i32, w: u32) {

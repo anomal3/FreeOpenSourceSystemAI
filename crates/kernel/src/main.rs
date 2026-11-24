@@ -938,6 +938,11 @@ fn run_session(have_input: bool) -> ! {
         kprintln!("  fs          : the writeback task did not start: {err}");
     }
 
+    // `\\host\share` (Roman 24.11): computers on the network and their
+    // shared folders under `/net` (`net::lan`, `fs::netfs`).
+    net::lan::start();
+    fs::netfs::mount();
+
     // Уточнение частоты счётчика времени (фаза 68g): калибровка при загрузке
     // ошибалась в разы в VirtualBox поверх Hyper-V — см. `time::refine_task`.
     #[cfg(target_arch = "x86_64")]
