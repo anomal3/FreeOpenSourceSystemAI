@@ -563,7 +563,9 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
                 }
             }
             nr::FSTAT => fstat(a0, a1),
-            nr::LSEEK => errno(native(SYS_SEEK, a0, a1, a2)),
+            // 25.11: a dma-buf answers its size to SEEK_END (Mesa llvmpipe
+            // sizes the mmap of an imported dma-buf so).
+            nr::LSEEK => drm::dmabuf_seek(a0, a1 as i64, a2).unwrap_or_else(|| errno(native(SYS_SEEK, a0, a1, a2))),
             nr::MMAP => mmap(a0, a1, a2, a3, a4, args[5]),
             nr::MPROTECT => mprotect(a0, a1, a2),
             // Снять то, чего нет, у Linux не ошибка (12.11: Wine снимает

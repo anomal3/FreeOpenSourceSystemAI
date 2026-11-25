@@ -266,12 +266,34 @@ pub fn prime_handle_to_fd(file: &DrmFile, arg: usize) -> i64 {
     if bo.no_share {
         return -e::EPERM;
     }
+    note_exported(&bo);
     let fd = super::install(Arc::new(DmaBuf(bo)), false, args.flags & O_CLOEXEC != 0);
     if fd < 0 {
         return fd;
     }
     args.fd = fd as i32;
     if put(arg, args).is_err() { -e::EFAULT } else { 0 }
+}
+
+/// 25.11 (OBS zero copy): exported system-memory buffers by their first
+/// physical frame - the desktop knows a fullscreen game's buffer only by the
+/// address it scans out (`Window::scanout_source`); the screen capture hands
+/// the same buffer to OBS as a dma-buf through it ([`exported_by_frame`]).
+static EXPORTED: SpinLock<Vec<(u64, Weak<Bo>)>> = SpinLock::new(Vec::new());
+
+fn note_exported(bo: &Arc<Bo>) {
+    let Some(first) = bo.frames().and_then(|frames| frames.first().copied()) else {
+        return;
+    };
+    let mut list = EXPORTED.lock();
+    list.retain(|(at, weak)| *at != first && weak.strong_count() > 0);
+    list.push((first, Arc::downgrade(bo)));
+}
+
+/// The exported buffer whose memory starts at physical `first`, if it lives.
+#[must_use]
+pub fn exported_by_frame(first: u64) -> Option<Arc<Bo>> {
+    EXPORTED.lock().iter().find(|(at, _)| *at == first).and_then(|(_, weak)| weak.upgrade())
 }
 
 /// `DRM_IOCTL_PRIME_FD_TO_HANDLE`: ручка для dma-buf; уже есть у файла —

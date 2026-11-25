@@ -404,6 +404,46 @@ pub fn dmabuf_memory(object: &dyn Object) -> Option<(Arc<crate::user::shm::Share
     Some((gem::shared_of(bo)?, bo.size))
 }
 
+/// 25.11 (OBS zero copy, `/dev/fossai-capture`): a linear buffer in system
+/// memory that the GPU of the render node can read - a slot of the screen
+/// capture's dma-buf ring. `Err(-ENODEV)` - no render node (no NVIDIA, no
+/// `nvk soft on`): the capture stays on the CPU copy.
+pub fn capture_buffer(size: u64) -> Result<Arc<Bo>, i64> {
+    let gpu = backend().ok_or(-e::ENODEV)?;
+    let bo = Bo::new(&gpu, size, gem::DOMAIN_GART, (0, 0))?;
+    if bo.frames().is_none() {
+        return Err(-e::ENOMEM);
+    }
+    Ok(bo)
+}
+
+/// A dma-buf descriptor (close-on-exec) of `bo` in the current program.
+pub fn install_dmabuf(bo: Arc<Bo>) -> i64 {
+    install(Arc::new(gem::DmaBuf(bo)), false, true)
+}
+
+/// `lseek` of a dma-buf descriptor, as Linux `dma_buf_llseek`: only offset
+/// 0, `SEEK_SET` answers 0 and `SEEK_END` the size of the buffer (Mesa
+/// llvmpipe maps an imported dma-buf by that size - without it the map was
+/// empty and llvmpipe's threads read address 0, OBS 25.11). `None` - not a
+/// dma-buf.
+pub fn dmabuf_seek(fd: usize, offset: i64, whence: usize) -> Option<i64> {
+    let object = object_of(fd)?;
+    let buf = object.as_any().downcast_ref::<gem::DmaBuf>()?;
+    Some(match (offset, whence) {
+        (0, 0) => 0,
+        (0, 2) => buf.bo().size as i64,
+        _ => -e::EINVAL,
+    })
+}
+
+/// The exported (PRIME) buffer whose memory starts at physical `first` - a
+/// fullscreen game's swapchain image scanned out by the desktop.
+#[must_use]
+pub fn exported_by_frame(first: u64) -> Option<Arc<Bo>> {
+    gem::exported_by_frame(first)
+}
+
 /// 25.11: is the GPU still drawing the frame of the dma-buf whose memory
 /// starts at physical `first_frame` (see `gem::frame_pending`)?
 #[must_use]

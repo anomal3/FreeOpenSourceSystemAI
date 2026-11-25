@@ -18839,3 +18839,106 @@ Chromium без ANGLE; на Windows это не мешает (уходит на 
 
 **TODO**: HiDPI (масштаб окна в obsos-core), GPU-путь на Windows, пересборка
 пакета `obsos` под FossAi из нового репозитория (нужен образ fossai-builder).
+
+## OBS для стримов: видеокарта по умолчанию, кадры через dma-buf, x264 для игр (25.11) - **сделано в коде, проверено в QEMU, проверить на железе**
+
+Роман: стример должен играть и писать/транслировать, как на Windows. В hw-log19
+OBS рисовал на llvmpipe и ел 85-91 % из 16 ЦП - игры лагали.
+
+**Почему zink/NVK «не получил канал» (`chans 0` в hw-log19).** Каналов не было,
+потому что OBS ни разу не запускался на zink: проба `eglinfo` не работала
+(`timeout`/`env` Debian 12 с `LD_LIBRARY_PATH` glibc 2.41 - код 127, исправлено
+в 4a4cb0e), и оба запуска OBS (#1208 `--gpu`, #1608 из «Пуска») шли на
+llvmpipe. Три пары `nvgpu: drm open/close pid 1208 (gem 0 chans 0 vm 0)` - это
+Mesa EGL, перебирающий устройства при `LIBGL_ALWAYS_SOFTWARE=1`, а не отказ NVK.
+
+**Сделано**
+1. **Видеокарта по умолчанию, с проверенным откатом** (`fossai-obs`,
+   `xtask/src/obs.rs`). Есть `/dev/dri/renderD128` - zink на NVK; до запуска
+   `eglinfo` должен назвать renderer `zink ...` не на llvmpipe/lavapipe, после -
+   журнал OBS должен дойти до «OpenGL loaded successfully», иначе OBS
+   перезапускается на llvmpipe (4 потока). `--gpu`/`--cpu`, `gpu=1|0|auto` в
+   `~/.config/fossai-obs.conf`. Вторая строка «Пуска» теперь «OBS Studio
+   (процессор)» (`--cpu`). Выбор - в журнал ядра (`kmsg : fossai-obs: ...`), и
+   2 минуты после старта лаунчер переносит из журнала OBS в журнал ядра
+   `OBS: Loading up OpenGL on adapter ...` и `OBS: [fossai-capture] frames: ...`.
+2. **Кадры без копий в OBS** - dma-buf из `/dev/fossai-capture`
+   (`linux/fossaicap.rs`, `ui/capture.rs`, модуль `libc/linux/obs-fossai.c`):
+   - `FOSSAI_CAP_DMABUF` (`F`,8): кольцо из 3 линейных буферов в системной
+     памяти, которые читает GPU узла рендера (`drm::capture_buffer`, шаг строки
+     кратен 256), их dma-buf, fourcc (`XR24`/`XB24`), модификатор LINEAR.
+   - `FOSSAI_CAP_FRAME` (`F`,9): новейший кадр. Изменился - зеркало копируется
+     в следующий буфер кольца (единственная копия, в потоке захвата OBS, с
+     указателем) и отдаётся номер. Если захваченный монитор показывает игру на
+     весь экран прямо из её буфера (scanout) - отдаётся **сам буфер игры**
+     (dma-buf по первому физическому кадру, `drm::exported_by_frame`), и стол
+     перестаёт копировать игру в зеркало (`capture::set_client`): копий нет
+     совсем. Забор кадра: кольцо готово по возврату (копия синхронная), буфер
+     игры стол показывает только после её забора (`frame_pending`) -
+     `fence_fd` всегда -1.
+   - Модуль OBS: источники стали синхронными (рисуют текстуру сами, без очереди
+     кадров OBS - минус одна копия и в запасном пути). Импорт -
+     `gs_texture_create_from_dmabuf` (EGL dma-buf import; zink - в NVK), с
+     модификатором LINEAR, если OpenGL его называет. Запасной путь (нет узла
+     рендера, нет импорта, импорт не удался, `FOSSAI_OBS_DMABUF=0`) - `GRAB` в
+     один из двух буферов и загрузка текстуры. Источник по умолчанию - один
+     (основной) монитор в родном разрешении.
+   - Ядро: `lseek(SEEK_END)` dma-buf отвечает размер (как Linux; llvmpipe по
+     нему мапит импортированный буфер - без этого его потоки читали адрес 0).
+3. **x264 для игр** (NVENC нет). Профиль «FossAi» версии 2
+   (`FossAiProfile=2`, старый профиль заменяется один раз): расширенный режим,
+   x264 `veryfast` и для записи (MP4, CRF 21, `recordEncoder.json`), и для
+   трансляции (CBR 6000 кбит/с, ключ раз в 2 с, `streamEncoder.json`),
+   `threads` = четверть ЦП от 2 до 4 (16 ЦП - 4), холст - основной монитор,
+   вывод до 1080p, 30 к/с (60 - в настройках «Видео»). OBS запускается через
+   `nice -n 5` (`FOSSAI_OBS_NICE=0` - без).
+
+**Проверено в QEMU** (`set FOSSAI_WITH_OBS=1`, `cargo xtask test -r -a x86_64
+-s install,obs,obs-dmabuf -j 1`, 25.11 - все три ок):
+- `obs`: нет узла рендера - `fossai-obs: no /dev/dri/renderD128 - OpenGL stays
+  on llvmpipe`, `x264 veryfast with 2 threads of 4 CPUs`, `[fossai-capture]
+  frames: CPU copy (no dma-buf ring from the kernel: no GPU render node)`, запись
+  F9/F10 1280x800 h264+aac.
+- `obs-dmabuf`: `nvk soft on` (SoftGpu) + `fossai-obs --cpu
+  --env=FOSSAI_OBS_DMABUF=1`: `capture : dma-buf ring of 3 for 1280x800
+  (stride 5120, linear)`, llvmpipe импортирует (`dma-buf import works`,
+  `frames: dma-buf ring (one kernel copy, no copy in OBS)`), превью и запись
+  (`custom settings: threads = 2`) - ок. Снимки `photos/tests/obs-*`,
+  `obs-dmabuf-*`.
+- Не проверено в QEMU: zink на NVK (в QEMU нет NVIDIA; virtio-gpu ядра без 3D),
+  буфер игры вместо кольца (нужен scanout игры на NVIDIA).
+
+**Что смотреть на железе (LOG.TXT)**
+1. `fossai-obs: OpenGL on the GPU: zink Vulkan ...(NVIDIA GeForce RTX 3060 ...
+   NVK ...)` и `fossai-obs: OBS: Loading up OpenGL on adapter ... zink ...`;
+   при закрытии OBS - `nvgpu: drm close pid <OBS> (gem N chans 2 vm 1)` (каналы
+   есть). Откат - `GPU probe failed ...` (подробности
+   `~/.cache/fossai-obs/gpu-probe.txt`) или `OBS did not start OpenGL on the
+   GPU ... restarting on llvmpipe`.
+2. `capture : dma-buf ring of 3 for 2560x1440 (stride 10240, linear)`,
+   `OBS: [fossai-capture] dma-buf import works`, `OBS: [fossai-capture]
+   frames: dma-buf ring ...`. Отказ - `[fossai-capture] dma-buf import failed
+   (...) - CPU copy from now on`.
+3. Игра на весь экран на захваченном мониторе (scanout direct): `capture : the
+   source samples the fullscreen window's buffer (no copy)`; вышла из полного
+   экрана - `the source takes composed frames again`.
+4. `fossai-obs: profile FossAi: ... x264 veryfast with 4 threads of 16 CPUs`;
+   нагрузка ЦП OBS под игрой (perf-diag) против hw-log19 (85-91 %).
+
+**Не сделано (TODO)**
+- **Аппаратное кодирование**: NVENC нет (проприетарный), Vulkan Video encode
+  (H.264/HEVC) в NVK Mesa 25.0 нет - кодирует x264 на ЦП. Когда в NVK появится
+  `VK_KHR_video_encode_h264` - кодировщик OBS через FFmpeg Vulkan
+  (`h264_vulkan`) или свой.
+- **`nice` не действует**: ядро принимает `setpriority` и молча игнорирует
+  (планировщик без приоритетов, `linux/mod.rs` `SETPRIORITY => 0`). Нужен класс
+  «фоновых» задач в `sched` (наследуется при `clone`), не строгий, чтобы OBS
+  под нагрузкой не замирал. Пока OBS держат в рамках потоки: x264 2-4,
+  llvmpipe 4.
+- Два монитора двумя источниками - по-прежнему один захват охватывающего
+  прямоугольника (5120x1440 - копия кольца вдвое больше); нужен захват ядра на
+  несколько прямоугольников.
+- Буфер игры отдаётся без указателя (игры его обычно прячут) и только целым
+  монитором (окно игры = монитор, scanout).
+- Окно OBS само попадает в захват основного монитора (как на Windows без
+  «Исключить окно»).

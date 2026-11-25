@@ -75,6 +75,10 @@ struct Capture {
     pointer: PointerShot,
     last_grab_ms: u64,
     grabs: u64,
+    /// 25.11: the captured rectangle is an output shown straight from a
+    /// contiguous client buffer - its physical address and pitch
+    /// ([`note_direct`]).
+    direct: Option<(u64, u32)>,
 }
 
 /// The pointer as the display shows it, for patching into grabbed frames.
@@ -271,6 +275,7 @@ fn end() {
     STARTED_MS.store(0, Ordering::Relaxed);
     STOP_ASKED.store(false, Ordering::Relaxed);
     SHARED.store(false, Ordering::Relaxed);
+    CLIENT.store(false, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +372,7 @@ fn start(ptr: usize) -> i64 {
         pointer: PointerShot { drawn: true, visible: false, x: 0, y: 0, key: usize::MAX, hot: (0, 0), side: 0, image: Vec::new() },
         last_grab_ms: now,
         grabs: 0,
+        direct: None,
     };
     {
         let mut state = STATE.lock();
@@ -394,8 +400,55 @@ fn start(ptr: usize) -> i64 {
     0
 }
 
+/// Where a grab puts the frame: the program's buffer ([`grab`]) or a slot of
+/// the dma-buf ring of `/dev/fossai-capture` (25.11, OBS on the GPU).
+pub trait FrameSink {
+    /// `points` are rows `first..` of the frame, `width` points each.
+    fn put_rows(&mut self, first: u32, width: u32, points: &[u32]);
+    /// The point at `(x, y)` of the frame (the pointer patch).
+    fn point(&mut self, x: u32, y: u32) -> &mut u32;
+}
+
+/// The program's own buffer, rows packed.
+struct SliceSink<'a> {
+    out: &'a mut [u32],
+    width: usize,
+}
+
+impl FrameSink for SliceSink<'_> {
+    fn put_rows(&mut self, first: u32, width: u32, points: &[u32]) {
+        let from = first as usize * width as usize;
+        self.out[from..from + points.len()].copy_from_slice(points);
+    }
+    fn point(&mut self, x: u32, y: u32) -> &mut u32 {
+        &mut self.out[y as usize * self.width + x as usize]
+    }
+}
+
 /// Copy the mirror into the program's buffer, the pointer patched in.
 fn grab(buf: usize, have: u64) -> i64 {
+    grab_with(have, |w, h| {
+        let bytes = w as usize * h as usize * 4;
+        if buf % 4 != 0 || !space::user_can(buf, bytes, PageFlags::WRITE) {
+            return Err(ERR_BAD_ADDRESS);
+        }
+        // SAFETY: the whole buffer is the program's, writable, aligned (checked).
+        let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u32, w as usize * h as usize) };
+        Ok(SliceSink { out, width: w as usize })
+    })
+}
+
+/// Size of the running capture; `None` - none.
+#[must_use]
+pub fn size() -> Option<(u32, u32)> {
+    STATE.lock().as_ref().map(|capture| (capture.rect.w, capture.rect.h))
+}
+
+/// A grab into any sink: nothing when the mirror still has frame `have`
+/// (the answer is that number), else the mirror goes to the sink `make`
+/// builds for the size, the pointer patched in. The answer is the frame
+/// number or a native error.
+pub fn grab_with<S: FrameSink>(have: u64, make: impl FnOnce(u32, u32) -> Result<S, i64>) -> i64 {
     let (w, h, seq) = {
         let mut state = STATE.lock();
         let Some(capture) = state.as_mut() else {
@@ -407,12 +460,10 @@ fn grab(buf: usize, have: u64) -> i64 {
     if seq == have {
         return seq as i64;
     }
-    let bytes = w as usize * h as usize * 4;
-    if buf % 4 != 0 || !space::user_can(buf, bytes, PageFlags::WRITE) {
-        return ERR_BAD_ADDRESS;
-    }
-    // SAFETY: the whole buffer is the program's, writable, aligned (checked).
-    let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u32, w as usize * h as usize) };
+    let mut out = match make(w, h) {
+        Ok(out) => out,
+        Err(err) => return err,
+    };
     let mut row = 0;
     while row < h {
         let rows = GRAB_ROWS.min(h - row);
@@ -425,7 +476,7 @@ fn grab(buf: usize, have: u64) -> i64 {
         }
         let from = row as usize * w as usize;
         let to = from + rows as usize * w as usize;
-        out[from..to].copy_from_slice(&capture.mirror[from..to]);
+        out.put_rows(row, w, &capture.mirror[from..to]);
         drop(state);
         row += rows;
     }
@@ -453,12 +504,62 @@ fn grab(buf: usize, have: u64) -> i64 {
                 if alpha == 0 {
                     continue;
                 }
-                let at = y as usize * w as usize + x as usize;
-                out[at] = if alpha == 255 { color } else { blend(out[at], color, alpha) };
+                let at = out.point(x as u32, y as u32);
+                *at = if alpha == 255 { color } else { blend(*at, color, alpha) };
             }
         }
     }
     seq as i64
+}
+
+// ---------------------------------------------------------------------------
+// 25.11: a fullscreen game's own buffer for OBS (zero copy)
+// ---------------------------------------------------------------------------
+
+/// The capture consumer (OBS through `/dev/fossai-capture`) samples the
+/// scanned-out client buffer itself ([`direct_source`]): the desktop then
+/// skips the mirror copy of the direct output ([`mirror_direct`]).
+static CLIENT: AtomicBool = AtomicBool::new(false);
+
+/// Desktop hook, every presented frame while a capture runs: the outputs
+/// shown straight from a client buffer - `(output rect, physical address,
+/// pitch)`. The one that is exactly the captured rectangle is remembered.
+pub fn note_direct(sources: &[(Rect, u64, u32)]) {
+    let mut state = STATE.lock();
+    let Some(capture) = state.as_mut() else {
+        return;
+    };
+    capture.direct = sources.iter().find(|(rect, _, _)| *rect == capture.rect).map(|&(_, phys, pitch)| (phys, pitch));
+}
+
+/// The captured rectangle is an output shown straight from one contiguous
+/// client buffer now: its physical address and pitch.
+#[must_use]
+pub fn direct_source() -> Option<(u64, u32)> {
+    STATE.lock().as_ref().and_then(|capture| capture.direct)
+}
+
+/// The consumer uses the client buffer ([`direct_source`]) from now on, or
+/// stops using it - then the mirror is repainted whole once (it was not kept
+/// up to date meanwhile).
+pub fn set_client(on: bool) {
+    if CLIENT.swap(on, Ordering::Relaxed) != on {
+        crate::kprintln!(
+            "  capture     : {}",
+            if on { "the source samples the fullscreen window's buffer (no copy)" } else { "the source takes composed frames again" }
+        );
+        if !on {
+            REPAINT.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Should the desktop copy a directly shown window into the mirror (no -
+/// the consumer samples that buffer itself).
+#[inline]
+#[must_use]
+pub fn mirror_direct() -> bool {
+    !CLIENT.load(Ordering::Relaxed)
 }
 
 /// `over` on `under` with `alpha` (channel-wise, format-agnostic).

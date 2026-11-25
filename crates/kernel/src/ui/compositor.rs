@@ -5404,6 +5404,15 @@ impl Compositor {
         if super::capture::active() {
             let drawn = !self.hw_cursor && !theme::is_mobile() && plan.iter().all(Option::is_none);
             super::capture::note_pointer(&self.pointer, drawn);
+            // 25.11 (OBS zero copy): outputs shown straight from a client
+            // buffer - OBS may sample that buffer itself.
+            let mut sources = alloc::vec::Vec::new();
+            for (index, at) in plan.iter().enumerate().take(self.outputs.len()) {
+                if let Some(Ok((phys, pitch))) = at.and_then(|at| self.windows.get(at)).map(Window::scanout_source) {
+                    sources.push((self.outputs[index].rect, phys, pitch));
+                }
+            }
+            super::capture::note_direct(&sources);
         }
         if !self.damage_overflow && self.damage_count == 0 {
             return;
@@ -5577,8 +5586,9 @@ impl Compositor {
                     let o = self.outputs[index].rect;
                     let local = Rect::new(part.x - o.x, part.y - o.y, part.w, part.h);
                     self.flip_touched[index] = Some(self.flip_touched[index].map_or(local, |r| r.union(&local)));
-                    // Screen recorder (22.11): the frame is the client buffer.
-                    if super::capture::active() {
+                    // Screen recorder (22.11): the frame is the client buffer
+                    // (25.11: not copied when OBS samples that buffer itself).
+                    if super::capture::active() && super::capture::mirror_direct() {
                         if let Some(shown) = self.windows.get(window) {
                             if let Some(pixels) = shown.direct_pixels() {
                                 super::capture::put(part, pixels, part.x - shown.rect.x, part.y - shown.rect.y);
@@ -5788,8 +5798,9 @@ impl Compositor {
         let w = window.rect;
         out.screen.blit(pixels, (part.x - o.x, part.y - o.y), Rect::new(part.x - w.x, part.y - w.y, part.w, part.h));
         // Screen recorder (22.11): without the pointer patch (it is patched
-        // into grabbed frames, see `capture::note_pointer`).
-        if super::capture::active() {
+        // into grabbed frames, see `capture::note_pointer`; 25.11: not when
+        // OBS samples the client buffer itself).
+        if super::capture::active() && super::capture::mirror_direct() {
             super::capture::put(part, pixels, part.x - w.x, part.y - w.y);
         }
         if !self.hw_cursor && self.pointer.is_visible() {
