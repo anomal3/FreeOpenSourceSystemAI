@@ -82,9 +82,55 @@ const DESC_FS: u32 = 1 << 29;
 const DESC_LS: u32 = 1 << 28;
 const RX_RES: u32 = 1 << 21;
 
+/// Transmit descriptors.
 const RING: usize = 64;
+/// Receive descriptors (25.11, hw-log19: a 40 MB page in OBSOS overflowed the
+/// 64-slot ring while the receive task polled every 5 ms under load). 256
+/// slots of [`RX_BUFFER`] — 384 KiB; when the DMA window has no room for
+/// them, [`RX_RING_SMALL`].
+const RX_RING: usize = 256;
+const RX_RING_SMALL: usize = 64;
 const DESC_SIZE: usize = 16;
 const BUFFER: usize = 2048;
+/// A receive buffer: a whole frame with FCS and a VLAN tag fits ([`RX_MAX`]).
+const RX_BUFFER: usize = 1536;
+
+/// Interrupt causes we take (`IntrMask_8125`): RxOK, RxErr, RDU (no free
+/// receive descriptor), LinkChg, RxFIFOOver.
+const INTR_RX_OK: u32 = 1 << 0;
+const INTR_RX_ERR: u32 = 1 << 1;
+const INTR_RDU: u32 = 1 << 4;
+const INTR_LINK: u32 = 1 << 5;
+const INTR_FIFO_OVER: u32 = 1 << 6;
+const INTR_CAUSES: u32 = INTR_RX_OK | INTR_RX_ERR | INTR_RDU | INTR_LINK | INTR_FIFO_OVER;
+
+/// The register window for the interrupt handler (zero — no MSI set up).
+static CARD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Receive overflows (RDU / FIFO over) seen, for the log.
+static OVERFLOWS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Interrupts taken (for the log line «rtl8125: N interrupts»).
+static INTERRUPTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// MSI from the card: acknowledge the causes (write-1-to-clear — an
+/// unacknowledged cause never raises the next message) and wake the network
+/// task. The frames are taken by the task, not here.
+pub fn on_interrupt() {
+    let base = CARD.load(core::sync::atomic::Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let regs = Regs(base);
+    let causes = regs.r32(INTR_STATUS);
+    if causes == 0 || causes == u32::MAX {
+        return;
+    }
+    regs.w32(INTR_STATUS, causes);
+    if causes & (INTR_RDU | INTR_FIFO_OVER) != 0 {
+        OVERFLOWS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    INTERRUPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    super::on_interrupt();
+}
 /// Наибольший принимаемый кадр с контрольной суммой и меткой VLAN.
 const RX_MAX: u16 = 1536;
 /// Окно регистров: всё, что здесь трогается, лежит ниже `0x7000`.
@@ -209,8 +255,12 @@ pub struct Rtl8125 {
     tx_pool: DmaBuffer,
     rx_next: usize,
     tx_next: usize,
-    /// Переполнение приёма уже сказано в журнал.
-    overflow_seen: bool,
+    /// Receive descriptors in the ring ([`RX_RING`] or [`RX_RING_SMALL`]).
+    rx_count: usize,
+    /// Overflows already told to the log.
+    overflow_told: u32,
+    /// Frames arrive by MSI (25.11), not by polling.
+    interrupts: bool,
     mac: [u8; 6],
     stats: Stats,
     device_id: u16,
@@ -267,7 +317,8 @@ impl Rtl8125 {
         let later_than_a = xid != 0x609;
         kprintln!("  rtl8125     : {} at {} (TxConfig {tx_config:#010x}, xid {xid:#x})", chip, device.address);
 
-        // Прерывания карты не нужны (опрос) — закрыть и снять накопленное.
+        // Interrupts closed and cleared until `enable_msi` (or for good, when
+        // the card stays polled).
         regs.w32(INTR_MASK, 0);
         regs.w32(INTR_STATUS, u32::MAX);
         let _ = regs.r8(CHIP_CMD);
@@ -283,14 +334,17 @@ impl Rtl8125 {
         phy_power_up(regs);
         let mac = read_mac(regs);
 
-        let rx_ring = dma::alloc(RING * DESC_SIZE).map_err(Rtl8125Error::NoMemory)?;
+        let rx_ring = dma::alloc(RX_RING * DESC_SIZE).map_err(Rtl8125Error::NoMemory)?;
         let tx_ring = dma::alloc(RING * DESC_SIZE).map_err(Rtl8125Error::NoMemory)?;
-        let rx_pool = dma::alloc(RING * BUFFER).map_err(Rtl8125Error::NoMemory)?;
+        let (rx_pool, rx_count) = match dma::alloc(RX_RING * RX_BUFFER) {
+            Ok(pool) => (pool, RX_RING),
+            Err(_) => (dma::alloc(RX_RING_SMALL * RX_BUFFER).map_err(Rtl8125Error::NoMemory)?, RX_RING_SMALL),
+        };
         let tx_pool = dma::alloc(RING * BUFFER).map_err(Rtl8125Error::NoMemory)?;
         rx_ring.zero();
         tx_ring.zero();
 
-        let card = Self {
+        let mut card = Self {
             regs,
             rx_ring,
             tx_ring,
@@ -298,7 +352,9 @@ impl Rtl8125 {
             tx_pool,
             rx_next: 0,
             tx_next: 0,
-            overflow_seen: false,
+            rx_count,
+            overflow_told: 0,
+            interrupts: false,
             mac,
             stats: Stats::default(),
             device_id: device.device,
@@ -310,10 +366,13 @@ impl Rtl8125 {
         phy_autoneg(regs);
         let status = regs.r16(PHY_STATUS);
         kprintln!(
-            "  rtl8125     : started, address {}, PHY status {status:#06x} ({})",
+            "  rtl8125     : started, address {}, PHY status {status:#06x} ({}), {} receive descriptors",
             super::eth::Display(mac),
-            describe_phy(status).join(", ")
+            describe_phy(status).join(", "),
+            card.rx_count
         );
+        // SAFETY: the window is mapped, the card is running.
+        card.interrupts = unsafe { card.enable_msi(&device) };
         Ok(card)
     }
 
@@ -341,19 +400,44 @@ impl Rtl8125 {
     /// Отдать дескриптор приёма карте.
     fn give_rx(&self, index: usize) {
         let desc = Self::desc(&self.rx_ring, index);
-        let phys = self.rx_pool.phys().as_u64() + (index * BUFFER) as u64;
-        let eor = if index == RING - 1 { DESC_EOR } else { 0 };
+        let phys = self.rx_pool.phys().as_u64() + (index * RX_BUFFER) as u64;
+        let eor = if index == self.rx_count - 1 { DESC_EOR } else { 0 };
         // SAFETY: дескриптор внутри кольца; признак владения пишется последним.
         unsafe {
             desc.add(2).cast::<u64>().write_volatile(phys);
             desc.add(1).write_volatile(0);
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            desc.write_volatile(DESC_OWN | eor | BUFFER as u32);
+            desc.write_volatile(DESC_OWN | eor | RX_BUFFER as u32);
         }
     }
 
+    /// Ask for MSI instead of polling (25.11). `false` — no MSI capability or
+    /// no target for it: the card stays polled, as before.
+    ///
+    /// # Safety
+    ///
+    /// The register window is mapped, the card is running.
+    unsafe fn enable_msi(&self, device: &Device) -> bool {
+        let Some(msi) = device.msi() else {
+            kprintln!("  rtl8125     : no MSI capability; frames will be polled for");
+            return false;
+        };
+        let Some((address, data)) = crate::arch::interrupts::alloc_msi(on_interrupt) else {
+            kprintln!("  rtl8125     : no MSI target on this machine; frames will be polled for");
+            return false;
+        };
+        // The window first: a message may come at once.
+        CARD.store(self.regs.0, core::sync::atomic::Ordering::Relaxed);
+        self.regs.w32(INTR_STATUS, u32::MAX);
+        // SAFETY: contract of the function; the handler is installed above.
+        unsafe { device.set_msi_vector(&msi, address, data) };
+        self.regs.w32(INTR_MASK, INTR_CAUSES);
+        kprintln!("  rtl8125     : MSI -> {address:#018x} data {data:#x}, frames arrive by interrupt");
+        true
+    }
+
     fn fill_rx(&self) {
-        for index in 0..RING {
+        for index in 0..self.rx_count {
             self.give_rx(index);
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -585,8 +669,23 @@ impl Card for Rtl8125 {
         "rtl8125"
     }
 
+    fn link(&self) -> Option<(bool, u32)> {
+        let status = self.regs.r16(PHY_STATUS);
+        let speed = match status {
+            s if s & 0x0400 != 0 => 2500,
+            s if s & 0x0010 != 0 => 1000,
+            s if s & 0x0008 != 0 => 100,
+            _ => 10,
+        };
+        Some((status & PHY_LINK != 0, speed))
+    }
+
     fn mac(&self) -> [u8; 6] {
         self.mac
+    }
+
+    fn interrupts(&self) -> bool {
+        self.interrupts
     }
 
     fn send(&mut self, frame: &[u8]) -> Result<(), CardError> {
@@ -638,13 +737,26 @@ impl Card for Rtl8125 {
             // FIFO (бит 6) неподтверждённая карта может больше не принимать
             // (17.11, ПК Романа: адрес по DHCP получен, дальше ни пинга, ни
             // страниц — пока шла установка Proton, задача приёма отставала).
-            let events = self.regs.r32(INTR_STATUS);
-            if events != 0 {
-                self.regs.w32(INTR_STATUS, events);
-                if events & (1 << 4 | 1 << 6) != 0 && !self.overflow_seen {
-                    self.overflow_seen = true;
-                    crate::kprintln!("  rtl8125     : receive ring overflowed (status {events:#x}), acknowledged");
+            // With MSI the handler acknowledges; polled — here.
+            if !self.interrupts {
+                let events = self.regs.r32(INTR_STATUS);
+                if events != 0 && events != u32::MAX {
+                    self.regs.w32(INTR_STATUS, events);
+                    if events & (INTR_RDU | INTR_FIFO_OVER) != 0 {
+                        OVERFLOWS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                 }
+            }
+            // Overflows to the log: the first, then at 10, 100, 1000…
+            let seen = OVERFLOWS.load(core::sync::atomic::Ordering::Relaxed);
+            if seen > self.overflow_told && (self.overflow_told == 0 || seen >= self.overflow_told.saturating_mul(10)) {
+                self.overflow_told = seen;
+                crate::kprintln!(
+                    "  rtl8125     : receive ring overflowed {seen} time(s) ({} descriptors, {}, {} interrupts)",
+                    self.rx_count,
+                    if self.interrupts { "MSI" } else { "polled" },
+                    INTERRUPTS.load(core::sync::atomic::Ordering::Relaxed)
+                );
             }
             return None;
         }
@@ -658,7 +770,7 @@ impl Card for Rtl8125 {
             let length = length - 4; // без контрольной суммы кадра
             // SAFETY: буфер выделен, длина проверена.
             unsafe {
-                let buffer = self.rx_pool.as_ptr::<u8>().add(index * BUFFER);
+                let buffer = self.rx_pool.as_ptr::<u8>().add(index * RX_BUFFER);
                 core::ptr::copy_nonoverlapping(buffer, frame.as_mut_ptr(), length);
             }
             self.stats.rx_frames += 1;
@@ -666,7 +778,7 @@ impl Card for Rtl8125 {
             Some(length)
         };
         self.give_rx(index);
-        self.rx_next = (index + 1) % RING;
+        self.rx_next = (index + 1) % self.rx_count;
         taken
     }
 

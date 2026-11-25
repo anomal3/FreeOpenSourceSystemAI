@@ -47,9 +47,10 @@
 #[path = "dhcp/ntp.rs"]
 mod ntp;
 
+use user_abi::{NETINFO_DHCP, NetLease};
 use user_progs::{
-    Line, NetConfig, NetInfo, bind, close, close_socket, config_path, connect, error, exit,
-    netconf, netinfo, open, read, recv_waiting, send_waiting, sleep_ms, socket, uptime_ms,
+    Line, NetConfig, NetInfo, bind, close_socket, connect, error, netconf_lease, netinfo, recv_waiting,
+    send_waiting, sleep_ms, socket, uptime_ms,
 };
 
 /// Порт клиента.
@@ -127,21 +128,48 @@ fn renew_after(lease_seconds: u32) -> u64 {
     half.max(60_000)
 }
 
+/// How often to look at the adapter's wishes (`NetInfo::flags`, 25.11):
+/// «Диагностика» and the switch to DHCP in «Сетевые подключения» are seen
+/// within this time.
+const WATCH_MS: u64 = 1_000;
+
+/// The renew counter of `NetInfo::flags` (bits 2..7).
+fn renew_mark(info: &NetInfo) -> u8 {
+    info.flags >> 2
+}
+
+/// Should the address come by DHCP now.
+fn wanted(info: &NetInfo) -> bool {
+    info.flags & NETINFO_DHCP != 0
+}
+
+fn netinfo_now() -> NetInfo {
+    let mut info = NetInfo::default();
+    if netinfo(&mut info) != 0 {
+        return NetInfo::default();
+    }
+    info
+}
+
+/// Sleep up to `ms`, looking at the adapter every second: `true` — its
+/// wishes changed (DHCP off, or a new lease asked for at once).
+fn watchful_sleep(ms: u64, seen: u8) -> bool {
+    let until = uptime_ms() + ms;
+    loop {
+        let now = uptime_ms();
+        if now >= until {
+            return false;
+        }
+        sleep_ms((until - now).min(WATCH_MS));
+        let fresh = netinfo_now();
+        if !wanted(&fresh) || renew_mark(&fresh) != seen {
+            return true;
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    // Постоянный адрес старше аренды. Проверяется **первым делом**, до того как
-    // в сеть уйдёт хоть один кадр: DISCOVER, отправленный машиной с заданным
-    // адресом, — это не только лишний обмен, но и предложение от сервера,
-    // которое некому отклонить, то есть адрес, зря зарезервированный в чужой
-    // сети на время аренды.
-    //
-    // Уходим с нулём: это не падение службы, а её работа — увидеть, что делать
-    // нечего. Супервизор поднимать нас по кругу не должен.
-    if static_address_is_set() {
-        error("dhcp: a static address is configured, standing down\n");
-        exit(0);
-    }
-
     let mut info = NetInfo::default();
     if netinfo(&mut info) != 0 || info.present == 0 {
         // Карты нет — это не поломка службы, а свойство машины. Но карта может
@@ -165,13 +193,30 @@ pub extern "C" fn _start() -> ! {
 
     let mut clock = ntp::Schedule::new();
     loop {
+        // Постоянный адрес старше аренды (25.11: per adapter, from the
+        // kernel's `NetInfo::flags`, not from `/etc/network.cfg`). Checked
+        // before a single frame goes out: a DISCOVER from a machine with a
+        // hand-set address reserves an address in someone's network for
+        // nothing. The service does not leave — «Сетевые подключения» may
+        // switch the adapter back to DHCP at any moment.
+        if !wanted(&info) {
+            error("dhcp: the address is set by hand or the adapter is off, standing by\n");
+            while !wanted(&info) {
+                sleep_ms(WATCH_MS);
+                info = netinfo_now();
+            }
+            error("dhcp: asked to lease an address\n");
+        }
+        let seen = renew_mark(&info);
         match lease(&info) {
-            Some(lease) => {
-                apply(&lease);
+            Some(lease) if apply(&lease) => {
                 clock.adopt(lease.gateway, lease.ntp);
                 // До продления аренды служба не спит одним куском, а
-                // просыпается и к сроку часов: SNTP идёт между продлениями.
+                // просыпается и к сроку часов: SNTP идёт между продлениями;
+                // and every second it looks whether the adapter wants a new
+                // lease now.
                 let renew_at = uptime_ms() + renew_after(lease.seconds);
+                let mut asked = false;
                 loop {
                     let now = uptime_ms();
                     if now >= renew_at {
@@ -181,49 +226,28 @@ pub extern "C" fn _start() -> ! {
                         clock.sync();
                         continue;
                     }
-                    sleep_ms(renew_at.min(clock.next_at()) - now);
+                    if watchful_sleep(renew_at.min(clock.next_at()) - now, seen) {
+                        asked = true;
+                        break;
+                    }
                 }
-                error("dhcp: renewing the lease\n");
+                if asked {
+                    error("dhcp: the adapter's settings changed\n");
+                } else {
+                    error("dhcp: renewing the lease\n");
+                }
+            }
+            Some(_) => {
+                // Refused: the adapter went static or off meanwhile.
+                sleep_ms(WATCH_MS);
             }
             None => {
                 error("dhcp: no answer, trying again later\n");
-                sleep_ms(RETRY_MS);
+                watchful_sleep(RETRY_MS, seen);
             }
         }
+        info = netinfo_now();
     }
-}
-
-/// Задан ли в `/etc/network.cfg` постоянный адрес.
-///
-/// Читается тот же файл и тем же соглашением, что у ядра
-/// (`crates/kernel/src/net/persist.rs`): сначала `/etc`, потом эталон в образе.
-/// Разбор здесь нарочно минимальный — нужен ответ «да или нет», а не настройки:
-/// применяет их ядро при загрузке, и второй разборщик разошёлся бы с первым.
-fn static_address_is_set() -> bool {
-    let Some(path) = config_path("network.cfg") else {
-        return false;
-    };
-    let fd = open(path.as_str());
-    if fd < 0 {
-        return false;
-    }
-    let mut buffer = [0u8; 512];
-    let got = read(fd, &mut buffer);
-    close(fd);
-    if got <= 0 {
-        return false;
-    }
-    let Ok(text) = core::str::from_utf8(&buffer[..got as usize]) else {
-        return false;
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        let Some(value) = line.strip_prefix("mode=") else {
-            continue;
-        };
-        return value.trim().eq_ignore_ascii_case("static");
-    }
-    false
 }
 
 /// Что приехало в ACK.
@@ -232,6 +256,8 @@ struct Lease {
     netmask: u32,
     gateway: u32,
     dns: u32,
+    /// The second server of option 6 (25.11).
+    dns2: u32,
     /// Сервер NTP из опции 42; ноль — сеть его не назвала.
     ntp: u32,
     seconds: u32,
@@ -399,6 +425,7 @@ fn parse(message: &[u8], xid: u32) -> Option<(Lease, u8)> {
         netmask: 0,
         gateway: 0,
         dns: 0,
+        dns2: 0,
         ntp: 0,
         seconds: 0,
         server: 0,
@@ -427,7 +454,12 @@ fn parse(message: &[u8], xid: u32) -> Option<(Lease, u8)> {
             // Маршрутизаторов может быть несколько; берём первый — таблицы
             // маршрутов у нас всё равно одна строка.
             (OPT_ROUTER, len) if len >= 4 => lease.gateway = be32(value),
-            (OPT_DNS, len) if len >= 4 => lease.dns = be32(value),
+            (OPT_DNS, len) if len >= 4 => {
+                lease.dns = be32(value);
+                if len >= 8 {
+                    lease.dns2 = be32(&value[4..8]);
+                }
+            }
             (OPT_NTP, len) if len >= 4 => lease.ntp = be32(value),
             (OPT_LEASE_TIME, 4) => lease.seconds = be32(value),
             (OPT_SERVER_ID, 4) => lease.server = be32(value),
@@ -446,25 +478,31 @@ fn be32(value: &[u8]) -> u32 {
     u32::from_be_bytes([value[0], value[1], value[2], value[3]])
 }
 
-/// Отдать полученное ядру и рассказать об этом.
-fn apply(lease: &Lease) {
+/// Отдать полученное ядру и рассказать об этом. `false` — the kernel
+/// refused (the adapter went static or off meanwhile, 25.11).
+fn apply(lease: &Lease) -> bool {
     // Маска, которой сервер не прислал, — обычное дело для сетей класса C:
     // берём /24, потому что адрес без маски бесполезен, а угадать её здесь
     // можно только так.
     let netmask = if lease.netmask == 0 { 0xFFFF_FF00 } else { lease.netmask };
-    let config = NetConfig {
-        address: lease.address,
-        netmask,
-        gateway: lease.gateway,
-        dns: lease.dns,
+    let full = NetLease {
+        config: NetConfig {
+            address: lease.address,
+            netmask,
+            gateway: lease.gateway,
+            dns: lease.dns,
+        },
+        server: lease.server,
+        seconds: lease.seconds,
+        dns2: lease.dns2,
     };
-    let result = netconf(&config);
+    let result = netconf_lease(&full);
     if result != 0 {
         Line::to_log()
             .str("dhcp: the kernel refused the configuration, code ")
             .signed(result)
             .end();
-        return;
+        return false;
     }
 
     // Строка собирается целиком и уходит одним вызовом — см. `Line`.
@@ -479,6 +517,7 @@ fn apply(lease: &Lease) {
         .num(u64::from(lease.seconds))
         .str(" s")
         .end();
+    true
 }
 
 /// Длина префикса маски.

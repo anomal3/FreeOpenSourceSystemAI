@@ -355,7 +355,7 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 66] = [
+pub const USER_PROGRAMS: [&str; 67] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sockfd", "sshd",
     "cat", "sysupdate", "fetch", "memtest", "filemap", "posix", "winshow", "sysmon", "files",
@@ -373,6 +373,8 @@ pub const USER_PROGRAMS: [&str; 66] = [
     "screenrec",
     // «Параметры значков рабочего стола» (24.11).
     "deskicon",
+    // «Сетевые подключения» — ncpa.cpl (25.11).
+    "ncpa",
     // «Сетевые учётные данные»: \\host\share с вводом имени и пароля (24.11).
     "netlogon",
     // «Архиватор 7-Zip» над `/bin/7zz` (24.11).

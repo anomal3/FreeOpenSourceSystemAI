@@ -2556,11 +2556,35 @@ pub struct NetInfo {
     pub mac: [u8; 6],
     /// Единица, если карта в системе есть.
     pub present: u8,
-    pub _reserved: u8,
+    /// What the adapter wants of `/bin/dhcp` (25.11, «Сетевые подключения»):
+    /// [`NETINFO_DHCP`], [`NETINFO_DISABLED`], and in bits 2..7 a counter
+    /// that moves when a new lease is asked for at once («Диагностика», the
+    /// switch to DHCP).
+    pub flags: u8,
     pub address: u32,
     pub netmask: u32,
     pub gateway: u32,
     pub dns: u32,
+}
+
+/// [`NetInfo::flags`]: the address comes by DHCP now (the adapter is on and
+/// not set by hand).
+pub const NETINFO_DHCP: u8 = 1;
+/// [`NetInfo::flags`]: the adapter is switched off («Отключить»).
+pub const NETINFO_DISABLED: u8 = 2;
+
+/// A DHCP lease — [`SYS_NETCONF`] with this length (25.11): the
+/// configuration and what «Сведения о сетевом подключении» show.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NetLease {
+    pub config: NetConfig,
+    /// The DHCP server (option 54).
+    pub server: u32,
+    /// Lease time, seconds (option 51).
+    pub seconds: u32,
+    /// The second DNS server of option 6; zero — none.
+    pub dns2: u32,
 }
 
 /// Кто прислал датаграмму — ответ [`SYS_PEER`].

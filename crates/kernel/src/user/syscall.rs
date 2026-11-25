@@ -1265,12 +1265,20 @@ fn netconf(ptr: usize, len: usize) -> i64 {
     if !super::allow(Rights::NET) {
         return ERR_PERMISSION;
     }
-    if len != size_of::<NetConfig>() || !space::user_can(ptr, len, PageFlags::READ) {
+    // 25.11: a lease may come as `NetLease` — `NetConfig` and the server, the
+    // term and the alternate DNS server for «Сведения» of the adapter.
+    let long = len == size_of::<user_abi::NetLease>();
+    if (len != size_of::<NetConfig>() && !long) || !space::user_can(ptr, len, PageFlags::READ) {
         return ERR_BAD_ADDRESS;
+    }
+    // The adapter is set by hand or switched off: a lease that comes now is
+    // late, not news (`/bin/dhcp` stands down by `NetInfo::flags`).
+    if !net::adapter::dhcp_may_apply() {
+        return ERR_PERMISSION;
     }
     // SAFETY: диапазон проверен по таблицам программы и вмещает структуру.
     let config = unsafe { core::ptr::read_unaligned(ptr as *const NetConfig) };
-    match net::configure_all(
+    let result = match net::configure_all(
         Ipv4(config.address),
         Ipv4(config.netmask),
         Ipv4(config.gateway),
@@ -1278,7 +1286,13 @@ fn netconf(ptr: usize, len: usize) -> i64 {
     ) {
         Ok(()) => 0,
         Err(err) => net_errno(err),
+    };
+    if result == 0 && long {
+        // SAFETY: as above — the range holds a whole `NetLease`.
+        let lease = unsafe { core::ptr::read_unaligned(ptr as *const user_abi::NetLease) };
+        net::adapter::note_lease(Ipv4(lease.server), lease.seconds, Ipv4(config.dns), Ipv4(lease.dns2));
     }
+    result
 }
 
 /// `netinfo(ptr, len) -> 0`.
@@ -1294,7 +1308,7 @@ fn netinfo(ptr: usize, len: usize) -> i64 {
         Some(status) => NetInfo {
             mac: status.mac,
             present: 1,
-            _reserved: 0,
+            flags: net::adapter::netinfo_flags(),
             address: status.address.0,
             netmask: status.netmask.0,
             gateway: status.gateway.0,
@@ -1666,7 +1680,11 @@ fn kernel_command(line: usize, len: usize, out: usize) -> i64 {
     // без аргументов (страница «Видеокарта и драйверы»).
     // 24.11: `ui deskicons …` — the desktop icons dialog (`/bin/deskicons`)
     // changes only which system icons the desktop shows.
-    let open_window = text.trim().starts_with("ui open ") || text.trim().starts_with("ui deskicons");
+    // 25.11: `netcfg` without arguments — «Сетевые подключения» shows the
+    // adapter to everyone; changing it stays root's.
+    let open_window = text.trim().starts_with("ui open ")
+        || text.trim().starts_with("ui deskicons")
+        || crate::net::adapter::is_read_only(text);
     if !super::credentials().is_root() && !open_window && !matches!(text.trim(), "version" | "gpu" | "nvk" | "outputs") {
         return ERR_PERMISSION;
     }

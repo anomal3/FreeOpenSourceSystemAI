@@ -1785,6 +1785,12 @@ fn run_builtin(line: &str) -> bool {
             }
         }
         "ip" => ip(argument),
+        // Per-adapter settings (25.11, «Сетевые подключения», `/bin/ncpa`).
+        "netcfg" => {
+            for line in crate::net::adapter::command(argument) {
+                sprintln!("{line}");
+            }
+        }
         "ping" => {
             if argument.is_empty() {
                 sprintln!("  usage: ping <address> [count]");

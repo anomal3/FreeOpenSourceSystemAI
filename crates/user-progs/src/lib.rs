@@ -1696,6 +1696,20 @@ pub fn close_socket(socket: i64) -> i64 {
     unsafe { syscall(SYS_CLOSE_SOCKET, socket as usize, 0, 0) }
 }
 
+/// Apply a DHCP lease with its server, term and second DNS server (25.11).
+/// Root only; `ERR_PERMISSION` also when the adapter is set by hand or off.
+pub fn netconf_lease(lease: &user_abi::NetLease) -> i64 {
+    // SAFETY: the structure lives in the program's memory, its own length.
+    unsafe {
+        syscall(
+            SYS_NETCONF,
+            (lease as *const user_abi::NetLease) as usize,
+            core::mem::size_of::<user_abi::NetLease>(),
+            0,
+        )
+    }
+}
+
 /// Задать настройки интерфейса. Только root.
 pub fn netconf(config: &NetConfig) -> i64 {
     // SAFETY: структура живёт в памяти программы, длина — её собственная.

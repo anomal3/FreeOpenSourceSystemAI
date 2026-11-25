@@ -500,6 +500,18 @@ impl Card for E1000 {
         self.interrupts
     }
 
+    fn link(&self) -> Option<(bool, u32)> {
+        // SAFETY: the register window is mapped for the card's lifetime.
+        let status = unsafe { read(self.regs, REG_STATUS) };
+        // STATUS.SPEED (bits 7:6): 00 — 10, 01 — 100, 1x — 1000 Mbit/s.
+        let speed = match (status >> 6) & 3 {
+            0 => 10,
+            1 => 100,
+            _ => 1000,
+        };
+        Some((status & STATUS_LU != 0, speed))
+    }
+
     fn mac(&self) -> [u8; 6] {
         self.mac
     }
