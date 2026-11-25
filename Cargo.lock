@@ -139,10 +139,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "browser-sync"
-version = "0.8.0"
-
-[[package]]
 name = "btrfs"
 version = "0.8.0"
 dependencies = [

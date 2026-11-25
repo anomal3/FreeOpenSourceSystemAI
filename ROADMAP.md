@@ -18756,3 +18756,42 @@ Chromium без ANGLE; на Windows это не мешает (уходит на 
 ВМ при копировании `tmnf-2.11.fpk` сразу после `proton-11.fpk` (2 ГБ) — петля
 «FossAi installer» до таймаута (`[install] copying package -> /media/tmnf…`,
 затем снова BdsDxe). Без tmnf на носителе установка проходит за 5 мин.
+
+## OBSOS вынесен в свой репозиторий (25.11.2026) — E:\BlueGit\OBSOS
+
+Роман: «другим агентом начинай выносить браузер» — чтобы OBSOS разрабатывался и
+отлаживался прямо на Windows, параллельно с ОС, и подключался к FossAi готовым.
+
+- **Новый репозиторий** `E:\BlueGit\OBSOS` (история файлов перенесена `git
+  filter-repo`, на GitHub ещё не выложен — ждёт решения Романа, предложено
+  `anomal3/OBSOS`). Cargo workspace: `obsos-core` (вся оболочка: вкладки,
+  история, закладки, пароли, синхронизация, загрузки, `obsos://`, скрипт
+  страниц с исправлением `change`/Enter; договор с платформой —
+  `obsos-core/src/window.rs`), `obsos-desktop` (Windows/Linux: winit +
+  softbuffer → `obsos.exe`), `obsos-fossai` (окно стола FossAi, syscalls,
+  `/bin/filedlg`; программы `browser` и `servoprobe`), `crates/browser-sync`,
+  `third_party/egui-software-backend`, `xtask` (`cargo xtask vendor` — правки
+  Servo 0.8, список в `patches/README.md`).
+- **Из FossAi убраны**: `ports/servo/servoprobe`, `ports/servo/egui-software-backend`,
+  `ports/servo/fonts`, `ports/servo/builder/patch-servo.sh`, `crates/browser-sync`.
+  Остались здесь набор сборки под FreeOS (`ports/servo/builder`, `mozjs`,
+  `patch-crates.sh`, пробы `jsprobe`/`depsprobe`), значок и `ports/browser/NOTICE.md`
+  (их берёт `xtask` в пакет).
+- **Версия OBSOS для FossAi** закреплена в `ports/servo/OBSOS_REV`.
+  `build-servoprobe.sh` теперь собирает `obsos-fossai` из смонтированного
+  репозитория OBSOS (`-v <OBSOS>:/obsos`), предупреждает, если он не на
+  закреплённой версии, и кладёт программы туда же, что и раньше
+  (`build/linux/servo-browser-<арх>`, `servoprobe-<арх>`) — `xtask` пакета
+  `obsos` не менялся. Готовый `servo-browser-*` в `build/linux` — старый
+  (до 25.11); пересборка — после того, как Роман решит про Docker
+  (`fossai-builder` удалён уборкой 25.11).
+- **Windows**: `obsos.exe` собирается (`cargo xtask vendor`, `CC=CXX=clang-cl`,
+  `cargo build --release`, ~5,6 ГБ в `target`), открывает web.pynop.online
+  (Blazor работает, страница входа рисуется), ввод в поля, `change` по Tab и
+  Enter, отправка формы, localStorage переживает перезапуск — снимки
+  `photos/obsos/`. Найдено попутно: правка swgl (`clear_caches_with_quads`,
+  дизеринг) нужна везде, где рисует swgl, а не только на FossAi (без неё
+  Windows падал на первом кадре, gl.cc:1390).
+
+**TODO**: HiDPI (масштаб окна в obsos-core), GPU-путь на Windows, пересборка
+пакета `obsos` под FossAi из нового репозитория (нужен образ fossai-builder).
