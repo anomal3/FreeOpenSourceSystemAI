@@ -1317,3 +1317,113 @@ fn an_interrupted_edit_leaves_the_old_volume_or_the_new_one() {
     }
     assert!(saw_old && saw_new);
 }
+
+/// Детерминированный «шум» правок (24.11, btrfs-churn): xorshift.
+struct Churn(u64);
+
+impl Churn {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n.max(1)
+    }
+}
+
+#[test]
+fn churn_of_small_files_keeps_every_commit_working() {
+    // 24.11: после установки Proton каждая фиксация раздела состояния
+    // отказывала `Unsupported`, и правки пропадали. Подбор раскладки ходил по
+    // кругу — дерево свободного места то помещалось в один новый лист, то
+    // просило второй, — а запасной путь отказывал на подгружаемом дереве ФС.
+    // Здесь — тот же шум, что у Wine и `pkg`: сотни правок на фиксацию
+    // (создать, дописать, переписать середину, усечь, перенести, удалить),
+    // дерево ФС выгружается после каждой фиксации, писатель иногда
+    // открывается заново. До исправления 57-я фиксация кончалась отказом.
+    let mut disk = fresh_volume(256);
+    let mut rng = Churn(12u64.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let mut writer = Writer::open(&mut disk, 0).unwrap();
+    writer.set_loaded_limit(1);
+    let mut dirs: Vec<u64> = alloc::vec![256];
+    // (каталог, имя, inode, размер)
+    let mut files: Vec<(u64, String, u64, u64)> = Vec::new();
+    let data = alloc::vec![0x5au8; 64 * 1024];
+    let mut counter = 0u64;
+    for round in 0..60 {
+        let ops = 1 + rng.below(400);
+        for _ in 0..ops {
+            counter += 1;
+            let time = LATER + counter;
+            let done = match rng.below(100) {
+                0..=4 => {
+                    let parent = dirs[rng.below(dirs.len() as u64) as usize];
+                    writer.create_directory(&mut disk, parent, &format!("d{counter}"), &dir_attrs()).map(|n| dirs.push(n))
+                }
+                5..=34 => {
+                    let parent = dirs[rng.below(dirs.len() as u64) as usize];
+                    let len = 2049 + rng.below(30_000) as usize;
+                    let name = format!("f{counter}");
+                    writer.create_file(&mut disk, parent, &name, &data[..len], &attrs()).map(|n| files.push((parent, name, n, len as u64)))
+                }
+                35..=54 if !files.is_empty() => {
+                    let (parent, name, _, _) = files.swap_remove(rng.below(files.len() as u64) as usize);
+                    writer.unlink(&mut disk, parent, &name, time)
+                }
+                55..=69 if !files.is_empty() => {
+                    let at = rng.below(files.len() as u64) as usize;
+                    let len = 2049 + rng.below(30_000) as usize;
+                    let end = files[at].3;
+                    files[at].3 += len as u64;
+                    writer.write_at(&mut disk, files[at].2, end, &data[..len], time).map(|_| ())
+                }
+                70..=79 if !files.is_empty() => {
+                    let at = rng.below(files.len() as u64) as usize;
+                    let offset = rng.below(files[at].3 + 1);
+                    let len = 2049 + rng.below(30_000) as usize;
+                    files[at].3 = files[at].3.max(offset + len as u64);
+                    writer.write_at(&mut disk, files[at].2, offset, &data[..len], time).map(|_| ())
+                }
+                80..=87 if !files.is_empty() => {
+                    let at = rng.below(files.len() as u64) as usize;
+                    let size = rng.below(files[at].3 + 1);
+                    files[at].3 = size;
+                    writer.truncate(&mut disk, files[at].2, size, time)
+                }
+                88..=95 if !files.is_empty() => {
+                    let at = rng.below(files.len() as u64) as usize;
+                    let parent = dirs[rng.below(dirs.len() as u64) as usize];
+                    let name = format!("r{counter}");
+                    let (old_parent, old_name) = (files[at].0, files[at].1.clone());
+                    writer.rename(&mut disk, old_parent, &old_name, parent, &name, time).map(|()| {
+                        files[at].0 = parent;
+                        files[at].1 = name;
+                    })
+                }
+                _ if !files.is_empty() => {
+                    let at = rng.below(files.len() as u64) as usize;
+                    writer.set_times(&mut disk, files[at].2, Some(time), Some(time), time)
+                }
+                _ => Ok(()),
+            };
+            done.unwrap_or_else(|err| panic!("правка {counter}: {err}"));
+        }
+        writer.commit(&mut disk).unwrap_or_else(|err| panic!("фиксация {round}: {err}"));
+        if rng.below(20) == 0 {
+            writer = Writer::open(&mut disk, 0).unwrap();
+            writer.set_loaded_limit(1);
+        }
+    }
+    drop(writer);
+
+    let mut fs = Btrfs::mount(&mut disk, 0).unwrap();
+    assert_eq!(fs.generation(), 61);
+    for (parent, name, number, size) in &files {
+        let entry = fs.inode(&mut disk, *number).unwrap_or_else(|err| panic!("{name} в {parent}: {err}"));
+        assert_eq!(entry.size, *size, "{name}");
+        let content = fs.read_file(&mut disk, &entry).unwrap();
+        assert!(content.iter().all(|&byte| byte == 0x5a), "{name}");
+    }
+    drop(fs);
+    let report = assert_clean(&mut disk);
+    assert_eq!(report.files, files.len() as u64);
+}

@@ -2190,6 +2190,9 @@ impl Writer {
 
     /// Раскладка с прежними узлами; не сошлась — прежним способом, всё
     /// тронутое заново. Второй путь — страховка: он тот, что жил до 30.10.
+    /// Дерево с неподгруженными листьями (ФС большого тома) и там
+    /// раскладывается с прежними узлами: «всё заново» для него невозможно, и
+    /// до 24.11 страховка на таком томе отказывала всегда.
     fn plan_any(&self, generation: u64) -> Result<Plan<'_>> {
         match self.plan(generation, true) {
             Err(Error::Unsupported) => self.plan(generation, false),
@@ -2239,15 +2242,22 @@ impl Writer {
         // с поколением суперблока.
         let mut memo = LeafMemo::new(&self.trees[extent_index].items);
         let mut layouts = Vec::new();
+        let mut damping = Vec::new();
         for &index in &rebuilt {
             let tree = &self.trees[index];
+            let paged = tree.levels.first().is_some_and(|leaves| leaves.iter().any(|leaf| !leaf.loaded));
             let first = if index == extent_index {
-                layout_with(&tree.items, &tree.levels, self.nodesize, reuse, false, |placed, start, end| {
+                layout_with(&tree.items, &tree.levels, self.nodesize, reuse, false, &Damping::default(), |placed, start, end| {
                     memo.base_leaf(placed, start, end)
                 })?
             } else {
-                layout(&tree.items, &tree.levels, self.nodesize, reuse, index == root_index)?
+                layout(&tree.items, &tree.levels, self.nodesize, reuse || paged, index == root_index)?
             };
+            let mut damped = Damping::default();
+            if derived.contains(&index) {
+                damped.absorb(&first, &tree.levels)?;
+            }
+            push(&mut damping, damped)?;
             push(&mut layouts, first)?;
         }
 
@@ -2332,18 +2342,28 @@ impl Writer {
             let mut next = Vec::new();
             for (slot, &index) in rebuilt.iter().enumerate() {
                 let levels = &self.trees[index].levels;
+                let damped = &damping[slot];
                 let again = if index == extent_index {
-                    layout_with(&extent, levels, self.nodesize, reuse, false, |placed, start, end| {
+                    layout_with(&extent, levels, self.nodesize, reuse, false, damped, |placed, start, end| {
                         memo.view_leaf(&extent, placed, start, end)
                     })?
                 } else if index == free_index {
-                    layout(&free_space, levels, self.nodesize, reuse, false)?
+                    layout_with(&free_space, levels, self.nodesize, reuse, false, damped, |placed, start, end| {
+                        hash_items(&free_space[start..end]) == placed.hash
+                    })?
                 } else if index == root_index {
-                    layout(&root, levels, self.nodesize, reuse, true)?
+                    layout_with(&root, levels, self.nodesize, reuse, true, damped, |placed, start, end| {
+                        hash_items(&root[start..end]) == placed.hash
+                    })?
                 } else {
                     layouts[slot].clone()
                 };
                 push(&mut next, again)?;
+            }
+            for (slot, &index) in rebuilt.iter().enumerate() {
+                if derived.contains(&index) {
+                    damping[slot].absorb(&next[slot], &self.trees[index].levels)?;
+                }
             }
             if next == layouts {
                 let space = (groups, busy);
@@ -2815,18 +2835,99 @@ fn relay(
 /// новый в любом случае (дерево корней: его поколение — поколение
 /// суперблока).
 fn layout<D: AsRef<[u8]>>(items: &[(Key, D)], old: &[Vec<Placed>], nodesize: u32, reuse: bool, new_root: bool) -> Result<Layout> {
-    layout_with(items, old, nodesize, reuse, new_root, |placed, start, end| hash_items(&items[start..end]) == placed.hash)
+    layout_with(items, old, nodesize, reuse, new_root, &Damping::default(), |placed, start, end| hash_items(&items[start..end]) == placed.hash)
+}
+
+/// Гашение подбора раскладки вычисляемых деревьев (24.11).
+///
+/// Подбор неподвижной точки ходил по кругу: на томе после установки Proton
+/// дерево свободного места то укладывалось в один новый лист (647
+/// элементов), то просило второй (648), а лишний узел закрывал дыру, и
+/// элементов снова становилось 647. Шестнадцать кругов — отказ, запасной путь
+/// «всё заново» отказывал на подгружаемом дереве ФС, и **каждая** фиксация
+/// тома кончалась `Unsupported` — правки терялись.
+///
+/// Гашение делает подбор монотонным, как копирование при записи у Linux
+/// («узел, уже скопированный в этой транзакции, второй раз не копируется»):
+/// прежний узел, однажды ставший новым, больше не остаётся на месте
+/// (`forced`), а число новых узлов уровня не убывает (`floors`) — новых
+/// листьев меньше, чем было, не бывает: лишний получается делением самого
+/// большого нового пополам. Оба множества растут и ограничены, значит,
+/// перестают меняться; тогда раскладка круга — функция тех же элементов и
+/// тех же адресов, и следующий круг её повторяет.
+#[derive(Debug, Default, Clone)]
+struct Damping {
+    /// Адреса прежних узлов, которые уже были заменены в каком-то круге.
+    forced: alloc::collections::BTreeSet<u64>,
+    /// Наименьшее число новых узлов каждого уровня.
+    floors: Vec<usize>,
+}
+
+impl Damping {
+    fn floor(&self, level: usize) -> usize {
+        self.floors.get(level).copied().unwrap_or(0)
+    }
+
+    /// Учесть раскладку круга: её заменённые узлы и её число новых.
+    fn absorb(&mut self, layout: &Layout, old: &[Vec<Placed>]) -> Result<()> {
+        let mut kept = Vec::new();
+        for slot in layout.iter().flatten() {
+            if let Slot::Kept(placed) = slot {
+                push(&mut kept, placed.address)?;
+            }
+        }
+        kept.sort_unstable();
+        for placed in old.iter().flatten() {
+            if kept.binary_search(&placed.address).is_err() {
+                self.forced.insert(placed.address);
+            }
+        }
+        for (level, slots) in layout.iter().enumerate() {
+            let count = slots.iter().filter(|slot| matches!(slot, Slot::New { .. })).count();
+            if self.floors.len() <= level {
+                push(&mut self.floors, 0)?;
+            }
+            self.floors[level] = self.floors[level].max(count);
+        }
+        Ok(())
+    }
+}
+
+/// Добавить уровню новых узлов до `floor`, деля пополам самый большой новый
+/// (по числу элементов или потомков). Делить нечего — сколько вышло.
+fn pad_level(level: &mut Vec<Slot>, floor: usize) -> Result<()> {
+    loop {
+        let count = level.iter().filter(|slot| matches!(slot, Slot::New { .. })).count();
+        if count >= floor {
+            return Ok(());
+        }
+        let mut best: Option<(usize, usize)> = None;
+        for (at, slot) in level.iter().enumerate() {
+            if let Slot::New { start, end } = *slot {
+                if end - start >= 2 && best.is_none_or(|(_, size)| end - start > size) {
+                    best = Some((at, end - start));
+                }
+            }
+        }
+        let Some((at, _)) = best else { return Ok(()) };
+        let Slot::New { start, end } = level[at] else { return Err(Error::Corrupt) };
+        let middle = start + (end - start) / 2;
+        level[at] = Slot::New { start, end: middle };
+        level.try_reserve(1).map_err(|_| Error::NoMemory)?;
+        level.insert(at + 1, Slot::New { start: middle, end });
+    }
 }
 
 /// То же, что [`layout`], со своей сверкой листа (`same_leaf`, см.
-/// [`LeafMemo`]).
+/// [`LeafMemo`]) и гашением подбора ([`Damping`]).
 fn layout_with<D: AsRef<[u8]>>(
     items: &[(Key, D)],
     old: &[Vec<Placed>],
     nodesize: u32,
     reuse: bool,
     new_root: bool,
-    same_leaf: impl FnMut(&Placed, usize, usize) -> bool,
+    damping: &Damping,
+    mut same_leaf: impl FnMut(&Placed, usize, usize) -> bool,
 ) -> Result<Layout> {
     // «Всё заново» для дерева с неподгруженными листьями выбросило бы их
     // элементы — их нет в `items`.
@@ -2839,11 +2940,17 @@ fn layout_with<D: AsRef<[u8]>>(
     let mut keys = Vec::new();
     keys.try_reserve_exact(items.len()).map_err(|_| Error::NoMemory)?;
     keys.extend(items.iter().map(|(key, _)| *key));
-    let mut leaves = relay(&keys, old_level(0), same_leaf, |start, end, out| pack_leaves(items, start, end, nodesize, out))?;
+    let mut leaves = relay(
+        &keys,
+        old_level(0),
+        |placed, start, end| !damping.forced.contains(&placed.address) && same_leaf(placed, start, end),
+        |start, end, out| pack_leaves(items, start, end, nodesize, out),
+    )?;
     // Пустое дерево — один пустой лист; других пустых листьев не бывает.
     if leaves.is_empty() {
         push(&mut leaves, Slot::New { start: 0, end: 0 })?;
     }
+    pad_level(&mut leaves, damping.floor(0))?;
     let mut out: Layout = Vec::new();
     let mut below_keys: Vec<Key> = Vec::new();
     for slot in &leaves {
@@ -2862,10 +2969,13 @@ fn layout_with<D: AsRef<[u8]>>(
             return Err(Error::Unsupported);
         }
         let below = out.last().ok_or(Error::Corrupt)?;
-        let level = relay(
+        let mut level = relay(
             &below_keys,
             old_level(out.len()),
             |placed, start, end| {
+                if damping.forced.contains(&placed.address) {
+                    return false;
+                }
                 let mut hash = Hasher::new();
                 for slot in &below[start..end] {
                     let Slot::Kept(child) = slot else { return false };
@@ -2875,6 +2985,7 @@ fn layout_with<D: AsRef<[u8]>>(
             },
             |start, end, out| pack_internal(start, end, nodesize, out),
         )?;
+        pad_level(&mut level, damping.floor(out.len()))?;
         let mut keys = Vec::new();
         for slot in &level {
             push(
