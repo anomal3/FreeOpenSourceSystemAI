@@ -1281,6 +1281,8 @@ enum Obj {
     Viewport(u32),
     Dmabuf,
     DmabufParams(dmabuf::Params),
+    /// `zwp_linux_dmabuf_feedback_v1` (версия 4, узел AMD).
+    DmabufFeedback,
     TearingManager,
     /// `wp_tearing_control_v1` поверхности с этим номером.
     Tearing(u32),
@@ -1342,6 +1344,7 @@ impl Obj {
             Self::Viewport(_) => "wp_viewport",
             Self::Dmabuf => "zwp_linux_dmabuf_v1",
             Self::DmabufParams(_) => "zwp_linux_buffer_params_v1",
+            Self::DmabufFeedback => "zwp_linux_dmabuf_feedback_v1",
             Self::TearingManager => "wp_tearing_control_manager_v1",
             Self::Tearing(_) => "wp_tearing_control_v1",
             Self::Presentation => "wp_presentation",
@@ -1663,6 +1666,7 @@ impl Client {
                     let registry = args.u32()?;
                     self.objects.insert(registry, Obj::Registry);
                     for (name, interface, version) in GLOBALS {
+                        let version = if name == 9 { dmabuf::version() } else { version };
                         self.send(Msg::new(registry, 0).u32(name).str(interface).u32(version));
                     }
                     let outputs: Vec<u32> = self.outputs_told.iter().map(|o| o.global).collect();
@@ -2137,8 +2141,19 @@ impl Client {
                     let new = args.u32()?;
                     self.objects.insert(new, Obj::DmabufParams(dmabuf::Params::default()));
                 }
+                // `get_default_feedback(id)` и `get_surface_feedback(id, surface)` (версия 4).
+                2 | 3 => {
+                    let new = args.u32()?;
+                    self.objects.insert(new, Obj::DmabufFeedback);
+                    self.dmabuf_feedback(new);
+                }
                 _ => {}
             },
+            Obj::DmabufFeedback => {
+                if opcode == 0 {
+                    self.delete(id);
+                }
+            }
             // `destroy`, `add(fd, plane, offset, stride, mod_hi, mod_lo)`,
             // `create(w, h, format, flags)`, `create_immed(id, w, h, format, flags)`.
             Obj::DmabufParams(_) => match opcode {
@@ -2439,7 +2454,8 @@ impl Client {
             self.fail(1, 0, "interface does not match the global");
             return;
         }
-        let version = version.min(*ours);
+        let ours = if name == 9 { dmabuf::version() } else { *ours };
+        let version = version.min(ours);
         let object = match name {
             1 => Obj::Compositor,
             2 => Obj::Subcompositor,
@@ -2474,7 +2490,8 @@ impl Client {
             // Версия 3: `format` (устаревшее, но его ждут старые клиенты) и
             // `modifier` — только LINEAR.
             9 => {
-                for (format, _) in dmabuf::FORMATS {
+                // С версии 4 форматы приходят только обратной связью (`get_default_feedback`).
+                for (format, _) in dmabuf::FORMATS.into_iter().filter(|_| version < 4) {
                     self.send(Msg::new(new, 0).u32(format));
                     if version >= 3 {
                         let linear = dmabuf::MOD_LINEAR;
@@ -4354,6 +4371,30 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// События `zwp_linux_dmabuf_feedback_v1`: таблица форматов (fd), главное устройство, одна партия
+    /// (все форматы таблицы, без флагов), `done`.
+    fn dmabuf_feedback(&mut self, feedback: u32) {
+        let table = dmabuf::format_table();
+        let mem = SharedMem::new(0);
+        let node = Arc::new(crate::user::shm::ShmNode(Arc::clone(&mem)));
+        if crate::vfs::Node::write_at(&*node, 0, &table).is_err() {
+            return;
+        }
+        self.out_fds.push(Handle::of_node(node, false));
+        let device = dmabuf::MAIN_DEVICE.to_ne_bytes();
+        let mut indices = Vec::new();
+        for index in 0..dmabuf::FORMATS.len() as u16 {
+            indices.extend_from_slice(&index.to_ne_bytes());
+        }
+        self.send(Msg::new(feedback, 1).u32(table.len() as u32));
+        self.send(Msg::new(feedback, 2).bytes(&device));
+        self.send(Msg::new(feedback, 4).bytes(&device));
+        self.send(Msg::new(feedback, 6).u32(0));
+        self.send(Msg::new(feedback, 5).bytes(&indices));
+        self.send(Msg::new(feedback, 3));
+        self.send(Msg::new(feedback, 0));
     }
 
     /// Новый `wl_keyboard`: раскладка, повтор и — если фокус уже есть — вход.

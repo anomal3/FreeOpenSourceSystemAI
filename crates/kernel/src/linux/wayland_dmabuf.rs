@@ -27,6 +27,33 @@ use crate::user::shm::SharedMem;
 
 pub(super) const INTERFACE: &str = "zwp_linux_dmabuf_v1";
 pub(super) const VERSION: u32 = 3;
+/// Версия с обратной связью (`get_default_feedback`) - объявляется при узле AMD, см. [`version`].
+const FEEDBACK_VERSION: u32 = 4;
+/// `dev_t` <главного устройства> композитора: major 226, minor 129 - не тот, что у узла рендера (226:128).
+pub(super) const MAIN_DEVICE: u64 = (226 << 8) | 129;
+
+/// Какую версию объявить. Узел AMD (RADV на Polaris) не знает модификаторов и отдаёт в WSI картинки в тайлинге
+/// (`TILING_OPTIMAL`), а стол читает буфер процессором как линейный - на экране артефакты и мерцание в окне
+/// (25.11, RX 590). Mesa копирует кадр средствами GPU в **линейный** буфер (PRIME), когда <главное устройство>
+/// композитора не совпадает с картой рисования; сказать это можно только обратной связью версии 4.
+pub(super) fn version() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if crate::linux::drm::amdgpu::active() {
+        return FEEDBACK_VERSION;
+    }
+    VERSION
+}
+
+/// Таблица форматов обратной связи: записи по 16 байт `{u32 format, u32 pad, u64 modifier}`.
+pub(super) fn format_table() -> alloc::vec::Vec<u8> {
+    let mut table = alloc::vec::Vec::new();
+    for (format, _) in FORMATS {
+        table.extend_from_slice(&format.to_le_bytes());
+        table.extend_from_slice(&0u32.to_le_bytes());
+        table.extend_from_slice(&MOD_LINEAR.to_le_bytes());
+    }
+    table
+}
 
 const fn fourcc(code: &[u8; 4]) -> u32 {
     u32::from_le_bytes(*code)
