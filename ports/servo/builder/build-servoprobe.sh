@@ -1,8 +1,10 @@
 #!/bin/sh
 # Собрать OBSOS (браузер на Servo 0.8) и servoprobe под <арх>-unknown-freeos.
 #
-# Исходники OBSOS с 25.11.2026 — отдельный репозиторий (E:\BlueGit\OBSOS,
-# крейт obsos-fossai); его версия закреплена в ports/servo/OBSOS_REV.
+# Исходники OBSOS с 25.11.2026 — отдельный репозиторий
+# https://github.com/anomal3/OBSOS (MIT OR Apache-2.0; на ПК Романа —
+# E:\BlueGit\OBSOS, крейт obsos-fossai); его версия закреплена в
+# ports/servo/OBSOS_REV.
 #
 #   docker run --rm -v <проект>:/work -v <OBSOS>:/obsos -v fossai-servo:/cache \
 #       -v fossai-cargo-registry:/opt/cargo/registry \
