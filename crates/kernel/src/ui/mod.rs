@@ -4852,6 +4852,18 @@ fn program_mods(mods: Modifiers) -> i32 {
 
 /// Отдать событие активному окну.
 fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
+    // A key from the serial line (the harness, a cable) is the kernel shell's,
+    // whatever window has the focus (25.11): a program window that took the
+    // focus - a Wine/Proton window above all, which stays open for good -
+    // swallowed every serial line, and the shell looked dead. Only the keys of
+    // the terminal window itself (tabs, scrollback) still apply.
+    if event.mods.contains(Modifiers::SERIAL) {
+        if !matches!(desktop.focused_app(), Some(App::Terminal | App::TermWin(_)) | None) {
+            let session = desktop.front_terminal().and_then(|app| desktop.find(app)).map_or(0, |window| window.active_session());
+            ACTIVE_SESSION.store(session, Ordering::Relaxed);
+            return Some(event);
+        }
+    }
     // Отпускание клавиши, нажатие которой досталось окну программы, — ему же
     // (фаза 62c), где бы ни был фокус теперь, и больше никому: оболочке оно
     // ни к чему, а нажатия она и не видела.
