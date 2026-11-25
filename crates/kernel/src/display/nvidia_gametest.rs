@@ -147,23 +147,32 @@ fn task() {
     RUNNING.store(false, Ordering::Release);
 }
 
-/// Вместо ступеней 1–4 — программная видеокарта (QEMU).
-fn soft_steps(run: &mut Run) -> bool {
-    let t = crate::time::uptime_ms();
-    let amd = SOFT_AMD.load(Ordering::Relaxed);
-    let hw = HW_AMD.load(Ordering::Relaxed);
-    let ok = if hw {
+/// Узел AMD: на настоящей карте (`hw`) или программный. Узел amdgpu есть только на x86-64.
+#[cfg(target_arch = "x86_64")]
+fn amd_node(hw: bool) -> bool {
+    if hw {
         // Настоящая карта: кольцо и микрокод поднимает цепочка `amd smc start`/`ucode`/`ring`.
         for line in drm::amdgpu::set_hw(true) {
             say(format!("gametest: amd hw: {line}"));
         }
         crate::display::amd::hw::ready()
-    } else if amd {
+    } else {
         drm::amdgpu::set_soft(true);
         true
-    } else {
-        drm::set_soft(true)
-    };
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn amd_node(_hw: bool) -> bool {
+    false
+}
+
+/// Вместо ступеней 1–4 — программная видеокарта (QEMU).
+fn soft_steps(run: &mut Run) -> bool {
+    let t = crate::time::uptime_ms();
+    let amd = SOFT_AMD.load(Ordering::Relaxed);
+    let hw = HW_AMD.load(Ordering::Relaxed);
+    let ok = if amd { amd_node(hw) } else { drm::set_soft(true) };
     let node = drm::node_visible();
     let kind = if hw { "AMD on the card" } else if amd { "soft AMD" } else { "SoftGpu" };
     run.step("soft-node", ok && node, t, &format!("{kind} {}, /dev/dri/renderD128 {}", if ok { "on" } else { "not available" }, if node { "present" } else { "absent" }))

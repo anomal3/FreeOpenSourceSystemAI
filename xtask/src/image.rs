@@ -728,6 +728,9 @@ fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
         // Настройки живой системы (21.11): два снимка по 128 КиБ, ядро
         // переписывает их на месте (`usb::stick_settings`). Пробелы — «снимка
         // ещё нет».
+        // Снимки экрана AMD-теста (25.11): ядро пишет в этот файл кадры с монитора (`display::amd::shots`).
+        logs.write_file_path(&mut dev, "FREEOS/SHOTS.BIN", &vec![0u8; 12 * 1024 * 1024])
+            .map_err(|err| anyhow::anyhow!("не удалось записать файл снимков: {err}"))?;
         logs.write_file_path(&mut dev, "FREEOS/SETTINGS.DAT", &vec![b' '; 256 * 1024])
             .map_err(|err| anyhow::anyhow!("не удалось записать файл настроек: {err}"))?;
         logs.finish(&mut dev)

@@ -185,6 +185,11 @@ pub fn offer(device: &Shared, first_lba: u64) {
             *SETTINGS.lock() = Some(Target { device: device.clone(), runs, size, flushed: 0, fresh: false, failures: 0 });
         }
     }
+    if SHOTS.lock().is_none() {
+        if let Some((runs, size)) = file_runs(&fat, &mut device, dir, b"SHOTS   BIN") {
+            *SHOTS.lock() = Some(Target { device: device.clone(), runs, size, flushed: 0, fresh: false, failures: 0 });
+        }
+    }
     if TARGET.lock().is_some() {
         return;
     }
@@ -246,6 +251,24 @@ pub fn store_layout(text: &str) -> bool {
     let ok = layout.write_range(text.as_bytes(), 0, 0, size);
     let _ = layout.device.flush();
     *LAYOUT.lock() = Some(layout);
+    ok
+}
+
+/// Файл снимков экрана AMD-теста на флешке (`\FREEOS\SHOTS.BIN`), если он есть.
+static SHOTS: SpinLock<Option<Target>> = SpinLock::new(None);
+
+/// Размер `\FREEOS\SHOTS.BIN`, если флешка с ним уже найдена.
+pub fn shots_size() -> Option<usize> {
+    SHOTS.lock().as_ref().map(|target| target.size)
+}
+
+/// Переписать кусок `\FREEOS\SHOTS.BIN` с байта `offset` (кратен сектору).
+pub fn shots_write(offset: usize, bytes: &[u8]) -> bool {
+    let Some(mut target) = SHOTS.lock().take() else { return false };
+    let end = offset + bytes.len().div_ceil(SECTOR) * SECTOR;
+    let ok = offset % SECTOR == 0 && end <= target.size && target.write_range(bytes, offset, offset, end);
+    let _ = target.device.flush();
+    *SHOTS.lock() = Some(target);
     ok
 }
 

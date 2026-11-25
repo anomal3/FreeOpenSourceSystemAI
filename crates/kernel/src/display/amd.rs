@@ -30,6 +30,8 @@ const MMIO_LEN: usize = 512 * 1024;
 
 /// Бэкенд DRM на железе: адресное пространство VMID 1 и отправка буферов команд.
 pub mod hw;
+/// Снимки экрана во время AMD-теста (что видно на мониторе).
+pub mod shots;
 
 /// Индексный доступ к памяти через окно регистров (байтовые смещения;
 /// у драйвера это dword-номера 0, 1 и 6).
@@ -1228,9 +1230,18 @@ fn radv_auto() {
             crate::kprintln!("==== AMD TEST: step {}/{total} - {title}. WAIT (up to {} min). ====", number + 1, limit / 60);
             crate::kprintln!("  amdgpu     : radv: {}", super::nvidia_gametest::start(&alloc::format!("hw amd -- {what}")));
             let mut ticks = 0u32;
+            let (mut last_commits, mut bursts, mut next_burst) = (wayland_commits(), 0u32, 0u32);
             while super::nvidia_gametest::running() {
                 crate::sched::sleep_ms(1000);
                 ticks += 1;
+                // Идут кадры (игра или проба рисуют) - снять серию с экрана: до двух на шаг, не чаще раза в 8 с.
+                let commits = wayland_commits();
+                if commits.wrapping_sub(last_commits) >= 5 && bursts < 2 && ticks >= next_burst {
+                    shots::burst(what);
+                    bursts += 1;
+                    next_burst = ticks + 8;
+                }
+                last_commits = commits;
                 if ticks % 15 == 0 {
                     crate::kprintln!("  amdgpu     : radv: '{what}' still running ({ticks} s of up to {limit})");
                 }
@@ -1248,6 +1259,18 @@ fn radv_auto() {
     }
     crate::kprintln!("==== AMD TEST: FINISHED. You can power off now. The result is in FREEOS\\LOG.TXT (gametest| lines). ====");
     crate::usb::stick_log::flush_now();
+}
+
+/// Сколько кадров показал сервер Wayland с загрузки.
+fn wayland_commits() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::linux::perfdiag::WL_COMMITS.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
 }
 
 // --- Загрузка микрокода CP/RLC/SDMA через SMC (`amd ucode`) ----------------

@@ -489,6 +489,9 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     if info.framebuffer.is_present() {
         kprintln!("  framebuffer : still reachable at {:#018x}", info.framebuffer.base);
     }
+    // Снимки экрана AMD-теста читают этот framebuffer (адрес уже в верхней половине).
+    #[cfg(target_arch = "x86_64")]
+    display::amd::shots::set_screen(info.framebuffer);
 
     // Время суток запоминается сразу после запуска таймера: до этого момента
     // складывать точку отсчёта не с чем, а после — счётчик тиков уже идёт, и
