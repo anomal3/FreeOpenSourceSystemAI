@@ -3230,6 +3230,60 @@ fn place_ca_root(disk_path: &std::path::Path) -> Result<()> {
     fs.finish()
 }
 
+/// Шум правок на разделе состояния (24.11, сценарий `btrfs-churn`): тем же
+/// писателем btrfs, что у ядра, 12 кругов в `/home/roman/churn/rNN` — по
+/// 300 файлов от сотни байт (встроенные в лист) до мегабайта, на каждом круге
+/// стирается половина прошлого круга и всё позапрошлого, фиксация на круг.
+/// До исправления подбора раскладки такой шум на томе после Proton кончался
+/// отказом фиксации; здесь отказ — провал сценария с причиной.
+fn churn_state(disk_path: &std::path::Path) -> Result<()> {
+    const ROUNDS: usize = 12;
+    const FILES: usize = 300;
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move |limit: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % limit
+    };
+    let started = std::time::Instant::now();
+    for round in 0..ROUNDS {
+        let mut fs = crate::statefs::StateVolume::open(disk_path)?;
+        let dir = format!("home/roman/churn/r{round:02}");
+        fs.create_dir_path(&dir, 0o755, 1000, 1000)?;
+        for n in 0..FILES {
+            let head = format!("churn r{round:02} f{n:03}\n");
+            let len = match (n, next(10)) {
+                (0, _) => head.len(),
+                (_, 0..=3) => 100 + next(1900) as usize,
+                (_, 4..=7) => 4096 + next(60_000) as usize,
+                _ => 100_000 + next(900_000) as usize,
+            };
+            let data: Vec<u8> = head.bytes().cycle().take(len.max(head.len())).collect();
+            fs.write_file_path(&format!("{dir}/f{n:03}"), &data, 0o644, 1000, 1000)?;
+        }
+        if round >= 1 {
+            for n in (1..FILES).step_by(2) {
+                fs.remove_path(&format!("home/roman/churn/r{:02}/f{n:03}", round - 1))?;
+            }
+        }
+        if round >= 2 {
+            let old = format!("home/roman/churn/r{:02}", round - 2);
+            for n in 0..FILES {
+                fs.remove_path(&format!("{old}/f{n:03}"))?;
+            }
+            fs.remove_path(&old)?;
+        }
+        fs.finish()?;
+    }
+    let mut fs = crate::statefs::StateVolume::open(disk_path)?;
+    let _ = fs.remove_path("home/roman/churn/marker.txt")?;
+    fs.write_file_path("home/roman/churn/marker.txt", format!("host churn: {ROUNDS} rounds\n").as_bytes(), 0o644, 1000, 1000)?;
+    fs.finish()?;
+    say!("стенд: шум правок на разделе состояния - {ROUNDS} кругов за {:.1} с", started.elapsed().as_secs_f64());
+    Ok(())
+}
+
 /// Стереть пути с раздела состояния гостя — до запуска.
 ///
 /// Файл — `unlink`, каталог — `rmdir` (только пустой: рекурсии нет намеренно,
@@ -3364,6 +3418,9 @@ fn prepare_drives(
             }
             if scenario.name == "proton-net" {
                 place_ca_root(&disk)?;
+            }
+            if scenario.name == "btrfs-churn" {
+                churn_state(&disk)?;
             }
             vec![Drive::Image(disk)]
         }
