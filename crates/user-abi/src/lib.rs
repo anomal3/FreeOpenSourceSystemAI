@@ -1811,6 +1811,82 @@ pub const OPENWITH_LIST: usize = 0;
 pub const OPENWITH_ICON: usize = 1;
 pub const OPENWITH_REMEMBER: usize = 2;
 
+/// Settings store, «реестр» (24.11): `(действие | длина_входа << 32, адрес
+/// буфера, длина буфера) -> длина ответа`, buffers as in [`SYS_OPEN_WITH`].
+/// Keys are `hive/path` (`filetypes/.txt/default`, `explorer/show_hidden`;
+/// the list and the file format — `sysconf::store`). A scope word is `user`
+/// or `system`.
+///
+/// * [`REG_GET`] — input `key`; answer: the value (user, else system, else
+///   built in); [`ERR_NOT_FOUND`] — not set.
+/// * [`REG_SET`] — input `scope\tkey\tvalue`; answer 0. The system scope is
+///   root's, the user scope — the session user's (else [`ERR_PERMISSION`]).
+/// * [`REG_REMOVE`] — input `scope\tkey`; answer 0.
+/// * [`REG_LIST`] — input `prefix` (`filetypes/.txt/`); answer: lines
+///   `key\tvalue\n`, merged like [`REG_GET`].
+/// * [`REG_SEQ`] — answer: change counter; it grows with every change, so a
+///   program re-reads its options only when it moved.
+/// * [`REG_GET_IN`] — input `scope\tkey`; the value of one scope only.
+pub const SYS_REGISTRY: usize = 97;
+pub const REG_GET: usize = 0;
+pub const REG_SET: usize = 1;
+pub const REG_REMOVE: usize = 2;
+pub const REG_LIST: usize = 3;
+pub const REG_SEQ: usize = 4;
+pub const REG_GET_IN: usize = 5;
+
+/// Change the rights of a file (24.11, «Свойства → Только чтение»):
+/// `(путь, длина, права) -> 0`. Owner or root, as `chmod`.
+pub const SYS_CHMOD: usize = 98;
+
+/// Everything about a file, times included (24.11: `stat` of the C library
+/// had no `st_mtime`, and 7-Zip stamped archives made here with 1970):
+/// `(путь, длина, out: *mut StatX) -> 0`. `длина == 0` — `путь` is a
+/// descriptor (`fstat`). [`SYS_STAT`]/[`SYS_FSTAT`] stay as they were: their
+/// [`Stat`] is fixed in programs already built.
+pub const SYS_STATX: usize = 99;
+
+/// Set the access and modification time of a file (24.11, `utimensat`,
+/// `futimens`, `utime`; 7-Zip restores the times of extracted files):
+/// `(путь, длина, times: *const FileTimes) -> 0`. `длина == 0` — `путь` is a
+/// descriptor; `times == 0` — both «now». Owner or root, as `chmod`; a file
+/// system without stored times answers [`ERR_UNSUPPORTED`].
+pub const SYS_UTIMES: usize = 100;
+
+/// Answer of [`SYS_STATX`]. Times are seconds of the Unix epoch, UTC; zero —
+/// unknown (a file system without times, a file made without a clock).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatX {
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// [`KIND_FILE`], [`KIND_DIRECTORY`], [`KIND_PIPE`]…, as in [`Stat`].
+    pub kind: u32,
+    /// Last content change.
+    pub mtime: i64,
+    /// Last access (= `mtime` where the file system keeps no access time).
+    pub atime: i64,
+    /// Last status change (ext2, btrfs) or creation (FAT, exFAT, SMB).
+    pub ctime: i64,
+    /// Number of the file on its volume (0 — none): `st_ino`.
+    pub ino: u64,
+}
+
+/// Input of [`SYS_UTIMES`]: Unix seconds, or [`TIME_NOW`] / [`TIME_OMIT`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileTimes {
+    pub atime: i64,
+    pub mtime: i64,
+}
+
+/// [`FileTimes`]: set this time to «now» (`UTIME_NOW`).
+pub const TIME_NOW: i64 = i64::MIN;
+/// [`FileTimes`]: leave this time as it is (`UTIME_OMIT`).
+pub const TIME_OMIT: i64 = i64::MIN + 1;
+
 /// Screen capture for the recorder (22.11, `/bin/screenrec`):
 /// `(action, a1, a2) -> answer`. One capture at a time on the whole system.
 ///
@@ -1834,6 +1910,40 @@ pub const OPENWITH_REMEMBER: usize = 2;
 /// * [`CAP_WINDOWS`] — `a1`/`a2` = text buffer: windows top first, lines
 ///   `x\ty\tw\th\tname\n`; answer — bytes written.
 pub const SYS_SCREENCAP: usize = 95;
+
+/// Size limits of a window (24.11, WM SDK): `(id, min, max) -> 0`.
+///
+/// `min` and `max` are content sizes (without the title band and frame) in
+/// **layout points** — the same units as `ctx.px(n)` takes: the desktop
+/// multiplies them by the scale of the window, so a limit keeps its look at
+/// 100 % and 200 % and on a monitor with another scale. Each is packed by
+/// [`pack_size`]; a zero side means «no limit on this side». `min == max` —
+/// a fixed-size window: no resizing, no «Развернуть» (like a Windows dialog
+/// without `WS_THICKFRAME`).
+///
+/// The desktop keeps the window inside them everywhere it changes the size:
+/// dragging an edge, snapping to a half, maximizing (a window with a maximum
+/// smaller than the monitor is maximized to its maximum at the top-left
+/// corner of the work area, as in Windows), restoring and a scale change.
+/// A window smaller than the new minimum grows at once (the program gets
+/// [`WIN_RESIZE`]). The phone ignores the limits: its windows are the
+/// screen. Wayland clients get the same through
+/// `xdg_toplevel.set_min_size/set_max_size` (in pixels there).
+pub const SYS_WINLIMITS: usize = 96;
+
+/// A size `w`×`h` (each up to 65535) in one argument of [`SYS_WINLIMITS`].
+#[must_use]
+pub const fn pack_size(w: u32, h: u32) -> usize {
+    let w = if w > 0xFFFF { 0xFFFF } else { w };
+    let h = if h > 0xFFFF { 0xFFFF } else { h };
+    ((w as usize) << 16) | h as usize
+}
+
+/// Back from [`pack_size`].
+#[must_use]
+pub const fn unpack_size(v: usize) -> (u32, u32) {
+    (((v >> 16) & 0xFFFF) as u32, (v & 0xFFFF) as u32)
+}
 pub const CAP_INFO: usize = 0;
 pub const CAP_START: usize = 1;
 pub const CAP_GRAB: usize = 2;
@@ -1841,6 +1951,11 @@ pub const CAP_STOP: usize = 3;
 pub const CAP_STATUS: usize = 4;
 pub const CAP_REQUEST_STOP: usize = 5;
 pub const CAP_WINDOWS: usize = 6;
+/// [`SYS_SCREENCAP`] (24.11, «Определить» like Windows): show a big number
+/// plate on every monitor for `a1` ms (0 — 3 s). The number is the one
+/// «Параметры → Дисплей» shows (the place of the monitor in the registry),
+/// so the lists of OBS and of the settings agree with what is on the screens.
+pub const CAP_IDENTIFY: usize = 7;
 
 /// [`CapSpec::flags`]: draw the pointer into the frames.
 pub const CAP_POINTER: u32 = 1;
@@ -1914,6 +2029,12 @@ pub const WIN_STYLE_DIALOG: u32 = 2;
 /// (20.11) — так открывается «Выполнить» в Windows. Действует один раз, в
 /// момент вызова; окно, которое человек уже сдвинул, тоже переедет.
 pub const WIN_STYLE_AT_START: u32 = 4;
+
+/// [`SYS_WINSTYLE`] (24.11, F11 in «Фотографии»): the window takes its whole
+/// monitor without the frame, above the taskbar; the program gets
+/// [`WIN_RESIZE`] with the monitor size. A later call without the flag puts
+/// the window back where it stood.
+pub const WIN_STYLE_FULLSCREEN: u32 = 8;
 
 /// Ответ [`SYS_THREAD_INFO`].
 ///
@@ -3011,7 +3132,8 @@ mod tests {
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
             SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK, SYS_MODEM, SYS_FLOCK,
-            SYS_FSWATCH, SYS_OPEN_WITH, SYS_SCREENCAP,
+            SYS_FSWATCH, SYS_OPEN_WITH, SYS_SCREENCAP, SYS_WINLIMITS,
+            SYS_REGISTRY, SYS_CHMOD, SYS_STATX, SYS_UTIMES,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(

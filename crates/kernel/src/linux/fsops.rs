@@ -196,16 +196,23 @@ pub fn fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> i64 {
 pub fn statfs(path: Option<usize>, fd: usize, out: usize) -> i64 {
     const TMPFS_MAGIC: u64 = 0x0102_1994;
     const EXT2_MAGIC: u64 = 0xEF53;
-    let tmpfs = match path {
+    // sysfs (24.11.2026, gamepads): libudev refuses a device whose directory
+    // is not on sysfs (`fd_is_fs_type(fd, SYSFS_MAGIC)` in `device_set_syspath`).
+    const SYSFS_MAGIC: u64 = 0x6265_6572;
+    let in_sys = |linux: &str| linux == "/sys" || linux.starts_with("/sys/");
+    let (tmpfs, sysfs) = match path {
         Some(ptr) => match linux_path(AT_FDCWD, ptr) {
-            Ok(linux) => linux == "/dev/shm" || linux.starts_with("/dev/shm/"),
+            Ok(linux) => (linux == "/dev/shm" || linux.starts_with("/dev/shm/"), in_sys(&linux)),
             Err(err) => return err,
         },
-        None => match crate::user::with_current(|program| program.files.file_or_dir(fd)) {
-            Some(Ok(node)) => node.shared_memory().is_some(),
-            Some(Err(err)) => return file_errno(err),
-            None => return -e::ESRCH,
-        },
+        None => {
+            let sysfs = super::dir_path(fd).is_some_and(|linux| in_sys(&linux));
+            match crate::user::with_current(|program| program.files.file_or_dir(fd)) {
+                Some(Ok(node)) => (node.shared_memory().is_some(), sysfs),
+                Some(Err(err)) => return file_errno(err),
+                None => return -e::ESRCH,
+            }
+        }
     };
     if !space::user_can(out, 120, PageFlags::WRITE) {
         return -e::EFAULT;
@@ -216,7 +223,13 @@ pub fn statfs(path: Option<usize>, fd: usize, out: usize) -> i64 {
     // type, bsize, blocks, bfree, bavail, files, ffree, fsid, namelen, frsize,
     // flags, spare[4].
     let fields: [u64; 15] = [
-        if tmpfs { TMPFS_MAGIC } else { EXT2_MAGIC },
+        if tmpfs {
+            TMPFS_MAGIC
+        } else if sysfs {
+            SYSFS_MAGIC
+        } else {
+            EXT2_MAGIC
+        },
         4096,
         blocks,
         free,

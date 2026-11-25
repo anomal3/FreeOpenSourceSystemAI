@@ -141,6 +141,9 @@ pub fn repeat_tick() {
 pub enum Reader {
     Keyboard(Keyboard),
     Mouse(Mouse),
+    /// Gamepad or joystick (24.11.2026): HID by its descriptor, or an Xbox
+    /// pad on its vendor interface (`usb::gamepad`).
+    Gamepad(super::gamepad::Gamepad),
 }
 
 impl Reader {
@@ -148,6 +151,23 @@ impl Reader {
         match self {
             Reader::Keyboard(keyboard) => keyboard.handle_report(report),
             Reader::Mouse(mouse) => mouse.handle_report(report),
+            Reader::Gamepad(pad) => pad.handle_report(report),
+        }
+    }
+
+    /// The next packet for the device's interrupt OUT endpoint (Xbox pads:
+    /// init, acknowledgements, LEDs); `None` - nothing to send.
+    pub fn take_output(&mut self) -> Option<alloc::vec::Vec<u8>> {
+        match self {
+            Reader::Gamepad(pad) => pad.take_output(),
+            _ => None,
+        }
+    }
+
+    /// Vendor and product of the device, for a HID gamepad's name.
+    pub fn identify(&mut self, vendor: u16, product: u16) {
+        if let Reader::Gamepad(pad) = self {
+            pad.identify(vendor, product);
         }
     }
 
@@ -156,6 +176,7 @@ impl Reader {
         match self {
             Reader::Keyboard(keyboard) => keyboard.reports(),
             Reader::Mouse(mouse) => mouse.reports(),
+            Reader::Gamepad(pad) => pad.reports(),
         }
     }
 
@@ -164,6 +185,7 @@ impl Reader {
         match self {
             Reader::Keyboard(_) => "keyboard",
             Reader::Mouse(_) => "mouse",
+            Reader::Gamepad(_) => "gamepad",
         }
     }
 
@@ -177,6 +199,7 @@ impl Reader {
         match self {
             Reader::Keyboard(_) => usb::PROTOCOL_KEYBOARD,
             Reader::Mouse(_) => usb::PROTOCOL_MOUSE,
+            Reader::Gamepad(_) => 0,
         }
     }
 }
@@ -196,7 +219,10 @@ pub fn log_descriptor(driver: &str, interface: u8, bytes: &[u8]) {
         )
     });
     let keyboard = parsed.keyboard.map_or("no keyboard", |_| "keyboard");
-    crate::kprintln!("  {driver:<11} : interface {interface} report descriptor {} bytes: {pointer}, {keyboard}", bytes.len());
+    let gamepad = parsed.gamepad.map_or(alloc::string::String::from("no gamepad"), |map| {
+        alloc::format!("gamepad ({} axes, {} buttons{})", map.axis_count(), map.button_count(), if map.has_hat() { ", hat" } else { "" })
+    });
+    crate::kprintln!("  {driver:<11} : interface {interface} report descriptor {} bytes: {pointer}, {keyboard}, {gamepad}", bytes.len());
     for (row, chunk) in bytes.chunks(16).enumerate() {
         let mut line = alloc::string::String::new();
         for byte in chunk {
@@ -240,6 +266,11 @@ pub fn choose_reader(
     }
     if let Some(map) = described.pointer {
         return Some((Reader::Mouse(Mouse::described(map)), false));
+    }
+    // A gamepad or joystick (24.11.2026): before, such a device was "nothing
+    // the kernel can use" and was not brought up at all.
+    if let Some(map) = described.gamepad {
+        return Some((Reader::Gamepad(super::gamepad::Gamepad::hid(map)), false));
     }
 
     if !found.boot {

@@ -558,6 +558,7 @@ impl Editor {
             inode.size = end;
         }
         inode.time = self.time;
+        inode.mtime = self.time;
         self.write_inode(dev, number, &inode)?;
         Ok(done)
     }
@@ -710,6 +711,7 @@ impl Editor {
 
         inode.size = size;
         inode.time = self.time;
+        inode.mtime = self.time;
         self.write_inode(dev, number, &inode)
     }
 
@@ -717,6 +719,28 @@ impl Editor {
     pub fn set_mode(&mut self, dev: &mut dyn BlockDevice, number: u32, mode: u16) -> Result<()> {
         let mut inode = self.read_inode(dev, number)?;
         inode.mode = (inode.mode & !0o7777) | (mode & 0o7777);
+        // Status change only: `chmod` is not a content change, and «Только
+        // чтение» in «Свойствах» must not move the file's date (24.11).
+        inode.time = self.time;
+        self.write_inode(dev, number, &inode)
+    }
+
+    /// Set the access and/or modification time of an inode (`utimensat`,
+    /// 24.11); `None` keeps the value. The status-change time becomes «now».
+    pub fn set_times(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        number: u32,
+        atime: Option<u32>,
+        mtime: Option<u32>,
+    ) -> Result<()> {
+        let mut inode = self.read_inode(dev, number)?;
+        if let Some(atime) = atime {
+            inode.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            inode.mtime = mtime;
+        }
         inode.time = self.time;
         self.write_inode(dev, number, &inode)
     }

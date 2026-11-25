@@ -72,8 +72,14 @@ extern crate std;
 #[cfg(test)]
 mod tests;
 
+pub mod pad;
+
+pub use pad::PadState;
+
 /// Страницы usage, которые ядро различает (HID Usage Tables, глава 3).
 const PAGE_GENERIC_DESKTOP: u16 = 0x01;
+/// Simulation Controls: accelerator and brake of the HID Xbox pads (24.11).
+const PAGE_SIMULATION: u16 = 0x02;
 const PAGE_KEYBOARD: u16 = 0x07;
 const PAGE_BUTTON: u16 = 0x09;
 const PAGE_DIGITIZER: u16 = 0x0D;
@@ -84,6 +90,17 @@ const USAGE_MOUSE: u16 = 0x02;
 const USAGE_X: u16 = 0x30;
 const USAGE_Y: u16 = 0x31;
 const USAGE_WHEEL: u16 = 0x38;
+/// Joystick, gamepad and multi-axis controller collections (24.11).
+const USAGE_JOYSTICK: u16 = 0x04;
+const USAGE_GAMEPAD: u16 = 0x05;
+const USAGE_MULTI_AXIS: u16 = 0x08;
+/// Hat switch (the d-pad of HID pads): a number of eight (or four) directions.
+const USAGE_HAT: u16 = 0x39;
+/// Simulation page: accelerator and brake.
+const USAGE_ACCELERATOR: u16 = 0xC4;
+const USAGE_BRAKE: u16 = 0xC5;
+/// How many buttons a gamepad map keeps (page Button, usages 1..=32).
+const PAD_BUTTONS: usize = 32;
 
 /// Первый и последний usage клавиш-модификаторов на странице Keyboard.
 const USAGE_MODIFIER_FIRST: u16 = 0xE0;
@@ -440,11 +457,198 @@ impl KeyboardMap {
     }
 }
 
+/// Gamepad or joystick report map (24.11): the axes X..Dial, accelerator and
+/// brake, the hat switch and up to 32 buttons of an application collection
+/// Joystick, Gamepad or Multi-axis Controller.
+///
+/// Only the fields of the first report that carries them are kept: a
+/// DualShock 4 sends its pad state in report 1 and its feature and output
+/// reports under other numbers.
+#[derive(Clone, Copy, Debug)]
+pub struct GamepadMap {
+    pub report_id: u8,
+    /// Usage of the collection: 4 joystick, 5 gamepad, 8 multi-axis.
+    pub usage: u16,
+    /// X, Y, Z, Rx, Ry, Rz, Slider, Dial (usages 0x30..=0x37).
+    axes: [Option<Field>; 8],
+    accelerator: Option<Field>,
+    brake: Option<Field>,
+    hat: Option<Field>,
+    /// Field of button N+1 (usually one bit).
+    buttons: [Option<Field>; PAD_BUTTONS],
+}
+
+/// What one gamepad report said, in the units of the device turned into
+/// fractions: 0 is the minimum of an axis, 65535 its maximum.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GamepadReport {
+    /// X, Y, Z, Rx, Ry, Rz, Slider, Dial; `None` - the device has no such axis.
+    pub axes: [Option<u16>; 8],
+    pub accelerator: Option<u16>,
+    pub brake: Option<u16>,
+    /// Direction of the hat: 0 up, 1 up-right ... 7 up-left; `None` -
+    /// centred (or no hat).
+    pub hat: Option<u8>,
+    /// Bit N - button N+1.
+    pub buttons: u32,
+}
+
+impl GamepadMap {
+    const fn empty() -> Self {
+        Self {
+            report_id: 0,
+            usage: 0,
+            axes: [None; 8],
+            accelerator: None,
+            brake: None,
+            hat: None,
+            buttons: [None; PAD_BUTTONS],
+        }
+    }
+
+    /// How many axes (of X..Dial) the device declares.
+    #[must_use]
+    pub fn axis_count(&self) -> usize {
+        self.axes.iter().filter(|axis| axis.is_some()).count()
+    }
+
+    /// How many buttons: the highest declared number.
+    #[must_use]
+    pub fn button_count(&self) -> usize {
+        self.buttons.iter().rposition(Option::is_some).map_or(0, |at| at + 1)
+    }
+
+    /// Whether a hat switch is declared.
+    #[must_use]
+    pub const fn has_hat(&self) -> bool {
+        self.hat.is_some()
+    }
+
+    /// Whether axis `index` (0 X ... 7 Dial) is declared.
+    #[must_use]
+    pub fn has_axis(&self, index: usize) -> bool {
+        self.axes.get(index).is_some_and(Option::is_some)
+    }
+
+    /// Read a report; `None` - a report with another number.
+    #[must_use]
+    pub fn decode(&self, report: &[u8]) -> Option<GamepadReport> {
+        let data = strip_report_id(self.report_id, report)?;
+        let mut out = GamepadReport::default();
+        for (slot, field) in out.axes.iter_mut().zip(self.axes.iter()) {
+            *slot = field.map(|field| field.fraction(data));
+        }
+        out.accelerator = self.accelerator.map(|field| field.fraction(data));
+        out.brake = self.brake.map(|field| field.fraction(data));
+        out.hat = self.hat.and_then(|field| hat_direction(&field, data));
+        for (index, field) in self.buttons.iter().enumerate() {
+            if let Some(field) = field {
+                if field.read(data) != 0 {
+                    out.buttons |= 1 << index;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// The report as the state of an Xbox-like pad ([`PadState`]).
+    ///
+    /// Layout of the axes - the one of the DualShock 4, DualSense and most
+    /// DirectInput pads: X/Y the left stick, Z/Rz the right one, Rx/Ry the
+    /// analog triggers. Without Z/Rz the right stick is Rx/Ry (HID Xbox
+    /// pads), and their triggers are accelerator and brake. Buttons -
+    /// DirectInput numbering of the PlayStation pads (Logitech in D mode, the
+    /// same): 1 X (square), 2 A (cross), 3 B (circle), 4 Y (triangle), 5 LB, 6
+    /// RB, 7 LT, 8 RT, 9 Back (Share), 10 Start (Options), 11/12 stick
+    /// presses, 13 Guide (PS).
+    #[must_use]
+    pub fn to_pad(&self, report: &[u8]) -> Option<PadState> {
+        let read = self.decode(report)?;
+        let mut pad = PadState::default();
+        let axis = |index: usize| read.axes[index];
+        let stick = |value: Option<u16>| value.map_or(0, |value| (i32::from(value) - 32768) as i16);
+        let trigger = |value: Option<u16>| value.map_or(0, |value| (value >> 8) as u8);
+        pad.lx = stick(axis(0));
+        pad.ly = stick(axis(1));
+        let (z, rz, rx, ry) = (self.has_axis(2), self.has_axis(5), self.has_axis(3), self.has_axis(4));
+        let mut analog_triggers = false;
+        if z && rz {
+            pad.rx = stick(axis(2));
+            pad.ry = stick(axis(5));
+            if rx && ry {
+                pad.lt = trigger(axis(3));
+                pad.rt = trigger(axis(4));
+                analog_triggers = true;
+            }
+        } else if rx && ry {
+            pad.rx = stick(axis(3));
+            pad.ry = stick(axis(4));
+            if let Some(value) = axis(2) {
+                // One Z for both triggers (the Windows HID view of an Xbox
+                // pad): below the middle - left, above - right.
+                let value = i32::from(value) - 32768;
+                pad.lt = ((-value).max(0) >> 7).min(255) as u8;
+                pad.rt = (value.max(0) >> 7).min(255) as u8;
+                analog_triggers = true;
+            }
+        }
+        if read.brake.is_some() || read.accelerator.is_some() {
+            pad.lt = trigger(read.brake);
+            pad.rt = trigger(read.accelerator);
+            analog_triggers = true;
+        }
+        if let Some(direction) = read.hat {
+            (pad.hat_x, pad.hat_y) = pad::HAT_VECTORS[usize::from(direction & 7)];
+        }
+        let pressed = |number: u32| read.buttons & (1 << (number - 1)) != 0;
+        for (number, bit) in [
+            (1, pad::BTN_X),
+            (2, pad::BTN_A),
+            (3, pad::BTN_B),
+            (4, pad::BTN_Y),
+            (5, pad::BTN_LB),
+            (6, pad::BTN_RB),
+            (9, pad::BTN_BACK),
+            (10, pad::BTN_START),
+            (11, pad::BTN_LS),
+            (12, pad::BTN_RS),
+            (13, pad::BTN_GUIDE),
+        ] {
+            if pressed(number) {
+                pad.buttons |= bit;
+            }
+        }
+        if !analog_triggers {
+            pad.lt = if pressed(7) { 255 } else { 0 };
+            pad.rt = if pressed(8) { 255 } else { 0 };
+        }
+        Some(pad)
+    }
+}
+
+/// Direction of a hat switch: eight positions (0 up, clockwise) or four (up,
+/// right, down, left); a value outside the range is the centre ("null
+/// state").
+fn hat_direction(field: &Field, report: &[u8]) -> Option<u8> {
+    let value = field.read(report);
+    if value < field.logical_min || value > field.logical_max {
+        return None;
+    }
+    let index = (value - field.logical_min) as u8;
+    match field.logical_max - field.logical_min + 1 {
+        8 => Some(index),
+        4 => Some(index * 2),
+        _ => None,
+    }
+}
+
 /// Что удалось понять из дескриптора.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Descriptor {
     pub pointer: Option<PointerMap>,
     pub keyboard: Option<KeyboardMap>,
+    /// Gamepad, joystick or multi-axis controller (24.11).
+    pub gamepad: Option<GamepadMap>,
 }
 
 /// Состояние Global-элементов: действует до следующего такого же.
@@ -533,6 +737,10 @@ struct Parser {
     modifiers: Option<u16>,
     keys: Option<(u16, u8, u8)>,
     keyboard_report: u8,
+    /// Unfinished gamepad map: the report its first field came in, and the
+    /// fields so far.
+    pad_report: Option<u8>,
+    pad: GamepadMap,
 }
 
 impl Parser {
@@ -546,7 +754,7 @@ impl Parser {
             collections: 0,
             bits: 0,
             current_report: 0,
-            found: Descriptor { pointer: None, keyboard: None },
+            found: Descriptor { pointer: None, keyboard: None, gamepad: None },
             x: None,
             y: None,
             wheel: None,
@@ -555,7 +763,38 @@ impl Parser {
             modifiers: None,
             keys: None,
             keyboard_report: 0,
+            pad_report: None,
+            pad: GamepadMap::empty(),
         }
+    }
+
+    /// Whether the top-level collection is a joystick, gamepad or multi-axis
+    /// controller: only there X and Y are sticks.
+    const fn is_gamepad_collection(&self) -> bool {
+        let page = (self.top_usage >> 16) as u16;
+        let usage = self.top_usage as u16;
+        page == PAGE_GENERIC_DESKTOP && matches!(usage, USAGE_JOYSTICK | USAGE_GAMEPAD | USAGE_MULTI_AXIS)
+    }
+
+    /// A field of a gamepad collection: an axis, the hat or a button.
+    fn gamepad_field(&mut self, page: u16, usage: u16, field: Field) {
+        let report = self.global.report_id;
+        if self.pad_report.is_some_and(|first| first != report) {
+            return;
+        }
+        let slot = match (page, usage) {
+            (PAGE_GENERIC_DESKTOP, 0x30..=0x37) => &mut self.pad.axes[usize::from(usage - 0x30)],
+            (PAGE_GENERIC_DESKTOP, USAGE_HAT) => &mut self.pad.hat,
+            (PAGE_SIMULATION, USAGE_ACCELERATOR) => &mut self.pad.accelerator,
+            (PAGE_SIMULATION, USAGE_BRAKE) => &mut self.pad.brake,
+            (PAGE_BUTTON, number) if (1..=PAD_BUTTONS as u16).contains(&number) => {
+                &mut self.pad.buttons[usize::from(number - 1)]
+            }
+            _ => return,
+        };
+        slot.get_or_insert(field);
+        self.pad_report = Some(report);
+        self.pad.report_id = report;
     }
 
     /// Описывает ли коллекция верхнего уровня указатель.
@@ -636,12 +875,23 @@ impl Parser {
                 keys: self.keys,
             });
         }
+        // A pad: two axes, or a hat, or four buttons (a button box) - a
+        // collection with one stray field is not a gamepad.
+        if self.found.gamepad.is_none()
+            && (self.pad.axis_count() >= 2 || self.pad.has_hat() || self.pad.button_count() >= 4)
+        {
+            let mut map = self.pad;
+            map.usage = self.top_usage as u16;
+            self.found.gamepad = Some(map);
+        }
         self.x = None;
         self.y = None;
         self.wheel = None;
         self.buttons = None;
         self.modifiers = None;
         self.keys = None;
+        self.pad = GamepadMap::empty();
+        self.pad_report = None;
     }
 
     /// Объявление полей: разложить их по битам отчёта.
@@ -697,6 +947,11 @@ impl Parser {
                 logical_max: self.global.logical_max,
                 relative,
             };
+
+            if self.is_gamepad_collection() {
+                self.gamepad_field(page, usage, field);
+                continue;
+            }
 
             match (page, usage) {
                 (PAGE_GENERIC_DESKTOP, USAGE_X) if self.is_pointer_collection() => {

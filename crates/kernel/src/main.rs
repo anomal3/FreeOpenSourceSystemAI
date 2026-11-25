@@ -197,7 +197,7 @@ pub(crate) fn start(boot_info: *const BootInfo) -> ! {
     };
 
     if info.framebuffer.is_present() {
-        console::init(&info.framebuffer);
+        console::init(&info.framebuffer, info.boot_flags & boot_info::BOOT_VERBOSE != 0);
     }
 
     // Проверка адреса порта — сразу, как только карта памяти прошла проверку.
@@ -641,6 +641,7 @@ fn start_graphics(info: &BootInfo, have_input: bool) {
     // Условие снимется само. Заработает тачскрин — появится источник событий, и
     // стол поедет как раньше, без единой правки здесь.
     if !have_input {
+        console::show_log();
         kprintln!(
             "  compositor  : not started -- no input on this machine; the log keeps the screen"
         );
@@ -652,6 +653,7 @@ fn start_graphics(info: &BootInfo, have_input: bool) {
     // чужой машине чаще всего именно графика: не завестись должно то, что
     // может не завестись.
     if info.safe_mode() {
+        console::show_log();
         kprintln!("  compositor  : not started, safe mode; the shell runs on the boot console");
         return;
     }
@@ -661,6 +663,7 @@ fn start_graphics(info: &BootInfo, have_input: bool) {
     // GOP его и нет — см. `virtio::gpu`).
     let gpu_screen = virtio_gpu_screen(info);
     if gpu_screen.is_none() && !info.framebuffer.is_present() {
+        console::show_log();
         kprintln!("  compositor  : no framebuffer; the shell will run on the serial console");
         return;
     }
@@ -769,6 +772,8 @@ fn hold_boot_log(info: &BootInfo) {
     // стоят здесь на случай, если наладить не удастся вовсе: без них ядро
     // осталось бы на загрузочном экране навсегда.
     const HOLD_SECONDS: u64 = 30;
+    // The log is what this hold is for: off the logo, onto the screen.
+    console::show_log();
     kprintln!("  console     : holding this log for {HOLD_SECONDS} s -- the desktop comes next");
 
     // Ожидание по счётчику тиков, а не по циклу заданной длины: тактовая
@@ -944,6 +949,11 @@ fn run_session(have_input: bool) -> ! {
     if let Err(err) = sched::spawn_daemon("writeback", fs::writeback_task) {
         kprintln!("  fs          : the writeback task did not start: {err}");
     }
+
+    // `\\host\share` (Roman 24.11): computers on the network and their
+    // shared folders under `/net` (`net::lan`, `fs::netfs`).
+    net::lan::start();
+    fs::netfs::mount();
 
     // Уточнение частоты счётчика времени (фаза 68g): калибровка при загрузке
     // ошибалась в разы в VirtualBox поверх Hyper-V — см. `time::refine_task`.

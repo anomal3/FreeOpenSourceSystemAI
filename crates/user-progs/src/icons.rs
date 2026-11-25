@@ -116,16 +116,43 @@ fn draw_from(theme: u8, s: &mut Surface, rect: Rect, name: &str) -> Option<()> {
     let index = pack.index.as_deref()?;
     let side = rect.w.max(rect.h);
     let slot = match pack.cache.iter().position(|(known, wanted, _)| known == name && *wanted == side) {
-        Some(slot) => slot,
+        // The last used goes last: the cache drops from the front.
+        Some(slot) => {
+            let entry = pack.cache.remove(slot);
+            pack.cache.push(entry);
+            pack.cache.len() - 1
+        }
         None => {
             // Только нужный размер: со всеми значок весит под сто килобайт.
             let parsed = load_entry(theme, index, name).and_then(|bytes| Image::parse_for(&bytes, side));
+            // The cache is bounded (24.11): every size stayed for ever, and
+            // after a few `ui scale` changes (1.25 → 1.5 → 2) «Файлы» ran out
+            // of their megabyte heap at 200 % («user: panic», exit 101).
+            let room = cache_budget().saturating_sub(parsed.as_ref().map_or(0, image_bytes));
+            while !pack.cache.is_empty() && cached_bytes(&pack.cache) > room {
+                pack.cache.remove(0);
+            }
             pack.cache.push((String::from(name), side, parsed));
             pack.cache.len() - 1
         }
     };
     pack.cache[slot].2.as_ref()?.draw(s, rect);
     Some(())
+}
+
+/// Bytes a parsed icon keeps (one size, `R G B A`).
+fn image_bytes(image: &Image) -> usize {
+    image.width as usize * image.height as usize * 4
+}
+
+/// Bytes the cache of one pack keeps.
+fn cached_bytes(cache: &[(String, u32, Option<Image>)]) -> usize {
+    cache.iter().filter_map(|(_, _, image)| image.as_ref()).map(image_bytes).sum()
+}
+
+/// How much the parsed icons may take: a quarter of the program heap.
+fn cache_budget() -> usize {
+    crate::heap_capacity() / 4
 }
 
 /// Нарисовать значок `name` текущей темы (нет в ней — темы по умолчанию).

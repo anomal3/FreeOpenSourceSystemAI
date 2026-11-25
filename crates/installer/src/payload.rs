@@ -315,7 +315,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 79] = [
+const PROGRAMS: [(&CStr16, &str); 84] = [
     // vDSO программ Linux (01.11.2026): время без входа в ядро. Не программа,
     // но едет тем же путём — так он есть и на установленной системе.
     (cstr16!("\\FREEOS\\BIN\\VDSO"), "vdso"),
@@ -388,6 +388,12 @@ const PROGRAMS: [(&CStr16, &str); 79] = [
     (cstr16!("\\FREEOS\\BIN\\WALLCONV"), "wallconv"),
     // «Запись экрана» (22.11): имя на носителе в 8.3 — `SCRNREC`.
     (cstr16!("\\FREEOS\\BIN\\SCRNREC"), "screenrec"),
+    // «Параметры значков рабочего стола» (24.11).
+    (cstr16!("\\FREEOS\\BIN\\DESKICON"), "deskicon"),
+    // «Сетевые учётные данные» (24.11): \\host\share с вводом имени и пароля.
+    (cstr16!("\\FREEOS\\BIN\\NETLOGON"), "netlogon"),
+    // «Фотографии»: просмотр фото (24.11).
+    (cstr16!("\\FREEOS\\BIN\\PHOTOS"), "photos"),
     // Окно «Открыть» / «Сохранить как» / «Выбор папки» для всех программ (20.11).
     (cstr16!("\\FREEOS\\BIN\\FILEDLG"), "filedlg"),
     // Системные инструменты (фаза П1/П2, 20.11) и «Администрирование» (П3):
@@ -448,6 +454,11 @@ const PROGRAMS: [(&CStr16, &str); 79] = [
     // curl 8.23 (фаза 65d): HTTP и HTTPS из командной строки, корни — из
     // `/etc/ca.pem`. Едет, только если собран `cargo xtask thirdparty`.
     (cstr16!("\\FREEOS\\BIN\\CURL"), "curl"),
+    // 7-Zip 26.06 (24.11): консольный `7zz` из исходников 7-zip.org — его
+    // зовёт окно архиватора. Едет, только если собран (`xtask/src/sevenzip.rs`).
+    (cstr16!("\\FREEOS\\BIN\\7ZZ"), "7zz"),
+    // «Архиватор 7-Zip» — окно над `7zz` (24.11).
+    (cstr16!("\\FREEOS\\BIN\\ARCHIVER"), "archiver"),
 ];
 
 /// Эталонные настройки на носителе и их пути в корневом образе.
@@ -655,7 +666,7 @@ const DOTNET: [(&CStr16, &str); 3] = [
 ///
 /// Их отсутствие — не отказ: пакеты собирает `xtask`, и носитель, собранный без
 /// них, остаётся годным установочным носителем.
-const PACKAGES: [(&CStr16, &str); 18] = [
+const PACKAGES: [(&CStr16, &str); 20] = [
     (cstr16!("\\FREEOS\\PKG\\HELLO.FPK"), "hello-1.0.fpk"),
     (cstr16!("\\FREEOS\\PKG\\EXTRA.FPK"), "extra-1.0.fpk"),
     // Программа WinForms пакетом (фаза N8).
@@ -691,6 +702,11 @@ const PACKAGES: [(&CStr16, &str); 18] = [
     // OBS Studio из Debian 13 (23.11.2026) — только если собран и
     // `FOSSAI_WITH_OBS=1`.
     (cstr16!("\\FREEOS\\PKG\\OBS.FPK"), "obs-30.fpk"),
+    // VLC из Debian 13 (24.11.2026) — только если собран и `FOSSAI_WITH_VLC=1`.
+    (cstr16!("\\FREEOS\\PKG\\VLC.FPK"), "vlc-3.0.fpk"),
+    // Rupor, the Linux client of Roman's messenger (24.11.2026) - only if
+    // built and `FOSSAI_WITH_RUPOR=1`.
+    (cstr16!("\\FREEOS\\PKG\\RUPOR.FPK"), "rupor-1.9.50.fpk"),
 ];
 
 /// Размер файла по данным файловой системы.

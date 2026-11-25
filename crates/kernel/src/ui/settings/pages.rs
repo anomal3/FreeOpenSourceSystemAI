@@ -46,13 +46,13 @@ impl SettingsView {
             Section::Keyboard => keyboard(pass, x, y, w),
             Section::Usb => self.usb(pass, x, y, w),
             Section::Network => self.network(pass, x, y, w),
-            Section::Personal => {
-                let mut y = y;
-                for section in [Section::Wallpaper, Section::Colors, Section::Appearance, Section::Dock] {
-                    y = nav_row(pass, x, y, w, section);
-                }
-            }
+            Section::Sharing => sharing(pass, x, y, w),
+            Section::Personal => personal(pass, x, y, w),
             Section::Wallpaper => super::background::page(pass, x, y, w),
+            Section::LockScreen => {
+                let y = super::background::lock_page(pass, x, y, w);
+                saver_rows(pass, x, y, w);
+            }
             Section::Colors => colors(pass, x, y, w),
             Section::Appearance => appearance(pass, x, y, w),
             Section::Dock => dock(pass, x, y, w),
@@ -326,6 +326,28 @@ impl SettingsView {
         if !any {
             y = pass.note(x, y, w, "Ни одного устройства USB не подключено.");
         }
+        // Геймпады (24.11.2026): что ядро видит сейчас - кнопки, стики,
+        // курки; игры Windows получают их как геймпад Xbox 360 (XInput).
+        let pads = crate::usb::gamepad::pads();
+        if !pads.is_empty() {
+            y = pass.group(x, y, w, "Игровые контроллеры");
+            for pad in pads {
+                let state = pad.state;
+                let desc = format!(
+                    "Кнопки: {} · левый стик {}, {} · правый {}, {} · курки {}, {} · для игр: /dev/input/event{}",
+                    state.pressed(),
+                    state.lx,
+                    state.ly,
+                    state.rx,
+                    state.ry,
+                    state.lt,
+                    state.rt,
+                    pad.index
+                );
+                let title = format!("{} ({:04x}:{:04x})", pad.name, pad.vendor, pad.product);
+                y = row(pass, x, y, w, Some(Fi::Usb), &title, &desc, Ctl::Chip("РАБОТАЕТ", Tone::Ok), None);
+            }
+        }
         y = pass.group(x, y, w, "Контроллеры");
         for line in self.cache.devices.lines().filter(|line| line.starts_with("pci\t") && line.contains("usb controller")) {
             let fields: Vec<&str> = line.split('\t').collect();
@@ -353,7 +375,9 @@ impl SettingsView {
         // телефоне это единственная связь, и искать её ниже карты Ethernet,
         // которой нет, человек не станет.
         let wifi = crate::wifi::state();
-        let mut y = y;
+        // «Параметры общего доступа» (24.11) — первой строкой, как ссылка
+        // «Дополнительные параметры общего доступа» в Windows.
+        let mut y = nav_row(pass, x, y, w, Section::Sharing);
         if wifi != crate::wifi::State::Absent {
             y = pass.group(x, y, w, "Wi-Fi");
             // Тумблер — как у телефонов: включён, пока блок не выключен.
@@ -648,6 +672,10 @@ impl SettingsView {
             let previous = format!("Слот {}", state.previous.name());
             y = row(pass, x, y, w, Some(Fi::Undo), "Предыдущая версия", "Загрузчик вернётся к ней сам, если новая не поднимется", Ctl::Value(&previous), None);
         }
+        // Экран загрузки (24.11): логотип с полосой или журнал.
+        y = pass.group(x, y, w, "Экран загрузки");
+        let verbose = super::super::prefs::boot_verbose();
+        y = row(pass, x, y, w, Some(Fi::Terminal), "Подробная загрузка", "Журнал загрузки на экране вместо логотипа и полосы — со следующей загрузки", Ctl::Toggle(verbose), Some(Deed::BootLog(!verbose)));
         y = pass.group(x, y, w, "Меню загрузки");
         y = pass.note(x, y, w, "Нажмите любую клавишу, пока машина загружается, — откроется меню:");
         for (title, desc, key) in [
@@ -656,6 +684,7 @@ impl SettingsView {
             ("Безопасный режим с проверкой", "Оба пункта сразу", "4"),
             ("Режим экрана прошивки", "Если экран остаётся чёрным", "5"),
             ("Один процессор", "Если загрузка встаёт на «processors»", "6"),
+            ("Подробная загрузка", "Журнал вместо логотипа — только эту загрузку", "7"),
         ] {
             y = row(pass, x, y, w, Some(Fi::History), title, desc, Ctl::Mono(key), None);
         }
@@ -681,7 +710,7 @@ fn default_apps(pass: &mut Pass, x: i32, y: i32, w: u32) {
         };
         let kind = sysconf::filetypes::kind_of(&format!("file.{ext}"), false);
         let title = format!("{} (.{ext})", kind.name);
-        let note = if super::super::prefs::open_with(ext).is_some() { "выбрано вами" } else { "по умолчанию" };
+        let note = if super::super::prefs::chosen_by_person(ext) { "выбрано вами" } else { "по умолчанию" };
         // Одна программа — менять не на что; несколько — кнопка по кругу.
         y = if choices.len() > 1 {
             row(pass, x, y, w, Some(Fi::Apps), &title, note, Ctl::Button(name, Weight::Normal), Some(Deed::OpenWith(ext)))
@@ -699,6 +728,120 @@ fn nav_row(pass: &mut Pass, x: i32, y: i32, w: u32, section: Section) -> i32 {
     row(pass, x, y, w, Some(section.icon()), section.title(), section.blurb(), Ctl::Nav, Some(Deed::Open(section)))
 }
 
+// ── Персонализация (24.11, одной страницей, как в Windows 11) ───────────────
+
+/// Темы «Выберите тему для применения»: обои темы, тёмная ли, акцент, имя.
+/// Каждая — только сочетание того, что и так настраивается по отдельности.
+pub(super) const THEMES: [(theme::Wallpaper, bool, theme::Accent, &str); 6] = [
+    (theme::Wallpaper::Fossai, true, theme::Accent::Blue, "FossAi"),
+    (theme::Wallpaper::Fossai, false, theme::Accent::Blue, "FossAi светлая"),
+    (theme::Wallpaper::Night, true, theme::Accent::Violet, "Ночь"),
+    (theme::Wallpaper::Ocean, false, theme::Accent::Green, "Океан"),
+    (theme::Wallpaper::Sunset, true, theme::Accent::Orange, "Закат"),
+    (theme::Wallpaper::Graphite, false, theme::Accent::Rose, "Графит"),
+];
+
+/// Окно-образец поверх фона: светлое или тёмное, с кнопкой цвета акцента.
+fn sample_window(s: &mut mini_ui::Surface, ctx: mini_ui::paint::Ctx, area: Rect, dark: bool, accent: Color, big: bool) {
+    let (fill, line) = if dark { (Color::rgb(0x22, 0x25, 0x2E), Color::rgb(0x5A, 0x60, 0x70)) } else { (Color::rgb(0xF4, 0xF5, 0xF7), Color::rgb(0xB8, 0xBE, 0xC8)) };
+    let (ww, wh) = if big { (area.w * 2 / 5, area.h * 3 / 5) } else { (area.w * 2 / 5, area.h * 2 / 5) };
+    let win = Rect::new(area.right() - ww as i32 - (area.w / 10) as i32, area.bottom() - wh as i32 - (area.h / 8) as i32, ww, wh);
+    draw::rounded(s, win, ctx.px(3), fill, 240);
+    if big {
+        for i in 0..4 {
+            let ly = win.y + ctx.px(10) as i32 + i * ctx.px(7) as i32;
+            draw::hline(s, win.x + ctx.px(10) as i32, ly, win.w.saturating_sub(ctx.px(20)) * if i == 3 { 1 } else { 2 } / 2, line, 255);
+        }
+    }
+    let bw = (win.w / 4).max(ctx.px(8));
+    let bh = (win.h / 7).max(ctx.px(4));
+    let button = Rect::new(win.right() - bw as i32 - ctx.px(6) as i32, win.bottom() - bh as i32 - ctx.px(5) as i32, bw, bh);
+    draw::rounded(s, button, ctx.px(2), accent, 255);
+}
+
+/// «Персонализация»: образец текущей темы и плитки тем, под ними — строки
+/// разделов (Фон, Цвета, Темы, Экран блокировки, Пуск, Панель задач,
+/// Значки рабочего стола). Шрифтов система выбирать не умеет — их строки нет.
+fn personal(pass: &mut Pass, x: i32, y: i32, w: u32) {
+    use super::super::wallpaper;
+    let ctx = pass.ctx;
+    let p = ctx.palette;
+    let gap = ctx.px(10);
+    let wide = w >= ctx.px(620);
+    let tile_w = ctx.px(112);
+    let tile_h = ctx.px(84);
+    let tiles_w = tile_w * 3 + gap * 2;
+    let label_h = line_h(ctx, Role::Strong) as u32 + ctx.px(10);
+    let grid_h = label_h + tile_h * 2 + gap;
+    let preview_w = if wide { w.saturating_sub(tiles_w + ctx.px(32)).min(ctx.px(300)) } else { w.min(ctx.px(300)) };
+    let preview_h = (preview_w * 10 / 16).min(grid_h);
+    let top = y + ctx.px(8) as i32;
+
+    // ── Образец текущей темы ────────────────────────────────────────────
+    let preview = Rect::new(x, top + if wide { (grid_h as i32 - preview_h as i32) / 2 } else { 0 }, preview_w, preview_h);
+    if pass.visible(preview) {
+        let choice = wallpaper::choice();
+        let color = wallpaper::color();
+        let preset = theme::wallpaper();
+        let dark = theme::chosen_dark();
+        let accent = theme::accent_color(theme::accent());
+        pass.on(|s| {
+            let frame = ctx.px(8);
+            draw::rounded(s, preview, ctx.px(10), Color::rgb(0x0B, 0x0D, 0x12), 255);
+            let inner = Rect::new(preview.x + frame as i32, preview.y + frame as i32, preview.w.saturating_sub(frame * 2), preview.h.saturating_sub(frame * 2));
+            super::background::thumb(s, inner, ctx.px(4), &choice, color, preset);
+            sample_window(s, ctx, inner, dark, accent, true);
+        });
+    }
+
+    // ── Плитки тем ───────────────────────────────────────────────────────
+    let (gx, gy) = if wide { (x + w as i32 - tiles_w as i32, top) } else { (x, preview.bottom() + ctx.px(16) as i32) };
+    let caption = Rect::new(gx, gy, tiles_w, label_h);
+    if pass.visible(caption) {
+        pass.text(Role::Strong, gx, gy, tiles_w, "Выберите тему для применения", p.ink);
+    }
+    let current_choice = wallpaper::choice();
+    for (index, &(wall, dark, accent, _)) in THEMES.iter().enumerate() {
+        let (col, line) = (index as u32 % 3, index as u32 / 3);
+        let rect = Rect::new(gx + (col * (tile_w + gap)) as i32, gy + label_h as i32 + (line * (tile_h + gap)) as i32, tile_w, tile_h);
+        let focused = pass.deed(rect, Deed::ThemeSet(index as u8));
+        if !pass.visible(rect) {
+            continue;
+        }
+        let current = current_choice == super::super::wallpaper::Choice::Preset && theme::wallpaper() == wall && theme::chosen_dark() == dark && theme::accent() == accent;
+        let accent_color = theme::accent_color(accent);
+        pass.on(|s| {
+            let radius = ctx.px(6);
+            super::background::thumb(s, rect, radius, &super::super::wallpaper::Choice::Preset, 0, wall);
+            sample_window(s, ctx, rect, dark, accent_color, false);
+            draw::rounded_stroke(s, rect, radius, p.line3.color, p.line3.alpha);
+            if current {
+                for i in 1..4 {
+                    let ring = Rect::new(rect.x - i, rect.y - i, rect.w + 2 * i as u32, rect.h + 2 * i as u32);
+                    draw::rounded_stroke(s, ring, radius + i as u32, p.acc, 255);
+                }
+            }
+            if focused {
+                let ring = Rect::new(rect.x - 5, rect.y - 5, rect.w + 10, rect.h + 10);
+                draw::rounded_stroke(s, ring, radius + 5, p.ink, 255);
+            }
+        });
+    }
+    let grid_bottom = gy + grid_h as i32;
+    let mut y = if wide { grid_bottom.max(preview.bottom()) } else { grid_bottom } + ctx.px(12) as i32;
+
+    // ── Разделы ─────────────────────────────────────────────────────────
+    let saver = if super::super::saver::settings().enabled { "заставка включена" } else { "заставка выключена" };
+    let lock_desc = format!("{}, {saver}", if wallpaper::lock_same() { "Фон как у рабочего стола" } else { "Свой фон" });
+    y = row(pass, x, y, w, Some(Fi::Image), "Фон", "Картинка, цвет, расположение; также для экрана блокировки", Ctl::Nav, Some(Deed::Open(Section::Wallpaper)));
+    y = row(pass, x, y, w, Some(Fi::Palette), "Цвета", "Тёмная или светлая тема, акцентный цвет, заголовок окна", Ctl::Nav, Some(Deed::Open(Section::Colors)));
+    y = row(pass, x, y, w, Some(Fi::Sliders), "Темы", "Современный, простой или классический вид, стиль значков, эффекты", Ctl::Nav, Some(Deed::Open(Section::Appearance)));
+    y = row(pass, x, y, w, Some(Fi::Lock), "Экран блокировки", &lock_desc, Ctl::Nav, Some(Deed::Open(Section::LockScreen)));
+    y = row(pass, x, y, w, Some(Fi::Apps), "Пуск", "Ширина, разделы и закреплённые программы", Ctl::Nav, Some(Deed::Open(Section::Start)));
+    y = row(pass, x, y, w, Some(Fi::Dock), "Панель задач", "Панель или Dock, сторона экрана, автоскрытие, значки", Ctl::Nav, Some(Deed::Open(Section::Dock)));
+    row(pass, x, y, w, Some(Fi::Monitor), "Значки рабочего стола", "Какие значки показывать на рабочем столе", Ctl::Nav, Some(Deed::DesktopIcons));
+}
+
 fn power(pass: &mut Pass, x: i32, y: i32, w: u32) {
     let ctx = pass.ctx;
     let limit = crate::power::screen_off_after();
@@ -708,7 +851,13 @@ fn power(pass: &mut Pass, x: i32, y: i32, w: u32) {
         y = row(pass, x, y, w, None, &label, "", Ctl::Radio(limit == seconds), Some(Deed::ScreenOff(seconds)));
     }
     y = pass.note(x, y + ctx.px(4) as i32, w, "Мониторы уходят в режим ожидания; любая клавиша, мышь или касание зажигают их обратно.");
-    y = saver_rows(pass, x, y, w);
+    // Заставка переехала в «Персонализация → Экран блокировки» (24.11).
+    let saver = if super::super::saver::settings().enabled { "Вкл." } else { "Откл." };
+    y = row(pass, x, y, w, Some(Fi::Image), "Заставка", "Персонализация → Экран блокировки", Ctl::NavValue(saver), Some(Deed::Open(Section::LockScreen)));
+    let due = super::super::saver::after();
+    if due != 0 && limit != 0 && limit <= due {
+        y = pass.note(x, y + ctx.px(4) as i32, w, &format!("Экран гаснет раньше, чем появится заставка (через {}): выберите срок больше.", super::super::saver::after_text(due)));
+    }
     y = pass.group(x, y, w, "Действия");
     if crate::power::can_power_off() {
         y = row(pass, x, y, w, Some(Fi::Power), "Завершение работы", "Счётчики сбрасываются на диск, том помечается чистым", Ctl::Button("Выключить", Weight::Primary), Some(Deed::Shutdown));
@@ -758,9 +907,15 @@ fn saver_rows(pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
         y = row(pass, x, y, w, Some(Fi::Lock), "Показывать экран блокировки при выходе", "Первое нажатие убирает заставку, дальше — вход", Ctl::Toggle(s.lock), Some(Deed::Saver(Sd::Lock(!s.lock))));
     }
     y = row(pass, x, y, w, Some(Fi::Eye), "Просмотр", "Показать заставку сейчас; любое движение её уберёт", Ctl::Button("Просмотр", Weight::Normal), Some(Deed::Saver(Sd::Preview)));
+    // hw-log18: screen off after 60 s, saver after 180 s - the saver never
+    // showed and nothing said why. The conflict is a row with the fix.
     let off = crate::power::screen_off_after();
     if s.enabled && off != 0 && off <= s.after {
-        y = pass.note(x, y + ctx.px(4) as i32, w, "Экран гаснет раньше, чем появится заставка: увеличьте срок гашения.");
+        let later = screen_off_options().into_iter().find(|&sec| sec == 0 || sec > s.after).unwrap_or(0);
+        let desc = format!("Экран гаснет через {}, а заставка — через {}", screen_off_text(off), saver::after_text(s.after));
+        let label = if later == 0 { String::from("Не гасить") } else { format!("Гасить через {}", screen_off_text(later)) };
+        y = row(pass, x, y, w, Some(Fi::Info), "Заставка не успеет появиться", &desc, Ctl::Button(&label, Weight::Primary), Some(Deed::ScreenOff(later)));
+        y = pass.note(x, y + ctx.px(4) as i32, w, "Срок гашения экрана — в «Система → Питание».");
     }
     y
 }
@@ -886,12 +1041,28 @@ fn dock(pass: &mut Pass, x: i32, y: i32, w: u32) {
         y = row(pass, x, y, w, None, "Открепить все", "Останутся только кнопки открытых окон", Ctl::Button("Открепить", Weight::Normal), Some(Deed::Taskbar(TaskbarDeed::ClearPins)));
     }
 
+    // Tray icons (24.11, like Windows «Другие значки в области
+    // уведомлений»): on the taskbar or under the chevron ˄.
+    y = pass.group(x, y, w, "Значки в области уведомлений");
+    let dock = cfg.mode == Mode::Dock;
+    for icon in deskcfg::TrayIcon::ALL {
+        let on_bar = cfg.tray_hidden & icon.bit() == 0;
+        let (glyph, desc) = match icon {
+            deskcfg::TrayIcon::Recording => (Fi::Monitor, "Красная точка и время, пока идёт запись"),
+            deskcfg::TrayIcon::Network => (Fi::NetworkWired, "Подключение и параметры сети"),
+            deskcfg::TrayIcon::Volume => (Fi::Volume, "Громкость и звуковое устройство"),
+            deskcfg::TrayIcon::Layout => (Fi::Keyboard, "«РУС» или «ENG»; щелчок — выбор раскладки"),
+        };
+        let desc = if dock { "В Dock — всегда под стрелкой ˄" } else { desc };
+        y = row(pass, x, y, w, Some(glyph), icon.title(), desc, Ctl::Toggle(on_bar && !dock), (!dock).then_some(Deed::Taskbar(TaskbarDeed::TrayHidden(icon, on_bar))));
+    }
+    y = pass.note(x, y, w, "Выключенные значки — под стрелкой ˄ слева от часов: щелчок по ней показывает их.");
+
     y = pass.group(x, y, w, "Часы");
     let uptime = super::super::panel::shows(PanelPref::Uptime);
     y = row(pass, x, y, w, Some(Fi::Clock), "Показывать аптайм", "Время и время работы отвечают на разные вопросы", Ctl::Toggle(uptime), Some(Deed::Panel(PanelPref::Uptime, !uptime)));
     let date = super::super::panel::shows(PanelPref::Date);
     y = row(pass, x, y, w, Some(Fi::Calendar), "Показывать дату", "", Ctl::Toggle(date), Some(Deed::Panel(PanelPref::Date, !date)));
-    y = row(pass, x, y, w, Some(Fi::Keyboard), "Раскладка в трее", "Щелчок переключает, как Alt+Shift", Ctl::Value("Показывается"), None);
     y = pass.group(x, y, w, "Меню «Пуск»");
     nav_row(pass, x, y, w, Section::Start);
     let _ = p;
@@ -1103,6 +1274,88 @@ fn mode_card(pass: &mut Pass, rect: Rect, mode: super::super::deskcfg::Mode, edg
     pass.text(Role::Caption, rect.x + pad as i32, ty + line_h(ctx, Role::Strong) + ctx.px(2) as i32, rect.w - pad * 2, desc, p.ink3);
 }
 
+/// «Параметры общего доступа» (Roman 24.11, like Windows' advanced sharing
+/// settings) — only switches that do something here.
+fn sharing(pass: &mut Pass, x: i32, y: i32, w: u32) {
+    use crate::net::lan;
+    let ctx = pass.ctx;
+    let discovery = lan::discovery_enabled();
+    let mut y = pass.group(x, y, w, "Эта сеть");
+    y = row(
+        pass,
+        x,
+        y,
+        w,
+        Some(Fi::Search),
+        "Сетевое обнаружение",
+        "Находить компьютеры сети и отвечать на имя FOSSAI",
+        Ctl::Toggle(discovery),
+        Some(Deed::Share(lan::KEY_DISCOVERY, !discovery)),
+    );
+    y = row(
+        pass,
+        x,
+        y,
+        w,
+        Some(Fi::FolderOpen),
+        "Общий доступ к файлам и принтерам",
+        "Свои папки для других — сервер SMB будет позже",
+        Ctl::Value("Недоступно"),
+        None,
+    );
+    y = pass.group(x, y, w, "Все сети");
+    let protected = lan::password_protected();
+    y = row(
+        pass,
+        x,
+        y,
+        w,
+        Some(Fi::Lock),
+        "Общий доступ с парольной защитой",
+        "Свои общие папки — только по учётной записи и паролю",
+        Ctl::Toggle(protected),
+        Some(Deed::Share(lan::KEY_PASSWORD_PROTECTED, !protected)),
+    );
+    y = row(
+        pass,
+        x,
+        y,
+        w,
+        Some(Fi::ShieldCheck),
+        "Подключения общего доступа к файлам",
+        "SMB 2–3.1.1, NTLMv2, подпись; шифрования SMB 3 пока нет",
+        Ctl::Value("С подписью"),
+        None,
+    );
+    y = pass.group(x, y, w, "Компьютеры в сети");
+    if !discovery {
+        y = pass.note(x, y, w, "Сетевое обнаружение выключено. Открыть компьютер по имени или адресу можно и так: Win+R → \\\\имя.");
+    } else {
+        let hosts = lan::hosts();
+        if hosts.is_empty() {
+            y = pass.note(x, y, w, "Пока никого не найдено — поиск идёт раз в минуту. Компьютер по адресу: Win+R → \\\\192.168.1.10.");
+        }
+        for host in hosts.iter().take(32) {
+            let address = format!("{}", host.address);
+            let title = if host.name.is_empty() { address.clone() } else { host.name.clone() };
+            let desc = if host.files { format!("{address} · общие папки") } else { address.clone() };
+            let target = if host.name.is_empty() { address.clone() } else { host.name.clone() };
+            y = row(pass, x, y, w, Some(Fi::Monitor), &title, &desc, Ctl::Button("Открыть", Weight::Normal), Some(Deed::NetOpen(format!("/net/{target}"))));
+        }
+    }
+    let saved = crate::config::exists("netcreds").is_some();
+    pass.note(
+        x,
+        y + ctx.px(4) as i32,
+        w,
+        if saved {
+            "Запомненные учётные данные лежат в /etc/netcreds (только root, без паролей — хеш NT)."
+        } else {
+            "Учётные данные спрашиваются при первом входе; «Запомнить» сохраняет их без пароля (хеш NT, только root)."
+        },
+    );
+}
+
 fn explorer(pass: &mut Pass, x: i32, y: i32, w: u32) {
     let mut y = row(pass, x, y, w, Some(Fi::FolderOpen), "Файловый менеджер", "Программа /bin/files", Ctl::Button("Открыть", Weight::Primary), Some(Deed::Launch("/bin/files")));
     y = pass.group(x, y, w, "Папки");
@@ -1182,6 +1435,12 @@ fn time(pass: &mut Pass, x: i32, y: i32, w: u32) {
     y = row(pass, x, y, w, Some(Fi::Clock), "Текущее время", "", Ctl::Mono(&now), None);
     y = row(pass, x, y, w, Some(Fi::Calendar), "Источник времени", "Прошивка при загрузке и монотонный счётчик", Ctl::Value("UEFI GetTime"), None);
     y = row(pass, x, y, w, Some(Fi::Clock), "Установить время вручную", "Перевести часы прошивки эта система не умеет", Ctl::Value("Недоступно"), None);
+    // 24.11: what the battery clock keeps — Windows keeps local time there.
+    y = pass.group(x, y, w, "Аппаратные часы");
+    let local = crate::time::rtc_local();
+    y = row(pass, x, y, w, None, "Местное время", "Как в Windows: так часы ведёт компьютер, где есть Windows", Ctl::Radio(local), Some(Deed::RtcLocal(true)));
+    y = row(pass, x, y, w, None, "UTC", "Как в Linux и macOS", Ctl::Radio(!local), Some(Deed::RtcLocal(false)));
+    y = pass.note(x, y + ctx.px(4) as i32, w, "Если время из сети разойдётся с часами ровно на часовой пояс, настройка переключится сама.");
     y = pass.group(x, y, w, "Часовой пояс");
     let current = crate::time::offset_minutes();
     for minutes in crate::time::TIMEZONES {
@@ -1332,6 +1591,8 @@ fn usb_kind_ru(kind: &str) -> String {
         "Планшет USB"
     } else if lower.contains("storage") || lower.contains("mass") {
         "Накопитель USB"
+    } else if lower.contains("gamepad") {
+        "Игровой контроллер USB"
     } else if lower.contains("hub") {
         "Концентратор USB"
     } else if lower.contains("net") || lower.contains("rndis") || lower.contains("ecm") {

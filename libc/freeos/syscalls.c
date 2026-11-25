@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <freeos/sound.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -156,11 +157,28 @@ int close(int fd) {
  * Чего этот перевод **не** умеет, и это названо здесь, а не спрятано:
  * `O_APPEND`, `O_EXCL` и `O_NONBLOCK` договором не предусмотрены вовсе. Просьба
  * с ними — `ENOSYS`, а не тихое открытие без них: файл, открытый «на дозапись»,
- * которая не дозапись, теряет данные молча. */
+ * которая не дозапись, теряет данные молча.
+ *
+ * `O_CREAT | O_EXCL` (24.11, 7-Zip создаёт так каждый файл) — это ровно
+ * `SYS_CREATE`: новый файл с правами `mode`, занятое имя — `EEXIST`. Без
+ * `O_CREAT` `O_EXCL` ничего не значит (POSIX) и пропускается. */
 int open(const char *path, int flags, ...) {
-    if (flags & (O_APPEND | O_EXCL | O_NONBLOCK)) {
+    if (flags & (O_APPEND | O_NONBLOCK)) {
         errno = ENOSYS;
         return -1;
+    }
+    if ((flags & O_EXCL) && (flags & O_CREAT)) {
+        va_list args;
+        va_start(args, flags);
+        mode_t mode = (mode_t)va_arg(args, int);
+        va_end(args);
+        char buf[FREEOS_PATH_LIMIT + 1];
+        const char *full = freeos_path(path, buf);
+        if (full == NULL) {
+            return -1;
+        }
+        long fd = freeos_syscall(SYS_CREATE, (long)full, (long)strlen(full), (long)(mode & 07777));
+        return fd < 0 ? freeos_set_errno(fd) : (int)fd;
     }
 
     long os_flags = 0;
@@ -255,9 +273,28 @@ static void fill_stat(struct stat *out, const struct freeos_stat *info) {
     out->st_blocks = (blkcnt_t)((info->size + 511) / 512);
 }
 
+/* Ответ `SYS_STATX` (24.11): то же, что `fill_stat`, и времена с номером
+ * файла. До этого `st_mtime` оставался нулём, и 7-Zip ставил в архивы,
+ * собранные здесь, 1970 год. */
+static void fill_statx(struct stat *out, const struct freeos_statx *info) {
+    struct freeos_stat short_info = {info->size, info->mode, info->uid, info->gid, info->kind};
+    fill_stat(out, &short_info);
+    out->st_mtime = (time_t)info->mtime;
+    out->st_atime = (time_t)info->atime;
+    out->st_ctime = (time_t)info->ctime;
+    out->st_ino = (ino_t)info->ino;
+    out->st_nlink = 1;
+}
+
 int fstat(int fd, struct stat *out) {
+    struct freeos_statx full;
+    long code = freeos_syscall(SYS_STATX, fd, 0, (long)&full);
+    if (code == 0) {
+        fill_statx(out, &full);
+        return 0;
+    }
     struct freeos_stat info;
-    long code = freeos_syscall(SYS_FSTAT, fd, (long)&info, 0);
+    code = freeos_syscall(SYS_FSTAT, fd, (long)&info, 0);
     if (code < 0) {
         return freeos_set_errno(code);
     }
@@ -271,12 +308,12 @@ int stat(const char *path, struct stat *out) {
     if (full == NULL) {
         return -1;
     }
-    struct freeos_stat info;
-    long code = freeos_syscall(SYS_STAT, (long)full, (long)strlen(full), (long)&info);
+    struct freeos_statx info;
+    long code = freeos_syscall(SYS_STATX, (long)full, (long)strlen(full), (long)&info);
     if (code < 0) {
         return freeos_set_errno(code);
     }
-    fill_stat(out, &info);
+    fill_statx(out, &info);
     return 0;
 }
 

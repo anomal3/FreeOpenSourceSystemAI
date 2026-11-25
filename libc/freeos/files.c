@@ -366,6 +366,88 @@ int fchmodat(int dir, const char *path, mode_t mode, int flags) {
     return full == NULL ? -1 : chmod(full, mode);
 }
 
+/* `fstatat` (24.11, 7-Zip обходит каталог `fstatat(dirfd(dir), имя)`): путь от
+ * каталога — как у остальных `*at`; ссылок нет, `AT_SYMLINK_NOFOLLOW` ничего
+ * не меняет. */
+int fstatat(int dir, const char *path, struct stat *out, int flags) {
+    (void)flags;
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = at_path(dir, path, buf);
+    return full == NULL ? -1 : stat(full, out);
+}
+
+/* Времена файла (24.11) — `SYS_UTIMES`: путь (или дескриптор при длине 0) и
+ * пара «доступ, изменение» в секундах; `UTIME_NOW`/`UTIME_OMIT` — как в POSIX.
+ * Доли секунды отбрасываются: ext2 хранит целые секунды. 7-Zip так ставит
+ * распакованным файлам их время из архива. */
+#ifndef UTIME_NOW
+#define UTIME_NOW ((1l << 30) - 1l)
+#endif
+#ifndef UTIME_OMIT
+#define UTIME_OMIT ((1l << 30) - 2l)
+#endif
+
+static int64_t file_time(const struct timespec *t) {
+    if (t->tv_nsec == UTIME_NOW) {
+        return FREEOS_TIME_NOW;
+    }
+    if (t->tv_nsec == UTIME_OMIT) {
+        return FREEOS_TIME_OMIT;
+    }
+    return (int64_t)t->tv_sec;
+}
+
+static int set_times(long target, long len, const struct timespec times[2]) {
+    struct freeos_file_times wanted;
+    long arg = 0;
+    if (times != NULL) {
+        wanted.atime = file_time(&times[0]);
+        wanted.mtime = file_time(&times[1]);
+        arg = (long)&wanted;
+    }
+    long code = freeos_syscall(SYS_UTIMES, target, len, arg);
+    return code < 0 ? freeos_set_errno(code) : 0;
+}
+
+int utimensat(int dir, const char *path, const struct timespec times[2], int flags) {
+    (void)flags;
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = at_path(dir, path, buf);
+    if (full == NULL) {
+        return -1;
+    }
+    return set_times((long)full, (long)strlen(full), times);
+}
+
+int futimens(int fd, const struct timespec times[2]) {
+    return set_times(fd, 0, times);
+}
+
+/* `utimes`/`utime` — те же времена в старых видах. */
+int freeos_set_path_times(const char *path, const struct timespec times[2]) {
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = freeos_path(path, buf);
+    if (full == NULL) {
+        return -1;
+    }
+    return set_times((long)full, (long)strlen(full), times);
+}
+
+/* Маска прав новых файлов (24.11, 7-Zip): ядро её не применяет — права
+ * задаёт сам `open`/`mkdir`, — но программа вправе спросить и поставить свою;
+ * значение живёт в процессе, по умолчанию 022, как у Linux. */
+static mode_t file_mask = 022;
+
+mode_t umask(mode_t mask) {
+    mode_t old = file_mask;
+    file_mask = mask & 0777;
+    return old;
+}
+
+/* Родителя процесса ядро не называет: вызова нет. 1 — «init», как у
+ * осиротевшего процесса в Linux (7-Zip смешивает его в имя временного файла). */
+pid_t getppid(void) { return 1; }
+
 /* `renameat` и `renameat2` (08.11.2026, rustix у Servo): пути от каталогов —
  * как у остальных `*at`. Флаги `renameat2` (`RENAME_NOREPLACE`,
  * `RENAME_EXCHANGE`) ядро не умеет — `EINVAL`, а не тихо обычное
@@ -522,14 +604,27 @@ char *realpath(const char *path, char *resolved) {
     return resolved;
 }
 
-/* Права, время и жёсткие ссылки файла ядро пока менять не умеет: у него нет
- * таких вызовов. Отказ `ENOSYS`, а не успех, — программа, поставившая права
- * «только владельцу», обязана узнать, что они остались прежними. */
+/* Права по пути — `SYS_CHMOD` (24.11; владельцу и root). FAT и exFAT прав
+ * Unix не хранят: там ответ — успех без действия, как у Linux на vfat с
+ * `quiet`, иначе 7-Zip, распаковывая на флешку, считал бы ошибкой каждый
+ * файл.
+ *
+ * Время и жёсткие ссылки ядро менять не умеет: у него нет таких вызовов.
+ * Отказ `ENOSYS`, а не успех, — программа, поставившая время, обязана узнать,
+ * что оно осталось прежним. По дескриптору прав тоже нет (пути у
+ * дескриптора libc не знает) — `fchmod` отвечает `ENOSYS`, и программы
+ * (7-Zip) повторяют `chmod` по пути. */
 int chmod(const char *path, mode_t mode) {
-    (void)path;
-    (void)mode;
-    errno = ENOSYS;
-    return -1;
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = freeos_path(path, buf);
+    if (full == NULL) {
+        return -1;
+    }
+    long code = freeos_syscall(SYS_CHMOD, (long)full, (long)strlen(full), (long)(mode & 07777));
+    if (code == FREEOS_ERR_UNSUPPORTED) {
+        return 0;
+    }
+    return code < 0 ? freeos_set_errno(code) : 0;
 }
 
 int fchmod(int fd, mode_t mode) {
@@ -566,10 +661,14 @@ int fchown(int fd, uid_t owner, gid_t group) {
 }
 
 int utimes(const char *path, const struct timeval times[2]) {
-    (void)path;
-    (void)times;
-    errno = ENOSYS;
-    return -1;
+    if (times == NULL) {
+        return freeos_set_path_times(path, NULL);
+    }
+    struct timespec both[2] = {
+        {times[0].tv_sec, times[0].tv_usec * 1000},
+        {times[1].tv_sec, times[1].tv_usec * 1000},
+    };
+    return freeos_set_path_times(path, both);
 }
 
 int link(const char *target, const char *path) {

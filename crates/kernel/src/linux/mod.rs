@@ -43,6 +43,7 @@ mod netdev;
 mod netlink;
 // Узел DRM nouveau для Mesa NVK (18.11.2026, `nvk-spec.md`).
 pub mod drm;
+pub(crate) mod evdev;
 mod fossaicap;
 pub mod ntsync;
 pub mod perfdiag;
@@ -231,6 +232,12 @@ mod nr {
     pub const FCHMOD: usize = 91;
     pub const FCHOWN: usize = 93;
     pub const GETRESUID: usize = 118;
+    pub const SETUID: usize = 105;
+    pub const SETGID: usize = 106;
+    pub const SETREUID: usize = 113;
+    pub const SETREGID: usize = 114;
+    pub const SETRESUID: usize = 117;
+    pub const SETRESGID: usize = 119;
     pub const GETRESGID: usize = 120;
     pub const SCHED_SETPARAM: usize = 142;
     pub const SCHED_GETPARAM: usize = 143;
@@ -617,6 +624,9 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::INOTIFY_INIT => ipc::inotify_init(0),
             nr::INOTIFY_INIT1 => ipc::inotify_init(a0),
             nr::INOTIFY_ADD_WATCH => match linux_path(AT_FDCWD, a1) {
+                // `/dev/input` (gamepads, 24.11.2026): its events come from the
+                // kernel, under this very name.
+                Ok(linux) if evdev::virtual_dir(&linux) => ipc::inotify_add_watch(a0, &linux, a2 as u32),
                 Ok(linux) => ipc::inotify_add_watch(a0, &fsops::place(&linux), a2 as u32),
                 Err(err) => err,
             },
@@ -651,6 +661,11 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::GETPPID => process::getppid(),
             nr::GETUID | nr::GETEUID => errno(native(SYS_GETUID, 0, 0, 0)),
             nr::GETGID | nr::GETEGID => errno(native(SYS_GETGID, 0, 0, 0)),
+            // 24.11 (Rupor, Xwayland): `setuid`/`setgid` and the `setre*`/
+            // `setres*` forms to the ids the program already has - the drop of
+            // privileges an X server does in the child of `Popen` before
+            // running xkbcomp (and exits with 127 when it fails).
+            nr::SETUID | nr::SETGID | nr::SETREUID | nr::SETREGID | nr::SETRESUID | nr::SETRESGID => set_ids(number, [a0, a1, a2]),
             nr::UNAME => uname(a0),
             nr::ARCH_PRCTL => arch_prctl(a0, a1),
             nr::FUTEX => futex(a0, a1, a2, a3, a4, a5),
@@ -675,6 +690,24 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             _ => unknown(number),
         }
     }
+}
+
+/// `setuid`, `setgid`, `setreuid`, `setregid`, `setresuid`, `setresgid`:
+/// every id given (not -1) must be the one the program has - a real change of
+/// identity is not there (`EPERM`).
+fn set_ids(number: usize, args: [usize; 3]) -> i64 {
+    let (count, gid) = match number {
+        nr::SETUID => (1, false),
+        nr::SETGID => (1, true),
+        nr::SETREUID => (2, false),
+        nr::SETREGID => (2, true),
+        nr::SETRESUID => (3, false),
+        _ => (3, true),
+    };
+    // SAFETY: a plain query of the native system, no memory involved.
+    let own = unsafe { native(if gid { SYS_GETGID } else { SYS_GETUID }, 0, 0, 0) };
+    let keeps = args[..count].iter().all(|id| *id as u32 == u32::MAX || i64::from(*id as u32) == own);
+    if keeps { 0 } else { -e::EPERM }
 }
 
 const SIGCHLD: usize = 17;
@@ -846,6 +879,29 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
         Ok(path) => links::follow(&path),
         Err(err) => return err,
     };
+    // `O_TMPFILE` (VLC 24.11.2026): an unnamed file in a directory needs
+    // `linkat` from `/proc/self/fd` to ever get a name (Qt's `QSaveFile`),
+    // which the layer does not do - "the file system cannot", as Linux says
+    // for a file system without it. Qt (`QSaveFile`, `QTemporaryFile`),
+    // glibc `tmpfile` and VLC's `vlc_memfd` then take a named temporary
+    // file; `EINVAL` is "a real error" to Qt (its settings were not saved)
+    // and to VLC (no wl_shm video buffers).
+    const O_TMPFILE: usize = 0o20_000_000;
+    if flags & O_TMPFILE != 0 {
+        let cred = crate::user::credentials();
+        let native = crate::linux_path::resolve(&linux, cred);
+        return match crate::fs::resolve_as(cred, &native, Access::NONE) {
+            Some(Ok(node)) if node.metadata().kind == NodeKind::Directory => -e::EOPNOTSUPP,
+            Some(Ok(_)) => -e::ENOTDIR,
+            _ => -e::ENOENT,
+        };
+    }
+    // Gamepads (24.11.2026): `/dev/input/eventN`, and sysfs through
+    // `/sys/class/input/eventN`.
+    let linux = evdev::resolve(&linux).unwrap_or(linux);
+    if let Some(answer) = evdev::open(&linux, flags) {
+        return answer;
+    }
     if let Some(answer) = ipc::open_shm(&linux, flags) {
         return answer;
     }
@@ -1076,6 +1132,13 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
             return put_stat(out, S_IFLNK, 0o777, 0, 0, text.len() as u64, 0, ino_of(&linux));
         }
     }
+    // Links of the gamepads' sysfs (24.11.2026).
+    if let Some(text) = evdev::link(&linux) {
+        if !follow {
+            return put_stat(out, S_IFLNK, 0o777, 0, 0, text.len() as u64, 0, ino_of(&linux));
+        }
+    }
+    let linux = evdev::resolve(&linux).unwrap_or(linux);
     let mut linux = links::follow(&linux);
     // `/proc/self/exe` — ссылка на файл программы (фаза 71j): `realpath`
     // glibc идёт по ней, только если `lstat` назвал её ссылкой, — иначе
@@ -1121,6 +1184,9 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
     }
     // Узел DRM: `st_rdev` = 226:128 — по нему libdrm узнаёт устройство.
     if let Some(rdev) = drm::rdev(&linux) {
+        return put_stat(out, S_IFCHR, 0o666, 0, 0, 0, 0, rdev);
+    }
+    if let Some(rdev) = evdev::rdev(&linux) {
         return put_stat(out, S_IFCHR, 0o666, 0, 0, 0, 0, rdev);
     }
     if special::exists(&linux) {
@@ -1390,6 +1456,9 @@ fn readlink(dir: usize, ptr: usize, buf: usize, size: usize) -> i64 {
     }
     // Ссылки sysfs узла DRM (`…/device/subsystem` → `…/bus/pci`).
     if let Some(answer) = drm::readlink(&path, buf, size) {
+        return answer;
+    }
+    if let Some(answer) = evdev::readlink(&path, buf, size) {
         return answer;
     }
     if path == "/proc/self/exe" {
@@ -2173,6 +2242,10 @@ unsafe fn ioctl(fd: usize, request: usize, arg: usize) -> i64 {
     }
     // DRM nouveau, dma-buf, syncobj (NVK, 18.11.2026).
     if let Some(answer) = drm::ioctl(fd, request, arg) {
+        return answer;
+    }
+    // Gamepads `/dev/input/eventN` (24.11.2026).
+    if let Some(answer) = evdev::ioctl(fd, request, arg) {
         return answer;
     }
     // Звук ALSA (`/dev/snd`, шаг 7 Proton).

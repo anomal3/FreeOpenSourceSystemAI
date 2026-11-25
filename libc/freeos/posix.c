@@ -366,14 +366,15 @@ const char *inet_ntop(int family, const void *address, char *out, socklen_t leng
 
 /* ── Время файла ─────────────────────────────────────────────────────────── */
 
-/* Ядро времён файлу не ставит — ни доступа, ни изменения. `ENOSYS`, а не
- * нуль: программа, проверяющая время после `utime`, иначе нашла бы там не то,
- * что поставила, и не поняла бы почему. */
+/* Времена доступа и изменения (24.11) — через `SYS_UTIMES` (`files.c`). */
+int freeos_set_path_times(const char *path, const struct timespec times[2]);
+
 int utime(const char *path, const struct utimbuf *times) {
-    (void)path;
-    (void)times;
-    errno = ENOSYS;
-    return -1;
+    if (times == NULL) {
+        return freeos_set_path_times(path, NULL);
+    }
+    struct timespec both[2] = {{times->actime, 0}, {times->modtime, 0}};
+    return freeos_set_path_times(path, both);
 }
 
 /* ── Имена: протоколы, хосты, адреса ─────────────────────────────────────── */

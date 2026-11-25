@@ -1399,6 +1399,11 @@ impl CfgEdit {
 }
 
 impl App for CfgEdit {
+    /// Smallest window (24.11, WM SDK): the 290-point file list and the editor beside it.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(640, 400)
+    }
+
     fn key_with(&mut self, code: u32, mods: i32, latin: u32) -> bool {
         let ctrl = mods & WIN_MOD_CTRL != 0;
         if ctrl {

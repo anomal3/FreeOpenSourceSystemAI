@@ -668,6 +668,7 @@ dependencies = [
  "nvgpu",
  "osupdate",
  "slots",
+ "smb",
  "swipe",
  "sysconf",
  "usb-hid",
@@ -1067,6 +1068,14 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 [[package]]
 name = "slots"
 version = "0.8.0"
+
+[[package]]
+name = "smb"
+version = "0.8.0"
+dependencies = [
+ "hmac",
+ "sha2",
+]
 
 [[package]]
 name = "ssh"

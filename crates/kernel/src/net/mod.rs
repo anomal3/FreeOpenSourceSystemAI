@@ -36,6 +36,7 @@ pub mod rtl8125;
 pub mod eth;
 pub mod icmp;
 pub mod ipv4;
+pub mod lan;
 pub mod persist;
 pub mod socket;
 pub mod stream;
@@ -1421,6 +1422,8 @@ fn handle_ipv4(iface: &mut Interface, payload: &[u8]) {
         || packet.destination.is_broadcast()
         || (!iface.netmask.is_unspecified()
             && packet.destination == iface.address.network_broadcast(iface.netmask))
+        // LLMNR and mDNS groups — queries for our name (`lan` responder).
+        || matches!(packet.destination.to_bytes(), [224, 0, 0, 251 | 252])
         // Пока адреса нет, «наш» — это любой пакет, который карта нам отдала:
         // она уже отфильтровала кадры по аппаратному адресу, а сервер DHCP
         // вправе ответить на предлагаемый адрес, которого у нас ещё нет.
@@ -2002,8 +2005,12 @@ fn send_ipv4(
     // Куда отдавать кадр: получателю напрямую, если он в нашей сети, и шлюзу
     // во всех остальных случаях. Это и есть вся таблица маршрутов, какая
     // сегодня существует.
+    // Multicast (224.0.0.0/4: LLMNR, mDNS, WS-Discovery of `lan`) goes
+    // straight onto the link, to the group's Ethernet address.
+    let multicast = destination.0 >> 28 == 0xE;
     let next_hop = if destination.same_network(iface.address, iface.netmask)
         || destination.is_broadcast()
+        || multicast
     {
         destination
     } else if !iface.gateway.is_unspecified() {
@@ -2017,6 +2024,9 @@ fn send_ipv4(
             && next_hop == iface.address.network_broadcast(iface.netmask))
     {
         eth::BROADCAST
+    } else if multicast {
+        let [_, b, c, d] = destination.to_bytes();
+        [0x01, 0x00, 0x5e, b & 0x7f, c, d]
     } else {
         let now = crate::time::uptime_ms();
         match iface.table.lookup(next_hop, now) {
@@ -2047,6 +2057,16 @@ fn send_ipv4(
         id,
     );
     frame[eth::HEADER + ipv4::HEADER..total].copy_from_slice(payload);
+    if multicast {
+        // Link-local groups: TTL 1 (LLMNR, WS-Discovery), 255 for mDNS
+        // (RFC 6762 section 11); the header checksum follows the TTL.
+        let header = &mut frame[eth::HEADER..eth::HEADER + ipv4::HEADER];
+        header[8] = if destination.to_bytes() == [224, 0, 0, 251] { 255 } else { 1 };
+        header[10] = 0;
+        header[11] = 0;
+        let sum = ipv4::checksum(&[&*header]);
+        header[10..12].copy_from_slice(&sum.to_be_bytes());
+    }
 
     iface.device.send(&frame[..total]).map_err(NetError::Device)
 }

@@ -82,6 +82,11 @@
 #define SYS_SOUND 82
 /* Блокировки файлов: fcntl F_GETLK/F_SETLK/F_SETLKW и flock (08.11.2026). */
 #define SYS_FLOCK 88
+/* Права файла по пути (24.11): `chmod` libc. */
+#define SYS_CHMOD 98
+/* Времена файла (24.11): `stat` с `st_mtime`, `utimensat`/`futimens`/`utime`. */
+#define SYS_STATX 99
+#define SYS_UTIMES 100
 
 /* ── Значения, которые эти вызовы принимают и возвращают ──────────────────── */
 
@@ -231,6 +236,27 @@ struct freeos_stat {
     uint32_t gid;
     uint32_t kind;
 };
+
+/* Раскладка `StatX` — ответа `SYS_STATX` (24.11): времена — секунды Unix, UTC. */
+struct freeos_statx {
+    uint64_t size;
+    uint32_t mode;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t kind;
+    int64_t mtime;
+    int64_t atime;
+    int64_t ctime;
+    uint64_t ino;
+};
+
+/* Раскладка `FileTimes` — входа `SYS_UTIMES` (24.11). */
+struct freeos_file_times {
+    int64_t atime;
+    int64_t mtime;
+};
+#define FREEOS_TIME_NOW INT64_MIN
+#define FREEOS_TIME_OMIT (INT64_MIN + 1)
 
 /* Раскладка `Dirent` — ответа `SYS_READDIR` (фаза 58b в libc). */
 struct freeos_dirent {

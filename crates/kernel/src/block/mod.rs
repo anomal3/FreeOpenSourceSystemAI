@@ -337,6 +337,10 @@ pub fn scan(disks: Vec<Disk>) -> Vec<Partition> {
                 kprintln!("  partitions  : out of memory while listing partitions");
                 return found;
             }
+            if !windows_seen() && is_windows_partition(&mut device, partition.type_guid, partition.first_lba, sector) {
+                WINDOWS_SEEN.store(true, core::sync::atomic::Ordering::Relaxed);
+                kprintln!("  partitions  : {name} #{unit}: part {} is Windows' (its firmware clock is in local time)", partition.index + 1);
+            }
             found.push(Partition {
                 first_lba: partition.first_lba,
                 sectors: partition.range().sectors(),
@@ -349,6 +353,35 @@ pub fn scan(disks: Vec<Disk>) -> Vec<Partition> {
     }
 
     found
+}
+
+/// A disk of this machine carries Windows (24.11): its MSR or recovery
+/// partition, or an NTFS data partition. Windows keeps the battery clock in
+/// local time, so then [`crate::time`] reads it so by default.
+static WINDOWS_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[must_use]
+pub fn windows_seen() -> bool {
+    WINDOWS_SEEN.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Microsoft Reserved Partition — only Windows makes it.
+const MSR_TYPE: disk::guid::Guid = disk::guid::Guid::new(0xE3C9_E316, 0x0B5C, 0x4DB8, [0x81, 0x7D, 0xF9, 0x2D, 0xF0, 0x02, 0x15, 0xAE]);
+/// Windows Recovery Environment.
+const WINRE_TYPE: disk::guid::Guid = disk::guid::Guid::new(0xDE94_BBA4, 0x06D1, 0x4D40, [0xA1, 0x6A, 0xBF, 0xD5, 0x01, 0x79, 0xD6, 0xAC]);
+/// Microsoft Basic Data (NTFS, FAT, exFAT — the boot sector tells which).
+const BASIC_DATA_TYPE: disk::guid::Guid = disk::guid::Guid::new(0xEBD0_A0A2, 0xB9E5, 0x4433, [0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7]);
+
+fn is_windows_partition(device: &mut Shared, type_guid: disk::guid::Guid, first_lba: u64, sector: usize) -> bool {
+    if type_guid == MSR_TYPE || type_guid == WINRE_TYPE {
+        return true;
+    }
+    if type_guid != BASIC_DATA_TYPE || !(512..=4096).contains(&sector) {
+        return false;
+    }
+    let mut boot = alloc::vec![0u8; sector];
+    // NTFS: OEM name «NTFS    » at byte 3 of the boot sector.
+    device.read(first_lba, &mut boot).is_ok() && &boot[3..11] == b"NTFS    "
 }
 
 /// Взять из списка раздел заданного типа.

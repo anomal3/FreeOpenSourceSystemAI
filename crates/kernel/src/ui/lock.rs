@@ -8,8 +8,9 @@
 //!
 //! При загрузке экран не показывается: сеанс входит сам, как и прежде.
 //!
-//! Шрифта крупнее заголовка в системе нет, поэтому часы рисуются обычным
-//! заголовком в маску и увеличиваются втрое со сглаживанием.
+//! Часы — начертанием `typeface::display`, растеризованным в размер часов
+//! (24.11: увеличенный втрое заголовок выглядел размытым); буква имени в
+//! круге — по-прежнему увеличенный заголовок.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -139,8 +140,11 @@ impl Lock {
             Phase::Clock => {
                 let x = px(88) as i32;
                 let y = screen.h as i32 / 6;
-                big_text(ctx, s, x, y, &clock, scale);
-                let line = i32::from(ctx.face(Role::Heading).line) * CLOCK_ZOOM as i32;
+                // Crisp (24.11, Roman: "pixelated, upscaled"): a face
+                // rasterized at the clock's own size, not a zoomed heading.
+                let face = clock_face(ctx, screen.h);
+                mini_ui::typeface::draw(s, face, x, y, &clock, WHITE, 255);
+                let line = i32::from(face.line);
                 if let Some(date) = &date {
                     paint::text(ctx, s, Role::Heading, x + px(4) as i32, y + line, date, Color::rgb(0xD6, 0xDE, 0xEC));
                 }
@@ -194,8 +198,17 @@ impl Default for Lock {
     }
 }
 
+/// Face of the lock-screen clock: as tall as [`CLOCK_ZOOM`] headings of this
+/// scale and at least a tenth of the screen (Windows-sized on 2560x1440 at
+/// 100 %), rasterized at that size (`typeface::display`).
+fn clock_face(ctx: Ctx, screen_h: u32) -> &'static mini_ui::typeface::Face {
+    let line = (u32::from(ctx.face(Role::Heading).line) * CLOCK_ZOOM).max(screen_h / 10);
+    mini_ui::typeface::display_face(line)
+}
+
 /// Текст заголовком, увеличенный в [`CLOCK_ZOOM`] раз со сглаживанием:
-/// рисуется белым по чёрному в маску, яркость маски — прозрачность.
+/// рисуется белым по чёрному в маску, яркость маски — прозрачность. Only
+/// the avatar initial now (any letter; the display faces have digits only).
 fn big_text(ctx: Ctx, s: &mut Surface, x: i32, y: i32, text: &str, scale: mini_ui::Scale) {
     let face = ctx.face(Role::Heading);
     let (w, h) = (face.width(text).max(1) + 2, u32::from(face.line).max(1));

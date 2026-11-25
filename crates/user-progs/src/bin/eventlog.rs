@@ -664,6 +664,11 @@ enum LeftRow {
 }
 
 impl App for EventLog {
+    /// Smallest window (24.11, WM SDK): the 220-point log list and the events table.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(640, 400)
+    }
+
     fn title(&self) -> Option<String> {
         Some(String::from("Event Log\x1fЖурнал событий"))
     }

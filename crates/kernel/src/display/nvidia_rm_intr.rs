@@ -125,9 +125,20 @@ static FIRST_IRQ_MS: AtomicU64 = AtomicU64::new(0);
 static STORM_WINDOW: AtomicU64 = AtomicU64::new(0);
 static STORM_COUNT: AtomicU64 = AtomicU64::new(0);
 static STORM: AtomicBool = AtomicBool::new(false);
-/// Sleeping fence waits that ended `[by the interrupt, by the timer with the
-/// fence done (late), by the timer not done]` since the mode was set.
-static ENDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Sleeps of fence waits, indexed by [`End`], in the current judging window
+/// (`Live`: `[0]` and `[1]` start again every 256 finished waits - hw-log18
+/// read "by irq 233 / by timer 697547" as "the interrupt rarely wakes
+/// anyone", while 233 was a window count and the timer one a total).
+static ENDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// The same since boot, never reset (perf-diag, `fenceirq`).
+static TOTAL_ENDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// When the handler last found a fence bit (uptime ns): the wake latency of
+/// a wait that ends by the interrupt is measured from it.
+static LAST_HIT_NS: AtomicU64 = AtomicU64::new(0);
+/// Interrupt -> waiter back with its fence done: sum, count, worst (ns).
+static WAKE_NS: AtomicU64 = AtomicU64::new(0);
+static WAKES: AtomicU64 = AtomicU64::new(0);
+static WAKE_WORST_NS: AtomicU64 = AtomicU64::new(0);
 /// Sleeping waits in `Trial` (to judge "no interrupt").
 static TRIAL_SLEEPS: AtomicU64 = AtomicU64::new(0);
 
@@ -196,6 +207,7 @@ fn on_interrupt() {
     }
     if ours {
         HITS.fetch_add(1, Ordering::Relaxed);
+        LAST_HIT_NS.store(crate::time::uptime_ns(), Ordering::Relaxed);
         let _ = FIRST_IRQ_MS.compare_exchange(0, now_ms.max(1), Ordering::Relaxed, Ordering::Relaxed);
         hrsleep::signal(SRC_GPU);
     }
@@ -385,27 +397,53 @@ fn fallback(reason: String) {
 }
 
 fn counters() -> String {
+    let total = |end: End| TOTAL_ENDS[end as usize].load(Ordering::Relaxed);
+    let wakes = WAKES.load(Ordering::Relaxed);
     format!(
-        "{} irqs, {} with fence bits, {} with other bits; sleeping waits ended by irq {}, by timer late {}, by timer {}",
+        "{} irqs, {} with fence bits, {} with other bits; since boot, sleeps of fence waits: {} ended by the interrupt with the fence done \
+         (interrupt to waiter {} us avg, worst {} us), {} found the fence done only at the backstop timer (missed or late interrupt), \
+         {} woke by an interrupt for another fence, {} slept to the backstop with the fence pending; judging window: irq {}, late {}",
         IRQS.load(Ordering::Relaxed),
         HITS.load(Ordering::Relaxed),
         FOREIGN.load(Ordering::Relaxed),
-        ENDS[0].load(Ordering::Relaxed),
-        ENDS[1].load(Ordering::Relaxed),
-        ENDS[2].load(Ordering::Relaxed),
+        total(End::Irq),
+        WAKE_NS.load(Ordering::Relaxed) / wakes.max(1) / 1000,
+        WAKE_WORST_NS.load(Ordering::Relaxed) / 1000,
+        total(End::TimerDone),
+        total(End::IrqOther),
+        total(End::Timer),
+        ENDS[End::Irq as usize].load(Ordering::Relaxed),
+        ENDS[End::TimerDone as usize].load(Ordering::Relaxed),
     )
 }
+
 
 /// How a sleep of a fence wait ended.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum End {
-    /// The interrupt source moved during the sleep.
+    /// The interrupt source moved during the sleep and the fence is done.
     Irq,
     /// The backstop timer, and the fence was done (an interrupt was missed
     /// or came late).
     TimerDone,
     /// The backstop timer, fence still pending (normal for long waits).
     Timer,
+    /// Woken by the interrupt, but the fence is still pending: another
+    /// channel or an earlier submission of this one finished (every nonstall
+    /// interrupt wakes every fence waiter).
+    IrqOther,
+}
+
+/// How one sleep of a fence wait ended: `by_irq` - the interrupt source
+/// moved during it, `done` - the fence is signalled now.
+#[must_use]
+pub fn classify(by_irq: bool, done: bool) -> End {
+    match (by_irq, done) {
+        (true, true) => End::Irq,
+        (false, true) => End::TimerDone,
+        (true, false) => End::IrqOther,
+        (false, false) => End::Timer,
+    }
 }
 
 /// The wait path reports every sleep (task context, may log). Moves the
@@ -416,6 +454,16 @@ pub fn after_wait(end: End) {
         return;
     }
     ENDS[end as usize].fetch_add(1, Ordering::Relaxed);
+    TOTAL_ENDS[end as usize].fetch_add(1, Ordering::Relaxed);
+    if end == End::Irq {
+        let hit = LAST_HIT_NS.load(Ordering::Relaxed);
+        if hit != 0 {
+            let took = crate::time::uptime_ns().saturating_sub(hit);
+            WAKE_NS.fetch_add(took, Ordering::Relaxed);
+            WAKES.fetch_add(1, Ordering::Relaxed);
+            WAKE_WORST_NS.fetch_max(took, Ordering::Relaxed);
+        }
+    }
     if STORM.load(Ordering::Relaxed) {
         fallback(format!("interrupt storm (> {STORM_PER_100MS} in 100 ms; pending bits we do not own?); {}", counters()));
         return;
@@ -482,7 +530,11 @@ pub fn command(argument: &str) -> String {
             set_status("fenceirq: off ('fenceirq on' to enable)".into());
         }
         "" => {}
-        _ => return "fenceirq: usage `fenceirq [on|off]`".into(),
+        other if other.starts_with("test") => {
+            let rounds = other["test".len()..].trim().parse::<u64>().unwrap_or(200).clamp(1, 100_000);
+            return self_test(rounds);
+        }
+        _ => return "fenceirq: usage `fenceirq [on|off|test N]`".into(),
     }
     status()
 }
@@ -493,4 +545,128 @@ pub fn status() -> String {
     let line = STATUS.lock().clone();
     let head = if line.is_empty() { String::from("fenceirq: not set up (no GPU backend yet)") } else { line };
     format!("{head}; mode {:?}; {}", mode(), counters())
+}
+
+// ---- self-test without a card (QEMU) -------------------------------------------
+
+/// `fenceirq test N`: the fence wait path (`drm::sync::wait_until`) in `Live`
+/// mode against a simulated interrupt - a kernel task "finishes" a fence at a
+/// random moment 0.1-3 ms after the wait began and signals [`SRC_GPU`] the
+/// way [`on_interrupt`] does; half the waits also get an interrupt for
+/// "another fence" first. Checks what hw-log18 could not tell: that waits end
+/// by the interrupt (not the backstop timer), how long the wake-up takes,
+/// and that foreign interrupts are counted apart. Only while no card is
+/// armed (QEMU); the state is put back afterwards.
+fn self_test(rounds: u64) -> String {
+    if mode() != Mode::Off || BAR.load(Ordering::Acquire) != 0 {
+        return String::from("fenceirq test: the interrupt is in use (a card is armed); nothing done");
+    }
+    if !hrsleep::enabled() {
+        return String::from("fenceirq test: fine sleeps (hrsleep) are off; nothing done");
+    }
+    let before: [u64; 4] = core::array::from_fn(|i| TOTAL_ENDS[i].load(Ordering::Relaxed));
+    let wakes_before = (WAKES.load(Ordering::Relaxed), WAKE_NS.load(Ordering::Relaxed));
+    TEST_DUE_NS.store(0, Ordering::SeqCst);
+    TEST_FOREIGN_NS.store(0, Ordering::SeqCst);
+    TEST_DONE.store(0, Ordering::SeqCst);
+    TEST_ROUND.store(0, Ordering::SeqCst);
+    TEST_RUN.store(true, Ordering::SeqCst);
+    MODE.store(Mode::Live as u8, Ordering::Release);
+    if crate::sched::spawn("fenceirq-test", test_interrupts).is_err() {
+        MODE.store(Mode::Off as u8, Ordering::Release);
+        TEST_RUN.store(false, Ordering::SeqCst);
+        return String::from("fenceirq test: no task for the simulated interrupt");
+    }
+    let (mut sum, mut worst, mut errors) = (0u64, 0u64, 0u64);
+    let mut seed = crate::time::uptime_ns() | 1;
+    for round in 1..=rounds {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let start = crate::time::uptime_ns();
+        let delay = 100_000 + seed % 2_900_000;
+        if round % 2 == 0 {
+            TEST_FOREIGN_NS.store(start + delay / 2, Ordering::SeqCst);
+        }
+        TEST_ROUND.store(round, Ordering::SeqCst);
+        TEST_DUE_NS.store(start + delay, Ordering::SeqCst);
+        // The Linux DRM layer (and its wait) exists on x86-64 only.
+        #[cfg(target_arch = "x86_64")]
+        let result = crate::linux::drm::fence_wait(Some(start + 50_000_000), || TEST_DONE.load(Ordering::SeqCst) >= round);
+        #[cfg(not(target_arch = "x86_64"))]
+        let result: Result<(), i64> = Err(0);
+        let end = crate::time::uptime_ns();
+        if result.is_err() {
+            errors += 1;
+            TEST_DONE.store(round, Ordering::SeqCst);
+        }
+        // From the moment the "card" finished it (the simulated interrupt
+        // task itself may run late under QEMU).
+        let done_at = TEST_DONE_AT_NS.load(Ordering::SeqCst);
+        let late = end.saturating_sub(if done_at > start { done_at } else { start + delay });
+        sum += late;
+        worst = worst.max(late);
+    }
+    TEST_RUN.store(false, Ordering::SeqCst);
+    MODE.store(Mode::Off as u8, Ordering::Release);
+    for end in &ENDS {
+        end.store(0, Ordering::Relaxed);
+    }
+    hrsleep::signal(SRC_GPU);
+    let delta: [u64; 4] = core::array::from_fn(|i| TOTAL_ENDS[i].load(Ordering::Relaxed) - before[i]);
+    let wakes = WAKES.load(Ordering::Relaxed) - wakes_before.0;
+    let wake_ns = WAKE_NS.load(Ordering::Relaxed) - wakes_before.1;
+    format!(
+        "fenceirq test: {rounds} waits, {errors} timed out; fence seen {} us after it was done on average, worst {} us; sleeps ended: \
+         {} by the interrupt (interrupt to waiter {} us avg), {} done only at the backstop, {} by an interrupt for another fence, {} backstop with the fence pending",
+        sum / rounds / 1000,
+        worst / 1000,
+        delta[End::Irq as usize],
+        wake_ns / wakes.max(1) / 1000,
+        delta[End::TimerDone as usize],
+        delta[End::IrqOther as usize],
+        delta[End::Timer as usize],
+    )
+}
+
+static TEST_RUN: AtomicBool = AtomicBool::new(false);
+/// When the simulated fence is due / when an interrupt for "another fence"
+/// comes (uptime ns, 0 - none).
+static TEST_DUE_NS: AtomicU64 = AtomicU64::new(0);
+static TEST_FOREIGN_NS: AtomicU64 = AtomicU64::new(0);
+/// The round being waited for, and the last round whose fence is done.
+static TEST_ROUND: AtomicU64 = AtomicU64::new(0);
+/// When the last simulated fence was finished (uptime ns).
+static TEST_DONE_AT_NS: AtomicU64 = AtomicU64::new(0);
+static TEST_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// The simulated interrupt: a task that watches the clock to the next due
+/// moment and signals [`SRC_GPU`] like [`on_interrupt`].
+fn test_interrupts() {
+    while TEST_RUN.load(Ordering::SeqCst) {
+        let foreign = TEST_FOREIGN_NS.load(Ordering::SeqCst);
+        let due = TEST_DUE_NS.load(Ordering::SeqCst);
+        let now = crate::time::uptime_ns();
+        if foreign != 0 && foreign <= now {
+            TEST_FOREIGN_NS.store(0, Ordering::SeqCst);
+            hrsleep::signal(SRC_GPU);
+            continue;
+        }
+        if due != 0 && due <= now {
+            TEST_DUE_NS.store(0, Ordering::SeqCst);
+            TEST_DONE_AT_NS.store(crate::time::uptime_ns(), Ordering::SeqCst);
+            TEST_DONE.store(TEST_ROUND.load(Ordering::SeqCst), Ordering::SeqCst);
+            LAST_HIT_NS.store(crate::time::uptime_ns(), Ordering::Relaxed);
+            hrsleep::signal(SRC_GPU);
+            continue;
+        }
+        // Polls (with yields) rather than fine sleeps: a fine sleep of this
+        // task would end in the same timer pass as the waiter's backstop
+        // and turn the test into a race of two timer wake-ups (QEMU).
+        if due == 0 && foreign == 0 {
+            crate::sched::sleep_ms(1);
+        } else {
+            crate::sched::yield_now();
+        }
+    }
 }

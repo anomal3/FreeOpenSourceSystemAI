@@ -83,6 +83,12 @@ pub const BOOT_LIVE: u64 = 1 << 4;
 /// Intel graphics. This is the way back for a machine whose screen goes dark.
 pub const BOOT_FIRMWARE_DISPLAY: u64 = 1 << 5;
 
+/// Verbose boot (24.11): the boot log on the screen instead of the logo and
+/// the bar. Boot-menu item 7 for one boot, or the first line `verbose` of
+/// `\FREEOS\BOOT.CFG` (written by the kernel from «Параметры →
+/// Восстановление → Подробная загрузка») for every boot.
+pub const BOOT_VERBOSE: u64 = 1 << 6;
+
 /// Which instruction set the bootloader was built for.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

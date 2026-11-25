@@ -182,8 +182,8 @@ fn live_packages(mount: &str) {
 /// 23.11: сначала Debian, Proton и OBS Studio (`obs`, своя glibc), потом
 /// игра и остальное — пакеты ставятся строго по одному, память `/opt`
 /// растёт только под распакованное.
-const LIVE_ORDER: [&str; 9] =
-    ["debian", "proton", "obs", "tmnf", "obsos", "gridcraf", "wordcraf", "pdfcraft", "mailcraf"];
+const LIVE_ORDER: [&str; 10] =
+    ["debian", "proton", "obs", "vlc", "tmnf", "obsos", "gridcraf", "wordcraf", "pdfcraft", "mailcraf"];
 
 static LIVE_QUEUE: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
 static LIVE_RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -475,14 +475,26 @@ impl UsbDisk {
             // просили, или отказал; точка уже сброшена, а итог скажет CSW.
             match xhci::storage_bulk(handle, dir_in, StorageBuffer::Data, length) {
                 Ok(_) | Err(BulkError::Stalled) => {}
-                Err(err) => return Err(err.into()),
+                // hw-log18: a transaction error halts the xHCI endpoint; without
+                // Reset Recovery the next command waited on a halted ring.
+                Err(err) => {
+                    if matches!(err, BulkError::Failed(_) | BulkError::Timeout) {
+                        xhci::storage_reset(handle);
+                    }
+                    return Err(err.into());
+                }
             }
         }
         let status = match xhci::storage_bulk(handle, true, StorageBuffer::Status, 13) {
             Ok(read) => read,
             // Остановка вместо CSW — попытка ещё одна, после сброса точки.
             Err(BulkError::Stalled) => xhci::storage_bulk(handle, true, StorageBuffer::Status, 13)?,
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                if matches!(err, BulkError::Failed(_) | BulkError::Timeout) {
+                    xhci::storage_reset(handle);
+                }
+                return Err(err.into());
+            }
         };
         if let Direction::In(buf) = &mut data {
             let len = buf.len();

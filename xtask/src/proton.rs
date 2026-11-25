@@ -105,7 +105,8 @@ const SKIP_UNIX: &[&str] = &[
     "winepulse.so",
     "winegstreamer.so",
     "wineusb.so",
-    "winebus.so",
+    // `winebus.so` is taken (24.11.2026, gamepads): it reads the kernel's
+    // `/dev/input/eventN` through libudev (`linux/evdev.rs`).
     "gphoto2.so",
     "sane.so",
     "opencl.so",
@@ -129,8 +130,10 @@ const SKIP_UNIX: &[&str] = &[
 const DLOPEN: [&str; 3] = ["libfreetype.so.6", "libfontconfig.so.1", "libgnutls.so.30"];
 
 /// Свои пакеты Debian (снимок 20261020, `Packages` bookworm) сверх
-/// `wine::PACKAGES`: GnuTLS и то, на чём он стоит.
-const PACKAGES: [(&str, &str); 8] = [
+/// `wine::PACKAGES`: GnuTLS и то, на чём он стоит; libudev - для
+/// `winebus.so` (gamepads, 24.11.2026: it reads sysfs itself, no udevd).
+const PACKAGES: [(&str, &str); 9] = [
+    ("pool/main/s/systemd/libudev1_252.39-1~deb12u2_amd64.deb", "6f7e08f11c4809d2e5998c775f7b423ab5ec2ce0309494b4a2615037052245e2"),
     ("pool/main/g/gnutls28/libgnutls30_3.7.9-2+deb12u7_amd64.deb", "30abec8c824feb1d2d7e9000a34083cccd19d139625e1b21547e3ac53b922f8e"),
     ("pool/main/g/gmp/libgmp10_6.2.1+dfsg1-1.1_amd64.deb", "187aedef2ed763f425c1e523753b9719677633c7eede660401739e9c893482bd"),
     ("pool/main/libi/libidn2/libidn2-0_2.3.3-1+b1_amd64.deb", "d50716d5824083d667427817d506b45d3f59dc77e1ca52de000f3f62d4918afa"),
@@ -535,6 +538,10 @@ pub fn build(arch: Arch) -> Result<()> {
         # (16.11): ядро отвечает netlink, SIOCGIF* и /proc/net.\n\
         export WINEDLLOVERRIDES=\"mscoree,mshtml,tabtip.exe=${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}\"\n\
         export WINEDEBUG=${WINEDEBUG:-fixme-all}\n\
+        # Геймпады (24.11.2026): ядро показывает каждый как виртуальный\n\
+        # геймпад Steam Input (28de:11ff, `/dev/input/eventN`), winebus делает\n\
+        # из него геймпад XInput; игре он виден как Xbox 360 (045e:028e).\n\
+        export PROTON_SPOOF_STEAMINPUT_VIDPID=${PROTON_SPOOF_STEAMINPUT_VIDPID:-1}\n\
         # `/tmp` у FossAi переживает перезагрузку: сокет wineserver прошлой\n\
         # загрузки остаётся обычным файлом, и Wine падает «is not a socket».\n\
         for s in /tmp/.wine-*/server-*/socket; do [ -e \"$s\" ] && [ ! -S \"$s\" ] && LD_LIBRARY_PATH= rm -f \"$s\"; done\n\
@@ -612,6 +619,14 @@ export DXVK_STATE_CACHE_PATH=${DXVK_STATE_CACHE_PATH:-$C/dxvk}
 export DXVK_LOG_PATH=${DXVK_LOG_PATH:-$C/log}
 # Кеш конвейеров vkd3d-proton (Direct3D 12, 20.11) - туда же.
 export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$C/vkd3d}
+# .NET 5+ (24.11, hw-log18: Rupor Updater - .NET 8, Avalonia - ended with
+# code 3 at once): on Windows the runtime loads icu.dll; Wine's icu.dll only
+# forwards to icuuc68/icuin68, which Proton does not ship, so the lookup of
+# `u_charsToUChars` fails and the runtime's ICU shim calls abort() (code 3,
+# `err:module:find_forwarded_export ... icuuc68`). With USENLS the runtime
+# does not touch ICU and uses the NLS functions of kernel32 (Wine has them):
+# cultures, sorting and formats keep working (unlike InvariantGlobalization).
+export DOTNET_SYSTEM_GLOBALIZATION_USENLS=${DOTNET_SYSTEM_GLOBALIZATION_USENLS:-1}
 LD_LIBRARY_PATH= mkdir -p "$MESA_SHADER_CACHE_DIR" "$DXVK_SHADER_CACHE_PATH" "$DXVK_LOG_PATH" "$VKD3D_SHADER_CACHE_PATH"
 # Потоки рисования llvmpipe/lavapipe (P3/P9): без переменной Mesa берёт все
 # ЦП (16 на Ryzen 8 ядер/16 потоков), и каждый кадр будит 16 потоков через
@@ -804,24 +819,36 @@ case "$1" in
         done < "$f"
         # `Exec=env WINEPREFIX="…" wine …start.exe /Unix ПУТЬ`: winemenubuilder
         # экранирует пробел и прочее как `\\ `, обратную косую - как `\\\\`.
-        case $x in *' /Unix '*|*' /unix '*) ;; *) echo "fossai-proton: no /Unix in $f: $x"; exit 1 ;; esac
-        x=${x#* /[Uu]nix }; u=; i=0
+        # Proton's winemenubuilder writes `Exec="C:\\\\…\\\\Updater" ""` (the
+        # program itself, no start.exe) - 24.11, Rupor's desktop shortcut:
+        # this ended with code 1 before. Run that Windows path via `start`.
+        win=
+        case $x in
+            *' /Unix '*|*' /unix '*) x=${x#* /[Uu]nix } ;;
+            '"'[A-Za-z]:*) x=${x#\"}; x=${x%%\"*}; win=1 ;;
+            *) klog "fossai-proton: no /Unix nor a Windows path in $f: $x"; exit 1 ;;
+        esac
+        u=; i=0
         while [ $i -lt ${#x} ]; do
             if [ "${x:i:4}" = '\\\\' ]; then u+='\'; i=$((i + 4))
             elif [ "${x:i:2}" = '\\' ]; then u+=${x:i+2:1}; i=$((i + 3))
             elif [ "${x:i:1}" = '\' ]; then u+=${x:i+1:1}; i=$((i + 2))
-            elif [ "${x:i:1}" = ' ' ]; then break
+            elif [ "${x:i:1}" = ' ' ] && [ -z "$win" ]; then break
             else u+=${x:i:1}; i=$((i + 1)); fi
         done
         [ -n "$w" ] && cd "$w" 2>/dev/null
         klog "fossai-proton: shortcut $f -> $u (prefix $WINEPREFIX)"
+        if [ -n "$win" ]; then
+            set -- start /wait "$u" "$@"
+        else
         tmnf_handoff "$u" "$@"
         # Ярлык .exe при узле видеокарты - через DXVK/vkd3d-proton, как `--open`.
         case "${u,,}" in
             *.exe) if [ -e /dev/dri/renderD128 ]; then set -- --dxvk start /wait /unix "$u" "$@"; else set -- start /wait /unix "$u" "$@"; fi
                 game_args "$u"; [ ${#GA[@]} -gt 0 ] && set -- "$@" "${GA[@]}" ;;
             *) set -- start /wait /unix "$u" "$@" ;;
-        esac ;;
+        esac
+        fi ;;
 esac
 # `--d2r[=КАТАЛОГ|=ПУТЬ.exe] [КЛЮЧИ ИГРЫ]` (20.11) - Diablo II Resurrected
 # (Direct3D 12): без пути - первый D2R.exe в /usb../D2RLAN и /usb../*

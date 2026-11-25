@@ -424,7 +424,7 @@ impl App for Runner {
                 iconset::draw(s, Fi::Warning, plan.message.x, plan.message.y + (plan.message.h - g) as i32 / 2, g, p.bad_ink, 255);
                 paint::text_clipped(ctx, s, Role::Caption, plan.message.x + ctx.px(24) as i32, paint::baseline(ctx, Role::Caption, plan.message), plan.message.w.saturating_sub(ctx.px(24)), message, p.bad_ink);
             } else {
-                paint::text_clipped(ctx, s, Role::Caption, plan.message.x, paint::baseline(ctx, Role::Caption, plan.message), plan.message.w, "Например: taskmgr, eventvwr, /home, notepad /etc/services", p.ink4);
+                paint::text_clipped(ctx, s, Role::Caption, plan.message.x, paint::baseline(ctx, Role::Caption, plan.message), plan.message.w, "Например: taskmgr, eventvwr, /home, \\\\192.168.1.10", p.ink4);
             }
         }
 
@@ -490,6 +490,16 @@ fn resolve_and_start(text: &str) -> Outcome {
     }
     if lower.starts_with("http://") || lower.starts_with("https://") {
         return Outcome::Failed(String::from("Для адресов в сети пока нет программы по умолчанию."));
+    }
+    // `\\host\share` (Roman 24.11): a shared folder of another computer —
+    // `/net/host/share`. `netlogon` tries it, asks for credentials if the
+    // computer wants them, and opens it in «Файлы».
+    if text.starts_with("\\\\") || text.starts_with("/net/") {
+        let path = sysconf::winpath::to_unix(text.trim()).into_owned();
+        if path.trim_end_matches('/') == "/net" {
+            return start("/bin/files /net");
+        }
+        return start(&format!("/bin/netlogon --open {path}"));
     }
     // Путь: папка — «Файлы», программа — запуск, остальное — «Блокнот».
     if word.starts_with('/') {

@@ -378,6 +378,50 @@ pub enum TrayItem {
     /// Screen recording runs (22.11): red dot and elapsed time; a click
     /// stops it.
     Recording,
+    /// The chevron (24.11): a popup with the icons kept off the taskbar.
+    Overflow,
+}
+
+impl TrayItem {
+    /// The setting behind a hideable icon.
+    #[must_use]
+    pub const fn icon(self) -> Option<deskcfg::TrayIcon> {
+        match self {
+            TrayItem::Recording => Some(deskcfg::TrayIcon::Recording),
+            TrayItem::Network => Some(deskcfg::TrayIcon::Network),
+            TrayItem::Volume => Some(deskcfg::TrayIcon::Volume),
+            TrayItem::Layout => Some(deskcfg::TrayIcon::Layout),
+            TrayItem::Clock | TrayItem::Bell | TrayItem::Overflow => None,
+        }
+    }
+}
+
+/// Tray icons that exist now but live under the chevron (24.11), in tray
+/// order. The recording indicator exists only while a recording runs.
+#[must_use]
+pub fn hidden_tray() -> Vec<TrayItem> {
+    [TrayItem::Recording, TrayItem::Network, TrayItem::Volume, TrayItem::Layout]
+        .into_iter()
+        .filter(|item| item.icon().is_some_and(deskcfg::tray_hidden))
+        .filter(|item| *item != TrayItem::Recording || super::capture::elapsed_s().is_some())
+        .collect()
+}
+
+/// Start is open (24.11): read without the desktop's lock by the input path
+/// (`ui::dispatch`), which then waits for a busy desktop longer.
+static START_OPEN: AtomicBool = AtomicBool::new(false);
+
+#[must_use]
+pub fn start_open() -> bool {
+    START_OPEN.load(Ordering::Relaxed)
+}
+
+/// The chevron's popup is open — the chevron is drawn pressed.
+static OVERFLOW_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// The compositor opened or closed the chevron's popup.
+pub fn set_overflow_open(open: bool) {
+    OVERFLOW_OPEN.store(open, Ordering::Relaxed);
 }
 
 /// Elapsed time of the screen recording for the tray: `0:07`, `12:34`,
@@ -1039,6 +1083,19 @@ impl Panel {
         self.tray.iter().find(|(known, _)| *known == item).map(|(_, rect)| rect.translate(self.rect.x, self.rect.y))
     }
 
+    /// Tray icons on the plate as `tray:<item> at X,Y WxH`, screen
+    /// coordinates (24.11, for the bench).
+    #[must_use]
+    pub fn tray_spots(&self) -> Vec<String> {
+        self.tray
+            .iter()
+            .map(|(item, rect)| {
+                let rect = rect.translate(self.rect.x, self.rect.y);
+                alloc::format!("tray:{} at {},{} {}x{}", alloc::format!("{item:?}").to_lowercase(), rect.x, rect.y, rect.w, rect.h)
+            })
+            .collect()
+    }
+
     pub fn anchor(&self, app: App) -> Option<Rect> {
         let local = if let Some(dock) = self.dock {
             if !dock.stack.is_empty() {
@@ -1218,10 +1275,25 @@ impl Panel {
         let caption = ctx.face(Role::Caption);
         let clock_w = body.width(&clock).max(date.as_deref().map_or(0, |date| caption.width(date)));
         let _ = mono;
-        // Сеть, звук, раскладка, часы, колокол (макет 05).
-        let mut status_w = (glyph + step) * 2 + body.width(lang) + step + clock_w + step + glyph;
+        // Сеть, звук, раскладка, часы, колокол (макет 05). Icons set to
+        // «hide» (24.11) live under the chevron at the left of the tray.
+        let on_bar = |icon: deskcfg::TrayIcon| !deskcfg::tray_hidden(icon);
+        let overflow = !hidden_tray().is_empty();
+        let mut status_w = clock_w + step + glyph;
+        if overflow {
+            status_w += glyph + step;
+        }
+        if on_bar(deskcfg::TrayIcon::Network) {
+            status_w += glyph + step;
+        }
+        if on_bar(deskcfg::TrayIcon::Volume) {
+            status_w += glyph + step;
+        }
+        if on_bar(deskcfg::TrayIcon::Layout) {
+            status_w += body.width(lang) + step;
+        }
         // Screen recording (22.11): red dot and elapsed time before the network.
-        let recording = super::capture::elapsed_s().map(recording_text);
+        let recording = super::capture::elapsed_s().filter(|_| on_bar(deskcfg::TrayIcon::Recording)).map(recording_text);
         let dot = ctx.px(10);
         let recording_w = recording.as_deref().map_or(0, |text| dot + ctx.px(6) + body.width(text) + step);
         status_w += recording_w;
@@ -1334,6 +1406,18 @@ impl Panel {
                 mini_ui::classic::shallow(&mut self.surface, well, t);
             }
 
+            // The chevron (24.11): hidden tray icons in a popup above it.
+            if overflow {
+                let button = Rect::new(x - half, plate.y + ctx.px(4) as i32, glyph + step, plate.h.saturating_sub(ctx.px(8)));
+                if OVERFLOW_OPEN.load(Ordering::Relaxed) {
+                    draw::rounded(&mut self.surface, button, m.round_row, p.hover2.color, p.hover2.alpha);
+                }
+                let icon = if self.cfg.edge == deskcfg::Edge::Top { Icon::ChevronDown } else { Icon::ChevronUp };
+                glyphicon::draw(&mut self.surface, icon, x, plate.y + (plate.h as i32 - glyph as i32) / 2, glyph, p.ink2, 255);
+                self.tray.push((TrayItem::Overflow, Rect::new(x - half, plate.y, glyph + step, plate.h)));
+                x += (glyph + step) as i32;
+            }
+
             // Screen recording (22.11): red dot and elapsed time.
             if let Some(text) = recording.as_deref() {
                 let spot = Rect::new(x, plate.y + (plate.h as i32 - dot as i32) / 2, dot, dot);
@@ -1348,55 +1432,42 @@ impl Panel {
             // когда карты нет или адрес не получен. Приглушённый, а не другой
             // значок: «нет сети» в наборе значков нет, а чужой значок сказал бы
             // не то. Разница между «нет карты» и «нет адреса» — в меню трея.
-            let net_ink = match status.net {
-                NetState::Up => p.ink,
-                NetState::NoAddress | NetState::Absent => p.ink3,
-            };
-            // Проводная сеть — монитор, как значок Ethernet в Windows (24.10:
-            // глобус с крестом читался как «нет сети» и при сети).
-            glyphicon::draw(
-                &mut self.surface,
-                Icon::Network,
-                x,
-                plate.y + (plate.h as i32 - glyph as i32) / 2,
-                glyph,
-                net_ink,
-                255,
-            );
-            // Область попадания шире значка на полшага в обе стороны: значок в
-            // четырнадцать точек — цель для меткого, а трей должен нажиматься
-            // с первого раза.
-            self.tray.push((
-                TrayItem::Network,
-                Rect::new(x - half, plate.y, glyph + step, plate.h),
-            ));
-            x += (glyph + step) as i32;
+            if on_bar(deskcfg::TrayIcon::Network) {
+                let net_ink = match status.net {
+                    NetState::Up => p.ink,
+                    NetState::NoAddress | NetState::Absent => p.ink3,
+                };
+                // Проводная сеть — монитор, как значок Ethernet в Windows (24.10:
+                // глобус с крестом читался как «нет сети» и при сети).
+                glyphicon::draw(&mut self.surface, Icon::Network, x, plate.y + (plate.h as i32 - glyph as i32) / 2, glyph, net_ink, 255);
+                // Область попадания шире значка на полшага в обе стороны: значок в
+                // четырнадцать точек — цель для меткого, а трей должен нажиматься
+                // с первого раза.
+                self.tray.push((TrayItem::Network, Rect::new(x - half, plate.y, glyph + step, plate.h)));
+                x += (glyph + step) as i32;
+            }
 
-            // Звук: перечёркнутый динамик — карты нет или звук на нуле.
-            let quiet = !crate::sound::present() || crate::sound::volume() == 0;
-            iconset::draw(
-                &mut self.surface,
-                if quiet { Fi::VolumeOff } else { Fi::Volume },
-                x,
-                plate.y + (plate.h as i32 - glyph as i32) / 2,
-                glyph,
-                if crate::sound::present() { p.ink } else { p.ink3 },
-                255,
-            );
-            self.tray.push((TrayItem::Volume, Rect::new(x - half, plate.y, glyph + step, plate.h)));
-            x += (glyph + step) as i32;
+            if on_bar(deskcfg::TrayIcon::Volume) {
+                // Звук: перечёркнутый динамик — карты нет или звук на нуле.
+                let quiet = !crate::sound::present() || crate::sound::volume() == 0;
+                iconset::draw(
+                    &mut self.surface,
+                    if quiet { Fi::VolumeOff } else { Fi::Volume },
+                    x,
+                    plate.y + (plate.h as i32 - glyph as i32) / 2,
+                    glyph,
+                    if crate::sound::present() { p.ink } else { p.ink3 },
+                    255,
+                );
+                self.tray.push((TrayItem::Volume, Rect::new(x - half, plate.y, glyph + step, plate.h)));
+                x += (glyph + step) as i32;
+            }
 
-            let width = paint::text(
-                ctx,
-                &mut self.surface,
-                Role::Body,
-                x,
-                paint::baseline(ctx, Role::Body, plate),
-                lang,
-                p.ink,
-            );
-            self.tray.push((TrayItem::Layout, Rect::new(x - half, plate.y, width + step, plate.h)));
-            x += (width + step) as i32;
+            if on_bar(deskcfg::TrayIcon::Layout) {
+                let width = paint::text(ctx, &mut self.surface, Role::Body, x, paint::baseline(ctx, Role::Body, plate), lang, p.ink);
+                self.tray.push((TrayItem::Layout, Rect::new(x - half, plate.y, width + step, plate.h)));
+                x += (width + step) as i32;
+            }
 
             // Часы и дата в две строки, прижаты вправо, как в Windows.
             let right = x + clock_w as i32;
@@ -1563,19 +1634,35 @@ impl Panel {
         let body = ctx.face(Role::Body);
         let lang = lang_tag();
         let (time, date) = short_clock(status);
-        let mut out = alloc::vec![(TrayItem::Network, glyph + step), (TrayItem::Volume, glyph + step)];
+        let on_bar = |icon: deskcfg::TrayIcon| !deskcfg::tray_hidden(icon);
+        let mut out = Vec::new();
+        // The chevron first (24.11): the Dock keeps every hideable icon
+        // under it.
+        if !hidden_tray().is_empty() {
+            out.push((TrayItem::Overflow, glyph + step));
+        }
         // Screen recording (22.11): a red dot first (the time is in its row
         // along a horizontal Dock only).
-        if let Some(seconds) = super::capture::elapsed_s() {
+        if let Some(seconds) = super::capture::elapsed_s().filter(|_| on_bar(deskcfg::TrayIcon::Recording)) {
             let len = if vertical { glyph + step } else { ctx.px(16) + caption.width(&recording_text(seconds)) + step };
-            out.insert(0, (TrayItem::Recording, len));
+            out.push((TrayItem::Recording, len));
+        }
+        if on_bar(deskcfg::TrayIcon::Network) {
+            out.push((TrayItem::Network, glyph + step));
+        }
+        if on_bar(deskcfg::TrayIcon::Volume) {
+            out.push((TrayItem::Volume, glyph + step));
         }
         if vertical {
-            out.push((TrayItem::Layout, u32::from(caption.line) + step));
+            if on_bar(deskcfg::TrayIcon::Layout) {
+                out.push((TrayItem::Layout, u32::from(caption.line) + step));
+            }
             let lines = if date.is_empty() { 1 } else { 2 };
             out.push((TrayItem::Clock, u32::from(caption.line) * lines + step));
         } else {
-            out.push((TrayItem::Layout, caption.width(lang) + step));
+            if on_bar(deskcfg::TrayIcon::Layout) {
+                out.push((TrayItem::Layout, caption.width(lang) + step));
+            }
             out.push((TrayItem::Clock, body.width(&time).max(caption.width(&date)) + step));
         }
         out.push((TrayItem::Bell, glyph + step));
@@ -1727,6 +1814,21 @@ impl Panel {
                 TrayItem::Bell => {
                     let (x, y) = center(glyph);
                     iconset::draw(&mut self.surface, Fi::Bell, x, y, glyph, p.ink2, 255);
+                }
+                TrayItem::Overflow => {
+                    if OVERFLOW_OPEN.load(Ordering::Relaxed) {
+                        let side = glyph + ctx.px(10);
+                        let (x, y) = center(side);
+                        draw::rounded(&mut self.surface, Rect::new(x, y, side, side), m.round_row, p.hover2.color, p.hover2.alpha);
+                    }
+                    // Points away from the edge: the popup opens that way.
+                    let icon = match self.cfg.edge {
+                        deskcfg::Edge::Top => Icon::ChevronDown,
+                        deskcfg::Edge::Left => Icon::ChevronRight,
+                        deskcfg::Edge::Right | deskcfg::Edge::Bottom => Icon::ChevronUp,
+                    };
+                    let (x, y) = center(glyph);
+                    glyphicon::draw(&mut self.surface, icon, x, y, glyph, p.ink2, 255);
                 }
                 TrayItem::Layout => {
                     paint::text_centered(ctx, &mut self.surface, Role::Caption, rect, lang_tag(), p.ink);
@@ -2129,6 +2231,9 @@ pub enum Choice {
     Lock,
     /// Недавний файл: команда программы и путь.
     Recent(String, String),
+    /// The power menu of Start (24.11): shut down (`false`) or restart
+    /// (`true`); `force` — Shift was held: at once, as before.
+    Power { restart: bool, force: bool },
 }
 
 /// Программа, поставленная пакетом (фаза N8): строка «Пуска» из реестра
@@ -2483,6 +2588,8 @@ enum Target {
     Tool(usize),
     /// Кнопка питания (номер в `items`).
     Power(usize),
+    /// The one power button (24.11): opens the power menu.
+    PowerMenu,
     /// Полоса прокрутки: `true` — списка, `false` — закреплённых.
     Bar(bool),
     /// Строка всплывающего меню.
@@ -2508,14 +2615,24 @@ enum PopAct {
     PinTask(String),
     UnpinTask(String),
     First(String),
-    /// Перенести строку (номер в `items`) в папку (пусто — наружу), 21.11.
-    MoveTo(usize, &'static str),
     /// Ярлык программы Windows на рабочий стол.
     Desk(usize),
     Account,
     Lock,
     Logout,
+    /// Power menu (24.11): sleep (not supported yet), shut down, restart.
+    Sleep,
+    PowerOff(bool),
 }
+
+/// Rows of the power menu (24.11, like Windows): label, act, enabled, hint.
+/// Sleep stands grey: the kernel has no ACPI S3 yet (house rule — what is not
+/// done is shown, not hidden).
+const POWER_ROWS: [(&str, PopAct, bool, &str); 3] = [
+    ("Спящий режим", PopAct::Sleep, false, "пока нет"),
+    ("Завершение работы", PopAct::PowerOff(false), true, ""),
+    ("Перезагрузка", PopAct::PowerOff(true), true, ""),
+];
 
 /// Всплывающее над «Пуском»: меню программы, меню пользователя или
 /// раскрытая папка закреплённых.
@@ -2524,6 +2641,8 @@ enum Popup {
     Menu { at: (i32, i32), rows: Vec<(String, PopAct, bool)> },
     User,
     Folder { folder: &'static startapps::Folder, cell: Rect },
+    /// The power menu above the power button (24.11).
+    Power { cell: Rect },
 }
 
 /// Нажатая и, может быть, перетаскиваемая строка «Пуска» (21.11).
@@ -2605,6 +2724,9 @@ pub struct Menu {
     hot: Option<Target>,
     /// Всплывающее меню или папка.
     popup: Option<Popup>,
+    /// When the popup opened (ms of uptime) while it still fades in; 0 —
+    /// shown fully (24.11).
+    pop_since: u64,
     /// Стрелками уже ходили — показать выбранную строку рамкой.
     keys_used: bool,
     cfg: deskcfg::Start,
@@ -2786,6 +2908,7 @@ impl Menu {
             scroll_list: 0,
             hot: None,
             popup: None,
+            pop_since: 0,
             keys_used: false,
             cfg: start_cfg,
             recent: Vec::new(),
@@ -2990,7 +3113,12 @@ impl Menu {
     fn refilter(&mut self) {
         let query = self.query.to_lowercase();
         self.visible = (0..self.items.len())
-            .filter(|index| query.is_empty() || self.items[*index].caption(&self.packages).to_lowercase().contains(&query))
+            // By the caption, and by the program's name (24.11: «term» finds
+            // «Терминал», as Windows finds «cmd»).
+            .filter(|index| {
+                let item = self.items[*index];
+                query.is_empty() || item.caption(&self.packages).to_lowercase().contains(&query) || item.key(&self.packages).to_lowercase().contains(&query)
+            })
             .collect();
         self.row = 0;
         self.scroll_list = 0;
@@ -3031,6 +3159,7 @@ impl Menu {
     /// Открыть или закрыть меню. Возвращает новое состояние.
     pub fn toggle(&mut self) -> bool {
         self.open = !self.open;
+        START_OPEN.store(self.open, Ordering::Relaxed);
         if self.open {
             self.row = 0;
             self.query.clear();
@@ -3052,6 +3181,7 @@ impl Menu {
     /// по ним [`Self::full_rect`] говорит композитору, что стереть.
     pub fn close(&mut self) {
         self.open = false;
+        START_OPEN.store(false, Ordering::Relaxed);
         self.popup = None;
         self.held = None;
     }
@@ -3111,6 +3241,7 @@ impl Menu {
                 Target::User => String::from("user"),
                 Target::Tool(n) => alloc::format!("tool:{n}"),
                 Target::Power(index) => alloc::format!("power:{}", self.items[index].key(&self.packages)),
+                Target::PowerMenu => String::from("power"),
                 _ => continue,
             };
             out.push(at(&name, *rect));
@@ -3140,6 +3271,40 @@ impl Menu {
         for spot in self.spots().into_iter().filter(|spot| spot.starts_with("row:") || spot.starts_with("tile:pkg:windows:")) {
             crate::kprintln!("  desktop     : start spot {spot}");
         }
+    }
+
+    /// Show `popup` — it fades in over [`POP_MS`] (24.11).
+    fn open_popup(&mut self, popup: Popup) {
+        self.popup = Some(popup);
+        self.pop_since = if super::animations_enabled() { crate::time::uptime_ms().max(1) } else { 0 };
+    }
+
+    /// How far the popup has faded in, 0..=255.
+    fn pop_alpha(&self) -> u32 {
+        if self.pop_since == 0 {
+            return 255;
+        }
+        let spent = crate::time::uptime_ms().saturating_sub(self.pop_since);
+        (spent.min(POP_MS) * 255 / POP_MS) as u32
+    }
+
+    /// A popup is still fading in: the desktop redraws Start every frame.
+    #[must_use]
+    pub fn animating(&self) -> bool {
+        self.open && self.popup.is_some() && self.pop_since != 0
+    }
+
+    /// One frame of the popup's fade (desktop, before a frame). `true` —
+    /// Start was redrawn.
+    pub fn tick_anim(&mut self) -> bool {
+        if !self.animating() {
+            return false;
+        }
+        if crate::time::uptime_ms().saturating_sub(self.pop_since) >= POP_MS {
+            self.pop_since = 0;
+        }
+        self.redraw();
+        true
     }
 
     /// Закрыть всплывающее меню, если оно есть (Escape). `true` — было.
@@ -3425,11 +3590,9 @@ impl Menu {
         let side = px(36);
         let y = foot.y + (foot.h as i32 - side as i32) / 2;
         let mut x = card.right() - px(PAD) as i32 - side as i32;
-        let power: Vec<usize> = (0..self.items.len()).rev().filter(|index| self.items[*index].danger()).collect();
-        for index in power {
-            cells.push((Rect::new(x, y, side, side), Target::Power(index)));
-            x -= (side + px(6)) as i32;
-        }
+        // One power button with a menu (24.11, like Windows) instead of two.
+        cells.push((Rect::new(x, y, side, side), Target::PowerMenu));
+        x -= (side + px(6)) as i32;
         // Черта между инструментами и питанием.
         x -= px(8) as i32;
         for tool in (0..TOOLS.len()).rev() {
@@ -3479,6 +3642,16 @@ impl Menu {
                 let h = px(64) + px(POP_ROW) * rows + px(16);
                 let rect = fit(Rect::new(user.x, user.y - h as i32 - px(6) as i32, w, h));
                 let lines = (0..rows as usize).map(|n| (Rect::new(rect.x + px(6) as i32, rect.y + px(64) as i32 + (px(POP_ROW) * n as u32) as i32, rect.w - px(12), px(POP_ROW)), Target::Pop(n))).collect();
+                Some((rect, lines))
+            }
+            Popup::Power { cell } => {
+                let small = ctx.face(Role::Caption);
+                let widest = POWER_ROWS.iter().map(|(label, _, _, hint)| face.width(label) + small.width(hint) + px(24)).max().unwrap_or(0);
+                let w = (widest + px(56)).max(px(240));
+                let h = px(POP_ROW) * POWER_ROWS.len() as u32 + px(12);
+                // Above the button, its right edge at the button's.
+                let rect = fit(Rect::new(cell.right() - w as i32, cell.y - h as i32 - px(6) as i32, w, h));
+                let lines = (0..POWER_ROWS.len()).map(|n| (Rect::new(rect.x + px(6) as i32, rect.y + px(6) as i32 + (px(POP_ROW) * n as u32) as i32, rect.w - px(12), px(POP_ROW)), Target::Pop(n))).collect();
                 Some((rect, lines))
             }
             Popup::Folder { folder, cell } => {
@@ -3581,37 +3754,11 @@ impl Menu {
         }
         let found = self.target_at(x, y);
         let hot = found.map(|(target, _)| target);
-        let mut changed = hot != self.hot;
+        let changed = hot != self.hot;
         self.hot = hot;
-        // Плитка-папка раскрывается наведением; уход и с плитки, и с
-        // раскрытого закрывает её.
-        match found {
-            Some((Target::Tile(n), rect)) => {
-                if let Some(Tile::Folder(folder)) = self.tiles.get(n).copied() {
-                    let open_here = matches!(&self.popup, Some(Popup::Folder { folder: shown, .. }) if shown.key == folder.key);
-                    if !open_here && !matches!(self.popup, Some(Popup::Menu { .. } | Popup::User)) {
-                        self.popup = Some(Popup::Folder { folder, cell: rect });
-                        crate::kprintln!("  desktop     : start folder '{}' opened", folder.caption);
-                        self.log_popup();
-                        changed = true;
-                    }
-                } else if matches!(self.popup, Some(Popup::Folder { .. })) {
-                    self.popup = None;
-                    changed = true;
-                }
-            }
-            Some((Target::Child(_), _)) => {}
-            _ => {
-                if let Some(Popup::Folder { cell, .. }) = &self.popup {
-                    let (lx, ly) = (x - self.rect.x, y - self.rect.y);
-                    let keep = cell.contains(lx, ly) || self.start_layout().popup.is_some_and(|(rect, _)| rect.contains(lx, ly));
-                    if !keep {
-                        self.popup = None;
-                        changed = true;
-                    }
-                }
-            }
-        }
+        // A folder tile opens on a click only (24.11, Roman: «по наведению
+        // выскакивает само»), like the lists of Start and folders of Windows
+        // 11: hovering only lights it.
         if changed {
             self.redraw();
         }
@@ -3638,7 +3785,7 @@ impl Menu {
         let found = self.target_at(x, y);
         // Щелчок мимо открытого меню программы или пользователя закрывает
         // только его.
-        if matches!(self.popup, Some(Popup::Menu { .. } | Popup::User)) && !matches!(found, Some((Target::Pop(_), _))) {
+        if matches!(self.popup, Some(Popup::Menu { .. } | Popup::User | Popup::Power { .. })) && !matches!(found, Some((Target::Pop(_), _))) {
             self.popup = None;
             self.redraw();
             return MenuClick::Stay;
@@ -3657,14 +3804,30 @@ impl Menu {
                 Some(Tile::Item(index)) => self.hold(index, x, y),
                 Some(Tile::Folder(folder)) => {
                     let again = matches!(&self.popup, Some(Popup::Folder { folder: shown, .. }) if shown.key == folder.key);
-                    self.popup = if again { None } else { Some(Popup::Folder { folder, cell: rect }) };
+                    if again {
+                        self.popup = None;
+                        crate::kprintln!("  desktop     : start folder '{}' closed", folder.caption);
+                    } else {
+                        self.open_popup(Popup::Folder { folder, cell: rect });
+                        crate::kprintln!("  desktop     : start folder '{}' opened", folder.caption);
+                    }
                     self.redraw();
+                    if !again {
+                        self.log_popup();
+                    }
                     MenuClick::Stay
                 }
                 None => MenuClick::Stay,
             },
             Target::Row(index) | Target::Child(index) => self.hold(index, x, y),
             Target::Power(index) => self.launch(index),
+            Target::PowerMenu => {
+                self.open_popup(Popup::Power { cell: rect });
+                self.redraw();
+                crate::kprintln!("  desktop     : start power menu opened");
+                self.log_popup();
+                MenuClick::Stay
+            }
             Target::FolderRow(number) => {
                 let key = startapps::FOLDERS[number].key;
                 match self.expanded.iter().position(|known| *known == key) {
@@ -3687,7 +3850,11 @@ impl Menu {
                 None => MenuClick::Stay,
             },
             Target::User => {
-                self.popup = if matches!(self.popup, Some(Popup::User)) { None } else { Some(Popup::User) };
+                if matches!(self.popup, Some(Popup::User)) {
+                    self.popup = None;
+                } else {
+                    self.open_popup(Popup::User);
+                }
                 self.redraw();
                 if self.popup.is_some() {
                     crate::kprintln!("  desktop     : start user menu opened");
@@ -3803,21 +3970,14 @@ impl Menu {
                 rows.push((String::from("Закрепить на панели задач"), PopAct::PinTask(key.clone()), true));
             }
         }
-        // Папки (21.11): строку списка — в любую папку «Пуска» или наружу.
-        if let Some(index) = item.filter(|_| !in_pins) {
-            let home = self.home(index);
-            for folder in startapps::FOLDERS.iter().filter(|folder| folder.key != home) {
-                rows.push((alloc::format!("Переместить в «{}»", folder.caption), PopAct::MoveTo(index, folder.key), true));
-            }
-            if !home.is_empty() {
-                rows.push((String::from("Убрать из папки"), PopAct::MoveTo(index, ""), true));
-            }
-        }
+        // Folders: no «Переместить в …» rows any more (24.11, Roman: junk in
+        // the menu) — a row is moved into a folder or out of it by dragging
+        // it there with the mouse (see `drop_at`).
         if let Some(index) = item.filter(|index| self.windows_file(*index).is_some()) {
             rows.push((String::from("Создать ярлык на рабочем столе"), PopAct::Desk(index), true));
         }
         crate::kprintln!("  desktop     : start context menu for '{key}'");
-        self.popup = Some(Popup::Menu { at, rows });
+        self.open_popup(Popup::Menu { at, rows });
         self.hot = None;
         self.redraw();
         self.log_popup();
@@ -3842,6 +4002,10 @@ impl Menu {
                 _ => return MenuClick::Stay,
             },
             Some(Popup::User) => match Self::user_rows().get(n) {
+                Some((_, act, true, _)) => act.clone(),
+                _ => return MenuClick::Stay,
+            },
+            Some(Popup::Power { .. }) => match POWER_ROWS.get(n) {
                 Some((_, act, true, _)) => act.clone(),
                 _ => return MenuClick::Stay,
             },
@@ -3871,19 +4035,19 @@ impl Menu {
                 crate::kprintln!("  desktop     : taskbar {} '{key}'", if pinned { "pinned" } else { "unpinned" });
                 stay(self)
             }
-            PopAct::MoveTo(index, folder) => {
-                self.move_to_folder(index, folder);
-                let out = stay(self);
-                self.log_rows();
-                out
-            }
             PopAct::Desk(index) => {
                 self.shortcut_to_desktop(index);
                 stay(self)
             }
             PopAct::Account => MenuClick::Launch(Choice::Settings(super::settings::Section::Accounts)),
             PopAct::Lock => MenuClick::Launch(Choice::Lock),
-            PopAct::Logout => MenuClick::Stay,
+            PopAct::Logout | PopAct::Sleep => MenuClick::Stay,
+            // Shift held at the click (24.11): at once, as before; without
+            // it — programs are asked to close first.
+            PopAct::PowerOff(restart) => {
+                let force = crate::input::modifiers().contains(crate::input::Modifiers::SHIFT);
+                MenuClick::Launch(Choice::Power { restart, force })
+            }
         }
     }
 
@@ -3916,15 +4080,18 @@ impl Menu {
             mini_ui::classic::field(&mut self.surface, field, mini_ui::classic::unit(self.scale));
         } else {
             draw::rounded(&mut self.surface, field, px(theme::R_ROW), p.sunk.over(fill), 255);
-            let focus_line = if self.query.is_empty() { p.line3 } else { p.accline };
-            draw::rounded_stroke(&mut self.surface, field, px(theme::R_ROW), focus_line.color, focus_line.alpha);
+            // The field has the keyboard as soon as Start opens (24.11):
+            // accent outline and caret, typing goes straight into it.
+            draw::rounded_stroke(&mut self.surface, field, px(theme::R_ROW), p.accline.color, p.accline.alpha);
         }
         let glyph = px(14);
         glyphicon::draw(&mut self.surface, Icon::Search, field.x + px(12) as i32, field.y + (field.h as i32 - glyph as i32) / 2, glyph, p.ink4, 255);
         let text_x = field.x + px(34) as i32;
         let room = field.right().saturating_sub(text_x + px(12) as i32).max(0) as u32;
         if self.query.is_empty() {
-            paint::text_clipped(ctx, &mut self.surface, Role::Body, text_x, paint::baseline(ctx, Role::Body, field), room, "Поиск программ", p.ink4);
+            let caret = Rect::new(text_x, field.y + px(9) as i32, px(1).max(1), field.h - px(18));
+            self.surface.fill(caret, if classic { p.ink } else { p.acc });
+            paint::text_clipped(ctx, &mut self.surface, Role::Body, text_x + px(4) as i32, paint::baseline(ctx, Role::Body, field), room, "Введите имя программы", p.ink4);
         } else {
             let used = paint::text_clipped(ctx, &mut self.surface, Role::Body, text_x, paint::baseline(ctx, Role::Body, field), room, &self.query, p.ink);
             let caret = Rect::new(text_x + used as i32 + 1, field.y + px(9) as i32, px(1).max(1), field.h - px(18));
@@ -4079,7 +4246,7 @@ impl Menu {
             draw::hline(&mut self.surface, 0, foot.y, card.w, p.line2.color, p.line2.alpha);
         }
         let mut tip: Option<(&str, i32, bool)> = None;
-        let leftmost = layout.cells.iter().filter(|(_, target)| matches!(target, Target::Tool(_) | Target::Power(_))).map(|(rect, _)| rect.x).min().unwrap_or(card.right());
+        let leftmost = layout.cells.iter().filter(|(_, target)| matches!(target, Target::Tool(_) | Target::Power(_) | Target::PowerMenu)).map(|(rect, _)| rect.x).min().unwrap_or(card.right());
         for (rect, target) in &layout.cells {
             match *target {
                 Target::User => {
@@ -4128,6 +4295,21 @@ impl Menu {
                         tip = Some((item.caption(&self.packages), rect.y, true));
                     }
                 }
+                Target::PowerMenu => {
+                    let open = matches!(self.popup, Some(Popup::Power { .. }));
+                    let hot = self.hot == Some(*target) || open;
+                    let plate = if hot { hover } else { p.btn.over(fill) };
+                    if classic {
+                        mini_ui::classic::button(&mut self.surface, *rect, mini_ui::classic::unit(self.scale), open);
+                    } else {
+                        draw::rounded(&mut self.surface, *rect, px(theme::R_ROW), plate, 255);
+                    }
+                    let glyph = px(16);
+                    glyphicon::draw(&mut self.surface, Icon::Power, rect.x + (rect.w as i32 - glyph as i32) / 2, rect.y + (rect.h as i32 - glyph as i32) / 2, glyph, if hot { p.ink } else { p.ink2 }, 255);
+                    if hot && !open {
+                        tip = Some(("Выключение", rect.y, false));
+                    }
+                }
                 _ => {}
             }
         }
@@ -4137,9 +4319,16 @@ impl Menu {
             paint::text_right(ctx, &mut self.surface, Role::Body, leftmost - px(12) as i32, paint::baseline(ctx, Role::Body, row), caption, if danger { p.bad_ink } else { p.ink2 });
         }
 
-        // Всплывающее — поверх всего.
+        // Всплывающее — поверх всего. It appears with a fade and a slight
+        // zoom (24.11, ~150 ms), not at once.
         if let Some((rect, lines)) = &layout.popup {
+            let alpha = self.pop_alpha();
+            let area = Rect::new(rect.x - px(4) as i32, rect.y - px(4) as i32, rect.w + px(8), rect.h + px(8)).intersect(&card);
+            let under = (alpha < 255).then(|| copy_region(&self.surface, area));
             self.draw_popup(ctx.on(fill), *rect, lines);
+            if let Some(under) = under {
+                fade_zoom(&mut self.surface, area, &under, *rect, alpha);
+            }
         }
         // Перенос строки (21.11): в поле поиска — что будет при отпускании,
         // у указателя — значок строки.
@@ -4215,7 +4404,6 @@ impl Menu {
                     let icon = match act {
                         PopAct::Open(_) => Some(Fi::ArrowRight),
                         PopAct::First(_) => Some(Fi::ArrowUp),
-                        PopAct::MoveTo(..) => Some(Fi::Folder),
                         PopAct::Desk(_) => Some(Fi::Monitor),
                         _ => Some(Fi::Pin),
                     };
@@ -4247,6 +4435,25 @@ impl Menu {
                     let ink = if *enabled { p.ink } else { p.ink4 };
                     iconset::draw(&mut self.surface, icon, line.x + px(10) as i32, line.y + (line.h as i32 - glyph as i32) / 2, glyph, if *enabled { p.ink2 } else { p.ink4 }, 255);
                     paint::text(ctx, &mut self.surface, Role::Body, line.x + px(34) as i32, paint::baseline(ctx, Role::Body, *line), label, ink);
+                    if !hint.is_empty() {
+                        paint::text_right(ctx, &mut self.surface, Role::Caption, line.right() - px(10) as i32, paint::baseline(ctx, Role::Caption, *line), hint, p.ink4);
+                    }
+                }
+            }
+            Some(Popup::Power { .. }) => {
+                for ((line, target), (label, act, enabled, hint)) in lines.iter().zip(POWER_ROWS.iter()) {
+                    if self.hot == Some(*target) && *enabled {
+                        draw::rounded(&mut self.surface, *line, px(theme::R_ROW), hover, 255);
+                    }
+                    let glyph = px(15);
+                    let icon = match act {
+                        PopAct::Sleep => Fi::Moon,
+                        PopAct::PowerOff(true) => Fi::Restart,
+                        _ => Fi::Power,
+                    };
+                    let ink = if *enabled { p.ink } else { p.ink4 };
+                    iconset::draw(&mut self.surface, icon, line.x + px(10) as i32, line.y + (line.h as i32 - glyph as i32) / 2, glyph, if *enabled { p.ink2 } else { p.ink4 }, 255);
+                    paint::text(ctx, &mut self.surface, Role::Body, line.x + px(36) as i32, paint::baseline(ctx, Role::Body, *line), label, ink);
                     if !hint.is_empty() {
                         paint::text_right(ctx, &mut self.surface, Role::Caption, line.right() - px(10) as i32, paint::baseline(ctx, Role::Caption, *line), hint, p.ink4);
                     }
@@ -4373,6 +4580,51 @@ impl Menu {
         }
 
         self.damage = self.surface.bounds();
+    }
+}
+
+/// How long a Start popup takes to appear (24.11).
+const POP_MS: u64 = 150;
+
+/// Pixels of `area` of `s`, row by row.
+fn copy_region(s: &Surface, area: Rect) -> Vec<u32> {
+    let mut out = Vec::with_capacity(area.w as usize * area.h as usize);
+    for y in area.y..area.bottom() {
+        let row = s.row(y as u32);
+        out.extend_from_slice(&row[area.x as usize..area.right() as usize]);
+    }
+    out
+}
+
+/// The popup `popup` just drawn into `area` of `s`, shown at `alpha` (0..=255)
+/// over what was there (`under`) and shrunk to 92 % → 100 % about its centre
+/// as it fades in. Channel-wise blending works in any pixel order.
+fn fade_zoom(s: &mut Surface, area: Rect, under: &[u32], popup: Rect, alpha: u32) {
+    if area.is_empty() || area.x < 0 || area.y < 0 || under.len() != area.w as usize * area.h as usize {
+        return;
+    }
+    let drawn = copy_region(s, area);
+    let scale = 920 + 80 * i64::from(alpha.min(255)) / 255;
+    let (cx, cy) = (i64::from(popup.x) + i64::from(popup.w) / 2, i64::from(popup.y) + i64::from(popup.h) / 2);
+    let width = area.w as usize;
+    let a = alpha.min(255);
+    for y in area.y..area.bottom() {
+        let sy = cy + (i64::from(y) - cy) * 1000 / scale;
+        let row = s.row_mut(y as u32);
+        for x in area.x..area.right() {
+            let sx = cx + (i64::from(x) - cx) * 1000 / scale;
+            let at = (y - area.y) as usize * width + (x - area.x) as usize;
+            let back = under[at];
+            let inside = sx >= i64::from(area.x) && sx < i64::from(area.right()) && sy >= i64::from(area.y) && sy < i64::from(area.bottom());
+            let front = if inside { drawn[(sy - i64::from(area.y)) as usize * width + (sx - i64::from(area.x)) as usize] } else { back };
+            let mut out = back & 0xFF00_0000;
+            for shift in [0, 8, 16] {
+                let b = (back >> shift) & 0xFF;
+                let f = (front >> shift) & 0xFF;
+                out |= ((f * a + b * (255 - a)) / 255) << shift;
+            }
+            row[x as usize] = out;
+        }
     }
 }
 
@@ -4732,6 +4984,8 @@ struct Fingerprint {
     layout: u8,
     /// Тема могла смениться, а вместе с ней все цвета плашки.
     dark: bool,
+    /// Tray icons under the chevron and whether its popup is open (24.11).
+    tray: u16,
 }
 
 impl Fingerprint {
@@ -4784,6 +5038,7 @@ impl Fingerprint {
             net: status.net as u8,
             layout: crate::input::keymap::layout() as u8,
             dark: theme::is_dark(),
+            tray: u16::from(deskcfg::taskbar().tray_hidden) | (u16::from(OVERFLOW_OPEN.load(Ordering::Relaxed)) << 8) | (u16::from(deskcfg::taskbar().mode == deskcfg::Mode::Dock) << 9),
         }
     }
 }

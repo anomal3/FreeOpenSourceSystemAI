@@ -60,6 +60,11 @@ pub enum Aim {
     Content(&'static str, i32, i32),
     /// Значок рабочего стола по его номеру сверху, считая с нуля.
     Icon(usize),
+    /// Значок стола с конца (0 — последний) по числу из последней строки
+    /// стола `icons N, M from …` (24.11): файлы каталога стола идут после
+    /// системных значков, значков пакетов и ярлыков Wine, и их номер сверху
+    /// зависел от того, что поставлено (ярлык FossDemo из `winapps-real`).
+    IconFromEnd(usize),
     /// Пустое место стола — правее значков и выше панели.
     Empty,
     /// Середина места, которое «Пуск» напечатал строкой `start spot <имя> at
@@ -186,6 +191,17 @@ fn field(log: &str, label: &str) -> Result<i32> {
     digits
         .parse()
         .with_context(|| format!("за '{label}' не оказалось числа"))
+}
+
+/// Сколько значков на столе: число из последней строки `icons N, M from …`
+/// (`desktop     : icons …` и `desktop folder changed, icons …`).
+fn icon_total(log: &str) -> Result<usize> {
+    log.lines()
+        .filter(|line| line.contains("desktop     : ") && line.contains(" from "))
+        .filter_map(|line| line.split("icons ").nth(1))
+        .filter_map(|rest| rest.split_once(", ").and_then(|(total, _)| total.trim().parse().ok()))
+        .last()
+        .context("в журнале нет строки стола `icons N, M from …`")
 }
 
 /// Высота полосы заголовка окна. `theme::TITLE_H`.
@@ -467,7 +483,15 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         // 112×64 на масштаб. Столбец кончается у панели задач — ровно так же,
         // как его считает сам стол, и по той же формуле: разойдись они, прицел
         // молча уехал бы в соседнюю ячейку.
-        Aim::Icon(index) => {
+        Aim::Icon(_) | Aim::IconFromEnd(_) => {
+            let index = match aim {
+                Aim::IconFromEnd(back) => {
+                    let total = icon_total(log)?;
+                    total.checked_sub(back + 1).with_context(|| format!("на столе {total} значков, с конца {back} нет"))?
+                }
+                Aim::Icon(index) => index,
+                _ => unreachable!(),
+            };
             let scale = ui_scale(log)?;
             let step_x = (ICON_CELL_W + ICON_GAP) * scale;
             let step_y = (ICON_CELL_H + ICON_GAP) * scale;

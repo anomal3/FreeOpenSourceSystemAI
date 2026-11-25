@@ -183,6 +183,11 @@ impl Info {
 }
 
 impl App for Info {
+    /// Smallest window (24.11, WM SDK): the 230-point section list and the facts table.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(600, 400)
+    }
+
     fn key_with(&mut self, code: u32, mods: i32, latin: u32) -> bool {
         let ctrl = mods & user_abi::WIN_MOD_CTRL != 0;
         let page = self.visible.get().max(1) as isize;

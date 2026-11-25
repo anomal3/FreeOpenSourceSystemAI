@@ -96,12 +96,44 @@ pub fn accept(path: &str) -> Accepted<'_> {
         return Accepted::Translated(out);
     }
 
+    // UNC (Roman 24.11): `\\host\share\dir` is a shared folder of another
+    // computer — `/net/host/share/dir` (kernel `fs::netfs`).
+    if let Some(rest) = path.strip_prefix("\\\\") {
+        return Accepted::Translated(unc_to_net(rest));
+    }
+
     // Одиночная обратная косая в начале: «от корня» в виндовом написании.
     if path.starts_with('\\') {
         return Accepted::Translated(path.replace('\\', "/"));
     }
 
     Accepted::AsIs(path)
+}
+
+/// Where shared folders of other computers live.
+pub const NET: &str = "/net";
+
+/// `host\share\dir` (after the leading `\\`) as `/net/host/share/dir`.
+fn unc_to_net(rest: &str) -> String {
+    let mut out = String::from(NET);
+    for part in rest.split(['\\', '/']).filter(|part| !part.is_empty()) {
+        out.push('/');
+        out.push_str(part);
+    }
+    out
+}
+
+/// `/net/host/share/dir` as `\\host\share\dir` — for showing a network path
+/// the way it was typed. `None` — not under `/net/<host>`.
+#[must_use]
+pub fn net_to_unc(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(NET)?.strip_prefix('/')?.trim_end_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+    let mut out = String::from("\\\\");
+    out.push_str(&rest.replace('/', "\\"));
+    Some(out)
 }
 
 /// Тот же перевод, но одной строкой: чужая буква возвращается как есть.
@@ -166,6 +198,7 @@ pub fn label(path: &str) -> Option<&'static str> {
         "/opt" => "Установленные пакеты",
         "/usr" => "Система",
         "/var" => "Служебные данные",
+        "/net" => "Сеть",
         _ => return None,
     })
 }
@@ -199,6 +232,17 @@ mod tests {
         assert_eq!(unix("C:/etc"), "/etc");
         assert_eq!(unix(r"\etc\system.cfg"), "/etc/system.cfg");
         assert_eq!(unix(r"c:\bin"), "/bin");
+    }
+
+    /// `\\host\share` — a shared folder on another computer, under `/net`.
+    #[test]
+    fn unc_paths_go_to_net() {
+        assert_eq!(unix(r"\\192.168.88.246"), "/net/192.168.88.246");
+        assert_eq!(unix(r"\\192.168.88.246\"), "/net/192.168.88.246");
+        assert_eq!(unix(r"\\NAS\Общая\Фото\2026"), "/net/NAS/Общая/Фото/2026");
+        assert_eq!(net_to_unc("/net/NAS/Общая/Фото").as_deref(), Some(r"\\NAS\Общая\Фото"));
+        assert_eq!(net_to_unc("/net"), None);
+        assert_eq!(label("/net"), Some("Сеть"));
     }
 
     /// `C:` и `C:\` — это корень, а не пустая строка.

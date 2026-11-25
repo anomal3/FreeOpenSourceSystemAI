@@ -10,6 +10,7 @@ description = "Проба DirectX 9/11/12 для Proton в FossAi: окно, о�
 [dependencies.windows]
 version = "0.62"
 features = [
+    "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
@@ -26,6 +27,7 @@ features = [
     "Win32_System_Variant",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_UI_Input_XboxController",
     "Win32_UI_WindowsAndMessaging",
 ]
 

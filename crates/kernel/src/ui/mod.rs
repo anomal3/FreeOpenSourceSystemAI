@@ -48,7 +48,9 @@ pub mod clipboard;
 pub mod compositor;
 pub mod context;
 pub mod deskcfg;
+pub mod deskicons;
 pub mod dialog;
+pub mod ending;
 pub mod icons;
 pub mod lock;
 pub mod look;
@@ -439,7 +441,7 @@ fn open_file(desktop: &mut Compositor, command: &str, path: &str) {
         run_choice(desktop, panel::proton_choice(openwith::line(command, path)));
         return;
     }
-    start(desktop, &alloc::format!("{command} {path}"));
+    start(desktop, &openwith::line(command, path));
 }
 
 /// Закрыть окно так же, как его крестик: окно программы закрывает она сама.
@@ -2261,6 +2263,84 @@ pub fn lock_now() -> bool {
     .is_some()
 }
 
+/// `with_desktop` for the shutdown task (24.11): it may wait — retries while
+/// the desktop is busy composing, up to about two seconds.
+fn with_desktop_waiting<T>(mut work: impl FnMut(&mut Compositor) -> T) -> Option<T> {
+    for _ in 0..1000 {
+        if let Some(answer) = with_desktop(&mut work) {
+            return Some(answer);
+        }
+        if !graphics() {
+            return None;
+        }
+        crate::sched::sleep_ms(2);
+    }
+    None
+}
+
+/// Program windows open now (`App::Program`): their apps.
+fn program_windows(desktop: &Compositor) -> alloc::vec::Vec<App> {
+    let mut apps = alloc::vec::Vec::new();
+    let mut index = 0;
+    while let Some(app) = desktop.app_at(index) {
+        if matches!(app, App::Program(..)) {
+            apps.push(app);
+        }
+        index += 1;
+    }
+    apps
+}
+
+/// Graceful shutdown, first step (24.11, `power::graceful`): the black
+/// «Завершение работы» / «Перезагрузка» screen on every monitor, and every
+/// program window asked to close exactly as by its cross (native programs
+/// get `WIN_CLOSE`, Wayland clients `xdg_toplevel.close`, Wine windows
+/// `WM_CLOSE` through it). Answer — how many windows were asked; `None` —
+/// no desktop.
+pub fn begin_ending(restart: bool) -> Option<usize> {
+    with_desktop_waiting(|desktop| {
+        if desktop.menu_open() {
+            if let Some(menu) = desktop.menu_mut() {
+                menu.close();
+            }
+            desktop.mark_menu_area();
+        }
+        desktop.close_tray_pop();
+        if desktop.context_open() {
+            desktop.close_context();
+        }
+        desktop.begin_ending(restart);
+        let apps = program_windows(desktop);
+        for app in &apps {
+            let name = name_of(desktop, *app);
+            if request_close(desktop, *app) {
+                kprintln!("  desktop     : ending: close requested of '{name}'");
+            }
+        }
+        desktop.present();
+        apps.len()
+    })
+}
+
+/// The machine refused to go down (24.11): the desktop comes back.
+pub fn cancel_ending() {
+    with_desktop_waiting(|desktop| {
+        desktop.cancel_ending();
+        desktop.present();
+    });
+}
+
+/// Graceful shutdown, while waiting (24.11): next frame of the spinner, a
+/// note under the words; answer — program windows still open.
+pub fn ending_tick(note: Option<&str>) -> usize {
+    with_desktop_waiting(|desktop| {
+        desktop.ending_tick(note);
+        desktop.present();
+        program_windows(desktop).len()
+    })
+    .unwrap_or(0)
+}
+
 pub fn set_screen_off(off: bool) -> bool {
     let status = if off { None } else { Some(status_now()) };
     with_desktop(|desktop| {
@@ -2328,14 +2408,36 @@ pub fn tick() {
         }
         // Фон (22.11, `wallpaper`): картинка перевелась — стол и «Фон» заново.
         if framegap::step(&"wallpaper", wallpaper::poll) {
+            // Картинка экрана блокировки могла дойти, пока он на экране.
+            if desktop.locked() {
+                desktop.redraw_lock();
+            }
             desktop.repaint_all();
             if let Some(window) = desktop.find(App::Settings) {
                 window.refresh_settings();
             }
         }
         desktop.expire_toast();
+        // «Определить» (24.11): plates asked by «Параметры» or OBS.
+        let identify = IDENTIFY_MS.swap(0, Ordering::Relaxed);
+        if identify != 0 {
+            let numbers: Vec<_> = crate::display::outputs::list().into_iter().enumerate().map(|(i, o)| (o.backend, i as u32 + 1, o.name)).collect();
+            if !desktop.start_identify(&numbers, identify) {
+                kprintln!("  desktop     : identify: no monitor to show the numbers on");
+            }
+        }
+        desktop.expire_identify();
         // Screen recorder (22.11): «Запись сохранена», a capture left behind.
         framegap::step(&"capture", || capture::tick(desktop));
+        // A btrfs commit failed (24.11): the batch of changes is lost - say so.
+        if let Some(text) = crate::fs::btrfsfs::take_commit_failure() {
+            let art = appicon::tool_art("eventlog").unwrap_or(appicon::Art::Glyph(mini_ui::glyphicon::Icon::Log, mini_ui::paint::Tone::Bad, true));
+            let (area, panel_top) = desktop.toast_place();
+            if let Some(toast) = toast::Toast::notice("Диск", "Изменения не сохранены", &text, "Журнал событий", &art, String::from("/bin/eventlog"), fpk::Rights::ALL, area, panel_top, desktop.scale()) {
+                desktop.show_toast(toast);
+            }
+            kprintln!("  desktop     : notification 'Изменения не сохранены' ({text})");
+        }
         desktop.refresh_lock_clock();
         framegap::step(&"watch hung", || watch_hung(desktop));
         // Wi-Fi включается отдельной задачей: сменилось состояние —
@@ -2442,7 +2544,8 @@ pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
     let defer = crate::input::has_events();
     let since = crate::time::uptime_ns();
     let _waiting = InputWaiting;
-    for attempt in 0..INPUT_TRIES {
+    let mut attempt = 0;
+    loop {
         let answer = with_desktop(|desktop| {
             desktop.set_deferred(defer);
             let answer = dispatch_on(desktop, event, &status);
@@ -2463,10 +2566,16 @@ pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
         }
         // Стол вынут из-под замка: кто-то собирает кадр. Ждём — см.
         // [`INPUT_TRIES`], — но только между попытками, а не после последней.
-        if attempt + 1 < INPUT_TRIES {
-            INPUT_WAITING.store(true, Ordering::Relaxed);
-            crate::sched::sleep_ms(INPUT_PAUSE_MS);
+        // With Start open (24.11) a key is a letter of its search: it waits
+        // for the desktop longer instead of landing in the window under Start
+        // (Roman: Win, then typing — the letters went to the focused window).
+        attempt += 1;
+        let limit = if panel::start_open() { INPUT_TRIES * 8 } else { INPUT_TRIES };
+        if attempt >= limit {
+            break;
         }
+        INPUT_WAITING.store(true, Ordering::Relaxed);
+        crate::sched::sleep_ms(INPUT_PAUSE_MS);
     }
     // Не дождались. Событие всё-таки уходит оболочке: она есть всегда, а
     // потерять нажатие молча — худшее из возможного.
@@ -2501,6 +2610,10 @@ const INPUT_TRIES: u32 = 250;
 const INPUT_PAUSE_MS: u64 = 2;
 
 fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
+    // «Завершение работы» (24.11) takes no input.
+    if desktop.ending() {
+        return None;
+    }
     // The key that ends the screensaver or wakes the dark screen (22.11) is
     // not delivered, nor its release.
     let saver_up = desktop.saver_showing();
@@ -2601,7 +2714,7 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
     // столу: иначе F2 принадлежит окну (у `mc` это меню).
     if event.code == KeyCode::F2 && DESK_FOCUS.load(Ordering::Relaxed) {
         if let Some(index) = desktop.icon_selection() {
-            if matches!(desktop.icon_kind(index), Some(icons::Kind::Folder | icons::Kind::File)) {
+            if matches!(desktop.icon_kind(index), Some(icons::Kind::Folder | icons::Kind::File)) || selected_special(desktop).is_some() {
                 desktop.start_icon_edit(index);
                 kprintln!("  desktop     : naming '{}'", desktop.icon_label(index).unwrap_or_default());
                 desktop.present();
@@ -2624,6 +2737,19 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
         } else {
             desktop_to_clipboard(desktop, event.code == KeyCode::X);
         }
+        return None;
+    }
+    // Delete на столе (24.11, Роман: «неизвестный файл не удалить») — меню
+    // подписывало «Удалить  Del», а клавиши стол не знал.
+    if event.code == KeyCode::Delete
+        && DESK_FOCUS.load(Ordering::Relaxed)
+        && !event.mods.contains(Modifiers::CTRL)
+        && !event.mods.contains(Modifiers::ALT)
+        && !desktop.context_open()
+        && !desktop.menu_open()
+        && desktop_delete_key(desktop)
+    {
+        desktop.present();
         return None;
     }
 
@@ -2677,7 +2803,8 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
         // (22.11): a running capture is asked to stop, otherwise
         // `/bin/screenrec --record` starts with the saved settings.
         KeyCode::R if event.mods.contains(Modifiers::META) && event.mods.contains(Modifiers::ALT) => {
-            if capture::active() {
+            // A program's screen source (OBS, 24.11) is not a recording.
+            if capture::recording() {
                 capture::request_stop();
             } else {
                 run_choice(desktop, panel::Choice::Program("screenrec", "--record"));
@@ -3091,6 +3218,10 @@ pub fn swallow_wake_touch() {
 }
 
 fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
+    // «Завершение работы» (24.11) takes no input.
+    if desktop.ending() {
+        return;
+    }
     // The screensaver (22.11) ends on the first motion or click, which goes
     // no further.
     let saver_up = desktop.saver_showing();
@@ -3328,7 +3459,14 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                     }
                     // Меню по тому, во что целились (как в Windows): ярлык
                     // программы, системный значок, папка, файл.
+                    // System icons (24.11): rename, hide, properties.
+                    let special = desktop.icon_kind(index).and_then(|kind| deskicons::of_item(&kind, desktop.icon_path(index).as_deref()));
                     match desktop.icon_kind(index) {
+                        _ if special == Some(deskicons::Special::Computer) => (&context::Action::ON_COMPUTER[..], "icon (computer)"),
+                        _ if matches!(special, Some(deskicons::Special::User | deskicons::Special::Network)) => (&context::Action::ON_PLACE[..], "icon (place)"),
+                        _ if matches!(special, Some(deskicons::Special::Control | deskicons::Special::Terminal | deskicons::Special::About)) => {
+                            (&context::Action::ON_SYSTEM[..], "icon (system)")
+                        }
                         Some(icons::Kind::Program(_)) if desktop.icon_is_shortcut(index) => {
                             (&context::Action::ON_PROGRAM[..], "icon")
                         }
@@ -4397,8 +4535,13 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
         kprintln!("  desktop     : closed '{}'", app.title());
     }
     match (app.confirms_power(), answer) {
+        // Programs are asked to close first (24.11); Shift held — at once.
         (Some(restart), Answer::Confirm) => {
-            crate::power::request(restart, crate::power::Source::Desktop);
+            if crate::input::modifiers().contains(Modifiers::SHIFT) {
+                crate::power::request(restart, crate::power::Source::Desktop);
+            } else {
+                crate::power::request_graceful(restart);
+            }
         }
         (Some(_), Answer::Close) => kprintln!("  desktop     : '{}' cancelled", app.title()),
         _ => {}
@@ -5237,6 +5380,10 @@ pub fn taskbar_command(words: &str) {
     with_desktop(|desktop| {
         desktop.refresh_panel(&status);
         desktop.present();
+        // Where the tray icons are now (24.11) — the bench aims at them.
+        for spot in desktop.tray_spots() {
+            kprintln!("  desktop     : start spot {spot}");
+        }
     });
 }
 
@@ -5292,10 +5439,12 @@ fn section_named(name: &str) -> Option<Section> {
         "keyboard" | "typing" | "regionlanguage" | "language" => Section::Keyboard,
         "usb" | "autoplay" => Section::Usb,
         "network" | "network-status" | "network-ethernet" | "network-wifi" | "network-proxy" => Section::Network,
+        "sharing" | "advancedsharing" | "network-advancedsharing" | "network-advancedsettings" => Section::Sharing,
         "personal" | "personalization" => Section::Personal,
         "wallpaper" | "personalization-background" | "background" => Section::Wallpaper,
         "colors" | "personalization-colors" => Section::Colors,
         "appearance" | "themes" | "personalization-themes" => Section::Appearance,
+        "lockscreen" | "lock" | "personalization-lock" | "screensaver" => Section::LockScreen,
         "dock" | "taskbar" => Section::Dock,
         "start" | "personalization-start" => Section::Start,
         "explorer" | "folders" => Section::Explorer,
@@ -5332,6 +5481,11 @@ pub fn open_command(words: &str) -> Result<String, String> {
                 desktop.present();
             });
             Ok(alloc::format!("settings {section:?}"))
+        }
+        // «Параметры значков рабочего стола» (24.11).
+        "deskicons" => {
+            with_desktop(|desktop| open_desktop_icons_dialog(desktop));
+            Ok(String::from(what))
         }
         "terminal" | "about" => {
             let app = if what == "terminal" { App::Terminal } else { App::About };
@@ -5483,6 +5637,18 @@ fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
             desktop.lock_screen();
             kprintln!("  desktop     : locked");
         }
+        // Start's power menu (24.11): without Shift programs are asked to
+        // close first (`power::request_graceful`); with Shift — at once.
+        panel::Choice::Power { restart, force } => {
+            let what = if restart { "restart" } else { "shut down" };
+            if force {
+                kprintln!("  desktop     : {what} at once (Shift)");
+                crate::power::request(restart, crate::power::Source::Desktop);
+            } else {
+                kprintln!("  desktop     : {what} requested, closing programs first");
+                crate::power::request_graceful(restart);
+            }
+        }
         panel::Choice::Recent(command, path) => {
             kprintln!("  desktop     : opening recent '{path}'");
             open_file(desktop, &command, &path);
@@ -5589,6 +5755,13 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
             let Some(command) = desktop.icon_path(index) else {
                 return;
             };
+            // «Сеть» on the desktop: «Файлы» at `/net` — the computers of
+            // the network and their shared folders (SMB, 24.11), as Windows'
+            // «Сеть» opens Explorer.
+            if command == deskicons::NETWORK_COMMAND {
+                start(desktop, deskicons::NETWORK_FILES);
+                return;
+            }
             // Ярлык программы Windows (21.11) — с правами пакета `proton`,
             // как из «Пуска».
             if command.contains(panel::PROTON_SCRIPT) {
@@ -5765,6 +5938,51 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         // имя, второе — подтверждения. Действие происходит в ответе на
         // клавишу, см. [`handle_context_key`].
         // «Переименовать» — поле на месте подписи, как F2.
+        // A system icon (24.11): its name lives in `desktop.cfg`.
+        context::Action::Rename if selected_special(desktop).is_some() => {
+            desktop.close_context();
+            kprintln!("  desktop     : context menu closed");
+            if let Some(index) = desktop.icon_selection() {
+                desktop.start_icon_edit(index);
+                kprintln!("  desktop     : naming '{}'", desktop.icon_label(index).unwrap_or_default());
+            }
+        }
+        context::Action::HideIcon => {
+            desktop.close_context();
+            if let Some(special) = selected_special(desktop) {
+                deskicons::set_shown(special, false);
+                desktop.reload_icons();
+                log_icons(desktop);
+                desktop.repaint_all();
+            }
+        }
+        context::Action::Manage => {
+            desktop.close_context();
+            run_choice(desktop, panel::Choice::Program("compmgmt", ""));
+            desktop.refresh_panel(status);
+        }
+        // «Свойства» of a system icon (24.11): «Этот компьютер» — the system
+        // page of «Параметры», «Сеть» — the network page, the user's files —
+        // facts of the folder.
+        context::Action::Properties if matches!(selected_special(desktop), Some(deskicons::Special::Computer | deskicons::Special::Network | deskicons::Special::User)) => {
+            match selected_special(desktop) {
+                Some(deskicons::Special::Computer) => {
+                    desktop.close_context();
+                    open_settings(desktop, Section::About, status);
+                }
+                Some(deskicons::Special::Network) => {
+                    desktop.close_context();
+                    open_settings(desktop, Section::Network, status);
+                }
+                _ => {
+                    let home = deskicons::home_dir();
+                    let label = desktop.icon_selection().and_then(|index| desktop.icon_label(index)).unwrap_or_default();
+                    let note = entry_facts(&home, &label);
+                    kprintln!("  desktop     : properties of '{home}': {note}");
+                    desktop.context_note(&note);
+                }
+            }
+        }
         context::Action::Rename => match selected_entry(desktop) {
             Some((_, label)) => {
                 desktop.close_context();
@@ -5828,9 +6046,25 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
                 desktop.context_note(&alloc::format!("{}: объектов {count}, {}", trash::LABEL, human_size(bytes)));
                 kprintln!("  desktop     : trash has {count} items, {bytes} bytes");
             } else if let Some((path, label)) = selected_entry(desktop) {
-                let note = entry_facts(&path, &label);
-                kprintln!("  desktop     : properties of '{path}': {note}");
-                desktop.context_note(&note);
+                // Окно «Свойства» «Файлов» (24.11): имя, тип, «Открывать с
+                // помощью», размер, атрибуты — как у Проводника. Строка
+                // запуска не длиннее 255 байт: что не влезло, не попадает.
+                let mut entries = selected_entries(desktop);
+                if entries.is_empty() {
+                    entries.push((path.clone(), label.clone()));
+                }
+                let mut line = String::from("/bin/files --properties");
+                for (path, _) in &entries {
+                    let word = panel::pct(path);
+                    if line.len() + word.len() + 1 > 250 {
+                        break;
+                    }
+                    line.push(' ');
+                    line.push_str(&word);
+                }
+                desktop.close_context();
+                kprintln!("  desktop     : properties of '{path}' ({} item(s))", entries.len());
+                start(desktop, &line);
             }
         }
         context::Action::NewFolder | context::Action::NewTextFile => {
@@ -6029,6 +6263,8 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
         TrayItem::Clock => traypop::Kind::Calendar,
         TrayItem::Volume => traypop::Kind::Volume,
         TrayItem::Bell => traypop::Kind::Quick,
+        // The chevron (24.11): the icons kept off the taskbar.
+        TrayItem::Overflow => traypop::Kind::Overflow,
         // The red recording indicator (22.11): a click stops the recording.
         TrayItem::Recording => {
             capture::request_stop();
@@ -6040,6 +6276,9 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
     desktop.close_tray_pop();
     if was != Some(kind) && desktop.open_tray_pop(kind, item) {
         kprintln!("  desktop     : tray popup {kind:?} opened");
+        for spot in desktop.tray_pop_spots() {
+            kprintln!("  desktop     : start spot {spot}");
+        }
     }
     desktop.refresh_panel(status);
 }
@@ -6101,6 +6340,12 @@ fn press_tray_pop(desktop: &mut Compositor, x: i32, y: i32, status: &Status) -> 
         }
         desktop.close_tray_pop();
         match action {
+            // An icon of the chevron's popup (24.11): as its click on the
+            // taskbar — its own window opens above the chevron.
+            traypop::Action::Item(item) => {
+                kprintln!("  desktop     : tray overflow item {item:?}");
+                tray_click(desktop, item, status);
+            }
             traypop::Action::Layout(layout) => {
                 keymap::set_layout(layout);
                 desktop.refresh_panel(status);
@@ -6137,6 +6382,9 @@ fn settings_request(desktop: &mut Compositor, request: settings::Request, status
         settings::Request::Restart => launch(desktop, App::Restart),
         settings::Request::Panel => {}
         settings::Request::Scale => apply_scale(desktop, status),
+        // «Персонализация → Значки рабочего стола»: the dialog of the
+        // desktop shell (`/bin/deskicon`, `open_desktop_icons_dialog`).
+        settings::Request::DesktopIcons => start(desktop, "/bin/deskicon"),
     }
     kprintln!("  desktop     : settings asked for {request:?}");
     desktop.refresh_panel(status);
@@ -6159,7 +6407,22 @@ fn finish_icon_edit(desktop: &mut Compositor, accept: Option<String>) {
         return;
     };
     let (path, label) = (desktop.icon_path(index), desktop.icon_label(index).unwrap_or_default());
+    // A system icon (24.11): the new name goes to `desktop.cfg`, nothing on
+    // disk is renamed.
+    let special = desktop.icon_kind(index).and_then(|kind| deskicons::of_item(&kind, path.as_deref()));
     desktop.end_icon_edit();
+    if let Some(special) = special {
+        match accept {
+            Some(name) if !name.trim().is_empty() && name != label => {
+                deskicons::set_label(special, Some(&name));
+                desktop.reload_icons();
+                log_icons(desktop);
+            }
+            Some(_) => kprintln!("  desktop     : named '{label}'"),
+            None => kprintln!("  desktop     : naming '{label}' cancelled"),
+        }
+        return;
+    }
     match (accept, path) {
         (Some(name), Some(path)) if !name.is_empty() && name != label => match context::rename_entry(&path, &name) {
             Ok(target) => {
@@ -6187,6 +6450,31 @@ fn selected_entries(desktop: &Compositor) -> alloc::vec::Vec<(String, String)> {
         .filter(|index| matches!(desktop.icon_kind(*index), Some(icons::Kind::Folder | icons::Kind::File)))
         .filter_map(|index| Some((desktop.icon_path(index)?, desktop.icon_label(index)?)))
         .collect()
+}
+
+/// Клавиша Delete на столе: выделенные файлы и каталоги — тем же окном
+/// «Удаление файла», что пункт меню «Удалить». `false` — удалять нечего
+/// (выделен системный значок или ярлык программы).
+fn desktop_delete_key(desktop: &mut Compositor) -> bool {
+    let mut entries = selected_entries(desktop);
+    if entries.is_empty() && desktop.icon_selection().is_some_and(|index| matches!(desktop.icon_kind(index), Some(icons::Kind::Folder | icons::Kind::File))) {
+        entries.extend(selected_entry(desktop));
+    }
+    let question = match entries.as_slice() {
+        [] => return false,
+        [(_, label)] => alloc::format!("Удалить «{label}»?"),
+        many => alloc::format!("Удалить объекты ({})?", many.len()),
+    };
+    kprintln!("  desktop     : Delete key on {} item(s)", entries.len());
+    *DELETE_PENDING.lock() = entries;
+    EMPTY_PENDING.store(false, Ordering::Relaxed);
+    let rect = layout(desktop, App::DeleteAsk);
+    if let Some(window) = Window::dialog(App::DeleteAsk, rect, desktop.scale(), Dialog::Delete { question, forever: false }) {
+        desktop.push(window);
+        kprintln!("  desktop     : opened '{}'", App::DeleteAsk.title());
+        log_focus(desktop);
+    }
+    true
 }
 
 /// Выделенные значки стола (файлы, каталоги) — в буфер обмена системы
@@ -6222,6 +6510,20 @@ fn desktop_paste() {
         Ok(_) => kprintln!("  desktop     : pasting {} item(s){} into {dir}", paths.len(), if cut { " (cut)" } else { "" }),
         Err(err) => kprintln!("  desktop     : cannot paste: {err}"),
     }
+}
+
+/// «Параметры значков рабочего стола» (24.11): the dialog `/bin/deskicon`
+/// — checkboxes of the system icons, a preview, «Сменить значок…» and
+/// «Обычный значок». The entry point for «Персонализация».
+pub fn open_desktop_icons_dialog(desktop: &mut Compositor) {
+    start(desktop, "/bin/deskicon");
+    kprintln!("  desktop     : desktop icons dialog requested");
+}
+
+/// The system icon selected on the desktop (24.11, `deskicons`).
+fn selected_special(desktop: &Compositor) -> Option<deskicons::Special> {
+    let index = desktop.icon_selection()?;
+    deskicons::of_item(&desktop.icon_kind(index)?, desktop.icon_path(index).as_deref())
 }
 
 /// Что выбрано на столе, если это файл или каталог: путь и подпись.
@@ -7081,6 +7383,9 @@ pub fn resize_window(task: u32, slot: u32, pixels: Surface) -> Result<(), Window
     .unwrap_or_else(|| Err(unavailable()))
 }
 
+/// Program windows that asked for fullscreen (`WIN_STYLE_FULLSCREEN`).
+static FULL_ASKED: crate::sync::SpinLock<alloc::vec::Vec<(u32, u32)>> = crate::sync::SpinLock::new(alloc::vec::Vec::new());
+
 /// Запомнить, что умеет окно программы (фаза 62b, `user_abi::SYS_WINSTYLE`).
 pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError> {
     let app = App::Program(task, slot);
@@ -7125,6 +7430,79 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
                 kprintln!("  desktop     : '{}' placed at the Start button {x},{y}", name_of(desktop, app));
                 log_window(desktop, app, focused);
             }
+            desktop.repaint_all();
+        }
+        // Fullscreen asked by the program itself (24.11, F11 in «Фотографии»);
+        // only a change of the request acts — the other style calls of a
+        // window made fullscreen otherwise (monitor-sized) leave it so.
+        let full = flags & user_abi::WIN_STYLE_FULLSCREEN != 0;
+        let asked = FULL_ASKED.lock().contains(&(task, slot));
+        if full != asked {
+            if full {
+                FULL_ASKED.lock().push((task, slot));
+            } else {
+                FULL_ASKED.lock().retain(|known| *known != (task, slot));
+            }
+            if desktop.set_fullscreen(app, full) {
+                kprintln!("  desktop     : '{}' {} fullscreen at its request", name_of(desktop, app), if full { "is" } else { "left" });
+                desktop.repaint_all();
+            }
+        }
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// «Определить» asked (24.11): how long to show the plates, ms; zero — not
+/// asked. Taken by the next desktop tick — the caller may be inside the
+/// desktop already («Параметры») or in a system call (OBS).
+static IDENTIFY_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Show the number of every monitor on it for `ms` (0 — 3 s), like
+/// «Определить» in Windows: «Параметры → Дисплей», OBS through
+/// `/dev/fossai-capture` and `user_abi::CAP_IDENTIFY`.
+pub fn identify_monitors(ms: u64) {
+    let ms = if ms == 0 { 3_000 } else { ms.clamp(500, 15_000) };
+    IDENTIFY_MS.store(ms, Ordering::Relaxed);
+    kprintln!("  desktop     : identify asked for {ms} ms");
+}
+
+/// Size limits of a program window (24.11, WM SDK: `user_abi::SYS_WINLIMITS`
+/// and `xdg_toplevel.set_min_size/set_max_size`). A window outside the new
+/// limits is resized into them at once (the program is asked to redraw).
+pub fn limit_window(task: u32, slot: u32, limits: window::SizeLimits) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let focused = desktop.focused_app() == Some(app);
+        let name = name_of(desktop, app);
+        let Some(window) = desktop.find(app) else {
+            return Err(WindowError::NoWindow);
+        };
+        if !window.set_limits(limits) {
+            return Ok(());
+        }
+        window.draw_decorations(focused);
+        let l = window.limits();
+        kprintln!(
+            "  desktop     : '{name}' size limits min {}x{} max {}x{}{}{}",
+            l.min.0,
+            l.min.1,
+            l.max.0,
+            l.max.1,
+            if l.logical { " points" } else { " px" },
+            if l.fixed() { ", fixed size" } else { "" }
+        );
+        let before = window.rect;
+        if !window.fullscreen && window.resizable() {
+            let (w, h) = window.clamp_size(before.w, before.h);
+            if (w, h) != (before.w, before.h) && window.resize(w, h) {
+                window.draw_decorations(focused);
+            }
+        }
+        if desktop.rect_of(app).is_some_and(|rect| rect != before) {
+            kprintln!("  desktop     : '{name}' resized into its limits");
+            log_window(desktop, app, focused);
             desktop.repaint_all();
         }
         desktop.present();

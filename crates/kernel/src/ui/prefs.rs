@@ -104,6 +104,8 @@ pub fn adopt() {
     if let Some(list) = sysconf::value(text, "hidden_shortcuts") {
         super::icons::set_hidden(list);
     }
+    // System desktop icons: shown, names, pictures (24.11, `deskicons`).
+    super::deskicons::adopt(text);
     // Что показывает панель рядом с часами (фаза 69b).
     for (pref, key) in [
         (super::settings::PanelPref::Uptime, "panel_uptime"),
@@ -127,10 +129,41 @@ pub fn adopt() {
     super::deskcfg::adopt(text, &path);
     // Заставка (22.11, `saver`).
     super::saver::adopt(text, &path);
+    // Подробная загрузка (24.11): what «Восстановление» shows; the loader
+    // itself reads `\FREEOS\BOOT.CFG`.
+    if let Some(mode) = sysconf::value(text, "boot_log") {
+        BOOT_VERBOSE.store(mode.trim() == "verbose", core::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(height) = sysconf::title_bar(text) {
         if mini_ui::theme::set_title_h(height) {
             crate::kprintln!("  desktop     : title bar {height} px from {path}");
         }
+    }
+}
+
+/// «Подробная загрузка» chosen in «Параметрах» (24.11).
+static BOOT_VERBOSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Is the verbose boot chosen for the next boots.
+#[must_use]
+pub fn boot_verbose() -> bool {
+    BOOT_VERBOSE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Choose the normal (logo and bar) or verbose (log) boot for the next
+/// boots: `\FREEOS\BOOT.CFG` for the loader and `boot_log=` here. `Ok` -
+/// what to tell the person.
+pub fn set_boot_verbose(on: bool) -> Result<alloc::string::String, alloc::string::String> {
+    BOOT_VERBOSE.store(on, core::sync::atomic::Ordering::Relaxed);
+    let mode = if on { "verbose" } else { "normal" };
+    crate::kprintln!("  settings    : boot {mode}");
+    let said = alloc::string::String::from(if on { "со следующей загрузки — журнал вместо логотипа" } else { "со следующей загрузки — логотип и полоса" });
+    let loader = crate::slot::request_boot_log(on);
+    let stored = store_line("boot_log", mode);
+    match (loader, stored) {
+        (Ok(()), Ok(())) => Ok(said),
+        (Err(err), _) => Err(alloc::format!("{said}: загрузчику не записано ({err})")),
+        (_, Err(err)) => Err(alloc::format!("{said}, но не запомнено: {err}")),
     }
 }
 
@@ -183,17 +216,41 @@ pub fn store_hidden_shortcuts(list: &str) -> Result<(), crate::vfs::VfsError> {
     store_key("hidden_shortcuts", list)
 }
 
-/// Программа, выбранная для расширения `ext`.
+/// Программа для расширения `ext`: выбор человека (с 24.11 — в хранилище
+/// настроек, `filetypes/.ext/default` области пользователя), прежняя строка
+/// `open_with=` этого файла, затем умолчание системы (OBSOS для `.html`).
 #[must_use]
 pub fn open_with(ext: &str) -> Option<alloc::string::String> {
-    sysconf::filetypes::chosen(&OPEN_WITH.lock(), ext).map(alloc::string::String::from)
+    use crate::config::registry::{self, Scope};
+    if ext.is_empty() {
+        return None;
+    }
+    let key = sysconf::store::default_key(ext);
+    if let Some(command) = registry::get_in(Scope::User, &key).filter(|command| registry::program_exists(command)) {
+        return Some(command);
+    }
+    if let Some(command) = sysconf::filetypes::chosen(&OPEN_WITH.lock(), ext) {
+        return Some(alloc::string::String::from(command));
+    }
+    registry::default_program(ext)
 }
 
-/// Запомнить программу для расширения.
+/// Выбрал ли программу для `ext` сам человек (а не умолчание системы).
+#[must_use]
+pub fn chosen_by_person(ext: &str) -> bool {
+    use crate::config::registry::{self, Scope};
+    registry::get_in(Scope::User, &sysconf::store::default_key(ext)).is_some() || sysconf::filetypes::chosen(&OPEN_WITH.lock(), ext).is_some()
+}
+
+/// Запомнить программу для расширения — в хранилище настроек человека
+/// (24.11; `desktop.cfg` больше не пишется).
 pub fn store_open_with(ext: &str, command: &str) -> Result<(), crate::vfs::VfsError> {
-    let list = sysconf::filetypes::with_choice(&OPEN_WITH.lock(), ext, command);
-    *OPEN_WITH.lock() = list.clone();
-    store_key("open_with", &list)
+    use crate::config::registry::{self, RegError, Scope};
+    match registry::set(Scope::User, &sysconf::store::default_key(ext), Some(command.trim())) {
+        Ok(()) => Ok(()),
+        Err(RegError::Fs(err)) => Err(err),
+        Err(RegError::BadKey) => Err(crate::vfs::VfsError::BadPath),
+    }
 }
 
 /// Запомнить раскладку мониторов: и в файл, и в память (её же берёт

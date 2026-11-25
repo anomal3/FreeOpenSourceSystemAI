@@ -195,6 +195,8 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_WINRESIZE => winresize(a0 as i64, a1),
         // Фаза 62b: окно говорит, что умеет, — размер у него меняет человек.
         user_abi::SYS_WINSTYLE => winstyle(a0 as i64, a1),
+        // 24.11: smallest and largest size of the window (WM SDK).
+        user_abi::SYS_WINLIMITS => winlimits(a0 as i64, a1, a2),
         // 09.11.2026: форма указателя над окном (браузер: ссылки, поля).
         user_abi::SYS_WINCURSOR => wincursor(a0 as i64, a1),
         // 09.11.2026: часовой пояс для программ (JavaScript `Date`).
@@ -223,6 +225,12 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_CLIPBOARD => clipboard(a0, a1, a2),
         // 22.11: «Открыть с помощью» для «Файлов» (программы Windows из Wine).
         user_abi::SYS_OPEN_WITH => open_with(a0, a1, a2),
+        // 24.11: settings store («реестр») and «Только чтение» of «Свойств».
+        user_abi::SYS_REGISTRY => registry(a0, a1, a2),
+        user_abi::SYS_CHMOD => chmod(a0, a1, a2),
+        // 24.11: file times for programs (`st_mtime`, `utimensat`).
+        user_abi::SYS_STATX => statx(a0, a1, a2),
+        user_abi::SYS_UTIMES => utimes(a0, a1, a2),
         // 22.11: screen capture for the recorder (`/bin/screenrec`).
         user_abi::SYS_SCREENCAP => crate::ui::capture::syscall(a0, a1, a2),
         // 05.11.2026: время из сети (SNTP службы `dhcp`).
@@ -1408,6 +1416,192 @@ fn clipboard(action: usize, ptr: usize, len: usize) -> i64 {
     }
 }
 
+/// `SYS_REGISTRY` (24.11): the settings store — see the contract in
+/// `user_abi` and `config::registry`.
+fn registry(action: usize, ptr: usize, len: usize) -> i64 {
+    use crate::config::registry::{self as reg, Scope};
+    let input_len = action >> 32;
+    let action = action & 0xFFFF_FFFF;
+    if action == user_abi::REG_SEQ {
+        return reg::seq() as i64;
+    }
+    if len > (4 << 20) || input_len > len || input_len > 8192 || (len > 0 && !space::user_can(ptr, len, PageFlags::WRITE)) {
+        return ERR_BAD_ADDRESS;
+    }
+    let input = if input_len == 0 { alloc::string::String::new() } else {
+        // SAFETY: диапазон проверен по таблицам программы.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, input_len) };
+        match core::str::from_utf8(bytes) {
+            Ok(text) => alloc::string::String::from(text),
+            Err(_) => return ERR_BAD_PATH,
+        }
+    };
+    let scoped = |text: &str| -> Option<(Scope, alloc::string::String)> {
+        let (scope, rest) = text.split_once('\t')?;
+        Some((Scope::from_word(scope)?, alloc::string::String::from(rest)))
+    };
+    let output: alloc::string::String = match action {
+        user_abi::REG_GET => match reg::get(&input) {
+            Some(value) => value,
+            None => return ERR_NOT_FOUND,
+        },
+        user_abi::REG_GET_IN => {
+            let Some((scope, key)) = scoped(&input) else { return ERR_BAD_PATH };
+            match reg::get_in(scope, &key) {
+                Some(value) => value,
+                None => return ERR_NOT_FOUND,
+            }
+        }
+        user_abi::REG_LIST => {
+            let mut out = alloc::string::String::new();
+            for (key, value) in reg::list(None, &input) {
+                out.push_str(&key);
+                out.push('\t');
+                out.push_str(&value.replace(['\t', '\n'], " "));
+                out.push('\n');
+            }
+            out
+        }
+        user_abi::REG_SET | user_abi::REG_REMOVE => {
+            let Some((scope, rest)) = scoped(&input) else { return ERR_BAD_PATH };
+            if !reg::may_write(super::credentials(), scope) {
+                return ERR_PERMISSION;
+            }
+            let (key, value) = if action == user_abi::REG_SET {
+                match rest.split_once('\t') {
+                    Some((key, value)) => (key, Some(value)),
+                    None => return ERR_BAD_PATH,
+                }
+            } else {
+                (rest.as_str(), None)
+            };
+            return match reg::set(scope, key, value) {
+                Ok(()) => 0,
+                Err(reg::RegError::BadKey) => ERR_BAD_PATH,
+                Err(reg::RegError::Fs(err)) => vfs_errno(err),
+            };
+        }
+        _ => return ERR_UNSUPPORTED,
+    };
+    let bytes = output.as_bytes();
+    let count = bytes.len().min(len);
+    if count > 0 {
+        // SAFETY: диапазон проверен по таблицам программы на запись.
+        unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, count) }.copy_from_slice(&bytes[..count]);
+    }
+    bytes.len() as i64
+}
+
+/// `SYS_CHMOD` (24.11): права файла по пути — владельцу и root.
+fn chmod(ptr: usize, len: usize, mode: usize) -> i64 {
+    let mut buffer = [0u8; MAX_PATH];
+    let path = match copy_path(ptr, len, &mut buffer) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    match crate::fs::chmod_as(super::credentials(), path, (mode & 0o7777) as u16) {
+        Some(Ok(())) => 0,
+        Some(Err(err)) => vfs_errno(err),
+        None => ERR_NO_FILESYSTEM,
+    }
+}
+
+/// The node behind a path (`len > 0`) or a descriptor (`len == 0`) — for
+/// [`statx`] and [`utimes`]. Pipes, sockets and standard streams have no node.
+fn node_of(ptr: usize, len: usize) -> Result<alloc::sync::Arc<dyn crate::vfs::Node>, i64> {
+    if len == 0 {
+        return match super::with_current(|program| program.files.file_or_dir(ptr)) {
+            Some(Ok(node)) => Ok(node),
+            Some(Err(err)) => Err(errno(err)),
+            None => Err(ERR_NO_PROGRAM),
+        };
+    }
+    let mut buffer = [0u8; MAX_PATH];
+    let path = copy_path(ptr, len, &mut buffer)?;
+    match crate::fs::resolve_as(super::credentials(), path, Access::NONE) {
+        Some(Ok(node)) => Ok(alloc::sync::Arc::from(node)),
+        Some(Err(err)) => Err(vfs_errno(err)),
+        None => Err(ERR_NO_FILESYSTEM),
+    }
+}
+
+/// `SYS_STATX` (24.11): [`user_abi::StatX`] of a path or a descriptor.
+fn statx(ptr: usize, len: usize, out: usize) -> i64 {
+    if out % align_of::<user_abi::StatX>() != 0 || !space::user_can(out, size_of::<user_abi::StatX>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    let value = match node_of(ptr, len) {
+        Ok(node) => {
+            let meta = node.metadata();
+            let times = node.times();
+            user_abi::StatX {
+                size: meta.size,
+                mode: u32::from(meta.mode),
+                uid: meta.uid,
+                gid: meta.gid,
+                kind: match meta.kind {
+                    NodeKind::File => KIND_FILE,
+                    NodeKind::Directory => KIND_DIRECTORY,
+                },
+                mtime: i64::from(times.mtime),
+                atime: i64::from(times.atime),
+                ctime: i64::from(times.ctime),
+                ino: node.file_id().map_or(0, |(_, number)| number),
+            }
+        }
+        // A descriptor without a node: the kind from `fstat`, no times.
+        Err(err) if len == 0 => {
+            let kind = match super::with_current(|program| program.files.describe(ptr)) {
+                Some(Ok(info)) => match info.kind {
+                    files::FdKind::Socket => user_abi::KIND_SOCKET,
+                    _ => KIND_PIPE,
+                },
+                _ => return err,
+            };
+            user_abi::StatX { kind, ..Default::default() }
+        }
+        Err(err) => return err,
+    };
+    // SAFETY: alignment and the writable range were checked above.
+    unsafe { core::ptr::write(out as *mut user_abi::StatX, value) };
+    0
+}
+
+/// `SYS_UTIMES` (24.11): access/modification time of a path or descriptor.
+fn utimes(ptr: usize, len: usize, times: usize) -> i64 {
+    let wanted = if times == 0 {
+        user_abi::FileTimes { atime: user_abi::TIME_NOW, mtime: user_abi::TIME_NOW }
+    } else {
+        if !space::user_can(times, size_of::<user_abi::FileTimes>(), PageFlags::READ) {
+            return ERR_BAD_ADDRESS;
+        }
+        // SAFETY: the range is readable by the program (checked above).
+        unsafe { core::ptr::read_unaligned(times as *const user_abi::FileTimes) }
+    };
+    let node = match node_of(ptr, len) {
+        Ok(node) => node,
+        Err(err) => return err,
+    };
+    let now = crate::time::now_unix_u32();
+    let pick = |value: i64| match value {
+        user_abi::TIME_OMIT => Ok(None),
+        user_abi::TIME_NOW => Ok(Some(now)),
+        // The file systems keep 32-bit seconds (ext2); earlier than 1970 or
+        // after 2106 is clamped rather than refused — 7-Zip goes on either way.
+        seconds => Ok::<_, i64>(Some(seconds.clamp(0, i64::from(u32::MAX)) as u32)),
+    };
+    let (Ok(atime), Ok(mtime)) = (pick(wanted.atime), pick(wanted.mtime)) else {
+        return ERR_UNSUPPORTED;
+    };
+    if atime.is_none() && mtime.is_none() {
+        return 0;
+    }
+    match crate::fs::set_times_node(super::credentials(), &*node, atime, mtime) {
+        Ok(()) => 0,
+        Err(err) => vfs_errno(err),
+    }
+}
+
 /// `SYS_OPEN_WITH` (22.11): программы для файла, их значки, выбор «всегда».
 fn open_with(action: usize, ptr: usize, len: usize) -> i64 {
     let input_len = action >> 32;
@@ -1470,7 +1664,9 @@ fn kernel_command(line: usize, len: usize, out: usize) -> i64 {
     // П3 (20.11): ещё «открой окно стола» (`ui open …` — «Администрирование»
     // открывает страницы «Параметров») и три читающие команды видеокарты
     // без аргументов (страница «Видеокарта и драйверы»).
-    let open_window = text.trim().starts_with("ui open ");
+    // 24.11: `ui deskicons …` — the desktop icons dialog (`/bin/deskicons`)
+    // changes only which system icons the desktop shows.
+    let open_window = text.trim().starts_with("ui open ") || text.trim().starts_with("ui deskicons");
     if !super::credentials().is_root() && !open_window && !matches!(text.trim(), "version" | "gpu" | "nvk" | "outputs") {
         return ERR_PERMISSION;
     }
@@ -2452,11 +2648,27 @@ fn winstyle(id: i64, flags: usize) -> i64 {
     // Незнакомый флаг — отказ целиком, а не выполненная знакомая часть:
     // программа, попросившая больше, чем ядро умеет, должна узнать об этом
     // сразу, а не по окну, которое ведёт себя не так, как она рассчитывала.
-    let known = user_abi::WIN_STYLE_RESIZABLE | user_abi::WIN_STYLE_DIALOG | user_abi::WIN_STYLE_AT_START;
+    let known = user_abi::WIN_STYLE_RESIZABLE | user_abi::WIN_STYLE_DIALOG | user_abi::WIN_STYLE_AT_START | user_abi::WIN_STYLE_FULLSCREEN;
     if flags & !(known as usize) != 0 {
         return ERR_UNSUPPORTED;
     }
     match super::style_window(slot, flags as u32) {
+        Ok(()) => 0,
+        Err(err) => window_errno(err),
+    }
+}
+
+/// `winlimits(id, min, max) -> 0` (24.11): content size limits in layout
+/// points, packed by `user_abi::pack_size`; zero side — no limit.
+fn winlimits(id: i64, min: usize, max: usize) -> i64 {
+    let slot = match own_window(id) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
+    if (min | max) >> 32 != 0 {
+        return ERR_UNSUPPORTED;
+    }
+    match super::limit_window(slot, user_abi::unpack_size(min), user_abi::unpack_size(max)) {
         Ok(()) => 0,
         Err(err) => window_errno(err),
     }

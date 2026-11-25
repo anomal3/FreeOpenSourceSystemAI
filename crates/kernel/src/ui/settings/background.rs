@@ -11,7 +11,7 @@ use mini_ui::theme;
 use mini_ui::typeface::Role;
 use mini_ui::{Color, Rect};
 
-use super::super::wallpaper::{self, COLORS, Choice, FOSSAI_THUMB, Fit, WallDeed};
+use super::super::wallpaper::{self, COLORS, Choice, FOSSAI_THUMB, Fit, LockDeed, WallDeed};
 use super::Deed;
 use super::kit::{Pass, button_width, line_h};
 
@@ -24,8 +24,6 @@ struct Tile {
 }
 
 pub(super) fn page(pass: &mut Pass, x: i32, y: i32, w: u32) {
-    let ctx = pass.ctx;
-    let p = ctx.palette;
     let choice = wallpaper::choice();
     let preset = theme::wallpaper();
 
@@ -53,6 +51,92 @@ pub(super) fn page(pass: &mut Pass, x: i32, y: i32, w: u32) {
             tiles.push(Tile { key: path.clone(), title: String::from(name), deed: Deed::Background(WallDeed::Image(path.clone())), current: true });
         }
     }
+    y = tile_grid(pass, x, y, w, &tiles, Deed::Background(WallDeed::Browse));
+    let status = wallpaper::note().unwrap_or_else(|| String::from("Свои картинки — JPEG, PNG, BMP или QOI: «Обзор…» откроет окно выбора файла."));
+    y = pass.note(x, y, w, &status);
+
+    // ── Экран блокировки (24.11) ─────────────────────────────────────────
+    let same = wallpaper::lock_same();
+    y = super::kit::row(pass, x, y, w, Some(Fi::Lock), "Также для экрана блокировки", "Снимите флажок, чтобы выбрать экрану блокировки свой фон", super::kit::Ctl::Check(same), Some(Deed::Background(WallDeed::LockSame(!same))));
+    if !same {
+        y = super::kit::row(pass, x, y, w, Some(Fi::Image), "Фон экрана блокировки", "Свой: картинка, обои FossAi или цвет", super::kit::Ctl::Nav, Some(Deed::Open(super::Section::LockScreen)));
+    }
+    rest(pass, x, y, w, choice, preset);
+}
+
+/// «Экран блокировки» (24.11): тот же фон, что у стола, или свой — обои
+/// FossAi, картинка галереи, своя («Обзор…») или цвет. Возвращает `y` под ним.
+pub(super) fn lock_page(pass: &mut Pass, x: i32, y: i32, w: u32) -> i32 {
+    let ctx = pass.ctx;
+    let p = ctx.palette;
+    let same = wallpaper::lock_same();
+    // Образец: фон экрана блокировки с часами, как в Windows.
+    let pw = w.min(ctx.px(320));
+    let preview = Rect::new(x, y + ctx.px(8) as i32, pw, pw * 9 / 16);
+    if pass.visible(preview) {
+        let (choice, color) = if same { (wallpaper::choice(), wallpaper::color()) } else { wallpaper::lock_choice() };
+        let preset = if same { theme::wallpaper() } else { theme::Wallpaper::Fossai };
+        let clock = crate::time::clock_text().unwrap_or_default();
+        pass.on(|s| {
+            thumb(s, preview, ctx.px(8), &choice, color, preset);
+            draw::blend_rect(s, preview, Color::rgb(0x04, 0x08, 0x14), 70);
+            ring(s, preview, ctx.px(8), p.line3.color, p.line3.alpha, 0, 1);
+            paint::text(ctx, s, Role::Heading, preview.x + ctx.px(16) as i32, preview.y + preview.h as i32 / 6, &clock, Color::rgb(0xFF, 0xFF, 0xFF));
+        });
+    }
+    let mut y = preview.bottom() + ctx.px(4) as i32;
+    y = pass.group(x, y, w, "Фон экрана блокировки");
+    y = super::kit::row(pass, x, y, w, Some(Fi::Image), "Как на рабочем столе", "Тот же фон, что выбран в «Фоне» (флажок «Также для экрана блокировки»)", super::kit::Ctl::Check(same), Some(Deed::Background(WallDeed::LockSame(!same))));
+    if same {
+        return y;
+    }
+    let (choice, color_now) = wallpaper::lock_choice();
+    let lock = |deed: LockDeed| Deed::Background(WallDeed::Lock(deed));
+    let mut tiles = alloc::vec![Tile { key: String::from(FOSSAI_THUMB), title: String::from("FossAi"), deed: lock(LockDeed::Fossai), current: choice == Choice::Preset }];
+    let gallery = wallpaper::gallery();
+    for item in &gallery {
+        tiles.push(Tile { key: item.path.clone(), title: item.title.clone(), deed: lock(LockDeed::Image(item.path.clone())), current: choice == Choice::Image(item.path.clone()) });
+    }
+    if let Choice::Image(path) = &choice {
+        if !gallery.iter().any(|item| item.path == *path) {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            tiles.push(Tile { key: path.clone(), title: String::from(name), deed: lock(LockDeed::Image(path.clone())), current: true });
+        }
+    }
+    y = tile_grid(pass, x, y + ctx.px(4) as i32, w, &tiles, lock(LockDeed::Browse));
+    y = pass.group(x, y, w, "Сплошной цвет");
+    let dot = ctx.px(36);
+    let dot_gap = ctx.px(12);
+    let per_line = ((w + dot_gap) / (dot + dot_gap)).max(1);
+    y += ctx.px(4) as i32;
+    for (index, color) in COLORS.into_iter().enumerate() {
+        let (col, line) = (index as u32 % per_line, index as u32 / per_line);
+        let rect = Rect::new(x + ctx.px(4) as i32 + (col * (dot + dot_gap)) as i32, y + (line * (dot + dot_gap)) as i32, dot, dot);
+        let focused = pass.deed(rect, lock(LockDeed::Color(color)));
+        let current = choice == Choice::Color && color_now == color;
+        if pass.visible(Rect::new(rect.x - 4, rect.y - 4, rect.w + 8, rect.h + 8)) {
+            let fill = Color::rgb((color >> 16) as u8, (color >> 8) as u8, color as u8);
+            pass.on(|s| {
+                let r = rect.w / 2;
+                draw::rounded(s, rect, r, fill, 255);
+                draw::rounded_stroke(s, rect, r, p.line3.color, p.line3.alpha);
+                if current {
+                    ring(s, rect, r, p.acc, 255, 2, 3);
+                }
+                if focused {
+                    ring(s, rect, r, p.ink, 255, 6, 1);
+                }
+            });
+        }
+    }
+    y += (COLORS.len() as u32).div_ceil(per_line) as i32 * (dot + dot_gap) as i32;
+    pass.note(x, y, w, "Картинка закрывает экран целиком («Заполнение»); часы и поле пароля — поверх.")
+}
+
+/// Плитки картинок с подписями и «Обзор…» последней. Возвращает `y` под ними.
+fn tile_grid(pass: &mut Pass, x: i32, y: i32, w: u32, tiles: &[Tile], browse: Deed) -> i32 {
+    let ctx = pass.ctx;
+    let p = ctx.palette;
     let gap = ctx.px(12);
     let min_w = ctx.px(150);
     let count = tiles.len() as u32 + 1;
@@ -94,7 +178,7 @@ pub(super) fn page(pass: &mut Pass, x: i32, y: i32, w: u32) {
         let index = tiles.len() as u32;
         let (col, line) = (index % cols, index / cols);
         let rect = Rect::new(x + (col * (tile_w + gap)) as i32, y + (line * cell_h) as i32, tile_w, tile_h);
-        let focused = pass.deed_in(rect, Rect::new(rect.x, rect.y, rect.w, rect.h + label_h), Deed::Background(WallDeed::Browse));
+        let focused = pass.deed_in(rect, Rect::new(rect.x, rect.y, rect.w, rect.h + label_h), browse);
         if pass.visible(Rect::new(rect.x, rect.y, rect.w, rect.h + label_h)) {
             let icon = ctx.px(28);
             pass.on(|s| {
@@ -108,12 +192,18 @@ pub(super) fn page(pass: &mut Pass, x: i32, y: i32, w: u32) {
             pass.text(Role::Caption, rect.x, rect.bottom() + ctx.px(6) as i32, rect.w, "Обзор…", p.ink3);
         }
     }
-    y += (count.div_ceil(cols) * cell_h) as i32;
-    let status = wallpaper::note().unwrap_or_else(|| String::from("Свои картинки — JPEG, PNG, BMP или QOI: «Обзор…» откроет окно выбора файла."));
-    y = pass.note(x, y, w, &status);
+    y + (count.div_ceil(cols) * cell_h) as i32
+}
 
+/// Расположение, градиенты темы и сплошной цвет — под картинками «Фона».
+fn rest(pass: &mut Pass, x: i32, y: i32, w: u32, choice: Choice, preset: theme::Wallpaper) {
+    let ctx = pass.ctx;
+    let p = ctx.palette;
+    let gap = ctx.px(12);
+    let label_h = line_h(ctx, Role::Caption) as u32 + ctx.px(6);
+    let radius = ctx.px(6);
     // ── Расположение ─────────────────────────────────────────────────────
-    y = pass.group(x, y, w, "Расположение картинки");
+    let mut y = pass.group(x, y, w, "Расположение картинки");
     let current_fit = wallpaper::fit();
     let button_h = ctx.px(34);
     let mut bx = x;
@@ -197,6 +287,23 @@ pub(super) fn page(pass: &mut Pass, x: i32, y: i32, w: u32) {
     }
     y += (COLORS.len() as u32).div_ceil(per_line) as i32 * (dot + dot_gap) as i32;
     pass.note(x, y, w, "Один фон на все мониторы; картинка уменьшается под каждый один раз, при выборе.");
+}
+
+/// Миниатюра фона: картинка, цвет или обои темы (`preset` при `Preset`).
+pub(super) fn thumb(s: &mut mini_ui::Surface, rect: Rect, radius: u32, choice: &Choice, color: u32, preset: theme::Wallpaper) {
+    let drawn = match choice {
+        Choice::Image(path) => wallpaper::draw_thumb(s, rect, path),
+        Choice::Color => {
+            draw::rounded(s, rect, radius, Color::rgb((color >> 16) as u8, (color >> 8) as u8, color as u8), 255);
+            true
+        }
+        Choice::Preset if preset == theme::Wallpaper::Fossai => wallpaper::draw_thumb(s, rect, FOSSAI_THUMB),
+        Choice::Preset => false,
+    };
+    if !drawn {
+        let (top, bottom) = theme::wallpaper_colors(preset);
+        draw::rounded_gradient(s, rect, radius, top, bottom, 255);
+    }
 }
 
 /// Рамка вокруг `rect` толщиной `width` точек, отступив наружу на `out`.

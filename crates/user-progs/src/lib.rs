@@ -257,6 +257,18 @@ impl Window {
         insist(|| unsafe { syscall(user_abi::SYS_WINSTYLE, self.id as usize, flags as usize, 0) })
     }
 
+    /// Size limits of the window content (24.11, WM SDK,
+    /// [`user_abi::SYS_WINLIMITS`]): `min` and `max` in layout points (what
+    /// `ctx.px` takes), zero side — no limit, `min == max` — one fixed size.
+    /// The desktop keeps the window inside them on resize, snap, maximize and
+    /// scale changes. Programs of the [`app`] frame say it through
+    /// [`app::App::size_limits`] instead.
+    pub fn set_size_limits(&self, min: (u32, u32), max: (u32, u32)) -> i64 {
+        let (min, max) = (user_abi::pack_size(min.0, min.1), user_abi::pack_size(max.0, max.1));
+        // SAFETY: аргументы — числа.
+        insist(|| unsafe { syscall(user_abi::SYS_WINLIMITS, self.id as usize, min, max) })
+    }
+
     /// Назначить окну владельца ([`user_abi::SYS_WINOWNER`]): окно этой же
     /// программы или (20.11) другой программы того же пользователя; флаги —
     /// `WIN_OWNER_MODAL`, `WIN_OWNER_CENTER`.
@@ -357,6 +369,13 @@ pub fn heap_size(bytes: usize) -> bool {
     }
     HEAP_WANTED.store(bytes.max(HEAP_BYTES), core::sync::atomic::Ordering::Relaxed);
     true
+}
+
+/// How big the program heap is (or will be once started): caches size
+/// themselves by it (24.11, theme icons).
+#[must_use]
+pub fn heap_capacity() -> usize {
+    HEAP_WANTED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Куча программы.
@@ -1079,6 +1098,34 @@ pub fn stat(path: &str, out: &mut Stat) -> i64 {
     }
 }
 
+/// Everything about a file, times included (24.11, `SYS_STATX`).
+pub fn statx(path: &str, out: &mut user_abi::StatX) -> i64 {
+    if path.is_empty() {
+        return user_abi::ERR_BAD_PATH;
+    }
+    // SAFETY: the path and the answer are in the program's memory; `StatX`
+    // is aligned by its type.
+    unsafe { syscall(user_abi::SYS_STATX, path.as_ptr() as usize, path.len(), core::ptr::from_mut(out) as usize) }
+}
+
+/// Modification time of a file, Unix seconds UTC (0 — unknown or no file).
+#[must_use]
+pub fn mtime_of(path: &str) -> i64 {
+    let mut info = user_abi::StatX::default();
+    if statx(path, &mut info) < 0 { 0 } else { info.mtime }
+}
+
+/// Set the access/modification time of a file (24.11, `SYS_UTIMES`);
+/// [`user_abi::TIME_NOW`] / [`user_abi::TIME_OMIT`] are understood.
+pub fn set_times(path: &str, atime: i64, mtime: i64) -> i64 {
+    if path.is_empty() {
+        return user_abi::ERR_BAD_PATH;
+    }
+    let times = user_abi::FileTimes { atime, mtime };
+    // SAFETY: the path and the times are in the program's memory.
+    unsafe { syscall(user_abi::SYS_UTIMES, path.as_ptr() as usize, path.len(), core::ptr::from_ref(&times) as usize) }
+}
+
 /// От чьего имени исполняется программа.
 #[must_use]
 pub fn uid() -> u32 {
@@ -1798,6 +1845,82 @@ pub fn open_with_remember(ext: &str, command: &str) -> bool {
     open_with_call(user_abi::OPENWITH_REMEMBER, alloc::format!("{ext}\t{command}").as_bytes()).is_some()
 }
 
+// ---- Settings store, «реестр» (24.11, [`user_abi::SYS_REGISTRY`]) ----------
+//
+// Keys `hive/path`, scopes `user` and `system`; names and the file format —
+// `sysconf::store`. Example (a port registering itself, as root):
+// `reg_set("system", "filetypes/.7z/openwith/7zip", "/opt/7zip/bin/7zfm")`.
+
+/// One call of the store: answer bytes or the error code.
+fn registry_call(action: usize, input: &[u8]) -> Result<alloc::vec::Vec<u8>, i64> {
+    let mut buffer = alloc::vec![0u8; input.len().max(4096)];
+    loop {
+        buffer[..input.len()].copy_from_slice(input);
+        // SAFETY: буфер живёт в памяти программы, длина — его собственная.
+        let result = unsafe { syscall(user_abi::SYS_REGISTRY, action | (input.len() << 32), buffer.as_mut_ptr() as usize, buffer.len()) };
+        if result < 0 {
+            return Err(result);
+        }
+        let total = result as usize;
+        if total <= buffer.len() {
+            buffer.truncate(total);
+            return Ok(buffer);
+        }
+        if total > (4 << 20) {
+            return Err(user_abi::ERR_NO_SPACE);
+        }
+        buffer.resize(total, 0);
+    }
+}
+
+/// Value of `key`: the person's, else the system's, else built in.
+#[must_use]
+pub fn reg_get(key: &str) -> Option<alloc::string::String> {
+    registry_call(user_abi::REG_GET, key.as_bytes()).ok().map(|bytes| alloc::string::String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Value of `key` in one scope (`user` or `system`).
+#[must_use]
+pub fn reg_get_in(scope: &str, key: &str) -> Option<alloc::string::String> {
+    registry_call(user_abi::REG_GET_IN, alloc::format!("{scope}\t{key}").as_bytes()).ok().map(|bytes| alloc::string::String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Set `key` in `scope`; `Err` — the error code (no rights, bad key).
+pub fn reg_set(scope: &str, key: &str, value: &str) -> Result<(), i64> {
+    registry_call(user_abi::REG_SET, alloc::format!("{scope}\t{key}\t{value}").as_bytes()).map(|_| ())
+}
+
+/// Remove `key` from `scope`.
+pub fn reg_remove(scope: &str, key: &str) -> Result<(), i64> {
+    registry_call(user_abi::REG_REMOVE, alloc::format!("{scope}\t{key}").as_bytes()).map(|_| ())
+}
+
+/// Keys under `prefix` with values (merged as [`reg_get`] reads them).
+#[must_use]
+pub fn reg_list(prefix: &str) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
+    let Ok(bytes) = registry_call(user_abi::REG_LIST, prefix.as_bytes()) else {
+        return alloc::vec::Vec::new();
+    };
+    alloc::string::String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(key, value)| (alloc::string::String::from(key), alloc::string::String::from(value))))
+        .collect()
+}
+
+/// Change counter of the store: re-read cached options when it moved.
+#[must_use]
+pub fn reg_seq() -> u64 {
+    // SAFETY: вызов без памяти программы.
+    let result = unsafe { syscall(user_abi::SYS_REGISTRY, user_abi::REG_SEQ, 0, 0) };
+    result.max(0) as u64
+}
+
+/// Rights of a file (`chmod`): owner or root.
+pub fn chmod(path: &str, mode: u32) -> i64 {
+    // SAFETY: путь живёт в памяти программы на время вызова.
+    unsafe { syscall(user_abi::SYS_CHMOD, path.as_ptr() as usize, path.len(), mode as usize) }
+}
+
 /// Screen capture (22.11, [`user_abi::SYS_SCREENCAP`]): `action` is one of
 /// `CAP_*`, the arguments are as the contract says.
 ///
@@ -2437,9 +2560,36 @@ pub fn exit(code: i64) -> ! {
 /// Печатает и завершается, а не останавливает машину: паника **программы** —
 /// это её дело, и система обязана её пережить. В этом и разница между кодом в
 /// ядре и кодом здесь.
+///
+/// The place and the message go into the line (24.11): a bare «user: panic»
+/// left nothing to look for. Formatted into a buffer on the stack — the
+/// panic may be the heap running out.
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
-    println("user: panic");
+fn panic(info: &PanicInfo<'_>) -> ! {
+    struct Line {
+        bytes: [u8; 320],
+        len: usize,
+    }
+    impl core::fmt::Write for Line {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let take = text.len().min(self.bytes.len() - self.len);
+            self.bytes[self.len..self.len + take].copy_from_slice(&text.as_bytes()[..take]);
+            self.len += take;
+            Ok(())
+        }
+    }
+    let mut line = Line { bytes: [0; 320], len: 0 };
+    let _ = core::fmt::Write::write_str(&mut line, "user: panic");
+    if let Some(at) = info.location() {
+        let _ = core::fmt::write(&mut line, format_args!(" at {}:{}:{}", at.file(), at.line(), at.column()));
+    }
+    let _ = core::fmt::write(&mut line, format_args!(": {}", info.message()));
+    // A cut in the middle of a letter keeps the whole letters before it.
+    let text = match core::str::from_utf8(&line.bytes[..line.len]) {
+        Ok(text) => text,
+        Err(error) => core::str::from_utf8(&line.bytes[..error.valid_up_to()]).unwrap_or("user: panic"),
+    };
+    println(text);
     exit(101)
 }
 

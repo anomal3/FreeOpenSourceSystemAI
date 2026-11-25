@@ -112,6 +112,24 @@ pub enum WallDeed {
     /// включить — сплошной #008080, прежний фон запоминается; выключить —
     /// вернуть прежний.
     ClassicTeal(bool),
+    /// «Также для экрана блокировки» (24.11): `true` — экран блокировки
+    /// с тем же фоном, что и стол; `false` — свой ([`LockDeed`]).
+    LockSame(bool),
+    /// Свой фон экрана блокировки.
+    Lock(LockDeed),
+}
+
+/// Что выбирают на странице «Экран блокировки» (24.11).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LockDeed {
+    /// Обои FossAi.
+    Fossai,
+    /// Картинка — путь к источнику.
+    Image(String),
+    /// «Обзор…».
+    Browse,
+    /// Сплошной цвет `0xRRGGBB`.
+    Color(u32),
 }
 
 /// Бирюзовый стол Windows 95/98.
@@ -130,6 +148,9 @@ struct Job {
     /// Какой файл кэша она обязана оставить.
     output: String,
     started: u64,
+    /// «Обзор…» на странице «Экран блокировки»: выбранное — фону экрана
+    /// блокировки, не стола.
+    for_lock: bool,
 }
 
 struct State {
@@ -151,9 +172,18 @@ struct State {
     /// Фон до «Классического бирюзового» (строка `background=` и цвет):
     /// его возвращает выключение (`background_saved=` в `desktop.cfg`).
     saved: Option<(String, u32)>,
+    /// Экран блокировки с фоном стола (24.11, по умолчанию так).
+    lock_same: bool,
+    /// Свой фон экрана блокировки: `Preset` — обои FossAi.
+    lock_choice: Choice,
+    /// Цвет своего фона экрана блокировки.
+    lock_color: u32,
 }
 
 static STATE: SpinLock<State> = SpinLock::new(State {
+    lock_same: true,
+    lock_choice: Choice::Preset,
+    lock_color: COLORS[0],
     choice: Choice::Preset,
     fit: Fit::Fill,
     color: COLORS[0],
@@ -254,8 +284,27 @@ pub fn adopt(text: &str, path: &str) {
         };
         kprintln!("  desktop     : background {} ({}, #{:06x}) from {path}", value, state.fit.tag(), state.color);
     }
+    // Экран блокировки (24.11): `same`, `fossai`, `color`, `image:<путь>`.
+    if let Some(color) = sysconf::value(text, "lock_background_color").and_then(|hex| u32::from_str_radix(hex.trim().trim_start_matches('#'), 16).ok()) {
+        state.lock_color = color & 0xFF_FFFF;
+    }
+    if let Some(value) = sysconf::value(text, "lock_background_same") {
+        state.lock_same = value.trim() != "off";
+    }
+    if let Some(value) = sysconf::value(text, "lock_background") {
+        let value = value.trim();
+        state.lock_choice = if let Some(image) = value.strip_prefix("image:") {
+            Choice::Image(image.to_string())
+        } else if value == "color" {
+            Choice::Color
+        } else {
+            Choice::Preset
+        };
+        kprintln!("  desktop     : lock screen background {value} ({}) from {path}", if state.lock_same { "not used: same as the desktop" } else { "own" });
+    }
     drop(state);
     bump();
+    bump_lock();
 }
 
 /// Выбраны обои темы (FossAi или градиент): картинка и цвет больше не главные.
@@ -292,7 +341,7 @@ pub fn apply(deed: WallDeed) -> (String, Result<(), crate::vfs::VfsError>) {
         }
         WallDeed::Browse => {
             STATE.lock().wanted = None;
-            let text = match start_pick() {
+            let text = match start_pick(false) {
                 Ok(()) => String::from("выберите картинку в окне «Открыть»"),
                 Err(why) => why,
             };
@@ -318,7 +367,201 @@ pub fn apply(deed: WallDeed) -> (String, Result<(), crate::vfs::VfsError>) {
             (format!("расположение «{}» запомнено", fit.title()), super::prefs::store_line("background_fit", fit.tag()))
         }
         WallDeed::ClassicTeal(on) => classic_teal(on),
+        WallDeed::LockSame(same) => {
+            STATE.lock().lock_same = same;
+            bump_lock();
+            kprintln!("  settings    : lock screen background {}", if same { "same as the desktop" } else { "own" });
+            let text = String::from(if same { "экран блокировки — с фоном рабочего стола" } else { "у экрана блокировки свой фон: «Экран блокировки»" });
+            (text, super::prefs::store_line("lock_background_same", if same { "on" } else { "off" }))
+        }
+        WallDeed::Lock(deed) => apply_lock(deed),
     }
+}
+
+/// Строка `lock_background=` своего фона.
+fn lock_line() -> String {
+    let state = STATE.lock();
+    match &state.lock_choice {
+        Choice::Preset => String::from("fossai"),
+        other => choice_line(other),
+    }
+}
+
+fn apply_lock(deed: LockDeed) -> (String, Result<(), crate::vfs::VfsError>) {
+    let text = match deed {
+        LockDeed::Browse => {
+            STATE.lock().wanted = None;
+            let text = match start_pick(true) {
+                Ok(()) => String::from("выберите картинку в окне «Открыть»"),
+                Err(why) => why,
+            };
+            return (text, Ok(()));
+        }
+        LockDeed::Fossai => {
+            STATE.lock().lock_choice = Choice::Preset;
+            String::from("экран блокировки: обои FossAi")
+        }
+        LockDeed::Image(path) => {
+            let mut state = STATE.lock();
+            state.failed.retain(|known| *known != path);
+            state.lock_choice = Choice::Image(path);
+            String::from("картинка экрана блокировки запомнена")
+        }
+        LockDeed::Color(color) => {
+            let mut state = STATE.lock();
+            state.lock_choice = Choice::Color;
+            state.lock_color = color & 0xFF_FFFF;
+            format!("экран блокировки: цвет #{:06X}", color & 0xFF_FFFF)
+        }
+    };
+    STATE.lock().lock_same = false;
+    bump_lock();
+    let line = lock_line();
+    kprintln!("  settings    : lock screen background {line}");
+    let color = format!("{:06x}", STATE.lock().lock_color);
+    let result = super::prefs::store_line("lock_background_color", &color)
+        .and_then(|()| super::prefs::store_line("lock_background", &line))
+        .and_then(|()| super::prefs::store_line("lock_background_same", "off"));
+    (text, result)
+}
+
+// ── Экран блокировки (24.11) ────────────────────────────────────────────────
+
+/// Номер выбора фона экрана блокировки: сменился — готовый фон устарел.
+static LOCK_GENERATION: AtomicU32 = AtomicU32::new(1);
+
+/// Готовый фон экрана блокировки: номер выбора, размер, картинка. Живёт,
+/// пока экран заблокирован ([`lock_done`]).
+static LOCK_WALL: SpinLock<Option<(u32, u32, u32, Surface)>> = SpinLock::new(None);
+
+fn bump_lock() {
+    LOCK_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Тот же ли фон у экрана блокировки, что и у стола.
+#[must_use]
+pub fn lock_same() -> bool {
+    STATE.lock().lock_same
+}
+
+/// Свой фон экрана блокировки: выбор и цвет.
+#[must_use]
+pub fn lock_choice() -> (Choice, u32) {
+    let state = STATE.lock();
+    (state.lock_choice.clone(), state.lock_color)
+}
+
+/// Нарисовать свой фон экрана блокировки в `surface` целиком. `false` —
+/// фон тот же, что у стола, или своя картинка ещё не готова: рисует стол.
+pub fn paint_lock(surface: &mut Surface) -> bool {
+    let (same, choice, color) = {
+        let state = STATE.lock();
+        (state.lock_same, state.lock_choice.clone(), state.lock_color)
+    };
+    if same {
+        return false;
+    }
+    let generation = LOCK_GENERATION.load(Ordering::Relaxed);
+    let (w, h) = (surface.width(), surface.height());
+    let bounds = surface.bounds();
+    {
+        let cache = LOCK_WALL.lock();
+        if let Some((made, cw, ch, picture)) = cache.as_ref() {
+            if *made == generation && *cw == w && *ch == h {
+                surface.blit_from(picture, (0, 0), bounds);
+                return true;
+            }
+        }
+    }
+    let render = |target: &mut Surface| -> bool {
+        match &choice {
+            Choice::Color => {
+                let all = target.bounds();
+                target.fill(all, rgb(color));
+                true
+            }
+            Choice::Preset => super::wallart::paint(target),
+            Choice::Image(source) => match lock_picture(source) {
+                Some(decoded) => {
+                    place(&decoded, target, Fit::Fill, rgb(color));
+                    true
+                }
+                None => false,
+            },
+        }
+    };
+    // The ready copy costs a whole screen of kernel heap; without room for
+    // it (64 MiB heap, fragmented) the background is drawn straight into the
+    // lock screen on every redraw instead.
+    let Some(mut picture) = Surface::new(w, h, rgb(color)) else {
+        let drawn = render(surface);
+        if drawn {
+            kprintln!("  desktop     : lock screen background {} {w}x{h} (no room for a ready copy)", choice_line(&choice));
+        }
+        return drawn;
+    };
+    if !render(&mut picture) {
+        return false;
+    }
+    kprintln!("  desktop     : lock screen background {} {w}x{h}", choice_line(&choice));
+    surface.blit_from(&picture, (0, 0), bounds);
+    *LOCK_WALL.lock() = Some((generation, w, h, picture));
+    true
+}
+
+/// `ui lockbg same|fossai|color RRGGBB|image PATH` — фон экрана блокировки
+/// из оболочки (стенд, серийная линия), то же, что страница «Экран блокировки».
+pub fn lock_command(words: &str) {
+    let mut it = words.split_whitespace();
+    let deed = match (it.next(), it.next()) {
+        (Some("same"), _) => Some(WallDeed::LockSame(true)),
+        (Some("fossai"), _) => Some(WallDeed::Lock(LockDeed::Fossai)),
+        (Some("color"), Some(hex)) => u32::from_str_radix(hex.trim_start_matches('#'), 16).ok().map(|c| WallDeed::Lock(LockDeed::Color(c))),
+        (Some("image"), Some(path)) => Some(WallDeed::Lock(LockDeed::Image(path.to_string()))),
+        _ => None,
+    };
+    let Some(deed) = deed else {
+        kprintln!("  usage: ui lockbg same|fossai|color RRGGBB|image PATH");
+        return;
+    };
+    let (text, result) = apply(deed);
+    match result {
+        Ok(()) => kprintln!("  lockbg      : {text}"),
+        Err(err) => kprintln!("  lockbg      : {text} (not saved: {err})"),
+    }
+}
+
+/// Экран разблокирован: готовый фон больше не нужен (десяток мегабайт).
+pub fn lock_done() {
+    *LOCK_WALL.lock() = None;
+}
+
+/// Картинка своего фона экрана блокировки из кэша; нет — заказать перевод.
+/// Не запоминается: распакованная живёт, пока готовится фон.
+fn lock_picture(source: &str) -> Option<Arc<Picture>> {
+    {
+        let state = STATE.lock();
+        if let Some((of, picture)) = state.picture.as_ref() {
+            if of == source {
+                return Some(picture.clone());
+            }
+        }
+        if state.failed.iter().any(|known| known == source) {
+            return None;
+        }
+    }
+    let path = cache_path(source);
+    let bytes = match crate::fs::read(&path, 64 * 1024 * 1024) {
+        Some(Ok((bytes, _))) => bytes,
+        _ => {
+            let mut state = STATE.lock();
+            if state.job.as_ref().and_then(|job| job.source.as_deref()) != Some(source) {
+                state.wanted = Some(source.to_string());
+            }
+            return None;
+        }
+    };
+    Picture::decode(&bytes).map(Arc::new)
 }
 
 /// Стоит ли «Классический бирюзовый фон».
@@ -449,7 +692,7 @@ fn pct(path: &str) -> String {
     super::panel::pct(path)
 }
 
-fn start_pick() -> Result<(), String> {
+fn start_pick(for_lock: bool) -> Result<(), String> {
     if STATE.lock().job.is_some() {
         return Err(String::from("подождите: предыдущая картинка ещё готовится"));
     }
@@ -461,7 +704,7 @@ fn start_pick() -> Result<(), String> {
         Ok(task) => {
             kprintln!("  desktop     : started '{line}' as {task}");
             let mut state = STATE.lock();
-            state.job = Some(Job { task, source: None, output: String::new(), started: crate::time::uptime_ms() });
+            state.job = Some(Job { task, source: None, output: String::new(), started: crate::time::uptime_ms(), for_lock });
             state.note = Some(String::from("Выберите картинку в окне «Открыть»…"));
             Ok(())
         }
@@ -480,7 +723,7 @@ fn start_convert(source: &str) {
         Ok(task) => {
             kprintln!("  desktop     : started '{line}' as {task}");
             let mut state = STATE.lock();
-            state.job = Some(Job { task, source: Some(source.to_string()), output, started: crate::time::uptime_ms() });
+            state.job = Some(Job { task, source: Some(source.to_string()), output, started: crate::time::uptime_ms(), for_lock: false });
             state.note = Some(String::from("Картинка готовится…"));
         }
         Err(err) => {
@@ -492,20 +735,57 @@ fn start_convert(source: &str) {
     }
 }
 
+/// «Сделать фоном рабочего стола» from a program (24.11, «Фотографии»): the
+/// path of the picture in this key of the user scope of the settings store.
+/// The desktop takes it on its next tick, removes the key and applies the
+/// picture as «Параметры → Фон» would.
+pub const REQUEST_KEY: &str = "desktop/background_request";
+
+/// Store change counter last looked at for [`REQUEST_KEY`].
+static REQUEST_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Take a background asked by a program. `true` — the background changed.
+fn take_request() -> bool {
+    use crate::config::registry::{self, Scope};
+    let seq = registry::seq();
+    if REQUEST_SEQ.swap(seq, Ordering::Relaxed) == seq {
+        return false;
+    }
+    let Some(path) = registry::get_in(Scope::User, REQUEST_KEY) else {
+        return false;
+    };
+    let _ = registry::set(Scope::User, REQUEST_KEY, None);
+    REQUEST_SEQ.store(registry::seq(), Ordering::Relaxed);
+    let path = path.trim();
+    if !path.starts_with('/') || !matches!(crate::fs::read(path, 16), Some(Ok(_))) {
+        kprintln!("  desktop     : background asked for '{path}': no such file");
+        return false;
+    }
+    kprintln!("  desktop     : background asked by a program: {path}");
+    let (_, result) = apply(WallDeed::Image(String::from(path)));
+    if let Err(err) = result {
+        kprintln!("  desktop     : background {path} applied, not stored: {err}");
+    }
+    true
+}
+
 /// Работа вне кадра (из `ui::tick`): запустить перевод, дождаться его. `true`
 /// — фон сменился или сменилась строка состояния: перерисовать стол и «Фон».
 pub fn poll() -> bool {
+    if take_request() {
+        return true;
+    }
     let (wanted, job) = {
         let mut state = STATE.lock();
         let wanted = if state.job.is_none() { state.wanted.take() } else { None };
-        let job = state.job.as_ref().map(|job| (job.task, job.source.clone(), job.output.clone(), job.started));
+        let job = state.job.as_ref().map(|job| (job.task, job.source.clone(), job.output.clone(), job.started, job.for_lock));
         (wanted, job)
     };
     if let Some(source) = wanted {
         start_convert(&source);
         return true;
     }
-    let Some((task, source, output, started)) = job else {
+    let Some((task, source, output, started, for_lock)) = job else {
         return false;
     };
     let running = matches!(crate::sched::lookup(task), Some((_, state)) if state != crate::sched::TaskState::Finished);
@@ -513,6 +793,8 @@ pub fn poll() -> bool {
         return false;
     }
     let took = crate::time::uptime_ms().saturating_sub(started);
+    // A converted picture may be the lock screen's: its background redraws.
+    bump_lock();
     let mut state = STATE.lock();
     state.job = None;
     match source {
@@ -537,8 +819,9 @@ pub fn poll() -> bool {
             };
             match picked {
                 Some(path) => {
-                    kprintln!("  desktop     : wallpaper picked {path} in {took} ms");
-                    let (_, result) = apply(WallDeed::Image(path));
+                    kprintln!("  desktop     : wallpaper picked {path} in {took} ms{}", if for_lock { " for the lock screen" } else { "" });
+                    let deed = if for_lock { WallDeed::Lock(LockDeed::Image(path)) } else { WallDeed::Image(path) };
+                    let (_, result) = apply(deed);
                     STATE.lock().note = match result {
                         Ok(()) => None,
                         Err(err) => Some(format!("Картинка применена, но не запомнена: {err}")),

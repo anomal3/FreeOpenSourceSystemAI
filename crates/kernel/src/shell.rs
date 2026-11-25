@@ -1186,6 +1186,12 @@ fn run_builtin(line: &str) -> bool {
         // System clipboard (24.11): `clip` - show it, `clip set TEXT`,
         // `clip files PATH...` (copied files), `clip cut PATH...`.
         "clip" => clip_command(argument),
+        // Settings store (24.11): `reg get|set|rm|list|path`.
+        "reg" => {
+            for line in crate::config::registry::shell_command(argument) {
+                sprintln!("{line}");
+            }
+        }
         // Запросы и события сервера Wayland — в серийную линию (`on`/`off`).
         #[cfg(target_arch = "x86_64")]
         "wltrace" => {
@@ -1585,6 +1591,13 @@ fn run_builtin(line: &str) -> bool {
                 wait_ns / waits.max(1) / 1000
             );
         }
+        // Gamepads (24.11.2026): the pads and their live state, `log on` -
+        // every change into the journal, `fake ...` - a test pad.
+        "gamepad" => {
+            for line in crate::usb::gamepad::shell(argument) {
+                sprintln!("{line}");
+            }
+        }
         // hw-log17: `usbwin KIB` caps a USB disk command (0 = the device's
         // whole window: 1 MiB on SuperSpeed); `usbwin big|small` - the
         // buffer of a disk plugged from now on (1 MiB or 128 KiB).
@@ -1864,6 +1877,12 @@ fn find_program(name: &str) -> Option<String> {
     if name.is_empty() || name.contains('/') || name.starts_with('.') {
         return None;
     }
+    // `7z` и `7za` — привычные имена 7-Zip; программа в образе одна, `7zz`
+    // (24.11): все форматы внутри.
+    let name = match name {
+        "7z" | "7za" | "7zr" => "7zz",
+        other => other,
+    };
     let cred = user::session::credentials();
     let exists = |path: &str| fs::resolve_as(cred, path, Access::NONE).is_some_and(|result| result.is_ok());
     let native = alloc::format!("/bin/{name}");
@@ -2653,6 +2672,11 @@ fn ui_status(argument: &str) {
         ui::look::command(words);
         return;
     }
+    // System desktop icons (24.11): `ui deskicons [show|hide|icon|label KEY …]`.
+    if let Some(words) = argument.trim().strip_prefix("deskicons") {
+        ui::deskicons::command(words);
+        return;
+    }
     // Тема значков (22.11): `ui icons glossy|crisp`.
     if let Some(words) = argument.trim().strip_prefix("icons") {
         ui::appicon::command(words);
@@ -2662,6 +2686,11 @@ fn ui_status(argument: &str) {
         ui::start_command(words);
         return;
     }
+    // Фон экрана блокировки (24.11): `ui lockbg same|fossai|color RRGGBB|image PATH`.
+    if let Some(words) = argument.trim().strip_prefix("lockbg") {
+        ui::wallpaper::lock_command(words);
+        return;
+    }
     // Окно стола по просьбе программы (П3, 20.11): `ui open settings
     // network`, `ui open terminal` — «Администрирование», «Выполнить».
     if let Some(words) = argument.trim().strip_prefix("open") {
@@ -2669,6 +2698,11 @@ fn ui_status(argument: &str) {
             Ok(what) => sprintln!("  ui open: {what}"),
             Err(why) => sprintln!("  ui open: FAILED {why}"),
         }
+        return;
+    }
+    // «Определить» (24.11): `ui identify [ms]` — number plates on the monitors.
+    if let Some(word) = argument.trim().strip_prefix("identify") {
+        ui::identify_monitors(word.trim().parse().unwrap_or(0));
         return;
     }
     // Масштаб стола на ходу (20.11): `ui scale auto|100|125|150|175|200`.

@@ -26,6 +26,7 @@
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/utime.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -226,6 +227,43 @@ static void check_process(void) {
     check(getuid() == geteuid() && getgid() == getegid(), "getuid matches geteuid");
 }
 
+/* ── Времена файла (24.11) ───────────────────────────────────────────────── */
+
+/* `stat` видит время изменения (было — ноль, и 7-Zip ставил архивам 1970
+ * год), а `utime`, `futimens` и `utimensat` его ставят. Файл `cposix-old.txt`
+ * остаётся с временем 1234567890 — по нему сценарий проверяет, что 7-Zip
+ * переносит время в архив и обратно. */
+static void check_times(void) {
+    time_t now = time(NULL);
+    int fd = open("cposix-times.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    struct stat info;
+    int fresh = fd >= 0 && write(fd, "times\n", 6) == 6 && fstat(fd, &info) == 0 && info.st_mtime > now - 600 &&
+                info.st_mtime < now + 600;
+    check(fresh, "fstat of a new file says now in st_mtime");
+
+    struct timespec times[2] = {{1000000000, 0}, {1500000000, 0}};
+    int by_fd = fd >= 0 && futimens(fd, times) == 0 && close(fd) == 0 && stat("cposix-times.txt", &info) == 0 &&
+                info.st_mtime == 1500000000 && info.st_atime == 1000000000;
+    check(by_fd, "futimens sets both times");
+
+    struct timespec keep_atime[2] = {{0, UTIME_OMIT}, {1600000000, 0}};
+    int omit = utimensat(AT_FDCWD, "cposix-times.txt", keep_atime, 0) == 0 && stat("cposix-times.txt", &info) == 0 &&
+               info.st_mtime == 1600000000 && info.st_atime == 1000000000;
+    check(omit, "utimensat with UTIME_OMIT keeps the access time");
+
+    int back_to_now = utimensat(AT_FDCWD, "cposix-times.txt", NULL, 0) == 0 && stat("cposix-times.txt", &info) == 0 &&
+                      info.st_mtime > now - 600;
+    check(back_to_now, "utimensat(NULL) sets now");
+    unlink("cposix-times.txt");
+
+    FILE *old = fopen("cposix-old.txt", "w");
+    struct utimbuf stamp = {1234567890, 1234567890};
+    int stamped = old != NULL && fputs("old file\n", old) >= 0 && fclose(old) == 0 &&
+                  utime("cposix-old.txt", &stamp) == 0 && stat("cposix-old.txt", &info) == 0 &&
+                  info.st_mtime == 1234567890;
+    check(stamped, "utime stamps cposix-old.txt with 1234567890");
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "/home/roman";
     printf("cposix: starting in %s\n", dir);
@@ -235,6 +273,7 @@ int main(int argc, char **argv) {
     check_waiting_pipe();
     check_standard();
     check_process();
+    check_times();
     printf("cposix: done, %d check(s) failed\n", failures);
     return failures == 0 ? 0 : 1;
 }

@@ -1,0 +1,19 @@
+[package]
+name = "smb"
+description = "SMB2/3 client (NTLMv2 in SPNEGO, signing, srvsvc share listing) and LAN name discovery packets (NetBIOS, LLMNR, mDNS, WS-Discovery)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Hashes from RustCrypto, `no_std` without a heap — the same crates as ssh,
+# tls and wpa. MD4, MD5, RC4, AES-128 and CMAC are our own (`src/crypto.rs`):
+# small, table-free or byte-wise, and the `aes` crate breaks the debug kernel
+# build on x86-64 (see wpa/src/aes.rs).
+[dependencies]
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+
+[lints]
+workspace = true

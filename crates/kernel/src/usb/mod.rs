@@ -37,6 +37,7 @@
 //! чинить.
 
 pub mod ehci;
+pub mod gamepad;
 pub mod hid;
 pub mod net;
 pub mod ohci;

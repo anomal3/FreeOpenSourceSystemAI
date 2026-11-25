@@ -458,6 +458,18 @@ impl Line {
         line
     }
 
+    /// Строка, у которой выделены первые `chars` символов (24.11: при
+    /// переименовании — имя без расширения, как F2 в Проводнике).
+    pub fn with_selection(text: &str, chars: usize) -> Self {
+        let mut line = Self::new(text);
+        let chars = chars.min(line.len());
+        if chars > 0 {
+            line.anchor = Some(0);
+            line.caret = chars;
+        }
+        line
+    }
+
     fn len(&self) -> usize {
         self.text.chars().count()
     }

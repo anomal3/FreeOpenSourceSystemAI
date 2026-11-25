@@ -59,31 +59,40 @@ pub fn heard(path: &Path, floor: i64) -> Result<u64> {
     Ok(loud * WINDOW as u64 * 1000 / u64::from(rate.max(1)))
 }
 
-/// Самый громкий участок: частота тона на нём и его длительность в мс.
-pub fn dominant(path: &Path) -> Result<(u32, u64)> {
+/// Сколько кадров звука гостя уже записано (метка [`Step::SoundMark`]: тон
+/// потом ищется только в том, что записано после неё).
+///
+/// [`Step::SoundMark`]: super::scenarios::Step::SoundMark
+pub fn frames(path: &Path) -> Result<usize> {
+    Ok(left_channel(path)?.0.len())
+}
+
+/// Самые громкие окна звука гостя с кадра `from`: частота тона на них и их
+/// длительность в мс.
+///
+/// Считаются только громкие окна, а не всё от первого до последнего (24.11,
+/// VLC: два гудка 660 Гц с полуторами секундами тишины между ними мерились
+/// как 527 Гц — тишина шла в знаменатель).
+pub fn dominant(path: &Path, from: usize) -> Result<(u32, u64)> {
     let (samples, rate) = left_channel(path)?;
+    let samples = &samples[from.min(samples.len())..];
     if samples.len() < WINDOW * 4 {
         bail!("в звуке гостя {} отсчётов — почти ничего", samples.len());
     }
 
-    // Громкость окнами, потом — участок, где она не ниже трети наибольшей.
-    let loudness = loudness(&samples);
+    // Громкость окнами, потом — окна, где она не ниже трети наибольшей.
+    let loudness = loudness(samples);
     let peak = loudness.iter().copied().max().unwrap_or(0);
     if peak < 500 {
         bail!("в звуке гостя тишина (средняя громкость не выше {peak})");
     }
-    let loud: Vec<usize> = loudness
-        .iter()
-        .enumerate()
-        .filter(|(_, value)| **value * 3 >= peak)
-        .map(|(index, _)| index)
-        .collect();
-    let first = loud.first().copied().unwrap_or(0) * WINDOW;
-    let last = (loud.last().copied().unwrap_or(0) + 1) * WINDOW;
-    let span = &samples[first..last.min(samples.len())];
-
-    let crossings = span.windows(2).filter(|pair| pair[0] < 0 && pair[1] >= 0).count() as u64;
-    let seconds_x1000 = span.len() as u64 * 1000 / u64::from(rate);
+    let (mut crossings, mut frames) = (0u64, 0u64);
+    for (index, _) in loudness.iter().enumerate().filter(|(_, value)| **value * 3 >= peak) {
+        let window = &samples[index * WINDOW..((index + 1) * WINDOW + 1).min(samples.len())];
+        crossings += window.windows(2).filter(|pair| pair[0] < 0 && pair[1] >= 0).count() as u64;
+        frames += (window.len() - 1) as u64;
+    }
+    let seconds_x1000 = frames * 1000 / u64::from(rate);
     if seconds_x1000 == 0 {
         bail!("громкий участок пуст");
     }

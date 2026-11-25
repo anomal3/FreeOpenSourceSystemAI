@@ -118,6 +118,12 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
             Ok(library) => say!("screenrec-media: {}", library.display()),
             Err(err) => say!("screenrec-media пропущена (запись экрана — только AVI): {err:#}"),
         }
+        // 7-Zip (24.11): `7zz` из исходников в sysroot, откуда его берут
+        // программы на C (`cbuild::FOREIGN_PROGRAMS`) — `/bin/7zz`.
+        match crate::sevenzip::ensure(opts.arch) {
+            Ok(program) => say!("7-Zip: {}", program.display()),
+            Err(err) => say!("7-Zip пропущен (архиватор без 7zz): {err:#}"),
+        }
     }
 
     // Программы собираются вместе с ядром: программа и ядро связаны номерами
@@ -349,7 +355,7 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 62] = [
+pub const USER_PROGRAMS: [&str; 66] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sockfd", "sshd",
     "cat", "sysupdate", "fetch", "memtest", "filemap", "posix", "winshow", "sysmon", "files",
@@ -365,6 +371,14 @@ pub const USER_PROGRAMS: [&str; 62] = [
     "admin", "compmgmt", "resmon", "startup", "autorun", "cfgedit",
     // «Запись экрана» (22.11): окно, запись по Win+Alt+R, проверка файла.
     "screenrec",
+    // «Параметры значков рабочего стола» (24.11).
+    "deskicon",
+    // «Сетевые учётные данные»: \\host\share с вводом имени и пароля (24.11).
+    "netlogon",
+    // «Архиватор 7-Zip» над `/bin/7zz` (24.11).
+    "archiver",
+    // «Фотографии»: просмотр фото (24.11).
+    "photos",
 ];
 
 /// Программы, которые в `/bin` **не** едут.

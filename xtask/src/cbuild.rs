@@ -239,7 +239,7 @@ pub const C_PROGRAMS: [CProgram; 12] = [
 ///
 /// `curl` (фаза 65d) — программа самого curl 8.23 поверх libcurl, mbedTLS и
 /// zlib, собранная его `configure`.
-pub const FOREIGN_PROGRAMS: [&str; 3] = ["lua", "mono", "curl"];
+pub const FOREIGN_PROGRAMS: [&str; 4] = ["lua", "mono", "curl", crate::sevenzip::PROGRAM];
 
 /// Библиотеки классов Mono, которые едут в образ рядом с `/bin/mono` (фаза 60):
 /// имя сборки и каталог в образе.
@@ -736,10 +736,10 @@ pub fn builtins(arch: Arch) -> PathBuf {
 /// Проверочные программы Linux (фаза 71a): исходники в `libc/linux`, путь в
 /// образе — `/compat/linux/bin/<имя>`.
 /// `drmprobe`/`nvkprobe` (18.11.2026) — узел DRM nouveau для NVK (общий
-/// `drmprobe.h` рядом); `amdprobe` (22.11.2026) — узел DRM amdgpu для RADV.
-const LINUX_PROGRAMS: [&str; 17] = [
-    "hello", "futexv", "sigasync", "shmprobe", "wow32probe", "netlinkprobe", "ntsyncprobe", "heapgrow", "rwxprobe",
-    "futexlat", "hangprobe", "drmprobe", "nvkprobe", "forkpoll", "tlblat", "rdlat", "amdprobe",
+/// `drmprobe.h` рядом); `amdprobe` (22.11.2026) — узел DRM amdgpu для RADV. `evdevprobe` (24.11.2026) —
+/// геймпад `/dev/input/event0` и его sysfs так, как их читает `winebus.sys` Proton.
+const LINUX_PROGRAMS: [&str; 18] = [
+    "hello", "futexv", "sigasync", "shmprobe", "wow32probe", "netlinkprobe", "ntsyncprobe", "heapgrow", "rwxprobe", "futexlat", "hangprobe", "drmprobe", "nvkprobe", "forkpoll", "tlblat", "rdlat", "evdevprobe", "amdprobe",
 ];
 
 /// Общие флаги проверочных программ Linux.
@@ -1149,6 +1149,12 @@ mod tests {
         );
         assert_eq!(core::mem::offset_of!(user_abi::Dirent, name_len), 28);
         assert_eq!(core::mem::offset_of!(user_abi::Dirent, name), 32);
+        // 24.11: file times.
+        assert_eq!(fields_of("freeos_statx"), ["size", "mode", "uid", "gid", "kind", "mtime", "atime", "ctime", "ino"]);
+        assert_eq!(size_of::<user_abi::StatX>(), 56);
+        assert_eq!(core::mem::offset_of!(user_abi::StatX, mtime), 24);
+        assert_eq!(fields_of("freeos_file_times"), ["atime", "mtime"]);
+        assert_eq!(size_of::<user_abi::FileTimes>(), 16);
         assert_eq!(fields_of("freeos_pollfd"), ["fd", "wanted", "ready"]);
         // Фаза 65b: сведения о сокете и о сети.
         assert_eq!(
@@ -1261,6 +1267,9 @@ mod tests {
             "FDCTL_FLAGS" => abi::FDCTL_FLAGS as i64,
             "FD_NONBLOCK" => abi::FD_NONBLOCK,
             "SYS_FLOCK" => abi::SYS_FLOCK as i64,
+            "SYS_CHMOD" => abi::SYS_CHMOD as i64,
+            "SYS_STATX" => abi::SYS_STATX as i64,
+            "SYS_UTIMES" => abi::SYS_UTIMES as i64,
             "FLOCK_GETLK" => abi::FLOCK_GETLK as i64,
             "FLOCK_SETLK" => abi::FLOCK_SETLK as i64,
             "FLOCK_SETLKW" => abi::FLOCK_SETLKW as i64,

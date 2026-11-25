@@ -91,6 +91,10 @@ pub fn tool_art(program: &str) -> Option<Art> {
         "startup" => "startup",
         "cfgedit" => "cfgedit",
         "screenrec" => "screenrec",
+        // «Архиватор 7-Zip» (24.11): значок архива темы.
+        "archiver" => "doc-archive",
+        // «Фотографии» (24.11): the picture-document icon of the theme.
+        "photos" => "doc-image",
         _ => return None,
     };
     let (icon, tone) = match program {
@@ -108,6 +112,8 @@ pub fn tool_art(program: &str) -> Option<Art> {
         "cfgedit" => (Icon::File, Tone::Accent),
         // Запись экрана (22.11).
         "screenrec" => (Icon::Camera, Tone::Bad),
+        "doc-archive" => (Icon::Package, Tone::Warn),
+        "doc-image" => (Icon::Camera, Tone::Accent),
         _ => return None,
     };
     // Картинка темы значков (22.11), плитка — если в теме такой нет.

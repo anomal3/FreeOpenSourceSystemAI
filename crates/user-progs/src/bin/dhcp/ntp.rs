@@ -61,7 +61,12 @@ const ATTEMPTS: u32 = 2;
 const TOLERANCE_NS: i128 = 2_000_000_000;
 
 /// Первая сверка машины со своими часами — через столько после аренды.
-const FIRST_CHECK_MS: u64 = 15 * 60 * 1000;
+///
+/// 20 s, not 15 min (24.11, hw-log18): a PC with Windows keeps local time in
+/// its battery clock, and until the first check the clock was hours off for a
+/// quarter of an hour - files stamped, the log, the panel. The first answer
+/// also tells the kernel what the battery clock keeps (`time::guess_rtc_from_ntp`).
+const FIRST_CHECK_MS: u64 = 20 * 1000;
 /// Как часто сверяться потом.
 const RESYNC_MS: u64 = 6 * 60 * 60 * 1000;
 /// Первая пауза после неудачи; дальше вдвое, до [`MOST_RETRY_MS`].

@@ -33,6 +33,7 @@ pub mod ext2fs;
 pub mod fat;
 // Блокировки файлов (08.11.2026): fcntl F_*LK и flock для всех программ.
 pub mod locks;
+pub mod netfs;
 // Наблюдение за каталогами (20.11): события создания, удаления, записи.
 pub mod notify;
 pub mod ramvol;
@@ -355,6 +356,16 @@ pub fn chmod_node(cred: Credentials, node: &dyn Node, mode: u16) -> VfsResult<()
         return Err(VfsError::PermissionDenied);
     }
     node.chmod(mode)
+}
+
+/// Set the access/modification time of a node (24.11, `utimensat`): owner
+/// and root, as `chmod` (Linux also lets a writer set «now»; programs here
+/// set times of files they made, so the owner rule covers them).
+pub fn set_times_node(cred: Credentials, node: &dyn Node, atime: Option<u32>, mtime: Option<u32>) -> VfsResult<()> {
+    if cred.uid != 0 && node.metadata().uid != cred.uid {
+        return Err(VfsError::PermissionDenied);
+    }
+    node.set_times(atime, mtime)
 }
 
 pub fn mkdir_as(cred: Credentials, path: &str, mode: u16) -> Option<VfsResult<()>> {

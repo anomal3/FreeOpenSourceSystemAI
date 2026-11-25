@@ -771,6 +771,9 @@ impl Volume {
                     attr,
                     first_cluster: cluster & FAT_ENTRY_MASK,
                     size: u32_at(raw, 28),
+                    mtime: dos_time(u16_at(raw, 24), u16_at(raw, 22)),
+                    atime: dos_time(u16_at(raw, 18), 0),
+                    ctime: dos_time(u16_at(raw, 16), u16_at(raw, 14)),
                 };
                 if visit(&entry)? == Flow::Stop {
                     return Ok(());
@@ -828,6 +831,30 @@ struct RawEntry {
     attr: u8,
     first_cluster: u32,
     size: u32,
+    /// Write, access (date only) and creation times, Unix seconds UTC; zero —
+    /// not set (24.11).
+    mtime: u32,
+    atime: u32,
+    ctime: u32,
+}
+
+/// A FAT date and time into Unix seconds, UTC (24.11). FAT keeps **local**
+/// time (that of the machine that wrote it), so the current offset is taken
+/// off — Windows and Linux `vfat` read it the same way. A zero date is «not
+/// set» (the access date of many writers, the creation date of DOS).
+fn dos_time(date: u16, time: u16) -> u32 {
+    if date == 0 {
+        return 0;
+    }
+    let year = 1980 + i32::from(date >> 9);
+    let month = ((date >> 5) & 0xF).clamp(1, 12) as u8;
+    let day = (date & 0x1F).max(1) as u8;
+    let hour = ((time >> 11) & 0x1F).min(23) as u8;
+    let minute = ((time >> 5) & 0x3F).min(59) as u8;
+    let second = ((time & 0x1F) * 2).min(59) as u8;
+    let local = calendar::DateTime::new(year, month, day, hour, minute, second).to_unix();
+    let utc = local - i64::from(crate::time::offset_minutes()) * 60;
+    u32::try_from(utc).unwrap_or(0)
 }
 
 impl RawEntry {
@@ -1115,6 +1142,7 @@ impl FileSystem for Fat32 {
             kind: NodeKind::Directory,
             first_cluster: self.volume.geometry.root_cluster,
             size: 0,
+            times: crate::vfs::Times::default(),
         }))
     }
 }
@@ -1125,6 +1153,7 @@ pub struct FatNode {
     kind: NodeKind,
     first_cluster: u32,
     size: u64,
+    times: crate::vfs::Times,
 }
 
 impl FatNode {
@@ -1138,13 +1167,21 @@ impl FatNode {
         } else {
             entry.first_cluster
         };
-        Self { volume: Arc::clone(volume), kind, first_cluster, size: entry.size() }
+        let times = crate::vfs::Times { mtime: entry.mtime, atime: entry.atime, ctime: entry.ctime };
+        Self { volume: Arc::clone(volume), kind, first_cluster, size: entry.size(), times }
     }
 }
 
 impl Node for FatNode {
     fn metadata(&self) -> Metadata {
-        Metadata::defaults(self.kind, self.size)
+        Metadata { mtime: self.times.mtime, ..Metadata::defaults(self.kind, self.size) }
+    }
+
+    fn times(&self) -> crate::vfs::Times {
+        // Missing access/creation dates fall back to the write time.
+        let mtime = self.times.mtime;
+        let or = |value: u32| if value == 0 { mtime } else { value };
+        crate::vfs::Times { mtime, atime: or(self.times.atime), ctime: or(self.times.ctime) }
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -1180,12 +1217,9 @@ impl Node for FatNode {
                 mode: defaults.mode,
                 uid: defaults.uid,
                 gid: defaults.gid,
-                // Время остаётся неизвестным, и это не то же самое, что с
-                // правами: у FAT32 поля даты есть, и установщик их заполняет —
-                // просто этот читатель записи каталога до них не разбирает.
-                // Показывать прочерк честнее, чем показать эпоху FAT и выдать
-                // её за дату файла.
-                mtime: defaults.mtime,
+                // The write time of the entry (24.11; before that the reader
+                // did not parse the date fields and showed a dash).
+                mtime: entry.mtime,
             });
             Ok(Flow::Continue)
         })?;

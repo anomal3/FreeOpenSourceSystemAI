@@ -34,6 +34,21 @@
 //! ряд выбирается по ширине экрана один раз при запуске.
 
 pub mod data;
+pub mod display;
+
+/// Display face (24.11) whose line height is nearest to `line` px: big text
+/// (lock-screen clock, boot title) drawn at its own size instead of a zoomed
+/// heading. Only digits, `:` and the letters of FOSSAI are in it.
+#[must_use]
+pub fn display_face(line: u32) -> &'static Face {
+    let mut best = display::ALL[0].1;
+    for &(_, face) in &display::ALL {
+        if u32::from(face.line).abs_diff(line) < u32::from(best.line).abs_diff(line) {
+            best = face;
+        }
+    }
+    best
+}
 
 use alloc::boxed::Box;
 use alloc::format;

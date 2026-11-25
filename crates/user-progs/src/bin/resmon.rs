@@ -683,6 +683,11 @@ impl Monitor {
 }
 
 impl App for Monitor {
+    /// Smallest window (24.11, WM SDK): the tabs, a table and the graphs column.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(640, 420)
+    }
+
     fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
         s.fill(area, theme::window_bg());
         let plan = Plan::new(ctx, area);

@@ -64,11 +64,15 @@ pub enum Section {
     Keyboard,
     Usb,
     Network,
+    /// «Параметры общего доступа» (24.11): network discovery, sharing.
+    Sharing,
     Personal,
     Wallpaper,
     Colors,
     /// «Оформление» (20.11): наборы «Современный»/«Простой» и эффекты.
     Appearance,
+    /// «Экран блокировки» (24.11): свой фон и заставка.
+    LockScreen,
     Dock,
     /// «Пуск» (20.11): ширина, разделы, закреплённые.
     Start,
@@ -105,7 +109,7 @@ const NAV: [Section; 13] = [
 ];
 
 /// Все страницы — для поиска.
-const ALL: [Section; 26] = [
+const ALL: [Section; 28] = [
     Section::Home,
     Section::System,
     Section::Display,
@@ -116,10 +120,12 @@ const ALL: [Section; 26] = [
     Section::Keyboard,
     Section::Usb,
     Section::Network,
+    Section::Sharing,
     Section::Personal,
     Section::Wallpaper,
     Section::Colors,
     Section::Appearance,
+    Section::LockScreen,
     Section::Dock,
     Section::Start,
     Section::Explorer,
@@ -148,10 +154,12 @@ impl Section {
             Section::Keyboard => "Клавиатура",
             Section::Usb => "USB-устройства",
             Section::Network => "Сеть",
+            Section::Sharing => "Параметры общего доступа",
             Section::Personal => "Персонализация",
             Section::Wallpaper => "Фон",
             Section::Colors => "Цвета",
-            Section::Appearance => "Оформление",
+            Section::Appearance => "Темы",
+            Section::LockScreen => "Экран блокировки",
             Section::Dock => "Dock и панель задач",
             Section::Start => "Пуск",
             Section::Explorer => "Проводник",
@@ -171,6 +179,7 @@ impl Section {
     const fn heading(self) -> &'static str {
         match self {
             Section::Privacy => "Конфиденциальность и безопасность",
+            Section::Appearance => "Темы и оформление",
             other => other.title(),
         }
     }
@@ -182,7 +191,8 @@ impl Section {
                 Some(Section::System)
             }
             Section::Keyboard | Section::Usb => Some(Section::Devices),
-            Section::Wallpaper | Section::Colors | Section::Appearance => Some(Section::Personal),
+            Section::Sharing => Some(Section::Network),
+            Section::Wallpaper | Section::Colors | Section::Appearance | Section::LockScreen => Some(Section::Personal),
             Section::Start => Some(Section::Dock),
             Section::Packages | Section::Services | Section::DefaultApps => Some(Section::Apps),
             _ => None,
@@ -208,9 +218,11 @@ impl Section {
             Section::Devices | Section::Keyboard => Fi::Keyboard,
             Section::Usb => Fi::Usb,
             Section::Network => Fi::Globe,
+            Section::Sharing => Fi::Server,
             Section::Personal | Section::Colors => Fi::Palette,
             Section::Wallpaper => Fi::Image,
             Section::Appearance => Fi::Sliders,
+            Section::LockScreen => Fi::Lock,
             Section::Dock => Fi::Dock,
             Section::Start => Fi::Apps,
             Section::Explorer => Fi::Folder,
@@ -262,10 +274,12 @@ impl Section {
             Section::Keyboard => "Раскладка и горячие клавиши",
             Section::Usb => "Подключённые устройства и контроллеры",
             Section::Network => "Адрес: по DHCP или постоянный",
-            Section::Personal => "Фон, цвета, тема, оформление",
+            Section::Sharing => "Сетевое обнаружение, общий доступ к файлам, парольная защита",
+            Section::Personal => "Тема, фон, цвета, экран блокировки, панель задач",
             Section::Wallpaper => "Картинка, цвет и расположение",
             Section::Colors => "Тема, акцентный цвет, заголовок окна",
-            Section::Appearance => "Современный или простой вид, эффекты, контур окна",
+            Section::Appearance => "Современный, простой или классический вид, стиль значков, эффекты",
+            Section::LockScreen => "Фон экрана блокировки, заставка",
             Section::Dock => "Вид, сторона экрана, автоскрытие, значки",
             Section::Start => "Ширина, разделы и закреплённые программы",
             Section::Explorer => "Файловый менеджер",
@@ -294,10 +308,12 @@ impl Section {
             Section::Keyboard => "клавиатура раскладка горячие клавиши alt shift",
             Section::Usb => "usb xhci ehci ohci контроллер мышь планшет",
             Section::Network => "сеть адрес dhcp шлюз ip mac dns",
-            Section::Personal => "персонализация оформление",
+            Section::Sharing => "общий доступ сетевое обнаружение компьютеры сети smb общие папки парольная защита netbios",
+            Section::Personal => "персонализация оформление тема темы",
             Section::Wallpaper => "фон обои градиент картинка цвет",
             Section::Colors => "цвета тема тёмная светлая акцент заголовок",
-            Section::Appearance => "оформление интерфейс вид эффекты анимация сворачивание открытие тени прозрачность размытие подсмотр контур перетаскивание простой классический современный быстродействие",
+            Section::LockScreen => "экран блокировки фон заставка часы вход win+l картинка",
+            Section::Appearance => "темы стиль значков значки оформление интерфейс вид эффекты анимация сворачивание открытие тени прозрачность размытие подсмотр контур перетаскивание простой классический современный быстродействие",
             Section::Dock => "панель задач dock аптайм дата часы расположение скрывать автоскрытие сверху слева справа значки мониторы дисплеи кнопки окон",
             Section::Start => "пуск меню закреплённые недавние все программы ширина широкий",
             Section::Explorer => "проводник файлы папки files",
@@ -362,6 +378,8 @@ pub enum Request {
     Panel,
     /// Сменился выбор масштаба — применить ко всему столу сразу (20.11).
     Scale,
+    /// Открыть окно «Значки рабочего стола» (24.11, «Персонализация»).
+    DesktopIcons,
 }
 
 /// Что делает пункт, по которому нажали.
@@ -381,6 +399,12 @@ enum Deed {
     ScreenOff(u32),
     /// Заставка (22.11, `saver`).
     Saver(super::saver::Deed),
+    /// «Подробная загрузка» (24.11): журнал вместо логотипа со следующей загрузки.
+    BootLog(bool),
+    /// Плитка «Выберите тему» в «Персонализации» (24.11): номер в `pages::THEMES`.
+    ThemeSet(u8),
+    /// «Значки рабочего стола» (24.11): окно оболочки стола.
+    DesktopIcons,
     Panel(PanelPref, bool),
     /// Панель задач и Dock (20.11, `deskcfg`).
     Taskbar(super::deskcfg::TaskbarDeed),
@@ -392,8 +416,14 @@ enum Deed {
     IconTheme(u8),
     Layout(crate::input::keymap::Layout),
     Timezone(i32),
+    /// «Аппаратные часы»: местное время (`true`) или UTC (24.11).
+    RtcLocal(bool),
     NetDhcp,
     NetStatic,
+    /// A switch of «Параметры общего доступа»: registry key and the new state.
+    Share(&'static str, bool),
+    /// Open a computer of the network (`/net/<name>`) — `netlogon --open`.
+    NetOpen(String),
     /// Включить Wi-Fi (`crate::wifi::enable`, 03.11).
     WifiOn,
     /// Выключить Wi-Fi (04.11: включить было можно, выключить — нет).
@@ -442,6 +472,8 @@ enum Deed {
     DisplaysKeep,
     /// «Отменить изменения» там же.
     DisplaysRevert,
+    /// «Определить» (24.11): number plates on the monitors.
+    DisplaysIdentify,
 }
 
 /// Что меняют на странице «Оформление» и в «Глубине цвета».
@@ -1280,6 +1312,44 @@ impl SettingsView {
                     Err(said) => Report::bad(said),
                 });
             }
+            Deed::ThemeSet(index) => {
+                let Some(&(wall, dark, accent, name)) = pages::THEMES.get(usize::from(index)) else {
+                    return;
+                };
+                let mut changed = super::wallpaper::use_preset();
+                changed |= theme::set_wallpaper(wall);
+                changed |= theme::set_dark(dark);
+                changed |= theme::set_accent(accent);
+                if changed {
+                    self.theme_changed = true;
+                }
+                let result = super::prefs::store_wallpaper(wall).and_then(|()| super::prefs::store_theme(dark)).and_then(|()| super::prefs::store_accent(accent));
+                kprintln!("  settings    : theme '{name}' ({}, {}, {})", wall.tag(), if dark { "dark" } else { "light" }, accent.tag());
+                self.report = Some(match result {
+                    Ok(()) => Report::ok(format!("тема «{name}» применена и запомнена")),
+                    Err(err) => Report::bad(format!("тема применена, но не запомнена: {err}")),
+                });
+            }
+            Deed::DesktopIcons => {
+                self.request = Some(Request::DesktopIcons);
+            }
+            Deed::Share(key, on) => {
+                crate::net::lan::set_flag(key, on);
+                kprintln!("  settings    : {key} = {}", if on { "on" } else { "off" });
+                self.report = Some(Report::ok(String::from(match (key, on) {
+                    (crate::net::lan::KEY_DISCOVERY, true) => "сетевое обнаружение включено",
+                    (crate::net::lan::KEY_DISCOVERY, false) => "сетевое обнаружение выключено: компьютер не ищет других и не отвечает на своё имя",
+                    (crate::net::lan::KEY_PASSWORD_PROTECTED, true) => "парольная защита включена",
+                    (crate::net::lan::KEY_PASSWORD_PROTECTED, false) => "парольная защита выключена",
+                    _ => "сохранено",
+                })));
+            }
+            Deed::BootLog(on) => {
+                self.report = Some(match super::prefs::set_boot_verbose(on) {
+                    Ok(said) => Report::ok(said),
+                    Err(said) => Report::bad(said),
+                });
+            }
             Deed::Panel(pref, on) => {
                 super::panel::set_shows(pref, on);
                 self.request = Some(Request::Panel);
@@ -1365,6 +1435,14 @@ impl SettingsView {
                     }
                     Err(err) => Report::bad(format!("раскладка включена, но не запомнена: {err}")),
                 });
+            }
+            Deed::RtcLocal(local) => {
+                let what = if local { "местное время" } else { "UTC" };
+                self.report = Some(match crate::time::set_rtc_local(local) {
+                    Ok(()) => Report::ok(format!("аппаратные часы: {what} — запомнено")),
+                    Err(err) => Report::bad(format!("аппаратные часы: {what} не записано: {err}")),
+                });
+                self.request = Some(Request::Panel);
             }
             Deed::Timezone(minutes) => {
                 let text = crate::time::zone_text(minutes);
@@ -1520,6 +1598,7 @@ impl SettingsView {
             Deed::Restart => self.request = Some(Request::Restart),
             Deed::Launch(path) => self.report = Some(pages::run(path, path)),
             Deed::Run(line) => self.report = Some(pages::run(&line, "Proton")),
+            Deed::NetOpen(path) => self.report = Some(pages::run(&format!("/bin/netlogon --open {path}"), "Обзор сети")),
             Deed::PickOutput(index) => {
                 self.displays.select(index);
                 kprintln!("  settings    : display {} selected", index + 1);
@@ -1559,6 +1638,10 @@ impl SettingsView {
                 // Фокус — на «Сохранить»: Enter сразу отвечает «да».
                 self.action = 0;
                 self.scroll = 0;
+            }
+            Deed::DisplaysIdentify => {
+                kprintln!("  settings    : identify displays");
+                crate::ui::identify_monitors(0);
             }
             Deed::DisplaysCancel => {
                 self.displays = displays::Displays::load();

@@ -55,6 +55,9 @@ MODULE_EXPORT const char *obs_module_description(void)
 #define CAP_GRAB CAP_IOC(3)
 #define CAP_STOP CAP_IOC(4)
 #define CAP_WINDOWS CAP_IOC(6)
+// 24.11: «Определить» — the number of every monitor on it (the argument is
+// the time in ms, 0 — 3 s), the same numbers as «Параметры → Дисплей».
+#define CAP_IDENTIFY CAP_IOC(7)
 
 #define CAP_POINTER 1u
 #define PIXEL_RGB 1u
@@ -99,6 +102,9 @@ static bool read_info(struct cap_info *info)
 struct monitor {
 	int x, y, w, h;
 	bool primary;
+	// The number of «Параметры → Дисплей» and of the «Определить» plates
+	// (24.11; an older kernel — the place in the list).
+	int number;
 	char name[32];
 	char description[96];
 };
@@ -133,8 +139,17 @@ static int read_monitors(struct monitor *list)
 			   &used) == 6 &&
 		    m->w > 0 && m->h > 0) {
 			m->primary = primary != 0;
+			m->number = count + 1;
 			if (used > 0)
 				snprintf(m->description, sizeof(m->description), "%s", line + used);
+			// `description\tnumber` (24.11).
+			char *tab = strrchr(m->description, '\t');
+			if (tab) {
+				int number = atoi(tab + 1);
+				if (number > 0)
+					m->number = number;
+				*tab = 0;
+			}
 			// «RHT QEMU Monitor (Virtual-1)»: the name is in the list line already.
 			char suffix[40];
 			snprintf(suffix, sizeof(suffix), " (%s)", m->name);
@@ -555,6 +570,24 @@ static void capture_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "fps", 0);
 }
 
+// «Определить» (24.11, like Windows): a big number on every monitor for 3 s
+// — the numbers of the list above.
+static bool identify_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(property);
+	UNUSED_PARAMETER(data);
+	int fd = open(CAP_DEVICE, O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+	if (ioctl(fd, CAP_IDENTIFY, 0) != 0)
+		blog(LOG_WARNING, "[fossai-capture] identify: %s", strerror(errno));
+	else
+		blog(LOG_INFO, "[fossai-capture] identify monitors");
+	close(fd);
+	return false;
+}
+
 static obs_properties_t *screen_properties(void *data)
 {
 	UNUSED_PARAMETER(data);
@@ -566,7 +599,7 @@ static obs_properties_t *screen_properties(void *data)
 	char text[192];
 	for (int i = 0; i < count; i++) {
 		const struct monitor *m = &monitors[i];
-		snprintf(text, sizeof(text), "Монитор %d — %s %d×%d%s%s%s", i + 1, m->name, m->w, m->h,
+		snprintf(text, sizeof(text), "Монитор %d — %s %d×%d%s%s%s", m->number, m->name, m->w, m->h,
 			 m->primary ? ", основной" : "", *m->description ? " — " : "", m->description);
 		obs_property_list_add_string(list, text, m->name);
 	}
@@ -577,6 +610,7 @@ static obs_properties_t *screen_properties(void *data)
 	} else {
 		obs_property_list_add_string(list, "Весь рабочий стол", MONITOR_DESKTOP);
 	}
+	obs_properties_add_button(props, "identify", "Определить", identify_clicked);
 	obs_properties_add_bool(props, "show_cursor", "Показывать указатель");
 	obs_property_t *fps = obs_properties_add_int(props, "fps", "Кадров в секунду (0 — как у видео OBS)", 0, 240, 1);
 	obs_property_set_long_description(fps, "0 — столько же, сколько в Настройки → Видео (30 или 60)");

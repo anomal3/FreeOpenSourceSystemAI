@@ -277,6 +277,11 @@ impl Services {
 }
 
 impl App for Services {
+    /// Smallest window (24.11, WM SDK): the services table and the action buttons.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(560, 360)
+    }
+
     fn key(&mut self, code: u32) -> bool {
         match code {
             WIN_KEY_UP => self.selected = self.selected.saturating_sub(1),

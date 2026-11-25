@@ -120,6 +120,13 @@ impl Snap {
     }
 }
 
+/// «Определить» (24.11): number plates on the monitors and when they go.
+struct Identify {
+    until_ms: u64,
+    /// Place on the desktop and the plate.
+    plates: Vec<(Rect, Surface)>,
+}
+
 /// Монитор стола: экран, в который выводятся собранные полосы, и его место
 /// на общем столе.
 ///
@@ -328,12 +335,17 @@ pub struct Compositor {
     thumbs: Option<super::thumbs::Thumbs>,
     /// Окно трея (72h-1).
     tray_pop: Option<super::traypop::TrayPop>,
+    /// «Завершение работы» screen (24.11): over everything on every monitor.
+    ending: Option<super::ending::Screen>,
     /// Экран блокировки (72h-4) и его готовая картинка во весь экран.
     lock: Option<(super::lock::Lock, Surface)>,
     /// Screensaver (22.11, `saver`): over everything, the lock screen too.
     saver: Option<super::saver::Shown>,
     /// Уведомление (72h-2) и пакеты, о которых стол уже знает.
     toast: Option<super::toast::Toast>,
+    /// «Определить» (24.11, like Windows): number plates on the monitors
+    /// until a moment.
+    identify: Option<Identify>,
     /// Заставка запуска программы Windows (21.11, `ui::launch`).
     splash: super::launch::Splash,
     known_packages: Option<Vec<alloc::string::String>>,
@@ -555,7 +567,9 @@ impl Compositor {
             peek_back: None,
             thumbs: None,
             tray_pop: None,
+            ending: None,
             toast: None,
+            identify: None,
             splash: super::launch::Splash::default(),
             known_packages: None,
             lock: None,
@@ -2326,7 +2340,8 @@ impl Compositor {
         // Обои основного монитора, в координатах самой картинки.
         if theme::is_mobile() {
             self.draw_background(&mut surface, full, 0);
-        } else {
+        } else if !super::wallpaper::paint_lock(&mut surface) {
+            // Свой фон экрана блокировки (24.11) не выбран или ещё готовится.
             self.draw_wall_on(&mut surface, full, full, 0);
         }
         lock.draw(&mut surface, self.scale);
@@ -2370,11 +2385,53 @@ impl Compositor {
             super::lock::Outcome::Redraw => self.redraw_lock(),
             super::lock::Outcome::Unlock => {
                 self.lock = None;
+                super::wallpaper::lock_done();
                 self.repaint_all();
             }
             _ => {}
         }
         outcome
+    }
+
+    /// Show the «Завершение работы» / «Перезагрузка» screen (24.11) on every
+    /// monitor; the pointer hides.
+    pub fn begin_ending(&mut self, restart: bool) {
+        if self.ending.is_some() {
+            return;
+        }
+        self.ending = Some(super::ending::Screen::new(restart, self.scale));
+        if self.hw_cursor {
+            let (x, y) = self.pointer.position();
+            crate::display::cursor_visible(false, x, y);
+        }
+        self.repaint_all();
+    }
+
+    /// Next spinner frame of the ending screen (and a new note under it).
+    pub fn ending_tick(&mut self, note: Option<&str>) {
+        let outputs: Vec<Rect> = self.outputs.iter().map(|out| out.rect).collect();
+        let Some(screen) = self.ending.as_mut() else { return };
+        screen.tick(note);
+        let parts: Vec<Rect> = screen.damage(&outputs).collect();
+        for part in parts {
+            self.mark(part);
+        }
+    }
+
+    #[must_use]
+    pub const fn ending(&self) -> bool {
+        self.ending.is_some()
+    }
+
+    /// Take the ending screen away (the machine refused to go down).
+    pub fn cancel_ending(&mut self) {
+        if self.ending.take().is_some() {
+            if self.hw_cursor {
+                let (x, y) = self.pointer.position();
+                crate::display::cursor_visible(true, x, y);
+            }
+            self.repaint_all();
+        }
     }
 
     /// Screensaver (22.11, `saver`): show `shown` (`None` - take it away);
@@ -2424,6 +2481,77 @@ impl Compositor {
         let toast = self.toast.take()?;
         self.mark_layer(toast.rect);
         Some((toast.start, toast.rights))
+    }
+
+    /// «Определить» (24.11, like Windows): a big number plate in the lower
+    /// left corner of every monitor for `ms`. `numbers` — `(backend, number,
+    /// name)` of each monitor in the registry: the number is the one
+    /// «Параметры → Дисплей» and OBS show, the name tells two monitors of
+    /// the same model apart. `false` — no monitor to show it on.
+    pub fn start_identify(&mut self, numbers: &[(crate::display::outputs::Backend, u32, alloc::string::String)], ms: u64) -> bool {
+        self.close_identify();
+        let ctx = mini_ui::paint::Ctx::scaled(self.scale);
+        let mut plates = Vec::new();
+        let mut lines = Vec::new();
+        let outputs: Vec<(Rect, crate::display::outputs::Backend)> = self.outputs.iter().map(|out| (out.rect, out.backend)).collect();
+        for (index, (mon, backend)) in outputs.into_iter().enumerate() {
+            let (number, name) = match numbers.iter().find(|(b, ..)| *b == backend) {
+                Some((_, number, name)) => (*number, name.clone()),
+                None => (index as u32 + 1, alloc::format!("{backend:?}")),
+            };
+            let digits = alloc::format!("{number}");
+            let size = (mon.h / 6).clamp(ctx.px(80), ctx.px(220));
+            let face = mini_ui::typeface::display_face(size);
+            let caption = alloc::format!("{name} · {}×{}", mon.w, mon.h);
+            let cap_face = ctx.face(mini_ui::typeface::Role::Body);
+            let pad = ctx.px(28);
+            let w = face.width(&digits).max(cap_face.width(&caption)).max(size) + 2 * pad;
+            let cap_h = u32::from(cap_face.line);
+            let h = u32::from(face.line) + cap_h + ctx.px(6) + 2 * ctx.px(18);
+            let work = self.work_rect_of(index);
+            let margin = ctx.px(40) as i32;
+            let x = mon.x + margin;
+            let y = (work.bottom().min(mon.bottom()) - margin - h as i32).max(mon.y);
+            let Some(mut surface) = Surface::new(w, h, Color::rgb(0x1B, 0x1E, 0x25)) else {
+                continue;
+            };
+            // An accent strip on the left, the number white, the name grey.
+            let accent = ctx.palette.acc;
+            surface.fill(Rect::new(0, 0, ctx.px(6), h), accent);
+            let white = Color::rgb(0xFF, 0xFF, 0xFF);
+            let nx = (w as i32 - face.width(&digits) as i32) / 2;
+            mini_ui::typeface::draw(&mut surface, face, nx, ctx.px(18) as i32, &digits, white, 255);
+            let cx = (w as i32 - cap_face.width(&caption) as i32) / 2;
+            let band = Rect::new(0, (ctx.px(18) + u32::from(face.line) + ctx.px(6)) as i32, w, cap_h);
+            mini_ui::paint::text(ctx, &mut surface, mini_ui::typeface::Role::Body, cx, mini_ui::paint::baseline(ctx, mini_ui::typeface::Role::Body, band), &caption, Color::rgb(0xC8, 0xCC, 0xD4));
+            let rect = Rect::new(x, y, w, h);
+            self.mark_layer(rect);
+            lines.push(alloc::format!("{number} '{name}' {}x{} at {},{}", mon.w, mon.h, mon.x, mon.y));
+            plates.push((rect, surface));
+        }
+        if plates.is_empty() {
+            return false;
+        }
+        crate::kprintln!("  desktop     : identify monitors for {} ms: {}", ms, lines.join("; "));
+        self.identify = Some(Identify { until_ms: crate::time::uptime_ms() + ms, plates });
+        true
+    }
+
+    /// Take the number plates off the monitors.
+    pub fn close_identify(&mut self) {
+        if let Some(identify) = self.identify.take() {
+            for (rect, _) in identify.plates {
+                self.mark_layer(rect);
+            }
+        }
+    }
+
+    /// The number plates are gone when their time is up.
+    pub fn expire_identify(&mut self) {
+        if self.identify.as_ref().is_some_and(|identify| crate::time::uptime_ms() >= identify.until_ms) {
+            self.close_identify();
+            crate::kprintln!("  desktop     : identify plates gone");
+        }
     }
 
     /// Убрать уведомление, если вышел его срок.
@@ -2664,7 +2792,9 @@ impl Compositor {
             }
             self.close_snap_layouts();
         }
-        let next = if theme::is_mobile() || self.drag_resizes || self.drag.is_none() {
+        // A window of one size (24.11, WM SDK) does not snap, as in Windows.
+        let snaps = self.drag.and_then(|app| self.index_of(app)).and_then(|index| self.windows.get(index)).is_some_and(|window| window.can_maximize());
+        let next = if theme::is_mobile() || self.drag_resizes || self.drag.is_none() || !snaps {
             None
         } else {
             self.snap_zone(x, y)
@@ -2752,7 +2882,7 @@ impl Compositor {
             return false;
         };
         let before = window.rect;
-        if !window.snap_to(target, previous, maximize) {
+        if !window.can_maximize() || !window.snap_to(target, previous, maximize) {
             return false;
         }
         window.draw_decorations(focused);
@@ -3043,6 +3173,11 @@ impl Compositor {
         // Окно во весь экран не разворачивают и не возвращают: его размер —
         // монитор, пока программа сама не выйдет из этого режима.
         if self.windows.get(index).is_some_and(|window| window.fullscreen) {
+            return false;
+        }
+        // «Развернуть» is greyed out for a window that cannot change size
+        // (24.11): neither the button nor Win+Up nor a client request.
+        if self.windows.get(index).is_some_and(|window| !window.is_maximized() && !window.can_maximize()) {
             return false;
         }
         let mut area = match self.windows.get(index) {
@@ -4074,8 +4209,21 @@ impl Compositor {
         // Контур (20.11): пока тянут, меняется только рамка; размер —
         // при отпускании ([`Self::settle_drag`]).
         if !self.settling && self.drag_resizes && self.drag.is_some() && super::look::outline_drag() {
-            if let Some((_, x, y, w, h)) = self.pending_size {
-                self.set_outline(Some(Rect::new(x, y, w.max(1) as u32, h.max(1) as u32)));
+            if let Some((app, x, y, w, h)) = self.pending_size {
+                // The outline obeys the size limits too (24.11): it stops
+                // where the window would, the fixed side stays put.
+                let edges = self.resize_edges;
+                let outline = match self.index_of(app).and_then(|index| self.windows.get(index)) {
+                    Some(window) => {
+                        let before = window.rect;
+                        let (cw, ch) = window.clamp_size(w.max(1) as u32, h.max(1) as u32);
+                        let cx = if edges & super::window::EDGE_LEFT != 0 { before.right() - cw as i32 } else { x };
+                        let cy = if edges & super::window::EDGE_TOP != 0 { before.bottom() - ch as i32 } else { y };
+                        Rect::new(cx, cy, cw, ch)
+                    }
+                    None => Rect::new(x, y, w.max(1) as u32, h.max(1) as u32),
+                };
+                self.set_outline(Some(outline));
             }
             return;
         }
@@ -4519,13 +4667,16 @@ impl Compositor {
     /// Открыть окно трея над значком `item`. `false` — не вышло.
     pub fn open_tray_pop(&mut self, kind: super::traypop::Kind, item: super::panel::TrayItem) -> bool {
         let Some(panel) = self.panel.as_ref() else { return false };
-        let Some(anchor) = panel.tray_rect(item) else { return false };
+        // An icon kept under the chevron (24.11) opens its window above the
+        // chevron.
+        let Some(anchor) = panel.tray_rect(item).or_else(|| panel.tray_rect(super::panel::TrayItem::Overflow)) else { return false };
         let panel_top = panel.home().y;
         let Some(mut pop) = super::traypop::TrayPop::new(kind, anchor, self.primary, panel_top, self.scale) else {
             return false;
         };
         pop.rect = self.beside_panel(pop.rect, anchor);
         self.mark_layer(pop.rect);
+        super::panel::set_overflow_open(kind == super::traypop::Kind::Overflow);
         self.tray_pop = Some(pop);
         true
     }
@@ -4534,6 +4685,7 @@ impl Compositor {
         if let Some(pop) = self.tray_pop.take() {
             self.mark_layer(pop.rect);
         }
+        super::panel::set_overflow_open(false);
     }
 
     #[must_use]
@@ -4563,6 +4715,18 @@ impl Compositor {
             None => return,
         };
         self.mark(rect);
+    }
+
+    /// Tray icons of the main panel as `tray:<item> at X,Y WxH` (24.11).
+    #[must_use]
+    pub fn tray_spots(&self) -> Vec<alloc::string::String> {
+        self.panel.as_ref().map(super::panel::Panel::tray_spots).unwrap_or_default()
+    }
+
+    /// Cells of the open tray popup as `traypop:<n> at X,Y WxH` (24.11).
+    #[must_use]
+    pub fn tray_pop_spots(&self) -> Vec<alloc::string::String> {
+        self.tray_pop.as_ref().map(super::traypop::TrayPop::spots).unwrap_or_default()
     }
 
     #[must_use]
@@ -5141,6 +5305,8 @@ impl Compositor {
         self.advance_flight();
         let shade_moving = self.advance_shade();
         let taskbar_moving = self.advance_taskbar();
+        // A Start popup fading in (24.11).
+        let taskbar_moving = taskbar_moving | self.menu.as_mut().is_some_and(Menu::tick_anim);
         // Наплыв подсмотра и отсчёт до макетов прилипания (20.11).
         let peek_moving = self.advance_peek();
         let snap_waiting = self.advance_snap_layouts();
@@ -5246,6 +5412,7 @@ impl Compositor {
         if !DIRECT.load(core::sync::atomic::Ordering::Relaxed)
             || theme::is_mobile()
             || self.lock.is_some()
+            || self.ending.is_some()
             || self.flight.is_some()
             || self.scene.is_some()
             || self.peek.is_some()
@@ -5258,6 +5425,7 @@ impl Compositor {
             || self.thumbs.is_some()
             || self.tray_pop.is_some()
             || self.snap_pop.is_some()
+            || self.identify.is_some()
             || self.menu_open()
             || self.context.as_ref().is_some_and(|menu| menu.is_open())
             || self.keyboard.as_ref().is_some_and(|keyboard| keyboard.is_visible())
@@ -5928,6 +6096,12 @@ impl Compositor {
     /// тень окна ложится на всё, что ниже него, и не задевает то, что выше.
     fn compose_band(&self, back: &mut Surface, band: Rect) {
         let dy = -band.y;
+        // «Завершение работы» (24.11) closes everything on every monitor.
+        if let Some(screen) = self.ending.as_ref() {
+            let outputs: Vec<Rect> = self.outputs.iter().map(|out| out.rect).collect();
+            screen.compose(back, band, dy, &outputs);
+            return;
+        }
         // The screensaver (22.11) closes everything, the pointer too.
         if let Some(saver) = self.saver.as_ref() {
             saver.compose(back, band, dy);
@@ -6157,6 +6331,15 @@ impl Compositor {
             let r = theme::R_WINDOW * self.scale;
             self.drop_shadow(back, toast.rect, band, dy, r);
             self.stack(back, toast.surface(), toast.rect, band, dy, r);
+        }
+        // «Определить» (24.11): the number plate of every monitor, over
+        // windows and the panel.
+        if let Some(identify) = self.identify.as_ref() {
+            let r = theme::R_WINDOW * self.scale;
+            for (rect, surface) in &identify.plates {
+                self.drop_shadow(back, *rect, band, dy, r);
+                self.stack(back, surface, *rect, band, dy, r);
+            }
         }
         if let Some((surface, rect)) = self.splash.layer() {
             let r = theme::R_WINDOW * self.scale;

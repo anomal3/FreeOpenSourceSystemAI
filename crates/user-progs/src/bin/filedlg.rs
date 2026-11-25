@@ -111,6 +111,11 @@ impl Picker {
 }
 
 impl App for Picker {
+    /// Smallest window (24.11, WM SDK): places, the file table and the name row with its buttons.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(560, 380)
+    }
+
     fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
         self.dialog.draw(&self.host, s, ctx, area);
     }

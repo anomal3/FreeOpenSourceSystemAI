@@ -3003,6 +3003,13 @@ pub fn style_window(slot: u32, flags: u32) -> Result<(), WindowError> {
     crate::ui::style_window(sched::current().as_u32(), slot, flags).map_err(WindowError::Desktop)
 }
 
+/// Size limits of the window `slot` of the current program (24.11), content
+/// size in layout points.
+pub fn limit_window(slot: u32, min: (u32, u32), max: (u32, u32)) -> Result<(), WindowError> {
+    let limits = crate::ui::window::SizeLimits { min, max, logical: true };
+    crate::ui::limit_window(sched::current().as_u32(), slot, limits).map_err(WindowError::Desktop)
+}
+
 /// Форма указателя над окном `slot` текущей программы (09.11.2026).
 pub fn cursor_window(slot: u32, shape: crate::ui::pointer::Shape) -> Result<(), WindowError> {
     crate::ui::cursor_window(sched::current().as_u32(), slot, shape).map_err(WindowError::Desktop)
@@ -4212,6 +4219,7 @@ fn run(
         })));
     }
     note_linux(slot, linux);
+    fresh_signal_state(slot);
     // Признак поднимается после того, как процесс попал в таблицу: обработчик
     // отказа читает его без лока и вправе увидеть `true` только тогда, когда
     // программу уже есть где найти.
@@ -4405,10 +4413,13 @@ const MAX_LINE: usize = 255;
 
 /// Сколько аргументов программа получает самое большее.
 ///
-/// Восемь — не свойство программы, а предел на разбор: аргументы разбираются в
+/// Предел — не свойство программы, а предел на разбор: аргументы разбираются в
 /// массив на стеке ядра, и брать его длину из того, что набрал человек, значило
-/// бы отдать ему глубину этого стека.
-const MAX_ARGS: usize = 8;
+/// бы отдать ему глубину этого стека. Было восемь; 24.11 — тридцать два
+/// (полкилобайта стека): окну 7-Zip нужно одиннадцать (`7zz x -y -aoa -bso1
+/// -bse1 -bsp1 … -o… архив @список`), а восьмой и дальше молча пропадали —
+/// 7zz отвечал «Cannot find archive name».
+const MAX_ARGS: usize = 32;
 
 /// Запустить программу отдельной задачей.
 ///
@@ -4612,6 +4623,46 @@ pub static LINUX_PENDING: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::ne
 /// Запасной стек сигналов потока Linux (`sigaltstack`): начало и размер.
 pub static LINUX_ALTSTACK: [(AtomicUsize, AtomicUsize); sched::MAX_TASKS] =
     [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; sched::MAX_TASKS];
+
+/// A program started by the kernel (desktop, shell `run`, init) begins with
+/// no blocked or pending signals, no alternate signal stack and no
+/// `clear_tid` (24.11.2026, hw-log18). These per-slot values used to be left
+/// as the slot's previous task had them (finished slots are handed out
+/// again once all ~1000 were used, oldest first - in hw-log18 from about
+/// task #1100 on, which is why only the late launches failed): glibc blocks
+/// every signal but SIGSETXID in a thread that is exiting, so a program that
+/// got such a slot
+/// started with SIGSEGV, SIGCHLD, SIGTERM... blocked, and `fork`/`execve`
+/// passed the mask down the whole tree (as they must). Proton launched from
+/// the desktop that way had winedevice.exe threads with SIGSEGV blocked, and
+/// the deliberate fault of ntoskrnl's `call_driver_init` (return address
+/// ORed with 0xffff800000000000, repaired by Wine's SIGSEGV handler) killed
+/// the process: mask `0xfffffffe6ffad4f8` = everything but Wine's
+/// `server_block_set`. `fork`, `clone` and `execve` keep setting the mask
+/// they inherit, as in Linux.
+fn fresh_signal_state(slot: usize) {
+    if slot >= sched::MAX_TASKS {
+        return;
+    }
+    let stale = LINUX_SIGMASK[slot].swap(0, Ordering::Relaxed);
+    LINUX_PENDING[slot].store(0, Ordering::Relaxed);
+    LINUX_ALTSTACK[slot].0.store(0, Ordering::Relaxed);
+    LINUX_ALTSTACK[slot].1.store(0, Ordering::Relaxed);
+    LINUX_CLEAR_TID[slot].store(0, Ordering::Relaxed);
+    #[cfg(target_arch = "x86_64")]
+    crate::linux::signal::slot_reused(slot);
+    if stale != 0 && STALE_MASKS.fetch_add(1, Ordering::Relaxed) < 8 {
+        kprintln!(
+            "  user        : {} got slot {slot} with a signal mask {stale:#x} left by its previous task: cleared",
+            sched::current()
+        );
+    }
+}
+
+/// How many kernel-started programs got a slot whose previous task left a
+/// signal mask behind (cleared by [`fresh_signal_state`]; the first eight are
+/// logged).
+static STALE_MASKS: AtomicUsize = AtomicUsize::new(0);
 
 /// Что новая задача должна знать о потоке Linux (`clone`, фаза 71c).
 #[cfg(target_arch = "x86_64")]
@@ -5383,6 +5434,8 @@ impl Program {
         let exe = crate::linux_path::shown(&self.path);
         let (stack_low, stack_high) = self.linux_stack;
         let mut stack_done = false;
+        #[cfg(target_arch = "x86_64")]
+        let mut last_named: Option<(usize, alloc::string::String)> = None;
         for region in &self.mappings {
             // Стек главного потока — одной строкой: ленивая часть записана
             // областью, жадная — нет.
@@ -5393,13 +5446,40 @@ impl Program {
                 let _ = writeln!(out, "{stack_low:x}-{stack_high:x} rw-p 00000000 00:00 0 [stack]");
                 stack_done = true;
             }
+            // A mapped file by its own path (24.11.2026, VLC): the name
+            // `openat` saw for its node (`linux::mapnames`), the program file
+            // for its image window, nothing for an unremembered data file.
+            // Every file used to carry the program path, and VLC, which finds
+            // its plugins from the line of `libvlccore.so`, looked in
+            // `/opt/vlc/bin/vlc/plugins`.
+            #[cfg(target_arch = "x86_64")]
+            let mut image_name = |image: &ImageBacking| {
+                // A library is several regions in a row: one table walk.
+                let key = alloc::sync::Arc::as_ptr(&image.node) as *const () as usize;
+                if let Some((last, name)) = &last_named {
+                    if *last == key {
+                        return name.clone();
+                    }
+                }
+                let name = crate::linux::mapnames::name_of(&image.node).unwrap_or_else(|| {
+                    if region.base < WINDOW_BASE + IMAGE_LIMIT_BYTES {
+                        alloc::string::String::from(exe)
+                    } else {
+                        alloc::string::String::new()
+                    }
+                });
+                last_named = Some((key, name.clone()));
+                name
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let image_name = |_: &ImageBacking| alloc::string::String::from(exe);
             let (flags, name, offset) = match &region.source {
-                Source::Anonymous(anon) => (anon.flags, "", 0),
-                Source::ThreadStack => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, "", 0),
-                Source::Image(image) => (image.flags, exe, image.offset),
-                Source::Shared(shared) => (shared.flags, "/dev/shm", (shared.first * PAGE_SIZE) as u64),
-                Source::File(file) => (PageFlags::READ | PageFlags::USER, "", file.offset),
-                _ => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, "", 0),
+                Source::Anonymous(anon) => (anon.flags, alloc::string::String::new(), 0),
+                Source::ThreadStack => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, alloc::string::String::new(), 0),
+                Source::Image(image) => (image.flags, image_name(image), image.offset),
+                Source::Shared(shared) => (shared.flags, alloc::string::String::from("/dev/shm"), (shared.first * PAGE_SIZE) as u64),
+                Source::File(file) => (PageFlags::READ | PageFlags::USER, alloc::string::String::new(), file.offset),
+                _ => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, alloc::string::String::new(), 0),
             };
             // Устройство и номер узла у отображённого файла — настоящие, а не
             // `00:00 0` (31.10.2026): `jetbrainsd` Rider (GraalVM) ищет себя
@@ -5582,6 +5662,28 @@ extern "C" fn thread_entry(arg: usize) -> ! {
     sched::exit_current_with(code)
 }
 
+/// Слова строки запуска: делит пробел; слово, начатое кавычкой, тянется до
+/// закрывающей кавычки (сами кавычки не входят). Без закрывающей — до конца.
+pub fn launch_words(line: &str) -> impl Iterator<Item = &str> {
+    let mut rest = line;
+    core::iter::from_fn(move || {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return None;
+        }
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"').unwrap_or(inner.len());
+            let word = &inner[..end];
+            rest = inner.get(end + 1..).unwrap_or("");
+            return Some(word);
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..end];
+        rest = &rest[end..];
+        Some(word)
+    })
+}
+
 /// Точка входа задачи, исполняющей программу.
 extern "C" fn program_entry(arg: usize) -> ! {
     // Задача начинает исполняться с запрещёнными прерываниями: их запретил
@@ -5611,7 +5713,10 @@ extern "C" fn program_entry(arg: usize) -> ! {
     // живёт ровно столько, сколько эта задача. Первое слово — путь, остальные —
     // аргументы программы; кавычек и экранирования нет, и обещать их, сделав
     // разбиение по пробелам, было бы хуже, чем не обещать.
-    let mut words = line.split_whitespace();
+    // Кавычки (24.11, hw-log18): слово в `"…"` — одно, с пробелами внутри
+    // (стол открывает «/root/Desktop/Новый текстовый документ.txt»). Строки
+    // без кавычек делятся как раньше.
+    let mut words = launch_words(line);
     let path = words.next().unwrap_or("");
     let mut args: [&str; MAX_ARGS] = [""; MAX_ARGS];
     let mut argc = 0;
@@ -6538,6 +6643,71 @@ pub fn end_program_group(id: sched::TaskId) -> Result<usize, KillError> {
     sched::wake_input();
     kprintln!("  user        : ending job #{job} of {id}: {ended} process(es):{names}");
     Ok(ended)
+}
+
+/// Each live process once: its first slot and the process (24.11, graceful
+/// shutdown).
+fn live_processes() -> Vec<(usize, Arc<Mutex<Program>>)> {
+    let table: Vec<(usize, Arc<Mutex<Program>>)> = {
+        let table = PROGRAMS.lock();
+        table.iter().enumerate().filter_map(|(slot, entry)| entry.as_ref().map(|p| (slot, Arc::clone(p)))).collect()
+    };
+    let mut out: Vec<(usize, Arc<Mutex<Program>>)> = Vec::new();
+    for (slot, process) in table {
+        if out.iter().any(|(_, known)| Arc::ptr_eq(known, &process)) {
+            continue;
+        }
+        if sched::id_of_slot(slot).and_then(sched::lookup).is_some_and(|(_, state)| state == sched::TaskState::Finished) {
+            continue;
+        }
+        out.push((slot, process));
+    }
+    out
+}
+
+/// Linux processes alive now — their pids (24.11, graceful shutdown).
+#[must_use]
+pub fn linux_processes() -> Vec<u32> {
+    live_processes()
+        .into_iter()
+        .filter_map(|(_, process)| {
+            let program = process.lock();
+            (program.linux && !program.ending && program.linux_pid != 0).then_some(program.linux_pid)
+        })
+        .collect()
+}
+
+/// Native programs alive now that a graceful shutdown stops: task and path.
+/// A program that holds a device as its driver (Д1) is left to the power-off
+/// — the volumes may still need it for the last flush.
+#[must_use]
+pub fn native_programs() -> Vec<(sched::TaskId, alloc::string::String)> {
+    live_processes()
+        .into_iter()
+        .filter_map(|(slot, process)| {
+            let program = process.lock();
+            if program.linux || program.ending || program.devices.iter().any(Option::is_some) {
+                return None;
+            }
+            Some((sched::id_of_slot(slot)?, program.path.clone()))
+        })
+        .collect()
+}
+
+/// Stop the native programs (services, 24.11): `init` first, so that it
+/// restarts none of them, then the others, the newest first. Answer — how
+/// many were asked.
+pub fn stop_native_programs() -> usize {
+    let mut programs = native_programs();
+    programs.sort_by_key(|(id, path)| (!path.ends_with("/init"), core::cmp::Reverse(id.as_u32())));
+    let mut asked = 0;
+    for (id, path) in programs {
+        if request_kill(id).is_ok() {
+            kprintln!("  user        : stopping {id} {path}");
+            asked += 1;
+        }
+    }
+    asked
 }
 
 /// Снять остальные потоки процесса, чей главный поток в слоте `slot` только

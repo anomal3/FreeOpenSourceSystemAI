@@ -60,6 +60,11 @@ struct Monitor {
 }
 
 impl App for Monitor {
+    /// Smallest window (24.11, WM SDK): the meters column.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(300, 240)
+    }
+
     fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
         let p = ctx.palette;
         let info = &self.info;

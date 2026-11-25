@@ -1075,6 +1075,23 @@ impl Node for ExfatNode {
         Ok(())
     }
 
+    fn times(&self) -> crate::vfs::Times {
+        let node = self.fresh_unlocked().unwrap_or_else(|_| self.snapshot());
+        let clip = |seconds: u64| seconds.min(u64::from(u32::MAX)) as u32;
+        // exFAT keeps creation, not status change: `ctime` carries creation,
+        // as Windows' «Дата создания».
+        crate::vfs::Times { mtime: clip(node.modified), atime: clip(node.accessed), ctime: clip(node.created) }
+    }
+
+    fn set_times(&self, atime: Option<u32>, mtime: Option<u32>) -> VfsResult<()> {
+        let mut volume = self.fs.volume.lock();
+        let result = volume.set_times(&self.snapshot(), atime.map(u64::from), mtime.map(u64::from)).map_err(convert);
+        self.fs.changed();
+        let node = result?;
+        self.store(node, self.fs.generation());
+        Ok(())
+    }
+
     fn create(&self, name: &str, _mode: u16, _uid: u32, _gid: u32) -> VfsResult<Box<dyn Node>> {
         let mut volume = self.fs.volume.lock();
         let result = volume.create(&self.snapshot(), name, false, now()).map_err(convert);

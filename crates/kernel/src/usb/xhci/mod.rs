@@ -360,6 +360,40 @@ struct Device {
     /// клавиатурой внутри — драйвер обслуживает только наполовину, и без этого
     /// числа вторая половина невидима.
     interface: (u8, u8),
+    /// Interrupt OUT endpoint of an Xbox pad (24.11.2026): init, acks, LEDs.
+    out: Option<OutPipe>,
+}
+
+/// An interrupt OUT endpoint: its ring, doorbell target and a page of
+/// [`OUT_SLOT`]-byte packet slots used round-robin.
+struct OutPipe {
+    ring: Ring,
+    target: u8,
+    buffer: DmaBuffer,
+    next: usize,
+    sent: u64,
+}
+
+/// One packet of an OUT pipe (GIP packets are at most 64 bytes).
+const OUT_SLOT: usize = 64;
+
+impl OutPipe {
+    /// Queue `packet` and ring the doorbell.
+    fn send(&mut self, regs: &Registers, slot: u8, packet: &[u8]) {
+        let len = packet.len().min(OUT_SLOT);
+        let at = (self.next % (PAGE_SIZE / OUT_SLOT)) * OUT_SLOT;
+        self.next = self.next.wrapping_add(1);
+        // SAFETY: the buffer is a page; `at + len` stays inside it.
+        unsafe { core::ptr::copy_nonoverlapping(packet.as_ptr(), self.buffer.as_ptr::<u8>().add(at), len) };
+        self.ring.push(Trb {
+            parameter: self.buffer.phys().as_u64() + at as u64,
+            status: len as u32,
+            control: (ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT) | ring::TRB_IOC,
+        });
+        self.sent += 1;
+        // SAFETY: the descriptor is written before the doorbell.
+        unsafe { regs.ring_doorbell(slot, self.target) };
+    }
 }
 
 /// Где устройство стоит за хабом (фаза 68l).
@@ -436,6 +470,8 @@ enum Described {
     Hub(HubInterface),
     Storage(StorageInterface),
     Net(NetInterface),
+    /// Xbox pad on its vendor interface (24.11.2026).
+    Xbox(usb::gamepad::XboxInterface),
 }
 
 /// Сетевая функция USB (фаза 68p).
@@ -525,6 +561,10 @@ struct Storage {
     td: [(u64, u32); STORAGE_TD_MAX],
     td_count: usize,
     td_closed: bool,
+    /// hw-log18: until this uptime (ns) the disk is "not answering" - its
+    /// recovery (Bulk-Only reset) timed out, and every transfer fails at once
+    /// instead of costing another reset under the controllers' lock.
+    sick_until: u64,
 }
 
 impl Storage {
@@ -1528,6 +1568,7 @@ impl Controller {
             identity: (0, 0),
             described_by: 0,
             interface: (0, 0),
+            out: None,
         };
 
         // SAFETY: контракт функции; контексты выделены и обнулены.
@@ -1611,6 +1652,11 @@ impl Controller {
                 unsafe { self.bring_up_net(device, &found) }.map_err(|err| (Stage::Configure, err))?;
                 return Ok(0);
             }
+            Described::Xbox(found) => {
+                // SAFETY: см. выше.
+                unsafe { self.bring_up_xbox(device, &found) }.map_err(|err| (Stage::Configure, err))?;
+                return Ok(0);
+            }
         };
         let micros = interval_micros(endpoint_interval(speed, found.interval));
         kprintln!(
@@ -1638,8 +1684,9 @@ impl Controller {
         }
         .map_err(|err| (Stage::Configure, err))?;
         // SAFETY: см. выше.
-        let reader =
+        let mut reader =
             unsafe { self.enable_reports(device, &found) }.map_err(|err| (Stage::Enable, err))?;
+        reader.identify(device.identity.0, device.identity.1);
         let protocol = reader.protocol();
         kprintln!("  usb         : slot {slot} is a {}", reader.name());
 
@@ -1701,7 +1748,7 @@ impl Controller {
             // SAFETY: точка заведена, буфер свободен.
             unsafe { self.enable_interface(device, found) }
         });
-        let reader = match reader {
+        let mut reader = match reader {
             Ok(reader) => reader,
             Err(err) => {
                 // SAFETY: точка в контексте осталась без дескрипторов в кольце.
@@ -1712,6 +1759,7 @@ impl Controller {
                 return Err(err);
             }
         };
+        reader.identify(device.identity.0, device.identity.1);
         kprintln!(
             "  usb         : slot {} interface {} is a {} too, endpoint {} IN",
             device.slot,
@@ -1730,6 +1778,111 @@ impl Controller {
             described_by: found.report_len,
         });
         Ok(())
+    }
+
+    /// Bring up an Xbox pad (24.11.2026): its interrupt IN endpoint, the
+    /// configuration, the interrupt OUT endpoint (an Xbox One pad is silent
+    /// until it gets "power on" there), and the reader with its first packets.
+    ///
+    /// # Safety
+    ///
+    /// The device is addressed and described.
+    unsafe fn bring_up_xbox(&mut self, device: &mut Device, found: &usb::gamepad::XboxInterface) -> Result<(), XhciError> {
+        let (endpoint, packet, interval) = found.input;
+        kprintln!(
+            "  usb         : {} pad {:04x}:{:04x}, interface {}, endpoint {} IN ({}-byte), OUT {}",
+            found.kind.name(),
+            device.identity.0,
+            device.identity.1,
+            found.interface,
+            endpoint,
+            packet,
+            found.output.map_or(alloc::string::String::from("none"), |(out, _, _)| alloc::format!("{out}"))
+        );
+        // SAFETY: the contract of the function.
+        unsafe { self.configure_endpoint(device, endpoint, interval, packet, None) }?;
+        // SAFETY: the endpoint is configured.
+        unsafe {
+            self.control_transfer(device, [0, usb::REQ_SET_CONFIGURATION, found.configuration, 0, 0, 0, 0, 0], 0, false)
+        }?;
+        if let Some((out, out_packet, out_interval)) = found.output {
+            // SAFETY: configured; the report buffer is not in use yet.
+            match unsafe { self.add_out_endpoint(device, out, out_packet, out_interval) } {
+                Ok(pipe) => device.out = Some(pipe),
+                Err(err) => kprintln!("  usb         : the pad's OUT endpoint {out} failed: {err}"),
+            }
+        }
+        device.report_len = packet.clamp(1, PAGE_SIZE as u16);
+        device.described_by = 0;
+        device.interface = (found.interface, 1);
+        let mut reader = Reader::Gamepad(usb::gamepad::Gamepad::xbox(found.kind, device.identity.0, device.identity.1));
+        let slot = device.slot;
+        while let Some(packet) = reader.take_output() {
+            if let Some(pipe) = device.out.as_mut() {
+                pipe.send(&self.regs, slot, &packet);
+            }
+        }
+        device.reader = Some(reader);
+        Ok(())
+    }
+
+    /// Add an interrupt OUT endpoint to a configured device (the way
+    /// [`Controller::bring_up_extra`] adds an IN one).
+    ///
+    /// # Safety
+    ///
+    /// The device is configured.
+    unsafe fn add_out_endpoint(&mut self, device: &mut Device, endpoint: u8, packet: u16, b_interval: u8) -> Result<OutPipe, XhciError> {
+        let target = endpoint * 2;
+        let ring = Ring::new(dma::alloc(RING_ENTRIES * ring::TRB_LEN)?);
+        let buffer = match dma::alloc(PAGE_SIZE) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                // SAFETY: the ring was never given to the controller.
+                unsafe { dma::free(ring.buffer()) };
+                return Err(err.into());
+            }
+        };
+        let speed = device.speed;
+        // SAFETY: the contract of the function; the contexts exist.
+        unsafe {
+            self.clear_input(device);
+            self.write_context(&device.input, 0, 1, 1 | (1 << target));
+            for dword in 0..4 {
+                let value = self.read_context(&device.context, 0, dword);
+                self.write_context(&device.input, 1, dword, value);
+            }
+            let slot0 = self.read_context(&device.context, 0, 0);
+            let entries = ((slot0 >> 27) & 0x1F).max(u32::from(target));
+            self.write_context(&device.input, 1, 0, (slot0 & !(0x1F << 27)) | (entries << 27));
+            let index = usize::from(target) + 1;
+            let interval = endpoint_interval(speed, b_interval);
+            let packet = u32::from(packet);
+            self.write_context(&device.input, index, 0, u32::from(interval) << 16);
+            // Type 3 - Interrupt OUT; CErr 3.
+            self.write_context(&device.input, index, 1, (packet << 16) | (3 << 3) | (3 << 1));
+            let dequeue = ring.phys() | 1;
+            self.write_context(&device.input, index, 2, dequeue as u32);
+            self.write_context(&device.input, index, 3, (dequeue >> 32) as u32);
+            self.write_context(&device.input, index, 4, packet | (packet << 16));
+        }
+        // SAFETY: the input context is filled.
+        let configured = unsafe {
+            self.command_execute(Trb {
+                parameter: device.input.phys().as_u64(),
+                status: 0,
+                control: (ring::TRB_CONFIGURE_ENDPOINT << ring::TRB_TYPE_SHIFT) | (u32::from(device.slot) << 24),
+            })
+        };
+        if let Err(err) = configured {
+            // SAFETY: the endpoint was refused; nothing points at the memory.
+            unsafe {
+                dma::free(ring.buffer());
+                dma::free(&buffer);
+            }
+            return Err(err);
+        }
+        Ok(OutPipe { ring, target, buffer, next: 0, sent: 0 })
     }
 
     /// Поднять хаб: конфигурация, дескриптор хаба, точка прерываний, питание
@@ -1865,6 +2018,7 @@ impl Controller {
             td: [(0, 0); STORAGE_TD_MAX],
             td_count: 0,
             td_closed: true,
+            sick_until: 0,
         });
         let Some(storage) = device.storage.as_ref() else {
             return Err(XhciError::NoDevice);
@@ -2033,6 +2187,21 @@ impl Controller {
     ///
     /// Устройство с индексом `index` — накопитель в списке.
     unsafe fn recover_endpoint(&mut self, index: usize, dir_in: bool) {
+        // SAFETY: контракт функции.
+        unsafe { self.recover_endpoint_with(index, dir_in, true) };
+    }
+
+    /// [`Controller::recover_endpoint`] по состоянию точки (hw-log18): `Reset
+    /// Endpoint` — только остановленной ошибкой (Halted), `Set TR Dequeue` —
+    /// Halted или Stopped; работающую точку не трогать (иначе «context state
+    /// error» на каждую попытку). `clear_device` — слать устройству
+    /// `CLEAR_FEATURE(ENDPOINT_HALT)` (не слать, если оно не отвечает на
+    /// управляющие запросы: каждый — 500 мс под замком контроллеров).
+    ///
+    /// # Safety
+    ///
+    /// Устройство с индексом `index` — накопитель в списке.
+    unsafe fn recover_endpoint_with(&mut self, index: usize, dir_in: bool, clear_device: bool) {
         let device = &self.devices[index];
         let slot = device.slot;
         let Some(storage) = device.storage.as_ref() else {
@@ -2043,23 +2212,32 @@ impl Controller {
         } else {
             (storage.out_target, storage.found.bulk_out, storage.bulk_out.enqueue_pointer())
         };
+        // EP State, xHCI 6.2.3: 0 disabled, 1 running, 2 halted, 3 stopped, 4 error.
+        // SAFETY: выходной контекст устройства выделен под 32 контекста.
+        let state = unsafe { self.read_context(&device.context, usize::from(target), 0) } & 7;
         let on = (u32::from(target) << 16) | (u32::from(slot) << 24);
         // SAFETY: контракт функции.
         unsafe {
-            if let Err(err) = self.command_execute(Trb {
-                parameter: 0,
-                status: 0,
-                control: (ring::TRB_RESET_ENDPOINT << ring::TRB_TYPE_SHIFT) | on,
-            }) {
-                kprintln!("  usb-storage : resetting endpoint {address:#04x} failed: {err}");
+            if state == 2 {
+                if let Err(err) = self.command_execute(Trb {
+                    parameter: 0,
+                    status: 0,
+                    control: (ring::TRB_RESET_ENDPOINT << ring::TRB_TYPE_SHIFT) | on,
+                }) {
+                    kprintln!("  usb-storage : resetting endpoint {address:#04x} failed: {err}");
+                }
             }
-            let _ = self.command_execute(Trb {
-                parameter: dequeue,
-                status: 0,
-                control: (ring::TRB_SET_TR_DEQUEUE << ring::TRB_TYPE_SHIFT) | on,
-            });
+            if state == 2 || state == 3 {
+                let _ = self.command_execute(Trb {
+                    parameter: dequeue,
+                    status: 0,
+                    control: (ring::TRB_SET_TR_DEQUEUE << ring::TRB_TYPE_SHIFT) | on,
+                });
+            }
             // CLEAR_FEATURE(ENDPOINT_HALT) точке: получатель — точка (2).
-            let _ = self.slot_control(slot, [0x02, 1, 0, 0, address, 0, 0, 0], 0, false);
+            if clear_device {
+                let _ = self.slot_control(slot, [0x02, 1, 0, 0, address, 0, 0, 0], 0, false);
+            }
         }
     }
 
@@ -2525,6 +2703,10 @@ impl Controller {
         if let Some(found) = find_net(bytes) {
             return Ok(Described::Net(found));
         }
+        // Xbox pads (24.11.2026): a vendor interface, not HID.
+        if let Some(found) = usb::gamepad::find_xbox(bytes) {
+            return Ok(Described::Xbox(found));
+        }
         if usb::find_hid(bytes).is_none() && configurations > 1 {
             // Сетевая функция бывает не в первой конфигурации: у адаптеров на
             // RTL8153 первая — своя, а CDC ECM — во второй.
@@ -2844,7 +3026,16 @@ impl Controller {
                 map.key_slots()
             );
         }
-        if parsed.pointer.is_none() && parsed.keyboard.is_none() {
+        if let Some(map) = parsed.gamepad {
+            kprintln!(
+                "  usb         : report descriptor {read} bytes: gamepad, {} axes, {} buttons{}, report id {}",
+                map.axis_count(),
+                map.button_count(),
+                if map.has_hat() { ", hat" } else { "" },
+                map.report_id
+            );
+        }
+        if parsed.pointer.is_none() && parsed.keyboard.is_none() && parsed.gamepad.is_none() {
             kprintln!("  usb         : report descriptor {read} bytes: nothing the kernel can use");
         }
 
@@ -3166,6 +3357,14 @@ impl Controller {
         let report = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), received) };
         if let Some(reader) = device.reader.as_mut() {
             reader.handle_report(report);
+            // Answers of an Xbox pad (acks, "power on" again after it
+            // re-announced itself) go out at once.
+            let slot = device.slot;
+            while let Some(packet) = reader.take_output() {
+                if let Some(pipe) = device.out.as_mut() {
+                    pipe.send(&self.regs, slot, &packet);
+                }
+            }
         }
     }
 
@@ -3504,6 +3703,10 @@ unsafe fn free_device(device: &Device) {
             dma::free(net.bulk_out.buffer());
             dma::free(&net.rx);
             dma::free(&net.tx);
+        }
+        if let Some(out) = &device.out {
+            dma::free(out.ring.buffer());
+            dma::free(&out.buffer);
         }
     }
 }
@@ -4155,6 +4358,9 @@ pub enum BulkError {
     Stalled,
     /// Иной код завершения.
     Failed(u32),
+    /// hw-log18: the disk did not answer its reset a moment ago - failed at
+    /// once (see [`storage_reset`]).
+    NotAnswering,
 }
 
 /// Какой буфер накопителя участвует в передаче.
@@ -4273,8 +4479,11 @@ pub fn storage_bulk(handle: StorageHandle, dir_in: bool, buffer: StorageBuffer, 
             let slot = device.slot;
             let page = device.report.phys().as_u64();
             let Some(storage) = device.storage.as_mut() else {
-                return by_irq;
+                return Some(by_irq);
             };
+            if storage.sick_until > crate::time::uptime_ns() {
+                return None;
+            }
             let phys = match buffer {
                 StorageBuffer::Command => page + STORAGE_CBW_OFFSET as u64,
                 StorageBuffer::Status => page + STORAGE_CSW_OFFSET as u64,
@@ -4322,13 +4531,14 @@ pub fn storage_bulk(handle: StorageHandle, dir_in: bool, buffer: StorageBuffer, 
             storage.awaited = storage.td[count - 1].0;
             // SAFETY: дескриптор записан целиком до звонка.
             unsafe { c.regs.ring_doorbell(slot, target) };
-            by_irq
+            Some(by_irq)
         });
         match queued {
-            Ok(irq) => {
+            Ok(Some(irq)) => {
                 by_irq = irq;
                 break;
             }
+            Ok(None) => return Err(BulkError::NotAnswering),
             Err(Reach::Gone) => return Err(BulkError::Gone),
             Err(Reach::Busy) => {}
         }
@@ -4449,21 +4659,56 @@ pub fn storage_stats() -> (u64, u64, u64, u64) {
 
 /// Сброс Bulk-Only (класс 8, запрос `0xFF`) и снятие остановки с обеих точек —
 /// то, что спецификация велит после ошибки фазы.
+///
+/// hw-log18 (Netac USB disk: every read `Failed(4)`, control requests not
+/// answered): the reset, both endpoints and their `CLEAR_FEATURE`s ran under
+/// one hold of the controllers' spin lock - three 500 ms timeouts, 1.5 s with
+/// interrupts off per failing read (keyboard and mouse froze, a file dialog on
+/// that disk took minutes). Now each step takes the lock on its own, the
+/// endpoints are reset only by their state, and when the Bulk-Only reset
+/// itself is not answered the device gets no `CLEAR_FEATURE`s and is "not
+/// answering" for [`STORAGE_SICK_NS`]: transfers fail at once (EIO in
+/// microseconds instead of 1.5 s x the file system's retries).
 pub fn storage_reset(handle: StorageHandle) {
-    let _ = with_storage(handle, |c, i| {
-        let device = &c.devices[i];
-        let slot = device.slot;
-        let Some(interface) = device.storage.as_ref().map(|s| s.found.interface) else {
-            return;
-        };
-        // SAFETY: устройство — накопитель в списке.
-        unsafe {
-            let _ = c.slot_control(slot, [0x21, 0xFF, 0, 0, interface, 0, 0, 0], 0, false);
-            c.recover_endpoint(i, true);
-            c.recover_endpoint(i, false);
+    let now = crate::time::uptime_ns();
+    let started = now;
+    let ready = with_storage(handle, |c, i| c.devices[i].storage.as_ref().map(|s| (c.devices[i].slot, s.found.interface, s.sick_until)));
+    let Ok(Some((slot, interface, sick_until))) = ready else {
+        return;
+    };
+    if sick_until > now {
+        return;
+    }
+    // SAFETY: устройство — накопитель в списке (замок взят заново).
+    let answered = with_storage(handle, |c, _| unsafe { c.slot_control(slot, [0x21, 0xFF, 0, 0, interface, 0, 0, 0], 0, false) });
+    let answered = match answered {
+        Ok(Ok(_)) => true,
+        Ok(Err(err)) => {
+            kprintln!("  usb-storage : Bulk-Only reset failed: {err}");
+            false
         }
-    });
+        Err(_) => return,
+    };
+    for dir_in in [true, false] {
+        // SAFETY: устройство — накопитель в списке.
+        let _ = with_storage(handle, |c, i| unsafe { c.recover_endpoint_with(i, dir_in, answered) });
+    }
+    if !answered {
+        let _ = with_storage(handle, |c, i| {
+            if let Some(storage) = c.devices[i].storage.as_mut() {
+                storage.sick_until = crate::time::uptime_ns() + STORAGE_SICK_NS;
+            }
+        });
+        STORAGE_SICK.fetch_add(1, Ordering::Relaxed);
+    }
+    let took = crate::time::uptime_ns().saturating_sub(started) / 1_000_000;
+    kprintln!("  usb-storage : reset in {took} ms{}", if answered { "" } else { ", the disk does not answer: transfers fail at once for 3 s" });
 }
+
+/// How long a disk whose Bulk-Only reset went unanswered fails at once.
+const STORAGE_SICK_NS: u64 = 3_000_000_000;
+/// Times a disk was marked "not answering" since boot.
+static STORAGE_SICK: AtomicU64 = AtomicU64::new(0);
 
 /// Код завершения Stall Error.
 const COMPLETION_STALL: u32 = 6;

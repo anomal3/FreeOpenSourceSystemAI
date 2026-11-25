@@ -487,10 +487,25 @@ fn read_lnk(path: &str) -> Option<(Lnk, String, String)> {
 }
 
 /// Цель ярлыка в префиксе.
+///
+/// Цель без расширения (`{app}\Updater` у ярлыка стола установщика Rupor,
+/// 24.11) Windows запускает как `Updater.exe` — `CreateProcess` и
+/// `ShellExecute` дописывают `.exe` сами. Без этого ярлык считался ярлыком
+/// удалённой программы, и значка на столе не было.
 fn target_of(prefix: &str, lnk_path: &str, lnk: &Lnk) -> Option<String> {
     if !lnk.target.is_empty() {
         if let Some(found) = to_unix(prefix, &lnk.target) {
-            return Some(found);
+            // Каталог с тем же именем, что программа без расширения, — не цель.
+            if !(no_extension(&lnk.target) && matches!(crate::fs::list(&found), Some(Ok(_)))) {
+                return Some(found);
+            }
+        }
+        if no_extension(&lnk.target) {
+            for ext in [".exe", ".com", ".bat", ".cmd"] {
+                if let Some(found) = to_unix(prefix, &alloc::format!("{}{ext}", lnk.target.trim().trim_matches('"'))) {
+                    return Some(found);
+                }
+            }
         }
     }
     if !lnk.relative.is_empty() && lnk_path.starts_with(prefix) {
@@ -499,6 +514,12 @@ fn target_of(prefix: &str, lnk_path: &str, lnk: &Lnk) -> Option<String> {
         return walk(dir, &parts);
     }
     None
+}
+
+/// Последняя часть пути Windows без точки (`…\Updater`).
+fn no_extension(path: &str) -> bool {
+    let name = path.trim().trim_matches('"').rsplit(['\\', '/']).next().unwrap_or("");
+    !name.is_empty() && !name.contains('.')
 }
 
 /// Строка запуска ярлыка `.lnk`, лежащего где угодно (на столе человека):
@@ -653,7 +674,9 @@ pub fn scan() -> Vec<WinApp> {
                 continue;
             }
             let caption = String::from(field("Name").unwrap_or_else(|| entry.name.trim_end_matches(".desktop")));
-            if out.iter().any(|app| app.prefix == prefix && !app.desktop && app.caption.eq_ignore_ascii_case(&caption)) {
+            // И ярлык стола тоже (24.11, Rupor: `Rupor.exe.desktop` от ярлыка
+            // стола был лишней строкой «Пуска» рядом со значком на столе).
+            if out.iter().any(|app| app.prefix == prefix && app.caption.eq_ignore_ascii_case(&caption)) {
                 continue;
             }
             let icon = super::panel::shortcut_icon(&dir, field("Icon").unwrap_or(""));
@@ -817,5 +840,13 @@ mod tests {
         assert_eq!(lnk.target, "C:\\Program Files\\Notepad++\\notepad++.exe");
         assert_eq!(lnk.workdir, "C:\\Program Files\\Notepad++");
         assert_eq!(lnk.icon, "C:\\Program Files\\Notepad++\\notepad++.exe");
+    }
+
+    #[test]
+    fn extensionless_target() {
+        assert!(no_extension("C:\\users\\steamuser\\AppData\\Local\\Rupor\\Updater"));
+        assert!(no_extension("\"C:\\Rupor\\Updater\" "));
+        assert!(!no_extension("C:\\Rupor\\Rupor.exe"));
+        assert!(!no_extension("C:\\Rupor\\"));
     }
 }

@@ -166,6 +166,8 @@ pub(super) enum Ctl<'a> {
     Toggle(bool),
     /// Кружок выбора: одно из нескольких.
     Radio(bool),
+    /// Флажок (24.11, «Также для экрана блокировки»).
+    Check(bool),
     /// Кнопка.
     Button(&'a str, Weight),
     /// Отметка.
@@ -295,6 +297,22 @@ pub(super) fn row(
                 }
             });
             right -= (d + ctx.px(14)) as i32;
+        }
+        Ctl::Check(on) => {
+            let side = ctx.px(20);
+            let box_rect = Rect::new(right - side as i32, rect.y + (h as i32 - side as i32) / 2, side, side);
+            pass.on(|s| {
+                if classic {
+                    mini_ui::classic::checkbox(s, box_rect, mini_ui::classic::unit(ctx.scale), on);
+                } else if on {
+                    draw::rounded(s, box_rect, ctx.px(4), p.acc, 255);
+                    let glyph = side * 3 / 4;
+                    iconset::draw(s, Fi::Check, box_rect.x + (side - glyph) as i32 / 2, box_rect.y + (side - glyph) as i32 / 2, glyph, Color::rgb(0x0F, 0x12, 0x18), 255);
+                } else {
+                    draw::rounded_stroke(s, box_rect, ctx.px(4), p.ink4, 255);
+                }
+            });
+            right -= (side + ctx.px(14)) as i32;
         }
         Ctl::Button(label, weight) => {
             if let Some(button) = control {

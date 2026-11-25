@@ -63,19 +63,18 @@ fn coverage(glyph: &Glyph, x: i32, y: i32) -> u32 {
     u32::from(level) * 17
 }
 
-/// Покрытие глифа, увеличенного в `zoom` раз: билинейно между точками.
-fn coverage_zoomed(glyph: &Glyph, tx: u32, ty: u32, zoom: u32) -> u32 {
-    if zoom == 1 {
-        return coverage(glyph, tx as i32, ty as i32);
+/// The same over another face's coverage array (display faces, 24.11).
+fn coverage_of(table: &[u8], glyph: &Glyph, x: i32, y: i32) -> u32 {
+    let gx = x - i32::from(glyph.left);
+    let gy = y - i32::from(glyph.top);
+    if gx < 0 || gy < 0 || gx >= i32::from(glyph.w) || gy >= i32::from(glyph.h) {
+        return 0;
     }
-    // Центр точки цели в координатах глифа, в 1/256.
-    let fx = ((tx * 2 + 1) * 128 / zoom) as i32 - 128;
-    let fy = ((ty * 2 + 1) * 128 / zoom) as i32 - 128;
-    let (sx, wx) = (fx.div_euclid(256), fx.rem_euclid(256) as u32);
-    let (sy, wy) = (fy.div_euclid(256), fy.rem_euclid(256) as u32);
-    let top = coverage(glyph, sx, sy) * (256 - wx) + coverage(glyph, sx + 1, sy) * wx;
-    let bottom = coverage(glyph, sx, sy + 1) * (256 - wx) + coverage(glyph, sx + 1, sy + 1) * wx;
-    (top * (256 - wy) + bottom * wy) >> 16
+    let stride = usize::from(glyph.w).div_ceil(2);
+    let at = glyph.off as usize + gy as usize * stride + gx as usize / 2;
+    let byte = table.get(at).copied().unwrap_or(0);
+    let level = if gx % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+    u32::from(level) * 17
 }
 
 /// Смешать два упакованных пикселя: `level` из 255 — доля `fg`. Каналы
@@ -116,6 +115,9 @@ const INK_WHITE: u8 = 4;
 const MARQUEE_MS: u64 = 30;
 /// Логотип над полосой загрузки: тот же, что у «Пуска» (RGBA, `FIMG`).
 static LOGO: &[u8] = include_bytes!("../../../assets/logo/fossai-logo.fimg");
+/// The same sign 192x192 for screens 1200 px tall and more (24.11): the logo
+/// is drawn 1:1, never zoomed - Roman: "blurry" (128 zoomed to 256 before).
+static LOGO_192: &[u8] = include_bytes!("../../../assets/logo/fossai-logo-192.fimg");
 /// Сколько знаков строки журнала копится до перевода строки.
 const LINE_MAX: usize = 200;
 
@@ -194,9 +196,14 @@ pub struct Console {
     /// Строк на весь экран — столько ячеек у буферов, сколько бы строк ни было
     /// видно сейчас (при заставке текст — только нижняя половина).
     full_rows: u32,
-    /// Экран загрузки (04.11): сверху логотип, FOSSAI и полоса, снизу журнал
-    /// строками `[  OK  ]` / `[FAIL]`. Снимается паникой и вводом.
+    /// Экран загрузки (04.11): журнал строками `[  OK  ]` / `[FAIL]` (строка
+    /// копится и выходит разобранной). Снимается паникой и вводом.
     splash: bool,
+    /// Normal boot (24.11): only the logo, FOSSAI and the bar are on the
+    /// screen; the log still goes into the text buffer but is not painted.
+    /// Verbose boot (`BOOT_VERBOSE`) has the log on the whole screen instead.
+    /// [`show_log`] turns the log on when the desktop does not come.
+    quiet: bool,
     /// Шаг бегущей полосы загрузки.
     stage: u32,
     /// Когда полоса делала шаг (мс).
@@ -380,21 +387,21 @@ impl Painter {
     }
 
     /// Надпись сглаженным шрифтом с середины по ширине, верх строки — `y`,
-    /// увеличенная в `zoom` раз с билинейным сглаживанием покрытия.
-    fn big_text(&self, y: u32, face: &Face, text: &str, zoom: u32, ink: u32) {
-        let zoom = zoom.max(1);
-        let w = face.width(text) * zoom;
+    /// at the face's own size (24.11: a display face, `typeface::display`,
+    /// instead of a heading zoomed 2-3x). The coverage is the face's own.
+    fn display_text(&self, y: u32, face: &Face, text: &str, ink: u32) {
+        let w = face.width(text);
         let x0 = self.width.saturating_sub(w) / 2;
-        let height = u32::from(face.line) * zoom;
+        let height = u32::from(face.line);
         let mut pen = 0u32;
-        let mut line = [0u32; 512];
+        let mut line = [0u32; 256];
         for ch in text.chars() {
             let Some(glyph) = face.glyph(ch) else { continue };
-            let advance = u32::from(glyph.adv) * zoom;
+            let advance = u32::from(glyph.adv);
             let span = (advance as usize).min(line.len());
             for ty in 0..height {
                 for (tx, slot) in line[..span].iter_mut().enumerate() {
-                    let level = coverage_zoomed(glyph, tx as u32, ty, zoom);
+                    let level = coverage_of(face.coverage, glyph, tx as i32, ty as i32);
                     *slot = if level == 0 { self.bg } else { blend(self.bg, ink, level) };
                 }
                 self.blit_row(x0 + pen, y + ty, &line[..span]);
@@ -405,14 +412,15 @@ impl Painter {
 
     /// Логотип (`FIMG`: метка, ширина и высота по u16, RGBA) стороной `side`
     /// с центром по ширине, верх — `y`. Без кучи: строка — на стеке.
-    fn logo(&self, y: u32, side: u32, bg: (u8, u8, u8), format: PixelFormat) {
-        if LOGO.len() < 8 || &LOGO[..4] != b"FIMG" {
+    fn logo(&self, image: &[u8], y: u32, side: u32, bg: (u8, u8, u8), format: PixelFormat) {
+        let logo = image;
+        if logo.len() < 8 || &logo[..4] != b"FIMG" {
             return;
         }
-        let w = u32::from(u16::from_le_bytes([LOGO[4], LOGO[5]]));
-        let h = u32::from(u16::from_le_bytes([LOGO[6], LOGO[7]]));
+        let w = u32::from(u16::from_le_bytes([logo[4], logo[5]]));
+        let h = u32::from(u16::from_le_bytes([logo[6], logo[7]]));
         let side = side.min(512);
-        if w == 0 || h == 0 || LOGO.len() < 8 + (w * h * 4) as usize || side == 0 {
+        if w == 0 || h == 0 || logo.len() < 8 + (w * h * 4) as usize || side == 0 {
             return;
         }
         let x0 = self.width.saturating_sub(side) / 2;
@@ -422,8 +430,8 @@ impl Painter {
         // премножённым на альфу, иначе по краю прозрачных точек ползёт кайма.
         let texel = |x: u32, y: u32| -> [u32; 4] {
             let at = 8 + ((y.min(h - 1) * w + x.min(w - 1)) * 4) as usize;
-            let a = LOGO[at + 3] as u32;
-            [LOGO[at] as u32 * a / 255, LOGO[at + 1] as u32 * a / 255, LOGO[at + 2] as u32 * a / 255, a]
+            let a = logo[at + 3] as u32;
+            [logo[at] as u32 * a / 255, logo[at + 1] as u32 * a / 255, logo[at + 2] as u32 * a / 255, a]
         };
         for ty in 0..side {
             // Центр точки цели в координатах источника, в 1/256.
@@ -661,6 +669,7 @@ impl Console {
             cursor_drawn: false,
             full_rows: rows,
             splash: false,
+            quiet: false,
             stage: 0,
             stage_at: 0,
             bar_y: 0,
@@ -705,43 +714,79 @@ impl Console {
         // Очистка — это и конец заставки: паника и консоль для ввода пишут
         // на весь экран обычным текстом.
         self.splash = false;
+        self.quiet = false;
         self.line_len = 0;
         self.fb.top = MARGIN;
         self.rows = self.full_rows;
     }
 
-    /// Нарисовать заставку и отвести журналу нижнюю половину экрана.
-    fn start_splash(&mut self) {
-        let (w, h) = (self.fb.width, self.fb.height);
-        let cell_h = self.fb.cell_h();
-        let side = (w.min(h) / 5).clamp(64, 256);
-        let title_face: &'static Face = &typeface::data::HEADINGLARGE;
-        let title = if w >= 2560 { 3 } else { 2 };
-        let title_h = u32::from(title_face.line) * title;
-        let (_, _, bar_h) = self.bar_geometry();
-        // Логотип, под ним FOSSAI, под ним полоса — одним блоком над
-        // серединой экрана; журнал — под серединой.
-        let block = side + side / 6 + title_h + cell_h * 2 + bar_h;
-        let logo_y = (h / 2).saturating_sub(block + cell_h);
-        self.fb.logo(logo_y, side, BG, self.format);
-        let title_y = logo_y + side + side / 6;
-        self.fb.big_text(title_y, title_face, "FOSSAI", title, self.fb.inks[INK_WHITE as usize]);
-        self.bar_y = title_y + title_h + cell_h * 2;
+    /// Экран загрузки (24.11, Roman). Normal: the logo, FOSSAI and the bar
+    /// as one block in the middle of the screen, no text - the log is kept
+    /// in the buffer for [`show_log`]. Verbose (`verbose`): the log on the
+    /// whole screen instead of the logo and the bar.
+    fn start_splash(&mut self, verbose: bool) {
         self.splash = true;
         self.stage = 0;
-        self.draw_progress();
-        // Журнал — ниже середины экрана и не выше её.
-        let top = (h / 2).max(self.bar_y + bar_h) + cell_h;
-        self.fb.top = top;
-        self.rows = (h.saturating_sub(top + MARGIN) / cell_h).clamp(1, self.full_rows);
+        self.fb.top = MARGIN;
+        self.rows = self.full_rows;
         self.row = 0;
         self.col = 0;
+        if verbose {
+            self.quiet = false;
+            return;
+        }
+        self.quiet = true;
+        let h = self.fb.height;
+        // Native sizes only (Roman: "blurry"): the logo 1:1 from its own
+        // file, the title from a face rasterized at its size.
+        let big = h >= 1200;
+        let (logo, side): (&[u8], u32) = if big { (LOGO_192, 192) } else { (LOGO, 128) };
+        let title_face: &'static Face = typeface::display_face(if big { 74 } else { 49 });
+        let title_h = u32::from(title_face.line);
+        let (_, _, bar_h) = self.bar_geometry();
+        let gap = side / 6;
+        let bar_gap = title_h / 2;
+        let block = side + gap + title_h + bar_gap + bar_h;
+        let logo_y = h.saturating_sub(block) / 2;
+        self.fb.logo(logo, logo_y, side, BG, self.format);
+        let title_y = logo_y + side + gap;
+        self.fb.display_text(title_y, title_face, "FOSSAI", self.fb.inks[INK_WHITE as usize]);
+        self.bar_y = title_y + title_h + bar_gap;
+        self.draw_progress();
+    }
+
+    /// Put the log on the screen (normal boot that does not reach the
+    /// desktop: safe mode, no input, the phone holding its log): the logo
+    /// goes, the text written so far comes from the buffer, and further
+    /// lines print as plain text.
+    fn show_log(&mut self) {
+        if self.splash && self.line_len > 0 {
+            self.emit_line();
+        }
+        let was_quiet = self.quiet;
+        self.quiet = false;
+        self.splash = false;
+        if !was_quiet {
+            return;
+        }
+        for y in 0..self.fb.height {
+            if !crate::arch::interrupts::enabled() {
+                crate::input::ascii::rescue();
+            }
+            self.fb.fill_row(0, y, self.fb.width, self.fb.bg);
+        }
+        if let Some(painted) = self.painted.as_mut() {
+            painted.fill(UNKNOWN_CELL);
+        }
+        self.paint_at = 0;
+        self.stale = false;
     }
 
     fn bar_geometry(&self) -> (u32, u32, u32) {
         let (w, h) = (self.fb.width, self.fb.height);
         let _ = h;
-        let width = (w * 2 / 5).clamp(160, 520);
+        // Half as long as before (24.11, Roman: "2x shorter").
+        let width = (w / 5).clamp(120, 260);
         let height = (self.fb.cell_h() + 4).max(14);
         (self.bar_y, width, height)
     }
@@ -924,7 +969,10 @@ impl Console {
     /// больше некому и нечем, и там символ уходит на экран сразу.
     fn put_cell(&mut self, col: u32, row: u32, cell: u16) {
         let Some(cells) = self.cells.as_mut() else {
-            self.fb.draw_cell(col, row, cell);
+            // Normal boot: no text over the logo.
+            if !self.quiet {
+                self.fb.draw_cell(col, row, cell);
+            }
             return;
         };
         cells[(row as usize) * (self.cols as usize) + (col as usize)] = cell;
@@ -968,7 +1016,7 @@ impl Console {
     /// курсор в редакторе строки стоит именно там, где только что напечатан
     /// символ, — и видеть его полезнее, чем видеть курсор.
     fn draw_cursor(&mut self) {
-        if !self.cursor || self.cursor_drawn || self.row >= self.rows || self.col >= self.cols {
+        if self.quiet || !self.cursor || self.cursor_drawn || self.row >= self.rows || self.col >= self.cols {
             return;
         }
         let (cw, ch) = (self.fb.cell_w(), self.fb.cell_h());
@@ -1203,15 +1251,34 @@ fn draw_overlay(ov: &Overlay) {
 static READY: AtomicBool = AtomicBool::new(false);
 
 /// Инициализировать экранную консоль. Возвращает `true`, если экран доступен.
-pub fn init(fb: &Framebuffer) -> bool {
+/// `verbose` — boot-menu item «подробная загрузка» or `\FREEOS\BOOT.CFG`
+/// (`BOOT_VERBOSE`): the log instead of the logo and the bar.
+pub fn init(fb: &Framebuffer, verbose: bool) -> bool {
     let Some(mut console) = Console::new(fb) else {
         return false;
     };
     console.clear();
-    console.start_splash();
+    console.start_splash(verbose);
     *CONSOLE.lock() = Some(console);
     READY.store(true, Ordering::Release);
     true
+}
+
+/// Show the boot log on the screen instead of the logo (24.11): the desktop
+/// is not coming (safe mode, no input, no compositor) or the phone holds
+/// its log for the camera. The text printed so far comes from the buffer.
+pub fn show_log() {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
+    // Ordinary code (never an interrupt handler): wait for the lock - a
+    // missed switch would leave safe mode with the logo and no text.
+    let mut console = CONSOLE.lock();
+    if let Some(console) = console.as_mut() {
+        console.show_log();
+    }
+    drop(console);
+    paint();
 }
 
 /// Перевести консоль с identity-адреса буфера прошивки на прямое отображение —
@@ -1327,7 +1394,8 @@ pub fn splash_tick() {
     let Some(console) = guard.as_mut() else {
         return;
     };
-    if !console.splash {
+    // The bar is on the screen only in the normal (quiet) boot.
+    if !console.splash || !console.quiet {
         return;
     }
     let now = crate::time::uptime_ms();
@@ -1388,7 +1456,8 @@ fn paint_pass() {
             return;
         };
         // Экран мог уйти композитору, пока мы красили предыдущую ячейку.
-        if !READY.load(Ordering::Acquire) {
+        // Normal boot: the log stays in the buffer, the logo on the screen.
+        if !READY.load(Ordering::Acquire) || console.quiet {
             return;
         }
         let Some((col, row, byte)) = console.next_dirty() else {
@@ -1426,7 +1495,8 @@ fn dirty() -> bool {
         // Замок занят — значит кто-то печатает, и он же позовёт покраску.
         return false;
     };
-    console.as_ref().is_some_and(Console::dirty)
+    // Normal boot: unpainted text is not "dirty" ([`paint`] would spin).
+    console.as_ref().is_some_and(|console| !console.quiet && console.dirty())
 }
 
 /// Отдать экран композитору.
@@ -1485,8 +1555,8 @@ pub fn set_cursor(visible: bool) {
     if let Some(console) = console.as_mut() {
         // Ждут ввода на консоли (безопасный режим, стол не поднялся) —
         // заставка уходит, экран — обычному тексту.
-        if visible && console.splash {
-            console.clear();
+        if visible && (console.splash || console.quiet) {
+            console.show_log();
         }
         console.cursor = visible;
         if visible {

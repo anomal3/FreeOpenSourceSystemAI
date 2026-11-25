@@ -177,6 +177,13 @@ pub fn offer(device: &Shared, first_lba: u64) {
             *DISPLAY.lock() = Some(Target { device: device.clone(), runs, size, flushed: 0, fresh: false, failures: 0 });
         }
     }
+    // Boot mode for the loader (24.11): `\FREEOS\BOOT.CFG`, pre-allocated the
+    // same way (`normal` / `verbose`).
+    if BOOT_CFG.lock().is_none() {
+        if let Some((runs, size)) = file_runs(&fat, &mut device, dir, b"BOOT    CFG") {
+            *BOOT_CFG.lock() = Some(Target { device: device.clone(), runs, size, flushed: 0, fresh: false, failures: 0 });
+        }
+    }
     // Настройки живой системы (21.11): `\FREEOS\SETTINGS.DAT` заранее нужного
     // размера, его читает и переписывает `super::stick_settings`.
     if SETTINGS.lock().is_none() {
@@ -237,6 +244,23 @@ pub fn store_display(width: u32, height: u32) -> bool {
     let ok = target.write_range(text.as_bytes(), 0, 0, size);
     let _ = target.device.flush();
     *DISPLAY.lock() = Some(target);
+    ok
+}
+
+/// Файл режима загрузки для загрузчика на флешке, если он есть (24.11).
+static BOOT_CFG: SpinLock<Option<Target>> = SpinLock::new(None);
+
+/// Записать режим загрузки на живую флешку (`verbose` — журнал вместо
+/// логотипа). `false` — файла нет (флешка старше 24.11) или запись не удалась.
+pub fn store_boot_cfg(verbose: bool) -> bool {
+    let Some(mut target) = BOOT_CFG.lock().take() else { return false };
+    // The rest of the sector goes as spaces: the file keeps its size, the
+    // loader reads the first line.
+    let word: &[u8] = if verbose { b"verbose\n" } else { b"normal\n" };
+    let size = target.size;
+    let ok = target.write_range(word, 0, 0, size);
+    let _ = target.device.flush();
+    *BOOT_CFG.lock() = Some(target);
     ok
 }
 

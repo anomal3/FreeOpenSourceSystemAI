@@ -28,6 +28,7 @@ members = [
     "crates/raster",
     "crates/screencast",
     "crates/slots",
+    "crates/smb",
     "crates/ssh",
     "crates/swipe",
     "crates/sysconf",

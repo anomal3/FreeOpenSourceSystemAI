@@ -350,20 +350,27 @@ struct Plan {
     burger: Rect,
     /// Разделы свёрнуты до значков — с учётом узкого окна.
     folded: bool,
+    /// 24.11: the sections were opened by the burger in a narrow window —
+    /// they lie over the content (like Windows 11 Task Manager) instead of
+    /// squeezing the table, which then ran left under the labels (clip-3).
+    overlay: bool,
 }
 
 impl Plan {
     fn new(ctx: Ctx, area: Rect, folded: bool) -> Self {
         // Узкое окно (экран 1024, телефон) сворачивает разделы до значков
         // само, как Windows: иначе таблице процессов не остаётся места на
-        // имя. Кнопка «бургер» тогда, наоборот, раскрывает их.
+        // имя. Кнопка «бургер» тогда, наоборот, раскрывает их — поверх
+        // таблицы (24.11), сама таблица остаётся при узкой полосе.
         let narrow = area.w < ctx.px(NAV_W + 352 + 40 + 200);
         let folded = folded != narrow;
-        let nav_w = ctx.px(if folded { NAV_W_FOLDED } else { NAV_W }).min(area.w / 3);
+        let overlay = narrow && !folded;
+        let nav_w = ctx.px(if folded { NAV_W_FOLDED } else { NAV_W }).min(area.w * 2 / 3);
         let status_h = ctx.px(STATUS_H);
         let nav = Rect::new(area.x, area.y, nav_w, area.h.saturating_sub(status_h));
-        let right_x = nav.right();
-        let right_w = area.w.saturating_sub(nav_w);
+        let rail = if overlay { ctx.px(NAV_W_FOLDED) } else { nav_w };
+        let right_x = area.x + rail as i32;
+        let right_w = area.w.saturating_sub(rail);
         let header = Rect::new(right_x, area.y, right_w, ctx.px(HEADER_H));
         let status = Rect::new(area.x, area.bottom() - status_h as i32, area.w, status_h);
         let body = Rect::new(right_x, header.bottom(), right_w, (status.y - header.bottom()).max(0) as u32);
@@ -377,7 +384,7 @@ impl Plan {
         let search_w = ctx.px(240);
         let search = Rect::new(run_button.x - ctx.px(10) as i32 - search_w as i32, by, search_w, bh);
         let burger = Rect::new(nav.x + ctx.px(8) as i32, nav.y + ctx.px(12) as i32, ctx.px(40), ctx.px(36));
-        Self { nav, header, body, status, search, run_button, end_button, burger, folded }
+        Self { nav, header, body, status, search, run_button, end_button, burger, folded, overlay }
     }
 
     /// Хватает ли шапке места на поле поиска.
@@ -396,6 +403,28 @@ impl Plan {
         Rect::new(self.body.x, top, self.body.w, (self.body.bottom() - top).max(0) as u32)
     }
 }
+
+/// Which columns of a table fit a body `body_w` wide (index 0 — the first,
+/// always shown; `i + 1` — `widths[i]`): fixed columns give way in the order
+/// `drop` until the first one keeps [`FIRST_MIN_W`] points.
+fn shown_columns(ctx: Ctx, body_w: u32, widths: &[u32], drop: &[usize]) -> Vec<bool> {
+    let mut shown = vec![true; widths.len() + 1];
+    let room = body_w.saturating_sub(ctx.px(16 + 12 + FIRST_MIN_W));
+    let mut used: u32 = widths.iter().map(|w| ctx.px(*w)).sum();
+    for &column in drop {
+        if used <= room {
+            break;
+        }
+        if let Some(width) = column.checked_sub(1).and_then(|i| widths.get(i)) {
+            shown[column] = false;
+            used -= ctx.px(*width);
+        }
+    }
+    shown
+}
+
+/// The first column of a table keeps at least this much (layout points).
+const FIRST_MIN_W: u32 = 150;
 
 fn button_w(ctx: Ctx, label: &str) -> u32 {
     ctx.face(Role::Body).width(label) + ctx.px(52)
@@ -1204,19 +1233,30 @@ impl Manager {
         self.scroll.row_at(y, view.y, row_h)
     }
 
-    fn draw_table(&self, s: &mut Surface, ctx: Ctx, plan: &Plan, titles: &[&str], widths: &[u32], rows: &[(Fi, Color, Vec<String>)], selected: Option<usize>) {
+    /// A table of the body: `widths` — fixed columns after the first (layout
+    /// points), the first takes what is left. `drop` — which columns (1 is
+    /// the first fixed one) give way, in this order, when the window is too
+    /// narrow for all of them (24.11): before, the fixed columns ran left
+    /// over the first one and the section list (clip-3).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_table(&self, s: &mut Surface, ctx: Ctx, plan: &Plan, titles: &[&str], widths: &[u32], drop: &[usize], rows: &[(Fi, Color, Vec<String>)], selected: Option<usize>) {
         let p = ctx.palette;
         let body = plan.body;
         let head = Rect::new(body.x, body.y, body.w, ctx.px(HEAD_H));
+        let shown = shown_columns(ctx, body.w, widths, drop);
         // Колонки справа налево фиксированной ширины, первая — что осталось.
-        let mut cols: Vec<Rect> = Vec::new();
+        let mut cols: Vec<Option<Rect>> = Vec::new();
         let mut x = body.right() - ctx.px(12) as i32;
-        for width in widths.iter().rev() {
+        for (index, width) in widths.iter().enumerate().rev() {
+            if !shown[index + 1] {
+                cols.push(None);
+                continue;
+            }
             x -= ctx.px(*width) as i32;
-            cols.push(Rect::new(x, body.y, ctx.px(*width), body.h));
+            cols.push(Some(Rect::new(x, body.y, ctx.px(*width), body.h)));
         }
         let first_x = body.x + ctx.px(16) as i32;
-        cols.push(Rect::new(first_x, body.y, (x - first_x).max(0) as u32, body.h));
+        cols.push(Some(Rect::new(first_x, body.y, (x - first_x).max(0) as u32, body.h)));
         cols.reverse();
         // Строки — первыми и по точкам (20.11); края, ушедшие за вид,
         // закрывают шапка и полоса под таблицей.
@@ -1235,6 +1275,7 @@ impl Manager {
             }
             draw::hline(s, rect.x, rect.bottom() - 1, rect.w, p.line.color, p.line.alpha / 2);
             for (index, (col, text)) in cols.iter().zip(cells).enumerate() {
+                let Some(col) = col else { continue };
                 let (tx, role, ink) = if index == 0 {
                     let g = ctx.px(18);
                     iconset::draw(s, *icon, col.x, rect.y + (rect.h - g) as i32 / 2, g, *tint, 255);
@@ -1256,6 +1297,7 @@ impl Manager {
         draw::hline(s, head.x, head.bottom() - 1, head.w, p.line.color, p.line.alpha);
         let base = head.bottom() - ctx.px(10) as i32 - line_h(ctx, Role::Caption);
         for (col, title) in cols.iter().zip(titles) {
+            let Some(col) = col else { continue };
             let tx = if col.x == first_x { col.x + ctx.px(28) as i32 } else { col.x };
             paint::text_clipped(ctx, s, Role::Caption, tx, base, col.w, title, p.ink4);
         }
@@ -1292,7 +1334,7 @@ impl Manager {
                 )
             })
             .collect();
-        self.draw_table(s, ctx, plan, &["Имя", "ИД", "Состояние", "Пользователь", "ЦП", "Время ЦП", "Переключения", "Память", "Путь"], &[60, 90, 110, 60, 100, 110, 90, 150], &rows, self.selected_index());
+        self.draw_table(s, ctx, plan, &["Имя", "ИД", "Состояние", "Пользователь", "ЦП", "Время ЦП", "Переключения", "Память", "Путь"], &[60, 90, 110, 60, 100, 110, 90, 150], &[6, 5, 3, 2, 4, 1, 8, 7], &rows, self.selected_index());
     }
 
     fn draw_users(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
@@ -1323,7 +1365,7 @@ impl Manager {
                 )
             })
             .collect();
-        self.draw_table(s, ctx, plan, &["Пользователь", "uid", "Задач", "ЦП", "Память"], &[80, 80, 90, 120], &rows, None);
+        self.draw_table(s, ctx, plan, &["Пользователь", "uid", "Задач", "ЦП", "Память"], &[80, 80, 90, 120], &[1, 2, 3, 4], &rows, None);
     }
 
     fn draw_services(&self, s: &mut Surface, ctx: Ctx, plan: &Plan, startup: bool) {
@@ -1352,9 +1394,9 @@ impl Manager {
             })
             .collect();
         if startup {
-            self.draw_table(s, ctx, plan, &["Имя", "Команда", "Порядок", "Пользователь", "Состояние"], &[220, 80, 120, 110], &rows, Some(self.cursor));
+            self.draw_table(s, ctx, plan, &["Имя", "Команда", "Порядок", "Пользователь", "Состояние"], &[220, 80, 120, 110], &[2, 3, 4, 1], &rows, Some(self.cursor));
         } else {
-            self.draw_table(s, ctx, plan, &["Служба", "Состояние", "ЦП", "Пользователь", "Путь"], &[150, 70, 120, 220], &rows, Some(self.cursor));
+            self.draw_table(s, ctx, plan, &["Служба", "Состояние", "ЦП", "Пользователь", "Путь"], &[150, 70, 120, 220], &[4, 3, 2, 1], &rows, Some(self.cursor));
         }
         let note = if startup {
             "Порядок — строки /etc/services: /bin/init запускает их при загрузке и перезапускает после сбоя"
@@ -1441,7 +1483,12 @@ impl App for Manager {
     fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
         s.fill(area, theme::window_bg());
         let plan = Plan::new(ctx, area, self.folded);
-        self.draw_nav(s, ctx, &plan);
+        if plan.overlay {
+            // The rail under the opened sections (the content starts right of it).
+            s.fill(Rect::new(area.x, area.y, ctx.px(NAV_W_FOLDED), plan.nav.h), ctx.flat(ctx.palette.panel));
+        } else {
+            self.draw_nav(s, ctx, &plan);
+        }
         self.draw_header(s, ctx, &plan);
         match self.section {
             Section::Processes => self.draw_processes(s, ctx, &plan),
@@ -1455,6 +1502,14 @@ impl App for Manager {
 
         if let Some(bar) = self.bar(ctx, &plan) {
             bar.draw(ctx, s, &self.scroll);
+        }
+        if plan.overlay {
+            // Opened over the content (24.11): a soft shadow on its right edge.
+            self.draw_nav(s, ctx, &plan);
+            for i in 0..ctx.px(8) {
+                let alpha = (40 * (ctx.px(8) - i) / ctx.px(8).max(1)) as u8;
+                draw::vline(s, plan.nav.right() + i as i32, plan.nav.y, plan.nav.h, Color::rgb(0, 0, 0), alpha);
+            }
         }
 
         // Строка состояния единого вида (20.11): части через черту.
@@ -1630,8 +1685,19 @@ impl App for Manager {
         for (index, section) in Section::ALL.into_iter().enumerate() {
             if plan.nav_row(ctx, index).contains(x, y) {
                 self.set_section(section);
+                // Opened over the content (24.11): a choice closes it, as in Windows.
+                if plan.overlay {
+                    self.folded = !self.folded;
+                }
                 return true;
             }
+        }
+        // A click beside the opened sections closes them first.
+        if plan.overlay {
+            if !plan.nav.contains(x, y) {
+                self.folded = !self.folded;
+            }
+            return true;
         }
         self.searching = false;
         // Полоса прокрутки (20.11): бегунок тянут, по дорожке листают.
@@ -1765,6 +1831,12 @@ impl App for Manager {
 
     fn quits_on_q(&self) -> bool {
         self.menu.is_none() && self.run.is_none() && !self.searching
+    }
+
+    /// 24.11: the folded rail, a table with its name column, «Новая задача»
+    /// and «Снять задачу» next to the section title, all seven sections.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(600, 400)
     }
 }
 

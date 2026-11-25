@@ -157,6 +157,11 @@ impl Cleaner {
 }
 
 impl App for Cleaner {
+    /// Smallest window (24.11, WM SDK): the list of what to clean and its buttons.
+    fn size_limits(&self) -> app::SizeLimits {
+        app::SizeLimits::min(480, 380)
+    }
+
     fn title(&self) -> Option<String> {
         Some(String::from("Disk Cleanup\x1fОчистка диска"))
     }

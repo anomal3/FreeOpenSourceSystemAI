@@ -47,7 +47,7 @@
 //! появится база часовых поясов: правило перехода — свойство страны и года, а
 //! не числа в конфигурационном файле.
 
-use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicU8, Ordering};
 
 use calendar::DateTime;
 
@@ -87,6 +87,24 @@ const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 /// Смещение местного времени от UTC в минутах.
 static OFFSET_MINUTES: AtomicI32 = AtomicI32::new(0);
+
+/// What the battery clock of the machine keeps (24.11, Roman's PC: Windows
+/// keeps **local** time there, UTC+4, and NTP moved the clock back 4 h in the
+/// middle of the session): [`RTC_UTC`] or [`RTC_LOCAL`]. Setting `rtc=` of
+/// `/etc/system.cfg`; without it — local time when a disk carries Windows
+/// (like Windows itself), UTC otherwise.
+static RTC_MODE: AtomicU8 = AtomicU8::new(RTC_UTC);
+const RTC_UTC: u8 = 0;
+const RTC_LOCAL: u8 = 1;
+
+/// Minutes the firmware reading is shifted by now: the firmware time minus
+/// this offset is UTC. Moves with [`RTC_MODE`] and the time zone until NTP
+/// gives the true time.
+static RTC_SHIFT_MINUTES: AtomicI32 = AtomicI32::new(0);
+
+/// The clock came from the network (NTP): from then on it is the truth, and
+/// the interpretation of the firmware clock no longer moves it.
+static SYNCED: AtomicBool = AtomicBool::new(false);
 
 /// Частота монотонного счётчика в герцах. Ноль — счётчика нет, и время работы
 /// считается тиками таймера, как до появления этого модуля.
@@ -487,6 +505,7 @@ pub fn set_wall_clock(seconds: u64, nanos: u32, source: &str) {
     REALTIME_BASE_NS.store(base, Ordering::Release);
     #[cfg(target_arch = "x86_64")]
     crate::linux::vdso::refresh();
+    let first = !SYNCED.swap(true, Ordering::AcqRel);
 
     // Число — сразу за меткой, как у строки `clock`: стенд сверяет его с
     // часами хоста. Метка своя, не `clock`: там стенд ждёт время прошивки.
@@ -496,8 +515,102 @@ pub fn set_wall_clock(seconds: u64, nanos: u32, source: &str) {
         Some(old) => {
             let moved_ms = (base - old) / 1_000_000;
             kprintln!("  ntp         : {seconds} s from {source} = {date} UTC; moved by {moved_ms:+} ms");
+            // A jump backwards is said, not just done: every time stamp after
+            // this line is earlier than the ones before it (24.11).
+            if moved_ms <= -1000 {
+                kprintln!("  clock jump  : the clock went back {} s; times stamped before this line were ahead", -moved_ms / 1000);
+            }
+            if first {
+                guess_rtc_from_ntp(moved_ms);
+            }
         }
     }
+}
+
+/// The first NTP correction of a boot moved the clock by about the time-zone
+/// offset: the firmware clock keeps the other kind of time than assumed —
+/// switch the setting and keep it, so the next boot starts right (24.11).
+fn guess_rtc_from_ntp(moved_ms: i64) {
+    let local = RTC_MODE.load(Ordering::Relaxed) == RTC_LOCAL;
+    let Some(now_local) = sysconf::clock::rtc_guess(moved_ms, offset_minutes(), local) else {
+        return;
+    };
+    RTC_MODE.store(if now_local { RTC_LOCAL } else { RTC_UTC }, Ordering::Relaxed);
+    // The current clock is NTP's: nothing to shift, only remember.
+    RTC_SHIFT_MINUTES.store(if now_local { offset_minutes() } else { 0 }, Ordering::Relaxed);
+    let saved = save_rtc_mode(now_local).is_ok();
+    kprintln!(
+        "  rtc         : NTP moved the clock by {:+} min, {}the zone offset (UTC{}): the firmware clock keeps {}; setting switched{}",
+        moved_ms / 60_000,
+        if local { "" } else { "minus " },
+        offset_text(),
+        if now_local { "LOCAL time (like Windows)" } else { "UTC" },
+        if saved { " and saved" } else { " (not saved)" }
+    );
+}
+
+/// Does the firmware clock keep local time (as Windows does)?
+#[must_use]
+pub fn rtc_local() -> bool {
+    RTC_MODE.load(Ordering::Relaxed) == RTC_LOCAL
+}
+
+/// «Аппаратные часы: местное время / UTC» from «Параметров» (24.11):
+/// remember, and if the network has not given the time yet, read the boot
+/// clock anew.
+pub fn set_rtc_local(local: bool) -> Result<(), crate::vfs::VfsError> {
+    save_rtc_mode(local)?;
+    RTC_MODE.store(if local { RTC_LOCAL } else { RTC_UTC }, Ordering::Relaxed);
+    kprintln!("  rtc         : the firmware clock keeps {} (set from Settings)", if local { "local time" } else { "UTC" });
+    apply_rtc_shift();
+    Ok(())
+}
+
+fn save_rtc_mode(local: bool) -> Result<(), crate::vfs::VfsError> {
+    let text = config::text(CONFIG, CONFIG_LIMIT);
+    let updated = config::replace_key(&text, "rtc", if local { "local" } else { "utc" });
+    config::write(CONFIG, &updated)
+}
+
+/// Shift the boot clock to what [`RTC_MODE`] and the zone say, unless NTP
+/// already gave the true time. Logged — a clock that moves silently is a
+/// clock that went wrong by itself.
+fn apply_rtc_shift() {
+    if SYNCED.load(Ordering::Acquire) {
+        return;
+    }
+    let wanted = if rtc_local() { offset_minutes() } else { 0 };
+    let applied = RTC_SHIFT_MINUTES.swap(wanted, Ordering::AcqRel);
+    let delta = wanted - applied;
+    if delta == 0 {
+        return;
+    }
+    let Some(base) = realtime_base_ns() else {
+        return;
+    };
+    REALTIME_BASE_NS.store(base - i64::from(delta) * 60 * NANOS_PER_SECOND, Ordering::Release);
+    #[cfg(target_arch = "x86_64")]
+    crate::linux::vdso::refresh();
+    let how = if wanted != 0 { alloc::format!("local time (UTC{})", offset_text()) } else { alloc::string::String::from("UTC") };
+    kprintln!(
+        "  rtc         : the firmware clock is read as {how}: the clock moved by {:+} min, now {} UTC",
+        -delta,
+        now_utc().map(|now| alloc::format!("{now}")).unwrap_or_default()
+    );
+}
+
+/// The firmware clock setting from `system.cfg` (`rtc=local|utc`); without
+/// it — local time when a disk of this machine carries Windows.
+fn adopt_rtc_mode(text: &str) {
+    let value = text.lines().find_map(|line| line.trim().strip_prefix("rtc=")).map(str::trim);
+    let (local, why) = match value {
+        Some("local") => (true, "set in system.cfg"),
+        Some("utc") => (false, "set in system.cfg"),
+        _ if crate::block::windows_seen() => (true, "a disk carries Windows, which keeps local time there"),
+        _ => (false, "the default"),
+    };
+    RTC_MODE.store(if local { RTC_LOCAL } else { RTC_UTC }, Ordering::Relaxed);
+    kprintln!("  rtc         : the firmware clock keeps {} ({why})", if local { "local time" } else { "UTC" });
 }
 
 /// То же число, но в виде, в котором его хранит ext2: 32 бита, ноль при
@@ -594,6 +707,9 @@ pub fn adopt_timezone() {
         offset_text(),
         config::path(CONFIG, source)
     );
+    // The firmware clock: UTC or local (24.11) — only now the zone is known.
+    adopt_rtc_mode(text);
+    apply_rtc_shift();
 }
 
 /// Задать часовой пояс и запомнить его в `/etc/system.cfg`.
@@ -622,6 +738,8 @@ pub fn set_timezone(minutes: i32) -> Result<(), crate::vfs::VfsError> {
     config::write(CONFIG, &updated)?;
     OFFSET_MINUTES.store(minutes, Ordering::Relaxed);
     kprintln!("  timezone    : UTC{} set from Settings", offset_text());
+    // A firmware clock in local time moves with the zone (until NTP).
+    apply_rtc_shift();
     Ok(())
 }
 

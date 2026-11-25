@@ -96,7 +96,7 @@ fn main() -> Status {
     // графикой, человек обязан успеть сказать об этом раньше, чем загрузчик
     // до них доберётся.
     let choice = menu::choose();
-    info.boot_flags = choice.flags | unattended_flag() | live_flag();
+    info.boot_flags = choice.flags | unattended_flag() | live_flag() | boot_cfg_flag();
     if choice.keep_display {
         info.boot_flags |= boot_info::BOOT_FIRMWARE_DISPLAY;
     }
@@ -171,6 +171,29 @@ fn live_flag() -> u64 {
     }
 }
 
+/// Verbose boot chosen in «Параметры» (24.11): the first line of
+/// `\FREEOS\BOOT.CFG` is `verbose` (the kernel writes it; a live stick
+/// carries it pre-allocated as `normal`).
+fn boot_cfg_flag() -> u64 {
+    let Ok(mut volume) = volume::BootVolume::open() else {
+        return 0;
+    };
+    let Ok(Some(mut file)) = volume.open_regular(uefi::cstr16!("\\FREEOS\\BOOT.CFG")) else {
+        return 0;
+    };
+    let mut buffer = [0u8; 32];
+    let Ok(read) = file.read(&mut buffer) else {
+        return 0;
+    };
+    let text = core::str::from_utf8(&buffer[..read]).unwrap_or("");
+    if text.lines().next().map(str::trim) == Some("verbose") {
+        println!("  [cfg] verbose boot: the boot log on the screen");
+        boot_info::BOOT_VERBOSE
+    } else {
+        0
+    }
+}
+
 /// Загружает ядро и передаёт ему управление. Возвращается только при ошибке:
 /// успешный путь заканчивается прыжком, поэтому `Ok` несёт [`Infallible`].
 fn boot_kernel(mut info: BootInfo, linger: Duration) -> Result<Infallible, Aborted> {
@@ -216,8 +239,10 @@ fn boot_kernel(mut info: BootInfo, linger: Duration) -> Result<Infallible, Abort
     // ядро**, до сих пор лежало бы в буфере прошивки невостребованным: на
     // машине с USB-клавиатурой нажать раньше нашего первого опроса просто
     // некуда. Стоит этот шанс одного чтения буфера.
-    if info.boot_flags == 0 {
-        info.boot_flags = menu::choose_late();
+    // A verbose boot from `BOOT.CFG` is not a menu choice: the late menu
+    // still gets its chance.
+    if info.boot_flags & !boot_info::BOOT_VERBOSE == 0 {
+        info.boot_flags |= menu::choose_late();
     }
 
     // Карта памяти оценивается до выделения hand-off блока, но снимается

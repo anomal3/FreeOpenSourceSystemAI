@@ -184,6 +184,19 @@ impl App {
         matches!(self, App::Terminal | App::TermWin(_) | App::Settings)
     }
 
+    /// Smallest content of the kernel's own resizable windows, layout points
+    /// (24.11): «Параметры» keep the 270-point side list next to a page of
+    /// rows (a row with its switch needs ~360), the terminal keeps ~40
+    /// columns and a few lines.
+    #[must_use]
+    pub const fn min_content(self) -> (u32, u32) {
+        match self {
+            App::Settings => (640, 420),
+            App::Terminal | App::TermWin(_) => (360, 180),
+            _ => (0, 0),
+        }
+    }
+
     /// Значок программы: на столе, в меню запуска и в заголовке окна.
     #[must_use]
     pub const fn icon(self) -> Icon {
@@ -486,6 +499,9 @@ pub struct Window {
     /// Маленький диалог программы (20.11, `user_abi::WIN_STYLE_DIALOG`,
     /// «Выполнить»): в заголовке только крестик.
     pub dialog: bool,
+    /// Size limits the program declared (24.11, [`SizeLimits`]); empty —
+    /// the built-in ones of [`App::min_content`].
+    limits: SizeLimits,
     /// G3 (21.11): the window is shown straight from the program pixels
     /// (fullscreen fast path, `Compositor::direct_plan`) and its own surface
     /// was not updated since - copy everything before composing it again.
@@ -579,8 +595,8 @@ fn edge_points(w: u32, h: u32, radius: u32, mut f: impl FnMut(u32, u32)) {
 /// шрифте Marlett: черта «свернуть» 6×2, рамка «развернуть» 9×9 с толстым
 /// верхом, две рамки «восстановить», косой крест «закрыть» 8×7. `u` —
 /// размер «точки» при масштабе.
-fn classic_glyph(surface: &mut Surface, knob: Rect, hit: Hit, restore: bool, u: u32) {
-    let black = Color::rgb(0, 0, 0);
+fn classic_glyph(surface: &mut Surface, knob: Rect, hit: Hit, restore: bool, u: u32, ink: Color) {
+    let black = ink;
     let ui = u as i32;
     // Начало сетки 16×14 — по центру кнопки (у масштаба кнопка больше).
     let ox = knob.x + (knob.w as i32 - 16 * ui) / 2;
@@ -622,6 +638,33 @@ static BORN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(
 /// заголовка; вернуть его к рабочему размеру мышью человек уже не сможет.
 const MIN_W: u32 = 220;
 const MIN_H: u32 = 120;
+
+/// Size limits of a window's content (24.11, WM SDK): what a program
+/// declared through `user_abi::SYS_WINLIMITS` or a Wayland client through
+/// `xdg_toplevel.set_min_size/set_max_size`, and the built-in minimum of the
+/// kernel's own windows ([`App::min_content`]). A zero side — no limit.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct SizeLimits {
+    pub min: (u32, u32),
+    pub max: (u32, u32),
+    /// In layout points (times the window scale) — native programs; `false`
+    /// — pixels (Wayland clients draw at the size they were given).
+    pub logical: bool,
+}
+
+impl SizeLimits {
+    /// Minimum equals maximum on both sides: the window has one size.
+    #[must_use]
+    pub const fn fixed(&self) -> bool {
+        self.min.0 > 0 && self.min.1 > 0 && self.min.0 == self.max.0 && self.min.1 == self.max.1
+    }
+
+    /// Nothing declared.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.min.0 == 0 && self.min.1 == 0 && self.max.0 == 0 && self.max.1 == 0
+    }
+}
 
 /// Сторона уголка, за который тянут размер.
 ///
@@ -797,6 +840,7 @@ impl Window {
             full_size: (0, 0),
             self_sized: false,
             dialog: false,
+            limits: SizeLimits { min: app.min_content(), max: (0, 0), logical: true },
             stale: false,
             direct_phys: None,
         }
@@ -920,10 +964,12 @@ impl Window {
         self.frame_at(self.scale)
     }
 
-    /// Title band of this window at `scale`: none for popups and frameless
-    /// windows; classic without the frame - only the caption.
+    /// Title band of this window at `scale`: none for popups, frameless and
+    /// fullscreen windows (24.11: F11 of a program window — the picture,
+    /// not a caption, at the top); classic without the frame - only the
+    /// caption.
     fn bar_at(&self, scale: mini_ui::Scale) -> u32 {
-        if self.popup || self.frameless {
+        if self.popup || self.frameless || self.fullscreen {
             0
         } else if Self::classic() && self.frame_at(scale) == 0 {
             CLASSIC_CAPTION * scale
@@ -1196,6 +1242,8 @@ impl Window {
                 let content_h = self.rect.h.saturating_sub(ch_old);
                 let w = scale.rescale(content_w, old) + cw;
                 let h = scale.rescale(content_h, old) + ch;
+                // Limits in pixels (Wayland) do not grow with the scale.
+                let (w, h) = self.clamp_size(w, h);
                 self.rebuild(w, h)
             }
             Content::Program(_) => self.retitle(),
@@ -1326,7 +1374,7 @@ impl Window {
         // размер менять можно, и с рамкой, и без (Chromium, Rider: их тень, за
         // которую тянут в Linux, стол срезает). Полоса узкая, а у углов —
         // шире, как у Windows: в угол целиться труднее.
-        if !self.popup && self.resizable() && !self.is_maximized() && !self.fullscreen && !theme::is_mobile() {
+        if !self.popup && self.resizable() && !self.fixed_size() && !self.is_maximized() && !self.fullscreen && !theme::is_mobile() {
             let edges = self.edges_at(local.0, local.1);
             if edges != 0 {
                 return Some(Hit::Resize(edges));
@@ -1368,7 +1416,9 @@ impl Window {
         // окно программы получает просьбу заполнить его. У диалога этих
         // кнопок нет (20.11): там просто заголовок.
         if !self.dialog && self.maximize_button().contains(local.0, local.1) {
-            return Some(Hit::Maximize);
+            // Greyed out (24.11, a window of one size or one that cannot
+            // change it): the title under it, as Windows does.
+            return Some(if self.can_maximize() { Hit::Maximize } else { Hit::Title });
         }
         if !self.dialog && self.minimize_button().contains(local.0, local.1) {
             return Some(Hit::Minimize);
@@ -1399,7 +1449,7 @@ impl Window {
         // Уголок проверяется после заголовка: у окна ростом с полосу заголовка
         // они пересекаются, и таскать такое окно важнее, чем тянуть его за
         // размер.
-        if self.resizable() && !self.fit && !self.is_maximized() && !self.fullscreen && !Self::classic() && self.resize_grip().contains(local.0, local.1) {
+        if self.resizable() && !self.fixed_size() && !self.fit && !self.is_maximized() && !self.fullscreen && !Self::classic() && self.resize_grip().contains(local.0, local.1) {
             return Some(Hit::Resize(EDGE_RIGHT | EDGE_BOTTOM));
         }
         Some(Hit::Body)
@@ -1456,7 +1506,7 @@ impl Window {
         // Развёрнутое окно за уголок не тянут (20.11) — и уголка у него нет.
         // Classic (23.11): the frame is what is dragged, as in Windows 98 -
         // no dots over the content.
-        if !self.resizable() || self.frameless || self.fit || self.is_maximized() || Self::classic() {
+        if !self.resizable() || self.fixed_size() || self.frameless || self.fit || self.is_maximized() || Self::classic() {
             return;
         }
         let ctx = self.ctx();
@@ -1635,6 +1685,8 @@ impl Window {
         let bar = Rect::new(0, 0, self.surface.width(), Self::title_height(self.scale));
         for (button, icon, hit) in keyboard.into_iter().chain(sizing.into_iter().flatten()).chain([(self.close_button(), Icon::Close, Hit::Close)]) {
             let hot = self.hot == Some(hit);
+            // «Развернуть» of a window that cannot change size (24.11) — greyed.
+            let disabled = hit == Hit::Maximize && !self.can_maximize();
             if classic && hit != Hit::Keyboard {
                 // Кнопка Windows 98 16×14 (22.11): выпуклая серая, знак
                 // чёрный; под ней — тот же градиент заголовка.
@@ -1644,7 +1696,15 @@ impl Window {
                 let knob = self.classic_knob(button);
                 let t = mini_ui::classic::unit(self.scale);
                 mini_ui::classic::button(&mut self.surface, knob, t, false);
-                classic_glyph(&mut self.surface, knob, hit, self.restore.is_some(), ctx.px(1).max(1));
+                let u = ctx.px(1).max(1);
+                if disabled {
+                    // Windows 98 disabled glyph: white emboss under a grey one.
+                    let shifted = Rect::new(knob.x + u as i32, knob.y + u as i32, knob.w, knob.h);
+                    classic_glyph(&mut self.surface, shifted, hit, self.restore.is_some(), u, Color::rgb(0xFF, 0xFF, 0xFF));
+                    classic_glyph(&mut self.surface, knob, hit, self.restore.is_some(), u, Color::rgb(0x80, 0x80, 0x80));
+                } else {
+                    classic_glyph(&mut self.surface, knob, hit, self.restore.is_some(), u, Color::rgb(0, 0, 0));
+                }
                 let _ = hot;
                 continue;
             }
@@ -1653,6 +1713,7 @@ impl Window {
             let (plate, ink) = match (hot, hit) {
                 (true, Hit::Close) => (p.bad, Color::rgb(0xFF, 0xFF, 0xFF)),
                 (_, Hit::Keyboard) if self.keyboard => (p.acc, Color::rgb(0xFF, 0xFF, 0xFF)),
+                _ if disabled => (fill, if focused { p.ink5 } else { p.line3.color }),
                 (true, _) => (p.btnhov.over(fill), p.ink),
                 (false, _) => (fill, if focused { p.ink2 } else { p.ink4 }),
             };
@@ -2870,6 +2931,64 @@ impl Window {
         }
     }
 
+    /// Declare the size limits of the content (24.11, WM SDK). An empty set
+    /// brings back the built-in ones. `true` — they changed.
+    pub fn set_limits(&mut self, limits: SizeLimits) -> bool {
+        let limits = if limits.is_empty() { SizeLimits { min: self.app.min_content(), max: (0, 0), logical: true } } else { limits };
+        if limits == self.limits {
+            return false;
+        }
+        self.limits = limits;
+        // «Развернуть» greys out or comes back.
+        self.draw_decorations(false);
+        true
+    }
+
+    /// The declared limits.
+    #[must_use]
+    pub const fn limits(&self) -> SizeLimits {
+        self.limits
+    }
+
+    /// Whole-window size bounds now: `(min_w, min_h, max_w, max_h)` with the
+    /// title band and the frame. The phone, a desktop frame (`fit`), a popup
+    /// and a fullscreen window know only the smallest window [`MIN_W`].
+    #[must_use]
+    pub fn outer_bounds(&self) -> (u32, u32, u32, u32) {
+        if theme::is_mobile() || self.fit || self.popup || self.fullscreen {
+            return (MIN_W, MIN_H, u32::MAX, u32::MAX);
+        }
+        let l = self.limits;
+        let px = |v: u32| if l.logical { v * self.scale } else { v };
+        let (cw, ch) = self.chrome_at(self.scale);
+        let min_w = if l.min.0 > 0 { px(l.min.0) + cw } else { 0 }.max(MIN_W);
+        let min_h = if l.min.1 > 0 { px(l.min.1) + ch } else { 0 }.max(MIN_H);
+        let max_w = if l.max.0 > 0 { (px(l.max.0) + cw).max(min_w) } else { u32::MAX };
+        let max_h = if l.max.1 > 0 { (px(l.max.1) + ch).max(min_h) } else { u32::MAX };
+        (min_w, min_h, max_w, max_h)
+    }
+
+    /// `w`×`h` brought inside [`Self::outer_bounds`].
+    #[must_use]
+    pub fn clamp_size(&self, w: u32, h: u32) -> (u32, u32) {
+        let (min_w, min_h, max_w, max_h) = self.outer_bounds();
+        (w.clamp(min_w, max_w), h.clamp(min_h, max_h))
+    }
+
+    /// The window has one size ([`SizeLimits::fixed`]).
+    #[must_use]
+    pub fn fixed_size(&self) -> bool {
+        self.limits.fixed() && !theme::is_mobile()
+    }
+
+    /// Can «Развернуть» (the button, a double click on the title, snapping)
+    /// change this window: it is resizable, not a dialog and not of one
+    /// fixed size. Windows greys the button out for such windows.
+    #[must_use]
+    pub fn can_maximize(&self) -> bool {
+        theme::is_mobile() || (self.resizable() && !self.dialog && !self.fixed_size())
+    }
+
     /// Задать окну новый размер, сохранив содержимое.
     ///
     /// Поверхность создаётся заново: она хранит пиксели, и растянуть её нечем.
@@ -2877,8 +2996,7 @@ impl Window {
     /// окно без поверхности нечем рисовать, и потерять на изменении размера
     /// работающий терминал было бы хуже, чем не изменить размер.
     pub fn resize(&mut self, w: u32, h: u32) -> bool {
-        let w = w.max(MIN_W);
-        let h = h.max(MIN_H);
+        let (w, h) = self.clamp_size(w, h);
         if w == self.rect.w && h == self.rect.h {
             return true;
         }

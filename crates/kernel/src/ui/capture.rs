@@ -98,16 +98,40 @@ pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
-/// Seconds since the start of the running capture (tray indicator).
+/// The running capture belongs to a Linux program through
+/// `/dev/fossai-capture` (24.11): OBS Studio's «Захват экрана FossAi» source
+/// grabs frames for its preview from the moment the source exists, recording
+/// or not. That is not a recording of ours — the red tray indicator showed
+/// «recording» with a timer while nothing was recorded (Roman, image 0.8.1068).
+static SHARED: AtomicBool = AtomicBool::new(false);
+
+/// Mark the capture that just started as a Linux program's source.
+pub fn mark_shared() {
+    if active() {
+        SHARED.store(true, Ordering::Relaxed);
+        crate::kprintln!("  capture     : the capture is a program's screen source, not a recording");
+    }
+}
+
+/// Does the screen recorder (`/bin/screenrec`) record now — a capture of
+/// ours that ends in a file.
+#[must_use]
+pub fn recording() -> bool {
+    active() && !SHARED.load(Ordering::Relaxed)
+}
+
+/// Seconds since the start of the running recording (tray indicator);
+/// `None` — no recording (a program's screen source is not one).
 #[must_use]
 pub fn elapsed_s() -> Option<u64> {
     let started = STARTED_MS.load(Ordering::Relaxed);
-    (started != 0).then(|| crate::time::uptime_ms().saturating_sub(started) / 1000)
+    (started != 0 && !SHARED.load(Ordering::Relaxed)).then(|| crate::time::uptime_ms().saturating_sub(started) / 1000)
 }
 
 /// Ask the recording program to stop (Win+Alt+R, tray, recorder window).
 pub fn request_stop() {
-    if active() {
+    // A program's screen source (OBS) is not ours to stop (24.11).
+    if recording() {
         STOP_ASKED.store(true, Ordering::Relaxed);
         crate::kprintln!("  capture     : stop requested");
     }
@@ -246,6 +270,7 @@ fn end() {
     ACTIVE.store(false, Ordering::Relaxed);
     STARTED_MS.store(0, Ordering::Relaxed);
     STOP_ASKED.store(false, Ordering::Relaxed);
+    SHARED.store(false, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -259,16 +284,34 @@ pub fn syscall(action: usize, a1: usize, a2: usize) -> i64 {
         user_abi::CAP_START => start(a1),
         user_abi::CAP_GRAB => grab(a1, a2 as u64),
         user_abi::CAP_STOP => stop(a1, a2),
+        // The recorder (`/bin/screenrec`) sees a Linux program's screen
+        // source as «no recording» (24.11): it offers neither the red state
+        // nor «Stop» for OBS's capture — stopping it is OBS's business.
+        user_abi::CAP_STATUS if SHARED.load(Ordering::Relaxed) => write_out(a1, CapStatus::default()),
         user_abi::CAP_STATUS => status(a1),
         user_abi::CAP_REQUEST_STOP => {
-            if !active() {
+            if !recording() {
                 return ERR_NOT_FOUND;
             }
             request_stop();
             0
         }
         user_abi::CAP_WINDOWS => windows(a1, a2),
+        // 24.11: «Определить» — number plates on the monitors.
+        user_abi::CAP_IDENTIFY => {
+            super::identify_monitors(a1 as u64);
+            0
+        }
         _ => ERR_UNSUPPORTED,
+    }
+}
+
+/// `SYS_SCREENCAP` for the Linux node `/dev/fossai-capture` (24.11): the
+/// capturing program itself sees its capture's real status.
+pub fn source_syscall(action: usize, a1: usize, a2: usize) -> i64 {
+    match action {
+        user_abi::CAP_STATUS => status(a1),
+        _ => syscall(action, a1, a2),
     }
 }
 
@@ -333,6 +376,7 @@ fn start(ptr: usize) -> i64 {
         *state = Some(capture);
     }
     STOP_ASKED.store(false, Ordering::Relaxed);
+    SHARED.store(false, Ordering::Relaxed);
     STARTED_MS.store(now.max(1), Ordering::Relaxed);
     REPAINT.store(true, Ordering::Relaxed);
     ACTIVE.store(true, Ordering::Relaxed);
