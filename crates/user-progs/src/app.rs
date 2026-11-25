@@ -60,6 +60,17 @@ pub const MIDDLE_BUTTON: u32 = 4;
 ///
 /// Методы, кроме [`App::draw`], необязательны. Возвращаемое `true` значит
 /// «перерисовать».
+/// Modifiers held at the last right click (`WIN_MOD_*`), 25.11.
+static RIGHT_MODS: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+/// Modifiers (`WIN_MOD_*`) held at the last right click — read it in
+/// [`App::click_right`]: Shift there shows the extended context-menu verbs
+/// (`sysconf::store::verbs`), as in Windows.
+#[must_use]
+pub fn right_click_mods() -> i32 {
+    RIGHT_MODS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub trait App {
     /// Нарисовать окно целиком.
     fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx);
@@ -485,7 +496,9 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
                 WIN_KEY => app.key_with(event.code, event.x, event.y.max(0) as u32),
                 user_abi::WIN_KEYUP => app.key_up(event.code),
                 WIN_POINTER if event.code == RIGHT_BUTTON => {
-                    pointer_mods = 0;
+                    // 25.11: kept for the menu it opens — Shift shows the
+                    // extended verbs ([`right_click_mods`]).
+                    RIGHT_MODS.store(core::mem::take(&mut pointer_mods), core::sync::atomic::Ordering::Relaxed);
                     app.click_right(area, ctx, event.x, event.y)
                 }
                 WIN_POINTER if event.code == MIDDLE_BUTTON => {

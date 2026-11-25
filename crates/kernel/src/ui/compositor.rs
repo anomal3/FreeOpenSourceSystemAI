@@ -4622,6 +4622,14 @@ impl Compositor {
         }
     }
 
+    /// The open submenu of the desktop menu closes when the pointer rests on
+    /// another row (25.11).
+    pub fn context_hover_tick(&mut self) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.hover_tick();
+        }
+    }
+
     /// What «7-Zip ▸» of the open menu offers (25.11).
     pub fn context_zip(&mut self, zip: super::context::ZipInfo) {
         if let Some(menu) = self.context.as_mut() {
@@ -4633,6 +4641,13 @@ impl Compositor {
     pub fn context_handlers(&mut self, handlers: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>) {
         if let Some(menu) = self.context.as_mut() {
             menu.set_handlers(handlers);
+        }
+    }
+
+    /// Verbs of the settings store for the next opening of the menu (25.11).
+    pub fn context_verbs(&mut self, verbs: alloc::vec::Vec<(alloc::string::String, Option<alloc::string::String>)>) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.set_verbs(verbs);
         }
     }
 

@@ -320,6 +320,8 @@ enum MenuItem {
     /// «7-Zip ▸» (25.11, Roman: as the 7-Zip shell extension in Windows) —
     /// one cascading item in the upper block; its submenu is [`ZipItem`].
     SevenZip,
+    /// Verb `n` of the settings store (`shell` hive, 25.11): see [`VERBS`].
+    Verb(u8),
 }
 
 impl MenuItem {
@@ -381,6 +383,7 @@ impl MenuItem {
             MenuItem::Pin => "Закрепить на панели быстрого доступа",
             MenuItem::Unpin => "Открепить от панели быстрого доступа",
             MenuItem::SevenZip => "7-Zip",
+            MenuItem::Verb(index) => verb_caption(index),
         }
     }
 
@@ -398,6 +401,7 @@ impl MenuItem {
             MenuItem::EmptyTrash => Some(Icon::Close),
             MenuItem::Paste | MenuItem::Pin | MenuItem::Unpin => None,
             MenuItem::SevenZip => Some(Icon::Package),
+            MenuItem::Verb(index) => verb_icon(index),
         }
     }
 
@@ -418,11 +422,56 @@ impl MenuItem {
             MenuItem::NewFolder | MenuItem::NewTextFile => 2,
             MenuItem::Refresh | MenuItem::Paste => 3,
             MenuItem::SevenZip => 4,
+            MenuItem::Verb(_) => 5,
         }
     }
 
     const fn danger(self) -> bool {
         matches!(self, MenuItem::Delete | MenuItem::EmptyTrash)
+    }
+}
+
+/// Context-menu verbs of the settings store for the open menu (25.11,
+/// `sysconf::store::verbs`): the verb, its caption kept for the program's
+/// life (menu titles are `&'static str`), and the path it acts on.
+struct VerbTable(core::cell::UnsafeCell<Vec<(sysconf::store::Verb, &'static str, String)>>);
+// SAFETY: «Файлы» run on one thread; the table is touched only from the
+// event loop.
+unsafe impl Sync for VerbTable {}
+static VERBS: VerbTable = VerbTable(core::cell::UnsafeCell::new(Vec::new()));
+/// Captions given out so far — each distinct one is leaked once.
+static VERB_CAPTIONS: VerbTable = VerbTable(core::cell::UnsafeCell::new(Vec::new()));
+
+fn verbs() -> &'static mut Vec<(sysconf::store::Verb, &'static str, String)> {
+    // SAFETY: see `VerbTable` — one thread, no reference outlives a call.
+    unsafe { &mut *VERBS.0.get() }
+}
+
+/// The caption, as `&'static str`, leaked once per distinct text.
+fn intern_caption(text: &str) -> &'static str {
+    // SAFETY: as above.
+    let known = unsafe { &mut *VERB_CAPTIONS.0.get() };
+    if let Some((_, caption, _)) = known.iter().find(|(_, caption, _)| *caption == text) {
+        return caption;
+    }
+    let caption: &'static str = alloc::boxed::Box::leak(String::from(text).into_boxed_str());
+    known.push((sysconf::store::Verb { id: String::new(), caption: String::new(), command: String::new(), icon: None, extended: false }, caption, String::new()));
+    caption
+}
+
+fn verb_caption(index: u8) -> &'static str {
+    verbs().get(usize::from(index)).map_or("…", |(_, caption, _)| caption)
+}
+
+fn verb_icon(index: u8) -> Option<Icon> {
+    match verbs().get(usize::from(index)).and_then(|(verb, _, _)| verb.icon.as_deref()) {
+        Some("folder") => Some(Icon::Folder),
+        Some("file") => Some(Icon::File),
+        Some("terminal") => Some(Icon::Terminal),
+        Some("delete" | "trash" | "close") => Some(Icon::Close),
+        Some("info") => Some(Icon::Info),
+        Some("package" | "archive") => Some(Icon::Package),
+        _ => None,
     }
 }
 
@@ -506,7 +555,22 @@ fn zip_entries(items: &[MenuItem]) -> Vec<Entry<'static>> {
 fn entries(items: &[MenuItem]) -> Vec<Entry<'static>> {
     items
         .iter()
-        .map(|item| Entry { title: item.title(), icon: item.icon(), danger: item.danger(), group: item.group(), ..Entry::NONE })
+        .map(|item| Entry {
+            title: item.title(),
+            icon: item.icon(),
+            danger: item.danger(),
+            group: item.group(),
+            // 25.11: the default item bold, shortcuts on the right (Windows 11).
+            bold: *item == MenuItem::Open,
+            keys: match item {
+                MenuItem::Rename => Some("F2"),
+                MenuItem::Delete => Some("Del"),
+                MenuItem::Refresh => Some("F5"),
+                MenuItem::Paste => Some("Ctrl+V"),
+                _ => None,
+            },
+            ..Entry::NONE
+        })
         .collect()
 }
 
@@ -965,6 +1029,9 @@ struct Files {
     no_cursor: bool,
     /// Модификаторы нажатия, которое сейчас обрабатывается (`click_with`).
     press_mods: i32,
+    /// «Удалить содержимое папки» asked (25.11): the folder and how many
+    /// objects are in it.
+    emptying: Option<(String, usize)>,
     /// Ctrl зажат — перетаскивание копирует (нажатие и `WIN_KEYUP`).
     ctrl_held: bool,
     /// Рамка выделения по пустому месту (21.11).
@@ -1373,6 +1440,7 @@ impl Files {
             anchor: 0,
             no_cursor: false,
             press_mods: 0,
+            emptying: None,
             ctrl_held: false,
             band: None,
             cols: COLS_DEFAULT,
@@ -2382,6 +2450,9 @@ impl Files {
                 }
             }
         }
+        // 25.11: verbs of the settings store (`shell` hive) — before
+        // «Свойства»; extended ones only with Shift held at the right click.
+        self.add_store_verbs(&mut items, at.is_some(), target);
         // «7-Zip ▸» (25.11): in the upper block, under the open items, where
         // the 7-Zip shell extension stands in Windows.
         self.zip_menu.clear();
@@ -2406,6 +2477,97 @@ impl Files {
         println(&format!("files: menu opened for {what}"));
     }
 
+    /// Verbs of the settings store for the row `target` (a file or a
+    /// folder; none on volumes and in the recycle bin) into `items`, before
+    /// «Свойства». `by_pointer` — opened by a right click (its Shift counts).
+    fn add_store_verbs(&mut self, items: &mut Vec<MenuItem>, by_pointer: bool, target: Option<usize>) {
+        verbs().clear();
+        let Some(row) = target.and_then(|index| self.rows.get(index)).filter(|row| !row.is_volume() && !self.in_trash()) else {
+            return;
+        };
+        let path = self.row_path(row);
+        let types = sysconf::store::verb_types(&row.name, row.directory);
+        let refs: Vec<&str> = types.iter().map(String::as_str).collect();
+        let shift = by_pointer && app::right_click_mods() & WIN_MOD_SHIFT != 0;
+        let found = sysconf::store::verbs(&user_progs::reg_list("shell/"), &refs, shift);
+        println(&format!(
+            "files: menu verbs{} [{}]",
+            if shift { " (shift)" } else { "" },
+            found.iter().map(|verb| verb.id.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+        let at = items.iter().position(|item| *item == MenuItem::Properties).unwrap_or(items.len());
+        for (index, verb) in found.into_iter().enumerate() {
+            let caption = intern_caption(&verb.caption);
+            verbs().push((verb, caption, path.clone()));
+            items.insert(at + index, MenuItem::Verb(index as u8));
+        }
+    }
+
+    /// Run verb `index` of the open menu (25.11).
+    fn run_verb(&mut self, index: u8) {
+        let Some((verb, _, path)) = verbs().get(usize::from(index)).cloned() else {
+            self.close_menu();
+            return;
+        };
+        println(&format!("files: verb '{}' on '{path}'", verb.id));
+        match verb.command.as_str() {
+            sysconf::store::VERB_LOCATION => {
+                self.close_menu();
+                // A new window on the folder with the item selected.
+                self.open_window(&path);
+            }
+            sysconf::store::VERB_COPY_AS_PATH => {
+                self.close_menu();
+                let quoted = format!("\"{path}\"");
+                if clipboard_set(&quoted) {
+                    println(&format!("files: copied as path {quoted}"));
+                    self.note = Some(format!("Скопировано: {quoted}"));
+                }
+            }
+            sysconf::store::VERB_EMPTY_FOLDER => {
+                let count = list_dir(&path).map_or(0, |(rows, _)| rows.len());
+                if count == 0 {
+                    self.close_menu();
+                    self.note = Some(String::from("Папка уже пуста"));
+                    return;
+                }
+                self.emptying = Some((path, count));
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.mode = MenuMode::Confirm(0);
+                }
+            }
+            command if command.starts_with('@') => self.close_menu(),
+            _ => {
+                self.close_menu();
+                let line = verb.command_for(&path);
+                let id = spawn(&line);
+                if id < 0 {
+                    println(&format!("files: cannot start '{line}': error {id}"));
+                    self.note = Some(format!("Не удалось запустить: {}", error_text(id)));
+                }
+            }
+        }
+    }
+
+    /// «Удалить содержимое папки» confirmed (25.11): everything inside to the
+    /// recycle bin.
+    fn empty_folder(&mut self, dir: &str) {
+        let names: Vec<String> = list_dir(dir).map(|(rows, _)| rows.into_iter().map(|row| row.name).collect()).unwrap_or_default();
+        let (mut moved, mut failed) = (0usize, 0usize);
+        for name in &names {
+            match self.move_to_trash(&join(dir, name)) {
+                Ok(_) => moved += 1,
+                Err(code) => {
+                    println(&format!("files: empty folder: '{name}' failed: {code}"));
+                    failed += 1;
+                }
+            }
+        }
+        println(&format!("files: emptied '{dir}': {moved} to the trash, {failed} failed"));
+        self.note = Some(if failed == 0 { format!("Содержимое перемещено в корзину: {moved}") } else { format!("В корзину: {moved}, не удалось: {failed}") });
+        self.reload();
+    }
+
     /// Открыть меню у выбранной строки — клавишей.
     fn open_menu_for_selection(&mut self) {
         let target = self.focus();
@@ -2416,6 +2578,7 @@ impl Files {
 
     fn close_menu(&mut self) {
         self.zip_menu.clear();
+        self.emptying = None;
         if self.menu.take().is_some() {
             println("files: menu closed");
         }
@@ -2692,6 +2855,7 @@ impl Files {
                 let _ = target;
                 self.open_zip(0, true);
             }
+            MenuItem::Verb(index) => self.run_verb(index),
         }
     }
 
@@ -3113,6 +3277,16 @@ impl Files {
     /// Что спрашивает вопрос об удалении: очистка корзины, стирание из неё
     /// или перенос в неё (макет 18) — те же слова, что у окна ядра.
     fn ask(&self) -> Question {
+        // «Удалить содержимое папки» (25.11).
+        if let Some((dir, count)) = &self.emptying {
+            return Question {
+                title: format!("Удалить содержимое папки «{}»?", dir.rsplit('/').next().unwrap_or(dir)),
+                text: "Всё, что лежит в папке, будет перемещено в корзину. Сама папка останется.",
+                detail: format!("Объектов: {count}"),
+                action: "Удалить",
+                forever: false,
+            };
+        }
         let target = self.menu.as_ref().and_then(|menu| menu.target);
         let name = target.and_then(|index| self.rows.get(index)).map_or(String::new(), |row| row.name.clone());
         let many = self.picked.len() > 1;
@@ -3310,6 +3484,11 @@ impl Files {
 
     /// Удалить строку меню; без строки (в корзине) — очистить корзину.
     fn finish_delete(&mut self) {
+        if let Some((dir, _)) = self.emptying.take() {
+            self.close_menu();
+            self.empty_folder(&dir);
+            return;
+        }
         let Some(index) = self.menu.as_ref().and_then(|menu| menu.target) else {
             let empty = self.in_trash();
             self.close_menu();
@@ -7033,7 +7212,8 @@ impl App for Files {
                 _ => {}
             }
         }
-        bars | changed | tip_gone | options | self.hover_crumb_pop(ctx, area, &plan, x, y)
+        let menus = self.hover_menus(ctx, area, &plan, x, y);
+        bars | changed | tip_gone | options | menus | self.hover_crumb_pop(ctx, area, &plan, x, y)
     }
 
     fn leave(&mut self) -> bool {
@@ -7573,6 +7753,39 @@ impl Files {
             }
         }
         drag.out || was
+    }
+
+    /// 25.11 (Roman: the item under the pointer must be lit): hover moves
+    /// the lit row of the open menus — the context menu, the tab menu and the
+    /// «Сортировка» / «Вид» drop-downs — the same row the arrows move.
+    fn hover_menus(&mut self, ctx: Ctx, area: Rect, plan: &Plan, x: i32, y: i32) -> bool {
+        if let Some(card) = self.menu_rect(ctx, area) {
+            if let Some(menu) = self.menu.as_mut() {
+                if matches!(menu.mode, MenuMode::Items) {
+                    if let Some(index) = kit::menu_hit(ctx, card, &entries(&menu.items), x, y) {
+                        let changed = index != menu.selected;
+                        menu.selected = index;
+                        return changed;
+                    }
+                }
+            }
+            return false;
+        }
+        if let Some((index, mx, my, selected)) = self.tab_menu {
+            if let Some(item) = self.tab_menu_rect(ctx, area).and_then(|rect| kit::menu_hit(ctx, rect, &TAB_ENTRIES, x, y)) {
+                self.tab_menu = Some((index, mx, my, item));
+                return item != selected;
+            }
+            return false;
+        }
+        if let Some((command, selected, rect, items)) = self.pop_layout(ctx, area, plan) {
+            let entries: Vec<Entry<'_>> = items.iter().map(|(title, group)| Entry { title, icon: None, danger: false, group: *group, ..Entry::NONE }).collect();
+            if let Some(index) = kit::menu_hit(ctx, rect, &entries, x, y) {
+                self.pop = Some((command, index));
+                return index != selected;
+            }
+        }
+        false
     }
 
     fn tab_menu_rect(&self, ctx: Ctx, area: Rect) -> Option<Rect> {

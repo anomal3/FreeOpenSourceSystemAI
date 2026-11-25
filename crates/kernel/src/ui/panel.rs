@@ -2617,6 +2617,9 @@ enum PopAct {
     First(String),
     /// Ярлык программы Windows на рабочий стол.
     Desk(usize),
+    /// «Расположение файла» (25.11): «Файлы» on the program's folder with
+    /// the program selected.
+    Location(String),
     Account,
     Lock,
     Logout,
@@ -2963,6 +2966,20 @@ impl Menu {
     /// Папка строки `index` (пусто — верхний уровень).
     fn home(&self, index: usize) -> &'static str {
         self.homes.get(index).copied().unwrap_or("")
+    }
+
+    /// The file behind row `index` for «Расположение файла» (25.11): the
+    /// Windows shortcut, the program in `/bin`, the program a package runs;
+    /// windows of the desktop itself have none.
+    fn location_of(&self, index: usize) -> Option<String> {
+        if let Some(file) = self.windows_file(index) {
+            return Some(String::from(file));
+        }
+        match self.items.get(index)?.choice(&self.packages)? {
+            Choice::Program(name, _) => Some(alloc::format!("/bin/{name}")),
+            Choice::Command(command, _) => sysconf::store::command_program(&command).filter(|file| file.starts_with('/')).map(String::from),
+            _ => None,
+        }
     }
 
     /// Программа Windows ли строка (у неё есть ярлык, который можно положить
@@ -3628,9 +3645,11 @@ impl Menu {
         match self.popup.as_ref()? {
             Popup::Menu { at, rows } => {
                 let width = rows.iter().map(|(label, _, _)| face.width(label)).max().unwrap_or(0) + px(64);
-                let h = px(POP_ROW) * rows.len() as u32 + px(12);
+                // 25.11: compact rows of every context menu (Windows 11).
+                let row = px(theme::MENU_ITEM_H);
+                let h = row * rows.len() as u32 + px(8);
                 let rect = fit(Rect::new(at.0, at.1, width.max(px(200)), h));
-                let lines = (0..rows.len()).map(|n| (Rect::new(rect.x + px(6) as i32, rect.y + px(6) as i32 + (px(POP_ROW) * n as u32) as i32, rect.w - px(12), px(POP_ROW)), Target::Pop(n))).collect();
+                let lines = (0..rows.len()).map(|n| (Rect::new(rect.x + px(4) as i32, rect.y + px(4) as i32 + (row * n as u32) as i32, rect.w - px(8), row), Target::Pop(n))).collect();
                 Some((rect, lines))
             }
             Popup::User => {
@@ -3976,6 +3995,11 @@ impl Menu {
         if let Some(index) = item.filter(|index| self.windows_file(*index).is_some()) {
             rows.push((String::from("Создать ярлык на рабочем столе"), PopAct::Desk(index), true));
         }
+        // 25.11 (Roman): «Расположение файла» on every program row — last,
+        // the stand counts the rows above from the top.
+        if let Some(file) = item.and_then(|index| self.location_of(index)) {
+            rows.push((String::from("Расположение файла"), PopAct::Location(file), true));
+        }
         crate::kprintln!("  desktop     : start context menu for '{key}'");
         self.open_popup(Popup::Menu { at, rows });
         self.hot = None;
@@ -4039,6 +4063,7 @@ impl Menu {
                 self.shortcut_to_desktop(index);
                 stay(self)
             }
+            PopAct::Location(file) => MenuClick::Launch(Choice::Recent(String::from("/bin/files"), file)),
             PopAct::Account => MenuClick::Launch(Choice::Settings(super::settings::Section::Accounts)),
             PopAct::Lock => MenuClick::Launch(Choice::Lock),
             PopAct::Logout | PopAct::Sleep => MenuClick::Stay,
@@ -4383,7 +4408,9 @@ impl Menu {
     fn draw_popup(&mut self, ctx: Ctx, rect: Rect, lines: &[(Rect, Target)]) {
         let p = ctx.palette;
         let px = |value: u32| ctx.px(value);
-        let fill = p.tb1.over(p.tb2.color);
+        // 25.11: the menu tone of every context menu (a raised step off the
+        // window colour), not the title-bar gradient.
+        let fill = theme::menu_bg();
         // Тень — тремя ступенями прозрачной подложки вниз-вправо: композитор
         // кладёт тень только под весь «Пуск».
         for step in (1..=3u32).rev() {
@@ -4397,21 +4424,27 @@ impl Menu {
         match self.popup.clone() {
             Some(Popup::Menu { rows, .. }) => {
                 for ((line, target), (label, act, enabled)) in lines.iter().zip(rows.iter()) {
-                    if self.hot == Some(*target) && *enabled {
-                        draw::rounded(&mut self.surface, *line, px(theme::R_ROW), hover, 255);
+                    let lit = self.hot == Some(*target);
+                    if lit {
+                        mini_ui::kit::menu_highlight(ctx, &mut self.surface, *line, *enabled);
                     }
                     let glyph = px(14);
                     let icon = match act {
                         PopAct::Open(_) => Some(Fi::ArrowRight),
                         PopAct::First(_) => Some(Fi::ArrowUp),
                         PopAct::Desk(_) => Some(Fi::Monitor),
+                        PopAct::Location(_) => Some(Fi::FolderOpen),
                         _ => Some(Fi::Pin),
                     };
+                    let classic_lit = lit && *enabled && theme::is_classic();
+                    let white = Color::rgb(0xFF, 0xFF, 0xFF);
                     if let Some(icon) = icon {
-                        iconset::draw(&mut self.surface, icon, line.x + px(10) as i32, line.y + (line.h as i32 - glyph as i32) / 2, glyph, p.ink3, 255);
+                        iconset::draw(&mut self.surface, icon, line.x + px(10) as i32, line.y + (line.h as i32 - glyph as i32) / 2, glyph, if classic_lit { white } else { p.ink3 }, 255);
                     }
-                    let ink = if *enabled { p.ink } else { p.ink4 };
-                    paint::text(ctx, &mut self.surface, Role::Body, line.x + px(34) as i32, paint::baseline(ctx, Role::Body, *line), label, ink);
+                    let ink = if !*enabled { p.ink6 } else if classic_lit { white } else if lit { p.ink } else { p.ink2 };
+                    // «Открыть» — the default item, bold as in Windows.
+                    let role = if matches!(act, PopAct::Open(_)) { Role::Title } else { Role::Body };
+                    paint::text(ctx, &mut self.surface, role, line.x + px(34) as i32, paint::baseline(ctx, role, *line), label, ink);
                 }
             }
             Some(Popup::User) => {

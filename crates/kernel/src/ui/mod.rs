@@ -2439,6 +2439,7 @@ pub fn tick() {
             }
         }
         desktop.expire_toast();
+        desktop.context_hover_tick();
         // «Определить» (24.11): plates asked by «Параметры» or OBS.
         let identify = IDENTIFY_MS.swap(0, Ordering::Relaxed);
         if identify != 0 {
@@ -3540,10 +3541,13 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 desktop.mark_menu_area();
                 desktop.refresh_panel(status);
             }
-            desktop.open_context(x, y, items);
+            // 25.11: items from the settings store (`shell` hive) join the
+            // menu of a file, a folder and the empty desktop.
+            let items_with_verbs = with_store_verbs(desktop, items, what);
+            desktop.open_context(x, y, &items_with_verbs);
             // «7-Zip ▸» (25.11): names of the picked icons for its items;
             // without 7-Zip in the system the item is grey.
-            if items.contains(&context::Action::Submenu(context::Sub::SevenZip)) {
+            if items_with_verbs.contains(&context::Action::Submenu(context::Sub::SevenZip)) {
                 if context::zip_available() {
                     let zip = zip_info(desktop);
                     kprintln!("  desktop     : 7-Zip menu for {} ({:?})", if zip.archive { "an archive" } else { "files" }, zip);
@@ -5941,11 +5945,6 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         }
         // Пункт с подменю ничего не делает сам: подменю открыл указатель.
         context::Action::Submenu(_) | context::Action::RecentHeader => {}
-        context::Action::Zip(zip) => {
-            desktop.close_context();
-            run_zip(desktop, zip);
-            desktop.refresh_panel(status);
-        }
         context::Action::Recent(number) => {
             desktop.close_context();
             let chosen = RECENT_MENU.lock().get(usize::from(number)).cloned();
@@ -6269,6 +6268,15 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             if let (Some(command), Some((path, _))) = (desktop.context_handler(number), selected_entry(desktop)) {
                 open_file(desktop, &command, &path);
             }
+            desktop.refresh_panel(status);
+        }
+        context::Action::Verb(index) => {
+            run_verb(desktop, index);
+            desktop.refresh_panel(status);
+        }
+        context::Action::Zip(zip) => {
+            desktop.close_context();
+            run_zip(desktop, zip);
             desktop.refresh_panel(status);
         }
         context::Action::OpenLocation => {
@@ -6719,6 +6727,100 @@ fn run_zip(desktop: &mut Compositor, zip: context::Zip) {
     }
     kprintln!("  desktop     : 7-Zip {zip:?} for {count} item(s)");
     start(desktop, &line);
+}
+
+/// Verbs of the open desktop menu (25.11): the verb and the path it acts on.
+static VERBS: SpinLock<alloc::vec::Vec<(sysconf::store::Verb, String)>> = SpinLock::new(alloc::vec::Vec::new());
+
+/// `items` with the verbs of the settings store for what the menu is opened
+/// on (`what`: "entry" — a file or folder of the desktop, "desktop" — the
+/// empty desktop): before «Свойства» when the menu ends with it, else at the
+/// end. Extended verbs (`extended=1`) only while Shift is held.
+fn with_store_verbs(desktop: &mut Compositor, items: &[context::Action], what: &str) -> alloc::vec::Vec<context::Action> {
+    use sysconf::store;
+    let mut out = items.to_vec();
+    let target = match what {
+        "entry" => selected_entry(desktop).map(|(path, label)| {
+            let directory = desktop.icon_selection().is_some_and(|index| matches!(desktop.icon_kind(index), Some(icons::Kind::Folder)));
+            (path, store::verb_types(&label, directory))
+        }),
+        "desktop" => Some((context::desktop_dir(), alloc::vec![String::from("desktop")])),
+        _ => None,
+    };
+    let Some((path, types)) = target else {
+        VERBS.lock().clear();
+        desktop.context_verbs(alloc::vec::Vec::new());
+        return out;
+    };
+    let shift = crate::input::modifiers().contains(crate::input::Modifiers::SHIFT);
+    let pairs = crate::config::registry::list(None, "shell/");
+    let refs: alloc::vec::Vec<&str> = types.iter().map(String::as_str).collect();
+    let verbs = store::verbs(&pairs, &refs, shift);
+    kprintln!(
+        "  desktop     : menu verbs{} [{}]",
+        if shift { " (shift)" } else { "" },
+        verbs.iter().map(|verb| verb.id.as_str()).collect::<alloc::vec::Vec<_>>().join(", ")
+    );
+    desktop.context_verbs(verbs.iter().map(|verb| (verb.caption.clone(), verb.icon.clone())).collect());
+    let at = if out.last() == Some(&context::Action::Properties) { out.len() - 1 } else { out.len() };
+    for index in (0..verbs.len()).rev() {
+        out.insert(at, context::Action::Verb(index as u8));
+    }
+    *VERBS.lock() = verbs.into_iter().map(|verb| (verb, path.clone())).collect();
+    out
+}
+
+/// Run verb `index` of the open desktop menu (25.11).
+fn run_verb(desktop: &mut Compositor, index: u8) {
+    use sysconf::store;
+    let Some((verb, path)) = VERBS.lock().get(usize::from(index)).cloned() else {
+        desktop.close_context();
+        return;
+    };
+    kprintln!("  desktop     : verb '{}' on '{path}'", verb.id);
+    match verb.command.as_str() {
+        store::VERB_LOCATION => {
+            desktop.close_context();
+            // «Файлы» on the folder with the item selected (`files <file>`).
+            start(desktop, &alloc::format!("/bin/files {path}"));
+        }
+        store::VERB_COPY_AS_PATH => {
+            desktop.close_context();
+            clipboard::set_text(alloc::format!("\"{path}\""));
+            kprintln!("  desktop     : copied as path \"{path}\"");
+        }
+        store::VERB_EMPTY_FOLDER => {
+            let children: alloc::vec::Vec<(String, String)> = match crate::fs::list(&path) {
+                Some(Ok(entries)) => entries
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .filter(|name| name != "." && name != "..")
+                    .map(|name| (alloc::format!("{}/{name}", path.trim_end_matches('/')), name))
+                    .collect(),
+                _ => alloc::vec::Vec::new(),
+            };
+            if children.is_empty() {
+                desktop.context_note("Папка уже пуста");
+                return;
+            }
+            desktop.close_context();
+            let label = String::from(context::base_name(&path));
+            let question = alloc::format!("Удалить содержимое папки «{label}»? Объектов: {}", children.len());
+            *DELETE_PENDING.lock() = children;
+            EMPTY_PENDING.store(false, Ordering::Relaxed);
+            let rect = layout(desktop, App::DeleteAsk);
+            if let Some(window) = Window::dialog(App::DeleteAsk, rect, desktop.scale(), Dialog::Delete { question, forever: false }) {
+                desktop.push(window);
+                kprintln!("  desktop     : opened '{}' to empty '{path}'", App::DeleteAsk.title());
+                log_focus(desktop);
+            }
+        }
+        command if command.starts_with('@') => desktop.context_note("Неизвестное действие"),
+        _ => {
+            desktop.close_context();
+            start(desktop, &verb.command_for(&path));
+        }
+    }
 }
 
 /// Что ждёт ответа окна «Удаление файла»: путь и подпись.

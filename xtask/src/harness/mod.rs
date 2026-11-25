@@ -1271,6 +1271,17 @@ fn play(
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
+            Step::RightClickWith(keys) => {
+                say!("  [{at:>6} мс] шаг {index}: {keys}+щелчок правой");
+                hmp.sendkey(&format!("{keys} 700")).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(Duration::from_millis(200));
+                press_right(qmp.as_deref_mut(), hmp, true)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(POINTER_DELAY);
+                press_right(qmp.as_deref_mut(), hmp, false)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(Duration::from_millis(700) + KEY_DELAY);
+            }
             Step::ClickWith(keys) => {
                 say!("  [{at:>6} мс] шаг {index}: {keys}+щелчок");
                 // Монитор держит клавишу сам и отпускает по сроку; щелчок —
