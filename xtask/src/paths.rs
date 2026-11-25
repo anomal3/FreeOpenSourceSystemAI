@@ -116,6 +116,20 @@ pub fn test_dir() -> PathBuf {
     build_dir().join("test")
 }
 
+/// Снимки экрана сценариев (PNG) — в `photos/tests` в корне проекта, рядом с
+/// остальными снимками проекта (правило владельца); журналы прогона и сырые
+/// PPM остаются в `build/test`. Каталог `photos` в git не попадает.
+pub fn shots_dir() -> PathBuf {
+    workspace_root().join("photos").join("tests")
+}
+
+/// PNG для сырого снимка `build/test/<имя>.ppm`: то же имя в [`shots_dir`].
+pub fn shot_png(ppm: &std::path::Path) -> PathBuf {
+    let name = ppm.with_extension("png");
+    let name = name.file_name().map(|n| n.to_owned()).unwrap_or_default();
+    shots_dir().join(name)
+}
+
 /// Каталог, который отдаётся QEMU как FAT-раздел ESP.
 /// Разделён по архитектурам, чтобы `BOOTX64.EFI` от прошлой сборки не оставался
 /// рядом с `BOOTAA64.EFI` и не путал ни прошивку, ни пользователя.

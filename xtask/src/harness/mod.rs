@@ -1661,7 +1661,7 @@ fn play(
             Step::Shot(name) => {
                 say!("  [{at:>6} мс] шаг {index}: снимок '{name}'");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
-                let png = ppm.with_extension("png");
+                let png = paths::shot_png(&ppm);
                 std::fs::create_dir_all(paths::test_dir()).ok();
                 let took = hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
                 report_slow_shot(index, took);
@@ -1672,7 +1672,7 @@ fn play(
             Step::ShotHead(name, head) => {
                 say!("  [{at:>6} мс] шаг {index}: снимок '{name}' выхода {head}");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
-                let png = ppm.with_extension("png");
+                let png = paths::shot_png(&ppm);
                 std::fs::create_dir_all(paths::test_dir()).ok();
                 let took = hmp.screendump_head(&ppm, "gpu0", *head).with_context(|| format!("шаг {index}"))?;
                 report_slow_shot(index, took);
@@ -1712,7 +1712,7 @@ fn play(
             Step::Painted(name) => {
                 say!("  [{at:>6} мс] шаг {index}: снимок '{name}' обязан быть нарисован");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
-                let png = ppm.with_extension("png");
+                let png = paths::shot_png(&ppm);
                 std::fs::create_dir_all(paths::test_dir()).ok();
                 let took = hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
                 report_slow_shot(index, took);
@@ -1731,7 +1731,7 @@ fn play(
                 // думает. Кадр, который отдаёт монитор, — это то, что показывает
                 // устройство.
                 let ppm = paths::test_dir().join(format!("{prefix}-screen.ppm"));
-                let png = ppm.with_extension("png");
+                let png = paths::shot_png(&ppm);
                 std::fs::create_dir_all(paths::test_dir()).ok();
                 let took = hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
                 report_slow_shot(index, took);
