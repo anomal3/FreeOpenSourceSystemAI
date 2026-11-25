@@ -317,13 +317,9 @@ enum MenuItem {
     /// «Закрепить на панели быстрого доступа» / «Открепить…» (24.11).
     Pin,
     Unpin,
-    /// 7-Zip (24.11, `/bin/archiver`): у архива — «Извлечь все…» и «Извлечь
-    /// сюда», у всего — «Добавить в архив…» и «Сжать в ZIP-файл». Пункты —
-    /// в конце меню, своей группой: стенды считают строки сверху.
-    ExtractAll,
-    ExtractHere,
-    AddToArchive,
-    CompressZip,
+    /// «7-Zip ▸» (25.11, Roman: as the 7-Zip shell extension in Windows) —
+    /// one cascading item in the upper block; its submenu is [`ZipItem`].
+    SevenZip,
 }
 
 impl MenuItem {
@@ -384,10 +380,7 @@ impl MenuItem {
             MenuItem::Paste => "Вставить",
             MenuItem::Pin => "Закрепить на панели быстрого доступа",
             MenuItem::Unpin => "Открепить от панели быстрого доступа",
-            MenuItem::ExtractAll => "Извлечь все…",
-            MenuItem::ExtractHere => "Извлечь сюда",
-            MenuItem::AddToArchive => "Добавить в архив…",
-            MenuItem::CompressZip => "Сжать в ZIP-файл",
+            MenuItem::SevenZip => "7-Zip",
         }
     }
 
@@ -404,7 +397,7 @@ impl MenuItem {
             MenuItem::Restore => Some(Icon::Back),
             MenuItem::EmptyTrash => Some(Icon::Close),
             MenuItem::Paste | MenuItem::Pin | MenuItem::Unpin => None,
-            MenuItem::ExtractAll | MenuItem::ExtractHere | MenuItem::AddToArchive | MenuItem::CompressZip => Some(Icon::Package),
+            MenuItem::SevenZip => Some(Icon::Package),
         }
     }
 
@@ -424,13 +417,89 @@ impl MenuItem {
             MenuItem::CopyPath | MenuItem::Properties => 1,
             MenuItem::NewFolder | MenuItem::NewTextFile => 2,
             MenuItem::Refresh | MenuItem::Paste => 3,
-            MenuItem::ExtractAll | MenuItem::ExtractHere | MenuItem::AddToArchive | MenuItem::CompressZip => 4,
+            MenuItem::SevenZip => 4,
         }
     }
 
     const fn danger(self) -> bool {
         matches!(self, MenuItem::Delete | MenuItem::EmptyTrash)
     }
+}
+
+/// An item of «7-Zip ▸» (25.11, as the 7-Zip shell extension of Windows):
+/// `/bin/archiver` with the picked rows ([`ZipItem::command`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZipItem {
+    Open,
+    /// «Открыть архив ▸ тип» — index in [`ZIP_TYPES`].
+    OpenAs(u8),
+    Extract,
+    ExtractHere,
+    ExtractTo,
+    Test,
+    Add,
+    Add7z,
+    AddZip,
+    /// «CRC SHA ▸ метод» — index in [`ZIP_HASHES`].
+    Hash(u8),
+    /// «Открыть архив ▸» and «CRC SHA ▸» — rows with a submenu.
+    OpenAsMenu,
+    HashMenu,
+}
+
+/// Types of «Открыть архив ▸» (7-Zip: `*` — any, `#` — parser).
+const ZIP_TYPES: [&str; 7] = ["*", "#", "7z", "zip", "tar", "rar", "iso"];
+
+/// «CRC SHA ▸»: menu words and `-scrc` methods.
+const ZIP_HASHES: [(&str, &str); 5] = [("CRC-32", "CRC32"), ("CRC-64", "CRC64"), ("SHA-1", "SHA1"), ("SHA-256", "SHA256"), ("*", "*")];
+
+impl ZipItem {
+    /// `/bin/archiver` arguments before the paths.
+    fn command(self) -> String {
+        match self {
+            ZipItem::Open | ZipItem::OpenAsMenu | ZipItem::HashMenu => String::new(),
+            ZipItem::OpenAs(index) => format!("--type {}", ZIP_TYPES.get(usize::from(index)).copied().unwrap_or("*")),
+            ZipItem::Extract => String::from("--extract"),
+            ZipItem::ExtractHere => String::from("--extract-here"),
+            ZipItem::ExtractTo => String::from("--extract-to"),
+            ZipItem::Test => String::from("--test"),
+            ZipItem::Add => String::from("--add"),
+            ZipItem::Add7z => String::from("--7z"),
+            ZipItem::AddZip => String::from("--zip"),
+            ZipItem::Hash(index) => format!("--hash {}", ZIP_HASHES.get(usize::from(index)).map_or("CRC32", |(_, key)| *key)),
+        }
+    }
+
+    const fn submenu(self) -> bool {
+        matches!(self, ZipItem::OpenAsMenu | ZipItem::HashMenu)
+    }
+}
+
+/// An open level of «7-Zip ▸»: its rows, their words, the lit row, the row
+/// of the parent card it hangs from, whether the arrows are here.
+struct ZipLevel {
+    items: Vec<ZipItem>,
+    titles: Vec<String>,
+    selected: usize,
+    parent: usize,
+    focus: bool,
+}
+
+impl ZipLevel {
+    fn entries(&self) -> Vec<Entry<'_>> {
+        self.items.iter().zip(&self.titles).map(|(item, title)| Entry { title, submenu: item.submenu(), ..Entry::NONE }).collect()
+    }
+}
+
+/// Entries of the context menu with «7-Zip» marked as a submenu (25.11).
+fn zip_entries(items: &[MenuItem]) -> Vec<Entry<'static>> {
+    let mut list = entries(items);
+    for (entry, item) in list.iter_mut().zip(items) {
+        if *item == MenuItem::SevenZip {
+            entry.submenu = true;
+        }
+    }
+    list
 }
 
 /// Пункты для общего меню (`mini_ui::kit`, фаза С8).
@@ -967,6 +1036,9 @@ struct Files {
     tab_drag: Option<TabDrag>,
     /// Меню вкладки (правая кнопка): какой вкладки, где, выбранный пункт.
     tab_menu: Option<(usize, i32, i32, usize)>,
+    /// Open levels of «7-Zip ▸» of the context menu (25.11): the submenu and
+    /// «CRC SHA ▸» / «Открыть архив ▸» in it.
+    zip_menu: Vec<ZipLevel>,
     /// Закрыли последнюю вкладку — окно закрывается.
     quit: bool,
     /// Где указатель над окном (20.11, ядро присылает движения без кнопок):
@@ -1278,6 +1350,7 @@ impl Files {
             tab: 0,
             tab_drag: None,
             tab_menu: None,
+            zip_menu: Vec::new(),
             address: None,
             crumb_pop: None,
             quit: false,
@@ -2309,14 +2382,12 @@ impl Files {
                 }
             }
         }
-        // 7-Zip (24.11): пункты архиватора — в конце меню файла и папки.
-        if let Some(row) = target.and_then(|index| self.rows.get(index)).filter(|row| !row.is_volume() && !self.in_trash()) {
-            if exists("/bin/archiver") && exists("/bin/7zz") {
-                if !row.directory && sysconf::filetypes::is_archive(&row.name) {
-                    items.extend([MenuItem::ExtractAll, MenuItem::ExtractHere]);
-                }
-                items.extend([MenuItem::AddToArchive, MenuItem::CompressZip]);
-            }
+        // «7-Zip ▸» (25.11): in the upper block, under the open items, where
+        // the 7-Zip shell extension stands in Windows.
+        self.zip_menu.clear();
+        if target.and_then(|index| self.rows.get(index)).is_some_and(|row| !row.is_volume() && !self.in_trash()) && exists("/bin/archiver") && exists("/bin/7zz") {
+            let at = items.iter().position(|item| *item == MenuItem::Rename).unwrap_or(items.len());
+            items.insert(at, MenuItem::SevenZip);
         }
         self.menu = Some(Menu {
             x,
@@ -2344,6 +2415,7 @@ impl Files {
     }
 
     fn close_menu(&mut self) {
+        self.zip_menu.clear();
         if self.menu.take().is_some() {
             println("files: menu closed");
         }
@@ -2351,6 +2423,10 @@ impl Files {
 
     /// Клавиша, пока открыто меню.
     fn key_menu(&mut self, code: u32) -> bool {
+        // «7-Zip ▸» takes the arrows while it is open (25.11).
+        if let Some(done) = self.key_zip(code) {
+            return done;
+        }
         let Some(menu) = self.menu.as_mut() else {
             return false;
         };
@@ -2611,51 +2687,291 @@ impl Files {
                     menu.mode = MenuMode::Confirm(0);
                 }
             }
-            MenuItem::ExtractAll | MenuItem::ExtractHere | MenuItem::AddToArchive | MenuItem::CompressZip => {
-                self.close_menu();
-                self.archiver(item, target);
+            // Enter or a click on «7-Zip» opens its submenu (25.11).
+            MenuItem::SevenZip => {
+                let _ = target;
+                self.open_zip(0, true);
             }
         }
     }
 
-    /// Пункт 7-Zip (24.11): `/bin/archiver --extract|--extract-here|--add|
-    /// --zip` с отмеченными (если строка среди них) или с одной строкой.
-    fn archiver(&mut self, item: MenuItem, target: Option<usize>) {
-        let paths: Vec<String> = match target {
-            Some(index) if self.picked.len() > 1 && self.picked.contains(&index) => {
-                self.picked.iter().filter_map(|index| self.rows.get(*index)).map(|row| self.row_path(row)).collect()
-            }
-            Some(index) => self.rows.get(index).map(|row| self.row_path(row)).into_iter().collect(),
+    // -----------------------------------------------------------------------
+    // «7-Zip ▸» (25.11)
+    // -----------------------------------------------------------------------
+
+    /// The rows the 7-Zip items act on: the picked ones (when the menu row is
+    /// among them), else the menu row; and whether it is one folder.
+    fn zip_paths(&self) -> (Vec<String>, bool) {
+        let target = self.menu.as_ref().and_then(|menu| menu.target);
+        let rows: Vec<&Row> = match target {
+            Some(index) if self.picked.len() > 1 && self.picked.contains(&index) => self.picked.iter().filter_map(|index| self.rows.get(*index)).collect(),
+            Some(index) => self.rows.get(index).into_iter().collect(),
             None => Vec::new(),
         };
-        let paths: Vec<String> = match item {
-            // Извлекают только архивы.
-            MenuItem::ExtractAll | MenuItem::ExtractHere => paths.into_iter().filter(|path| sysconf::filetypes::is_archive(path)).collect(),
-            _ => paths,
+        let single_dir = rows.len() == 1 && rows[0].directory;
+        (rows.iter().map(|row| self.row_path(row)).collect(), single_dir)
+    }
+
+    /// Rows and words of level `level` of «7-Zip ▸» (0 — the submenu; 1 — the
+    /// submenu of its row `parent`).
+    fn zip_level(&self, level: usize, parent: usize) -> Option<ZipLevel> {
+        let (paths, single_dir) = self.zip_paths();
+        if paths.is_empty() {
+            return None;
+        }
+        let items: Vec<ZipItem> = if level == 0 {
+            let archive = !single_dir && paths.iter().all(|path| sysconf::filetypes::is_archive(path));
+            if archive {
+                alloc::vec![
+                    ZipItem::Open,
+                    ZipItem::OpenAsMenu,
+                    ZipItem::Extract,
+                    ZipItem::ExtractHere,
+                    ZipItem::ExtractTo,
+                    ZipItem::Test,
+                    ZipItem::Add,
+                    ZipItem::Add7z,
+                    ZipItem::AddZip,
+                    ZipItem::HashMenu,
+                ]
+            } else {
+                alloc::vec![ZipItem::Add, ZipItem::Add7z, ZipItem::AddZip, ZipItem::HashMenu]
+            }
+        } else {
+            match self.zip_menu.first().and_then(|first| first.items.get(parent)) {
+                Some(ZipItem::OpenAsMenu) => (0..ZIP_TYPES.len()).map(|index| ZipItem::OpenAs(index as u8)).collect(),
+                Some(ZipItem::HashMenu) => (0..ZIP_HASHES.len()).map(|index| ZipItem::Hash(index as u8)).collect(),
+                _ => return None,
+            }
         };
-        let Some(first) = paths.first().cloned() else { return };
-        let verb = match item {
-            MenuItem::ExtractAll => "--extract",
-            MenuItem::ExtractHere => "--extract-here",
-            MenuItem::AddToArchive => "--add",
-            _ => "--zip",
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let named = |ext: &str| {
+            let target = sysconf::filetypes::add_to_target(&refs, single_dir, ext);
+            target.rsplit('/').next().unwrap_or("").to_string()
         };
-        let paths = if item == MenuItem::ExtractAll { alloc::vec![first] } else { paths };
-        let mut line = format!("/bin/archiver {verb}");
+        let titles = items
+            .iter()
+            .map(|item| match item {
+                ZipItem::Open | ZipItem::OpenAsMenu => String::from("Открыть архив"),
+                ZipItem::OpenAs(index) => String::from(ZIP_TYPES[usize::from(*index)]),
+                ZipItem::Extract => String::from("Распаковать"),
+                ZipItem::ExtractHere => String::from("Распаковать здесь"),
+                ZipItem::ExtractTo => format!("Распаковать в \"{}\\\"", sysconf::filetypes::archive_stem(paths[0].rsplit('/').next().unwrap_or(""))),
+                ZipItem::Test => String::from("Тестировать"),
+                ZipItem::Add => String::from("Добавить к архиву…"),
+                ZipItem::Add7z => format!("Добавить к \"{}\"", named("7z")),
+                ZipItem::AddZip => format!("Добавить к \"{}\"", named("zip")),
+                ZipItem::Hash(index) => String::from(ZIP_HASHES[usize::from(*index)].0),
+                ZipItem::HashMenu => String::from("CRC SHA"),
+            })
+            .collect();
+        Some(ZipLevel { items, titles, selected: usize::MAX, parent, focus: false })
+    }
+
+    /// Open level `level` (0 — «7-Zip ▸» itself, from the menu row; 1 — the
+    /// submenu of the lit row of level 0). `keys` — opened with the keyboard:
+    /// the arrows go into it, its first row lit.
+    fn open_zip(&mut self, level: usize, keys: bool) {
+        let parent = if level == 0 {
+            match self.menu.as_ref().and_then(|menu| menu.items.iter().position(|item| *item == MenuItem::SevenZip)) {
+                Some(at) => at,
+                None => return,
+            }
+        } else {
+            match self.zip_menu.get(level - 1) {
+                Some(up) if up.items.get(up.selected).is_some_and(|item| item.submenu()) => up.selected,
+                _ => return,
+            }
+        };
+        if self.zip_menu.get(level).is_some_and(|open| open.parent == parent) {
+            if keys {
+                self.zip_menu.truncate(level + 1);
+                for (at, open) in self.zip_menu.iter_mut().enumerate() {
+                    open.focus = at == level;
+                }
+                if let Some(open) = self.zip_menu.get_mut(level) {
+                    open.selected = 0;
+                }
+            }
+            return;
+        }
+        let Some(mut opened) = self.zip_level(level, parent) else { return };
+        if keys {
+            opened.selected = 0;
+            opened.focus = true;
+            for open in &mut self.zip_menu {
+                open.focus = false;
+            }
+        }
+        self.zip_menu.truncate(level);
+        if level == 0 {
+            if let Some(menu) = self.menu.as_mut() {
+                menu.selected = parent;
+            }
+        }
+        println(&format!(
+            "files: 7-Zip submenu {} opened: {}",
+            level + 1,
+            opened.titles.iter().map(String::as_str).collect::<Vec<_>>().join(" | ")
+        ));
+        self.zip_menu.push(opened);
+    }
+
+    /// Cards of the open levels, in order.
+    fn zip_rects(&self, ctx: Ctx, area: Rect) -> Vec<Rect> {
+        let mut out = Vec::new();
+        let (Some(menu), Some(card)) = (self.menu.as_ref(), self.menu_rect(ctx, area)) else { return out };
+        if !matches!(menu.mode, MenuMode::Items) {
+            return out;
+        }
+        let mut parent_rect = card;
+        let mut parent_entries = zip_entries(&menu.items);
+        for open in &self.zip_menu {
+            let entries = open.entries();
+            let rect = kit::submenu_rect(ctx, parent_rect, &parent_entries, open.parent, &entries, area);
+            out.push(rect);
+            parent_rect = rect;
+            parent_entries = entries.iter().map(|entry| Entry { title: "", submenu: entry.submenu, group: entry.group, ..Entry::NONE }).collect();
+        }
+        out
+    }
+
+    fn draw_zip(&self, ctx: Ctx, s: &mut Surface, area: Rect) {
+        for (open, rect) in self.zip_menu.iter().zip(self.zip_rects(ctx, area)) {
+            // The row whose submenu is open stays lit.
+            let lit = if open.selected < open.items.len() { open.selected } else { usize::MAX };
+            kit::draw_menu(ctx, s, rect, &open.entries(), lit);
+        }
+    }
+
+    /// Pointer over the menu (25.11): «7-Zip» opens its submenu, a row with a
+    /// submenu opens it, other rows close the deeper levels. `true` — handled
+    /// (redraw).
+    fn hover_zip(&mut self, ctx: Ctx, area: Rect, x: i32, y: i32) -> bool {
+        let Some(card) = self.menu_rect(ctx, area) else { return false };
+        if !self.menu.as_ref().is_some_and(|menu| matches!(menu.mode, MenuMode::Items)) {
+            return false;
+        }
+        let rects = self.zip_rects(ctx, area);
+        for level in (0..rects.len()).rev() {
+            if !rects[level].contains(x, y) {
+                continue;
+            }
+            let row = kit::menu_hit(ctx, rects[level], &self.zip_menu[level].entries(), x, y);
+            let open = &mut self.zip_menu[level];
+            let changed = row.is_some_and(|row| row != open.selected);
+            if let Some(row) = row {
+                open.selected = row;
+                if open.items[row].submenu() {
+                    self.open_zip(level + 1, false);
+                } else {
+                    self.zip_menu.truncate(level + 1);
+                }
+            }
+            return changed || row.is_some();
+        }
+        let Some(menu) = self.menu.as_ref() else { return false };
+        match kit::menu_hit(ctx, card, &zip_entries(&menu.items), x, y) {
+            Some(row) if menu.items[row] == MenuItem::SevenZip => {
+                let was = self.zip_menu.len();
+                self.open_zip(0, false);
+                was != self.zip_menu.len()
+            }
+            Some(_) if !self.zip_menu.is_empty() => {
+                self.zip_menu.clear();
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Click (25.11): a row of «7-Zip ▸» runs (or opens its submenu); a
+    /// click on «7-Zip» opens it. `None` — not here.
+    fn click_zip(&mut self, ctx: Ctx, area: Rect, x: i32, y: i32) -> Option<bool> {
+        let rects = self.zip_rects(ctx, area);
+        for level in (0..rects.len()).rev() {
+            if !rects[level].contains(x, y) {
+                continue;
+            }
+            if let Some(row) = kit::menu_hit(ctx, rects[level], &self.zip_menu[level].entries(), x, y) {
+                self.zip_menu[level].selected = row;
+                let item = self.zip_menu[level].items[row];
+                if item.submenu() {
+                    self.open_zip(level + 1, false);
+                } else {
+                    self.run_zip(item);
+                }
+            }
+            return Some(true);
+        }
+        None
+    }
+
+    /// Keys while the menu is open (25.11): → on «7-Zip» or on a row with a
+    /// submenu enters it, ← and Esc leave, ↑↓ move, Enter runs. `None` — the
+    /// key is for the card.
+    fn key_zip(&mut self, code: u32) -> Option<bool> {
+        let menu = self.menu.as_ref()?;
+        if !matches!(menu.mode, MenuMode::Items) {
+            return None;
+        }
+        let Some(level) = self.zip_menu.iter().position(|open| open.focus) else {
+            // On the card: → or Enter on «7-Zip» enters its submenu.
+            if matches!(code, WIN_KEY_RIGHT | ENTER) && menu.items.get(menu.selected) == Some(&MenuItem::SevenZip) {
+                self.open_zip(0, true);
+                return Some(true);
+            }
+            return None;
+        };
+        let open = &mut self.zip_menu[level];
+        let count = open.items.len().max(1);
+        match code {
+            WIN_KEY_UP => open.selected = if open.selected >= count { count - 1 } else { (open.selected + count - 1) % count },
+            WIN_KEY_DOWN => open.selected = if open.selected >= count { 0 } else { (open.selected + 1) % count },
+            WIN_KEY_RIGHT | ENTER if open.items.get(open.selected).is_some_and(|item| item.submenu()) => self.open_zip(level + 1, true),
+            ENTER => {
+                if let Some(item) = open.items.get(open.selected).copied() {
+                    self.run_zip(item);
+                }
+            }
+            WIN_KEY_LEFT | ESCAPE => {
+                self.zip_menu.truncate(level);
+                if let Some(up) = self.zip_menu.last_mut() {
+                    up.focus = true;
+                }
+            }
+            _ => return Some(false),
+        }
+        Some(true)
+    }
+
+    /// Run an item of «7-Zip ▸» (25.11): `/bin/archiver <command>` with the
+    /// picked rows (an archive command — with the first); a long list goes
+    /// as a file (the launch line is at most 255 bytes).
+    fn run_zip(&mut self, item: ZipItem) {
+        let (paths, _) = self.zip_paths();
+        self.close_menu();
+        let one = matches!(item, ZipItem::Open | ZipItem::OpenAs(_) | ZipItem::Extract);
+        let paths: Vec<String> = if one { paths.into_iter().take(1).collect() } else { paths };
+        if paths.is_empty() {
+            return;
+        }
+        let command = item.command();
+        let head = if command.is_empty() { String::from("/bin/archiver") } else { format!("/bin/archiver {command}") };
+        let mut line = head.clone();
         for path in &paths {
             line.push(' ');
             line.push_str(&pct(path));
         }
-        // Строка запуска — до 255 байт: длинный список уходит файлом.
         if line.len() > 250 {
             let file = format!("/tmp/.files-7zip-{}", monotonic_ms());
             let _ = make_dirs("/tmp");
             if write_file(&file, paths.join("\n").as_bytes()).is_ok() {
-                line = format!("/bin/archiver {verb} @{file}");
+                line = format!("{head} @{file}");
             }
         }
         let id = spawn(&line);
-        println(&format!("files: 7-Zip {verb} for {} item(s) ({id})", paths.len()));
+        println(&format!("files: 7-Zip {item:?} for {} item(s) ({id})", paths.len()));
         if id < 0 {
             self.note = Some(format!("Не удалось запустить архиватор: {}", error_text(id)));
         }
@@ -3372,6 +3688,10 @@ impl Files {
             return true;
         }
 
+        // «7-Zip ▸» and its submenus (25.11) — over the menu card.
+        if let Some(done) = self.click_zip(ctx, area, x, y) {
+            return done;
+        }
         // Открытое меню получает щелчок первым: внутри — пункт, снаружи —
         // закрытие, и щелчок мимо на этом заканчивается. Так ведёт себя всякое
         // меню, которое человек видел.
@@ -4543,7 +4863,8 @@ impl Files {
         // Пункты рисует общее меню; поле имени и вопрос об удалении — своё
         // содержимое на той же карточке (фаза С8).
         if matches!(menu.mode, MenuMode::Items) {
-            kit::draw_menu(ctx, s, card, &entries(&menu.items), menu.selected);
+            kit::draw_menu(ctx, s, card, &zip_entries(&menu.items), menu.selected);
+            self.draw_zip(ctx, s, area);
             return;
         }
         if let MenuMode::Confirm(focus) = menu.mode {
@@ -6672,6 +6993,10 @@ impl App for Files {
     /// ним шире и ярче, строка, место слева и вкладка подсвечены. Окно
     /// перерисовывается, только когда подсвеченное сменилось.
     fn hover(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        // «7-Zip ▸» opens and its rows light under the pointer (25.11).
+        if self.hover_zip(ctx, area, x, y) {
+            return true;
+        }
         let plan = layout(ctx, area);
         let (v, h) = self.bars(ctx, &plan);
         let bars = self.scroll.hover(v.as_ref(), x, y) | self.hscroll.hover(h.as_ref(), x, y);

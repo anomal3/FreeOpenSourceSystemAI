@@ -4622,6 +4622,13 @@ impl Compositor {
         }
     }
 
+    /// What «7-Zip ▸» of the open menu offers (25.11).
+    pub fn context_zip(&mut self, zip: super::context::ZipInfo) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.set_zip(zip);
+        }
+    }
+
     /// Программы «Открыть с помощью» для следующего открытия меню.
     pub fn context_handlers(&mut self, handlers: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>) {
         if let Some(menu) = self.context.as_mut() {
@@ -6431,6 +6438,11 @@ impl Compositor {
                 self.drop_shadow(back, menu.rect, band, dy, r);
                 self.stack(back, menu.surface(), menu.rect, band, dy, r);
                 if let Some((surface, rect)) = menu.sub_layer() {
+                    self.drop_shadow(back, rect, band, dy, r);
+                    self.stack(back, surface, rect, band, dy, r);
+                }
+                // «7-Zip ▸ CRC SHA ▸» (25.11): the second level.
+                if let Some((surface, rect)) = menu.sub2_layer() {
                     self.drop_shadow(back, rect, band, dy, r);
                     self.stack(back, surface, rect, band, dy, r);
                 }

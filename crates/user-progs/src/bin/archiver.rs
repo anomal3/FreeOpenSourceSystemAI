@@ -1700,6 +1700,8 @@ fn open_with_default(path: &str) {
 impl App for Archiver {
     fn size_limits(&self) -> app::SizeLimits {
         match self.mode {
+            // Action windows (`--hash`, `--test` …): only their card.
+            Mode::Browse if self.quit_after => app::SizeLimits::min(400, 200),
             Mode::Browse => app::SizeLimits::min(640, 440),
             Mode::Add(_) => app::SizeLimits::fixed(560, 470),
             Mode::Extract(_) => app::SizeLimits::fixed(560, 300),

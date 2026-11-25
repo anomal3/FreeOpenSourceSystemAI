@@ -8761,12 +8761,13 @@ pub const ALL: &[Scenario] = &[
             Step::Expect("for entry"),
             Step::Wait(1_500),
             Step::Shot("02-entry-menu"),
-            // «Переименовать» — седьмой пункт, после двух черт (макет 09:
-            // открыть… | вырезать, копировать | переименовать, удалить).
+            // «Переименовать» — восьмой пункт, после трёх черт (макет 09:
+            // открыть… | 7-Zip › (25.11) | вырезать, копировать |
+            // переименовать, удалить).
             // Поле открывается на месте подписи с выделенным именем (02.11):
             // набранное заменяет его, Enter принимает. Меню закрывается
             // сразу — оно больше не забирает ввод.
-            Step::Aim(Aim::ContextItem(6, 2)),
+            Step::Aim(Aim::ContextItem(7, 3)),
             Step::Click,
             Step::Await("desktop     : naming 'Новая папка'", 15_000),
             Step::Wait(1_500),
@@ -8785,7 +8786,7 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Icon(4)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
-            Step::Aim(Aim::ContextItem(7, 2)),
+            Step::Aim(Aim::ContextItem(8, 3)),
             Step::Click,
             Step::Wait(1_500),
             Step::Shot("04-delete-confirm"),
@@ -8864,7 +8865,7 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Icon(4)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
-            Step::Aim(Aim::ContextItem(5, 2)),
+            Step::Aim(Aim::ContextItem(6, 3)),
             Step::Click,
             Step::Wait(1_000),
             Step::Key("y"),
@@ -19748,9 +19749,9 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(800),
             Step::Shot("02-entry-menu"),
             // У папки с 20.11 под «Открыть» ещё «в новой вкладке» и «в новом
-            // окне», с 24.11 — «Закрепить на панели быстрого доступа»:
-            // «Переименовать» — пятый пункт.
-            Step::Repeat("down", 4),
+            // окне», с 24.11 — «Закрепить на панели быстрого доступа», с
+            // 25.11 — «7-Zip ›»: «Переименовать» — шестой пункт.
+            Step::Repeat("down", 5),
             Step::Key("ret"),
             Step::Wait(500),
             Step::Key("ctrl-u"),
@@ -19763,7 +19764,7 @@ pub const ALL: &[Scenario] = &[
             // Удаление — третий пункт, с вопросом; `y` отвечает «да».
             Step::Key("m"),
             Step::Await("files: menu opened for 'notes'", 15_000),
-            Step::Repeat("down", 5),
+            Step::Repeat("down", 6),
             Step::Key("ret"),
             Step::Wait(800),
             Step::Shot("04-confirm"),
@@ -19935,15 +19936,15 @@ pub const ALL: &[Scenario] = &[
             Step::Shot("07b-bin-list"),
             Step::Key("l"),
             Step::Await("files: view table", 15_000),
-            // Свойства — шестой пункт меню записи (с 22.11 вторым идёт
-            // «Открыть с помощью…»). Клавиша меню у QEMU зовётся
+            // Свойства — седьмой пункт меню записи (с 22.11 вторым идёт
+            // «Открыть с помощью…», с 25.11 третьим — «7-Zip ›»). Клавиша меню у QEMU зовётся
             // `compose`: это она даёт `E0 5D` и usage 0x65; `menu` у него —
             // другая, мультимедийная. Первая строка `/bin` — какая есть
             // (была `ask`, потом `admin`, с e6269e1 — `7zz`): имя не
             // проверяется.
             Step::Key("compose"),
             Step::Await("files: menu opened for '", 15_000),
-            Step::Repeat("down", 5),
+            Step::Repeat("down", 6),
             Step::Key("ret"),
             // С 24.11 «Свойства» — отдельное окно (`files --properties`).
             Step::Await("fileprops: window 'Properties' opened", 15_000),
@@ -21447,6 +21448,12 @@ pub const ALL: &[Scenario] = &[
 /// «Извлечь все…», «Добавить в архив…» с паролем, «Сжать в ZIP-файл»,
 /// «Извлечь сюда»; «Файлы» — архив открывается архиватором, пункты 7-Zip в
 /// меню.
+///
+/// 25.11 (Roman: like 7-Zip): the window is 7-Zip File Manager's — menu bar
+/// («Файл», «Вид» with sorting), «Информация», «Переместить» out of the
+/// archive through the folder dialog; «7-Zip ›» of «Файлы» and of the
+/// desktop with «CRC SHA ›» (SHA-256 / CRC-32 windows), «Распаковать в
+/// "t\"», «Добавить к "t_2.7z"».
 const SEVENZIP_STEPS: &[Step] = &[
     Step::Await("data        : mounted read-write", BOOT),
     Step::Await(PROMPT, 60_000),
@@ -21461,6 +21468,8 @@ const SEVENZIP_STEPS: &[Step] = &[
     Step::Await("created /data/z/src", 15_000),
     Step::Line("mkdir /data/z/src/sub"),
     Step::Await("created /data/z/src/sub", 15_000),
+    Step::Line("mkdir /data/z/mv"),
+    Step::Await("created /data/z/mv", 15_000),
     Step::Line("echo alpha-7zip-check > /data/z/src/a.txt"),
     Step::Line("echo beta-inside-sub > /data/z/src/sub/b.txt"),
     Step::Wait(1_000),
@@ -21505,10 +21514,35 @@ const SEVENZIP_STEPS: &[Step] = &[
     Step::Await("archiver: folder '/' has 1 entries", 15_000),
     Step::Wait(1_000),
     Step::Shot("01-archive-root"),
+    // The menu bar (25.11): «Файл», → → «Вид»; «Информация» — Ctrl+I.
+    Step::Aim(Aim::Program("7-Zip", 30, 15)),
+    Step::Click,
+    Step::Await("archiver: menu 'Файл' opened", 15_000),
+    Step::Wait(800),
+    Step::Shot("01b-menu-file"),
+    Step::Key("right"),
+    Step::Key("right"),
+    Step::Wait(800),
+    Step::Shot("01c-menu-view"),
+    Step::Key("esc"),
+    Step::Key("ctrl-i"),
+    Step::Await("archiver: info of '/data/z/t.7z'", 15_000),
+    Step::Wait(800),
+    Step::Shot("01d-info"),
+    Step::Key("ret"),
     Step::Key("ret"),
     Step::Await("archiver: folder '/src' has 2 entries", 15_000),
     Step::Wait(800),
     Step::Shot("02-archive-folder"),
+    // «Вид» → «Упорядочить: размер» (the second item).
+    Step::Aim(Aim::Program("7-Zip", 30, 15)),
+    Step::Click,
+    Step::Await("archiver: menu 'Файл' opened", 15_000),
+    Step::Key("right"),
+    Step::Key("right"),
+    Step::Repeat("down", 2),
+    Step::Key("ret"),
+    Step::Await("archiver: sorted by Размер asc", 15_000),
     Step::Key("ctrl-t"),
     Step::Await("archiver: test of '/data/z/t.7z' ok", 60_000),
     Step::Wait(800),
@@ -21521,11 +21555,32 @@ const SEVENZIP_STEPS: &[Step] = &[
     Step::Wait(2_000),
     Step::Shot("04-file-in-notepad"),
     Step::Key("alt-f4"),
+    Step::Wait(1_500),
+    // «Файл» → «Переместить в…» (the eighth item): the folder dialog, the
+    // path typed; a.txt goes out to /data/z/mv and away from the archive.
+    Step::Aim(Aim::Program("7-Zip", 30, 15)),
+    Step::Click,
+    Step::Await("archiver: menu 'Файл' opened", 15_000),
+    Step::Repeat("down", 8),
+    Step::Key("ret"),
+    Step::Await("archiver: command MoveTo", 15_000),
+    Step::Await("file dialog #", 15_000),
+    Step::Wait(2_000),
+    Step::Shot("04b-move-dialog"),
+    Step::Type("/data/z/mv"),
+    Step::Key("ret"),
+    Step::Await("archiver: moving 1 item(s) to '/data/z/mv'", 30_000),
+    Step::Await("archiver: moving 1 item(s) out of '/data/z/t.7z'", 60_000),
+    Step::Await("archiver: deleted from '/data/z/t.7z'", 60_000),
+    Step::Await("archiver: folder '/src' has 1 entries", 60_000),
     Step::Wait(800),
+    Step::Shot("04c-moved"),
     Step::Key("alt-f4"),
     Step::Await("archiver: closing on request", 15_000),
     Step::Await("/bin/archiver: exited with code", 15_000),
     Step::Wait(1_500),
+    Step::Line("cat /data/z/mv/src/a.txt"),
+    Step::Await("alpha-7zip-check", 15_000),
     // «Извлечь все…»: папка по имени архива, затем «Файлы» с ней.
     Step::Line("run -b /bin/archiver --extract /data/z/t.zip"),
     Step::Await("archiver: extract form for '/data/z/t.zip' to '/data/z/t'", 30_000),
@@ -21599,16 +21654,104 @@ const SEVENZIP_STEPS: &[Step] = &[
     Step::Await("files: closing on request", 15_000),
     Step::Await("desktop     : focus 'Terminal'", 15_000),
     Step::Wait(1_000),
+    // The desktop (25.11): an archive on it, «7-Zip ›» of its menu — the
+    // third item, → «CRC SHA ›» (the tenth), → CRC-32; then «Распаковать в».
+    Step::Line("mkdir /root/Desktop"),
+    Step::Line("7z a /root/Desktop/d.7z /data/z/src"),
+    Step::Await("Everything is Ok", 60_000),
+    Step::Wait(1_000),
+    Step::Aim(Aim::Minimize("Terminal")),
+    Step::Click,
+    Step::Await("desktop     : minimized 'Terminal'", 15_000),
+    Step::Wait(2_000),
+    Step::Aim(Aim::IconFromEnd(0)),
+    Step::RightClick,
+    Step::Await("desktop     : 7-Zip menu for an archive", 15_000),
+    Step::Await("desktop     : context menu at", 15_000),
+    Step::Repeat("down", 2),
+    Step::Key("right"),
+    Step::Await("desktop     : submenu at", 15_000),
+    Step::Wait(800),
+    Step::Shot("14-desktop-7zip"),
+    Step::Repeat("down", 9),
+    Step::Key("right"),
+    Step::Await("desktop     : submenu 2 'CRC SHA' at", 15_000),
+    Step::Wait(800),
+    Step::Shot("15-desktop-crc-sha"),
+    Step::Key("ret"),
+    Step::Await("desktop     : 7-Zip Hash(0) for 1 item(s)", 15_000),
+    Step::Await("CRC32 (данные) ", 60_000),
+    Step::Wait(1_500),
+    Step::Shot("16-desktop-crc32"),
+    Step::Key("ret"),
+    Step::Await("/bin/archiver: exited with code", 15_000),
+    Step::Wait(1_500),
+    Step::Aim(Aim::IconFromEnd(0)),
+    Step::RightClick,
+    Step::Await("desktop     : context menu at", 15_000),
+    Step::Repeat("down", 2),
+    Step::Key("right"),
+    Step::Await("desktop     : submenu at", 15_000),
+    Step::Repeat("down", 4),
+    Step::Key("ret"),
+    Step::Await("desktop     : 7-Zip ExtractTo for 1 item(s)", 15_000),
+    Step::Await("archiver: extracted '/root/Desktop/d.7z' to '/root/Desktop/d'", 60_000),
+    // «Файлы» (the terminal is minimized: Files from the desktop's run line
+    // is not needed — Win+R would do; the shell runs it over the serial line).
     Step::Line("run -b /bin/files /data/z/t.7z"),
     Step::Await("window      : 'Files' at", 30_000),
     Step::Wait(1_500),
+    // «7-Zip ›» (25.11) — the third item of a file's menu; → opens it,
+    // the tenth row «CRC SHA ›», → opens it, SHA-256 — the fourth.
+    // The pointer off the rows: the menu lights the row under it.
+    Step::Aim(Aim::Program("Files", 900, 520)),
+    Step::Wait(500),
     Step::Key("m"),
     Step::Await("files: menu opened for 't.7z'", 15_000),
+    Step::Repeat("down", 2),
+    Step::Wait(500),
+    Step::Shot("11a-files-menu"),
+    Step::Key("right"),
+    Step::Await("files: 7-Zip submenu 1 opened: Открыть архив | Открыть архив | Распаковать", 15_000),
     Step::Wait(800),
-    Step::Shot("11-files-menu"),
+    Step::Shot("11-files-7zip"),
+    Step::Repeat("down", 9),
+    Step::Key("right"),
+    Step::Await("files: 7-Zip submenu 2 opened: CRC-32 | CRC-64 | SHA-1 | SHA-256 | *", 15_000),
+    Step::Wait(800),
+    Step::Shot("12-files-crc-sha"),
+    Step::Repeat("down", 3),
+    Step::Key("ret"),
+    Step::Await("files: 7-Zip Hash(3) for 1 item(s)", 15_000),
+    Step::Await("SHA256 (данные) ", 60_000),
+    Step::Wait(1_500),
+    Step::Shot("13-sha256"),
+    Step::Key("ret"),
+    Step::Await("/bin/archiver: exited with code", 15_000),
+    Step::Wait(1_500),
+    // «Распаковать в "t\"» (the fifth row) and «Добавить к "t_2.7z"» (the
+    // eighth: "t.7z" is the source itself).
+    Step::Key("m"),
+    Step::Await("files: menu opened for 't.7z'", 15_000),
+    Step::Repeat("down", 2),
+    Step::Key("right"),
+    Step::Await("files: 7-Zip submenu 1 opened", 15_000),
+    Step::Repeat("down", 4),
+    Step::Key("ret"),
+    Step::Await("files: 7-Zip ExtractTo for 1 item(s)", 15_000),
+    Step::Await("archiver: extracted '/data/z/t.7z' to '/data/z/t'", 60_000),
+    Step::Await("/bin/archiver: exited with code", 15_000),
+    Step::Wait(1_500),
+    Step::Key("m"),
+    Step::Await("files: menu opened for 't.7z'", 15_000),
+    Step::Repeat("down", 2),
+    Step::Key("right"),
+    Step::Await("files: 7-Zip submenu 1 opened", 15_000),
     Step::Repeat("down", 7),
     Step::Key("ret"),
-    Step::Await("files: 7-Zip --extract-here for 1 item(s)", 15_000),
-    Step::Await("archiver: extracted '/data/z/t.7z' to '/data/z'", 60_000),
+    Step::Await("files: 7-Zip Add7z for 1 item(s)", 15_000),
+    Step::Await("archiver: created '/data/z/t_2.7z'", 60_000),
+    Step::Await("/bin/archiver: exited with code", 15_000),
+    Step::Wait(1_000),
     Step::Absent("KERNEL PANIC"),
 ];

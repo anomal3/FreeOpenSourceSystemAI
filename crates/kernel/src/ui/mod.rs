@@ -3541,6 +3541,17 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 desktop.refresh_panel(status);
             }
             desktop.open_context(x, y, items);
+            // «7-Zip ▸» (25.11): names of the picked icons for its items;
+            // without 7-Zip in the system the item is grey.
+            if items.contains(&context::Action::Submenu(context::Sub::SevenZip)) {
+                if context::zip_available() {
+                    let zip = zip_info(desktop);
+                    kprintln!("  desktop     : 7-Zip menu for {} ({:?})", if zip.archive { "an archive" } else { "files" }, zip);
+                    desktop.context_zip(zip);
+                } else {
+                    desktop.context_set_off(alloc::vec![context::Action::Submenu(context::Sub::SevenZip)]);
+                }
+            }
             // Ярлык программы на столе на панель пока не закрепляется — из
             // «Пуска» (20.11).
             if items.contains(&context::Action::PinTaskbar) {
@@ -5930,6 +5941,11 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         }
         // Пункт с подменю ничего не делает сам: подменю открыл указатель.
         context::Action::Submenu(_) | context::Action::RecentHeader => {}
+        context::Action::Zip(zip) => {
+            desktop.close_context();
+            run_zip(desktop, zip);
+            desktop.refresh_panel(status);
+        }
         context::Action::Recent(number) => {
             desktop.close_context();
             let chosen = RECENT_MENU.lock().get(usize::from(number)).cloned();
@@ -6649,6 +6665,60 @@ fn entry_facts(path: &str, label: &str) -> String {
         }
         _ => alloc::format!("{label}: {path}"),
     }
+}
+
+/// The picked desktop icons (25.11, «7-Zip ▸»): the ones marked, else the
+/// one the menu is open on.
+fn zip_paths(desktop: &Compositor) -> alloc::vec::Vec<(String, String)> {
+    let mut entries = selected_entries(desktop);
+    if entries.is_empty() {
+        entries.extend(selected_entry(desktop));
+    }
+    entries
+}
+
+/// What «7-Zip ▸» offers for the picked icons (25.11): archive items when
+/// every one is an archive; the names 7-Zip would give.
+fn zip_info(desktop: &Compositor) -> context::ZipInfo {
+    let entries = zip_paths(desktop);
+    let paths: alloc::vec::Vec<&str> = entries.iter().map(|(path, _)| path.as_str()).collect();
+    let single_dir = paths.len() == 1 && desktop.icon_selection().is_some_and(|index| matches!(desktop.icon_kind(index), Some(icons::Kind::Folder)));
+    let name = |ext: &str| String::from(context::base_name(&sysconf::filetypes::add_to_target(&paths, single_dir, ext)));
+    context::ZipInfo {
+        archive: !paths.is_empty() && !single_dir && paths.iter().all(|path| sysconf::filetypes::is_archive(path)),
+        add_7z: name("7z"),
+        add_zip: name("zip"),
+        folder: paths.first().map(|path| sysconf::filetypes::archive_stem(context::base_name(path))).unwrap_or_default(),
+    }
+}
+
+/// Run an item of «7-Zip ▸» (25.11): `/bin/archiver` with the picked icons
+/// (an archive command — with the first archive). The launch line is at most
+/// 255 bytes: what does not fit is left out, as for «Свойства».
+fn run_zip(desktop: &mut Compositor, zip: context::Zip) {
+    let entries = zip_paths(desktop);
+    let one = matches!(zip, context::Zip::Open | context::Zip::OpenAs(_) | context::Zip::Extract);
+    let mut line = String::from("/bin/archiver");
+    let command = zip.command();
+    if !command.is_empty() {
+        line.push(' ');
+        line.push_str(&command);
+    }
+    let mut count = 0;
+    for (path, _) in entries.iter().take(if one { 1 } else { usize::MAX }) {
+        let word = panel::pct(path);
+        if line.len() + word.len() + 1 > 250 {
+            break;
+        }
+        line.push(' ');
+        line.push_str(&word);
+        count += 1;
+    }
+    if count == 0 {
+        return;
+    }
+    kprintln!("  desktop     : 7-Zip {zip:?} for {count} item(s)");
+    start(desktop, &line);
 }
 
 /// Что ждёт ответа окна «Удаление файла»: путь и подпись.
