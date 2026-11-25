@@ -86,6 +86,10 @@ fn main() -> Status {
     if uefi::helpers::init().is_err() {
         return Status::ABORTED;
     }
+    // The boot manager's 5-minute UEFI watchdog (spec 7.5) would cold-reset
+    // the machine if someone sits in the boot menu or the stick is slow;
+    // same fix as in the installer (25.11).
+    let _ = boot::set_watchdog_timer(0, 0x1_0000, None);
 
     let _ = system::with_stdout(|stdout| stdout.clear());
 

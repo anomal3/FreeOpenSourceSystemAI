@@ -18761,6 +18761,7 @@ Chromium без ANGLE; на Windows это не мешает (уходит на 
 ВМ при копировании `tmnf-2.11.fpk` сразу после `proton-11.fpk` (2 ГБ) — петля
 «FossAi installer» до таймаута (`[install] copying package -> /media/tmnf…`,
 затем снова BdsDxe). Без tmnf на носителе установка проходит за 5 мин.
+**Fixed (25.11): UEFI watchdog.** The boot manager arms a 5-minute watchdog before starting BOOTX64.EFI (UEFI spec 7.5); on expiry OVMF/real firmware cold-resets. With Proton, TMNF and the office packages the QEMU install now takes ~296 s from the installer screen (24.11: ~255-263 s), so the timer fired mid-copy. The installer (crates/installer/src/main.rs) and the loader (crates/boot-uefi/src/main.rs: boot menu, slow sticks) call SetWatchdogTimer(0) first; installer log line [boot] firmware watchdog disabled. Checked: install with FOSSAI_WITH_PROTON=1 twice (default disk and FOSSAI_TARGET_MIB=32768).
 
 ## Контекстные меню как в Windows 11 и пункты из хранилища настроек (25.11, Роман) - **сделано в QEMU, проверить на железе**
 
