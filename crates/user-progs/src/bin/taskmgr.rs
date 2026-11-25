@@ -290,9 +290,9 @@ impl MenuItem {
 }
 
 const ENTRIES: [Entry<'static>; 3] = [
-    Entry { title: "Снять задачу", icon: Some(mini_ui::glyphicon::Icon::Close), danger: true, group: 0 },
-    Entry { title: "Открыть расположение файла", icon: Some(mini_ui::glyphicon::Icon::Folder), danger: false, group: 0 },
-    Entry { title: "Обновить", icon: Some(mini_ui::glyphicon::Icon::Update), danger: false, group: 1 },
+    Entry { title: "Снять задачу", icon: Some(mini_ui::glyphicon::Icon::Close), danger: true, group: 0, ..Entry::NONE },
+    Entry { title: "Открыть расположение файла", icon: Some(mini_ui::glyphicon::Icon::Folder), danger: false, group: 0, ..Entry::NONE },
+    Entry { title: "Обновить", icon: Some(mini_ui::glyphicon::Icon::Update), danger: false, group: 1, ..Entry::NONE },
 ];
 
 struct Menu {

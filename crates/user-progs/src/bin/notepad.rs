@@ -1347,7 +1347,7 @@ impl Plan {
     fn lang_menu(&self, ctx: Ctx, area: Rect) -> (Rect, Vec<kit::Entry<'static>>) {
         let entries: Vec<kit::Entry<'static>> = Lang::ALL
             .iter()
-            .map(|lang| kit::Entry { title: lang.name(), icon: None, danger: false, group: u8::from(*lang != Lang::Plain) })
+            .map(|lang| kit::Entry { title: lang.name(), icon: None, danger: false, group: u8::from(*lang != Lang::Plain), ..kit::Entry::NONE })
             .collect();
         let size = kit::menu_size(ctx, &entries);
         let rect = kit::place((self.lang.right() - size.0 as i32, self.status.y - size.1 as i32), size, area);

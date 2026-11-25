@@ -2246,7 +2246,7 @@ impl FileDialog {
     }
 
     fn type_menu_layout(&self, ctx: Ctx, lay: &Layout, area: Rect) -> (Rect, Vec<kit::Entry<'_>>) {
-        let entries: Vec<kit::Entry<'_>> = self.filters.iter().map(|filter| kit::Entry { title: &filter.label, icon: None, danger: false, group: 0 }).collect();
+        let entries: Vec<kit::Entry<'_>> = self.filters.iter().map(|filter| kit::Entry { title: &filter.label, icon: None, danger: false, group: 0, ..kit::Entry::NONE }).collect();
         let (w, h) = kit::menu_size(ctx, &entries);
         let w = w.max(lay.kind.w);
         let below = lay.kind.bottom() + ctx.px(4) as i32;

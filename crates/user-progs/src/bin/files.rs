@@ -437,7 +437,7 @@ impl MenuItem {
 fn entries(items: &[MenuItem]) -> Vec<Entry<'static>> {
     items
         .iter()
-        .map(|item| Entry { title: item.title(), icon: item.icon(), danger: item.danger(), group: item.group() })
+        .map(|item| Entry { title: item.title(), icon: item.icon(), danger: item.danger(), group: item.group(), ..Entry::NONE })
         .collect()
 }
 
@@ -1100,10 +1100,10 @@ struct TabDrag {
 
 /// Меню вкладки.
 const TAB_ENTRIES: [Entry<'static>; 4] = [
-    Entry { title: "Новая вкладка", icon: None, danger: false, group: 0 },
-    Entry { title: "Переместить в новое окно", icon: None, danger: false, group: 1 },
-    Entry { title: "Закрыть вкладку", icon: Some(Icon::Close), danger: false, group: 2 },
-    Entry { title: "Закрыть другие вкладки", icon: None, danger: false, group: 2 },
+    Entry { title: "Новая вкладка", icon: None, danger: false, group: 0, ..Entry::NONE },
+    Entry { title: "Переместить в новое окно", icon: None, danger: false, group: 1, ..Entry::NONE },
+    Entry { title: "Закрыть вкладку", icon: Some(Icon::Close), danger: false, group: 2, ..Entry::NONE },
+    Entry { title: "Закрыть другие вкладки", icon: None, danger: false, group: 2, ..Entry::NONE },
 ];
 
 /// Самая узкая таблица, в которой видны все столбцы: имя не уже 160 точек,
@@ -3333,7 +3333,7 @@ impl Files {
         }
         // Выпавшее меню «Сортировка» / «Вид».
         if let Some((command, _, rect, items)) = self.pop_layout(ctx, area, &plan) {
-            let entries: Vec<Entry<'_>> = items.iter().map(|(title, group)| Entry { title, icon: None, danger: false, group: *group }).collect();
+            let entries: Vec<Entry<'_>> = items.iter().map(|(title, group)| Entry { title, icon: None, danger: false, group: *group, ..Entry::NONE }).collect();
             let hit = kit::menu_hit(ctx, rect, &entries, x, y);
             drop(entries);
             match hit {
@@ -4210,7 +4210,7 @@ impl Files {
         let (command, selected) = self.pop?;
         let button = plan.commands.iter().find(|(c, _)| *c == command)?.1;
         let items = self.pop_entries(command);
-        let entries: Vec<Entry<'_>> = items.iter().map(|(title, group)| Entry { title, icon: None, danger: false, group: *group }).collect();
+        let entries: Vec<Entry<'_>> = items.iter().map(|(title, group)| Entry { title, icon: None, danger: false, group: *group, ..Entry::NONE }).collect();
         let size = kit::menu_size(ctx, &entries);
         let rect = kit::place((button.x, button.bottom() + ctx.px(2) as i32), size, area);
         Some((command, selected, rect, items))
@@ -4220,7 +4220,7 @@ impl Files {
         let Some((_, selected, rect, items)) = self.pop_layout(ctx, area, plan) else {
             return;
         };
-        let entries: Vec<Entry<'_>> = items.iter().map(|(title, group)| Entry { title, icon: None, danger: false, group: *group }).collect();
+        let entries: Vec<Entry<'_>> = items.iter().map(|(title, group)| Entry { title, icon: None, danger: false, group: *group, ..Entry::NONE }).collect();
         kit::draw_menu(ctx, s, rect, &entries, selected);
     }
 
@@ -7963,7 +7963,7 @@ impl Files {
     /// Место списка у шеврона.
     fn crumb_pop_rect(&self, ctx: Ctx, area: Rect, plan: &Plan) -> Option<Rect> {
         let pop = self.crumb_pop.as_ref()?;
-        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0, ..Entry::NONE }).collect();
         let size = kit::menu_size(ctx, &entries);
         Some(kit::place((pop.at, plan.path.bottom() + ctx.px(2) as i32), size, area))
     }
@@ -7972,7 +7972,7 @@ impl Files {
         let (Some(pop), Some(rect)) = (self.crumb_pop.as_ref(), self.crumb_pop_rect(ctx, area, plan)) else {
             return;
         };
-        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0, ..Entry::NONE }).collect();
         kit::draw_menu(ctx, s, rect, &entries, pop.selected);
     }
 
@@ -7982,7 +7982,7 @@ impl Files {
         let rect = self.crumb_pop_rect(ctx, area, plan);
         let Some(pop) = self.crumb_pop.take() else { return false };
         if let Some(rect) = rect {
-            let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+            let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0, ..Entry::NONE }).collect();
             if let Some(index) = kit::menu_hit(ctx, rect, &entries, x, y) {
                 drop(entries);
                 let path = pop.items[index].1.clone();
@@ -8016,7 +8016,7 @@ impl Files {
     fn hover_crumb_pop(&mut self, ctx: Ctx, area: Rect, plan: &Plan, x: i32, y: i32) -> bool {
         let Some(rect) = self.crumb_pop_rect(ctx, area, plan) else { return false };
         let Some(pop) = self.crumb_pop.as_mut() else { return false };
-        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0 }).collect();
+        let entries: Vec<Entry<'_>> = pop.items.iter().map(|(title, _)| Entry { title, icon: None, danger: false, group: 0, ..Entry::NONE }).collect();
         let hit = kit::menu_hit(ctx, rect, &entries, x, y);
         drop(entries);
         match hit {

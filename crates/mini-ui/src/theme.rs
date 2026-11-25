@@ -743,6 +743,40 @@ pub fn panel_bg() -> Color {
     p.panel.over(window_bg())
 }
 
+/// Context menus and drop-down menus (25.11, Roman: like Windows 11 — the
+/// menu is a raised surface a step off the window tone, not the window
+/// colour again). Dark: a touch lighter than the window; light: a touch
+/// darker than the paper (Windows 11 puts #F9F9F9 menus over white); classic:
+/// the Windows 98 face grey.
+#[must_use]
+pub fn menu_bg() -> Color {
+    if is_classic() {
+        return win98::FACE;
+    }
+    if is_dark() {
+        Ink::rgba(0xFF, 0xFF, 0xFF, 16).over(window_bg())
+    } else {
+        Ink::rgba(0x1F, 0x29, 0x37, 12).over(window_bg())
+    }
+}
+
+/// The highlight of the menu item under the pointer or the keyboard (25.11):
+/// a neutral plate, clearly visible on [`menu_bg`] in both themes. Classic
+/// uses the navy selection instead (see `paint::row`).
+#[must_use]
+pub fn menu_hover() -> Color {
+    let under = menu_bg();
+    if is_dark() {
+        Ink::rgba(0xFF, 0xFF, 0xFF, 22).over(under)
+    } else {
+        Ink::rgba(0x1F, 0x29, 0x37, 22).over(under)
+    }
+}
+
+/// Height of a context-menu item (25.11: compact like Windows 11 — the
+/// 36-point Start rows made menus look like lists).
+pub const MENU_ITEM_H: u32 = 28;
+
 
 
 /// Средний цвет обоев — подложка для сведения всего, что лежит на столе.
