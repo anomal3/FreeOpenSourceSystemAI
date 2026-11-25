@@ -563,7 +563,7 @@ L=$HOME/.cache/fossai-obs
 LD_LIBRARY_PATH= mkdir -p "$L" "$MESA_SHADER_CACHE_DIR"
 # Строки запуска - в терминал и в ~/.cache/fossai-obs/launch.log (из «Пуска»
 # терминала нет).
-say() { echo "fossai-obs: $*"; echo "$(LD_LIBRARY_PATH= date '+%F %T') $*" >> "$L/launch.log"; }
+say() { echo "fossai-obs: $*"; echo "$(LD_LIBRARY_PATH= date '+%F %T') $*" >> "$L/launch.log"; [ -w /dev/kmsg ] && echo "fossai-obs: $*" > /dev/kmsg; }
 # OpenGL: `--cpu` - llvmpipe (по умолчанию), `--gpu` - видеокарта NVIDIA:
 # zink (OpenGL поверх Vulkan) на NVK через узел nouveau ядра. Умолчание можно
 # сменить строкой `gpu=1` в ~/.config/fossai-obs.conf. Видеокарта - всегда с
@@ -574,6 +574,10 @@ case "$1" in --gpu) GPU=1; shift ;; --cpu) GPU=0; shift ;; esac
 cpu_gl() {
     export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
     unset MESA_LOADER_DRIVER_OVERRIDE VK_DRIVER_FILES VK_ICD_FILENAMES
+    # 25.11 (hw-log19): llvmpipe took all 16 CPUs (16 threads, 9-15 % idle)
+    # under a game; 4 threads draw OBS's canvas and leave the game its CPUs.
+    export LP_NUM_THREADS=${LP_NUM_THREADS:-4}
+    say "OpenGL on the CPU (llvmpipe, $LP_NUM_THREADS threads)"
 }
 gpu_gl() {
     export LIBGL_ALWAYS_SOFTWARE=0 GALLIUM_DRIVER=zink MESA_LOADER_DRIVER_OVERRIDE=zink
@@ -588,18 +592,24 @@ if [ "$GPU" = 1 ]; then
         gpu_gl
         # Проба: eglinfo на Wayland должен назвать zink (не llvmpipe) и не
         # зависнуть; иначе - процессор.
+        # 25.11 (hw-log19): `timeout` and `env` are Debian 12 coreutils - run
+        # with the package glibc 2.41 in LD_LIBRARY_PATH their loader exited
+        # 127 (eglinfo never ran, every `--gpu` start fell back to llvmpipe:
+        # OBS ate 14 of 16 CPUs under GOH and Uot). They get an empty path,
+        # eglinfo gets the package one through `env`.
         T=; LD_LIBRARY_PATH= command -v timeout >/dev/null 2>&1 && T="timeout 45"
-        out=$( { export LOCPATH=$P/locale LC_ALL=C.UTF-8; } 2>/dev/null; $T $P/bin/eglinfo 2>&1 )
+        out=$( { export LOCPATH=$P/locale LC_ALL=C.UTF-8; } 2>/dev/null; LD_LIBRARY_PATH= $T env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" $P/bin/eglinfo 2>&1 )
         r=$(printf '%s\n' "$out" | while IFS= read -r line; do case "$line" in *renderer*zink*) echo "${line#*: }"; break ;; esac; done)
         if [ -n "$r" ]; then
             say "OpenGL on the GPU: $r"
         else
             say "GPU probe failed (eglinfo found no zink renderer) - OpenGL on llvmpipe"
             printf '%s\n' "$out" > "$L/gpu-probe.txt"
-            cpu_gl; GPU=0
+            GPU=0
         fi
     fi
 fi
+[ "$GPU" = 1 ] || cpu_gl
 # `--run=ПРОГРАММА`: своя программа пакета с тем же окружением (eglinfo,
 # es2gears_wayland, ffprobe).
 case "$1" in --run=*) r=${1#--run=}; shift; { export LOCPATH=$P/locale LC_ALL=C.UTF-8; } 2>/dev/null; exec $P/bin/$r "$@" ;; esac

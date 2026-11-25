@@ -5491,7 +5491,10 @@ impl Compositor {
             let Some((at, window)) = top else {
                 continue;
             };
-            if window.fullscreen && window.rect == o && !dims(window.app) && window.direct_pixels().is_some() {
+            // 25.11: fullscreen, or a frameless window that covers the whole
+            // monitor by itself (borderless "fullscreen" of Wine games) - the
+            // panel checks above keep the taskbar case composed.
+            if window.rect == o && !dims(window.app) && window.direct_pixels().is_some() {
                 plan[index] = Some(at);
             }
         }
@@ -5519,6 +5522,11 @@ impl Compositor {
                 if now.is_some() { "shows a fullscreen window directly" } else { "composes again" },
                 now.or(was).map_or_else(|| alloc::string::String::from("-"), |app| self.label(app))
             );
+            if now.is_none() {
+                if let Some(app) = was {
+                    crate::kprintln!("  scanout     : composed on {} again (was '{}')", self.out_label(index), self.label(app));
+                }
+            }
             self.direct[index] = now;
             // A new window (or none) - the display may flip it again.
             self.flip_block[index] = None;
@@ -5604,6 +5612,8 @@ impl Compositor {
                 Err(why) => {
                     if self.flip_note[index].as_deref() != Some(why.as_str()) {
                         crate::kprintln!("  desktop     : output {index} does not flip: {why}");
+                        let client = self.windows.get(at).map_or_else(|| alloc::string::String::from("-"), |w| self.label(w.app));
+                        crate::kprintln!("  scanout     : not direct on {} for '{client}': {why} (one copy per frame instead)", self.out_label(index));
                         self.flip_note[index] = Some(why);
                     }
                 }
@@ -5646,6 +5656,14 @@ impl Compositor {
                                 "  desktop     : output {index} {}",
                                 if want.is_some() { "scans the fullscreen window's buffer out directly (no copy)" } else { "scans its frame buffer out again" }
                             );
+                            let client = plan[index]
+                                .and_then(|at| self.windows.get(at))
+                                .map_or_else(|| alloc::string::String::from("-"), |w| self.label(w.app));
+                            if want.is_some() {
+                                crate::kprintln!("  scanout     : direct on {} for '{client}' (page flip to the client buffer, no copy)", self.out_label(index));
+                            } else {
+                                crate::kprintln!("  scanout     : {} shows the desktop frame buffer again", self.out_label(index));
+                            }
                         }
                         if want.is_some() {
                             self.flip_note[index] = Some(alloc::string::String::new());
@@ -5657,6 +5675,7 @@ impl Compositor {
                     Err(crate::display::FlipError::Refused(why)) => {
                         if want.is_some() {
                             crate::kprintln!("  desktop     : output {index} does not flip: the display refused - {why}");
+                            crate::kprintln!("  scanout     : not direct on {}: the display refused - {why}", self.out_label(index));
                             self.flip_note[index] = Some(why.clone());
                             self.flip_block[index] = Some(why);
                             if self.flipped[index].is_none() {
@@ -5764,6 +5783,18 @@ impl Compositor {
         // The flush is counted in the direct time (not in `note_flush`).
         crate::display::flush_output(out.backend, out.primary, part.x - o.x, part.y - o.y, part.w, part.h);
         super::note_direct(crate::time::uptime_ns().wrapping_sub(started), u64::from(part.w) * u64::from(part.h));
+    }
+
+    /// Monitor name for the `scanout:` log lines (25.11): `output N 'model'`.
+    fn out_label(&self, index: usize) -> alloc::string::String {
+        let Some(out) = self.outputs.get(index) else {
+            return alloc::format!("output {index}");
+        };
+        let backend = out.backend;
+        match crate::display::outputs::list().into_iter().find(|o| o.backend == backend) {
+            Some(o) if !o.name.is_empty() => alloc::format!("output {index} '{}'", o.name),
+            _ => alloc::format!("output {index}"),
+        }
     }
 
     /// Window name for the log (G3).

@@ -9787,7 +9787,12 @@ pub const ALL: &[Scenario] = &[
             Step::Await("pkg: installed debian 12, ", 300_000),
             Step::Line("nvk soft on"),
             Step::Await("nvk: /dev/dri/renderD128 present", 30_000),
-            // Flip off: the direct output says why it does not flip.
+            // Flip off (on by default since 25.11): the direct output says
+            // why it does not flip.
+            Step::Line("wldirect"),
+            Step::Await("scanout flip on; frame fences async", 10_000),
+            Step::Line("wldirect flip off"),
+            Step::Await("`wldirect flip off` -> wldirect: on", 10_000),
             Step::Line("run /opt/debian/usr/libexec/fossai/waylandcheck bench 200"),
             Step::Await("shows a fullscreen window directly", 60_000),
             Step::Await("does not flip: flip is off", 10_000),
@@ -9826,6 +9831,11 @@ pub const ALL: &[Scenario] = &[
             Step::Expect("does not flip: flip is off"),
             Step::Expect("scans the fullscreen window's buffer out directly"),
             Step::Expect("scans its frame buffer out again"),
+            // 25.11: the `scanout:` lines the owner's log is read by.
+            Step::Expect("scanout     : direct on output 0"),
+            Step::Expect("scanout     : not direct on output 0"),
+            Step::Expect("scanout     : output 0"),
+            Step::Expect("scanout     : composed on output 0"),
             Step::Absent("could not scan its frame buffer out again"),
             Step::Absent("cannot show the client buffer"),
             Step::Absent("the display refused"),

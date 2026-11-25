@@ -7260,8 +7260,14 @@ pub fn direct_command(argument: &str) -> String {
             FLIP.store(true, Ordering::Relaxed);
         }
         "flip off" => crate::display::nvidia_disp::FLIP.store(false, Ordering::Relaxed),
+        // 25.11: game frame fences - waited for by the Wayland server before
+        // the show (async, default) or in the game's present call (wait).
+        #[cfg(target_arch = "x86_64")]
+        "fence async" => crate::linux::drm::set_fence_async(true),
+        #[cfg(target_arch = "x86_64")]
+        "fence wait" => crate::linux::drm::set_fence_async(false),
         "" => {}
-        _ => return String::from("  wldirect: usage `wldirect [on|off|flip on|flip timed|flip off]`"),
+        _ => return String::from("  wldirect: usage `wldirect [on|off|flip on|flip timed|flip off|fence async|fence wait]`"),
     }
     with_desktop(|desktop| {
         desktop.repaint_all();
@@ -7269,7 +7275,7 @@ pub fn direct_command(argument: &str) -> String {
     });
     let (pieces, ns, points, flips) = direct_stats();
     let flip = if !crate::display::nvidia_disp::FLIP.load(Ordering::Relaxed) {
-        "off (`wldirect flip on` to try)"
+        "off (`wldirect flip on` turns it back on)"
     } else if crate::display::nvidia_disp::FLIP_STOPPED.load(Ordering::Relaxed) {
         "stopped after a display error (`wldirect flip on` tries again)"
     } else if crate::display::nvidia_disp::FLIP_TIMED.load(Ordering::Relaxed) {
@@ -7277,11 +7283,17 @@ pub fn direct_command(argument: &str) -> String {
     } else {
         "on"
     };
+    #[cfg(target_arch = "x86_64")]
+    let ((fence_async, noted), (held, held_us)) = (crate::linux::drm::fence_stats(), crate::linux::wayland::fence_held());
+    #[cfg(not(target_arch = "x86_64"))]
+    let ((fence_async, noted), (held, held_us)) = ((false, 0u64), (0u64, 0u64));
     let line = alloc::format!(
-        "  wldirect: {} ({pieces} direct copies, {} us each, {} Kpx each; {flips} frames scanned out of client buffers since boot; scanout flip {flip})",
+        "  wldirect: {} ({pieces} direct copies, {} us each, {} Kpx each; {flips} frames scanned out of client buffers since boot; scanout flip {flip}; frame fences {} - {noted} noted, {held} shows waited {} us each)",
         if compositor::DIRECT.load(Ordering::Relaxed) { "on" } else { "off" },
         ns / pieces.max(1) / 1000,
         points / pieces.max(1) / 1000,
+        if fence_async { "async (the desktop waits)" } else { "wait (in the game's present)" },
+        held_us / held.max(1),
     );
     // The owner's logs show what was switched (hw-log14: not visible).
     if !argument.trim().is_empty() {

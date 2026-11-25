@@ -404,6 +404,25 @@ pub fn dmabuf_memory(object: &dyn Object) -> Option<(Arc<crate::user::shm::Share
     Some((gem::shared_of(bo)?, bo.size))
 }
 
+/// 25.11: is the GPU still drawing the frame of the dma-buf whose memory
+/// starts at physical `first_frame` (see `gem::frame_pending`)?
+#[must_use]
+pub fn frame_pending(first_frame: u64) -> bool {
+    gem::frame_pending(first_frame)
+}
+
+/// 25.11: `wldirect fence async|wait` - frame fences waited for by the
+/// Wayland server (default) or inside `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`.
+pub fn set_fence_async(on: bool) {
+    gem::FENCE_ASYNC.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// 25.11: `(async on, frames noted with a pending fence since boot)`.
+#[must_use]
+pub fn fence_stats() -> (bool, u64) {
+    (gem::FENCE_ASYNC.load(core::sync::atomic::Ordering::Relaxed), gem::FENCES_NOTED.load(core::sync::atomic::Ordering::Relaxed))
+}
+
 /// ioctl на дескрипторе DRM, dma-buf, syncobj или sync_file; `None` — не наш.
 pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
     let object = object_of(fd)?;
