@@ -4376,6 +4376,7 @@ impl Client {
     /// События `zwp_linux_dmabuf_feedback_v1`: таблица форматов (fd), главное устройство, одна партия
     /// (все форматы таблицы, без флагов), `done`.
     fn dmabuf_feedback(&mut self, feedback: u32) {
+        kprintln!("  wayland     : client #{} asked dmabuf feedback: main device differs from the renderer, Mesa copies frames into a linear buffer", self.pid);
         let table = dmabuf::format_table();
         let mem = SharedMem::new(0);
         let node = Arc::new(crate::user::shm::ShmNode(Arc::clone(&mem)));
