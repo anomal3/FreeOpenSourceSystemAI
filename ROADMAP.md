@@ -18650,3 +18650,109 @@ by interrupt` и `network : receive task …, woken by interrupt`; при бол
 «Параметров»); USB-карта, подключённая после загрузки, не получает сохранённых настроек
 адаптера; повышение прав для не-root; MSI-X и разгрузки RTL8125 (контрольные суммы,
 TSO); SACK/быстрый повтор по тройному дублю ACK в TCP.
+
+## OBSOS: вход в Rupor web (web.pynop.online) и журнал страниц (25.11, hw-log19) - **исправлено в коде OBSOS, пакет не пересобран**
+
+Роман: в OBSOS не войти в Rupor (Blazor WebAssembly + SignalR). Разбор на
+настоящем Servo 0.8 (servoshell того же выпуска, без окна, через WebDriver) с
+тестовой учётной записью Романа (её нет ни в одном файле — набиралась только во
+время прогона; сессии после проверки отозваны на сервере):
+- сервер в порядке: `POST api/Account/LoginJwtUser` с `Origin: https://web.pynop.online`
+  отвечает 200 и токеном, CORS (preflight и `Allow-Credentials`) правильный;
+- WebSocket SignalR (`wss://pynop.online/chat`, negotiate → `access_token`) в
+  Servo работает; localStorage (токен `SecurityService`) — тоже;
+- **причина 1** (общая для Servo 0.8): он не шлёт событие `change` текстовому полю, когда правку
+  завершили (уход фокуса, Enter), и Enter в поле формы ничего не отправляет
+  (нет неявной отправки формы). `InputText` Blazor (`@bind` по `change`) так и
+  не узнавал набранного — «Это поле необходимо», кнопка «Войти» не входила, а
+  Enter не делал ничего. (Вход Романа в 09:18 прошёл только через подстановку
+  сохранённого пароля OBSOS — она сама шлёт `input`+`change`.)
+- исправление — в скрипте страницы OBSOS (`PAGE_SCRIPT`, `ports/servo/servoprobe/src/bin/browser/shell.rs`):
+  `change` при уходе фокуса и по Enter, если значение поменялось с момента
+  фокуса; Enter в однострочном поле формы — щелчок по кнопке формы по
+  умолчанию (или `requestSubmit` формы с одним полем), если Servo сам не
+  отправил. Проверено на servoshell 0.8 тем же кодом: набор, Tab/щелчок и
+  Enter → `/pm`, личные сообщения, SignalR без ошибок.
+- **причина 2** (только OBSOS на FreeOS — найдена прогоном `obsos-rupor` в
+  QEMU: после исправления 1 вход на сервере проходит, сессия создаётся, но
+  страница снова уходит на вход): localStorage и IndexedDB в Servo — SQLite в
+  режиме WAL, которому нужна общая память файла `-shm` (mmap MAP_SHARED и
+  блокировки байтов); на FreeOS её нет — «storage::webstorage: Failed to get
+  storage environment: SqliteFailure(SystemIoFailure 4618)» (SQLITE_IOERR_SHMOPEN)
+  на каждый доступ. Токен `SecurityService` не сохранялся — Blazor считал
+  пользователя не вошедшим. Это и есть «петля» `Account/Login?returnUrl=…` в
+  hw-log19. Исправление — `ports/servo/builder/patch-servo.sh` (servo-storage:
+  `locking_mode = EXCLUSIVE` и журнал TRUNCATE вместо WAL; база, уже
+  переведённая в WAL, открывается в исключительном режиме без `-shm`).
+  Вместо этого можно научить ядро и libc `-shm` (mmap MAP_SHARED файла +
+  F_SETLK по байтам) — TODO, пригодится и другим программам на SQLite.
+- журнал: OBSOS со стола писал «browser: …» только в stdout (в журнал на флешке
+  не попадало ничего). Теперь ошибки/предупреждения консоли страниц, падения
+  вкладок и адреса страниц (без запроса и якоря — там бывают токены) идут ещё
+  и в журнал ядра (`shell::klog` → stderr с `kmsg: ` → строка `app log     : #задача …`,
+  не больше 20 строк/с — `user::syscall::write`). Скрипт страницы сообщает
+  предупреждением неудавшиеся fetch/XHR (статус ≥400 или сбой) и закрытия
+  WebSocket не по-хорошему (`net: …`, до 40 строк на страницу).
+
+**Проверка:** сценарий `obsos-rupor` (Installed, сеть, сайт хоста; учётная
+запись — переменные хоста `FOSSAI_SECRET_RUPOR_USER`/`FOSSAI_SECRET_RUPOR_PASS`,
+шаг `Type("{secret:…}")` в журнал стенда пишет только заглушку). Пока пакет OBSOS
+не пересобран, тот же код едет в браузер пользовательским скриптом с сайта
+хоста (`build/test/host-files/obsos-fix.js` → `~/.config/obsos/default/userscripts/`).
+
+**Прогон 25.11** (`install` без tmnf — см. ниже, затем `obsos-rupor` на старом
+пакете OBSOS + скрипт): страница входа нарисована, поле получило фокус, набор
++ Tab + Enter → `browser: login form submitted`, сервер создал сессию (Servo,
+92.241.230.141) — исправление 1 подтверждено в QEMU; переход на `/pm` не
+случился из-за причины 2 (старый пакет). Журнал страниц `net: …` (401 до
+входа) виден. Сессии теста отозваны.
+
+**Не сделано:** пересборка OBSOS — Docker-образ `fossai-builder` и тома
+`fossai-servo`/`fossai-cargo-registry` удалены уборкой диска C: 25.11, сборка
+Servo с нуля — часы и десятки ГБ на C: (Docker) — нужно решение Романа. Без
+пересборки вход в Rupor в OBSOS не заработает (причина 2 — в движке; скрипт
+`obsos-fix.js` в `~/.config/obsos/default/userscripts/` чинит только поля). Эмодзи на странице Rupor — квадраты (нет
+шрифта эмодзи). `navigator.serviceWorker` в Servo нет (PWA без офлайна, на вход
+не влияет).
+
+## Rupor на CEF (F:\cef-test) под Proton — чёрное окно (25.11, hw-log19) - **причина найдена, не исправлено**
+
+Сборка Романа (ветка feature/cef-desktop): Avalonia + CefGlue.Next 156 (CEF/Chromium
+156), браузер в окне (windowed, дочернее окно Chromium внутри окна Avalonia),
+дочерние процессы — тот же Rupor.exe `--type=…`. Сценарий `proton-cef`
+(Installed с Proton; tar папки кладётся в `build/test/host-files/cef-test.tar`,
+гость берёт его с сайта хоста `/host-file/…` и распаковывает своим 7-Zip):
+окно «Рупор» открывается через ~1 мин и остаётся пустым (однотонное), как у
+Романа. Пять прогонов 25.11:
+- процессы GPU, Network, Storage запускаются; процесс-рендерер — **никогда**;
+- поток браузера CEF (CrBrowserMain, `[32:356…]` в журнале Chromium — тот же
+  номер Wine-потока) исчерпывает свой стек 8 МиБ: `virtual_setup_exception stack
+  overflow` (каждый прогон, через 1-3 мин после окна) — дальше браузер мёртв;
+- `+seh` показал рекурсию: сотни вызовов `IUISettings2::get_TextScaleFactor`
+  (заглушка Wine windows.ui, `fixme … stub!`), значение `value` уходит вниз по
+  стеку на 0x690 за виток до дна;
+- `--in-process-gpu --disable-gpu-compositing` — то же (GPU и DXVK ни при чём;
+  `DCompositionCreateDevice3 failed` Chromium переживает);
+- windows.ui выключен (`WINEDLLOVERRIDES=windows.ui=`, активация UISettings
+  падает) — переполнение **то же**, в том же месте (адрес …e1fbf): заглушка была
+  только попутчиком, сама рекурсия — в другом (вероятно, цикл сообщений окна/
+  экрана между Chromium и winewayland: перерасчёт масштаба/размера → снова
+  сообщение). Правка в fossai-proton с этим обходом снята.
+- оболочка ядра после запуска Rupor не принимает строк с последовательного
+  порта (последующие шаги сценария не исполняются) — заметка для сценариев.
+
+**Дальше:** `--debug=+seh,+loaddll,+msg,+win` перед `--open=` в `proton-cef`
+(один запуск на прогон) — найти, какое сообщение ходит по кругу, и модуль
+адреса …e1fbf по базам `+loaddll`; затем правка в winewayland/user32 Proton или
+обход ключом. Со стороны Романа проверить: `--disable-features=CalculateNativeWinOcclusion`,
+`--force-device-scale-factor=1`, `--high-dpi-support=1` (снимают пересчёт
+масштаба окна) — если поможет, задать их в `RuporCefApp.OnBeforeCommandLineProcessing`
+под Wine (`wine_get_version` в ntdll). Также в сборке нет `libEGL.dll`/
+`libGLESv2.dll` CEF (есть только `av_libglesv2.dll` Avalonia) — GPU-процесс
+Chromium без ANGLE; на Windows это не мешает (уходит на SwiftShader/программно),
+но стоит положить их рядом с libcef.dll.
+
+**Попутно (установщик):** `install` с FOSSAI_WITH_PROTON=1 25.11 перезапускает
+ВМ при копировании `tmnf-2.11.fpk` сразу после `proton-11.fpk` (2 ГБ) — петля
+«FossAi installer» до таймаута (`[install] copying package -> /media/tmnf…`,
+затем снова BdsDxe). Без tmnf на носителе установка проходит за 5 мин.

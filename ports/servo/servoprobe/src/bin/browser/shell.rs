@@ -113,6 +113,19 @@ impl Delegate {
 
 const SCRIPT_PREFIX: &str = "__obsos__:";
 
+/// A diagnostic line: to stdout (the terminal, scenarios) and to the kernel
+/// log (25.11: OBSOS started from the desktop has no terminal, and Roman's
+/// journal on the flash drive had not a single line of why web.pynop.online
+/// did not log in). The kernel takes a stderr write that starts with
+/// `kmsg: ` into its log (`user::syscall::write`) — one write per line.
+pub fn klog(text: &str) {
+    use std::io::Write;
+    println!("{text}");
+    let short: String = text.chars().take(300).collect();
+    let line = format!("kmsg: {}\n", short.replace('\n', " "));
+    let _ = std::io::stderr().write_all(line.as_bytes());
+}
+
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, webview: WebView) {
         self.note(Note::Frame(webview.id()));
@@ -131,6 +144,14 @@ impl WebViewDelegate for Delegate {
     fn notify_url_changed(&self, webview: WebView, url: url::Url) {
         let shown = url.as_str();
         println!("browser: url {}", if shown.starts_with("data:") { "data:…" } else { shown });
+        // The journal gets the address without query and fragment: they may
+        // carry tokens (`?access_token=`, OAuth `#code=`).
+        if matches!(url.scheme(), "http" | "https") {
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                format!("kmsg: browser: page {}://{}{}\n", url.scheme(), url.host_str().unwrap_or(""), url.path()).as_bytes(),
+            );
+        }
         self.note(Note::Url(webview.id(), url));
     }
 
@@ -143,7 +164,7 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_crashed(&self, webview: WebView, reason: String, _backtrace: Option<String>) {
-        println!("browser: page crashed: {reason}");
+        klog(&format!("browser: page crashed: {reason}"));
         self.note(Note::Crashed(webview.id(), reason));
     }
 
@@ -261,9 +282,11 @@ impl WebViewDelegate for Delegate {
         let level = format!("{level:?}");
         // Ошибки страниц — и в журнал системы: по нему видно, на чём сайт
         // сломался, даже без открытой консоли.
+        // 25.11: and into the kernel log (`klog`) — with the failed requests
+        // and WebSocket closes the page script reports as warnings.
         if level.contains("Error") || level.contains("Warn") {
             let short: String = message.chars().take(400).collect();
-            println!("browser: console {level}: {short}");
+            klog(&format!("browser: console {level}: {short}"));
         }
         self.devlog.borrow_mut().console(Some(webview.id()), &level, message);
     }
@@ -303,6 +326,60 @@ try {
     W.instantiateStreaming = function(src, imports){ return body(src).then(function(b){ return W.instantiate(b, imports); }); };
     W.compileStreaming = function(src){ return body(src).then(function(b){ return W.compile(b); }); };
   }
+} catch(e) {}
+// Servo 0.8 не шлёт `change` текстовому полю, когда правку завершили (уход
+// фокуса, Enter), и Enter в поле формы ничего не отправляет (нет неявной
+// отправки). Blazor (`InputText` — `@bind` по `change`) так и не узнавал
+// набранного: вход на web.pynop.online отвечал «поле обязательно» (25.11).
+// Здесь — как в других браузерах: `change` при уходе фокуса и по Enter, если
+// значение изменилось с момента фокуса; Enter — щелчок по кнопке формы по
+// умолчанию (или отправка формы с одним полем), если сам Servo не отправил.
+try {
+  var base = new WeakMap(), lastSubmit = 0;
+  var textual = function(t){ if (!t || !t.tagName) return false; if (t.tagName == 'TEXTAREA') return true; if (t.tagName != 'INPUT') return false;
+    return ['text','password','email','search','tel','url','number',''].indexOf((t.type || 'text').toLowerCase()) >= 0; };
+  var commit = function(t){ if (!textual(t) || !base.has(t) || base.get(t) === t.value) return; base.set(t, t.value);
+    t.dispatchEvent(new Event('change', {bubbles: true})); };
+  document.addEventListener('focusin', function(e){ if (textual(e.target)) base.set(e.target, e.target.value); }, true);
+  document.addEventListener('change', function(e){ if (textual(e.target)) base.set(e.target, e.target.value); }, true);
+  document.addEventListener('focusout', function(e){ commit(e.target); }, true);
+  document.addEventListener('submit', function(){ lastSubmit = Date.now(); }, true);
+  document.addEventListener('keydown', function(e){
+    var t = e.target; if (e.key != 'Enter' || e.isComposing || !t || t.tagName != 'INPUT' || !textual(t)) return;
+    commit(t);
+    var f = t.form, at = Date.now(); if (!f) return;
+    setTimeout(function(){
+      if (e.defaultPrevented || lastSubmit >= at || !t.isConnected) return;
+      var els = f.elements, btn = null, fields = 0;
+      for (var i = 0; i < els.length; i++) { var x = els[i], y = (x.getAttribute('type') || '').toLowerCase();
+        if (!btn && ((x.tagName == 'BUTTON' && (y == '' || y == 'submit')) || (x.tagName == 'INPUT' && (y == 'submit' || y == 'image')))) btn = x;
+        if (x.tagName == 'INPUT' && textual(x)) fields++; }
+      if (btn) { if (!btn.disabled) btn.click(); }
+      else if (fields == 1) { if (f.requestSubmit) f.requestSubmit(); else f.submit(); }
+    }, 0);
+  }, false);
+} catch(e) {}
+// Журнал сети (25.11): неудавшиеся запросы fetch/XHR и закрытия WebSocket не
+// по-хорошему — предупреждением в консоль, а оттуда в журнал ядра (`klog`).
+// Адрес без запроса и якоря: в них бывают токены (`access_token=`). Не
+// больше 40 строк на страницу.
+try {
+  var said = 0, bare = function(u){ try { var a = new URL(String(u), location.href); return a.origin + a.pathname; } catch(x){ return '?'; } };
+  var warn = function(s){ if (said++ < 40) console.warn('net: ' + s); };
+  if (window.fetch) { var F = window.fetch; window.fetch = function(input, init){
+    var u = bare(input && input.url || input), m = (init && init.method) || (input && input.method) || 'GET';
+    return F.apply(this, arguments).then(function(r){ if (r.status >= 400) warn(m + ' ' + u + ' -> ' + r.status); return r; },
+      function(err){ warn(m + ' ' + u + ' failed: ' + err); throw err; }); }; }
+  if (window.XMLHttpRequest) { var O = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function(m, u){
+    var x = this, mu = m + ' ' + bare(u); x.addEventListener('loadend', function(){ if (x.status == 0 || x.status >= 400) warn('XHR ' + mu + ' -> ' + x.status); });
+    return O.apply(this, arguments); }; }
+  if (window.WebSocket) { var WS = window.WebSocket; var Wrapped = function(u, p){
+    var w = arguments.length > 1 ? new WS(u, p) : new WS(u), url = bare(u);
+    w.addEventListener('error', function(){ warn('WebSocket ' + url + ' error'); });
+    w.addEventListener('close', function(e){ if (e.code != 1000 && e.code != 1001) warn('WebSocket ' + url + ' closed ' + e.code + (e.reason ? ' ' + e.reason : '')); });
+    return w; };
+    Wrapped.prototype = WS.prototype; ['CONNECTING','OPEN','CLOSING','CLOSED'].forEach(function(k){ Wrapped[k] = WS[k]; });
+    window.WebSocket = Wrapped; }
 } catch(e) {}
 window.addEventListener('error', function(e){ if (!(e instanceof ErrorEvent)) return; try { console.error('Uncaught ' + (e.message || e) + (e.filename ? ' @ ' + e.filename + ':' + e.lineno + ':' + e.colno : '')); } catch(x){} }, true);
 window.addEventListener('unhandledrejection', function(e){ try { var r = e.reason; console.error('Unhandled rejection: ' + (r && (r.stack || r.message) || r)); } catch(x){} });

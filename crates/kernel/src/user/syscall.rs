@@ -322,6 +322,10 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
     // журналу.
     if fd == FD_STDERR {
         return match core::str::from_utf8(bytes) {
+            Ok(text) if text.starts_with(KMSG_PREFIX) => {
+                kmsg_lines(text);
+                len as i64
+            }
             Ok(text) => {
                 // Программа терминала (вывод не в канале) — stderr туда же,
                 // куда stdout, как в любой консоли (11.11): иначе человек не
@@ -372,6 +376,43 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
             len as i64
         }
         Err(_) => ERR_BAD_ADDRESS,
+    }
+}
+
+/// A native program's stderr line starting with this goes into the kernel log
+/// (25.11, OBSOS: a browser started from the desktop has no terminal, and its
+/// page errors must reach the journal on Roman's flash drive) — the native
+/// counterpart of `/dev/kmsg` of the Linux layer.
+const KMSG_PREFIX: &str = "kmsg: ";
+
+/// Not more than this many such lines per second for all programs.
+const KMSG_LINES_PER_SECOND: u64 = 20;
+
+fn kmsg_lines(text: &str) {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static SECOND: AtomicU64 = AtomicU64::new(0);
+    static LINES: AtomicU64 = AtomicU64::new(0);
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+    let now = crate::time::uptime_ms() / 1000;
+    if SECOND.swap(now, Relaxed) != now {
+        LINES.store(0, Relaxed);
+        let dropped = DROPPED.swap(0, Relaxed);
+        if dropped != 0 {
+            crate::kprintln!("  app log     : {dropped} line(s) dropped (more than {KMSG_LINES_PER_SECOND} per second)");
+        }
+    }
+    let task = crate::sched::current().as_u32();
+    for line in text.split('\n') {
+        let line = line.strip_prefix(KMSG_PREFIX).unwrap_or(line).trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        if LINES.fetch_add(1, Relaxed) >= KMSG_LINES_PER_SECOND {
+            DROPPED.fetch_add(1, Relaxed);
+            continue;
+        }
+        let end = line.char_indices().nth(300).map_or(line.len(), |(at, _)| at);
+        crate::kprintln!("  app log     : #{task} {}", &line[..end]);
     }
 }
 

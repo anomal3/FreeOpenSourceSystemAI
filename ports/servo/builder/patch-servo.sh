@@ -99,4 +99,33 @@ open(p, 'w', encoding='utf-8').write(s)
 EOF
 fi
 echo "servo-paint = { path = \"/cache/src/$PAINT\" }" >> /tmp/patches.toml
-echo "patch-servo: gaol (пусто), шрифты, $SCRIPT (freeos)"
+
+# servo-storage: localStorage и IndexedDB — SQLite в режиме WAL, а WAL берёт
+# общую память файла `-shm` (mmap MAP_SHARED + блокировки байтов), которой
+# на FreeOS нет: «Failed to get storage environment: SystemIoFailure 4618»
+# (SQLITE_IOERR_SHMOPEN) на каждый доступ, localStorage не хранил ничего —
+# токен входа web.pynop.online терялся, Blazor уводил обратно на вход
+# (25.11.2026, hw-log19). Журнал TRUNCATE (записан в файле базы — и при
+# следующих открытиях общая память не нужна); исключительный режим
+# блокировки перед ним — чтобы база, уже переведённая в WAL прежним OBSOS,
+# открылась без -shm и перешла на TRUNCATE. Одна связь на базу — так Servo
+# и работает.
+STORAGE=servo-storage-0.8.0
+if copy_crate $STORAGE shared/mod.rs; then
+    python3 - /cache/src/$STORAGE <<'EOF'
+import sys
+p = sys.argv[1] + '/shared/mod.rs'
+s = open(p, encoding='utf-8').read()
+old = 'pub const DB_INIT_PRAGMAS: [&str; 2] =\n    ["PRAGMA journal_mode = WAL;", "PRAGMA encoding = \'UTF-16\';"];'
+assert old in s, p
+s = s.replace(old, '// __freeos__: без WAL и общей памяти -shm (patch-servo.sh).\n'
+              'pub const DB_INIT_PRAGMAS: [&str; 3] = [\n'
+              '    "PRAGMA locking_mode = EXCLUSIVE;",\n'
+              '    "PRAGMA journal_mode = TRUNCATE;",\n'
+              '    "PRAGMA encoding = \'UTF-16\';",\n'
+              '];', 1)
+open(p, 'w', encoding='utf-8').write(s)
+EOF
+fi
+echo "servo-storage = { path = \"/cache/src/$STORAGE\" }" >> /tmp/patches.toml
+echo "patch-servo: gaol (пусто), шрифты, $SCRIPT (freeos), $STORAGE (без WAL)"
