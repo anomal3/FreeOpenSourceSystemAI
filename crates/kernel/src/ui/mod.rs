@@ -2429,6 +2429,15 @@ pub fn tick() {
         desktop.expire_identify();
         // Screen recorder (22.11): «Запись сохранена», a capture left behind.
         framegap::step(&"capture", || capture::tick(desktop));
+        // A btrfs commit failed (24.11): the batch of changes is lost - say so.
+        if let Some(text) = crate::fs::btrfsfs::take_commit_failure() {
+            let art = appicon::tool_art("eventlog").unwrap_or(appicon::Art::Glyph(mini_ui::glyphicon::Icon::Log, mini_ui::paint::Tone::Bad, true));
+            let (area, panel_top) = desktop.toast_place();
+            if let Some(toast) = toast::Toast::notice("Диск", "Изменения не сохранены", &text, "Журнал событий", &art, String::from("/bin/eventlog"), fpk::Rights::ALL, area, panel_top, desktop.scale()) {
+                desktop.show_toast(toast);
+            }
+            kprintln!("  desktop     : notification 'Изменения не сохранены' ({text})");
+        }
         desktop.refresh_lock_clock();
         framegap::step(&"watch hung", || watch_hung(desktop));
         // Wi-Fi включается отдельной задачей: сменилось состояние —

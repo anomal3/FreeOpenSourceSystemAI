@@ -444,6 +444,8 @@ impl Inner {
             // Отказ фиксации раньше был молчаливым (20.11): пачка пропадала
             // без следа, и тот, кто писал в созданный в ней каталог, получал
             // `NotFound` (похоже, так оборвалась установка Proton у G).
+            // С 24.11 о нём говорит и стол ([`take_commit_failure`]).
+            note_commit_failure(fs.label(), err, ops);
             let heap = crate::mm::heap::stats();
             crate::kprintln!(
                 "  btrfs       : commit FAILED ({err}) after {ops} op(s): uncommitted changes dropped, writer reopened; heap {}/{} KiB used, {} dirty block(s)",
@@ -526,6 +528,43 @@ impl Inner {
             None => self.fs.inode(&mut self.disk, number).map_err(convert),
         }
     }
+}
+
+/// Отказ фиксации, о котором стол ещё не сказал: текст и время (24.11).
+///
+/// Отказ фиксации — это потерянные правки (файл, сохранённый «Блокнотом»,
+/// записи установщика), и одной строки в журнале ядра мало: человек узнаёт об
+/// этом, когда файла уже нет. Стол забирает текст раз в полсекунды и
+/// показывает уведомление — не чаще раза в минуту, сколько бы фиксаций ни
+/// отказало подряд.
+static COMMIT_FAILURE: SpinLock<Option<String>> = SpinLock::new(None);
+static FAILURE_SHOWN_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const FAILURE_NOTICE_EVERY_MS: u64 = 60_000;
+
+fn note_commit_failure(label: &str, err: btrfs::Error, ops: usize) {
+    let why = match err {
+        btrfs::Error::NoSpace => "на томе нет места",
+        btrfs::Error::NoMemory => "не хватило памяти",
+        btrfs::Error::Io => "носитель отказал",
+        btrfs::Error::BadChecksum | btrfs::Error::Corrupt => "том повреждён",
+        btrfs::Error::Unsupported => "запись, которую система не умеет",
+        _ => "сбой записи",
+    };
+    let volume = if label.is_empty() { String::from("btrfs") } else { String::from(label) };
+    *COMMIT_FAILURE.lock() = Some(alloc::format!("Том «{volume}»: {why}; потеряно правок: {ops}"));
+}
+
+/// Текст для уведомления «изменения не сохранены», если фиксация отказала и
+/// с прошлого уведомления прошла минута.
+pub fn take_commit_failure() -> Option<String> {
+    let now = crate::time::uptime_ms();
+    let shown = FAILURE_SHOWN_MS.load(core::sync::atomic::Ordering::Relaxed);
+    if shown != 0 && now.saturating_sub(shown) < FAILURE_NOTICE_EVERY_MS {
+        return None;
+    }
+    let text = COMMIT_FAILURE.lock().take()?;
+    FAILURE_SHOWN_MS.store(now.max(1), core::sync::atomic::Ordering::Relaxed);
+    Some(text)
 }
 
 impl Clone for BtrfsMount {
