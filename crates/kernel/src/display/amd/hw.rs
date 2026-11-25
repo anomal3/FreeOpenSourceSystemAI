@@ -58,6 +58,60 @@ struct Hw {
 
 static HW: SpinLock<Option<Hw>> = SpinLock::new(None);
 
+/// `mmGB_TILE_MODE0` и `mmGB_MACROTILE_MODE0` (dword).
+pub const MM_GB_TILE_MODE0: u32 = 0x2644;
+pub const MM_GB_MACROTILE_MODE0: u32 = 0x2664;
+/// `mmMC_ARB_RAMCFG` (dword): RADV (addrlib) берёт из него число рангов и банков памяти.
+pub const MM_MC_ARB_RAMCFG: u32 = 0x9d8;
+const MM_HDP_ADDR_CONFIG: usize = 0xbd2;
+const GB_ADDR_CONFIG_POLARIS10: u32 = 0x2201_1003;
+
+/// Таблицы тайлинга Polaris10 (`gfx_v8_0_tiling_mode_table_init`, ветка `CHIP_POLARIS10`, Linux 6.12; значения
+/// посчитаны скриптом из исходника). Без них карта и RADV расходятся в раскладке картинок: в окне мусор
+/// (25.11, RX 590: пунктирный узор на месте сцены, а буферы без тайлинга - `vkprobe` - проходили).
+pub const TILE_MODES: [u32; 32] = [
+    0x0080_0310, 0x0080_0b10, 0x0080_1310, 0x0080_1b10, 0x0080_2b10, 0x0080_2b08, 0x0080_2b14, 0x0080_2954,
+    0x0000_0304, 0x0200_0308, 0x0200_0310, 0x0600_0314, 0x0600_0154, 0x0240_0308, 0x0240_0310, 0x0240_0330,
+    0x0640_0314, 0x0640_0154, 0x0040_030c, 0x0100_030c, 0x0100_031c, 0x0100_0334, 0x0100_0324, 0x0100_0164,
+    0x0040_031c, 0x0100_0320, 0x0100_0338, 0x02c0_0308, 0x02c0_0310, 0x06c0_0314, 0x06c0_0154, 0x0000_0000,
+];
+/// Запись 7 Linux не пишет.
+pub const MACROTILE_MODES: [u32; 16] = [
+    0xe8, 0xe8, 0xe8, 0xe8, 0xd4, 0xc0, 0xc0, 0x00, 0xec, 0xe8, 0xd4, 0xd0, 0x80, 0x40, 0x40, 0x00,
+];
+
+/// Записать таблицы тайлинга в карту; строка - что там было до этого.
+fn tiling_init(window: &Window) -> String {
+    let before = (window.rd(MM_GB_TILE_MODE0 as usize * 4), window.rd((MM_GB_TILE_MODE0 as usize + 9) * 4), window.rd(MM_GB_MACROTILE_MODE0 as usize * 4));
+    for (index, value) in TILE_MODES.iter().enumerate() {
+        window.wr((MM_GB_TILE_MODE0 as usize + index) * 4, *value);
+    }
+    for (index, value) in MACROTILE_MODES.iter().enumerate() {
+        if index != 7 {
+            window.wr((MM_GB_MACROTILE_MODE0 as usize + index) * 4, *value);
+        }
+    }
+    window.wr(MM_HDP_ADDR_CONFIG * 4, GB_ADDR_CONFIG_POLARIS10);
+    format!(
+        "tiling tables written (32 tile modes, 15 macro tile modes): before [0] {:#x}, [9] {:#x}, macro [0] {:#x}; after {:#x}, {:#x}, {:#x}",
+        before.0,
+        before.1,
+        before.2,
+        window.rd(MM_GB_TILE_MODE0 as usize * 4),
+        window.rd((MM_GB_TILE_MODE0 as usize + 9) * 4),
+        window.rd(MM_GB_MACROTILE_MODE0 as usize * 4)
+    )
+}
+
+/// Регистр карты по dword-номеру для `READ_MMR_REG`; `None` - бэкенд не поднят.
+#[must_use]
+pub fn read_register(dword: u32) -> Option<u32> {
+    if !ready() {
+        return None;
+    }
+    window().map(|window| window.rd(dword as usize * 4))
+}
+
 /// Пул видеопамяти для буферов GPU (VRAM-домен DRM). Берётся невидимая процессору часть: за 256 МиБ окна BAR0,
 /// где лежат микрокод, кольцо и таблицы страниц, и до верха минус запас. Хранит свободные куски
 /// `(смещение от начала VRAM, длина)` по возрастанию смещения.
@@ -238,6 +292,7 @@ pub fn start() -> Vec<String> {
         window.rd(MM_VM_CONTEXT1_CNTL * 4)
     ));
     note(super::gfx_init(&window));
+    note(tiling_init(&window));
     // Пул видеопамяти: размер - из MC_VM_FB_LOCATION (база и верх в единицах по 16 МиБ).
     let fb = window.rd(MM_MC_VM_FB_LOCATION * 4);
     let (fb_base, fb_top) = (u64::from(fb & 0xffff) << 24, (u64::from(fb >> 16) << 24) | 0xff_ffff);

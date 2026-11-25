@@ -757,9 +757,27 @@ fn info_ioctl(file: &AmdFile, arg: usize) -> i64 {
             reply(&request, bytes_of(&DrmAmdgpuInfoFirmware { ver, feature }))
         }
         INFO_READ_MMR_REG => {
-            // Для VI RADV читает только `GB_ADDR_CONFIG` (dword 0x263e); остальное — 0.
-            let value = if request.word[0] == 0x263e { info.gb_addr_config } else { 0 };
-            reply(&request, &value.to_le_bytes())
+            // `word`: dword-номер, сколько регистров подряд. libdrm читает адресную конфигурацию, таблицы
+            // тайлинга (32 + 16), `PA_SC_RASTER_CONFIG` и `MC_ARB_RAMCFG`: нули вместо таблиц тайлинга RADV
+            // принимал за истину, и картинки получались мусором (25.11).
+            use crate::display::amd::hw;
+            let (first, count) = (request.word[0], request.word[1].clamp(1, 128));
+            let mut values = Vec::new();
+            for register in first..first.saturating_add(count) {
+                let value = match register {
+                    0x263e => info.gb_addr_config,
+                    0xa0d4 => 0x1600_0012,
+                    0xa0d5 => 0x0000_002a,
+                    hw::MM_MC_ARB_RAMCFG => hw::read_register(register).unwrap_or(0),
+                    r if (hw::MM_GB_TILE_MODE0..hw::MM_GB_TILE_MODE0 + 32).contains(&r) => hw::TILE_MODES[(r - hw::MM_GB_TILE_MODE0) as usize],
+                    r if (hw::MM_GB_MACROTILE_MODE0..hw::MM_GB_MACROTILE_MODE0 + 16).contains(&r) => {
+                        hw::MACROTILE_MODES[(r - hw::MM_GB_MACROTILE_MODE0) as usize]
+                    }
+                    _ => 0,
+                };
+                values.extend_from_slice(&value.to_le_bytes());
+            }
+            reply(&request, &values)
         }
         INFO_MEMORY => {
             let heap = |total: u64| DrmAmdgpuHeapInfo { total_heap_size: total, usable_heap_size: total, heap_usage: 0, max_allocation: total * 3 / 4 };

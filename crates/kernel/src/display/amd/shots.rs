@@ -13,8 +13,8 @@ use boot_info::{Framebuffer, PixelFormat};
 
 use crate::sync::SpinLock;
 
-/// Байт на слот (кратно сектору): 400x300 - это 360 КБ.
-const SLOT_BYTES: usize = 768 * 1024;
+/// Байт на слот (кратно сектору): половина 1280x1024 (640x512) - это 983 КБ; в 12 МиБ - 12 кадров.
+const SLOT_BYTES: usize = 1024 * 1024;
 const HEADER: usize = 64;
 
 static SCREEN: SpinLock<Option<Framebuffer>> = SpinLock::new(None);
