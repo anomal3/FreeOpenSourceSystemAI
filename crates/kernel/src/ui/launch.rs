@@ -168,6 +168,8 @@ fn classify(line: &str) -> Option<(String, Source)> {
 /// программы Windows заводит заставку. Только свой замок: зовут и из-под
 /// замка стола.
 pub fn note_spawn(task: u32, line: &str) {
+    // Where it was launched from (25.11): its windows open on that monitor.
+    super::origin::note_spawn(task);
     if theme::is_mobile() {
         return;
     }

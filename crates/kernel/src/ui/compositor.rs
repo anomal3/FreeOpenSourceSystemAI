@@ -1134,6 +1134,34 @@ impl Compositor {
         (areas, n)
     }
 
+    /// Work area of the monitor under the point (or nearest to it) - where
+    /// a window launched from there opens (25.11, `ui::origin`). The
+    /// primary's when `at` is `None` and on the phone.
+    #[must_use]
+    pub fn work_at(&self, at: Option<(i32, i32)>) -> Rect {
+        match at {
+            Some((x, y)) if !theme::is_mobile() => self.work_rect_of(self.output_near(x, y)),
+            _ => self.primary_work(),
+        }
+    }
+
+    /// Centre of the monitor «Пуск» is open on (25.11: a program chosen in
+    /// it with the keyboard opens there).
+    #[must_use]
+    pub fn menu_point(&self) -> Option<(i32, i32)> {
+        let o = self.menu_output.unwrap_or_else(|| self.primary_index());
+        self.output_rects().get(o).map(|r| (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2))
+    }
+
+    /// Where the window of task `task` stands that its new window (a dialog,
+    /// a second window) opens over (25.11): the focused one of the task, or
+    /// its topmost not minimized ordinary window.
+    #[must_use]
+    pub fn task_window_rect(&self, task: u32) -> Option<Rect> {
+        let mine = |window: &&Window| matches!(window.app, App::Program(owner, _) if owner == task) && !window.minimized && !window.popup;
+        self.windows.get(self.focus).filter(mine).or_else(|| self.windows.iter().rev().find(mine)).map(|window| window.rect)
+    }
+
     /// Рабочая область монитора, на котором середина прямоугольника.
     fn work_rect_under(&self, rect: Rect) -> Rect {
         self.work_rect_of(self.output_near(rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2))
@@ -1547,7 +1575,9 @@ impl Compositor {
     #[must_use]
     pub fn cascade(&self, rect: Rect) -> Rect {
         let step = Window::title_height(self.scale) as i32;
-        let work = self.primary_work();
+        // The monitor the window is on (25.11: windows open on the monitor
+        // they were launched from, not only on the primary).
+        let work = self.work_rect_under(rect);
         let mut out = rect;
         for _ in 0..16 {
             let taken = self

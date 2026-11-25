@@ -75,6 +75,7 @@ pub mod thumbs;
 pub mod snaplay;
 pub mod toast;
 pub mod launch;
+pub mod origin;
 pub mod traypop;
 pub mod trash;
 pub mod wallart;
@@ -976,6 +977,11 @@ fn with_desktop<R>(action: impl FnOnce(&mut Compositor) -> R) -> Option<R> {
     remember_shell_size(&mut desktop);
     // И фокус меняет только то, что проходит здесь.
     report_focus(&mut desktop);
+    // Where the focused window is - the monitor of a keyboard launch (25.11).
+    origin::note_focus(desktop.focused_app().and_then(|app| desktop.find(app)).map(|window| {
+        let r = window.rect;
+        (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2)
+    }));
     // Возвращать стол можно только с пустой очередью, и проверка идёт под тем
     // же замком, под которым пишущий кладёт в неё текст (см. [`write`]). Иначе
     // текст, положенный между «очередь пуста» и «стол на месте», ждал бы в
@@ -1185,8 +1191,10 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
         return desktop.mobile_rect();
     }
     // От угла рабочей области: панель может стоять сверху или слева (20.11).
-    let p = desktop.primary_work();
-    let rect = layout_local(desktop, app).translate(p.x, p.y);
+    // The monitor the launch came from (25.11, `origin`): the click, the
+    // focused window, else the primary.
+    let p = desktop.work_at(origin::current());
+    let rect = layout_local(desktop, app, p).translate(p.x, p.y);
     // Окна-программы встают каскадом; диалоги — строго по центру.
     match app {
         App::Terminal | App::Settings => desktop.cascade(rect),
@@ -1195,12 +1203,12 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
 }
 
 /// [`layout`] в координатах основного монитора.
-fn layout_local(desktop: &Compositor, app: App) -> Rect {
+fn layout_local(desktop: &Compositor, app: App, area: Rect) -> Rect {
     // Раскладка считается от размера экрана, а не задана числами: прошивка
     // вправе дать и 800×600, и 1920×1080, и окно, не помещающееся на экран,
     // выглядело бы как испорченная графика.
-    let width = desktop.primary_work().w;
-    let work = desktop.primary_work().h.max(1);
+    let width = area.w;
+    let work = area.h.max(1);
 
     // На телефоне окно занимает экран целиком — от строки состояния до
     // полоски жеста у низа (04.11, как у iPhone): дока под программой нет,
@@ -2801,6 +2809,12 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
     }
 
     if desktop.menu_open() {
+        // A program chosen with the keyboard opens on Start's monitor.
+        if event.pressed && event.code == KeyCode::Enter {
+            if let Some((x, y)) = desktop.menu_point() {
+                origin::note_click(x, y);
+            }
+        }
         handle_menu(desktop, event, status);
         return None;
     }
@@ -3292,6 +3306,12 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     };
     if relative != (0, 0) {
         send_relative(desktop, relative);
+    }
+    // A click is where a launch comes from (25.11, `origin`): a double-click
+    // on the right monitor opens the program there.
+    if event.buttons.contains(Buttons::LEFT) || event.buttons.contains(Buttons::RIGHT) {
+        let (x, y) = desktop.pointer_position();
+        origin::note_click(x, y);
     }
 
     if dx != 0 || dy != 0 {
@@ -6853,6 +6873,8 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
     // Задание процесса — для заставки запуска (21.11): окно ли это
     // запущенной игры. Тоже до стола.
     let job = crate::user::job_of_task(task);
+    // Where it was launched from (25.11): its monitor, not the primary.
+    let from = origin::of_task(task, job);
     let opened = with_desktop(|desktop| {
         if desktop.index_of(app).is_some() {
             return Err(WindowError::Exists);
@@ -6865,9 +6887,14 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         let (chrome_w, chrome_h) = if framed { Window::chrome_for(scale) } else { (0, 0) };
         let full_w = w.saturating_add(chrome_w);
         let full_h = h.saturating_add(chrome_h);
-        // Окно программы открывается на основном мониторе, по центру его
-        // рабочей области.
-        let p = desktop.primary_work();
+        // Окно программы открывается по центру рабочей области монитора, с
+        // которого его запустили (25.11, `origin`); следующее окно той же
+        // программы (диалог) — над её окном, на его мониторе.
+        let parent = desktop.task_window_rect(task);
+        let p = match parent {
+            Some(rect) => desktop.work_at(Some((rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2))),
+            None => desktop.work_at(from),
+        };
         let screen = p.w;
         let work = p.h.max(1);
         // На телефоне окно программы открывается во весь экран, как у Android
@@ -6878,6 +6905,13 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         let mobile = theme::is_mobile();
         let rect = if mobile {
             desktop.app_area()
+        } else if let Some(over) = parent {
+            // Над окном программы, в пределах его монитора.
+            let x = over.x + (over.w as i32 - full_w as i32) / 2;
+            let y = over.y + (over.h as i32 - full_h as i32) / 2;
+            let x = x.min(p.right() - full_w as i32).max(p.x);
+            let y = y.min(p.bottom() - full_h as i32).max(p.y);
+            desktop.cascade(Rect::new(x, y, full_w, full_h))
         } else {
             // По центру; второе окно на том же месте — каскадом (20.11).
             desktop.cascade(Rect::new(
@@ -6909,6 +6943,7 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
             "  desktop     : opened '{title}' for {}",
             crate::sched::TaskId::new(task)
         );
+        log_output(desktop, app);
         log_window(desktop, app, true);
         desktop.refresh_panel(&status_now());
         desktop.present();
