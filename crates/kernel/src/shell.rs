@@ -439,6 +439,11 @@ fn run(primary: bool) {
                 }
             }
         }
+        // The terminal window was opened anew (25.11: there is none at boot):
+        // its grid is empty, the prompt goes there again.
+        if primary && ui::take_reprompt() {
+            show_prompt(&mut editor);
+        }
 
         // Отчёты мыши разбираются перед клавишами: они меняют, какое окно
         // активно, и разобрать их после значило бы отдать нажатие тому окну,
@@ -3930,4 +3935,9 @@ fn show_prompt(editor: &mut LineEditor) {
     );
     let width = status.chars().count() + user.chars().count() + 7 + 1 + shown.chars().count() + 2;
     editor.begin(width, shell_cols());
+    // The prompt is on the screen now: a terminal window opened while a
+    // command ran (`ui open terminal`) does not need it a second time.
+    if sched::session() == 0 {
+        let _ = ui::take_reprompt();
+    }
 }

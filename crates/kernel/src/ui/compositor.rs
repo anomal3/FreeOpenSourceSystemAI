@@ -1086,7 +1086,7 @@ impl Compositor {
     }
 
     /// Монитор под точкой, а если она в щели между ними — ближайший.
-    fn output_near(&self, x: i32, y: i32) -> usize {
+    pub fn output_near(&self, x: i32, y: i32) -> usize {
         self.output_at(x, y).unwrap_or_else(|| {
             let mut best = 0;
             let mut best_d = i64::MAX;

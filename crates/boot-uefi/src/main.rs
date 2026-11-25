@@ -96,7 +96,7 @@ fn main() -> Status {
     // графикой, человек обязан успеть сказать об этом раньше, чем загрузчик
     // до них доберётся.
     let choice = menu::choose();
-    info.boot_flags = choice.flags | unattended_flag() | live_flag() | boot_cfg_flag();
+    info.boot_flags = choice.flags | unattended_flag() | live_flag() | boot_cfg_flag() | console_flag();
     if choice.keep_display {
         info.boot_flags |= boot_info::BOOT_FIRMWARE_DISPLAY;
     }
@@ -166,6 +166,20 @@ fn live_flag() -> u64 {
         Ok(Some(_)) => {
             println!("  [cfg] live medium: the system on this stick runs, installed roots stay untouched");
             boot_info::BOOT_LIVE
+        }
+        _ => 0,
+    }
+}
+
+/// The harness asks for the console window at boot (25.11): `\FREEOS\CONSOLE`.
+fn console_flag() -> u64 {
+    let Ok(mut volume) = volume::BootVolume::open() else {
+        return 0;
+    };
+    match volume.open_regular(uefi::cstr16!("\\FREEOS\\CONSOLE")) {
+        Ok(Some(_)) => {
+            println!("  [cfg] console window at boot (test harness)");
+            boot_info::BOOT_CONSOLE
         }
         _ => 0,
     }

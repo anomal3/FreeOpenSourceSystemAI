@@ -775,6 +775,15 @@ pub fn screen_for(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The scenario boots as a person's machine does - without the console
+/// window (25.11: no `\FREEOS\CONSOLE` on the boot volume, see
+/// `qemu::prepare_esp`). Every other run keeps the shell's window open at
+/// boot, as all scenarios before 25.11 expected.
+#[must_use]
+pub fn without_console(name: &str) -> bool {
+    matches!(name, "boot-no-console" | "launch-monitor")
+}
+
 /// Сценарий грузится с RAM-диском телефона (05.11): облегчённая копия, как у
 /// `xtask phone --lean`, с NetSurf в `/opt/netsurf` (`harness::phone_ramdisk`).
 #[must_use]

@@ -787,10 +787,23 @@ pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
     // складывает слои, а не рисует два независимых прямоугольника. Теперь
     // монитор системы это программа (`/bin/sysmon`), её поднимает супервизор, и
     // перекрытие получается то же самое — только окно приходит снаружи ядра.
-    let Some(terminal) = build(&desktop, App::Terminal) else {
-        return false;
-    };
-    desktop.push(terminal);
+    //
+    // С 25.11 окно оболочки на загрузке не открывается (Роман: «при загрузке
+    // открывается терминал и сыплет журналом»): оболочка работает и без
+    // него — читает серийную линию и разбирает ввод стола, — а окно
+    // открывается по просьбе («Пуск» → «Терминал», Win+R `cmd`). Журнал —
+    // в «Журнале событий» и в файле журнала. Стенд просит окно меткой
+    // `\FREEOS\CONSOLE` ([`boot_info::BOOT_CONSOLE`]): его сценарии набирают в
+    // оболочку и смотрят на неё. Телефон — как был: там окно оболочки и есть
+    // экран разработчика.
+    if boot_flags & boot_info::BOOT_CONSOLE != 0 || theme::is_mobile() {
+        let Some(terminal) = build(&desktop, App::Terminal) else {
+            return false;
+        };
+        desktop.push(terminal);
+    } else {
+        kprintln!("  desktop     : no console window at boot (Start -> Terminal opens the shell)");
+    }
 
     desktop.refresh_panel(&status_now());
     desktop.present();
@@ -2549,6 +2562,13 @@ pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
         let answer = with_desktop(|desktop| {
             desktop.set_deferred(defer);
             let answer = dispatch_on(desktop, event, &status);
+            // A key of the keyboard bound for the shell while no window shows
+            // it (no console window since 25.11, or it was closed): typed on
+            // the bare desktop, it would run commands nobody sees. The serial
+            // line (the harness, a cable) still types into the shell.
+            let answer = answer.filter(|key| {
+                key.mods.contains(crate::input::Modifiers::SERIAL) || desktop.terminal_app_of(active_session()).is_some()
+            });
             desktop.set_deferred(false);
             if !defer {
                 desktop.present();
@@ -5686,6 +5706,15 @@ fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
     }
 }
 
+/// The shell of the first tab should print its prompt again (its window was
+/// just opened anew, see [`launch`]).
+static REPROMPT: AtomicBool = AtomicBool::new(false);
+
+/// Take the request to print the prompt again (the shell's loop asks).
+pub fn take_reprompt() -> bool {
+    REPROMPT.swap(false, Ordering::Relaxed)
+}
+
 /// Диспетчер задач: поднять его окно, если оно есть, иначе запустить
 /// `/bin/taskmgr` (Ctrl+Shift+Esc).
 fn open_task_manager(desktop: &mut Compositor) {
@@ -5728,7 +5757,15 @@ fn launch(desktop: &mut Compositor, app: App) {
     // систему: меню просто не откроет программу.
     if let Some(window) = build(desktop, app) {
         desktop.push(window);
+        // A fresh terminal window has an empty grid while the shell of the
+        // first tab waits at a prompt printed long ago (or never shown: no
+        // console window at boot, 25.11) - it prints the prompt again.
+        if app == App::Terminal {
+            REPROMPT.store(true, Ordering::Relaxed);
+            crate::sched::wake_input();
+        }
         kprintln!("  desktop     : opened '{}'", app.title());
+        log_output(desktop, app);
         log_window(desktop, app, true);
         log_focus(desktop);
     } else {
@@ -7637,6 +7674,18 @@ fn name_of(desktop: &Compositor, app: App) -> String {
 /// размер экрана, — то есть отдельно под каждую архитектуру, потому что режимы
 /// у них разные (на 14.09.2026 загрузчик ставит 1280×720 на OVMF и 1024×768 на
 /// ramfb), а с фазы С6a режим ещё и меняется на ходу.
+/// Which monitor a new window opened on (25.11, `origin`; the
+/// `launch-monitor` scenario waits for it).
+fn log_output(desktop: &Compositor, app: App) {
+    if desktop.output_rects().len() < 2 {
+        return;
+    }
+    if let Some(rect) = desktop.rect_of(app) {
+        let output = desktop.output_near(rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2);
+        kprintln!("  desktop     : '{}' opens on output {output}", name_of(desktop, app));
+    }
+}
+
 fn log_window(desktop: &Compositor, app: App, focused: bool) {
     let Some(rect) = desktop.rect_of(app) else {
         return;

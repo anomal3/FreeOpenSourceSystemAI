@@ -89,6 +89,13 @@ pub const BOOT_FIRMWARE_DISPLAY: u64 = 1 << 5;
 /// Восстановление → Подробная загрузка») for every boot.
 pub const BOOT_VERBOSE: u64 = 1 << 6;
 
+/// Open the console window (the shell of the first session) at boot (25.11):
+/// `\FREEOS\CONSOLE` on the boot volume, put there by the test harness only.
+/// Without it the desktop starts without a terminal window — the shell runs
+/// and opens on demand (Start → «Терминал»); the log lives in «Журнал
+/// событий» and the log file (Roman: «at boot a terminal keeps printing logs»).
+pub const BOOT_CONSOLE: u64 = 1 << 7;
+
 /// Which instruction set the bootloader was built for.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

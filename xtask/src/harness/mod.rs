@@ -3336,6 +3336,9 @@ fn prepare_drives(
     let drives = match scenario.target {
         Target::Live => {
             let esp = qemu::prepare_esp(built, true)?;
+            if scenarios::without_console(scenario.name) {
+                std::fs::remove_file(esp.join("FREEOS").join("CONSOLE"))?;
+            }
             if let Some(mode) = scenarios::screen_for(scenario.name) {
                 qemu::request_screen(&esp, mode)?;
             }
@@ -3363,6 +3366,13 @@ fn prepare_drives(
         Target::Iso => vec![Drive::Cdrom(image::build_iso(built, image::Kind::System)?)],
         Target::Installed => {
             let disk = prepare_installed_disk(arch, built.release)?;
+            // The console window at boot, as on the live ESP (25.11, see
+            // `qemu::prepare_esp`): the installer never writes it.
+            if scenarios::without_console(scenario.name) {
+                crate::diskfile::remove_esp_file(&disk, "FREEOS", "CONSOLE")?;
+            } else {
+                crate::diskfile::put_esp_file(&disk, "FREEOS", "CONSOLE", b"console\n")?;
+            }
             let forgotten = scenarios::forgotten_on_state(scenario.name);
             if !forgotten.is_empty() {
                 forget_on_state(&disk, forgotten)?;
