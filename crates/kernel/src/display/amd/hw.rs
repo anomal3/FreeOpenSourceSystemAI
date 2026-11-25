@@ -361,6 +361,26 @@ pub fn map_vram(va: u64, vram_offset: u64, pages: usize) -> Result<(), String> {
     map_with(va, pages, |index| ((vram_offset + index as u64 * 4096) & PTE_ADDRESS) | PTE_VRAM_FLAGS)
 }
 
+/// Убрать из таблиц `pages` страниц с адреса `va` (PT остаются за своими участками VA).
+pub fn unmap(va: u64, pages: usize) {
+    {
+        let mut guard = HW.lock();
+        let Some(hw) = guard.as_mut() else { return };
+        for index in 0..pages as u64 {
+            let pfn = va / 4096 + index;
+            if pfn >= VM_PAGES {
+                break;
+            }
+            let pde = (pfn / PAGES_PER_PDE) as usize;
+            if hw.pt_of[pde] != u16::MAX {
+                let table = PD_BYTES + usize::from(hw.pt_of[pde]) * PT_BYTES;
+                hw.put64(table + (pfn % PAGES_PER_PDE) as usize * 8, 0);
+            }
+        }
+    }
+    flush_locked();
+}
+
 /// Общая часть `map`/`map_vram`: `pte(i)` - запись для страницы `i`.
 fn map_with(va: u64, pages: usize, pte: impl Fn(usize) -> u64) -> Result<(), String> {
     if va % 4096 != 0 || va / 4096 + pages as u64 > VM_PAGES {
@@ -639,15 +659,27 @@ pub fn submit_timeout(va: u64, dwords: usize, timeout_ms: u32) -> Result<(), Str
         0,
     ];
     super::ring_submit(&window, &packets)?;
-    let mut value = 0;
-    for _ in 0..u64::from(timeout_ms) * 20 {
+    // Короткие отправки кончаются за микросекунды - сначала крутимся; дальше уступаем процессор другим задачам
+    // (прерываний от карты пока нет), а не жжём его опросом.
+    let read = || {
         window.hdp_invalidate();
         // SAFETY: слово fence внутри отображённой области, выровнено.
-        value = unsafe { core::ptr::read_volatile((area + FENCE_OFFSET) as *const u32) };
-        if value == seq {
+        unsafe { core::ptr::read_volatile((area + FENCE_OFFSET) as *const u32) }
+    };
+    let started = crate::time::uptime_ns();
+    let deadline = started + u64::from(timeout_ms) * 1_000_000;
+    let mut value = read();
+    while value != seq {
+        let now = crate::time::uptime_ns();
+        if now >= deadline {
             break;
         }
-        super::super::nvidia::spin_us(50);
+        if now - started < 100_000 {
+            super::super::nvidia::spin_us(2);
+        } else {
+            crate::sched::yield_now();
+        }
+        value = read();
     }
     if value == seq {
         return Ok(());

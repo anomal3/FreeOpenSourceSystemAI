@@ -1090,7 +1090,11 @@ pub fn probed() -> bool {
     POLARIS_MMIO.lock().is_some()
 }
 
-/// Background task: start the SMC if the stick carries the marker.
+/// Автозапуск драйвера при обычной загрузке (25.11): прошивки с флешки (`FREEOS/AMD/*.BIN`) -> SMC ->
+/// микрокод -> кольцо GFX -> GART -> узел DRM на карте (`/dev/dri/renderD128`, RADV). Никакие маркеры для этого
+/// не нужны; файл `FREEOS/AMD/NOAUTO.TXT` отключает запуск. Остальные маркеры добавляют проверки:
+/// `CS.TXT`, `SHADER.TXT`, `HW.TXT` - самотесты железа, `RADV.TXT` - прогон RADV и игр (`radv_auto`).
+/// Если ступень не удалась, дальше не идём: экран и система работают без видеокарты.
 pub fn auto_task() {
     if super::firmware_only() {
         crate::kprintln!("  amdgpu     : auto start skipped - firmware display asked in the boot menu");
@@ -1100,71 +1104,90 @@ pub fn auto_task() {
     let deadline = crate::time::uptime_ms() + 90_000;
     while firmware_file("SMC.BIN").is_err() {
         if crate::time::uptime_ms() > deadline {
-            crate::kprintln!("  amdgpu      : auto start: no FREEOS/AMD/SMC.BIN found in 90 s");
+            crate::kprintln!("  amdgpu     : auto start: no FREEOS/AMD/SMC.BIN found in 90 s - the card stays with the firmware picture");
             return;
         }
         crate::sched::sleep_ms(1000);
     }
-    if firmware_file("START.TXT").is_err() {
-        crate::kprintln!("  amdgpu     : auto start is off (no FREEOS/AMD/START.TXT on the stick); 'amd smc start' by hand");
+    if firmware_file("NOAUTO.TXT").is_ok() {
+        crate::kprintln!("  amdgpu     : auto start is off (FREEOS/AMD/NOAUTO.TXT); 'amd smc start' by hand");
         return;
     }
-    crate::kprintln!("==== AMD TEST: started. Stages: SMC, microcode, ring, GART, CS, shader, hw backend, RADV (Proton from the stick). ====");
-    crate::kprintln!("==== AMD TEST: watch the '==== AMD TEST' lines; the last one says when it is safe to power off. Whole run: about 5-15 min. ====");
-    crate::kprintln!("  amdgpu     : auto start: marker found, starting the SMC");
+    let testing = ["CS.TXT", "SHADER.TXT", "HW.TXT", "RADV.TXT"].iter().any(|name| firmware_file(name).is_ok());
+    if testing {
+        crate::kprintln!("==== AMD TEST: started. Stages: SMC, microcode, ring, GART, then the checks asked for by the markers. ====");
+        crate::kprintln!("==== AMD TEST: watch the '==== AMD TEST' lines; the last one says when it is safe to power off. ====");
+    }
+    let has = |lines: &[String], what: &str| lines.iter().any(|line| line.contains(what));
+    let failed = |stage: &str| {
+        crate::kprintln!("  amdgpu     : auto start STOPPED at {stage}: see the lines above; the system keeps the firmware picture");
+        crate::usb::stick_log::flush_now();
+    };
     let _ = polaris_smc_start();
-    for line in polaris_smc() {
+    let smc = polaris_smc();
+    for line in &smc {
         crate::kprintln!("  amdgpu     : auto start: smc: {line}");
     }
-    // The second marker (FOSSAI_AMD_UCODE=1 at build time) asks for P3: the
-    // CP/RLC/SDMA microcode through the running SMC.
-    if firmware_file("UCODE.TXT").is_ok() {
-        crate::kprintln!("  amdgpu     : auto start: UCODE.TXT found, loading the microcode");
-        let _ = polaris_ucode();
-        // The third marker (FOSSAI_AMD_RING=1) asks for P4: start the CP and test the GFX ring.
-        if firmware_file("RING.TXT").is_ok() {
-            crate::kprintln!("  amdgpu     : auto start: RING.TXT found, testing the GFX ring");
-            let _ = polaris_ring();
-            // The fourth marker (FOSSAI_AMD_GART=1) asks for P5: the GART of VMID0.
-            if firmware_file("GART.TXT").is_ok() {
-                crate::kprintln!("  amdgpu     : auto start: GART.TXT found, testing the GART");
-                let _ = polaris_gart();
-            }
-            // The fifth marker (FOSSAI_AMD_CS=1) asks for P5 step 2: fence, IB, user VM (VMID 1).
-            if firmware_file("CS.TXT").is_ok() {
-                crate::kprintln!("  amdgpu     : auto start: CS.TXT found, testing fence, IB and the user VM");
-                let _ = polaris_cs();
-            }
-            // The sixth marker (FOSSAI_AMD_SHADER=1) asks for P6: golden registers and the first compute shader.
-            if firmware_file("SHADER.TXT").is_ok() {
-                crate::kprintln!("  amdgpu     : auto start: SHADER.TXT found, running the first shader");
-                let _ = polaris_shader();
-            }
-            // The seventh marker (FOSSAI_AMD_HW=1): the DRM backend on the card - VMID 1 over 64 GiB, an IB above 4 GiB.
-            if firmware_file("HW.TXT").is_ok() {
-                crate::kprintln!("  amdgpu     : auto start: HW.TXT found, testing the hardware DRM backend");
-                let lines = hw::selftest();
-                let verdict = |what: &str| lines.iter().find(|l| l.contains(what)).map_or("no result", |l| if l.contains("PASSED") { "PASSED" } else { "FAILED" });
-                crate::kprintln!(
-                    "==== AMD TEST: hw backend: {}, shader in VMID 1: {}, VRAM buffers: {} ====",
-                    verdict("HW RESULT"),
-                    verdict("HW SHADER RESULT"),
-                    verdict("HW VRAM RESULT")
-                );
-                if let Some(speed) = lines.iter().find(|l| l.contains("HW VRAM SPEED")) {
-                    crate::kprintln!("==== AMD TEST: {speed} ====");
-                }
-                crate::usb::stick_log::flush_now();
-            }
-            // The eighth marker (FOSSAI_AMD_RADV=1): RADV on the card. The live stick installs Debian and Proton
-            // into RAM (FOSSAI_WITH_PROTON=1); when that is done the whole vkprobe/vulkaninfo check runs on the node.
-            if firmware_file("RADV.TXT").is_ok() {
-                crate::kprintln!("  amdgpu     : auto start: RADV.TXT found, waiting for Proton and running RADV on the card");
-                radv_auto();
-            }
+    if !has(&smc, "SMC is RUNNING") {
+        return failed("SMC");
+    }
+    if !has(&polaris_ucode(), "ALL loaded") {
+        return failed("microcode");
+    }
+    if !has(&polaris_ring(), "TEST 2 PASSED") {
+        return failed("the GFX ring");
+    }
+    if !has(&polaris_gart(), "TEST PASSED") {
+        return failed("GART");
+    }
+    // Самотесты по маркерам.
+    if firmware_file("CS.TXT").is_ok() {
+        let _ = polaris_cs();
+    }
+    if firmware_file("SHADER.TXT").is_ok() {
+        let _ = polaris_shader();
+    }
+    if firmware_file("HW.TXT").is_ok() {
+        let lines = hw::selftest();
+        let verdict = |what: &str| lines.iter().find(|l| l.contains(what)).map_or("no result", |l| if l.contains("PASSED") { "PASSED" } else { "FAILED" });
+        crate::kprintln!(
+            "==== AMD TEST: hw backend: {}, shader in VMID 1: {}, VRAM buffers: {} ====",
+            verdict("HW RESULT"),
+            verdict("HW SHADER RESULT"),
+            verdict("HW VRAM RESULT")
+        );
+        if let Some(speed) = lines.iter().find(|l| l.contains("HW VRAM SPEED")) {
+            crate::kprintln!("==== AMD TEST: {speed} ====");
         }
-    } else {
-        crate::kprintln!("  amdgpu     : auto start: no FREEOS/AMD/UCODE.TXT, microcode not loaded ('amd ucode' by hand)");
+        crate::usb::stick_log::flush_now();
+    }
+    // Узел DRM на карте - то, ради чего всё: RADV и DXVK берут его сами.
+    if !driver_ready() {
+        return failed("the DRM backend (VMID 1)");
+    }
+    crate::usb::stick_log::flush_now();
+    if firmware_file("RADV.TXT").is_ok() {
+        crate::kprintln!("  amdgpu     : auto start: RADV.TXT found, waiting for Proton and running RADV on the card");
+        radv_auto();
+    }
+}
+
+/// Включить узел amdgpu на карте; `false` - не вышло.
+fn driver_ready() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        for line in crate::linux::drm::amdgpu::set_hw(true) {
+            crate::kprintln!("  amdgpu     : {line}");
+        }
+        if hw::ready() {
+            crate::kprintln!("  amdgpu     : READY - /dev/dri/renderD128 is the card; Vulkan programs use RADV, Windows games DXVK");
+            return true;
+        }
+        false
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
     }
 }
 

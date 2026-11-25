@@ -365,8 +365,6 @@ pub fn set_soft(on: bool) {
 static HW: AtomicBool = AtomicBool::new(false);
 /// Поколения адресных пространств: у каждого файла своё, меняется при любом `GEM_VA`.
 static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
-/// Поколение, которое сейчас стоит в VMID 1 железа.
-static HW_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// `amdnode hw on|off`: исполнять `CS` на железе (нужны `amd smc start`, `ucode`, `ring`).
 /// Включение поднимает адресное пространство VMID 1; строки - ход этого.
@@ -377,7 +375,7 @@ pub fn set_hw(on: bool) -> alloc::vec::Vec<alloc::string::String> {
     }
     let mut lines = crate::display::amd::hw::start();
     if crate::display::amd::hw::ready() {
-        HW_GEN.store(0, Ordering::Relaxed);
+        *HW_EXEC.lock() = Installed::new();
         SOFT.store(true, Ordering::Relaxed);
         HW.store(true, Ordering::Relaxed);
         lines.push(alloc::string::String::from("amdgpu: drm node on, CS runs on the card"));
@@ -422,6 +420,8 @@ struct AmdState {
     va: BTreeMap<u64, Mapping>,
     /// PRT: разреженные области без буфера (начало -> размер), читаются нулями.
     prt: BTreeMap<u64, u64>,
+    /// Номер адресного пространства файла (не повторяется).
+    id: u64,
     /// Поколение адресного пространства (см. `NEXT_GEN`).
     vm_gen: u64,
     ctxs: BTreeMap<u32, Ctx>,
@@ -437,6 +437,7 @@ impl AmdState {
         Self {
             va: BTreeMap::new(),
             prt: BTreeMap::new(),
+            id: NEXT_GEN.fetch_add(1, Ordering::Relaxed),
             vm_gen: NEXT_GEN.fetch_add(1, Ordering::Relaxed),
             ctxs: BTreeMap::new(),
             next_ctx: 1,
@@ -471,7 +472,7 @@ impl Drop for AmdFile {
     fn drop(&mut self) {
         let st = self.st.lock();
         // Страницы файла уходят из таблиц железа до того, как кадры вернутся в пул.
-        hw_forget(st.vm_gen);
+        hw_forget(st.id, 0, u64::MAX);
         crate::kprintln!("amdgpu: drm close pid {} (gem {} ctx {} va {})", self.pid, st.bos.len(), st.ctxs.len(), st.va.len());
     }
 }
@@ -1033,7 +1034,11 @@ fn gem_va(file: &AmdFile, arg: usize) -> i64 {
     }
     let mut st = file.st.lock();
     // Отображение уходит или меняется: из таблиц железа убрать всё до того, как буфер может освободиться.
-    hw_forget(st.vm_gen);
+    // MAP на занятое место - ошибка, так что из железа уходят только пересечённые отображения (UNMAP, REPLACE, CLEAR).
+    if args.operation != VA_OP_MAP {
+        let end = if args.map_size == 0 { args.va_address.saturating_add(1) } else { args.va_address.saturating_add(args.map_size) };
+        hw_forget(st.id, args.va_address, end);
+    }
     st.vm_gen = NEXT_GEN.fetch_add(1, Ordering::Relaxed);
     let start = args.va_address;
     let end = start + args.map_size;
@@ -1436,42 +1441,139 @@ struct CsPlan {
     signals: Vec<(Arc<Syncobj>, u64)>,
 }
 
-/// Если в железе стоит адресное пространство с поколением `generation`, снять его: PTE не должны
-/// пережить кадры, на которые указывают (GPU простаивает - отправка синхронная).
-fn hw_forget(generation: u64) {
-    // Не под рукой у чужой отправки: пока IB идёт, таблицы трогать нельзя (DXVK - много потоков: один
-    // отправляет, другой делает GEM_VA; без замка GPU падал с ошибкой страницы на адресе своего IB).
-    let _exec = HW_EXEC.lock();
-    if HW_GEN.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-        crate::display::amd::hw::clear();
+/// Что сейчас стоит в VMID 1: чьё адресное пространство и какие отображения. Таблицы меняются точечно -
+/// только то, что появилось, ушло или поменялось: перестраивать всё на каждый `GEM_VA` (их у DXVK сотни) -
+/// десятки тысяч записей через PCIe на кадр.
+struct Installed {
+    owner: u64,
+    generation: u64,
+    /// Начало -> (длина, буфер, смещение в нём).
+    maps: BTreeMap<u64, (u64, usize, u64)>,
+}
+
+impl Installed {
+    const fn new() -> Self {
+        Self { owner: 0, generation: 0, maps: BTreeMap::new() }
     }
 }
 
-/// Одна отправка на железо за раз: перестройка таблиц, IB и ожидание fence - под этим замком.
-static HW_EXEC: Mutex<()> = Mutex::new(());
+/// Одна отправка на железо за раз: таблицы, IB и ожидание fence - под этим замком (DXVK - много потоков:
+/// без него `GEM_VA` одного потока гасил таблицы под IB другого).
+static HW_EXEC: Mutex<Installed> = Mutex::new(Installed::new());
 
-/// Исполнение на железе: поставить адресное пространство файла в VMID 1 (если там чужое или оно
-/// менялось) и отправить буферы по очереди.
-fn hw_run(view: &VaView, generation: u64, ibs: &[(u64, usize)]) -> Result<(), alloc::string::String> {
+/// Отображения файла `owner`, пересекающие `[start, end)`, уходят из железа сейчас: PTE не должны пережить
+/// кадры, на которые указывают (GPU простаивает - отправка синхронная).
+fn hw_forget(owner: u64, start: u64, end: u64) {
+    let mut installed = HW_EXEC.lock();
+    if installed.owner != owner {
+        return;
+    }
+    let gone: Vec<(u64, u64)> = installed
+        .maps
+        .iter()
+        .filter(|&(&from, &(size, ..))| from < end && from.saturating_add(size) > start)
+        .map(|(&from, &(size, ..))| (from, size))
+        .collect();
+    for (from, size) in gone {
+        crate::display::amd::hw::unmap(from, (size / PAGE) as usize);
+        installed.maps.remove(&from);
+    }
+    installed.generation = 0;
+}
+
+/// Счётчики для строки `amdgpu perf:` - куда уходит время отправок.
+static PERF_SUBMITS: AtomicU64 = AtomicU64::new(0);
+static PERF_GPU_NS: AtomicU64 = AtomicU64::new(0);
+static PERF_MAP_NS: AtomicU64 = AtomicU64::new(0);
+static PERF_PAGES: AtomicU64 = AtomicU64::new(0);
+static PERF_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Раз в 5 с отправок - строка в журнал: сколько их, сколько ждали GPU и сколько писали таблицы.
+fn perf_report() {
+    let now = crate::time::uptime_ms();
+    let since = PERF_SINCE_MS.load(Ordering::Relaxed);
+    if since == 0 {
+        PERF_SINCE_MS.store(now, Ordering::Relaxed);
+        return;
+    }
+    if now.saturating_sub(since) < 5000 || PERF_SINCE_MS.compare_exchange(since, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let submits = PERF_SUBMITS.swap(0, Ordering::Relaxed);
+    let gpu = PERF_GPU_NS.swap(0, Ordering::Relaxed);
+    let map = PERF_MAP_NS.swap(0, Ordering::Relaxed);
+    let pages = PERF_PAGES.swap(0, Ordering::Relaxed);
+    crate::kprintln!(
+        "amdgpu perf: {submits} submits in {} ms; waiting for the GPU {} ms ({} us each), page tables {} ms ({pages} pages written)",
+        now - since,
+        gpu / 1_000_000,
+        gpu / 1000 / submits.max(1),
+        map / 1_000_000
+    );
+}
+
+/// Поставить в VMID 1 недостающие отображения `view` (лишние и изменившиеся убрать).
+fn hw_sync(installed: &mut Installed, view: &VaView) -> Result<u64, alloc::string::String> {
     use crate::display::amd::hw;
-    let _exec = HW_EXEC.lock();
-    if HW_GEN.load(Ordering::Acquire) != generation {
-        hw::clear();
-        for (start, size, bo, offset) in &view.maps {
-            let first = (offset / PAGE) as usize;
-            let count = (size / PAGE) as usize;
-            if let Some(base) = bo.vram {
-                hw::map_vram(*start, base + offset, count)?;
-                continue;
-            }
+    let wanted: BTreeMap<u64, (u64, usize, u64)> =
+        view.maps.iter().map(|(start, size, bo, offset)| (*start, (*size, Arc::as_ptr(bo) as usize, *offset))).collect();
+    let stale: Vec<(u64, u64)> = installed
+        .maps
+        .iter()
+        .filter(|&(start, entry)| wanted.get(start) != Some(entry))
+        .map(|(&start, &(size, ..))| (start, size))
+        .collect();
+    for (start, size) in stale {
+        hw::unmap(start, (size / PAGE) as usize);
+        installed.maps.remove(&start);
+    }
+    let mut written = 0u64;
+    for (start, size, bo, offset) in &view.maps {
+        if installed.maps.contains_key(start) {
+            continue;
+        }
+        let first = (offset / PAGE) as usize;
+        let count = (size / PAGE) as usize;
+        if let Some(base) = bo.vram {
+            hw::map_vram(*start, base + offset, count)?;
+        } else {
             let Some(frames) = bo.frames.get(first..first + count) else {
                 return Err(alloc::format!("mapping at {start:#x} is outside of its buffer"));
             };
             hw::map(*start, frames)?;
         }
-        HW_GEN.store(generation, Ordering::Release);
+        written += count as u64;
+        installed.maps.insert(*start, (*size, Arc::as_ptr(bo) as usize, *offset));
+    }
+    Ok(written)
+}
+
+/// Исполнение на железе: адресное пространство файла в VMID 1 (точечно) и буферы по очереди.
+fn hw_run(view: &VaView, owner: u64, generation: u64, ibs: &[(u64, usize)]) -> Result<(), alloc::string::String> {
+    use crate::display::amd::hw;
+    let mut installed = HW_EXEC.lock();
+    if installed.owner != owner || installed.generation != generation {
+        let started = crate::time::uptime_ns();
+        if installed.owner != owner {
+            hw::clear();
+            installed.maps.clear();
+            installed.owner = owner;
+        }
+        let written = match hw_sync(&mut installed, view) {
+            Ok(written) => written,
+            // Пул таблиц PT исчерпан накопившимися участками VA - начать заново с одними нужными.
+            Err(_) => {
+                hw::clear();
+                installed.maps.clear();
+                hw_sync(&mut installed, view)?
+            }
+        };
+        installed.generation = generation;
+        PERF_PAGES.fetch_add(written, Ordering::Relaxed);
+        PERF_MAP_NS.fetch_add(crate::time::uptime_ns() - started, Ordering::Relaxed);
     }
     for &(va, dwords) in ibs {
+        let started = crate::time::uptime_ns();
         hw::submit(va, dwords).map_err(|why| {
             let near = view
                 .maps
@@ -1481,7 +1583,10 @@ fn hw_run(view: &VaView, generation: u64, ibs: &[(u64, usize)]) -> Result<(), al
                 .map_or_else(|| alloc::string::String::from("none below"), |(start, size, ..)| alloc::format!("{start:#x}+{size:#x}"));
             alloc::format!("{why}; the IB VA is {} a mapping, {} mappings, nearest below: {near}", if view.locate(va, 4).is_some() { "inside" } else { "NOT inside" }, view.maps.len())
         })?;
+        PERF_SUBMITS.fetch_add(1, Ordering::Relaxed);
+        PERF_GPU_NS.fetch_add(crate::time::uptime_ns() - started, Ordering::Relaxed);
     }
+    perf_report();
     Ok(())
 }
 
@@ -1495,9 +1600,9 @@ fn cs_ioctl(file: &AmdFile, arg: usize) -> i64 {
         return -e::EINVAL;
     }
     let Ok(pointers) = get_array::<u64>(args.chunks, args.num_chunks as usize) else { return -e::EFAULT };
-    let (view, generation) = {
+    let (view, owner, generation) = {
         let st = file.st.lock();
-        (VaView::of(&st), st.vm_gen)
+        (VaView::of(&st), st.id, st.vm_gen)
     };
     let mut plan = CsPlan { ibs: Vec::new(), fence: None, waits: Vec::new(), signals: Vec::new() };
     for pointer in pointers {
@@ -1574,7 +1679,7 @@ fn cs_ioctl(file: &AmdFile, arg: usize) -> i64 {
     }
     // Исполнение: заборы ожидания уже выполнены (всё синхронно), буфера — по порядку.
     if hw() {
-        if let Err(why) = hw_run(&view, generation, &plan.ibs) {
+        if let Err(why) = hw_run(&view, owner, generation, &plan.ibs) {
             crate::kprintln!("amdgpu: CS on the card failed: {why}");
             return -e::EIO;
         }
