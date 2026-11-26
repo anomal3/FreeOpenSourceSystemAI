@@ -61,10 +61,15 @@ pub fn refresh() {
     for chan in live {
         chan.poll();
     }
+    // Заборы AMD: одно кольцо, номер читается из видеопамяти (не канал реестра).
+    super::amdgpu::poll_fences();
 }
 
 /// «Номер `seq` контекста `ctx` выполнен» — по кэшу; можно под замками.
 pub fn done(ctx: u64, seq: u64) -> Result<bool, Errno> {
+    if ctx == super::amdgpu::fence_ctx() {
+        return Ok(super::amdgpu::fence_done(seq));
+    }
     let chan = CHANS.lock().get(&ctx).and_then(Weak::upgrade);
     Ok(chan.is_none_or(|chan| chan.cached_done(seq)))
 }

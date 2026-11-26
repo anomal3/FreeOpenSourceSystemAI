@@ -389,7 +389,11 @@ pub fn dmabuf_ioctl(dmabuf: &Arc<dyn Object>, request: u32, arg: usize) -> i64 {
             if super::sync::signaled(&sync.0) {
                 return 0;
             }
-            let first = dmabuf.as_any().downcast_ref::<DmaBuf>().and_then(|buf| buf.bo().frames().and_then(|frames| frames.first().copied()));
+            let first = dmabuf
+                .as_any()
+                .downcast_ref::<DmaBuf>()
+                .and_then(|buf| buf.bo().frames().and_then(|frames| frames.first().copied()))
+                .or_else(|| dmabuf.as_any().downcast_ref::<super::amdgpu::AmdDmaBuf>().and_then(super::amdgpu::AmdDmaBuf::first_frame));
             if let (true, Some(first)) = (FENCE_ASYNC.load(Ordering::Relaxed), first) {
                 note_pending(first, sync.0.clone());
                 return 0;

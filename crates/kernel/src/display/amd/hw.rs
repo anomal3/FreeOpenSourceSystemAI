@@ -9,12 +9,15 @@
 //! поэтому одновременно в железе стоит одно адресное пространство: DRM-слой
 //! перестраивает его (`clear` + `map`), когда его меняет другой файл.
 //!
-//! Отправка синхронная: `INDIRECT_BUFFER` с VMID 1 и за ним `EVENT_WRITE_EOP`
-//! с номером в слово видеопамяти; `submit` ждёт этот номер.
+//! Отправка асинхронная (26.11): [`kick`] ставит в кольцо `INDIRECT_BUFFER` с VMID 1 и `EVENT_WRITE_EOP` с
+//! номером в слово видеопамяти и не ждёт; выполненные номера читает [`poll`], ждут - [`wait_seq`] и [`wait_idle`].
+//! [`clear`] и [`unmap`] перед снятием отображений сами ждут простоя GPU.
 
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::{
     system_page, Window, MM_MC_VM_FB_LOCATION, MM_GRBM_STATUS, MM_VM_CONTEXT1_CNTL, MM_VM_CONTEXT1_CNTL2,
@@ -24,7 +27,7 @@ use super::{
     EOP_CONTROL, EOP_DATA_SEL_LOW32, PM4_EVENT_WRITE_EOP_4, PM4_INDIRECT_BUFFER_2, POLARIS_BAR0, POLARIS_MMIO,
     PTE_READABLE, PTE_SNOOPED, PTE_SYSTEM, PTE_VALID, PTE_WRITEABLE, PTE_EXECUTABLE, RING_STATE, UCODE_AREA,
 };
-use crate::sync::SpinLock;
+use crate::sync::{Mutex, SpinLock};
 
 /// Область таблиц в окне VRAM: за областью кольца (UCODE_AREA + 2 МиБ + 256 КиБ).
 const HW_AREA: u64 = UCODE_AREA + 4 * 1024 * 1024;
@@ -52,8 +55,6 @@ struct Hw {
     pt_next: usize,
     /// Номер PT для записи PD (`PDE -> индекс в пуле`), `u16::MAX` - нет.
     pt_of: Vec<u16>,
-    /// Номер последней отправки.
-    seq: u32,
 }
 
 static HW: SpinLock<Option<Hw>> = SpinLock::new(None);
@@ -267,10 +268,10 @@ pub fn start() -> Vec<String> {
         vram_start,
         pt_next: 0,
         pt_of: alloc::vec![u16::MAX; (VM_PAGES / PAGES_PER_PDE) as usize],
-        seq: 0,
     };
     hw.zero(0, PD_BYTES);
     hw.put32(FENCE_OFFSET, 0);
+    FENCE_VIRT.store(hw.area + FENCE_OFFSET, Ordering::Relaxed);
     let pd_mc = hw.mc(0);
     window.hdp_flush();
     // Контекст 1: диапазон, корень PD, страница для ошибок, управление (как в `amd cs`).
@@ -330,6 +331,7 @@ fn sh_mem_init(window: &Window) {
 
 /// Сбросить адресное пространство: все PDE пустые, пул PT свободен.
 pub fn clear() {
+    wait_idle();
     let mut guard = HW.lock();
     let Some(hw) = guard.as_mut() else { return };
     // Только занятые записи PD: обнулять все 128 КиБ через BAR на каждый GEM_VA слишком дорого.
@@ -363,6 +365,7 @@ pub fn map_vram(va: u64, vram_offset: u64, pages: usize) -> Result<(), String> {
 
 /// Убрать из таблиц `pages` страниц с адреса `va` (PT остаются за своими участками VA).
 pub fn unmap(va: u64, pages: usize) {
+    wait_idle();
     {
         let mut guard = HW.lock();
         let Some(hw) = guard.as_mut() else { return };
@@ -617,6 +620,10 @@ fn vram_test() -> Vec<String> {
         }
         note(format!("HW VRAM SPEED: CP DMA copy, 64 MiB each: {line}"));
     }
+    // 3. Очередь: несколько отправок в работе сразу.
+    if let (Some(&(_, a_first)), true) = (a.first(), a.len() == PAGES) {
+        async_test(&mut note, ib_virt, VA_IB, a_first, VA_A, VA_B);
+    }
     // Убрать за собой: таблицы, страницы, видеопамять.
     clear();
     vram_free(v1, 4 * MIB as u64);
@@ -631,6 +638,181 @@ fn vram_test() -> Vec<String> {
     out
 }
 
+// ---- очередь отправок (26.11: асинхронная) ----------------------------------------
+//
+// Каждый IB получает свой номер: кольцо ждёт номер предыдущего (`WAIT_REG_MEM`), выполняет `INDIRECT_BUFFER` и
+// пишет свой номер в слово fence (`EVENT_WRITE_EOP` после сброса кэшей). Порядок выполнения тот же, что при
+// прежней синхронной отправке, но процессор не ждёт: он ставит следующие кадры в кольцо, пока GPU рисует.
+// Ждать приходится, только когда кольцо занято, перед снятием отображений и когда этого просит программа.
+
+/// Номер последней поданной отправки и последней выполненной (64 бита; в слове fence - младшие 32).
+static EMITTED: AtomicU64 = AtomicU64::new(0);
+static COMPLETED: AtomicU64 = AtomicU64::new(0);
+/// Когда очередь последний раз двигалась (ns) - для сторожа зависания.
+static PROGRESS_NS: AtomicU64 = AtomicU64::new(0);
+/// GPU завис: новые отправки не принимаются, ждущих отпускаем.
+static DEAD: AtomicBool = AtomicBool::new(false);
+/// Виртуальный адрес слова fence.
+static FENCE_VIRT: AtomicUsize = AtomicUsize::new(0);
+/// Блоки кольца в работе: `(номер последней отправки блока, VA и длина первого IB)`.
+static QUEUE: Mutex<VecDeque<(u64, u64, usize)>> = Mutex::new(VecDeque::new());
+/// В кольце 8 блоков по 256 слов; в работе не больше этого, чтобы не переписать то, что CP ещё читает.
+const RING_IN_FLIGHT: usize = 6;
+/// IB на блок: по 17 слов (ожидание 7, IB 4, fence 6).
+const IBS_PER_BLOCK: usize = 14;
+/// Столько очередь может стоять без движения, прежде чем GPU считается зависшим.
+const HANG_MS: u32 = 5000;
+/// `PACKET3(WAIT_REG_MEM, 5)`; управление: память (бит 4), «равно» (3), ждёт PFP (бит 8).
+const PM4_WAIT_REG_MEM_5: u32 = 0xc005_3c00;
+const WAIT_MEM_EQUAL_PFP: u32 = (1 << 4) | 3 | (1 << 8);
+
+/// Счётчики для `amdgpu perf:`.
+static RING_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static IDLE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static IDLE_KICKS: AtomicU64 = AtomicU64::new(0);
+
+/// `(ждали места в кольце, ns; ждали простоя GPU, ns; отправок в простаивающую очередь)` с прошлого вызова.
+pub fn take_stats() -> (u64, u64, u64) {
+    (RING_WAIT_NS.swap(0, Ordering::Relaxed), IDLE_WAIT_NS.swap(0, Ordering::Relaxed), IDLE_KICKS.swap(0, Ordering::Relaxed))
+}
+
+/// Номер последней выполненной отправки по кэшу (освежает [`poll`]); можно под любыми замками.
+#[must_use]
+pub fn completed() -> u64 {
+    COMPLETED.load(Ordering::Acquire)
+}
+
+/// Прочитать слово fence и вернуть номер последней выполненной отправки.
+pub fn poll() -> u64 {
+    let done = COMPLETED.load(Ordering::Acquire);
+    let emitted = EMITTED.load(Ordering::Acquire);
+    let at = FENCE_VIRT.load(Ordering::Relaxed);
+    if done >= emitted || at == 0 {
+        return done;
+    }
+    let Some(window) = window() else { return done };
+    window.hdp_invalidate();
+    // SAFETY: слово fence внутри отображённой области (`start`), выровнено.
+    let word = unsafe { core::ptr::read_volatile(at as *const u32) };
+    // Другой поток мог уже продвинуть `COMPLETED` дальше прочитанного: такая «разница» больше всей очереди.
+    let delta = u64::from(word.wrapping_sub(done as u32));
+    if delta > 0 && delta <= emitted - done {
+        PROGRESS_NS.store(crate::time::uptime_ns(), Ordering::Relaxed);
+        return COMPLETED.fetch_max(done + delta, Ordering::AcqRel).max(done + delta);
+    }
+    if crate::time::uptime_ns().saturating_sub(PROGRESS_NS.load(Ordering::Relaxed)) > u64::from(HANG_MS) * 1_000_000 {
+        hang(&diagnose(&window, word));
+        return COMPLETED.load(Ordering::Acquire);
+    }
+    done
+}
+
+/// Что показывают регистры, когда отправка не кончается.
+fn diagnose(window: &Window, word: u32) -> String {
+    format!(
+        "fence {word:#x}, emitted {:#x}, GRBM_STATUS {:#x}, fault status {:#x} address {:#x} client {:#x}",
+        EMITTED.load(Ordering::Relaxed),
+        window.rd(MM_GRBM_STATUS * 4),
+        window.rd(MM_VM_CONTEXT1_PROTECTION_FAULT_STATUS * 4),
+        window.rd(MM_VM_CONTEXT1_PROTECTION_FAULT_ADDR * 4),
+        window.rd(MM_VM_CONTEXT1_PROTECTION_FAULT_MCCLIENT * 4)
+    )
+}
+
+/// Объявить GPU зависшим: все заборы считаются выполненными, чтобы программы не встали навсегда.
+fn hang(why: &str) {
+    if !DEAD.swap(true, Ordering::AcqRel) {
+        crate::kprintln!("amdgpu: GPU HANG: no progress for {HANG_MS} ms ({why}); further submissions are refused");
+    }
+    COMPLETED.store(EMITTED.load(Ordering::Acquire), Ordering::Release);
+}
+
+/// Ждать отправку номер `seq` не дольше `timeout_ms`.
+pub fn wait_seq(seq: u64, timeout_ms: u32) -> Result<(), String> {
+    let started = crate::time::uptime_ns();
+    let deadline = started + u64::from(timeout_ms) * 1_000_000;
+    // Короткие отправки кончаются за микросекунды - сначала крутимся; дальше уступаем процессор другим задачам
+    // (прерываний от карты пока нет), а не жжём его опросом.
+    while poll() < seq {
+        let now = crate::time::uptime_ns();
+        if now >= deadline {
+            let Some(window) = window() else { return Err(String::from("no Polaris card was probed")) };
+            let at = FENCE_VIRT.load(Ordering::Relaxed);
+            // SAFETY: см. `poll`.
+            let word = unsafe { core::ptr::read_volatile(at as *const u32) };
+            return Err(format!("submission {seq:#x} did not finish in {timeout_ms} ms: {}", diagnose(&window, word)));
+        }
+        if now - started < 100_000 {
+            super::super::nvidia::spin_us(2);
+        } else {
+            crate::sched::yield_now();
+        }
+    }
+    Ok(())
+}
+
+/// Дождаться, пока GPU выполнит всё поданное. Нужно перед тем, как убрать что-то из таблиц страниц: иначе
+/// отправка в работе обратилась бы к снятой странице, а освобождённые кадры могли бы получить её запись.
+pub fn wait_idle() {
+    let target = EMITTED.load(Ordering::Acquire);
+    if poll() >= target {
+        return;
+    }
+    let started = crate::time::uptime_ns();
+    if let Err(why) = wait_seq(target, HANG_MS) {
+        hang(&why);
+    }
+    IDLE_WAIT_NS.fetch_add(crate::time::uptime_ns() - started, Ordering::Relaxed);
+}
+
+/// Поставить IB `(VA, длина в словах)` в кольцо (VMID 1) и не ждать; номер последнего из них.
+pub fn kick(ibs: &[(u64, usize)]) -> Result<u64, String> {
+    if DEAD.load(Ordering::Acquire) {
+        return Err(String::from("the GPU hung earlier, submissions are refused"));
+    }
+    let Some(window) = window() else { return Err(String::from("no Polaris card was probed")) };
+    let fence_mc = HW.lock().as_ref().map(|hw| hw.mc(FENCE_OFFSET)).ok_or("the hardware backend is not started")?;
+    let (fence_lo, fence_hi) = (fence_mc as u32 & !3, (fence_mc >> 32) as u32 & 0xffff);
+    let mut queue = QUEUE.lock();
+    let mut last = EMITTED.load(Ordering::Acquire);
+    for group in ibs.chunks(IBS_PER_BLOCK) {
+        loop {
+            let done = poll();
+            while queue.front().is_some_and(|block| block.0 <= done) {
+                queue.pop_front();
+            }
+            if queue.len() < RING_IN_FLIGHT {
+                break;
+            }
+            let (oldest, va, dwords) = queue[0];
+            let started = crate::time::uptime_ns();
+            if let Err(why) = wait_seq(oldest, HANG_MS) {
+                let why = format!("{why}; oldest IB at {va:#x}, {dwords} dwords");
+                hang(&why);
+                return Err(why);
+            }
+            RING_WAIT_NS.fetch_add(crate::time::uptime_ns() - started, Ordering::Relaxed);
+        }
+        if queue.is_empty() {
+            PROGRESS_NS.store(crate::time::uptime_ns(), Ordering::Relaxed);
+            IDLE_KICKS.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut packets: Vec<u32> = Vec::with_capacity(group.len() * 17);
+        for &(va, dwords) in group {
+            // Ждать предыдущую, IB с VMID 1, за ним fence: EVENT_WRITE_EOP пишет номер после сброса кэшей.
+            packets.extend_from_slice(&[PM4_WAIT_REG_MEM_5, WAIT_MEM_EQUAL_PFP, fence_lo, fence_hi, last as u32, 0xffff_ffff, 4]);
+            last += 1;
+            packets.extend_from_slice(&[PM4_INDIRECT_BUFFER_2, va as u32 & !3, (va >> 32) as u32 & 0xffff, dwords as u32 | (1 << 24)]);
+            packets.extend_from_slice(&[PM4_EVENT_WRITE_EOP_4, EOP_CONTROL, fence_lo, fence_hi | EOP_DATA_SEL_LOW32, last as u32, 0]);
+        }
+        // Номер объявляется до того, как CP увидит пакеты: `poll` не должен встретить «лишний».
+        EMITTED.store(last, Ordering::Release);
+        super::ring_submit(&window, &packets)?;
+        queue.push_back((last, group[0].0, group[0].1));
+    }
+    Ok(last)
+}
+
 /// Выполнить буфер команд из `dwords` слов по адресу GPU `va` (VMID 1) и дождаться его конца.
 pub fn submit(va: u64, dwords: usize) -> Result<(), String> {
     submit_timeout(va, dwords, 200)
@@ -638,57 +820,64 @@ pub fn submit(va: u64, dwords: usize) -> Result<(), String> {
 
 /// То же, но ждать забор до `timeout_ms` миллисекунд (шейдеру с долгим циклом нужны секунды).
 pub fn submit_timeout(va: u64, dwords: usize, timeout_ms: u32) -> Result<(), String> {
-    let Some(window) = window() else { return Err(String::from("no Polaris card was probed")) };
-    let (seq, fence_mc, area) = {
-        let mut guard = HW.lock();
-        let hw = guard.as_mut().ok_or("the hardware backend is not started")?;
-        hw.seq = hw.seq.wrapping_add(1);
-        (hw.seq, hw.mc(FENCE_OFFSET), hw.area)
+    let seq = kick(&[(va, dwords)])?;
+    wait_seq(seq, timeout_ms).map_err(|why| format!("IB at {va:#x} ({dwords} dwords): {why}"))
+}
+
+/// Самопроверка очереди: цепочка из 20 отправок (больше, чем блоков в кольце), где каждая копирует слово,
+/// записанное предыдущей, - верный порядок доносит его до конца; затем замер: сколько процессор тратит на
+/// постановку 6 тяжёлых отправок и сколько GPU их выполняет. `HW ASYNC RESULT`.
+fn async_test(note: &mut dyn FnMut(String), ib_virt: usize, ib_va: u64, a_virt: usize, a_va: u64, b_va: u64) {
+    const LINKS: u64 = 20;
+    const MAGIC: u32 = 0xc0de_2611;
+    const MIB: u64 = 1 << 20;
+    // SAFETY: первая страница A (4 КиБ) принадлежит проверке; слова по смещениям 0..84 внутри неё.
+    unsafe {
+        for link in 0..=LINKS {
+            core::ptr::write_volatile((a_virt + link as usize * 4) as *mut u32, 0);
+        }
+        core::ptr::write_volatile(a_virt as *mut u32, MAGIC);
+    }
+    let write_ib = |offset: usize, words: &[u32]| {
+        for (index, word) in words.iter().enumerate() {
+            // SAFETY: страница IB выделена вызывающим; пакеты помещаются в неё (смещения ниже 4 КиБ).
+            unsafe { core::ptr::write_volatile((ib_virt + offset + index * 4) as *mut u32, *word) };
+        }
     };
-    // IB с VMID 1, за ним fence: EVENT_WRITE_EOP пишет номер в видеопамять после сброса кэшей.
-    let packets = [
-        PM4_INDIRECT_BUFFER_2,
-        va as u32 & !3,
-        (va >> 32) as u32 & 0xffff,
-        dwords as u32 | (1 << 24),
-        PM4_EVENT_WRITE_EOP_4,
-        EOP_CONTROL,
-        fence_mc as u32 & !3,
-        ((fence_mc >> 32) as u32 & 0xffff) | EOP_DATA_SEL_LOW32,
-        seq,
-        0,
-    ];
-    super::ring_submit(&window, &packets)?;
-    // Короткие отправки кончаются за микросекунды - сначала крутимся; дальше уступаем процессор другим задачам
-    // (прерываний от карты пока нет), а не жжём его опросом.
-    let read = || {
-        window.hdp_invalidate();
-        // SAFETY: слово fence внутри отображённой области, выровнено.
-        unsafe { core::ptr::read_volatile((area + FENCE_OFFSET) as *const u32) }
-    };
+    let mut last = 0;
+    for link in 0..LINKS {
+        let offset = link as usize * 64;
+        write_ib(offset, &dma_copy(a_va + link * 4, a_va + (link + 1) * 4, 4));
+        match kick(&[(ib_va + offset as u64, 7)]) {
+            Ok(seq) => last = seq,
+            Err(why) => return note(format!("HW ASYNC RESULT: FAILED: {why}")),
+        }
+    }
+    if let Err(why) = wait_seq(last, 3000) {
+        return note(format!("HW ASYNC RESULT: FAILED: {why}"));
+    }
+    // SAFETY: см. выше.
+    let end = unsafe { core::ptr::read_volatile((a_virt + LINKS as usize * 4) as *const u32) };
+    // Тяжёлые отправки: 64 копии по 1 МиБ в каждой (все шесть читают один и тот же IB).
+    let packets: Vec<u32> = (0..64u64).flat_map(|i| dma_copy(a_va + (i % 4) * MIB, b_va + (i % 4) * MIB, MIB as u32)).collect();
+    write_ib(2048, &packets[..packets.len().min(448)]);
     let started = crate::time::uptime_ns();
-    let deadline = started + u64::from(timeout_ms) * 1_000_000;
-    let mut value = read();
-    while value != seq {
-        let now = crate::time::uptime_ns();
-        if now >= deadline {
-            break;
+    for _ in 0..6 {
+        match kick(&[(ib_va + 2048, packets.len())]) {
+            Ok(seq) => last = seq,
+            Err(why) => return note(format!("HW ASYNC RESULT: FAILED: {why}")),
         }
-        if now - started < 100_000 {
-            super::super::nvidia::spin_us(2);
-        } else {
-            crate::sched::yield_now();
-        }
-        value = read();
     }
-    if value == seq {
-        return Ok(());
+    let queued = crate::time::uptime_ns() - started;
+    let behind = last - poll().min(last);
+    if let Err(why) = wait_seq(last, 8000) {
+        return note(format!("HW ASYNC RESULT: FAILED: {why}"));
     }
-    Err(format!(
-        "IB at {va:#x} ({dwords} dwords) did not finish: fence {value:#x} (expected {seq:#x}), GRBM_STATUS {:#x}, fault status {:#x} address {:#x} client {:#x}",
-        window.rd(MM_GRBM_STATUS * 4),
-        window.rd(MM_VM_CONTEXT1_PROTECTION_FAULT_STATUS * 4),
-        window.rd(MM_VM_CONTEXT1_PROTECTION_FAULT_ADDR * 4),
-        window.rd(MM_VM_CONTEXT1_PROTECTION_FAULT_MCCLIENT * 4)
-    ))
+    let finished = crate::time::uptime_ns() - started;
+    note(format!(
+        "HW ASYNC RESULT: {} (a word went through {LINKS} queued submissions: {end:#x}, want {MAGIC:#x}; 6 x 64 MiB queued in {} us with {behind} still running, finished after {} us)",
+        if end == MAGIC { "PASSED" } else { "FAILED" },
+        queued / 1000,
+        finished / 1000
+    ));
 }

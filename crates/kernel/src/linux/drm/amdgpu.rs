@@ -35,13 +35,17 @@
 //!
 //! * `CS` (чанки IB, FENCE, SYNCOBJ_IN/OUT, SYNCOBJ_TIMELINE_WAIT/SIGNAL, BO_HANDLES,
 //!   зависимости), `WAIT_CS` и все ioctl syncobj (общий код `drm::sync`).
-//!   Исполнение синхронное: [`exec_ib`] — мини-интерпретатор PM4 на CPU
-//!   (`WRITE_DATA`, `EVENT_WRITE_EOP`, `INDIRECT_BUFFER`, `DMA_DATA`; остальное
+//!   На программной карте исполнение синхронное: [`exec_ib`] — мини-интерпретатор PM4
+//!   на CPU (`WRITE_DATA`, `EVENT_WRITE_EOP`, `INDIRECT_BUFFER`, `DMA_DATA`; остальное
 //!   пропускается по счётчику), поэтому заборы выполнены сразу.
-//!
-//! PRIME и настоящее железо (кольцо `display::amd`) — следующие шаги плана.
+//! * на настоящей карте (`amdnode hw on`) `CS` ставит IB в кольцо и не ждёт (26.11):
+//!   syncobj получают заборы «контекст AMD, номер отправки», их читает
+//!   [`poll_fences`] (общие ожидания `drm::sync`), `WAIT_CS`, `GEM_WAIT_IDLE` и
+//!   сервер Wayland (забор кадра на dma-buf). Буферы, чьи страницы стоят в таблицах
+//!   GPU, держит [`Installed`]; снятие страниц ждёт простоя GPU (`display::amd::hw`).
+//! * PRIME: dma-buf буферов в системной памяти.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -375,7 +379,15 @@ pub fn set_hw(on: bool) -> alloc::vec::Vec<alloc::string::String> {
     }
     let mut lines = crate::display::amd::hw::start();
     if crate::display::amd::hw::ready() {
-        *HW_EXEC.lock() = Installed::new();
+        {
+            let mut installed = HW_EXEC.lock();
+            // Сначала убрать таблицы (с ожиданием GPU), потом отпускать буферы, на которые они указывают.
+            crate::display::amd::hw::clear();
+            *installed = Installed::new();
+        }
+        if FENCE_CTX.load(Ordering::Relaxed) == 0 {
+            FENCE_CTX.store(super::sync::new_ctx(), Ordering::Relaxed);
+        }
         SOFT.store(true, Ordering::Relaxed);
         HW.store(true, Ordering::Relaxed);
         lines.push(alloc::string::String::from("amdgpu: drm node on, CS runs on the card"));
@@ -386,6 +398,74 @@ pub fn set_hw(on: bool) -> alloc::vec::Vec<alloc::string::String> {
 
 fn hw() -> bool {
     HW.load(Ordering::Relaxed)
+}
+
+/// Не ждать GPU в `CS` (по умолчанию); `false` - ждать конец каждой отправки, как до 26.11.
+static ASYNC: AtomicBool = AtomicBool::new(true);
+
+/// Выбрать способ отправки (маркер `FREEOS/AMD/SYNC.TXT` - для сравнения и отладки).
+pub fn set_async(on: bool) {
+    ASYNC.store(on, Ordering::Relaxed);
+    crate::kprintln!("amdgpu: submissions are {}", if on { "asynchronous" } else { "synchronous (CS waits for the GPU)" });
+}
+
+/// Контекст заборов GFX-кольца AMD в `drm::sync` (0 - ещё не заведён).
+static FENCE_CTX: AtomicU64 = AtomicU64::new(0);
+
+/// Номер контекста заборов AMD; 0 - железо не включали.
+#[must_use]
+pub fn fence_ctx() -> u64 {
+    FENCE_CTX.load(Ordering::Relaxed)
+}
+
+/// Выполнена ли отправка `seq` (по кэшу, можно под замками).
+#[must_use]
+pub fn fence_done(seq: u64) -> bool {
+    crate::display::amd::hw::completed() >= seq
+}
+
+/// Пользовательский забор (`CHUNK_FENCE`), который ещё не записан: пишется, когда GPU кончит отправку.
+struct UserFence {
+    hw_seq: u64,
+    bo: Arc<AmdBo>,
+    offset: u64,
+    value: u64,
+}
+
+static USER_FENCES: SpinLock<VecDeque<UserFence>> = SpinLock::new(VecDeque::new());
+
+/// Освежить выполненный номер вопросом к карте и записать готовые пользовательские заборы.
+pub fn poll_fences() {
+    if fence_ctx() == 0 {
+        return;
+    }
+    let done = crate::display::amd::hw::poll();
+    // Буферы отпускаются вне замка (освобождение берёт замки пула памяти).
+    let mut finished: Vec<UserFence> = Vec::new();
+    {
+        let mut pending = USER_FENCES.lock();
+        // Номера в очереди почти по порядку; запись - под замком, чтобы забор не пошёл назад.
+        while pending.front().is_some_and(|fence| fence.hw_seq <= done) {
+            let Some(fence) = pending.pop_front() else { break };
+            let _ = fence.bo.write(fence.offset, &fence.value.to_le_bytes());
+            finished.push(fence);
+        }
+    }
+    drop(finished);
+}
+
+/// Ждать отправку `hw_seq` до абсолютного срока `timeout` (нс `CLOCK_MONOTONIC`, как у Linux amdgpu):
+/// `Ok(false)` - не успела.
+fn wait_hw(hw_seq: u64, timeout: u64) -> Result<bool, i64> {
+    let deadline = i64::try_from(timeout).ok().filter(|&at| at != i64::MAX).map(|at| at as u64);
+    match super::sync::wait_until(deadline, || Ok(fence_done(hw_seq))) {
+        Ok(()) => {
+            poll_fences();
+            Ok(true)
+        }
+        Err(err) if err == -super::ETIME => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// Что про узел знает sysfs.
@@ -430,6 +510,8 @@ struct AmdState {
     next_bo: u32,
     syncobjs: BTreeMap<u32, Arc<Syncobj>>,
     next_sync: u32,
+    /// Номер последней отправки файла на железо (`GEM_WAIT_IDLE`).
+    last_hw: u64,
 }
 
 impl AmdState {
@@ -445,6 +527,7 @@ impl AmdState {
             next_bo: 1,
             syncobjs: BTreeMap::new(),
             next_sync: 1,
+            last_hw: 0,
         }
     }
 }
@@ -485,6 +568,8 @@ struct Ctx {
     /// Номер последнего `CS` контекста (первый — 1): так `WAIT_CS` отличает
     /// выполненный номер от ещё не поданного.
     last_seq: u64,
+    /// Ещё не кончившиеся отправки контекста: `(номер CS, номер отправки на железе)`.
+    pending: VecDeque<(u64, u64)>,
 }
 
 /// Отображение `GEM_VA`: буфер, смещение в нём, длина, флаги PTE.
@@ -1114,7 +1199,7 @@ fn ctx_ioctl(file: &AmdFile, arg: usize) -> i64 {
             }
             let id = st.next_ctx;
             st.next_ctx = st.next_ctx.wrapping_add(1);
-            st.ctxs.insert(id, Ctx { priority: args.priority, stable_pstate: 0, last_seq: 0 });
+            st.ctxs.insert(id, Ctx { priority: args.priority, stable_pstate: 0, last_seq: 0, pending: VecDeque::new() });
             out[..4].copy_from_slice(&id.to_le_bytes());
         }
         CTX_OP_FREE => {
@@ -1193,12 +1278,25 @@ fn gem_op(file: &AmdFile, arg: usize) -> i64 {
     }
 }
 
-/// `DRM_IOCTL_AMDGPU_GEM_WAIT_IDLE`: работы на GPU нет — буфер всегда свободен (`status` 0).
+/// `DRM_IOCTL_AMDGPU_GEM_WAIT_IDLE`: какие отправки читают буфер, ядро не знает (виден весь VA файла),
+/// поэтому ждётся последняя отправка файла; `status` 1 - к сроку не кончилась.
 fn gem_wait_idle(file: &AmdFile, arg: usize) -> i64 {
     let Ok(args) = get::<GemWaitIdle>(arg) else { return -e::EFAULT };
-    let Some(bo) = file.st.lock().bos.get(&args.handle).cloned() else { return -e::ENOENT };
+    let (bo, last) = {
+        let st = file.st.lock();
+        let Some(bo) = st.bos.get(&args.handle).cloned() else { return -e::ENOENT };
+        (bo, st.last_hw)
+    };
+    let idle = match last {
+        0 => true,
+        seq => match wait_hw(seq, args.timeout) {
+            Ok(idle) => idle,
+            Err(err) => return err,
+        },
+    };
     let domain = if bo.domains & DOMAIN_VRAM != 0 { DOMAIN_VRAM } else { DOMAIN_GTT };
     let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&u32::from(!idle).to_le_bytes());
     out[4..8].copy_from_slice(&(domain as u32).to_le_bytes());
     if crate::linux::ipc::write_user(arg, &out).is_err() { -e::EFAULT } else { 0 }
 }
@@ -1441,14 +1539,15 @@ struct CsPlan {
     signals: Vec<(Arc<Syncobj>, u64)>,
 }
 
-/// Что сейчас стоит в VMID 1: чьё адресное пространство и какие отображения. Таблицы меняются точечно -
+/// Что сейчас стоит в VMID 1: чьё адресное пространство и какие отображения. Ссылка на буфер держится, пока
+/// его страницы в таблицах: освободить кадры под отправкой в работе нельзя. Таблицы меняются точечно -
 /// только то, что появилось, ушло или поменялось: перестраивать всё на каждый `GEM_VA` (их у DXVK сотни) -
 /// десятки тысяч записей через PCIe на кадр.
 struct Installed {
     owner: u64,
     generation: u64,
     /// Начало -> (длина, буфер, смещение в нём).
-    maps: BTreeMap<u64, (u64, usize, u64)>,
+    maps: BTreeMap<u64, (u64, Arc<AmdBo>, u64)>,
 }
 
 impl Installed {
@@ -1457,12 +1556,12 @@ impl Installed {
     }
 }
 
-/// Одна отправка на железо за раз: таблицы, IB и ожидание fence - под этим замком (DXVK - много потоков:
+/// Одна постановка в кольцо за раз: таблицы и IB - под этим замком (DXVK - много потоков:
 /// без него `GEM_VA` одного потока гасил таблицы под IB другого).
 static HW_EXEC: Mutex<Installed> = Mutex::new(Installed::new());
 
 /// Отображения файла `owner`, пересекающие `[start, end)`, уходят из железа сейчас: PTE не должны пережить
-/// кадры, на которые указывают (GPU простаивает - отправка синхронная).
+/// кадры, на которые указывают (`hw::unmap` сначала дожидается отправок в работе).
 fn hw_forget(owner: u64, start: u64, end: u64) {
     let mut installed = HW_EXEC.lock();
     if installed.owner != owner {
@@ -1471,8 +1570,8 @@ fn hw_forget(owner: u64, start: u64, end: u64) {
     let gone: Vec<(u64, u64)> = installed
         .maps
         .iter()
-        .filter(|&(&from, &(size, ..))| from < end && from.saturating_add(size) > start)
-        .map(|(&from, &(size, ..))| (from, size))
+        .filter(|&(&from, (size, ..))| from < end && from.saturating_add(*size) > start)
+        .map(|(&from, (size, ..))| (from, *size))
         .collect();
     for (from, size) in gone {
         crate::display::amd::hw::unmap(from, (size / PAGE) as usize);
@@ -1483,12 +1582,12 @@ fn hw_forget(owner: u64, start: u64, end: u64) {
 
 /// Счётчики для строки `amdgpu perf:` - куда уходит время отправок.
 static PERF_SUBMITS: AtomicU64 = AtomicU64::new(0);
-static PERF_GPU_NS: AtomicU64 = AtomicU64::new(0);
 static PERF_MAP_NS: AtomicU64 = AtomicU64::new(0);
 static PERF_PAGES: AtomicU64 = AtomicU64::new(0);
 static PERF_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Раз в 5 с отправок - строка в журнал: сколько их, сколько ждали GPU и сколько писали таблицы.
+/// Раз в 5 с отправок - строка в журнал: сколько их, сколько раз GPU к постановке уже простаивал (тогда
+/// тормозит процессор, а не карта), сколько ждали места в кольце и простоя и сколько писали таблицы.
 fn perf_report() {
     let now = crate::time::uptime_ms();
     let since = PERF_SINCE_MS.load(Ordering::Relaxed);
@@ -1500,14 +1599,14 @@ fn perf_report() {
         return;
     }
     let submits = PERF_SUBMITS.swap(0, Ordering::Relaxed);
-    let gpu = PERF_GPU_NS.swap(0, Ordering::Relaxed);
+    let (ring, idle, empty) = crate::display::amd::hw::take_stats();
     let map = PERF_MAP_NS.swap(0, Ordering::Relaxed);
     let pages = PERF_PAGES.swap(0, Ordering::Relaxed);
     crate::kprintln!(
-        "amdgpu perf: {submits} submits in {} ms; waiting for the GPU {} ms ({} us each), page tables {} ms ({pages} pages written)",
+        "amdgpu perf: {submits} submits in {} ms; the GPU had no queued work at {empty}; CPU blocked: ring full {} ms, drain {} ms; page tables {} ms ({pages} pages written)",
         now - since,
-        gpu / 1_000_000,
-        gpu / 1000 / submits.max(1),
+        ring / 1_000_000,
+        idle / 1_000_000,
         map / 1_000_000
     );
 }
@@ -1520,8 +1619,8 @@ fn hw_sync(installed: &mut Installed, view: &VaView) -> Result<u64, alloc::strin
     let stale: Vec<(u64, u64)> = installed
         .maps
         .iter()
-        .filter(|&(start, entry)| wanted.get(start) != Some(entry))
-        .map(|(&start, &(size, ..))| (start, size))
+        .filter(|&(start, (size, bo, offset))| wanted.get(start) != Some(&(*size, Arc::as_ptr(bo) as usize, *offset)))
+        .map(|(&start, (size, ..))| (start, *size))
         .collect();
     for (start, size) in stale {
         hw::unmap(start, (size / PAGE) as usize);
@@ -1543,13 +1642,14 @@ fn hw_sync(installed: &mut Installed, view: &VaView) -> Result<u64, alloc::strin
             hw::map(*start, frames)?;
         }
         written += count as u64;
-        installed.maps.insert(*start, (*size, Arc::as_ptr(bo) as usize, *offset));
+        installed.maps.insert(*start, (*size, Arc::clone(bo), *offset));
     }
     Ok(written)
 }
 
-/// Исполнение на железе: адресное пространство файла в VMID 1 (точечно) и буферы по очереди.
-fn hw_run(view: &VaView, owner: u64, generation: u64, ibs: &[(u64, usize)]) -> Result<(), alloc::string::String> {
+/// Исполнение на железе: адресное пространство файла в VMID 1 (точечно) и буферы в кольцо по очереди;
+/// результат - номер последней отправки.
+fn hw_run(view: &VaView, owner: u64, generation: u64, ibs: &[(u64, usize)]) -> Result<u64, alloc::string::String> {
     use crate::display::amd::hw;
     let mut installed = HW_EXEC.lock();
     if installed.owner != owner || installed.generation != generation {
@@ -1572,22 +1672,13 @@ fn hw_run(view: &VaView, owner: u64, generation: u64, ibs: &[(u64, usize)]) -> R
         PERF_PAGES.fetch_add(written, Ordering::Relaxed);
         PERF_MAP_NS.fetch_add(crate::time::uptime_ns() - started, Ordering::Relaxed);
     }
-    for &(va, dwords) in ibs {
-        let started = crate::time::uptime_ns();
-        hw::submit(va, dwords).map_err(|why| {
-            let near = view
-                .maps
-                .iter()
-                .filter(|(start, ..)| *start <= va)
-                .max_by_key(|(start, ..)| *start)
-                .map_or_else(|| alloc::string::String::from("none below"), |(start, size, ..)| alloc::format!("{start:#x}+{size:#x}"));
-            alloc::format!("{why}; the IB VA is {} a mapping, {} mappings, nearest below: {near}", if view.locate(va, 4).is_some() { "inside" } else { "NOT inside" }, view.maps.len())
-        })?;
-        PERF_SUBMITS.fetch_add(1, Ordering::Relaxed);
-        PERF_GPU_NS.fetch_add(crate::time::uptime_ns() - started, Ordering::Relaxed);
+    let seq = hw::kick(ibs)?;
+    PERF_SUBMITS.fetch_add(ibs.len() as u64, Ordering::Relaxed);
+    if !ASYNC.load(Ordering::Relaxed) {
+        hw::wait_seq(seq, 5000)?;
     }
     perf_report();
-    Ok(())
+    Ok(seq)
 }
 
 /// `DRM_IOCTL_AMDGPU_CS`.
@@ -1677,11 +1768,15 @@ fn cs_ioctl(file: &AmdFile, arg: usize) -> i64 {
     if plan.ibs.is_empty() {
         return -e::EINVAL;
     }
-    // Исполнение: заборы ожидания уже выполнены (всё синхронно), буфера — по порядку.
+    // Заборы ожидания ждать не надо: кольцо одно и выполняет отправки по порядку (каждая ждёт предыдущую).
+    let mut on_card = None;
     if hw() {
-        if let Err(why) = hw_run(&view, owner, generation, &plan.ibs) {
-            crate::kprintln!("amdgpu: CS on the card failed: {why}");
-            return -e::EIO;
+        match hw_run(&view, owner, generation, &plan.ibs) {
+            Ok(seq) => on_card = Some(seq),
+            Err(why) => {
+                crate::kprintln!("amdgpu: CS on the card failed: {why}");
+                return -e::EIO;
+            }
         }
     } else {
         for &(va, dwords) in &plan.ibs {
@@ -1690,28 +1785,41 @@ fn cs_ioctl(file: &AmdFile, arg: usize) -> i64 {
             }
         }
     }
-    let seq = {
+    let (seq, user_fence) = {
         let mut st = file.st.lock();
-        let ctx = st.ctxs.get_mut(&args.ctx_id).map(|ctx| {
-            ctx.last_seq += 1;
-            ctx.last_seq
-        });
-        let Some(seq) = ctx else { return -e::EINVAL };
+        if let Some(hw_seq) = on_card {
+            st.last_hw = hw_seq;
+        }
+        let Some(ctx) = st.ctxs.get_mut(&args.ctx_id) else { return -e::EINVAL };
+        ctx.last_seq += 1;
+        let seq = ctx.last_seq;
+        if let Some(hw_seq) = on_card {
+            while ctx.pending.front().is_some_and(|&(_, done)| fence_done(done)) {
+                ctx.pending.pop_front();
+            }
+            ctx.pending.push_back((seq, hw_seq));
+        }
         // Пользовательский забор: номер — в буфер.
-        if let Some((handle, offset)) = plan.fence {
-            if let Some(bo) = st.bos.get(&handle) {
-                let _ = bo.write(u64::from(offset), &seq.to_le_bytes());
+        let user_fence = plan.fence.and_then(|(handle, offset)| st.bos.get(&handle).map(|bo| (Arc::clone(bo), u64::from(offset))));
+        (seq, user_fence)
+    };
+    if let Some((bo, offset)) = user_fence {
+        match on_card {
+            Some(hw_seq) => USER_FENCES.lock().push_back(UserFence { hw_seq, bo, offset, value: seq }),
+            None => {
+                let _ = bo.write(offset, &seq.to_le_bytes());
             }
         }
-        seq
-    };
+    }
+    let fence = on_card.map_or_else(Fence::signaled, |hw_seq| Fence::seq(fence_ctx(), hw_seq));
     for (obj, point) in plan.signals {
         if point == 0 {
-            obj.replace(Some(Fence::signaled()));
+            obj.replace(Some(fence.clone()));
         } else {
-            obj.add_point(point, Fence::signaled());
+            obj.add_point(point, fence.clone());
         }
     }
+    poll_fences();
     if put(arg, seq).is_err() { -e::EFAULT } else { 0 }
 }
 
@@ -1727,8 +1835,17 @@ fn wait_cs(file: &AmdFile, arg: usize) -> i64 {
     if args.handle == 0 || args.handle > ctx.last_seq {
         return -e::EINVAL;
     }
+    // Номера нет среди незаконченных - он выполнен.
+    let hw_seq = ctx.pending.iter().find(|&&(seq, _)| seq == args.handle).map(|&(_, hw_seq)| hw_seq);
     drop(st);
-    if put::<u64>(arg, 0).is_err() { -e::EFAULT } else { 0 }
+    let done = match hw_seq {
+        None => true,
+        Some(hw_seq) => match wait_hw(hw_seq, args.timeout) {
+            Ok(done) => done,
+            Err(err) => return err,
+        },
+    };
+    if put::<u64>(arg, u64::from(!done)).is_err() { -e::EFAULT } else { 0 }
 }
 
 /// ioctl на открытом узле AMD (`request` уже приведён `canonical`).
@@ -1789,6 +1906,11 @@ impl Object for AmdDmaBuf {
 }
 
 impl AmdDmaBuf {
+    /// Первый кадр буфера: по нему сервер Wayland узнаёт кадр, который GPU ещё рисует (`gem::frame_pending`).
+    pub(super) fn first_frame(&self) -> Option<u64> {
+        self.0.frames.first().copied()
+    }
+
     /// Память буфера для `mmap` и для сервера Wayland, и его длина.
     pub(super) fn memory(&self) -> (Arc<SharedMem>, u64) {
         (self.0.shared(), self.0.size)

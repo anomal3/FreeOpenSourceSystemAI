@@ -1094,6 +1094,7 @@ pub fn probed() -> bool {
 /// микрокод -> кольцо GFX -> GART -> узел DRM на карте (`/dev/dri/renderD128`, RADV). Никакие маркеры для этого
 /// не нужны; файл `FREEOS/AMD/NOAUTO.TXT` отключает запуск. Остальные маркеры добавляют проверки:
 /// `HW.TXT` - самотест железа, `RADV.TXT` - прогон RADV, игр и программ (`radv_auto`); ход виден уведомлениями стола.
+/// `SYNC.TXT` - ждать GPU в каждой отправке, как до асинхронной очереди (для сравнения и отладки).
 /// Если ступень не удалась, дальше не идём: экран и система работают без видеокарты.
 pub fn auto_task() {
     if super::firmware_only() {
@@ -1143,21 +1144,24 @@ pub fn auto_task() {
     if firmware_file("HW.TXT").is_ok() {
         let lines = hw::selftest();
         let verdict = |what: &str| lines.iter().find(|l| l.contains(what)).map_or("no result", |l| if l.contains("PASSED") { "PASSED" } else { "FAILED" });
+        let checks = ["HW RESULT", "HW SHADER RESULT", "HW VRAM RESULT", "HW ASYNC RESULT"];
         crate::kprintln!(
-            "==== AMD TEST: hw backend: {}, shader in VMID 1: {}, VRAM buffers: {} ====",
-            verdict("HW RESULT"),
-            verdict("HW SHADER RESULT"),
-            verdict("HW VRAM RESULT")
+            "==== AMD TEST: hw backend: {}, shader in VMID 1: {}, VRAM buffers: {}, queued submissions: {} ====",
+            verdict(checks[0]),
+            verdict(checks[1]),
+            verdict(checks[2]),
+            verdict(checks[3])
         );
-        announce(
-            "Тест AMD начался",
-            &format!("Железо: бэкенд {}, шейдер {}, видеопамять {}. Дальше копируется Proton - не выключайте.", verdict("HW RESULT"), verdict("HW SHADER RESULT"), verdict("HW VRAM RESULT")),
-            120_000,
-        );
+        let all = checks.iter().all(|what| verdict(what) == "PASSED");
+        announce("Тест AMD начался", if all { "Железо PASSED. Не выключайте." } else { "Железо: есть FAILED. Не выключайте." }, 120_000);
         if let Some(speed) = lines.iter().find(|l| l.contains("HW VRAM SPEED")) {
             crate::kprintln!("==== AMD TEST: {speed} ====");
         }
         crate::usb::stick_log::flush_now();
+    }
+    #[cfg(target_arch = "x86_64")]
+    if firmware_file("SYNC.TXT").is_ok() {
+        crate::linux::drm::amdgpu::set_async(false);
     }
     // Узел DRM на карте - то, ради чего всё: RADV и DXVK берут его сами.
     if !driver_ready() {
@@ -1257,27 +1261,28 @@ fn radv_auto() {
         }
         if waited >= last_line + 30 || last_line == 0 {
             last_line = waited.max(1);
-            announce("Копируются программы", &format!("Из флешки в память, прошло {waited} с (обычно 2-8 минут). Не выключайте."), 40_000);
+            announce("Копируются программы", &format!("Прошло {waited} с из 2-8 мин. Не выключайте."), 40_000);
         }
         crate::sched::sleep_ms(2000);
     }
     if !present("/opt/proton/bin") {
-        announce("Тест AMD остановлен", "Proton не появился в /opt. Можно выключать, журнал на флешке.", 1_800_000);
+        announce("Тест AMD остановлен", "Нет Proton в /opt. Можно выключать.", 1_800_000);
         crate::usb::stick_log::flush_now();
         return;
     }
+    // Названия короткие: карточка уведомления узкая, длинное обрезается.
     let mut steps: Vec<(&str, &str, u32)> = alloc::vec![
-        ("vk", "Vulkan: vkprobe, vulkaninfo, vkcube", 600),
-        ("d3d", "Direct3D 9 (DXVK), создаётся префикс Wine", 900),
-        ("d3d11", "Direct3D 11 (DXVK)", 600),
-        ("d3d12", "Direct3D 12 (vkd3d)", 600),
-        ("vsync", "Скорость без VSync", 600),
+        ("vk", "Vulkan", 600),
+        ("d3d", "Direct3D 9", 900),
+        ("d3d11", "Direct3D 11", 600),
+        ("d3d12", "Direct3D 12", 600),
+        ("vsync", "скорость", 600),
     ];
     if present("/opt/tmnf/bin") {
-        steps.push(("tmnf", "Игра Trackmania, замер 60 с (первый запуск долгий)", 1900));
+        steps.push(("tmnf", "Trackmania", 1900));
     }
     if present("/opt/vlc/bin") || present("/opt/obs/bin") {
-        steps.push(("apps", "VLC и OBS: открыть окна", 300));
+        steps.push(("apps", "VLC и OBS", 300));
     }
     let total = steps.len() + 1;
     let mut results: Vec<String> = Vec::new();
@@ -1293,8 +1298,8 @@ fn radv_auto() {
         }));
     };
     for (number, (what, title, limit)) in steps.into_iter().enumerate() {
-        let previous = results.last().map_or(String::new(), |last| format!("Прошлый шаг: {last}. "));
-        announce(&format!("Шаг {}/{total}: {title}", number + 1), &format!("{previous}Подождите, не выключайте."), 600_000);
+        let previous = results.last().map_or(String::new(), |last| format!(" Было: {last}"));
+        announce(&format!("Шаг {}/{total}: {title}", number + 1), &format!("Не выключайте.{previous}"), 600_000);
         let verdict = run_gametest(what, limit);
         record(what, verdict, &mut results);
         crate::usb::stick_log::flush_now();
@@ -1303,16 +1308,14 @@ fn radv_auto() {
             break;
         }
     }
-    announce(&format!("Шаг {total}/{total}: архиватор 7-Zip"), "Подождите, не выключайте.", 120_000);
+    announce(&format!("Шаг {total}/{total}: 7-Zip"), "Не выключайте.", 120_000);
     if let Some(ok) = seven_zip_check() {
         record("7zip", Some(ok), &mut results);
     }
-    let summary = results.join(", ");
-    announce(
-        if failed == 0 { "Тест AMD завершён: всё прошло" } else { "Тест AMD завершён: есть ошибки" },
-        &format!("{summary}. Можно выключать, журнал на флешке."),
-        1_800_000,
-    );
+    crate::kprintln!("==== AMD TEST: summary: {} ====", results.join(", "));
+    let bad: Vec<&str> = results.iter().filter(|line| !line.ends_with(" PASS")).map(String::as_str).collect();
+    let text = if failed == 0 { String::from("Всё PASS. Можно выключать.") } else { format!("Выключайте. {}", bad.join(", ")) };
+    announce(if failed == 0 { "Тест AMD пройден" } else { "Тест AMD: есть ошибки" }, &text, 1_800_000);
     crate::usb::stick_log::flush_now();
 }
 
