@@ -18737,7 +18737,8 @@ freeos. The OBSOS repo is not changed.
   called but no upgrade transaction is set` (script thread, abort, browser gone). Before,
   IndexedDB never opened (SQLite errors); now the engine reaches this bug. **TODO (OBSOS
   repo, vendored servo-script):** no panic without an upgrade transaction; until then
-  the Rupor login in OBSOS probably still breaks off.
+  the Rupor login in OBSOS probably still breaks off. **Fixed 26.11** in F:\ObsosBrowser
+  (vendored servo-script, see "источник — F:\ObsosBrowser" below); obsos-storage passes.
 
 ## Rupor на CEF (F:\cef-test) под Proton — чёрное окно (25.11, hw-log19) - **причина найдена, не исправлено**
 
@@ -18865,6 +18866,81 @@ Chromium без ANGLE; на Windows это не мешает (уходит на 
 
 **TODO**: HiDPI (масштаб окна в obsos-core), GPU-путь на Windows, пересборка
 пакета `obsos` под FossAi из нового репозитория (нужен образ fossai-builder).
+
+### 26.11: источник — F:\ObsosBrowser (рабочее дерево), пакет пересобран
+
+Роман: «вынесли OBSOS в отдельный проект F:\ObsosBrowser, там работа большая
+проведена; интегрируй со всеми изменениями». Вся новая работа там ещё не
+закоммичена, поэтому источник — **рабочее дерево поверх c8f9827** (34 файла:
+несколько окон с переносом вкладок, новый хром `chrome.rs`, страницы
+`obsos://settings|history|bookmarks|downloads` (`webui*.rs`), DevTools-агент,
+управление из файла `--control` (`automation.rs`), журнал без секретов
+(`logs.rs`), `perf.rs`, Pacer кадров 40 Гц для swgl, GPU-вывод (`gpu_ctx.rs`),
+правки vendored servo-script: IndexedDB без двойного завершения транзакции и без
+паники `clear_upgrade_transaction`, `<style>` в shadow root, участки буфера
+servo-paint для нескольких окон).
+- `ports/servo/snapshot-obsos.ps1` копирует дерево в `build\obsos-src` (без .git,
+  target, dist, vendor) и пишет `.obsos-source` (HEAD, список изменений,
+  diff-sha256); `build-servoprobe.sh` по умолчанию собирает оттуда
+  (`/work/build/obsos-src`, отдельный том не нужен) и печатает `.obsos-source`.
+  `OBSOS_REV` — c8f9827 + пояснение и diff-sha256 снимка (484f6c96…).
+- **Исправлено в сборщике**: цикл подмен libc/mio ничего не делал — записей
+  `[[patch.unused]]` в копии Cargo.lock нет, пока cargo не пройдёт по нему раз;
+  новый lock ObsosBrowser снова потащил libc 0.2.191 (нет `wchar_t`/`off_t` у
+  freeos). Теперь сначала `cargo metadata`, потом `--precise`.
+- **Адаптация под FossAi не понадобилась**: obsos-core уже держит видеокарту под
+  `cfg(windows)` (на FossAi тип `Gpu` пустой — всегда swgl), настольные
+  настройки Servo (`layout_threads=-1`, пул 8 потоков, fontface, async
+  clipboard) под `cfg!(target_os="freeos")` пропускаются, новые методы
+  `HostWindow` (`open_window`, `gl_handles`, `waker`, `scale_factor`,
+  `set_fullscreen`, …) и `Platform` (`ui_font`, `utc_offset_minutes`) имеют
+  умолчания — obsos-fossai собирается без правок. Значит на FossAi: второе окно
+  (Ctrl+N) — отдельным процессом через `Platform::new_window`, без переноса
+  вкладок между окнами; F11 без полноэкранного режима; шрифт интерфейса —
+  встроенный egui (а не TTF системы); всё рисует swgl. В F:\ObsosBrowser ничего
+  не менялось.
+- **Ядро**: при всплеске ~100 потоков Servo на странице Rupor ядро падало
+  `KERNEL HEAP EXHAUSTED` сразу после «heap grown to 56 MiB»: выделение с
+  закрытыми прерываниями на одном ЦП не ждало рост кучи на другом
+  (`mm/heap.rs::grow`). Теперь ждёт ограниченное время (кроме случая, когда
+  растит этот же ЦП).
+- **libc `rename`** родных программ теперь заменяет существующий файл (POSIX;
+  ядро/ext2 отказывают `EEXIST` намеренно, edit.rs): цель-файл снимается
+  (`stat` → не каталог → `unlink`) и переименование повторяется; каталог —
+  `EISDIR`; как в Linux-слое (`linux/fsops.rs`). Нужно OBSOS: профиль, пароли,
+  загрузки и синхронизация пишут `x.tmp` и переименовывают поверх `x`
+  (profile.rs/vault.rs ошибку молча глотают). После правки libc:
+  `cargo xtask sdk` и перелинковка OBSOS
+  (`rm -rf /cache/target-servo/<арх>-unknown-freeos/release/build/obsos-fossai`
+  в контейнере, затем build-servoprobe.sh; по `.fingerprint` теперь не ищется —
+  у cargo новый build-dir).
+- **TODO (не решено): синхронизация в папку** (`--sync-folder`, сценарий
+  `servo-window`, шаг «sync ok pushed 1») по-прежнему «сеть: запись: File exists
+  (os error 17)» со второй синхронизации (browser-sync `remote/folder.rs`:
+  `fs::write(x.tmp)` + `fs::rename`), и с правкой libc тоже — то есть EEXIST
+  приходит уже после `unlink` (повторный rename) или не из rename. Разобрать в
+  госте (проба с `rename` поверх существующего файла на ext2 /home). Код
+  синхронизации в ObsosBrowser не менялся — это не регресс интеграции.
+- Сессия восстанавливается (новое в ObsosBrowser, `restore_session`):
+  `servo-window` теперь удаляет `~/.config/obsos/default/session.json` перед
+  запуском — иначе вкладки, оставленные на диске стенда другими сценариями
+  (web.pynop.online без сети → «Error loading page»), сбивают номера вкладок.
+  Закладки тоже живут на диске стенда: повторный `servo-window` без `install`
+  снимает закладку Ctrl+D (переключатель) и ждёт «bookmark added» зря —
+  гонять сразу после `install`.
+- Собрано: x86_64 (`servo-browser-x86_64` 130,7 МБ) и aarch64 (132,6 МБ),
+  инкрементально ~5 мин. Проверено в QEMU x86_64: `install`, `obsos-storage`
+  (visit 1 → перезапуск → visit 2, затем web.pynop.online/Account/Login —
+  страница входа Blazor нарисована, паники IndexedDB больше нет, браузер
+  закрывается сам), `servo-window` — до шага синхронизации всё проходит (окно,
+  прокрутка, ui frames, новая вкладка, obsos://view NOTICE, закладка Ctrl+D,
+  панель закладок), падает на «sync ok pushed 1» (TODO выше). Не прогонялись:
+  `obsos-downloads` (сценарий собирает образ), вход в Rupor с учётной записью
+  (`obsos-rupor`).
+- **TODO**: `Platform::ui_font` для FossAi (системный TTF вместо встроенного),
+  `HostWindow::open_window` (несколько окон в одном процессе — ядро умеет
+  несколько окон на программу?), `scale_factor` для HiDPI; когда Роман
+  закоммитит ObsosBrowser — перезакрепить `OBSOS_REV` на настоящий коммит.
 
 ## OBS для стримов: видеокарта по умолчанию, кадры через dma-buf, x264 для игр (25.11) - **сделано в коде, проверено в QEMU, проверить на железе**
 

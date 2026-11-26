@@ -1,25 +1,34 @@
 #!/bin/sh
 # Собрать OBSOS (браузер на Servo 0.8) и servoprobe под <арх>-unknown-freeos.
 #
-# Исходники OBSOS с 25.11.2026 — отдельный репозиторий
-# https://github.com/anomal3/OBSOS (MIT OR Apache-2.0; на ПК Романа —
-# E:\BlueGit\OBSOS, крейт obsos-fossai); его версия закреплена в
-# ports/servo/OBSOS_REV.
+# Исходники OBSOS — отдельный проект (git https://github.com/anomal3/OBSOS,
+# MIT OR Apache-2.0, крейт obsos-fossai). С 26.11.2026 на ПК Романа это
+# F:\ObsosBrowser, и берётся его РАБОЧЕЕ ДЕРЕВО (незакоммиченные правки
+# тоже): ports/servo/snapshot-obsos.ps1 копирует его в build/obsos-src
+# (= /work/build/obsos-src здесь) и пишет .obsos-source — из чего снимок.
+# ports/servo/OBSOS_REV — коммит, поверх которого лежит рабочее дерево.
 #
-#   docker run --rm -v <проект>:/work -v <OBSOS>:/obsos -v fossai-servo:/cache \
+#   powershell -File ports\servo\snapshot-obsos.ps1
+#   docker run --rm -v <проект>:/work -v fossai-servo:/cache \
 #       -v fossai-cargo-registry:/opt/cargo/registry \
 #       fossai-builder sh /work/ports/servo/builder/build-servoprobe.sh x86_64 [check]
 #
-# Второй аргумент `check` — только `cargo check`. Готовые программы —
-# build/linux/servo-browser-<арх> (в пакете /opt/obsos/bin/obsos) и
-# build/linux/servoprobe-<арх>.
+# Другой источник — `-e OBSOS=/obsos -v <OBSOS>:/obsos` (git-клон, пишется
+# vendor/). Второй аргумент `check` — только `cargo check`. Готовые
+# программы — build/linux/servo-browser-<арх> (в пакете
+# /opt/obsos/bin/obsos) и build/linux/servoprobe-<арх>.
 set -e
 ARCH=${1:-x86_64}
 MODE=${2:-build}
-OBSOS=${OBSOS:-/obsos}
-[ -f "$OBSOS/obsos-fossai/Cargo.toml" ] || { echo "нет OBSOS в $OBSOS: смонтируйте репозиторий OBSOS (-v <OBSOS>:/obsos)"; exit 1; }
-WANT=$(tr -d ' \r\n' < /work/ports/servo/OBSOS_REV)
-HAVE=$(git -C "$OBSOS" rev-parse HEAD 2>/dev/null || echo "?")
+OBSOS=${OBSOS:-/work/build/obsos-src}
+[ -f "$OBSOS/obsos-fossai/Cargo.toml" ] || { echo "нет OBSOS в $OBSOS: снимок ports/servo/snapshot-obsos.ps1 или -e OBSOS=/obsos -v <OBSOS>:/obsos"; exit 1; }
+WANT=$(head -c 40 /work/ports/servo/OBSOS_REV | tr -d ' \r\n')
+if [ -f "$OBSOS/.obsos-source" ]; then
+    sed -n '1,5p' "$OBSOS/.obsos-source"
+    HAVE=$(sed -n 's/^head: //p' "$OBSOS/.obsos-source" | tr -d '\r')
+else
+    HAVE=$(git -C "$OBSOS" rev-parse HEAD 2>/dev/null || echo "?")
+fi
 [ "$HAVE" = "$WANT" ] || echo "ВНИМАНИЕ: OBSOS на $HAVE, а закреплён $WANT (ports/servo/OBSOS_REV)"
 # Правки OBSOS в крейтах Servo (vendor/) — хостом, до окружения FreeOS.
 # Компоновщик хоста `cc` — clang образа (как в freeos-env.sh, тот ещё не подключён).
@@ -63,8 +72,11 @@ mkdir -p /cache/obsos-lock-$ARCH
 LOCK=/cache/obsos-lock-$ARCH/Cargo.lock
 cp -f "$OBSOS/Cargo.lock" "$LOCK"
 LOCKCFG="resolver.lockfile-path=\"$LOCK\""
+# [[patch.unused]] появляются в lock только после первого прохода cargo
+# (в копии из OBSOS их нет — без этого цикл ниже ничего не делал, 26.11.2026).
+cargo metadata -q --format-version 1 --config "$LOCKCFG" --config /tmp/patches.toml >/dev/null 2>&1 || true
 for pass in 1 2; do
-    awk '/^\[\[patch.unused\]\]/{u=1;next} u&&/^name = /{n=$3} u&&/^version = /{print n, $3; u=0}' "$LOCK" | tr -d '"' |
+    awk '/^\[\[patch.unused\]\]/{u=1;next} u&&/^name = /{n=$3} u&&/^version = /{print n, $3; u=0}' "$LOCK" | tr -d '"\r' |
     while read -r name version; do
         cargo update -q --config "$LOCKCFG" --config /tmp/patches.toml -p "$name" --precise "$version" 2>/dev/null || true
     done

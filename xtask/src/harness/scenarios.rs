@@ -14355,6 +14355,10 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(3_000),
             Step::Line("run /bin/pkg install /media/obsos-0.1.fpk"),
             Step::Await("pkg: installed obsos 0.1, ", 180_000),
+            // OBSOS restores the last session (F:\ObsosBrowser, 26.11): tabs left
+            // on the installed disk by other scenarios would shift the tab numbers.
+            Step::Line("rm /home/roman/.config/obsos/default/session.json"),
+            Step::Wait(1_000),
             // Синхронизация в папку (N10): площадка проверяется, сохраняется
             // в хранилище паролей и сразу синхронизируется.
             Step::Line("run /opt/obsos/bin/obsos --sync-folder /home/roman/obsos-sync"),

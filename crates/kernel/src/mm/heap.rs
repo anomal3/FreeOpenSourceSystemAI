@@ -256,6 +256,11 @@ unsafe impl GlobalAlloc for KernelHeap {
 
 /// Идёт ли рост кучи (см. [`grow`]).
 static GROWING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// CPU that holds [`GROWING`] (valid while it is set).
+static GROWER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+/// How long an allocation with interrupts off waits for another CPU's growth
+/// (spin iterations, tens of milliseconds; mapping 8 MiB takes far less).
+const GROW_WAIT_SPINS: u32 = 20_000_000;
 
 /// Шаг роста кучи.
 const GROW_STEP: usize = 8 * 1024 * 1024;
@@ -274,14 +279,27 @@ fn grow(need: usize) -> bool {
     use core::sync::atomic::Ordering;
     use crate::mm::FrameAllocator;
     let before = crate::mm::heap_size();
+    let mut patience = GROW_WAIT_SPINS;
     while GROWING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        // 26.11 (obsos-storage, OBSOS opening ~100 threads on the Rupor
+        // page): an allocation with interrupts off on one CPU while another
+        // CPU was growing the heap gave up at once - KERNEL HEAP EXHAUSTED
+        // right after "heap grown to 56 MiB". The grower on another CPU
+        // finishes without us, so wait for it a bounded time; only the
+        // grower's own CPU (an interrupt over it) or a grower that never
+        // comes back (preempted on this CPU) still fails as before.
         if !crate::arch::interrupts::enabled() {
-            return false;
+            if GROWER.load(Ordering::Relaxed) == crate::smp::cpu() || patience == 0 {
+                return false;
+            }
+            patience -= 1;
         }
         core::hint::spin_loop();
     }
+    GROWER.store(crate::smp::cpu(), Ordering::Relaxed);
     // Пока ждали, мог вырасти другой.
     if crate::mm::heap_size() != before {
+        GROWER.store(usize::MAX, Ordering::Relaxed);
         GROWING.store(false, Ordering::Release);
         return true;
     }
@@ -321,6 +339,7 @@ fn grow(need: usize) -> bool {
             crate::mm::set_heap_size(mapped);
         }
     }
+    GROWER.store(usize::MAX, Ordering::Relaxed);
     GROWING.store(false, Ordering::Release);
     if grown > 0 {
         kprintln!("  heap        : grown to {} MiB (limit {} MiB)", mapped >> 20, limit >> 20);
