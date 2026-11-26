@@ -4,6 +4,10 @@
 //! DirectInput game controllers, then XInput slots 0-3 polled every 10 ms;
 //! every change of a slot is a line `d3dprobe: xinput N buttons 0x.... lt ..`.
 //!
+//! `d3dprobe.exe mouse [секунды]` (26.11) - the mouse of a fullscreen game:
+//! own color cursor, raw input, `L` locks like a game in battle (see
+//! `mouse.rs`).
+//!
 //! `d3dprobe.exe monitors` (G5, 22.11) - `EnumDisplayMonitors` and the virtual
 //! screen as Wine sees them (one line per monitor).
 //!
@@ -16,6 +20,8 @@
 //! (20.11: vkd3d-proton, как у Diablo II Resurrected) и показывает.
 //! В stderr: имя адаптера, затем раз в 2 с строка `d3dprobe: N frames ... FPS` -
 //! сценарий ждёт её. Через заданное время (по умолчанию 0 = бесконечно) выходит сам.
+
+mod mouse;
 
 use std::time::{Duration, Instant};
 
@@ -670,6 +676,16 @@ fn main() {
         eprintln!("d3dprobe: start, pad");
         pad(seconds);
         eprintln!("d3dprobe: done, pad");
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("mouse") {
+        let seconds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(120);
+        eprintln!("d3dprobe: start, mouse");
+        if let Err(err) = mouse::mouse(seconds) {
+            eprintln!("d3dprobe: error {err}");
+            std::process::exit(1);
+        }
+        eprintln!("d3dprobe: done, mouse");
         return;
     }
     if args.get(1).map(String::as_str) == Some("monitors") {

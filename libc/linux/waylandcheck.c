@@ -95,8 +95,11 @@ enum {
     /* Clipboard (24.11): wl_data_device_manager, the device, our source. */
     ID_DDM, ID_DDEV, ID_SRC, ID_SYNC7,
     /* ext_data_control_manager_v1 (Wine's clipboard sync) and its device. */
-    ID_DCM, ID_DCDEV
+    ID_DCM, ID_DCDEV,
+    /* 26.11: own cursor image (wl_pointer.set_cursor with a surface). */
+    ID_CSURF, ID_CPOOL, ID_CBUF, ID_SYNC8
 };
+static int synced8;
 static uint32_t global_dcm, dc_offer;
 static int dc_text, dc_gnome, dc_sel, dc_files;
 /* Clipboard: the current offer and what it offers, the selection offer,
@@ -268,6 +271,8 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         src_cancelled = 1;
     } else if (id == ID_SYNC7 && opcode == 0) {
         synced7 = 1;
+    } else if (id == ID_SYNC8 && opcode == 0) {
+        synced8 = 1;
     } else if (id == ID_POPUP && opcode == 2) {
         repositioned_token = (int)args[0];
     } else if (id == ID_SYNC5 && opcode == 0) {
@@ -1571,6 +1576,30 @@ int main(int argc, char **argv) {
     printf("waylandcheck: preferred scale %d\n", frac_scale);
     check(frac_scale == 120, "wp_fractional_scale_v1 announces the preferred scale 1.0 (120)");
     check(token_done && !protocol_error, "xdg_activation_v1 hands out a token and activates the window");
+
+    /* 26.11 (Uot: no cursor over the fullscreen game): a program's own
+     * cursor image - a 24x24 magenta square with a white border, hotspot
+     * in the middle - over the window (Wine: SetCursor with a color
+     * cursor). The scenario takes a screenshot of it. */
+    begin(ID_COMPOSITOR, 0); /* create_surface */
+    put(ID_CSURF);
+    end();
+    shm_buffer(ID_CPOOL, ID_CBUF, 24, 24, 0xffff00ffu);
+    show(ID_CSURF, ID_CBUF, 24, 24);
+    begin(ID_POINTER, 0); /* set_cursor(serial, surface, hx, hy) */
+    put(0);
+    put(ID_CSURF);
+    put(12);
+    put(12);
+    end();
+    begin(ID_DISPLAY, 0);
+    put(ID_SYNC8);
+    end();
+    wait_for(&synced8, 5000);
+    printf("waylandcheck: own cursor shown\n");
+    fflush(stdout);
+    wait_for(&never, 3000);
+    check(synced8 && !protocol_error, "wl_pointer.set_cursor with a surface is taken");
 
     if (global_relative && global_constraints) {
         bind_global(global_relative, "zwp_relative_pointer_manager_v1", 1, ID_RELMGR);

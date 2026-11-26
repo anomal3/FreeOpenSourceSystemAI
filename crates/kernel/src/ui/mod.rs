@@ -7338,6 +7338,19 @@ pub fn window_rect(task: u32, slot: u32) -> Option<Rect> {
     with_desktop(|desktop| desktop.rect_of(App::Program(task, slot))).flatten()
 }
 
+/// 26.11: the pointer in the pixels of a program window (from the corner
+/// of its content) - where a pointer lock that moved the pointer in put it.
+pub fn pointer_in_window(task: u32, slot: u32) -> Option<(i32, i32)> {
+    with_desktop(|desktop| {
+        let (x, y) = desktop.pointer_position();
+        desktop.find(App::Program(task, slot)).map(|window| {
+            let (ox, oy) = window.content_origin();
+            (x - ox, y - oy)
+        })
+    })
+    .flatten()
+}
+
 /// G5 (21.11): where a popup of the program window `slot` may go - the
 /// corner of the window's pixels (popup anchors count from it) and the
 /// monitor under `point` (relative to that corner; the popup's anchor). A
@@ -7412,7 +7425,9 @@ pub const WIN_RELMOTION: u32 = 0x101;
 /// in its pixels (`None` - the whole window); `wanted == None` drops it.
 pub fn constrain_pointer(task: u32, slot: u32, wanted: Option<(bool, Option<Rect>)>) {
     let app = App::Program(task, slot);
-    with_desktop(|desktop| {
+    // 26.11: waits for a busy desktop - a lost request left the desktop
+    // confining while Wine had switched to a lock (no relative motion).
+    with_desktop_waiting(|desktop| {
         desktop.set_constraint(app, wanted);
         desktop.present();
     });
@@ -7494,10 +7509,21 @@ pub fn direct_command(argument: &str) -> String {
 /// G3: `wl_pointer.set_cursor` - the program hides (`hidden`, null cursor
 /// surface) or shows the pointer while it is over its window.
 pub fn client_cursor(task: u32, slot: u32, hidden: bool) {
-    with_desktop(|desktop| {
+    with_desktop_waiting(|desktop| {
         desktop.set_client_cursor(App::Program(task, slot), hidden);
         desktop.present();
     });
+}
+
+/// 26.11: `wl_pointer.set_cursor` with a surface that has a buffer - the
+/// program's own cursor image over its window (Wine: `SetCursor` with a
+/// game's color cursor). `false` - the desktop was busy, try again.
+pub fn client_cursor_image(task: u32, slot: u32, image: pointer::CustomCursor) -> bool {
+    with_desktop(|desktop| {
+        desktop.set_client_image(App::Program(task, slot), Some(image), false);
+        desktop.present();
+    })
+    .is_some()
 }
 
 /// G3: raise and focus a program window (`xdg_activation_v1.activate`).

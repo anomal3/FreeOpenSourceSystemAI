@@ -19189,7 +19189,7 @@ pointer on surface 3 (persistent)`, `pointer locked`, нажатия идут в
    Proton) и `wayland` (waylandcheck ставит свой курсор 24x24, снимок
    `wayland-cursor` над окном во весь экран).
 
-**Проверка в QEMU**: @@QEMU@@
+**Проверка в QEMU**: `wayland` passes: the 24x24 cursor of waylandcheck is drawn over the window shown directly (photos/tests/wayland-x86_64-release-wayland-cursor.png, 18x18 magenta core at the pointer). `proton-mouse` (two 1280x800 monitors, GE-Proton 11-12): d3dprobe fullscreen on monitor 2, its 32x32 ring cursor drawn over it (`shows its own cursor image 32x32 (hotspot 16,16)`, screenshot proton-mouse-cursor of head 1: 232 yellow ring pixels at the pointer), WM_INPUT and WM_MOUSEMOVE in the cursor phase; the lock with the pointer brought in from monitor 1 (`pointer enters surface 3 for the constraint`, `relative motion under the constraint: 100,0 ... focus on surface 3 of the window`) gave WM_INPUT raw dx 200 dy 60 = the harness moves 100+100,60 (run mouse8). Found on the way: a lost desktop request (busy) left the desktop confining while Wine had switched to a lock (`pointer unconfined` vs `pointer unlocked`); `ui::constrain_pointer`/`client_cursor` now wait for the desktop. One run right after creating the prefix got the relative motion to Wine with focus but no WM_INPUT - not understood yet (winewayland never logs `Enabling relative motion`: relative mode stays off, raw input comes only from the raw part of the motion), see the HW checklist.
 
 **Проверить на железе (Uot на втором мониторе)** - в LOG.TXT:
 - `desktop : 'taot' shows its own cursor image ...` - если игра ставит свой
