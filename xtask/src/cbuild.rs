@@ -1266,6 +1266,7 @@ mod tests {
             "SYS_FDCTL" => abi::SYS_FDCTL as i64,
             "FDCTL_NONBLOCK" => abi::FDCTL_NONBLOCK as i64,
             "FDCTL_FLAGS" => abi::FDCTL_FLAGS as i64,
+            "FDCTL_TRUNCATE" => abi::FDCTL_TRUNCATE as i64,
             "FD_NONBLOCK" => abi::FD_NONBLOCK,
             "SYS_FLOCK" => abi::SYS_FLOCK as i64,
             "SYS_CHMOD" => abi::SYS_CHMOD as i64,
