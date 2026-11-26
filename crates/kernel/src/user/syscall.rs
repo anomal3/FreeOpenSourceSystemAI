@@ -3262,6 +3262,9 @@ fn pipe_write_waiting(writer: &super::pipe::Writer, ptr: usize, len: usize) -> i
 
 /// `SYS_FDCTL` (фаза 66b): режим дескриптора — см. договор.
 fn fdctl(fd: usize, op: usize, arg: usize) -> i64 {
+    if op == user_abi::FDCTL_TRUNCATE {
+        return fd_truncate(fd, arg as u64);
+    }
     let result = super::with_current(|program| match op {
         user_abi::FDCTL_NONBLOCK => program.files.set_nonblock(fd, arg != 0).map(|()| 0),
         user_abi::FDCTL_FLAGS => program
@@ -3272,6 +3275,26 @@ fn fdctl(fd: usize, op: usize, arg: usize) -> i64 {
     });
     match result {
         Some(Ok(answer)) => answer,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
+/// [`user_abi::FDCTL_TRUNCATE`] (26.11): `ftruncate` of native programs — the
+/// file must be open for writing; the length changes outside the program lock
+/// (disk I/O), as in the Linux layer.
+fn fd_truncate(fd: usize, length: u64) -> i64 {
+    let node = super::with_current(|program| {
+        if program.files.access_mode(fd)? != 2 {
+            return Err(FileError::BadFd);
+        }
+        program.files.node(fd)
+    });
+    match node {
+        Some(Ok(node)) => match node.truncate(length) {
+            Ok(()) => 0,
+            Err(err) => vfs_errno(err),
+        },
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
     }
@@ -3308,9 +3331,6 @@ fn fswatch(a0: usize, a1: usize, a2: usize) -> i64 {
                 Err(err) => return err,
             };
             // Следить можно за тем, что можно читать.
-    if op == user_abi::FDCTL_TRUNCATE {
-        return fd_truncate(fd, arg as u64);
-    }
             match crate::fs::resolve_as(super::credentials(), path, crate::vfs::perm::Access::READ) {
                 Some(Ok(node)) if node.metadata().kind == crate::vfs::NodeKind::Directory => {}
                 Some(Ok(_)) => return vfs_errno(crate::vfs::VfsError::WrongKind),
@@ -3324,26 +3344,6 @@ fn fswatch(a0: usize, a1: usize, a2: usize) -> i64 {
             queue.add(path, mask).map_or(ERR_LIMIT, i64::from)
         }
         user_abi::FSWATCH_REMOVE => match queue_of(fd) {
-}
-
-/// [`user_abi::FDCTL_TRUNCATE`] (26.11): `ftruncate` of native programs — the
-/// file must be open for writing; the length changes outside the program lock
-/// (disk I/O), as in the Linux layer.
-fn fd_truncate(fd: usize, length: u64) -> i64 {
-    let node = super::with_current(|program| {
-        if program.files.access_mode(fd)? != 2 {
-            return Err(FileError::BadFd);
-        }
-        program.files.node(fd)
-    });
-    match node {
-        Some(Ok(node)) => match node.truncate(length) {
-            Ok(()) => 0,
-            Err(err) => vfs_errno(err),
-        },
-        Some(Err(err)) => errno(err),
-        None => ERR_NO_PROGRAM,
-    }
             Ok(queue) if queue.remove(a1 as i32) => 0,
             Ok(_) => user_abi::ERR_NOT_FOUND,
             Err(err) => err,

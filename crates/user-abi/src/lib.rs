@@ -1527,11 +1527,11 @@ pub const FDCTL_NONBLOCK: usize = 1;
 pub const FDCTL_FLAGS: usize = 2;
 /// Бит ответа [`FDCTL_FLAGS`]: дескриптор не ждёт.
 pub const FD_NONBLOCK: i64 = 1;
-
 /// [`SYS_FDCTL`] (26.11): new length of a file open for writing — the
 /// argument (`ftruncate`; SQLite's journal in OBSOS). Not a file open for
 /// writing — [`ERR_BAD_FD`]; a file system without it — its error.
 pub const FDCTL_TRUNCATE: usize = 3;
+
 /// Звук: `(действие, адрес, длина) -> ответ` (фаза 67f).
 ///
 /// Действия — `SOUND_*`. Отсчёты — 16 бит со знаком, little-endian, два канала
@@ -2034,7 +2034,10 @@ pub const TIME_NOW: i64 = i64::MIN;
 pub const TIME_OMIT: i64 = i64::MIN + 1;
 
 /// Screen capture for the recorder (22.11, `/bin/screenrec`):
-/// `(action, a1, a2) -> answer`. One capture at a time on the whole system.
+/// `(action, a1, a2) -> answer`. One recording at a time; other captures
+/// (OBS sources through `/dev/fossai-capture`, 26.11) run next to it, one
+/// kernel session per captured rectangle (a monitor, the desktop, a window)
+/// shared by everybody capturing that rectangle.
 ///
 /// The compositor keeps a mirror of the captured rectangle in ordinary
 /// memory, filled at present time from the composed bands (or the client
@@ -2102,9 +2105,47 @@ pub const CAP_WINDOWS: usize = 6;
 /// «Параметры → Дисплей» shows (the place of the monitor in the registry),
 /// so the lists of OBS and of the settings agree with what is on the screens.
 pub const CAP_IDENTIFY: usize = 7;
+/// [`SYS_SCREENCAP`] (26.11): `a1` = [`CapCursor`] — the pointer over the
+/// recorder's capture: its place, hotspot and picture (a copy only when the
+/// caller's [`CapCursor::have_serial`] is old). `/dev/fossai-capture` answers
+/// the same for the capture of the open (`FOSSAI_CAP_CURSOR`, `F`, 10).
+pub const CAP_CURSOR: usize = 8;
 
 /// [`CapSpec::flags`]: draw the pointer into the frames.
 pub const CAP_POINTER: u32 = 1;
+
+/// [`CapCursor::flags`]: the pointer is shown.
+pub const CAP_CURSOR_VISIBLE: u32 = 1;
+/// [`CapCursor::flags`]: the compositor drew the pointer into the composed
+/// frames itself (software pointer) — a consumer must not draw it again.
+pub const CAP_CURSOR_IN_FRAME: u32 = 2;
+/// [`CapCursor::flags`]: the picture was copied into [`CapCursor::image`] now.
+pub const CAP_CURSOR_IMAGE: u32 = 4;
+
+/// The pointer over a capture — argument and answer of [`CAP_CURSOR`].
+///
+/// The picture is `width`×`height` points `0xAARRGGBB` (straight alpha), rows
+/// packed; its top-left corner is at `x, y` of the captured rectangle (the
+/// hotspot is already subtracted; it may lie partly or wholly outside).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CapCursor {
+    /// In: where to copy the picture (0 — nowhere) and the room there in bytes.
+    pub image: u64,
+    pub image_len: u32,
+    /// In: the picture number the caller has (0 — none).
+    pub have_serial: u32,
+    /// Out: the number of the current picture (changes with the shape).
+    pub serial: u32,
+    /// Out: `CAP_CURSOR_*`.
+    pub flags: u32,
+    pub x: i32,
+    pub y: i32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    pub width: u32,
+    pub height: u32,
+}
 
 /// Monitors on the desktop (desktop coordinates, top-left of the union is
 /// 0,0) — answer of [`CAP_INFO`].

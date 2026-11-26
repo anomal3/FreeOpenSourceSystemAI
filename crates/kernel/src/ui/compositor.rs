@@ -5591,7 +5591,7 @@ impl Compositor {
                     if super::capture::active() && super::capture::mirror_direct() {
                         if let Some(shown) = self.windows.get(window) {
                             if let Some(pixels) = shown.direct_pixels() {
-                                super::capture::put(part, pixels, part.x - shown.rect.x, part.y - shown.rect.y);
+                                super::capture::put_direct(part, pixels, part.x - shown.rect.x, part.y - shown.rect.y);
                             }
                         }
                     }
@@ -5801,7 +5801,7 @@ impl Compositor {
         // into grabbed frames, see `capture::note_pointer`; 25.11: not when
         // OBS samples the client buffer itself).
         if super::capture::active() && super::capture::mirror_direct() {
-            super::capture::put(part, pixels, part.x - w.x, part.y - w.y);
+            super::capture::put_direct(part, pixels, part.x - w.x, part.y - w.y);
         }
         if !self.hw_cursor && self.pointer.is_visible() {
             let spot = self.pointer.rect().intersect(&part);

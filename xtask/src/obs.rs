@@ -555,6 +555,73 @@ const SCENES_JSON: &str = r#"{
 }
 "#;
 
+/// Коллекция сцен «FossAi-2-monitors» (26.11, стримерам с двумя мониторами):
+/// два источника «Захват экрана FossAi» — монитор 1 и монитор 2 (`monitor` —
+/// место в списке, основной первым: годится на любом ПК), каждый — свой
+/// захват ядра в родном размере монитора, на холсте основного монитора
+/// рядом, по половине. Выбрать: «Коллекция сцен» в OBS или
+/// `fossai-obs --collection FossAi-2-monitors` (сценарий `obs-monitors`).
+const SCENES_2MON_JSON: &str = r#"{
+    "name": "FossAi-2-monitors",
+    "current_scene": "Два монитора",
+    "current_program_scene": "Два монитора",
+    "scene_order": [{"name": "Два монитора"}],
+    "current_transition": "Затухание",
+    "transition_duration": 300,
+    "transitions": [],
+    "groups": [],
+    "quick_transitions": [],
+    "modules": {},
+    "sources": [
+        {
+            "id": "scene",
+            "versioned_id": "scene",
+            "name": "Два монитора",
+            "uuid": "6f1a1d2e-0b7a-4c1e-9a10-f05a10000011",
+            "settings": {
+                "id_counter": 3,
+                "custom_size": false,
+                "items": [
+                    {"name": "Монитор 1", "source_uuid": "6f1a1d2e-0b7a-4c1e-9a10-f05a10000012", "visible": true, "locked": false,
+                     "rot": 0.0, "pos": {"x": 0.0, "y": 0.0}, "scale": {"x": 0.5, "y": 0.5}, "align": 5,
+                     "bounds_type": 0, "bounds_align": 0, "bounds": {"x": 0.0, "y": 0.0}, "crop_left": 0, "crop_top": 0,
+                     "crop_right": 0, "crop_bottom": 0, "id": 1, "group_item_backup": false},
+                    {"name": "Монитор 2", "source_uuid": "6f1a1d2e-0b7a-4c1e-9a10-f05a10000013", "visible": true, "locked": false,
+                     "rot": 0.0, "pos": {"x": 640.0, "y": 0.0}, "scale": {"x": 0.5, "y": 0.5}, "align": 5,
+                     "bounds_type": 0, "bounds_align": 0, "bounds": {"x": 0.0, "y": 0.0}, "crop_left": 0, "crop_top": 0,
+                     "crop_right": 0, "crop_bottom": 0, "id": 2, "group_item_backup": false},
+                    {"name": "Звук рабочего стола", "source_uuid": "6f1a1d2e-0b7a-4c1e-9a10-f05a10000014", "visible": true,
+                     "locked": false, "rot": 0.0, "pos": {"x": 0.0, "y": 0.0}, "scale": {"x": 1.0, "y": 1.0}, "align": 5,
+                     "bounds_type": 0, "bounds_align": 0, "bounds": {"x": 0.0, "y": 0.0}, "crop_left": 0, "crop_top": 0,
+                     "crop_right": 0, "crop_bottom": 0, "id": 3, "group_item_backup": false}
+                ]
+            }
+        },
+        {
+            "id": "fossai_screen_capture",
+            "versioned_id": "fossai_screen_capture",
+            "name": "Монитор 1",
+            "uuid": "6f1a1d2e-0b7a-4c1e-9a10-f05a10000012",
+            "settings": {"monitor": 0, "show_cursor": true}
+        },
+        {
+            "id": "fossai_screen_capture",
+            "versioned_id": "fossai_screen_capture",
+            "name": "Монитор 2",
+            "uuid": "6f1a1d2e-0b7a-4c1e-9a10-f05a10000013",
+            "settings": {"monitor": 1, "show_cursor": true}
+        },
+        {
+            "id": "alsa_input_capture",
+            "versioned_id": "alsa_input_capture",
+            "name": "Звук рабочего стола",
+            "uuid": "6f1a1d2e-0b7a-4c1e-9a10-f05a10000014",
+            "settings": {"device_id": "default", "rate": 48000}
+        }
+    ]
+}
+"#;
+
 /// Запуск: окружение и `exec` OBS.
 const SCRIPT: &str = r#"#!/bin/bash
 # OBS Studio (23.11.2026): Debian 13 obs-studio через слой Linux; окно - Qt6
@@ -689,6 +756,10 @@ if [ ! -e "$C/global.ini" ] || { [ -e "$f" ] && ! LD_LIBRARY_PATH= grep -q '^Fos
     done
     say "profile FossAi: canvas ${BW}x${BH} (monitor ${MON:-?}), output ${OW}x${OH}, x264 veryfast with $X264T threads of $N CPUs"
 fi
+# Коллекции сцен пакета, которых ещё нет (26.11: «FossAi-2-monitors» у тех,
+# кто запускал OBS раньше), - без замены своих.
+LD_LIBRARY_PATH= mkdir -p "$C/basic/scenes"
+LD_LIBRARY_PATH= cp -n $P/share/fossai/obs-studio/basic/scenes/*.json "$C/basic/scenes/" 2>/dev/null
 cd $P/bin
 # Qt требует UTF-8: локаль C.UTF-8 glibc 2.41 - своя (LOCPATH), только для
 # программ пакета (bash и coreutils Debian 12 выше её не видят; bash сам
@@ -914,6 +985,7 @@ pub fn build(arch: Arch) -> Result<()> {
         ("basic/profiles/FossAi/streamEncoder.json", STREAM_ENCODER_JSON),
         ("basic/profiles/FossAi/recordEncoder.json", RECORD_ENCODER_JSON),
         ("basic/scenes/FossAi.json", SCENES_JSON),
+        ("basic/scenes/FossAi-2-monitors.json", SCENES_2MON_JSON),
     ] {
         files.push((format!("share/fossai/obs-studio/{path}"), text.as_bytes().to_vec(), 0o644));
     }
