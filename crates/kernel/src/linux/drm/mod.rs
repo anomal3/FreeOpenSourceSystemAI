@@ -485,10 +485,13 @@ pub fn install_dmabuf(bo: Arc<Bo>) -> i64 {
 /// dma-buf.
 pub fn dmabuf_seek(fd: usize, offset: i64, whence: usize) -> Option<i64> {
     let object = object_of(fd)?;
-    let buf = object.as_any().downcast_ref::<gem::DmaBuf>()?;
+    let size = match object.as_any().downcast_ref::<amdgpu::AmdDmaBuf>() {
+        Some(buf) => buf.memory().1,
+        None => object.as_any().downcast_ref::<gem::DmaBuf>()?.bo().size,
+    };
     Some(match (offset, whence) {
         (0, 0) => 0,
-        (0, 2) => buf.bo().size as i64,
+        (0, 2) => size as i64,
         _ => -e::EINVAL,
     })
 }
