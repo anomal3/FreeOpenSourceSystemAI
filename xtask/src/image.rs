@@ -396,6 +396,21 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     say!("на живую флешку не попал {}: нет файла", path.display());
                 }
             }
+            // Chromium (26.11) — с `FOSSAI_WITH_CHROMIUM=1`; тоже на корне Debian,
+            // ставится в `/opt/chromium` после него (`LIVE_ORDER` в usb/storage.rs).
+            if built.release && crate::chromium::enabled() {
+                let debian = format!("{}/DEBIAN.FPK", arch::PAYLOAD_PKG_DIR);
+                let path = crate::debian::package_path();
+                if !payload.iter().any(|item| item.path == debian) && path.is_file() {
+                    payload.push(read_payload(&debian, &path)?);
+                }
+                let path = crate::chromium::package_path();
+                if path.is_file() {
+                    payload.push(read_payload(&format!("{}/CHROMIUM.FPK", arch::PAYLOAD_PKG_DIR), &path)?);
+                } else {
+                    say!("на живую флешку не попал {}: нет файла", path.display());
+                }
+            }
         }
         Kind::Installer => {
             let installer = built.get(Component::Installer).ok_or_else(|| {

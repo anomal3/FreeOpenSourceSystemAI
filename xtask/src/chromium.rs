@@ -40,6 +40,12 @@ pub fn package_path() -> PathBuf {
     cbuild::games_dir().join(PACKAGE_FILE)
 }
 
+/// Класть ли Chromium на носитель (26.11, Роман: «chromium браузер, что делали,
+/// в сборку помести»): пакет в 350 МБ — только по `FOSSAI_WITH_CHROMIUM=1`.
+pub fn enabled() -> bool {
+    std::env::var("FOSSAI_WITH_CHROMIUM").is_ok_and(|value| value == "1")
+}
+
 /// Бинарник внутри пакета `chromium`.
 const BINARY: &str = "usr/lib/chromium/chromium";
 

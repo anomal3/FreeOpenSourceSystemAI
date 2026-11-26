@@ -182,8 +182,8 @@ fn live_packages(mount: &str) {
 /// 23.11: сначала Debian, Proton и OBS Studio (`obs`, своя glibc), потом
 /// игра и остальное — пакеты ставятся строго по одному, память `/opt`
 /// растёт только под распакованное.
-const LIVE_ORDER: [&str; 10] =
-    ["debian", "proton", "obs", "vlc", "tmnf", "obsos", "gridcraf", "wordcraf", "pdfcraft", "mailcraf"];
+const LIVE_ORDER: [&str; 11] =
+    ["debian", "proton", "obs", "vlc", "chromium", "tmnf", "obsos", "gridcraf", "wordcraf", "pdfcraft", "mailcraf"];
 
 static LIVE_QUEUE: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
 static LIVE_RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
