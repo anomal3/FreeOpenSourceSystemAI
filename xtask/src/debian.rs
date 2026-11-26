@@ -247,6 +247,9 @@ fn build_check(sysroot: &std::path::Path, source: &str) -> Result<PathBuf> {
     cmd.arg("--target=x86_64-linux-gnu")
         .arg(format!("--sysroot={}", sysroot.display()))
         .args(["-O2", "-Wall", "-Werror", "-fPIE", "-pie", "-fuse-ld=lld", "-nostdlib"])
+        // clang 23 (поставлен winget-ом 26.11) ругается на глобальные счётчики проб, которые только пишутся;
+        // прежние clang этого предупреждения не знают, поэтому и «неизвестное предупреждение» не ошибка.
+        .args(["-Wno-unknown-warning-option", "-Wno-unused-but-set-global"])
         .arg("-Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2")
         .arg(lib.join("Scrt1.o"))
         .arg(lib.join("crti.o"))
