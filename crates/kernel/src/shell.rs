@@ -1519,6 +1519,33 @@ fn run_builtin(line: &str) -> bool {
                 if on { "percpu" } else { "global" }
             );
         }
+        // Task priorities (25.11.2026, `sched/prio.rs`): nice by weight and
+        // the foreground boost; `prio` alone - the CPU share by nice since
+        // the last look.
+        "prio" => {
+            let mut words = argument.split_whitespace();
+            match (words.next(), words.next(), words.next()) {
+                (Some("on"), None, _) => crate::sched::prio::set_enabled(true),
+                (Some("off"), None, _) => crate::sched::prio::set_enabled(false),
+                (Some("rr"), None, _) => crate::sched::prio::set_round_robin(),
+                (Some("fg"), Some("on"), None) => crate::sched::prio::set_fg_enabled(true),
+                (Some("fg"), Some("off"), None) => crate::sched::prio::set_fg_enabled(false),
+                (Some("reset"), None, _) => {
+                    let _ = crate::sched::prio::take_shares();
+                }
+                // `prio set <task id> <nice>` - every thread of its program.
+                (Some("set"), Some(id), Some(nice)) => match (id.parse::<u32>(), nice.parse::<i32>()) {
+                    (Ok(id), Ok(nice)) => match crate::sched::prio::set_process_nice(id, nice) {
+                        Ok(count) => sprintln!("  prio: #{id}: nice {nice} for {count} thread(s)"),
+                        Err(err) => sprintln!("  prio: #{id}: {err}"),
+                    },
+                    _ => sprintln!("  prio: usage `prio set <task id> <nice -20..19>`"),
+                },
+                (None, ..) => {}
+                _ => sprintln!("  prio: usage `prio [on|off|rr|reset|fg on|fg off|set <task id> <nice>]`"),
+            }
+            sprintln!("  prio: {}", crate::sched::prio::diag_line());
+        }
         // Право `jit` проверочным программам Linux из `/compat/linux/bin`
         // (P5, 18.11.2026): там нет пакета, который назвал бы его, а проба
         // `rwxprobe` проверяет именно память «на запись и исполнение».

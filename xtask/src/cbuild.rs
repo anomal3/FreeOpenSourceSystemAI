@@ -738,8 +738,10 @@ pub fn builtins(arch: Arch) -> PathBuf {
 /// `drmprobe`/`nvkprobe` (18.11.2026) — узел DRM nouveau для NVK (общий
 /// `drmprobe.h` рядом); `amdprobe` (22.11.2026) — узел DRM amdgpu для RADV. `evdevprobe` (24.11.2026) —
 /// геймпад `/dev/input/event0` и его sysfs так, как их читает `winebus.sys` Proton.
-const LINUX_PROGRAMS: [&str; 18] = [
-    "hello", "futexv", "sigasync", "shmprobe", "wow32probe", "netlinkprobe", "ntsyncprobe", "heapgrow", "rwxprobe", "futexlat", "hangprobe", "drmprobe", "nvkprobe", "forkpoll", "tlblat", "rdlat", "evdevprobe", "amdprobe",
+const LINUX_PROGRAMS: [&str; 19] = [
+    "hello", "futexv", "sigasync", "shmprobe", "wow32probe", "netlinkprobe", "ntsyncprobe", "heapgrow", "rwxprobe",
+    "futexlat", "hangprobe", "drmprobe", "nvkprobe", "forkpoll", "tlblat", "rdlat", "evdevprobe", "prioprobe",
+    "amdprobe",
 ];
 
 /// Общие флаги проверочных программ Linux.
@@ -1265,6 +1267,7 @@ mod tests {
             "SYS_FDCTL" => abi::SYS_FDCTL as i64,
             "FDCTL_NONBLOCK" => abi::FDCTL_NONBLOCK as i64,
             "FDCTL_FLAGS" => abi::FDCTL_FLAGS as i64,
+            "FDCTL_TRUNCATE" => abi::FDCTL_TRUNCATE as i64,
             "FD_NONBLOCK" => abi::FD_NONBLOCK,
             "SYS_FLOCK" => abi::SYS_FLOCK as i64,
             "SYS_CHMOD" => abi::SYS_CHMOD as i64,

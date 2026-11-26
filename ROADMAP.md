@@ -18940,7 +18940,7 @@ by interrupt` и `network : receive task …, woken by interrupt`; при бол
 адаптера; повышение прав для не-root; MSI-X и разгрузки RTL8125 (контрольные суммы,
 TSO); SACK/быстрый повтор по тройному дублю ACK в TCP.
 
-## OBSOS: вход в Rupor web (web.pynop.online) и журнал страниц (25.11, hw-log19) - **исправлено в коде OBSOS, пакет не пересобран**
+## OBSOS: вход в Rupor web (web.pynop.online) и журнал страниц (25.11, hw-log19) - **OBSOS rebuilt 26.11: localStorage works; Servo IndexedDB panic on Rupor - TODO in OBSOS**
 
 Роман: в OBSOS не войти в Rupor (Blazor WebAssembly + SignalR). Разбор на
 настоящем Servo 0.8 (servoshell того же выпуска, без окна, через WebDriver) с
@@ -19003,6 +19003,33 @@ Servo с нуля — часы и десятки ГБ на C: (Docker) — ну�
 `obsos-fix.js` в `~/.config/obsos/default/userscripts/` чинит только поля). Эмодзи на странице Rupor — квадраты (нет
 шрифта эмодзи). `navigator.serviceWorker` в Servo нет (PWA без офлайна, на вход
 не влияет).
+
+**Rebuild 26.11** (from the OBSOS repo, `ports/servo/OBSOS_REV` = c8f9827): the builder
+image `fossai-builder` rebuilt (~5 min; apt retries in the Dockerfile, deb.debian.org
+dropped connections), Servo from scratch in empty volumes: x86_64 ~11 min, aarch64
+~9 min (16 threads). `build-servoprobe.sh`: host `cc` before OBSOS's `cargo xtask
+vendor`; its own Cargo.lock in the volume (`/cache/obsos-lock-ARCH`,
+`resolver.lockfile-path`): OBSOS's Cargo.lock has libc 0.2.191 and mio 1.2.5, so the
+FreeOS copies (libc 0.2.189, mio 1.2.4) stayed unused and libc did not build for
+freeos. The OBSOS repo is not changed.
+- **cause 3** (found by scenario `obsos-storage`): without WAL SQLite truncates its
+  journal with `ftruncate`, which native programs did not have (`ENOSYS`): `Failed to
+  get storage environment: SystemIoFailure 1546` (SQLITE_IOERR_TRUNCATE),
+  localStorage threw QuotaExceededError. Now `SYS_FDCTL` `FDCTL_TRUNCATE` (a file
+  open for writing; `Node::truncate`, like `ftruncate` of the Linux layer) and
+  `ftruncate`/`truncate` in `libc/freeos/files.c` (after a change: `cargo xtask sdk`
+  and relink OBSOS).
+- scenario `obsos-storage` (no account): host page `/storage.html` counts its visits
+  in localStorage (console.warn, an `app log` line), the browser is closed and opened
+  again (`visit 2`), then web.pynop.online/Account/Login. Run 26.11: visit 1, visit 2
+  after the restart (localStorage persists), `app log` lines present, the Rupor login
+  page came up (window title = the Blazor app's title). **Fails later:** Servo 0.8
+  panics in IndexedDB on the Rupor page - `idbdatabase.rs:169 clear_upgrade_transaction
+  called but no upgrade transaction is set` (script thread, abort, browser gone). Before,
+  IndexedDB never opened (SQLite errors); now the engine reaches this bug. **TODO (OBSOS
+  repo, vendored servo-script):** no panic without an upgrade transaction; until then
+  the Rupor login in OBSOS probably still breaks off. **Fixed 26.11** in F:\ObsosBrowser
+  (vendored servo-script, see "источник — F:\ObsosBrowser" below); obsos-storage passes.
 
 ## Rupor на CEF (F:\cef-test) под Proton — чёрное окно (25.11, hw-log19) - **причина найдена, не исправлено**
 
@@ -19131,6 +19158,125 @@ Chromium без ANGLE; на Windows это не мешает (уходит на 
 **TODO**: HiDPI (масштаб окна в obsos-core), GPU-путь на Windows, пересборка
 пакета `obsos` под FossAi из нового репозитория (нужен образ fossai-builder).
 
+### 26.11: источник — F:\ObsosBrowser (рабочее дерево), пакет пересобран
+
+Роман: «вынесли OBSOS в отдельный проект F:\ObsosBrowser, там работа большая
+проведена; интегрируй со всеми изменениями». Вся новая работа там ещё не
+закоммичена, поэтому источник — **рабочее дерево поверх c8f9827** (34 файла:
+несколько окон с переносом вкладок, новый хром `chrome.rs`, страницы
+`obsos://settings|history|bookmarks|downloads` (`webui*.rs`), DevTools-агент,
+управление из файла `--control` (`automation.rs`), журнал без секретов
+(`logs.rs`), `perf.rs`, Pacer кадров 40 Гц для swgl, GPU-вывод (`gpu_ctx.rs`),
+правки vendored servo-script: IndexedDB без двойного завершения транзакции и без
+паники `clear_upgrade_transaction`, `<style>` в shadow root, участки буфера
+servo-paint для нескольких окон).
+- `ports/servo/snapshot-obsos.ps1` копирует дерево в `build\obsos-src` (без .git,
+  target, dist, vendor) и пишет `.obsos-source` (HEAD, список изменений,
+  diff-sha256); `build-servoprobe.sh` по умолчанию собирает оттуда
+  (`/work/build/obsos-src`, отдельный том не нужен) и печатает `.obsos-source`.
+  `OBSOS_REV` — c8f9827 + пояснение и diff-sha256 снимка (484f6c96…).
+- **Исправлено в сборщике**: цикл подмен libc/mio ничего не делал — записей
+  `[[patch.unused]]` в копии Cargo.lock нет, пока cargo не пройдёт по нему раз;
+  новый lock ObsosBrowser снова потащил libc 0.2.191 (нет `wchar_t`/`off_t` у
+  freeos). Теперь сначала `cargo metadata`, потом `--precise`.
+- **Адаптация под FossAi не понадобилась**: obsos-core уже держит видеокарту под
+  `cfg(windows)` (на FossAi тип `Gpu` пустой — всегда swgl), настольные
+  настройки Servo (`layout_threads=-1`, пул 8 потоков, fontface, async
+  clipboard) под `cfg!(target_os="freeos")` пропускаются, новые методы
+  `HostWindow` (`open_window`, `gl_handles`, `waker`, `scale_factor`,
+  `set_fullscreen`, …) и `Platform` (`ui_font`, `utc_offset_minutes`) имеют
+  умолчания — obsos-fossai собирается без правок. Значит на FossAi: второе окно
+  (Ctrl+N) — отдельным процессом через `Platform::new_window`, без переноса
+  вкладок между окнами; F11 без полноэкранного режима; шрифт интерфейса —
+  встроенный egui (а не TTF системы); всё рисует swgl. В F:\ObsosBrowser ничего
+  не менялось.
+- **Ядро**: при всплеске ~100 потоков Servo на странице Rupor ядро падало
+  `KERNEL HEAP EXHAUSTED` сразу после «heap grown to 56 MiB»: выделение с
+  закрытыми прерываниями на одном ЦП не ждало рост кучи на другом
+  (`mm/heap.rs::grow`). Теперь ждёт ограниченное время (кроме случая, когда
+  растит этот же ЦП).
+- **libc `rename`** родных программ теперь заменяет существующий файл (POSIX;
+  ядро/ext2 отказывают `EEXIST` намеренно, edit.rs): цель-файл снимается
+  (`stat` → не каталог → `unlink`) и переименование повторяется; каталог —
+  `EISDIR`; как в Linux-слое (`linux/fsops.rs`). Нужно OBSOS: профиль, пароли,
+  загрузки и синхронизация пишут `x.tmp` и переименовывают поверх `x`
+  (profile.rs/vault.rs ошибку молча глотают). После правки libc:
+  `cargo xtask sdk` и перелинковка OBSOS
+  (`rm -rf /cache/target-servo/<арх>-unknown-freeos/release/build/obsos-fossai`
+  в контейнере, затем build-servoprobe.sh; по `.fingerprint` теперь не ищется —
+  у cargo новый build-dir).
+- **TODO (не решено): синхронизация в папку** (`--sync-folder`, сценарий
+  `servo-window`, шаг «sync ok pushed 1») по-прежнему «сеть: запись: File exists
+  (os error 17)» со второй синхронизации (browser-sync `remote/folder.rs`:
+  `fs::write(x.tmp)` + `fs::rename`), и с правкой libc тоже — то есть EEXIST
+  приходит уже после `unlink` (повторный rename) или не из rename. Разобрать в
+  госте (проба с `rename` поверх существующего файла на ext2 /home). Код
+  синхронизации в ObsosBrowser не менялся — это не регресс интеграции.
+- Сессия восстанавливается (новое в ObsosBrowser, `restore_session`):
+  `servo-window` теперь удаляет `~/.config/obsos/default/session.json` перед
+  запуском — иначе вкладки, оставленные на диске стенда другими сценариями
+  (web.pynop.online без сети → «Error loading page»), сбивают номера вкладок.
+  Закладки тоже живут на диске стенда: повторный `servo-window` без `install`
+  снимает закладку Ctrl+D (переключатель) и ждёт «bookmark added» зря —
+  гонять сразу после `install`.
+- Собрано: x86_64 (`servo-browser-x86_64` 130,7 МБ) и aarch64 (132,6 МБ),
+  инкрементально ~5 мин. Проверено в QEMU x86_64: `install`, `obsos-storage`
+  (visit 1 → перезапуск → visit 2, затем web.pynop.online/Account/Login —
+  страница входа Blazor нарисована, паники IndexedDB больше нет, браузер
+  закрывается сам), `servo-window` — до шага синхронизации всё проходит (окно,
+  прокрутка, ui frames, новая вкладка, obsos://view NOTICE, закладка Ctrl+D,
+  панель закладок), падает на «sync ok pushed 1» (TODO выше). Не прогонялись:
+  `obsos-downloads` (сценарий собирает образ), вход в Rupor с учётной записью
+  (`obsos-rupor`).
+- **TODO**: `Platform::ui_font` для FossAi (системный TTF вместо встроенного),
+  `HostWindow::open_window` (несколько окон в одном процессе — ядро умеет
+  несколько окон на программу?), `scale_factor` для HiDPI; когда Роман
+  закоммитит ObsosBrowser — перезакрепить `OBSOS_REV` на настоящий коммит.
+
+### 26.11 (позже): правки OBSOS с WebGL и WebRTC, браузер помечен BETA
+
+Роман: «Там правки по OBSOS браузеру пришли, надо их добавить — там WebGL и
+WebRTC, и браузер обязательно в FossAi пометить как BETA».
+- **Снимок**: прошлая работа в ObsosBrowser закоммичена (39bf29e), сверху 16
+  файлов, затем всё закоммичено как **f29cb49 = OBSOS v0.1.1** (чистое дерево;
+  `OBSOS_REV` теперь настоящий коммит, `.obsos-source`: dirty 0): WebGL
+  на Windows (правки surfman/wgl, `connection()` у GPU-контекста страниц,
+  `dom_webgl2_enabled`), звонки WebRTC (TURN из `iceServers`,
+  `track.enabled/stop`, каналы данных не создаются по кругу, вопрос «Сайт просит доступ к микрофону/камере»,
+  JS-прослойка `addTrack`/`connectionState`), `mask-image` для значков
+  (servo-layout). Пересобрано без правок в F:\ObsosBrowser: x86_64 и aarch64.
+- **Что из этого на FossAi**: **WebGL — нет**, честный отказ: у obsos-fossai нет
+  фичи Servo `webgl`, а программный вывод swgl не даёт `connection()` (surfman
+  без программного бэкенда, OSMesa в surfman 0.14 нет) — `getContext('webgl')`
+  и `'webgl2'` возвращают `null`, браузер не падает. **WebRTC — нет**: нужен
+  GStreamer (`servo/media-gstreamer`), у нас движок медиа `dummy`, и
+  `Platform::webrtc_available()` у FossAi по умолчанию `false` —
+  `RTCPeerConnection` странице не виден. `mask-image` на FossAi выключен самим
+  obsos-core (`!cfg!(target_os="freeos")`, «не проверялось»). Проверка —
+  сценарий **`obsos-webgl`** (страница `/webgl.html` хоста: `webgl=no webgl2=no
+  rtc=undefined`, 2D-холст рисуется).
+- **BETA** (всё на стороне FossAi, снимок не правился): ярлык стола «Браузер
+  (BETA)», значок телефона «OBSOS (BETA)» (`ui/icons.rs`); подпись пакета
+  `caption` «OBSOS (BETA) — Браузер» (её показывают «Пуск», закреплённые
+  `pkg:obsos`, «Открыть с помощью»), `summary`/`about` пакета (`package.rs`),
+  умолчание `apps/obsos/caption` (`sysconf/store.rs`); **заголовок окна**:
+  ядро вставляет « (BETA)» после «OBSOS» в заголовки окон программы
+  `/opt/obsos/bin/obsos` (`user/syscall.rs::beta_title`, вызовы winopen и
+  wintitle; всплывающие окна не трогаются) — «OBSOS (BETA) — <страница>» в
+  полосе заголовка, на панели задач и в Alt+Tab. Сценарии ждут теперь
+  «OBSOS (BETA) — Браузер».
+- **Проверено в QEMU x86_64** (26.11): `install`, `obsos-storage` (visit 1/2,
+  страница входа Rupor), `obsos-webgl`: страница получила `webgl=no webgl2=no
+  rtc=undefined getUserMedia=false` (Servo: «The rendering context has no
+  surfman connection, WebGL will be unavailable»), без паник; снимки
+  `photos\tests\obsos-webgl-x86_64-release-obsos-beta-{desktop,webgl}.png` —
+  ярлык «Браузер (BETA)», уведомление «OBSOS (BETA) — Браузер установлен»,
+  заголовок «OBSOS (BETA) — OBSOS WebGL».
+- **TODO**: WebGL на FossAi — только с бэкендом surfman поверх нашего GL (Mesa
+  есть лишь в слое Linux) или программным GL под нативный freeos; звонки — с
+  GStreamer под freeos. Метка в боковой шапке хрома («OBSOS», chrome.rs) —
+  только правкой obsos-core; сейчас BETA в заголовке окна от ядра.
+
 ## OBS для стримов: видеокарта по умолчанию, кадры через dma-buf, x264 для игр (25.11) - **сделано в коде, проверено в QEMU, проверить на железе**
 
 Роман: стример должен играть и писать/транслировать, как на Windows. В hw-log19
@@ -19221,15 +19367,280 @@ Mesa EGL, перебирающий устройства при `LIBGL_ALWAYS_SOF
   (H.264/HEVC) в NVK Mesa 25.0 нет - кодирует x264 на ЦП. Когда в NVK появится
   `VK_KHR_video_encode_h264` - кодировщик OBS через FFmpeg Vulkan
   (`h264_vulkan`) или свой.
-- **`nice` не действует**: ядро принимает `setpriority` и молча игнорирует
+- ~~**`nice` не действует**~~ - сделано 25.11, см. «Приоритеты задач» ниже. Было: ядро принимает `setpriority` и молча игнорирует
   (планировщик без приоритетов, `linux/mod.rs` `SETPRIORITY => 0`). Нужен класс
   «фоновых» задач в `sched` (наследуется при `clone`), не строгий, чтобы OBS
   под нагрузкой не замирал. Пока OBS держат в рамках потоки: x264 2-4,
   llvmpipe 4.
-- Два монитора двумя источниками - по-прежнему один захват охватывающего
-  прямоугольника (5120x1440 - копия кольца вдвое больше); нужен захват ядра на
-  несколько прямоугольников.
-- Буфер игры отдаётся без указателя (игры его обычно прячут) и только целым
+- ~~Два монитора двумя источниками - один захват охватывающего прямоугольника~~ - сделано 26.11 (сеансы по прямоугольникам, раздел ниже).
+- Буфер игры - только целым
   монитором (окно игры = монитор, scanout).
 - Окно OBS само попадает в захват основного монитора (как на Windows без
   «Исключить окно»).
+
+## OBS для стримов: каждый монитор своим захватом, указатель в кадре игры (26.11) - **сделано в коде, проверено в QEMU, проверить на железе**
+
+Роман (стримеры): два источника «Захват экрана FossAi» на мониторы 1 и 2 всё
+равно захватывали один прямоугольник 5120x1440 (один захват ядра на систему,
+модуль OBS брал охватывающую рамку и вырезал части); в кадре игры, который OBS
+берёт из её собственного буфера (scanout), и при курсоре адаптера указателя
+не было.
+
+**Сделано**
+1. **Сеансы захвата по прямоугольникам** (`ui/capture.rs`). Сеанс - один
+   захватываемый прямоугольник (монитор в родном размере, весь стол, место
+   окна) со своим зеркалом; до 8 сразу. Все, кто захватывает тот же
+   прямоугольник, делят сеанс (`capture : joined WxH at X,Y (session N, 2
+   consumers, no second copy)`): второй источник того же монитора или «Запись
+   экрана» этого монитора не стоят второй копии. Стол копирует составленные
+   полосы во все задетые сеансы (`put`), окно на весь экран - во все, кроме
+   тех, где все потребители берут буфер игры сами (`put_direct`, режим без
+   копий 25.11 стал по сеансу). «Запись экрана» (`SYS_SCREENCAP`) - один
+   потребитель (одна запись), OBS ей больше не мешает и наоборот (раньше
+   второй захват ждал `ERR_EXISTS`/`EBUSY`). Сирота - только запись (4 с без
+   захвата кадра); сеанс `/dev/fossai-capture` кончается закрытием
+   дескриптора.
+2. **`/dev/fossai-capture`** (`linux/fossaicap.rs`): каждый открытый
+   дескриптор держит свой сеанс (`START` второй раз - `EBUSY`), кольцо dma-buf
+   и буфер игры - по своему сеансу (игра на мониторе 1 - буфер игры только у
+   источника монитора 1).
+3. **Указатель отдельно** - `FOSSAI_CAP_CURSOR` (`F`,10) / `CAP_CURSOR` (8)
+   `SYS_SCREENCAP`, структура `user_abi::CapCursor`: картинка 48x48
+   `0xAARRGGBB` (копируется, только когда номер картинки `serial` новый),
+   точка прицела, место относительно захваченного прямоугольника, флаги
+   `VISIBLE` и `IN_FRAME` (стол сам нарисовал указатель в кадре -
+   программный указатель, несколько мониторов). Модуль OBS запускает захват
+   **без** `CAP_POINTER` и рисует указатель своим прямоугольником с
+   альфой поверх кадра (как xshm/PipeWire в OBS), обрезая по краю источника -
+   и поверх кольца, и поверх буфера игры. Сдвиг указателя больше не стоит
+   копии всего кадра. Флажок «Показывать курсор» (по умолчанию включён).
+   «Запись экрана» по-прежнему получает указатель вписанным в кадр ядром
+   (`CAP_POINTER`, та же картинка), в том числе у монитора с игрой.
+4. **Модуль OBS** (`libc/linux/obs-fossai.c`): поток захвата ведёт по
+   «потоку» на каждый различный прямоугольник источников (свой дескриптор,
+   кольцо/копия процессором, текстуры, указатель); источники одного
+   прямоугольника делят поток. Список мониторов и «Определить» - как раньше,
+   «Весь рабочий стол» - отдельный сеанс.
+5. **Коллекция сцен «FossAi-2-monitors»** (`xtask/src/obs.rs`): два
+   источника (монитор 1 и 2 по месту в списке - годится на любом ПК) рядом
+   по половине холста; `fossai-obs` докладывает недостающие коллекции пакета
+   и тем, кто запускал OBS раньше.
+
+**Проверено в QEMU** (`set FOSSAI_WITH_OBS=1`, `cargo xtask thirdparty -a
+x86_64 --only obs`, `cargo xtask test -r -a x86_64 -s
+install,obs-monitors,obs-cursor,obs-dmabuf -j 1`; `screenrec` - тоже):
+- `obs-monitors` (два монитора 1280x800, коллекция FossAi-2-monitors, копия процессором): `capture : started 1280x800 at 0,0 ..., session 1 of 1` и `started 1280x800 at 1280,0 ..., session 2 of 2`, у OBS `capturing 1280x800 at 0,0` и `at 1280,0`, строки `2560x800` нет; снимок превью - два монитора рядом, каждый целиком. «Запись экрана» второго монитора в это время: `capture : joined 1280x800 at 1280,0 (session 2, 2 consumers, no second copy)`, файл прошёл `--probe`. Неизменный монитор 2 за прогон - 49 захватов кадра против 2424 у монитора 1 (кадр без изменений ничего не копирует). Запись OBS F9/F10, ffprobe 1280x800. Указатель в QEMU с двумя мониторами рисует стол (`- in the composed frame already`) - источник его не удваивает.
+- `obs-cursor` (один монитор, курсор адаптера virtio-gpu: `desktop : the pointer is drawn by the display adapter`): `[fossai-capture] pointer 48x48 (hotspot 16,16) over 1280x800 at 0,0 - drawn by the source`; на снимке превью стрелка видна в превью OBS (снимок экрана QEMU курсора адаптера не содержит - это квадрат источника).
+- `obs-dmabuf`: кольцо по сеансу (`dma-buf import works`, `frames: dma-buf ring`); шаг `frames:` больше не зависит от порядка строк журнала (кадры начинались раньше окна OBS).
+- `screenrec` (живая система) - ок.
+- Не проверено в QEMU: стрелка поверх буфера игры (нужен scanout игры на NVIDIA), F9 в `obs-cursor` без щелчка по окну до OBS не доходил - запись проверена в `obs-monitors`.
+
+**Что смотреть на железе (LOG.TXT)**
+1. Два источника на два монитора: `capture : started 2560x1440 at 0,0 ...,
+   session 1 of 1` и `... at 2560,0 ..., session 2 of 2`, в журнале OBS
+   `[fossai-capture] capturing 2560x1440 at 0,0` и `at 2560,0`; строки
+   `capturing 5120x1440` быть не должно. С GPU - два кольца `dma-buf ring of 3
+   for 2560x1440`.
+2. Указатель: `[fossai-capture] pointer 48x48 (hotspot ...) over ... - drawn
+   by the source` (стрелка в превью и записи над игрой) или `- in the composed
+   frame already (software pointer)` (стол рисует сам - два монитора без
+   игры). Игра на весь экран (`the source samples the fullscreen window's
+   buffer (no copy) (session N)`) - стрелка над игрой должна быть видна в
+   превью OBS, если игра её не прячет.
+3. «Запись экрана» монитора, который уже захватывает OBS: `capture : joined
+   ...`, файл пишется, у OBS кадры не пропадают.
+
+**Не сделано (TODO)**
+- Указатель, который игра рисует своей поверхностью (`wl_pointer.set_cursor`,
+  работа агента ввода игр): `CapCursor` отдаёт картинку `Pointer::image` -
+  если своя картинка клиента не попадает туда, в кадре будет стрелка стола.
+- Картинка указателя - 48x48 без учёта масштаба монитора («Крупный указатель»
+  - да).
+- «Весь рабочий стол» вместе с источниками мониторов - отдельный сеанс:
+  составленные полосы копируются и туда (вторая копия тех же точек); можно
+  брать его из сеансов мониторов.
+- Источник окна при перемещении окна перезапускает сеанс (на миг пусто).
+
+## Приоритеты задач: nice с весами CFS, игра на переднем плане сильнее OBS (25.11, hw-log19) - **сделано, проверено в QEMU (1 и 4 ЦП), проверить на железе**
+
+hw-log19: OBS под `nice -n 5` (потоки llvmpipe и x264) отнимал ЦП у игры, которую
+писал: планировщик давал каждому готовому одинаковый квант 10 мс по кругу, а
+`setpriority` принимался и забывался.
+
+**Как устроено** (`crates/kernel/src/sched/prio.rs`, выбор - `pick_weighted` в
+`sched/mod.rs`)
+- У задачи nice -20..19 и политика (`SCHED_OTHER/BATCH/IDLE/FIFO/RR`). Вес - таблица
+  Linux CFS (`user_abi::NICE_WEIGHTS`: nice 0 = 1024, шаг ~1.25x; `SCHED_IDLE` = 3,
+  FIFO/RR = вес nice -20, отдельного класса реального времени нет - крутящийся
+  поток реального времени машину не повесит).
+- Виртуальное время: время на ЦП / вес (`user_abi::weighted_ns`), начисляется на
+  переключении (`cputime_switch_out`). Из своей очереди ЦП берёт задачу с
+  наименьшим; в конце кванта текущая **остаётся**, пока её время не больше, чем у
+  лучшей ждущей. Две занятые задачи nice 0 и 10 делят ЦП ~90/10, 0 и 5 ~75/25,
+  равные - 50/50 как раньше.
+- Виртуальное время - одна шкала на всю машину с «полом» (`MIN_VR`): пол идёт
+  за наименьшим временем исполняющихся задач (`CPU_VR`), никогда назад.
+  Проснувшаяся встаёт не раньше пола минус 5 мс (интерактивная - первой, долгий
+  сон не копится в кредит).
+- Между ЦП: в конце кванта ЦП смотрит и чужие очереди; задача, отставшая больше
+  чем на `MIGRATE_COST` (3 мс), берётся вместо своей. Поток, стоящий за более
+  тяжёлыми, отстаёт и переезжает на ЦП с более лёгкой работой - доля по весу
+  держится на всех ЦП (первая версия со шкалой на каждый ЦП давала на 4 ЦП только
+  75/25). Задачи, поставленные простаивающему ЦП (его уже разбудили), не
+  перехватываются.
+- Не тронуто: классы впереди всех (разбуженные прерыванием/вводом, драйверы, стол
+  при вводе), `sched_yield` отдаёт ЦП любому готовому, hrsleep, fence irq, режим
+  `schedq global` (там тот же выбор по виртуальному времени под замком).
+- **Передний план**: потоки программы, чьё окно в фокусе (то же адресное
+  пространство - игра Proton это один процесс Wine), считаются на `FG_BONUS` = 3
+  шага nice выше (вес ~2x). Фокус сообщает стол (`ui::with_desktop` ->
+  `prio::note_focus`).
+- Наследование: nice и политика копируются в `spawn_raw` от родителя (fork, clone,
+  spawn); `execve` их не трогает - `nice -n 5 obs` работает.
+
+**Вызовы Linux** (`linux/sched_prio.rs`): `getpriority/setpriority` (PRIO_PROCESS
+- поток по tid, как в Linux; PRIO_PGRP - процесс; PRIO_USER - все программы
+пользователя), `sched_setscheduler/getscheduler/setparam/getparam`,
+`sched_get_priority_max/min`, `sched_setattr/getattr`. Права как в Linux по
+умолчанию: владелец может только повышать nice, понижать - root
+(`RLIMIT_NICE` = 0: wineserver видит `nice_limit` 20 и не раздаёт Windows-приоритеты
+потоков через nice), чужие задачи и FIFO/RR - root (`EPERM`/`EACCES`).
+
+**Родной API**: `SYS_PRIORITY` = 101 (`PRIO_GET`, `PRIO_SET_PROCESS`,
+`PRIO_SET_THREAD`), обёртки `user_progs::priority`/`set_priority`; классы Windows
+`user_abi::PrioClass` (Высокий -10, Выше среднего -5, Обычный 0, Ниже среднего 5,
+Низкий 10; «Реального времени» показывается, не задаётся). `SYS_TASKS` отдаёт в
+конце строки `\t<nice>\t<policy>`.
+
+**Диспетчер задач**: «Подробности» - столбец «Приоритет»; контекстное меню (правый
+щелчок по строке в «Процессах» и «Подробностях», `M`) - «Задать приоритет ›» с
+подменю классов (текущий - жирным, «Реального времени» серый). Повысить
+приоритет без root - «повысить приоритет может только администратор (root)».
+
+**Оболочка**: `prio [on|off|rr]` (off - все веса 1024, выбор по-прежнему по виртуальному времени - поровну; rr - старый круг до 25.11), `prio fg on|off`,
+`prio reset`, `prio set <задача> <nice>` (все потоки её программы); `prio` и
+`perf-diag` печатают долю ЦП по nice с прошлого раза, долю переднего плана,
+счётчики «остался»/«перетянут».
+
+**Проверка**
+- `cargo test -p user-abi`: веса, правило выбора на модели одного ЦП (0/10 - 88..93 %,
+  0/5 - 72..78 %, -3/5 - >= 83 %, nice 19 рядом с -20 не голодает), классы.
+- `cargo xtask test -r -a x86_64 -s prio1,prio -j 1` (`libc/linux/prioprobe.c`):
+  - 1 ЦП (`prio1`): 1+1 потока nice 0/10 - **90.4/9.6** (теория 90.3); `prio off` - 54.1/45.9.
+  - 4 ЦП (`prio`): 4+4 потока - **89.7/10.3** (прогон до этого - 90.4/9.6); `prio off` - 50.0/50.0; вызовы
+    setpriority/getpriority/fork/RLIMIT_NICE/sched_*/sched_*attr - все ok.
+  - Диспетчер задач: Подробности -> M -> «Задать приоритет ›» -> «Ниже среднего»
+    (`photos/tests/prio-*-01-priority-menu.png`, `-02-priority-set.png`).
+  - Регрессия: `hrsleep`, `threads`, `schedq`, `smp` - ok.
+
+**Что смотреть на железе (LOG.TXT)**
+1. `perf-diag   : prio on (foreground boost on, task #<игра>); cpu share by nice:
+   nice 0 ...% nice 5 ...%; foreground ...%` - под игрой с OBS доля nice 5 (OBS)
+   должна упасть против hw-log19, а foreground - быть большей частью.
+2. Если игра стала хуже: `prio fg off`, затем `prio off` (старый круг) - и
+   сравнить к/с; строки `stays`/`pulls` в perf-diag.
+3. Диспетчер задач -> Подробности: у OBS «Ниже среднего» (nice 5).
+
+**Не сделано (TODO)**
+- Вытеснения при пробуждении нет: проснувшийся тяжёлый поток ждёт конца кванта
+  текущего (до 10 мс), если он не из классов впереди (как и раньше).
+- Переезд между ЦП - только в конце кванта и при простое (нет периодической
+  балансировки по весу очередей, как в CFS).
+- Группы задач (cgroup/autogroup) нет: 8 потоков OBS против 4 потоков игры делят ЦП
+  по потокам, не по процессам; держит OBS в рамках nice 5 и ограничение потоков.
+- Передний план - по адресному пространству окна: wineserver игры не поднимается.
+
+## Мышь в полноэкранных играх Proton: свой курсор программы, вход указателя при захвате, отчёт об относительном движении (26.11, Uot) - **сделано, QEMU: см. ниже; проверить на железе**
+
+Роман (Uot, Unity D3D11 через DXVK, во весь экран на втором мониторе): курсора
+не видно, башня не слушается мыши. Строки Wine «compositor doesn't support
+optional zwp_pointer_constraints_v1 / zwp_relative_pointer_manager_v1» - из
+старых журналов (13.11-17.11, `build/test/proton-*.log`): оба глобала есть с G3
+(e275cd1, 21.11), и в hw-log19 Uot ими пользуется: `#1485 asks to lock the
+pointer on surface 3 (persistent)`, `pointer locked`, нажатия идут в окно.
+
+**Что Wine делает с мышью** (winewayland `wayland_pointer.c`): курсор программы
+(`SetCursor`, цветной курсор игры) - поверхность в `wl_pointer.set_cursor`;
+`ClipCursor` при скрытом курсоре - `lock_pointer`, при видимом - `confine_pointer`
+с областью; `SetCursorPos` без `wp_pointer_warp_v1` - короткий захват с
+подсказкой положения. Относительное движение (`zwp_relative_pointer_v1`) Wine
+шлёт сырым вводом (`WM_INPUT`, им Unity считает поворот камеры/башни) **только
+окну с фокусом указателя** (`focused_hwnd` из `wl_pointer.enter`), иначе молча
+выбрасывает.
+
+**Сделано**
+1. **Курсор программы** (`wl_pointer.set_cursor` с поверхностью): сервер читает
+   буфер поверхности курсора (ARGB/XRGB shm, до 128x128, точка прицела из
+   запроса) при `set_cursor` и при каждом `commit` поверхности и отдаёт столу
+   (`ui::client_cursor_image`). Стол рисует его вместо своей стрелки, пока
+   указатель над окном программы (`Pointer::set_custom`), - в сборке кадра, в
+   заплатке поверх окна, показанного напрямую (`blit_direct`), в курсоре
+   адаптера и в курсоре головы NVIDIA при флипе (`image()`/`image_key()`).
+   Пустая поверхность - стрелка скрыта, как было. Журнал: `desktop : '<окно>'
+   shows its own cursor image WxH (hotspot X,Y)`.
+2. **Вход указателя при захвате**: захват стол включает сразу (G5), перенося
+   указатель в окно с другого монитора без события движения - окно не получало
+   `wl_pointer.enter`, а захваченный указатель уже не двигается: Wine выбрасывал
+   всё относительное движение. Теперь при включении ограничения окно получает
+   `enter` в точке указателя: `wayland : #N pointer enters surface S for the
+   constraint`.
+3. **Отчёт на железе**: по концу захвата/ограничения (Win, Alt+Tab, программа
+   сняла его, выход) - `wayland : #N K relative motion(s) during the constraint,
+   sum dx,dy; A without wl_pointer focus on the window, B without
+   zwp_relative_pointer_v1` и `pointer unlocked (constraint destroyed by the
+   client)`.
+4. **Проба Windows** `d3dprobe.exe mouse [с]` (`tools/d3dprobe/src/mouse.rs`):
+   окно без рамки во весь второй монитор, свой цветной курсор (жёлтое кольцо),
+   сырой ввод `WM_INPUT`, `WM_MOUSEMOVE`, кнопки; `L` - захват как у игры в бою
+   (курсор скрыт, `ClipCursor`, `SetCursorPos` в середину каждый такт), `U` -
+   отпустить, `Esc` - выход. Строки `d3dprobe: mouse <фаза>: raw dx .. dy ..`.
+   На живой флешке руками: `run -b /opt/debian/bin/bash
+   /opt/proton/bin/fossai-proton /opt/proton/share/fossai/d3dprobe.exe mouse 300`.
+5. Сценарии: `proton-mouse` (новый; два монитора 1280x800, после `install` с
+   Proton) и `wayland` (waylandcheck ставит свой курсор 24x24, снимок
+   `wayland-cursor` над окном во весь экран).
+
+**Проверка в QEMU**: `wayland` passes: the 24x24 cursor of waylandcheck is drawn over the window shown directly (photos/tests/wayland-x86_64-release-wayland-cursor.png, 18x18 magenta core at the pointer). `proton-mouse` (two 1280x800 monitors, GE-Proton 11-12): d3dprobe fullscreen on monitor 2, its 32x32 ring cursor drawn over it (`shows its own cursor image 32x32 (hotspot 16,16)`, screenshot proton-mouse-cursor of head 1: 232 yellow ring pixels at the pointer), WM_INPUT and WM_MOUSEMOVE in the cursor phase; the lock with the pointer brought in from monitor 1 (`pointer enters surface 3 for the constraint`, `relative motion under the constraint: 100,0 ... focus on surface 3 of the window`) gave WM_INPUT raw dx 200 dy 60 = the harness moves 100+100,60 (run mouse8). Found on the way: a lost desktop request (busy) left the desktop confining while Wine had switched to a lock (`pointer unconfined` vs `pointer unlocked`); `ui::constrain_pointer`/`client_cursor` now wait for the desktop. One run right after creating the prefix got the relative motion to Wine with focus but no WM_INPUT - not understood yet (winewayland never logs `Enabling relative motion`: relative mode stays off, raw input comes only from the raw part of the motion), see the HW checklist.
+
+**Проверить на железе (Uot на втором мониторе)** - в LOG.TXT:
+- `desktop : 'taot' shows its own cursor image ...` - если игра ставит свой
+  курсор, он виден над окном (и в меню, и при показе без сборки кадра);
+- `wayland : #N pointer locked` в бою, затем по выходу из боя/Alt+Tab строка
+  `relative motion(s) during the constraint`: K > 0 и `0 without wl_pointer
+  focus` - движение дошло до Wine. K > 0, а башня стоит - дело в Unity (сырой
+  ввод), тогда нужен `WINEDEBUG=+rawinput` или `d3dprobe mouse` на той же флешке;
+  K = 0 - движение не доходит до окна (журнал с этим - ко мне).
+
+**Осталось**: `wp_pointer_warp_v1` (Wine 11 ставит курсор им, у нас - через
+короткий захват с подсказкой); `wp_cursor_shape_v1` (формы курсора по имени);
+масштаб поверхности курсора (`set_buffer_scale`) не учитывается (у нас 1).
+
+## Регрессия 26.11: smp, chromium, рост кучи — **сделано**
+
+- **smp** падал не на старте процессоров (все 4 онлайн), а на снимке `tasks`:
+  dhcp и sshd спят до одного срока и просыпаются парой, с оболочкой на
+  третьем процессоре один из них вытесняет жгущую программу (CFS, c7ef918) —
+  снимок честно показывает её не на процессоре (3 провала из 6 за 26.11, до
+  этого ~1 из 20). Новый шаг `Step::Together(команда, конец ответа, строки,
+  попыток)`: все строки обязаны быть в **одном** ответе, иначе команда
+  повторяется (до 5 раз) — доказательство одновременности не ослаблено.
+- **smp, выход**: после «all tasks finished» линия бесконечно повторяла
+  кольцо очереди (128 KiB) и «processors asked to stop» не приходило.
+  Останавливаемый процессор в `arch::halt()` зовёт `drain_and_stop_queue`,
+  а загрузочный в это время в `pump()` между отправкой куска и `tail +=`:
+  хвост уходил за голову, `head - tail` оборачивался. Теперь drain берёт флаг
+  `PUMPING` (с ограниченным ожиданием) и отдаёт его, `pump` двигает хвост,
+  только если его никто не трогал, и считает разность с насыщением.
+- **chromium** (и wayland, wine, chromium-window, ipc/net-проверки на Debian):
+  сценарии цепочки установленной системы делят диск; предыдущий удаляет
+  Debian последней командой, QEMU гасится сразу, и удаление не доходит до
+  диска (writeback) — следующий видел «debian is already installed» и ждал
+  5 минут. Теперь такие сценарии сначала делают `pkg remove`. Сам Chromium
+  headless из linuxweb-150 работает (страница, JS, DOM, выход 0).
+- **Куча ядра**: флаг роста и номер растущего процессора — один атомик
+  (`GROWER`), без окна, в котором прерывание на растущем процессоре не узнавало
+  своего и крутилось весь срок с закрытыми прерываниями.
+
+**Осталось**: у нативных программ нет `sync` — `pkg` не сбрасывает учёт на
+диск, и выдернутое питание сразу после `pkg remove`/`install` оставляет
+рассогласованный учёт (в Linux-слое `sync()` есть: `fs::fsync_all`).

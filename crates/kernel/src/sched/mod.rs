@@ -103,6 +103,7 @@
 #![allow(dead_code)]
 
 pub mod hrsleep;
+pub mod prio;
 mod task;
 mod waitq;
 
@@ -302,6 +303,10 @@ impl SlotBits {
 
     fn any(&self) -> bool {
         self.0.iter().any(|word| word.load(Ordering::SeqCst) != 0)
+    }
+
+    fn has(&self, slot: usize) -> bool {
+        self.0[slot / 64].load(Ordering::Relaxed) & (1 << (slot % 64)) != 0
     }
 
     /// Visit set slots of `[from, to)`; `visit` returns `true` to stop.
@@ -576,6 +581,7 @@ fn choose_cpu(slot: usize) -> usize {
 /// `RUNSTATE` must already say ready (see the protocol above).
 fn enqueue_percpu(slot: usize) {
     let target = choose_cpu(slot);
+    prio::on_wake(slot, target);
     HOME[slot].store(target as u16, Ordering::Relaxed);
     HOMEQ[target].set(slot);
     READY.set(slot);
@@ -620,7 +626,7 @@ fn try_claim(slot: usize, found_in: Option<usize>) -> bool {
 
 /// The `percpu` choice for `cpu`, whose current task is `current`. `None` -
 /// nobody else is ready.
-fn pick_percpu(cpu: usize, current: usize) -> Option<usize> {
+fn pick_percpu(cpu: usize, current: usize, cause: Cause) -> Option<usize> {
     let high = HIGH.load(Ordering::Acquire).min(MAX_TASKS);
     let mut got = None;
     // Boosted (woken by an interrupt or input), then drivers, then the
@@ -645,6 +651,15 @@ fn pick_percpu(cpu: usize, current: usize) -> Option<usize> {
     if got.is_some() {
         PC_STOLEN.fetch_add(1, Ordering::Relaxed);
         return got;
+    }
+    // Priorities (25.11): by weight and virtual run time; round-robin
+    // below only when the chosen task was taken by another CPU meanwhile.
+    if prio::picker() {
+        match pick_weighted(cpu, current, cause, high) {
+            Weighted::Pick(slot) => return Some(slot),
+            Weighted::Stay => return None,
+            Weighted::Fallback => {}
+        }
     }
     // The own queue, round-robin after the current task.
     HOMEQ[cpu].scan_from(current + 1, high, |slot| {
@@ -671,6 +686,78 @@ fn pick_percpu(cpu: usize, current: usize) -> Option<usize> {
         PC_STOLEN.fetch_add(1, Ordering::Relaxed);
     }
     got
+}
+
+/// What [`pick_weighted`] decided.
+enum Weighted {
+    /// This task, claimed for the CPU.
+    Pick(usize),
+    /// The running task keeps the CPU.
+    Stay,
+    /// Nothing claimable by weight: the round-robin walks decide.
+    Fallback,
+}
+
+/// The `percpu` choice by priority (`prio on`, see `prio.rs`), after the
+/// boosted/driver/desktop classes.
+///
+/// * Every ready task is ranked by its virtual run time (one scale for the
+///   machine); a task of another CPU's queue counts [`prio::MIGRATE_COST`]
+///   later (its caches are elsewhere).
+/// * At the end of a slice the running task stays while its own virtual
+///   time is not above the best ranked; otherwise the best is taken - from
+///   another queue too: a task queued behind heavier ones falls behind and
+///   moves to the CPU that runs lighter work (prio scenario, 4 CPUs).
+/// * `sched_yield` and a task going to sleep switch to the best ranked
+///   ready task, as before to anybody ready.
+fn pick_weighted(cpu: usize, current: usize, cause: Cause, high: usize) -> Weighted {
+    let now_ns = crate::time::uptime_ns();
+    let running = !is_idle_slot(current) && matches!(RUNSTATE[current].load(Ordering::SeqCst), RS_RUNNING | RS_READY);
+    // (slot, rank, from the own queue)
+    let mut best: Option<(usize, i64, bool)> = None;
+    READY.scan(0, high, &mut |slot| {
+        if is_idle_slot(slot) || slot == current || RUNSTATE[slot].load(Ordering::Relaxed) != RS_READY || ON_CPU[slot].load(Ordering::Relaxed) {
+            return false;
+        }
+        let local = HOMEQ[cpu].has(slot);
+        // Queued for an idle CPU (kicked, about to run there): not ours -
+        // taking it leaves that CPU idle and the task taken from here waiting.
+        let home = usize::from(HOME[slot].load(Ordering::Relaxed)).min(MAX_CPUS - 1);
+        if !local && home != cpu && ON_IDLE[home].load(Ordering::Relaxed) {
+            return false;
+        }
+        let rank = prio::lag(slot).saturating_add(if local { 0 } else { prio::MIGRATE_COST });
+        if best.is_none_or(|(_, other, _)| rank < other) {
+            best = Some((slot, rank, local));
+        }
+        false
+    });
+    let choice = match best {
+        Some((_, rank, _)) if running && cause == Cause::Preempted && rank >= prio::live_lag(current, now_ns) => None,
+        other => other,
+    };
+    let Some((slot, _, local)) = choice else {
+        if running {
+            prio::on_stay(current, cpu, now_ns);
+            if cause == Cause::Preempted {
+                prio::STAYS.fetch_add(1, Ordering::Relaxed);
+            }
+            return Weighted::Stay;
+        }
+        return Weighted::Fallback;
+    };
+    if !try_claim(slot, if local { Some(cpu) } else { None }) {
+        return Weighted::Fallback;
+    }
+    if local {
+        PC_LOCAL.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PC_STOLEN.fetch_add(1, Ordering::Relaxed);
+        if running {
+            prio::PULLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    Weighted::Pick(slot)
 }
 
 /// The task in `slot` through its published pointer.
@@ -751,7 +838,7 @@ fn schedule_percpu(cause: Cause, block: Option<Block>) -> Option<Plan> {
     let current = RUNNING_SLOT[cpu].load(Ordering::Relaxed);
     // SAFETY: the current task of this CPU.
     let current_state = unsafe { task_at(current) }.map(|task| task.state);
-    let next = match pick_percpu(cpu, current) {
+    let next = match pick_percpu(cpu, current, cause) {
         Some(next) => Some(next),
         None if is_idle_slot(current) => None,
         None => match current_state {
@@ -844,6 +931,8 @@ fn schedule_percpu(cause: Cause, block: Option<Block>) -> Option<Plan> {
         if !is_idle_slot(next) {
             LAST_CPU[next].store(cpu as u16, Ordering::Relaxed);
         }
+        // What this CPU runs, for the floor of virtual time (25.11).
+        prio::on_pick(next, cpu);
         ON_CPU[next].store(true, Ordering::SeqCst);
         PREV_SLOT[cpu].store(current, Ordering::Relaxed);
         RUNNING_SLOT[cpu].store(next, Ordering::Relaxed);
@@ -974,7 +1063,10 @@ static SELF_SEEN_NS: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_
 fn cputime_switch_out(slot: usize, now_ns: u64) {
     let start = RUN_START_NS[slot].swap(0, Ordering::Relaxed);
     if start != 0 {
-        CPU_NS[slot].fetch_add(now_ns.saturating_sub(start), Ordering::Relaxed);
+        let ran = now_ns.saturating_sub(start);
+        CPU_NS[slot].fetch_add(ran, Ordering::Relaxed);
+        // Virtual run time and the share by nice (25.11, `prio`).
+        prio::charge(slot, ran);
     }
 }
 
@@ -1170,7 +1262,7 @@ impl Scheduler {
     /// отвечал «уйти в холостую», и на одном процессоре это стоило лишь пары
     /// переключений; на нескольких такая задача на миг становилась готовой и
     /// ничьей — и её было видно в `tasks` вместо «исполняется».
-    fn pick_next(&self, cpu: usize) -> Option<usize> {
+    fn pick_next(&self, cpu: usize, cause: Cause) -> Option<usize> {
         let current = RUNNING_SLOT[cpu].load(Ordering::Relaxed);
         // One walk over the ready set (G2, 21.11.2026) instead of three walks
         // over every slot: round-robin from the slot after the current one,
@@ -1179,6 +1271,9 @@ impl Scheduler {
         // the same order of preference as the three walks had.
         let high = self.high;
         let (mut boosted, mut driver, mut desktop, mut any) = (None, None, None, None);
+        // `prio on` (25.11): the task with the least virtual run time.
+        let weighted = prio::picker();
+        let mut fair: Option<(usize, i64)> = None;
         READY.scan_from(current + 1, high, |slot| {
             if is_idle_slot(slot) {
                 READY.clear(slot);
@@ -1210,6 +1305,12 @@ impl Scheduler {
             if any.is_none() {
                 any = Some(slot);
             }
+            if weighted {
+                let lag = prio::lag(slot);
+                if fair.is_none_or(|(_, best)| lag < best) {
+                    fair = Some((slot, lag));
+                }
+            }
             false
         });
         if let Some(slot) = boosted.or(driver) {
@@ -1217,6 +1318,18 @@ impl Scheduler {
         }
         if desktop.is_some() && (crate::input::has_events_now() || crate::ui::input_waiting()) {
             return desktop;
+        }
+        if let Some((slot, lag)) = fair {
+            // The end of a slice: the running task stays while it still has
+            // the least virtual run time.
+            let running = !is_idle_slot(current)
+                && self.tasks[current].as_ref().is_some_and(|task| matches!(task.state, TaskState::Running | TaskState::Ready));
+            if running && cause == Cause::Preempted && lag >= prio::live_lag(current, crate::time::uptime_ns()) {
+                prio::on_stay(current, cpu, crate::time::uptime_ns());
+                prio::STAYS.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            return Some(slot);
         }
         if any.is_some() {
             return any;
@@ -1238,6 +1351,7 @@ impl Scheduler {
                 if PERCPU.load(Ordering::Relaxed) {
                     enqueue_percpu(slot);
                 } else {
+                    prio::on_wake(slot, usize::from(LAST_CPU[slot].load(Ordering::Relaxed)));
                     READY.set(slot);
                 }
             }
@@ -1493,6 +1607,8 @@ pub fn spawn_raw(
 
     sched.next_id += 1;
     cputime_reset(slot);
+    // Nice and policy from the parent (fork, clone, spawn - as Linux).
+    prio::on_spawn(slot, parent);
     sched.tasks[slot] = Some(boxed);
     publish(&mut sched, slot);
     match rank_of(name) {
@@ -2652,7 +2768,7 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
             expired = sched.wake_expired(crate::time::uptime_ms());
 
             let current = RUNNING_SLOT[cpu].load(Ordering::Relaxed);
-            match sched.pick_next(cpu) {
+            match sched.pick_next(cpu, cause) {
                 None => {
                     // Остаёмся. Задача, которую разбудили до того, как она ушла,
                     // снова исполняется, а не числится готовой.
@@ -2785,6 +2901,7 @@ fn schedule_with(cause: Cause, block: Option<Block>) {
                         if !is_idle_slot(next) {
                             LAST_CPU[next].store(cpu as u16, Ordering::Relaxed);
                         }
+                        prio::on_pick(next, cpu);
                         PREV_SLOT[cpu].store(current, Ordering::Relaxed);
                         let state = &mut sched.cpus[cpu];
                         state.previous = Some(current);

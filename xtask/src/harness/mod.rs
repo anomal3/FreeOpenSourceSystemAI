@@ -1044,6 +1044,26 @@ fn play(
                 line.wait_for_one_of(needles, patience(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
             }
+            Step::Together(command, end, needles, tries) => {
+                let command = fill(command, &captured, &captured2);
+                let needles: Vec<String> = needles.iter().map(|n| fill(n, &captured, &captured2)).collect();
+                say!("  [{at:>6} мс] шаг {index}: {command:?} до {tries} раз, пока в одном ответе не будет всего из {needles:?}");
+                let mut found = false;
+                for attempt in 1..=*tries {
+                    if line
+                        .reply_has_all(&command, end, &needles, patience(15_000))
+                        .with_context(|| format!("шаг {index}"))?
+                    {
+                        found = true;
+                        break;
+                    }
+                    say!("             попытка {attempt}: не всё в одном ответе, ещё раз");
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                if !found {
+                    bail!("шаг {index}: ни в одном из {tries} ответов на {command:?} нет сразу всех {needles:?}");
+                }
+            }
             Step::AwaitAny(needle, timeout_ms) => {
                 let needle = fill(needle, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: ждём {needle:?} где угодно в выводе");
@@ -2839,6 +2859,51 @@ fn start_host_site() -> Result<(HostServer, u16)> {
                     <p class=\"box\">This page came over <b>HTTP</b> from the host and was laid out by NetSurf.</p>\
                     <table><tr><th>engine</th><th>fetch</th></tr><tr><td>NetSurf 3.11</td><td>libcurl + mbedTLS</td></tr></table>\
                     <p><a href=\"/hello.txt\">a link to hello.txt</a></p></body></html>\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
+            // OBSOS local storage (26.11, `obsos-storage`): a visit counter in
+            // localStorage, reported as a console warning — OBSOS copies those
+            // into the kernel log ("app log"). `#reset` starts from zero.
+            "/storage.html" => {
+                let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>OBSOS storage</title>\
+                    <style>body{font-family:sans-serif;margin:32px;background:#eef6ee}h1{font-size:40px}</style></head>\
+                    <body><h1 id=\"n\">?</h1><script>\
+                    if(location.hash=='#reset')localStorage.removeItem('obsos-visits');\
+                    var n=(parseInt(localStorage.getItem('obsos-visits')||'0',10)||0)+1;\
+                    localStorage.setItem('obsos-visits',String(n));\
+                    document.getElementById('n').textContent='localStorage visit '+n;\
+                    console.warn('obsos-storage: visit '+n);\
+                    </script></body></html>\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
+            // OBSOS WebGL/WebRTC (26.11, `obsos-webgl`): what the page gets on
+            // FossAi. WebGL needs a GPU connection (surfman) Servo does not have
+            // under swgl, so the honest answer is getContext() == null; WebRTC
+            // needs GStreamer, which the FossAi build does not have. A 2D canvas
+            // shows the page itself runs.
+            "/webgl.html" => {
+                let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>OBSOS WebGL</title>\
+                    <style>body{font-family:sans-serif;margin:32px;background:#eef2fb}h1{font-size:32px}p{font-size:20px}</style></head>\
+                    <body><h1>WebGL / WebRTC</h1><p id=\"r\">?</p><canvas id=\"c\" width=\"240\" height=\"80\"></canvas><script>\
+                    var err='',gl=null,gl2=null;\
+                    try{gl=document.createElement('canvas').getContext('webgl')}catch(e){err+=' webgl:'+e}\
+                    try{gl2=document.createElement('canvas').getContext('webgl2')}catch(e){err+=' webgl2:'+e}\
+                    var rtc=typeof window.RTCPeerConnection;\
+                    var gum=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);\
+                    var x=document.getElementById('c').getContext('2d');\
+                    x.fillStyle='#2b5797';x.fillRect(0,0,240,80);x.fillStyle='#fff';x.font='24px sans-serif';x.fillText('2D canvas ok',20,50);\
+                    var s='webgl='+(gl?'yes':'no')+' webgl2='+(gl2?'yes':'no')+' rtc='+rtc+' getUserMedia='+gum+err;\
+                    document.getElementById('r').textContent=s;\
+                    console.warn('obsos-webgl: '+s);\
+                    </script></body></html>\n";
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
                     body.len()

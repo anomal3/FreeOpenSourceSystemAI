@@ -349,6 +349,26 @@ int rename(const char *from, const char *to) {
     memcpy(joined + from_len, to, to_len);
     long code = freeos_syscall(SYS_RENAME, (long)joined, (long)from_len,
                                (long)(from_len + to_len));
+    if (code < 0 && freeos_set_errno(code) < 0 && errno == EEXIST &&
+        (from_len != to_len || memcmp(from, to, from_len) != 0)) {
+        /* POSIX `rename` replaces an existing target; the kernel refuses
+         * (ext2 Error::Exists by design). Like the Linux layer (fsops.rs):
+         * a file target is removed first, a directory is left alone - 26.11,
+         * OBSOS folder sync writes `x.tmp` and renames it over `x`. */
+        struct stat st;
+        if (stat(to, &st) != 0) {
+            return -1;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            errno = EISDIR;
+            return -1;
+        }
+        if (unlink(to) != 0) {
+            return -1;
+        }
+        code = freeos_syscall(SYS_RENAME, (long)joined, (long)from_len,
+                              (long)(from_len + to_len));
+    }
     return code < 0 ? freeos_set_errno(code) : 0;
 }
 

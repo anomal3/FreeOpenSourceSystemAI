@@ -428,6 +428,9 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
         if percpu { "percpu" } else { "global" }
     );
     kprintln!("  perf-diag   : {line}");
+    // 25.11: priorities - the CPU share by nice since the last perf-diag
+    // (OBS at nice 5 against the game in the foreground).
+    kprintln!("  perf-diag   : {}", crate::sched::prio::diag_line());
     // hw-log14 fixes at work (since boot): fence waits answered by the short
     // poll vs after sleeping, mprotect without shootdown, faults on a stale
     // translation, copy-on-write pages broken together with their neighbour.

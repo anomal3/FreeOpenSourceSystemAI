@@ -17,6 +17,7 @@
 //! рисуя курсор поверх. Никакого «следа» за стрелкой это не оставляет, потому
 //! что след — это как раз то, чего не пересобрали.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use mini_ui::image::Image;
@@ -88,6 +89,23 @@ fn with_image<T>(large: bool, index: usize, work: impl FnOnce(&Image, (u32, u32)
     set.get(index).map(|(image, hot)| work(image, *hot))
 }
 
+/// Largest side of a program's own cursor image (Windows cursors are 32,
+/// 48 or 64 px; bigger ones are cut).
+pub const CUSTOM_MAX: u32 = 128;
+
+/// A program's own cursor image (`wl_pointer.set_cursor` with a surface,
+/// 26.11): `0xAARRGGBB` pixels with premultiplied alpha (Wayland
+/// ARGB8888), its size and hotspot. `key` changes with every new image (the
+/// display adapter's cursor is sent again then).
+#[derive(Clone)]
+pub struct CustomCursor {
+    pub pixels: Arc<Vec<u32>>,
+    pub width: u32,
+    pub height: u32,
+    pub hot: (i32, i32),
+    pub key: usize,
+}
+
 /// Указатель: где он и виден ли.
 pub struct Pointer {
     x: i32,
@@ -103,6 +121,9 @@ pub struct Pointer {
     shape: Shape,
     /// Картинки 48×48 — на экране с множителем 2 и больше.
     large: bool,
+    /// 26.11: the cursor image of the program under the pointer, drawn
+    /// instead of [`Self::shape`].
+    custom: Option<CustomCursor>,
 }
 
 impl Pointer {
@@ -117,6 +138,7 @@ impl Pointer {
             busy_until: 0,
             shape: Shape::Arrow,
             large: false,
+            custom: None,
         }
     }
 
@@ -171,7 +193,25 @@ impl Pointer {
     /// заново.
     #[must_use]
     pub fn image_key(&self) -> usize {
-        self.index(crate::time::uptime_ms())
+        match &self.custom {
+            Some(custom) => 0x1000 + custom.key,
+            None => self.index(crate::time::uptime_ms()),
+        }
+    }
+
+    /// 26.11: draw a program's cursor image instead of ours (`None` - ours
+    /// again). `true` - something changed (the old and the new
+    /// [`Self::rect`] need a repaint).
+    pub fn set_custom(&mut self, custom: Option<CustomCursor>) -> bool {
+        let same = match (&self.custom, &custom) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.key == b.key,
+            _ => false,
+        };
+        if !same {
+            self.custom = custom;
+        }
+        !same
     }
 
     /// Прямоугольник, который занимает картинка курсора. Один на все формы —
@@ -181,7 +221,11 @@ impl Pointer {
     pub fn rect(&self) -> Rect {
         let (side, hot) = if self.large { (48, (10, 4)) } else { (32, (7, 3)) };
         let half = side as i32 / 2;
-        Rect::new(self.x - half, self.y - half, side, side).union(&Rect::new(self.x - hot.0, self.y - hot.1, side, side))
+        let ours = Rect::new(self.x - half, self.y - half, side, side).union(&Rect::new(self.x - hot.0, self.y - hot.1, side, side));
+        match &self.custom {
+            Some(c) => ours.union(&Rect::new(self.x - c.hot.0, self.y - c.hot.1, c.width, c.height)),
+            None => ours,
+        }
     }
 
     /// Круг погас — указатель снова просто стрелка. Возвращает прямоугольник,
@@ -242,6 +286,16 @@ impl Pointer {
     #[must_use]
     pub fn image(&self, side: u32) -> (Vec<u32>, (u32, u32)) {
         let mut out = alloc::vec![0u32; (side * side) as usize];
+        if let Some(c) = &self.custom {
+            // Straight alpha like our images (the adapter blends it so).
+            for y in 0..c.height.min(side) {
+                for x in 0..c.width.min(side) {
+                    out[(y * side + x) as usize] = unpremultiply(c.pixels[(y * c.width + x) as usize]);
+                }
+            }
+            let hot = (c.hot.0.clamp(0, side as i32 - 1) as u32, c.hot.1.clamp(0, side as i32 - 1) as u32);
+            return (out, hot);
+        }
         let hot = with_image(self.large, self.image_key(), |image, hot| {
             for y in 0..image.height.min(side) {
                 for x in 0..image.width.min(side) {
@@ -276,10 +330,35 @@ impl Pointer {
             return;
         }
         let (x, y) = (self.x + dx, self.y + dy);
+        if let Some(c) = &self.custom {
+            let (left, top) = (x - c.hot.0, y - c.hot.1);
+            for row in 0..c.height {
+                for column in 0..c.width {
+                    let [b, g, r, a] = unpremultiply(c.pixels[(row * c.width + column) as usize]).to_le_bytes();
+                    if a != 0 {
+                        mini_ui::draw::blend_pixel(surface, left + column as i32, top + row as i32, mini_ui::Color::rgb(r, g, b), a);
+                    }
+                }
+            }
+            return;
+        }
         with_image(self.large, self.index(crate::time::uptime_ms()), |image, (hx, hy)| {
             image.draw(surface, Rect::new(x - hx as i32, y - hy as i32, image.width, image.height));
         });
     }
+}
+
+/// Premultiplied `0xAARRGGBB` (Wayland) to straight alpha.
+fn unpremultiply(pixel: u32) -> u32 {
+    let a = pixel >> 24;
+    if a == 0 {
+        return 0;
+    }
+    if a == 255 {
+        return pixel;
+    }
+    let channel = |shift: u32| (((pixel >> shift) & 0xff) * 255 / a).min(255) << shift;
+    (a << 24) | channel(16) | channel(8) | channel(0)
 }
 
 /// Точка `(x, y)`, оставленная на каком-нибудь мониторе (`outs` — их места на

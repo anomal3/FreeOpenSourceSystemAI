@@ -128,6 +128,8 @@
 #define FREEOS_FDCTL_NONBLOCK 1
 #define FREEOS_FDCTL_FLAGS 2
 #define FREEOS_FD_NONBLOCK 1
+/* New length of a file open for writing (26.11.2026, `ftruncate`). */
+#define FREEOS_FDCTL_TRUNCATE 3
 
 /* Действия `SYS_FLOCK(fd, действие, аргумент)` (08.11.2026). У записей
  * (`fcntl`) аргумент — адрес `struct freeos_file_lock` с уже посчитанным

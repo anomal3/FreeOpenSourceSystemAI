@@ -50,8 +50,9 @@ use user_progs::app::{self, App, Spec};
 use user_progs::{
     SysInfo, WIN_KEY_DELETE, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT, WIN_KEY_MENU,
     WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP, close, kernel_command, kill,
-    monotonic_ms, nanosleep, open, println, read, spawn, sysinfo, tasks,
+    monotonic_ms, nanosleep, open, println, read, set_priority, spawn, sysinfo, tasks,
 };
+use user_abi::PrioClass;
 
 const SPEC: Spec = Spec { name: "taskmgr", title: "Task Manager", period_ms: 2_000 };
 
@@ -138,6 +139,9 @@ struct Task {
     /// полей нет).
     disk_bytes: Option<u64>,
     net_bytes: Option<u64>,
+    /// Nice and policy (since 25.11; an older kernel has no fields).
+    nice: Option<i32>,
+    policy: u32,
     /// Доля процессора за последний промежуток, в десятых процента.
     cpu: u32,
     /// Скорость обмена с носителем и по сети за последний промежуток, байт/с.
@@ -164,6 +168,8 @@ impl Task {
         let pages = fields.next().and_then(|text| text.parse().ok());
         let disk_bytes = fields.next().and_then(|text| text.parse().ok());
         let net_bytes = fields.next().and_then(|text| text.parse().ok());
+        let nice = fields.next().and_then(|text| text.parse().ok());
+        let policy = fields.next().and_then(|text| text.parse().ok()).unwrap_or(0);
         Some(Self {
             id,
             name,
@@ -176,6 +182,8 @@ impl Task {
             pages,
             disk_bytes,
             net_bytes,
+            nice,
+            policy,
             cpu: 0,
             disk_rate: 0,
             net_rate: 0,
@@ -199,6 +207,11 @@ impl Task {
 
     fn is_idle(&self) -> bool {
         self.kind == Kind::Kernel && self.name.starts_with("idle")
+    }
+
+    /// Priority class as Windows names it (25.11).
+    fn prio_class(&self) -> Option<PrioClass> {
+        self.nice.map(|nice| PrioClass::of(nice, self.policy))
     }
 
     fn memory_bytes(&self) -> Option<u64> {
@@ -282,22 +295,40 @@ impl Section {
 enum MenuItem {
     EndTask,
     OpenLocation,
+    /// «Задать приоритет ›» (25.11): the Windows classes in a submenu.
+    SetPriority,
     Refresh,
 }
 
 impl MenuItem {
-    const ALL: [MenuItem; 3] = [MenuItem::EndTask, MenuItem::OpenLocation, MenuItem::Refresh];
+    const ALL: [MenuItem; 4] = [MenuItem::EndTask, MenuItem::OpenLocation, MenuItem::SetPriority, MenuItem::Refresh];
 }
 
-const ENTRIES: [Entry<'static>; 3] = [
+const ENTRIES: [Entry<'static>; 4] = [
     Entry { title: "Снять задачу", icon: Some(mini_ui::glyphicon::Icon::Close), danger: true, group: 0, ..Entry::NONE },
     Entry { title: "Открыть расположение файла", icon: Some(mini_ui::glyphicon::Icon::Folder), danger: false, group: 0, ..Entry::NONE },
-    Entry { title: "Обновить", icon: Some(mini_ui::glyphicon::Icon::Update), danger: false, group: 1, ..Entry::NONE },
+    Entry { title: "Задать приоритет", group: 1, submenu: true, ..Entry::NONE },
+    Entry { title: "Обновить", icon: Some(mini_ui::glyphicon::Icon::Update), danger: false, group: 2, ..Entry::NONE },
 ];
+
+/// The submenu of «Задать приоритет»: the classes of Windows, the current one
+/// bold; «Реального времени» is shown and never set (as for a user without
+/// the right in Windows).
+fn priority_entries(current: Option<PrioClass>) -> Vec<Entry<'static>> {
+    PrioClass::ALL
+        .iter()
+        .map(|class| Entry {
+            title: class.title(),
+            disabled: *class == PrioClass::Realtime,
+            bold: current == Some(*class),
+            ..Entry::NONE
+        })
+        .collect()
+}
 
 struct Menu {
     at: Option<(i32, i32)>,
-    selected: usize,
+    cascade: kit::Cascade,
 }
 
 /// Окно «Запустить новую задачу».
@@ -846,12 +877,67 @@ impl Manager {
         }
     }
 
-    fn run_menu_item(&mut self, item: MenuItem) {
+    fn run_menu_item(&mut self, item: MenuItem, sub: Option<usize>) {
         self.close_menu();
         match item {
             MenuItem::EndTask => self.end_task(),
             MenuItem::OpenLocation => self.open_location(),
+            MenuItem::SetPriority => {
+                if let Some(class) = sub.and_then(|index| PrioClass::ALL.get(index)) {
+                    self.set_priority(*class);
+                }
+            }
             MenuItem::Refresh => self.refresh(),
+        }
+    }
+
+    /// «Задать приоритет» (25.11): every thread of the program gets the nice
+    /// of the class. A higher priority than it has needs root, as in Linux.
+    fn set_priority(&mut self, class: PrioClass) {
+        let Some(task) = self.selected_task().cloned() else {
+            return;
+        };
+        if class == PrioClass::Realtime {
+            return;
+        }
+        if task.kind == Kind::Kernel {
+            println(&format!("taskmgr: #{} is a kernel task, its priority stays", task.id));
+            self.note = Some(String::from("Приоритет задачи ядра здесь не меняется"));
+            return;
+        }
+        let code = set_priority(task.id, class.nice(), false);
+        if code < 0 {
+            println(&format!("taskmgr: cannot set the priority of #{}: {code}", task.id));
+            self.note = Some(match code {
+                user_abi::ERR_PERMISSION => format!("«{}»: повысить приоритет может только администратор (root)", task.name),
+                _ => format!("Не удалось задать приоритет «{}»: {}", task.name, error_text(code)),
+            });
+            return;
+        }
+        println(&format!("taskmgr: priority of #{} '{}' set to {:?} (nice {})", task.id, task.name, class, class.nice()));
+        self.note = Some(format!("«{}»: приоритет «{}»", task.name, class.title()));
+        self.refresh();
+    }
+
+    /// Items of the submenu of item `index` of the menu.
+    fn menu_children(&self) -> impl Fn(usize) -> Vec<Entry<'static>> + use<> {
+        let current = self.selected_task().and_then(Task::prio_class);
+        move |index: usize| if MenuItem::ALL.get(index) == Some(&MenuItem::SetPriority) { priority_entries(current) } else { Vec::new() }
+    }
+
+    /// A pick of the menu (click or key).
+    fn menu_pick(&mut self, pick: kit::Pick) {
+        match pick {
+            kit::Pick::Run(index, sub) => {
+                if let Some(item) = MenuItem::ALL.get(index).copied() {
+                    if item == MenuItem::SetPriority && sub.is_none() {
+                        return;
+                    }
+                    self.run_menu_item(item, sub);
+                }
+            }
+            kit::Pick::Outside | kit::Pick::Close => self.close_menu(),
+            kit::Pick::Inside => {}
         }
     }
 
@@ -860,7 +946,12 @@ impl Manager {
             return;
         };
         println(&format!("taskmgr: menu opened for #{} '{}'", task.id, task.name));
-        self.menu = Some(Menu { at, selected: 0 });
+        let mut cascade = kit::Cascade::new();
+        // From the keyboard the first item is lit, as before.
+        if at.is_none() {
+            cascade.selected = 0;
+        }
+        self.menu = Some(Menu { at, cascade });
         self.note = None;
     }
 
@@ -876,6 +967,12 @@ impl Manager {
         let at = menu.at.unwrap_or_else(|| {
             let plan = Plan::new(ctx, area, self.folded);
             let rows = plan.rows_area(ctx);
+            // «Подробности» (25.11): one row per task, no group headers.
+            if self.section == Section::Details {
+                let row_h = ctx.px(ROW_H) as i32;
+                let index = self.selected_index().unwrap_or(0) as i32;
+                return (rows.x + ctx.px(80) as i32, rows.y + index * row_h - self.scroll.offset() + row_h);
+            }
             let lines = self.lines();
             let at = self
                 .selected_index()
@@ -1324,6 +1421,7 @@ impl Manager {
                         task.name.clone(),
                         format!("{}", task.id),
                         task.state_title().to_string(),
+                        task.prio_class().map_or_else(|| String::from("—"), |class| class.title().to_string()),
                         self.user_name(task.uid),
                         percent_text(task.cpu),
                         format!("{} мс", group_digits(task.cpu_ms)),
@@ -1334,7 +1432,18 @@ impl Manager {
                 )
             })
             .collect();
-        self.draw_table(s, ctx, plan, &["Имя", "ИД", "Состояние", "Пользователь", "ЦП", "Время ЦП", "Переключения", "Память", "Путь"], &[60, 90, 110, 60, 100, 110, 90, 150], &[6, 5, 3, 2, 4, 1, 8, 7], &rows, self.selected_index());
+        // «Приоритет» (25.11) — the class as in Windows; it gives way after
+        // «Пользователь».
+        self.draw_table(
+            s,
+            ctx,
+            plan,
+            &["Имя", "ИД", "Состояние", "Приоритет", "Пользователь", "ЦП", "Время ЦП", "Переключения", "Память", "Путь"],
+            &[60, 90, 130, 110, 60, 100, 110, 90, 150],
+            &[7, 6, 4, 3, 2, 5, 1, 9, 8],
+            &rows,
+            self.selected_index(),
+        );
     }
 
     fn draw_users(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
@@ -1533,7 +1642,7 @@ impl App for Manager {
         kit::status_line(ctx, s, plan.status, &parts, &right, 0);
 
         if let (Some(menu), Some(rect)) = (self.menu.as_ref(), self.menu_rect(ctx, area)) {
-            kit::draw_menu(ctx, s, rect, &ENTRIES, menu.selected);
+            menu.cascade.draw(ctx, s, rect, &ENTRIES, &self.menu_children(), area);
         }
         if let Some(dialog) = &self.run {
             self.draw_run_dialog(s, ctx, area, dialog);
@@ -1590,17 +1699,33 @@ impl App for Manager {
             }
             return true;
         }
-        if let Some(menu) = self.menu.as_mut() {
-            match code {
-                WIN_KEY_UP => menu.selected = menu.selected.saturating_sub(1),
-                WIN_KEY_DOWN => menu.selected = (menu.selected + 1).min(MenuItem::ALL.len() - 1),
-                ENTER => {
-                    let item = MenuItem::ALL[menu.selected.min(MenuItem::ALL.len() - 1)];
-                    self.run_menu_item(item);
+        if self.menu.is_some() {
+            let key = match code {
+                WIN_KEY_UP => kit::MenuKey::Up,
+                WIN_KEY_DOWN => kit::MenuKey::Down,
+                WIN_KEY_LEFT => kit::MenuKey::Left,
+                WIN_KEY_RIGHT => kit::MenuKey::Right,
+                ENTER => kit::MenuKey::Enter,
+                ESCAPE => kit::MenuKey::Escape,
+                WIN_KEY_MENU | MENU => {
+                    self.close_menu();
+                    return true;
                 }
-                ESCAPE | WIN_KEY_MENU | MENU => self.close_menu(),
                 _ => return false,
+            };
+            let children = self.menu_children();
+            let Some(menu) = self.menu.as_mut() else {
+                return true;
+            };
+            let pick = menu.cascade.key(key, &ENTRIES, &children);
+            if let Some(menu) = self.menu.as_ref() {
+                if let Some(open) = menu.cascade.open.filter(|_| menu.cascade.in_sub) {
+                    if let Some(class) = PrioClass::ALL.get(menu.cascade.sub_selected) {
+                        println(&format!("taskmgr: menu item {open}, submenu {class:?}"));
+                    }
+                }
             }
+            self.menu_pick(pick);
             return true;
         }
         // Цифры — разделы по порядку слева.
@@ -1670,11 +1795,15 @@ impl App for Manager {
             return true;
         }
         if self.menu.is_some() {
-            let hit = self.menu_rect(ctx, area).and_then(|rect| kit::menu_hit(ctx, rect, &ENTRIES, x, y));
-            match hit {
-                Some(index) => self.run_menu_item(MenuItem::ALL[index]),
-                None => self.close_menu(),
-            }
+            let children = self.menu_children();
+            let Some(rect) = self.menu_rect(ctx, area) else {
+                return true;
+            };
+            let pick = match self.menu.as_mut() {
+                Some(menu) => menu.cascade.click(ctx, rect, &ENTRIES, &children, area, x, y),
+                None => return true,
+            };
+            self.menu_pick(pick);
             return true;
         }
         let plan = Plan::new(ctx, area, self.folded);
@@ -1774,10 +1903,20 @@ impl App for Manager {
             self.close_menu();
             return true;
         }
-        if self.section != Section::Processes || self.run.is_some() {
+        if !matches!(self.section, Section::Processes | Section::Details) || self.run.is_some() {
             return false;
         }
         let plan = Plan::new(ctx, area, self.folded);
+        if self.section == Section::Details {
+            // «Подробности» (25.11): the same menu on a row of the table.
+            let (rows, _, row_h) = self.view_metrics(ctx, &plan);
+            if let Some(index) = self.scroll.row_at(y, rows.y, row_h).filter(|&index| rows.contains(x, y) && index < self.tasks.len()) {
+                self.select_task(index);
+                self.open_menu(Some((x, y)));
+                return true;
+            }
+            return false;
+        }
         if let Some(Line::Task(index)) = self.line_at(ctx, &plan, x, y) {
             self.select_task(index);
             self.open_menu(Some((x, y)));
@@ -1807,6 +1946,15 @@ impl App for Manager {
 
     /// Полоса прокрутки под указателем шире, строка под ним подсвечена (20.11).
     fn hover(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        // The open menu lights its items and opens «Задать приоритет ›» under
+        // the pointer (25.11).
+        if self.menu.is_some() {
+            let children = self.menu_children();
+            let rect = self.menu_rect(ctx, area);
+            if let (Some(menu), Some(rect)) = (self.menu.as_mut(), rect) {
+                return menu.cascade.hover(ctx, rect, &ENTRIES, &children, area, x, y);
+            }
+        }
         let plan = Plan::new(ctx, area, self.folded);
         let bar = self.bar(ctx, &plan);
         let hot = self.scroll.hover(bar.as_ref(), x, y);

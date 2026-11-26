@@ -11,6 +11,10 @@ FROM debian:trixie
 ARG LLVM=22
 ARG RUST_NIGHTLY=nightly-2026-08-11
 
+# Повторы загрузок apt: deb.debian.org из Docker Desktop иногда рвёт
+# соединения посреди установки (26.11.2026).
+RUN printf 'Acquire::Retries "10";\nAcquire::http::Timeout "60";\n' > /etc/apt/apt.conf.d/80retries
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git make m4 perl python3 python3-venv \
         pkg-config file xz-utils unzip wget \

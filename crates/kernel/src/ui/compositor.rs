@@ -413,6 +413,9 @@ pub struct Compositor {
     /// G3: the program window that hid the pointer over itself
     /// (`wl_pointer.set_cursor` with a null surface).
     cursor_hidden_by: Option<App>,
+    /// 26.11: cursor images of program windows (`wl_pointer.set_cursor`
+    /// with a surface), shown while the pointer is over the window.
+    client_cursors: Vec<(App, super::pointer::CustomCursor)>,
     /// G3: pointer lock/confinement asked by a program window
     /// (`zwp_pointer_constraints_v1`).
     constraint: Option<Constraint>,
@@ -603,6 +606,7 @@ impl Compositor {
             flip_touched: [None; MAX_OUTPUTS],
             flip_retry: false,
             cursor_hidden_by: None,
+            client_cursors: Vec::new(),
             constraint: None,
             tablet_last: None,
         };
@@ -1947,7 +1951,7 @@ impl Compositor {
     /// настоящих изменений два пятна размером с курсор.
     pub fn move_pointer(&mut self, dx: i32, dy: i32) {
         self.move_pointer_by(dx, dy);
-        if self.cursor_hidden_by.is_some() {
+        if self.cursor_hidden_by.is_some() || !self.client_cursors.is_empty() {
             self.sync_client_cursor();
         }
     }
@@ -1994,7 +1998,7 @@ impl Compositor {
     /// часть движения, которую съел край экрана.
     pub fn move_pointer_to(&mut self, x_fraction: u16, y_fraction: u16) -> (i32, i32) {
         let moved = self.move_pointer_at(x_fraction, y_fraction);
-        if self.cursor_hidden_by.is_some() {
+        if self.cursor_hidden_by.is_some() || !self.client_cursors.is_empty() {
             self.sync_client_cursor();
         }
         moved
@@ -2003,6 +2007,28 @@ impl Compositor {
     /// G3: a program window hides (`hidden`) or shows the pointer over
     /// itself (`wl_pointer.set_cursor`).
     pub fn set_client_cursor(&mut self, app: App, hidden: bool) {
+        self.set_client_image(app, None, hidden);
+    }
+
+    /// 26.11: a program window shows its own cursor image over itself
+    /// (`Some`), ours (`None`, not hidden) or none (`hidden`). Images of
+    /// closed windows are dropped here.
+    pub fn set_client_image(&mut self, app: App, image: Option<super::pointer::CustomCursor>, hidden: bool) {
+        let windows = &self.windows;
+        self.client_cursors.retain(|(owner, _)| *owner != app && windows.iter().any(|window| window.app == *owner));
+        if let (Some(image), false) = (image, hidden) {
+            if !self.client_cursors.iter().any(|(owner, _)| *owner == app) {
+                crate::kprintln!(
+                    "  desktop     : '{}' shows its own cursor image {}x{} (hotspot {},{})",
+                    self.label(app),
+                    image.width,
+                    image.height,
+                    image.hot.0,
+                    image.hot.1
+                );
+            }
+            self.client_cursors.push((app, image));
+        }
         let before = self.cursor_hidden_by;
         if hidden {
             self.cursor_hidden_by = Some(app);
@@ -2026,9 +2052,20 @@ impl Compositor {
             return;
         }
         let (x, y) = self.pointer.position();
-        let hide =self.cursor_hidden_by.is_some_and(|app| {
-            self.window_at(x, y).is_some_and(|(index, _)| self.windows.get(index).is_some_and(|window| window.app == app))
-        });
+        let under = self.window_at(x, y).and_then(|(index, _)| self.windows.get(index)).map(|window| window.app);
+        let hide = self.cursor_hidden_by.is_some_and(|app| under == Some(app));
+        // 26.11: the image of the program under the pointer, or ours.
+        let image = under.and_then(|app| self.client_cursors.iter().find(|(owner, _)| *owner == app)).map(|(_, image)| image.clone());
+        let before = self.pointer.rect();
+        if self.pointer.set_custom(image) {
+            if self.hw_cursor {
+                self.hand_cursor(false);
+            } else {
+                self.mark(before);
+                let after = self.pointer.rect();
+                self.mark(after);
+            }
+        }
         let rect = self.pointer.rect();
         if hide {
             if self.pointer.hide() {
@@ -5591,7 +5628,7 @@ impl Compositor {
                     if super::capture::active() && super::capture::mirror_direct() {
                         if let Some(shown) = self.windows.get(window) {
                             if let Some(pixels) = shown.direct_pixels() {
-                                super::capture::put(part, pixels, part.x - shown.rect.x, part.y - shown.rect.y);
+                                super::capture::put_direct(part, pixels, part.x - shown.rect.x, part.y - shown.rect.y);
                             }
                         }
                     }
@@ -5801,7 +5838,7 @@ impl Compositor {
         // into grabbed frames, see `capture::note_pointer`; 25.11: not when
         // OBS samples the client buffer itself).
         if super::capture::active() && super::capture::mirror_direct() {
-            super::capture::put(part, pixels, part.x - w.x, part.y - w.y);
+            super::capture::put_direct(part, pixels, part.x - w.x, part.y - w.y);
         }
         if !self.hw_cursor && self.pointer.is_visible() {
             let spot = self.pointer.rect().intersect(&part);

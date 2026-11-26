@@ -154,7 +154,7 @@ pub fn format(hive: &str, map: &BTreeMap<String, String>) -> String {
 /// browser opens web pages, pictures in SVG and Internet shortcuts (Roman,
 /// 24.11). A default whose program is not installed is skipped by the reader.
 pub const BUILTIN: &[(&str, &str)] = &[
-    ("apps/obsos/caption", "OBSOS — Браузер"),
+    ("apps/obsos/caption", "OBSOS (BETA) — Браузер"),
     ("apps/obsos/icon", "/opt/obsos/icon.fimg"),
     ("filetypes/.html/default", OBSOS),
     ("filetypes/.html/openwith/obsos", OBSOS),

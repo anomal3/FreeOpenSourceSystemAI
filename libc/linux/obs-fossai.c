@@ -4,8 +4,15 @@
 // xdg-desktop-portal OBS uses on Linux/Wayland.
 //
 // The kernel keeps a mirror of the captured rectangle filled by the
-// compositor. One thread of the module captures the box around what all
-// sources want and each source draws its part of it.
+// compositor. One thread of the module runs a kernel capture per distinct
+// rectangle the sources want (26.11: a monitor at its own size, the whole
+// desktop, a window); sources of the same rectangle share it.
+//
+// The pointer (26.11): the capture runs without the kernel patching the
+// pointer into frames; FOSSAI_CAP_CURSOR hands its picture, hotspot and
+// place every frame and the source draws it as its own quad («Показывать
+// курсор», on by default) — also over a fullscreen game's own buffer, which
+// never has the pointer, and a pointer move costs no frame copy.
 //
 // How frames reach the GPU (25.11, hw-log19: three full copies of 5120x1440
 // per frame on Roman's PC):
@@ -72,8 +79,13 @@ MODULE_EXPORT const char *obs_module_description(void)
 // 25.11: the dma-buf ring and the newest frame.
 #define CAP_DMABUF CAP_IOC(8)
 #define CAP_FRAME CAP_IOC(9)
+// 26.11: the pointer over the capture of the descriptor.
+#define CAP_CURSOR CAP_IOC(10)
 
 #define CAP_POINTER 1u
+#define CAP_CURSOR_VISIBLE 1u
+#define CAP_CURSOR_IN_FRAME 2u
+#define CAP_CURSOR_IMAGE 4u
 #define PIXEL_RGB 1u
 #define PIXEL_BGR 2u
 
@@ -125,6 +137,20 @@ struct cap_frame {
 	uint64_t modifier;
 	int32_t fence_fd; // -1: complete on return
 	uint32_t flags;
+};
+
+// FOSSAI_CAP_CURSOR (user_abi::CapCursor): in `image`, `image_len`,
+// `have_serial`; the rest out. The picture is 0xAARRGGBB, straight alpha,
+// its top-left corner at `x, y` of the captured rectangle.
+struct cap_cursor {
+	uint64_t image;
+	uint32_t image_len;
+	uint32_t have_serial;
+	uint32_t serial;
+	uint32_t flags;
+	int32_t x, y;
+	uint32_t hot_x, hot_y;
+	uint32_t width, height;
 };
 
 static bool read_info(struct cap_info *info)
@@ -283,17 +309,21 @@ struct fossai_capture {
 	int fps; // 0 — the rate of OBS video
 	bool changed;
 
-	// Under `g_lock` (the shared capture thread).
+	// Under `g_lock` (the shared capture thread). `want.flags` has
+	// CAP_POINTER when the source shows the pointer.
 	struct cap_spec want;
 	bool want_ok;
 	uint64_t next_check;
 	struct fossai_capture *next;
 };
 
-// One kernel capture for all sources of the process (24.11): the kernel runs
-// one capture at a time, so a second source (monitor 2 next to monitor 1, a
-// window) used to wait forever. The thread captures the box around what all
-// sources want and each source draws its part.
+// One capture thread for all sources of the process. Since 26.11 it runs one
+// kernel capture — a *stream* — per distinct rectangle the sources want: two
+// sources on monitor 1 and monitor 2 are two streams of the monitors' own
+// sizes (before: one box around both, 5120x1440 on Roman's PC, and each
+// source cut its part out of it). Sources that want the same rectangle share
+// a stream; the kernel shares its session with `/bin/screenrec` recording
+// the same monitor.
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct fossai_capture *g_sources;
 static pthread_t g_thread;
@@ -302,13 +332,17 @@ static bool g_thread_running;
 // a new one started meanwhile gets a fresh one).
 static volatile bool *g_stop;
 
-// ---- frames between the thread and the render thread (25.11) -----------------
+// ---- streams: frames between the thread and the render thread ---------------
 
 enum frame_mode { MODE_NONE, MODE_CPU, MODE_RING, MODE_GAME };
 
 // dma-buf import by OBS's OpenGL: 0 — not known yet, 1 — works, -1 — not
 // available (no extension, an import failed, FOSSAI_OBS_DMABUF=0).
 static volatile int g_dmabuf;
+
+// The kernel has no FOSSAI_CAP_CURSOR (older image): the pointer is patched
+// into the frames by the kernel (CAP_POINTER) as before 26.11.
+static volatile bool g_old_kernel_cursor;
 
 struct game_buffer {
 	uint64_t id;
@@ -317,12 +351,30 @@ struct game_buffer {
 	uint64_t modifier;
 };
 
-// Under `g_frame_lock`.
-static pthread_mutex_t g_frame_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct {
+#define MAX_STREAMS 8
+#define CURSOR_MAX 64
+
+struct stream {
+	struct stream *next; // `g_streams`, under `g_frame_lock`
+	struct cap_spec spec; // the rectangle (flags: what the kernel was asked)
+	// Ended by the thread; freed by the render side (textures need the
+	// graphics context) — the thread never touches a dead stream again.
+	bool dead;
+
+	// Capture thread only.
+	int fd;
+	uint64_t have;
+	bool ring_on;
+	bool cursor_wanted;
+	bool busy_logged;
+	uint64_t retry_at;
+	uint32_t cursor_have;
+	uint32_t *cursor_buf; // CURSOR_MAX², the kernel copies the picture here
+	bool cursor_logged;
+
+	// Under `g_frame_lock`.
 	enum frame_mode mode;
-	struct cap_spec box; // the captured box of the frame
-	uint32_t format;     // PIXEL_RGB/PIXEL_BGR
+	uint32_t format; // PIXEL_RGB/PIXEL_BGR
 	// MODE_CPU: two buffers, the thread writes the one that is not `ready`.
 	uint32_t *cpu[2];
 	int ready; // -1 — nothing yet
@@ -336,41 +388,57 @@ static struct {
 	uint64_t game;
 	struct game_buffer pending[GAME_MAX];
 	uint64_t known[GAME_MAX]; // imported by the render thread
-} g_frame = {.ready = -1, .slot = -1};
+	// The pointer (26.11): place in the rectangle, picture `cur_pixels`.
+	struct {
+		bool visible, in_frame;
+		int32_t x, y;
+		uint32_t w, h;
+		uint32_t serial; // 0 — no picture yet
+	} cur;
+	uint32_t *cur_pixels; // CURSOR_MAX²
 
-// Render thread side (graphics context; under `g_frame_lock` too).
-static struct {
+	// Render side (graphics context; under `g_frame_lock` too).
 	gs_texture_t *cpu_tex;
 	uint32_t cpu_w, cpu_h, cpu_format;
 	uint64_t cpu_seq;
-	uint32_t cpu_gen;
+	uint32_t r_cpu_gen;
 	gs_texture_t *ring_tex[RING_MAX];
-	uint32_t ring_gen;
+	uint32_t r_ring_gen;
 	struct {
 		uint64_t id;
 		gs_texture_t *tex;
 		uint64_t used;
-	} game[GAME_MAX];
-	uint64_t frames;
+	} game_tex[GAME_MAX];
 	enum frame_mode logged;
-} g_render;
+	gs_texture_t *cursor_tex;
+	uint32_t cursor_serial;
+};
 
-static void close_pending_locked(void)
+static pthread_mutex_t g_frame_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct stream *g_streams; // under `g_frame_lock`
+static uint64_t g_render_frames;  // under `g_frame_lock`
+
+static bool same_rect(const struct cap_spec *a, const struct cap_spec *b)
+{
+	return a->x == b->x && a->y == b->y && a->w == b->w && a->h == b->h;
+}
+
+static void close_pending_locked(struct stream *s)
 {
 	for (int i = 0; i < GAME_MAX; i++) {
-		if (g_frame.pending[i].id && g_frame.pending[i].fd >= 0)
-			close(g_frame.pending[i].fd);
-		g_frame.pending[i].fd = -1;
-		g_frame.pending[i].id = 0;
+		if (s->pending[i].id && s->pending[i].fd >= 0)
+			close(s->pending[i].fd);
+		s->pending[i].fd = -1;
+		s->pending[i].id = 0;
 	}
 }
 
-static void close_ring_fds_locked(void)
+static void close_ring_fds_locked(struct stream *s)
 {
 	for (int i = 0; i < RING_MAX; i++) {
-		if (g_frame.ring.fds[i] >= 0)
-			close(g_frame.ring.fds[i]);
-		g_frame.ring.fds[i] = -1;
+		if (s->ring.fds[i] >= 0)
+			close(s->ring.fds[i]);
+		s->ring.fds[i] = -1;
 	}
 }
 
@@ -437,15 +505,15 @@ static const char *fourcc_text(uint32_t fourcc, char *text)
 	return text;
 }
 
-// Ask the kernel for a dma-buf ring for the running capture `fd`; true — the
+// Ask the kernel for a dma-buf ring for the stream's capture; true — the
 // frames go that way (published for the render thread).
-static bool start_ring(int fd, const struct cap_spec *box, uint32_t format)
+static bool start_ring(struct stream *s, uint32_t format)
 {
 	struct cap_dmabuf ring;
 	memset(&ring, 0, sizeof(ring));
 	for (int i = 0; i < RING_MAX; i++)
 		ring.fds[i] = -1;
-	if (ioctl(fd, CAP_DMABUF, &ring) != 0) {
+	if (ioctl(s->fd, CAP_DMABUF, &ring) != 0) {
 		blog(LOG_INFO, "[fossai-capture] frames: CPU copy (no dma-buf ring from the kernel: %s)",
 		     errno == ENODEV ? "no GPU render node" : strerror(errno));
 		return false;
@@ -461,73 +529,71 @@ static bool start_ring(int fd, const struct cap_spec *box, uint32_t format)
 	     ring.count, ring.width, ring.height, ring.stride, fourcc_text(ring.fourcc, text),
 	     (unsigned long long)ring.modifier);
 	pthread_mutex_lock(&g_frame_lock);
-	close_ring_fds_locked();
-	close_pending_locked();
-	g_frame.ring = ring;
-	g_frame.ring_gen++;
-	g_frame.slot = -1;
-	g_frame.game = 0;
-	g_frame.mode = MODE_RING;
-	g_frame.box = *box;
-	g_frame.format = format;
+	close_ring_fds_locked(s);
+	close_pending_locked(s);
+	s->ring = ring;
+	s->ring_gen++;
+	s->slot = -1;
+	s->game = 0;
+	s->mode = MODE_RING;
+	s->format = format;
 	pthread_mutex_unlock(&g_frame_lock);
 	return true;
 }
 
-// The CPU path for the running capture: two buffers of the box size.
-static void start_cpu(const struct cap_spec *box, uint32_t format)
+// The CPU path for the stream's capture: two buffers of its size.
+static void start_cpu(struct stream *s, uint32_t format)
 {
 	pthread_mutex_lock(&g_frame_lock);
-	close_ring_fds_locked();
-	close_pending_locked();
+	close_ring_fds_locked(s);
+	close_pending_locked(s);
 	for (int i = 0; i < 2; i++) {
-		bfree(g_frame.cpu[i]);
-		g_frame.cpu[i] = bmalloc((size_t)box->w * box->h * 4);
+		bfree(s->cpu[i]);
+		s->cpu[i] = bmalloc((size_t)s->spec.w * s->spec.h * 4);
 	}
-	g_frame.ready = -1;
-	g_frame.ready_seq = 0;
-	g_frame.cpu_gen++;
-	g_frame.mode = MODE_CPU;
-	g_frame.box = *box;
-	g_frame.format = format;
+	s->ready = -1;
+	s->ready_seq = 0;
+	s->cpu_gen++;
+	s->mode = MODE_CPU;
+	s->format = format;
 	pthread_mutex_unlock(&g_frame_lock);
 }
 
 // One frame through the ring: the newest slot or a game buffer. False — the
 // ring is gone (the kernel restarted the capture): ask again.
-static bool ring_frame(int fd, uint64_t *have)
+static bool ring_frame(struct stream *s)
 {
 	struct cap_frame frame;
 	memset(&frame, 0, sizeof(frame));
-	frame.have = *have;
+	frame.have = s->have;
 	pthread_mutex_lock(&g_frame_lock);
-	memcpy(frame.known, g_frame.known, sizeof(frame.known));
+	memcpy(frame.known, s->known, sizeof(frame.known));
 	// Buffers handed over and not imported yet are known too.
 	for (int i = 0; i < GAME_MAX; i++) {
-		if (!g_frame.pending[i].id)
+		if (!s->pending[i].id)
 			continue;
 		for (int k = 0; k < GAME_MAX; k++) {
 			if (!frame.known[k]) {
-				frame.known[k] = g_frame.pending[i].id;
+				frame.known[k] = s->pending[i].id;
 				break;
 			}
 		}
 	}
 	pthread_mutex_unlock(&g_frame_lock);
-	if (ioctl(fd, CAP_FRAME, &frame) != 0)
+	if (ioctl(s->fd, CAP_FRAME, &frame) != 0)
 		return errno != ENODATA;
-	*have = frame.seq;
+	s->have = frame.seq;
 	pthread_mutex_lock(&g_frame_lock);
 	if (frame.buffer) {
 		if (frame.fd >= 0) {
 			int free_at = -1;
 			for (int i = 0; i < GAME_MAX && free_at < 0; i++)
-				if (!g_frame.pending[i].id)
+				if (!s->pending[i].id)
 					free_at = i;
 			if (free_at < 0) {
 				close(frame.fd); // asked again next frame
 			} else {
-				struct game_buffer *b = &g_frame.pending[free_at];
+				struct game_buffer *b = &s->pending[free_at];
 				b->id = frame.buffer;
 				b->fd = frame.fd;
 				b->width = frame.width;
@@ -537,12 +603,12 @@ static bool ring_frame(int fd, uint64_t *have)
 				b->modifier = frame.modifier;
 			}
 		}
-		g_frame.game = frame.buffer;
-		g_frame.mode = MODE_GAME;
+		s->game = frame.buffer;
+		s->mode = MODE_GAME;
 	} else if (frame.slot >= 0) {
-		g_frame.slot = frame.slot;
-		g_frame.game = 0;
-		g_frame.mode = MODE_RING;
+		s->slot = frame.slot;
+		s->game = 0;
+		s->mode = MODE_RING;
 	}
 	pthread_mutex_unlock(&g_frame_lock);
 	return true;
@@ -550,38 +616,148 @@ static bool ring_frame(int fd, uint64_t *have)
 
 // One frame through the CPU: grab into the buffer that is not `ready`.
 // False — the capture was ended from outside.
-static bool cpu_frame(int fd, uint64_t *have)
+static bool cpu_frame(struct stream *s)
 {
 	pthread_mutex_lock(&g_frame_lock);
-	int write = g_frame.ready == 0 ? 1 : 0;
-	uint32_t *buffer = g_frame.cpu[write];
+	int write = s->ready == 0 ? 1 : 0;
+	uint32_t *buffer = s->cpu[write];
 	pthread_mutex_unlock(&g_frame_lock);
 	if (!buffer)
 		return true;
-	struct cap_pair arg = {(uint64_t)(uintptr_t)buffer, *have};
-	long seq = ioctl(fd, CAP_GRAB, &arg);
+	struct cap_pair arg = {(uint64_t)(uintptr_t)buffer, s->have};
+	long seq = ioctl(s->fd, CAP_GRAB, &arg);
 	if (seq < 0)
 		return false;
-	if ((uint64_t)seq != *have) {
-		*have = (uint64_t)seq;
+	if ((uint64_t)seq != s->have) {
+		s->have = (uint64_t)seq;
 		pthread_mutex_lock(&g_frame_lock);
-		g_frame.ready = write;
-		g_frame.ready_seq = (uint64_t)seq;
+		s->ready = write;
+		s->ready_seq = (uint64_t)seq;
 		pthread_mutex_unlock(&g_frame_lock);
 	}
 	return true;
+}
+
+// The pointer over the stream (26.11): place, flags and — when it changed —
+// the picture.
+static void cursor_frame(struct stream *s)
+{
+	struct cap_cursor c;
+	memset(&c, 0, sizeof(c));
+	c.image = (uint64_t)(uintptr_t)s->cursor_buf;
+	c.image_len = CURSOR_MAX * CURSOR_MAX * 4;
+	c.have_serial = s->cursor_have;
+	if (ioctl(s->fd, CAP_CURSOR, &c) != 0) {
+		if (errno == ENOTTY || errno == EINVAL) {
+			blog(LOG_INFO, "[fossai-capture] the kernel has no pointer request - the pointer is drawn into the frames");
+			g_old_kernel_cursor = true;
+		}
+		return;
+	}
+	bool fits = c.width > 0 && c.height > 0 && c.width <= CURSOR_MAX && c.height <= CURSOR_MAX;
+	pthread_mutex_lock(&g_frame_lock);
+	s->cur.visible = (c.flags & CAP_CURSOR_VISIBLE) && fits;
+	s->cur.in_frame = (c.flags & CAP_CURSOR_IN_FRAME) != 0;
+	s->cur.x = c.x;
+	s->cur.y = c.y;
+	if ((c.flags & CAP_CURSOR_IMAGE) && fits) {
+		memcpy(s->cur_pixels, s->cursor_buf, (size_t)c.width * c.height * 4);
+		s->cur.w = c.width;
+		s->cur.h = c.height;
+		s->cur.serial = c.serial;
+		s->cursor_have = c.serial;
+	}
+	pthread_mutex_unlock(&g_frame_lock);
+	if ((c.flags & CAP_CURSOR_IMAGE) && fits && !s->cursor_logged) {
+		s->cursor_logged = true;
+		blog(LOG_INFO, "[fossai-capture] pointer %ux%u (hotspot %u,%u) over %ux%u at %d,%d - %s",
+		     c.width, c.height, c.hot_x, c.hot_y, s->spec.w, s->spec.h, s->spec.x, s->spec.y,
+		     (c.flags & CAP_CURSOR_IN_FRAME) ? "in the composed frame already (software pointer)"
+						     : "drawn by the source");
+	}
+}
+
+// Start the kernel capture of a stream; false — not now (retried later).
+static bool stream_start(struct stream *s, int fps, uint32_t format)
+{
+	s->fd = open(CAP_DEVICE, O_RDWR | O_CLOEXEC);
+	if (s->fd < 0) {
+		blog(LOG_WARNING, "[fossai-capture] %s: %s", CAP_DEVICE, strerror(errno));
+		return false;
+	}
+	struct cap_spec spec = s->spec;
+	// The source draws the pointer itself; an old kernel patches it in.
+	spec.flags = g_old_kernel_cursor && s->cursor_wanted ? CAP_POINTER : 0;
+	spec.fps = (uint32_t)fps;
+	if (ioctl(s->fd, CAP_START, &spec) != 0) {
+		if (errno == EBUSY) {
+			if (!s->busy_logged)
+				blog(LOG_INFO, "[fossai-capture] another capture runs, waiting");
+			s->busy_logged = true;
+		} else {
+			blog(LOG_WARNING, "[fossai-capture] start %ux%u at %d,%d: %s", spec.w, spec.h, spec.x, spec.y,
+			     strerror(errno));
+		}
+		close(s->fd);
+		s->fd = -1;
+		return false;
+	}
+	s->busy_logged = false;
+	s->spec.flags = spec.flags;
+	s->have = 0;
+	blog(LOG_INFO, "[fossai-capture] capturing %ux%u at %d,%d, %d fps, pointer %s", spec.w, spec.h, spec.x, spec.y,
+	     fps, !s->cursor_wanted ? "off" : (spec.flags & CAP_POINTER) ? "on" : "drawn by the source");
+	s->ring_on = g_dmabuf >= 0 && start_ring(s, format);
+	if (!s->ring_on)
+		start_cpu(s, format);
+	return true;
+}
+
+static struct stream *stream_new(const struct cap_spec *rect)
+{
+	struct stream *s = bzalloc(sizeof(*s));
+	s->spec = *rect;
+	s->spec.flags = 0;
+	s->fd = -1;
+	s->ready = -1;
+	s->slot = -1;
+	for (int i = 0; i < RING_MAX; i++)
+		s->ring.fds[i] = -1;
+	for (int i = 0; i < GAME_MAX; i++)
+		s->pending[i].fd = -1;
+	s->cursor_buf = bzalloc(CURSOR_MAX * CURSOR_MAX * 4);
+	s->cur_pixels = bzalloc(CURSOR_MAX * CURSOR_MAX * 4);
+	// Touch the pages: the kernel copies into them.
+	memset(s->cursor_buf, 0, CURSOR_MAX * CURSOR_MAX * 4);
+	pthread_mutex_lock(&g_frame_lock);
+	s->next = g_streams;
+	g_streams = s;
+	pthread_mutex_unlock(&g_frame_lock);
+	return s;
+}
+
+// The thread is done with the stream: the kernel capture ends now, the
+// render side frees the rest.
+static void stream_end(struct stream *s)
+{
+	if (s->fd >= 0) {
+		ioctl(s->fd, CAP_STOP, 0);
+		close(s->fd);
+		s->fd = -1;
+	}
+	pthread_mutex_lock(&g_frame_lock);
+	s->dead = true;
+	s->mode = MODE_NONE;
+	pthread_mutex_unlock(&g_frame_lock);
 }
 
 static void *capture_thread(void *data)
 {
 	volatile bool *stop = data;
 	os_set_thread_name("fossai-capture");
-	int fd = -1;
-	struct cap_spec spec = {0};
-	uint64_t have = 0;
 	uint32_t format = pixel_format();
-	bool busy_logged = false;
-	bool ring = false;
+	struct stream *live[MAX_STREAMS];
+	int nlive = 0;
 
 	while (!*stop) {
 		uint64_t now = os_gettime_ns();
@@ -591,12 +767,12 @@ static void *capture_thread(void *data)
 		int video_fps = obs_get_video_info(&ovi) && ovi.fps_den
 					? (int)((ovi.fps_num + ovi.fps_den - 1) / ovi.fps_den)
 					: 30;
-		pthread_mutex_lock(&g_lock);
-		// What every source wants now (windows are looked up twice a second).
+		// What every source wants now (windows are looked up twice a second):
+		// the distinct rectangles, each with the pointer if a source wants it.
+		struct cap_spec wants[MAX_STREAMS];
+		int nwant = 0;
 		int fps = 0;
-		bool any = false;
-		int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-		uint32_t flags = 0;
+		pthread_mutex_lock(&g_lock);
 		for (struct fossai_capture *cap = g_sources; cap; cap = cap->next) {
 			pthread_mutex_lock(&cap->lock);
 			bool redo = cap->changed;
@@ -616,110 +792,96 @@ static void *capture_thread(void *data)
 				fps = want_fps;
 			if (!cap->want_ok)
 				continue;
-			const struct cap_spec *w = &cap->want;
-			if (!any) {
-				x0 = w->x;
-				y0 = w->y;
-				x1 = w->x + (int32_t)w->w;
-				y1 = w->y + (int32_t)w->h;
-			} else {
-				x0 = w->x < x0 ? w->x : x0;
-				y0 = w->y < y0 ? w->y : y0;
-				x1 = w->x + (int32_t)w->w > x1 ? w->x + (int32_t)w->w : x1;
-				y1 = w->y + (int32_t)w->h > y1 ? w->y + (int32_t)w->h : y1;
+			int at = 0;
+			while (at < nwant && !same_rect(&wants[at], &cap->want))
+				at++;
+			if (at == nwant) {
+				if (nwant == MAX_STREAMS)
+					continue;
+				wants[nwant] = cap->want;
+				wants[nwant].flags = 0;
+				nwant++;
 			}
-			flags |= w->flags;
-			any = true;
+			wants[at].flags |= cap->want.flags & CAP_POINTER;
 		}
 		pthread_mutex_unlock(&g_lock);
 		if (fps <= 0 || fps > 240)
 			fps = 30;
-		struct cap_spec box = {x0, y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), flags, (uint32_t)fps};
-		bool same = fd >= 0 && any && box.x == spec.x && box.y == spec.y && box.w == spec.w && box.h == spec.h &&
-			    box.flags == spec.flags;
-		if (!same) {
-			if (fd >= 0) {
-				ioctl(fd, CAP_STOP, 0);
-				close(fd);
-				fd = -1;
+
+		// Streams nobody wants any more end; new rectangles get streams.
+		for (int i = 0; i < nlive;) {
+			bool kept = false;
+			for (int k = 0; k < nwant && !kept; k++)
+				kept = same_rect(&live[i]->spec, &wants[k]);
+			if (kept) {
+				i++;
+				continue;
 			}
-			pthread_mutex_lock(&g_frame_lock);
-			g_frame.mode = MODE_NONE;
-			pthread_mutex_unlock(&g_frame_lock);
-			if (any) {
-				fd = open(CAP_DEVICE, O_RDWR | O_CLOEXEC);
-				if (fd < 0) {
-					blog(LOG_WARNING, "[fossai-capture] %s: %s", CAP_DEVICE, strerror(errno));
-				} else if (ioctl(fd, CAP_START, &box) != 0) {
-					if (errno == EBUSY) {
-						if (!busy_logged)
-							blog(LOG_INFO, "[fossai-capture] another capture runs, waiting");
-						busy_logged = true;
-					} else {
-						blog(LOG_WARNING, "[fossai-capture] start %ux%u at %d,%d: %s", box.w, box.h,
-						     box.x, box.y, strerror(errno));
-					}
-					close(fd);
-					fd = -1;
-				} else {
-					busy_logged = false;
-					spec = box;
-					have = 0;
-					blog(LOG_INFO, "[fossai-capture] capturing %ux%u at %d,%d, %d fps, pointer %s", spec.w,
-					     spec.h, spec.x, spec.y, fps, (spec.flags & CAP_POINTER) ? "on" : "off");
-					ring = g_dmabuf >= 0 && start_ring(fd, &spec, format);
-					if (!ring)
-						start_cpu(&spec, format);
-				}
+			stream_end(live[i]);
+			live[i] = live[--nlive];
+		}
+		for (int k = 0; k < nwant; k++) {
+			struct stream *s = NULL;
+			for (int i = 0; i < nlive && !s; i++)
+				if (same_rect(&live[i]->spec, &wants[k]))
+					s = live[i];
+			if (!s && nlive < MAX_STREAMS) {
+				s = stream_new(&wants[k]);
+				live[nlive++] = s;
 			}
+			if (s)
+				s->cursor_wanted = (wants[k].flags & CAP_POINTER) != 0;
 		}
 
-		if (fd >= 0) {
+		bool waiting = nlive == 0;
+		for (int i = 0; i < nlive; i++) {
+			struct stream *s = live[i];
+			if (s->fd < 0) {
+				if (now < s->retry_at || !stream_start(s, fps, format)) {
+					if (now >= s->retry_at)
+						s->retry_at = now + 250000000ULL;
+					waiting = true;
+					continue;
+				}
+			}
 			// OBS's OpenGL could not import the ring: the CPU from now on.
-			if (ring && g_dmabuf < 0) {
+			if (s->ring_on && g_dmabuf < 0) {
 				blog(LOG_INFO, "[fossai-capture] frames: CPU copy (OpenGL did not take the dma-buf)");
-				ring = false;
-				have = 0;
-				start_cpu(&spec, format);
+				s->ring_on = false;
+				s->have = 0;
+				start_cpu(s, format);
 			}
-			bool alive = ring ? ring_frame(fd, &have) : cpu_frame(fd, &have);
-			if (!alive && ring) {
+			bool alive = s->ring_on ? ring_frame(s) : cpu_frame(s);
+			if (!alive && s->ring_on) {
 				// The ring is gone with a restarted capture: a new one.
-				ring = start_ring(fd, &spec, format);
-				have = 0;
-				if (!ring)
-					start_cpu(&spec, format);
+				s->ring_on = start_ring(s, format);
+				s->have = 0;
+				if (!s->ring_on)
+					start_cpu(s, format);
 			} else if (!alive) {
-				// The capture was ended from outside (Win+Alt+R…): start again.
-				close(fd);
-				fd = -1;
-				spec.w = 0;
+				// The capture was ended from outside: start again.
+				close(s->fd);
+				s->fd = -1;
+				pthread_mutex_lock(&g_frame_lock);
+				s->mode = MODE_NONE;
+				pthread_mutex_unlock(&g_frame_lock);
+				continue;
 			}
+			if (s->cursor_wanted && !g_old_kernel_cursor)
+				cursor_frame(s);
 		}
 
 		// Next frame time.
 		uint64_t period = 1000000000ULL / (uint64_t)fps;
 		uint64_t spent = os_gettime_ns() - now;
-		if (fd < 0)
+		if (waiting && nlive == 0)
 			os_sleep_ms(250);
 		else if (spent < period)
 			os_sleepto_ns(now + period);
 	}
 
-	if (fd >= 0) {
-		ioctl(fd, CAP_STOP, 0);
-		close(fd);
-	}
-	pthread_mutex_lock(&g_frame_lock);
-	g_frame.mode = MODE_NONE;
-	close_ring_fds_locked();
-	close_pending_locked();
-	for (int i = 0; i < 2; i++) {
-		bfree(g_frame.cpu[i]);
-		g_frame.cpu[i] = NULL;
-	}
-	g_frame.ready = -1;
-	pthread_mutex_unlock(&g_frame_lock);
+	for (int i = 0; i < nlive; i++)
+		stream_end(live[i]);
 	return NULL;
 }
 
@@ -761,23 +923,23 @@ static gs_texture_t *import_dmabuf(int fd, uint32_t width, uint32_t height, uint
 	return tex;
 }
 
-static void drop_ring_textures(void)
+static void drop_ring_textures(struct stream *s)
 {
 	for (int i = 0; i < RING_MAX; i++) {
-		if (g_render.ring_tex[i])
-			gs_texture_destroy(g_render.ring_tex[i]);
-		g_render.ring_tex[i] = NULL;
+		if (s->ring_tex[i])
+			gs_texture_destroy(s->ring_tex[i]);
+		s->ring_tex[i] = NULL;
 	}
 }
 
-static void drop_game_textures(void)
+static void drop_game_textures(struct stream *s)
 {
 	for (int i = 0; i < GAME_MAX; i++) {
-		if (g_render.game[i].tex)
-			gs_texture_destroy(g_render.game[i].tex);
-		g_render.game[i].tex = NULL;
-		g_render.game[i].id = 0;
-		g_frame.known[i] = 0;
+		if (s->game_tex[i].tex)
+			gs_texture_destroy(s->game_tex[i].tex);
+		s->game_tex[i].tex = NULL;
+		s->game_tex[i].id = 0;
+		s->known[i] = 0;
 	}
 }
 
@@ -788,27 +950,53 @@ static void dmabuf_failed(const char *what)
 	g_dmabuf = -1;
 }
 
-// The texture with the newest frame of the box (under `g_frame_lock`);
-// NULL — nothing to show yet.
-static gs_texture_t *frame_texture_locked(void)
+// Free the streams the thread ended (graphics context, under `g_frame_lock`).
+static void sweep_streams_locked(void)
 {
-	switch (g_frame.mode) {
+	for (struct stream **at = &g_streams; *at;) {
+		struct stream *s = *at;
+		if (!s->dead) {
+			at = &s->next;
+			continue;
+		}
+		*at = s->next;
+		drop_ring_textures(s);
+		drop_game_textures(s);
+		if (s->cpu_tex)
+			gs_texture_destroy(s->cpu_tex);
+		if (s->cursor_tex)
+			gs_texture_destroy(s->cursor_tex);
+		close_ring_fds_locked(s);
+		close_pending_locked(s);
+		for (int i = 0; i < 2; i++)
+			bfree(s->cpu[i]);
+		bfree(s->cursor_buf);
+		bfree(s->cur_pixels);
+		bfree(s);
+	}
+}
+
+// The texture with the newest frame of the stream (under `g_frame_lock`);
+// NULL — nothing to show yet.
+static gs_texture_t *frame_texture_locked(struct stream *s)
+{
+	switch (s->mode) {
 	case MODE_RING: {
-		if (g_render.ring_gen != g_frame.ring_gen) {
-			drop_ring_textures();
-			g_render.ring_gen = g_frame.ring_gen;
-			const struct cap_dmabuf *r = &g_frame.ring;
+		if (s->r_ring_gen != s->ring_gen) {
+			drop_ring_textures(s);
+			s->r_ring_gen = s->ring_gen;
+			const struct cap_dmabuf *r = &s->ring;
 			bool ok = true;
 			for (uint32_t i = 0; i < r->count && i < RING_MAX; i++) {
-				g_render.ring_tex[i] = r->fds[i] >= 0 ? import_dmabuf(r->fds[i], r->width, r->height,
-										      r->stride, r->fourcc, r->modifier)
-								      : NULL;
-				ok = ok && g_render.ring_tex[i];
+				s->ring_tex[i] = r->fds[i] >= 0 ? import_dmabuf(r->fds[i], r->width, r->height, r->stride,
+										 r->fourcc, r->modifier)
+								 : NULL;
+				ok = ok && s->ring_tex[i];
 			}
 			// The textures keep the buffers; the descriptors are not needed.
-			close_ring_fds_locked();
+			close_ring_fds_locked(s);
 			if (!ok) {
-				drop_ring_textures();
+				drop_ring_textures(s);
 				dmabuf_failed("ring");
 				return NULL;
 			}
@@ -816,37 +1004,36 @@ static gs_texture_t *frame_texture_locked(void)
 				blog(LOG_INFO, "[fossai-capture] dma-buf import works");
 			g_dmabuf = 1;
 		}
-		if (!g_frame.game)
-			drop_game_textures();
-		if (g_render.logged != MODE_RING) {
+		if (!s->game)
+			drop_game_textures(s);
+		if (s->logged != MODE_RING) {
 			blog(LOG_INFO, "[fossai-capture] frames: dma-buf ring (one kernel copy, no copy in OBS)");
-			g_render.logged = MODE_RING;
+			s->logged = MODE_RING;
 		}
-		return g_frame.slot >= 0 && g_frame.slot < RING_MAX ? g_render.ring_tex[g_frame.slot] : NULL;
+		return s->slot >= 0 && s->slot < RING_MAX ? s->ring_tex[s->slot] : NULL;
 	}
 	case MODE_GAME: {
 		// Import what the thread handed over.
 		for (int i = 0; i < GAME_MAX; i++) {
-			struct game_buffer *b = &g_frame.pending[i];
+			struct game_buffer *b = &s->pending[i];
 			if (!b->id)
 				continue;
 			int at = 0;
 			for (int k = 0; k < GAME_MAX; k++) {
-				if (g_render.game[k].id == b->id || !g_render.game[k].tex) {
+				if (s->game_tex[k].id == b->id || !s->game_tex[k].tex) {
 					at = k;
 					break;
 				}
-				if (g_render.game[k].used < g_render.game[at].used)
+				if (s->game_tex[k].used < s->game_tex[at].used)
 					at = k;
 			}
-			if (g_render.game[at].tex)
-				gs_texture_destroy(g_render.game[at].tex);
-			g_render.game[at].tex =
-				import_dmabuf(b->fd, b->width, b->height, b->stride, b->fourcc, b->modifier);
-			g_render.game[at].id = g_render.game[at].tex ? b->id : 0;
-			g_render.game[at].used = g_render.frames;
-			g_frame.known[at] = g_render.game[at].id;
-			if (!g_render.game[at].tex)
+			if (s->game_tex[at].tex)
+				gs_texture_destroy(s->game_tex[at].tex);
+			s->game_tex[at].tex = import_dmabuf(b->fd, b->width, b->height, b->stride, b->fourcc, b->modifier);
+			s->game_tex[at].id = s->game_tex[at].tex ? b->id : 0;
+			s->game_tex[at].used = g_render_frames;
+			s->known[at] = s->game_tex[at].id;
+			if (!s->game_tex[at].tex)
 				dmabuf_failed("game buffer");
 			else
 				blog(LOG_INFO, "[fossai-capture] game buffer 0x%llx %ux%u imported",
@@ -855,53 +1042,95 @@ static gs_texture_t *frame_texture_locked(void)
 			b->fd = -1;
 			b->id = 0;
 		}
-		if (g_render.logged != MODE_GAME) {
+		if (s->logged != MODE_GAME) {
 			blog(LOG_INFO, "[fossai-capture] frames: the fullscreen game's own buffer (no copy at all)");
-			g_render.logged = MODE_GAME;
+			s->logged = MODE_GAME;
 		}
 		for (int k = 0; k < GAME_MAX; k++) {
-			if (g_render.game[k].tex && g_render.game[k].id == g_frame.game) {
-				g_render.game[k].used = g_render.frames;
-				return g_render.game[k].tex;
+			if (s->game_tex[k].tex && s->game_tex[k].id == s->game) {
+				s->game_tex[k].used = g_render_frames;
+				return s->game_tex[k].tex;
 			}
 		}
 		// Not imported yet: the last ring frame meanwhile.
-		return g_frame.slot >= 0 && g_frame.slot < RING_MAX ? g_render.ring_tex[g_frame.slot] : NULL;
+		return s->slot >= 0 && s->slot < RING_MAX ? s->ring_tex[s->slot] : NULL;
 	}
 	case MODE_CPU: {
-		if (g_render.logged != MODE_CPU) {
+		if (s->logged != MODE_CPU) {
 			blog(LOG_INFO, "[fossai-capture] frames: CPU copy (grab + texture upload)");
-			g_render.logged = MODE_CPU;
+			s->logged = MODE_CPU;
 		}
-		const struct cap_spec *box = &g_frame.box;
-		if (g_render.cpu_tex &&
-		    (g_render.cpu_w != box->w || g_render.cpu_h != box->h || g_render.cpu_format != g_frame.format)) {
-			gs_texture_destroy(g_render.cpu_tex);
-			g_render.cpu_tex = NULL;
+		uint32_t w = s->spec.w, h = s->spec.h;
+		if (s->cpu_tex && (s->cpu_w != w || s->cpu_h != h || s->cpu_format != s->format)) {
+			gs_texture_destroy(s->cpu_tex);
+			s->cpu_tex = NULL;
 		}
-		if (g_render.cpu_gen != g_frame.cpu_gen) {
-			g_render.cpu_gen = g_frame.cpu_gen;
-			g_render.cpu_seq = 0;
+		if (s->r_cpu_gen != s->cpu_gen) {
+			s->r_cpu_gen = s->cpu_gen;
+			s->cpu_seq = 0;
 		}
-		if (!g_render.cpu_tex && box->w && box->h) {
-			g_render.cpu_tex = gs_texture_create(box->w, box->h, gs_format_of(g_frame.format), 1, NULL,
-							     GS_DYNAMIC);
-			g_render.cpu_w = box->w;
-			g_render.cpu_h = box->h;
-			g_render.cpu_format = g_frame.format;
-			g_render.cpu_seq = 0;
+		if (!s->cpu_tex && w && h) {
+			s->cpu_tex = gs_texture_create(w, h, gs_format_of(s->format), 1, NULL, GS_DYNAMIC);
+			s->cpu_w = w;
+			s->cpu_h = h;
+			s->cpu_format = s->format;
+			s->cpu_seq = 0;
 		}
-		if (g_render.cpu_tex && g_frame.ready >= 0 && g_frame.ready_seq != g_render.cpu_seq &&
-		    g_frame.cpu[g_frame.ready]) {
-			gs_texture_set_image(g_render.cpu_tex, (const uint8_t *)g_frame.cpu[g_frame.ready], box->w * 4,
-					     false);
-			g_render.cpu_seq = g_frame.ready_seq;
+		if (s->cpu_tex && s->ready >= 0 && s->ready_seq != s->cpu_seq && s->cpu[s->ready]) {
+			gs_texture_set_image(s->cpu_tex, (const uint8_t *)s->cpu[s->ready], w * 4, false);
+			s->cpu_seq = s->ready_seq;
 		}
-		return g_render.cpu_seq ? g_render.cpu_tex : NULL;
+		return s->cpu_seq ? s->cpu_tex : NULL;
 	}
 	default:
 		return NULL;
 	}
+}
+
+// The pointer as its own quad over the frame (26.11, like OBS's xshm and
+// PipeWire captures): straight alpha, clipped to the source.
+static void draw_cursor_locked(struct stream *s, const struct cap_spec *want)
+{
+	if (!s->cursor_tex || s->cursor_serial != s->cur.serial) {
+		if (s->cursor_tex)
+			gs_texture_destroy(s->cursor_tex);
+		const uint8_t *data = (const uint8_t *)s->cur_pixels;
+		s->cursor_tex = gs_texture_create(s->cur.w, s->cur.h, GS_BGRA, 1, &data, 0);
+		s->cursor_serial = s->cur.serial;
+	}
+	if (!s->cursor_tex)
+		return;
+	int32_t x0 = s->cur.x < 0 ? 0 : s->cur.x;
+	int32_t y0 = s->cur.y < 0 ? 0 : s->cur.y;
+	int32_t x1 = s->cur.x + (int32_t)s->cur.w;
+	int32_t y1 = s->cur.y + (int32_t)s->cur.h;
+	if (x1 > (int32_t)want->w)
+		x1 = (int32_t)want->w;
+	if (y1 > (int32_t)want->h)
+		y1 = (int32_t)want->h;
+	if (x1 <= x0 || y1 <= y0)
+		return;
+	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	const bool linear_srgb = gs_get_linear_srgb();
+	const bool previous = gs_framebuffer_srgb_enabled();
+	gs_enable_framebuffer_srgb(linear_srgb);
+	gs_blend_state_push();
+	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+	gs_enable_color(true, true, true, false);
+	gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
+	if (linear_srgb)
+		gs_effect_set_texture_srgb(image, s->cursor_tex);
+	else
+		gs_effect_set_texture(image, s->cursor_tex);
+	gs_matrix_push();
+	gs_matrix_translate3f((float)x0, (float)y0, 0.0f);
+	while (gs_effect_loop(effect, "Draw"))
+		gs_draw_sprite_subregion(s->cursor_tex, 0, (uint32_t)(x0 - s->cur.x), (uint32_t)(y0 - s->cur.y),
+					 (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+	gs_matrix_pop();
+	gs_enable_color(true, true, true, true);
+	gs_blend_state_pop();
+	gs_enable_framebuffer_srgb(previous);
 }
 
 static void capture_render(void *data, gs_effect_t *unused)
@@ -912,15 +1141,16 @@ static void capture_render(void *data, gs_effect_t *unused)
 	struct cap_spec want = cap->want;
 	bool want_ok = cap->want_ok;
 	pthread_mutex_unlock(&g_lock);
-	if (!want_ok)
-		return;
 
 	pthread_mutex_lock(&g_frame_lock);
-	g_render.frames++;
-	gs_texture_t *tex = frame_texture_locked();
-	const struct cap_spec box = g_frame.box;
-	if (tex && want.x >= box.x && want.y >= box.y && want.x + (int32_t)want.w <= box.x + (int32_t)box.w &&
-	    want.y + (int32_t)want.h <= box.y + (int32_t)box.h) {
+	g_render_frames++;
+	sweep_streams_locked();
+	struct stream *s = NULL;
+	for (struct stream *at = g_streams; want_ok && at && !s; at = at->next)
+		if (!at->dead && same_rect(&at->spec, &want))
+			s = at;
+	gs_texture_t *tex = s ? frame_texture_locked(s) : NULL;
+	if (tex) {
 		gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_OPAQUE);
 		const bool linear_srgb = gs_get_linear_srgb();
 		const bool previous = gs_framebuffer_srgb_enabled();
@@ -931,9 +1161,13 @@ static void capture_render(void *data, gs_effect_t *unused)
 		else
 			gs_effect_set_texture(image, tex);
 		while (gs_effect_loop(effect, "Draw"))
-			gs_draw_sprite_subregion(tex, 0, (uint32_t)(want.x - box.x), (uint32_t)(want.y - box.y), want.w,
-						 want.h);
+			gs_draw_sprite_subregion(tex, 0, 0, 0, want.w, want.h);
 		gs_enable_framebuffer_srgb(previous);
+		// The pointer: unless it is in the frame already (the compositor
+		// drew it, or an old kernel patched it in).
+		if ((want.flags & CAP_POINTER) && !g_old_kernel_cursor && s->cur.visible && s->cur.serial &&
+		    !(s->cur.in_frame && s->mode != MODE_GAME))
+			draw_cursor_locked(s, &want);
 	}
 	pthread_mutex_unlock(&g_frame_lock);
 }
@@ -1032,21 +1266,14 @@ static void capture_destroy(void *data)
 		g_thread_running = false;
 	}
 	pthread_mutex_unlock(&g_lock);
-	// The last source: the thread stops the kernel capture and ends; the
-	// textures go with it.
+	// The last source: the thread stops the kernel captures and ends; the
+	// streams and their textures go with it.
 	if (last) {
 		pthread_join(thread, NULL);
 		bfree((void *)stop);
 		obs_enter_graphics();
 		pthread_mutex_lock(&g_frame_lock);
-		drop_ring_textures();
-		drop_game_textures();
-		if (g_render.cpu_tex)
-			gs_texture_destroy(g_render.cpu_tex);
-		g_render.cpu_tex = NULL;
-		g_render.ring_gen = 0;
-		g_frame.ring_gen = 0;
-		g_render.logged = MODE_NONE;
+		sweep_streams_locked();
 		pthread_mutex_unlock(&g_frame_lock);
 		obs_leave_graphics();
 	}
@@ -1115,7 +1342,7 @@ static obs_properties_t *screen_properties(void *data)
 		obs_property_list_add_string(list, "Весь рабочий стол", MONITOR_DESKTOP);
 	}
 	obs_properties_add_button(props, "identify", "Определить", identify_clicked);
-	obs_properties_add_bool(props, "show_cursor", "Показывать указатель");
+	obs_properties_add_bool(props, "show_cursor", "Показывать курсор");
 	obs_property_t *fps = obs_properties_add_int(props, "fps", "Кадров в секунду (0 — как у видео OBS)", 0, 240, 1);
 	obs_property_set_long_description(fps, "0 — столько же, сколько в Настройки → Видео (30 или 60)");
 	return props;
@@ -1138,7 +1365,7 @@ static obs_properties_t *window_properties(void *data)
 		line = end ? end + 1 : NULL;
 	}
 	bfree(text);
-	obs_properties_add_bool(props, "show_cursor", "Показывать указатель");
+	obs_properties_add_bool(props, "show_cursor", "Показывать курсор");
 	obs_properties_add_int(props, "fps", "Кадров в секунду (0 — как у видео OBS)", 0, 240, 1);
 	return props;
 }
@@ -1214,11 +1441,6 @@ static void probe_dmabuf(void)
 
 bool obs_module_load(void)
 {
-	// No descriptors yet (0 is a real one).
-	for (int i = 0; i < RING_MAX; i++)
-		g_frame.ring.fds[i] = -1;
-	for (int i = 0; i < GAME_MAX; i++)
-		g_frame.pending[i].fd = -1;
 	obs_register_source(&screen_info);
 	obs_register_source(&window_info);
 	int fd = open(CAP_DEVICE, O_RDWR | O_CLOEXEC);

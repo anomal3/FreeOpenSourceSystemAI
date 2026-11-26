@@ -254,8 +254,15 @@ unsafe impl GlobalAlloc for KernelHeap {
     }
 }
 
-/// Идёт ли рост кучи (см. [`grow`]).
-static GROWING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Who grows the heap now (see [`grow`]): the CPU number, or [`NO_GROWER`].
+/// One atomic for both "growing" and "by whom": with a separate flag an
+/// interrupt between taking the flag and recording the CPU did not recognise
+/// its own CPU and spun the whole patience with interrupts off.
+static GROWER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(NO_GROWER);
+const NO_GROWER: usize = usize::MAX;
+/// How long an allocation with interrupts off waits for another CPU's growth
+/// (spin iterations, tens of milliseconds; mapping 8 MiB takes far less).
+const GROW_WAIT_SPINS: u32 = 20_000_000;
 
 /// Шаг роста кучи.
 const GROW_STEP: usize = 8 * 1024 * 1024;
@@ -268,21 +275,34 @@ const GROW_STEP: usize = 8 * 1024 * 1024;
 /// Кадры отображаются сразу за концом кучи вне её замка (эти адреса ещё
 /// ничьи), потом куча расширяется под замком. Растёт один: второй ждёт
 /// первого и перепроверяет размер. Из кода с закрытыми прерываниями
-/// (обработчик, держатель спин-замка) рост не ждёт — `false`, и выделение
-/// откажет, как раньше.
+/// (обработчик, держатель спин-замка) рост другого процессора ждётся
+/// ограниченное время ([`GROW_WAIT_SPINS`]); рост на своём же процессоре
+/// (прерывание поверх растущего) не ждётся — `false`, и выделение откажет.
 fn grow(need: usize) -> bool {
     use core::sync::atomic::Ordering;
     use crate::mm::FrameAllocator;
     let before = crate::mm::heap_size();
-    while GROWING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+    let me = crate::smp::cpu();
+    let mut patience = GROW_WAIT_SPINS;
+    while let Err(grower) = GROWER.compare_exchange(NO_GROWER, me, Ordering::Acquire, Ordering::Relaxed) {
+        // 26.11 (obsos-storage, OBSOS opening ~100 threads on the Rupor
+        // page): an allocation with interrupts off on one CPU while another
+        // CPU was growing the heap gave up at once - KERNEL HEAP EXHAUSTED
+        // right after "heap grown to 56 MiB". The grower on another CPU
+        // finishes without us, so wait for it a bounded time; only the
+        // grower's own CPU (an interrupt over it) or a grower that never
+        // comes back (preempted on this CPU) still fails as before.
         if !crate::arch::interrupts::enabled() {
-            return false;
+            if grower == me || patience == 0 {
+                return false;
+            }
+            patience -= 1;
         }
         core::hint::spin_loop();
     }
     // Пока ждали, мог вырасти другой.
     if crate::mm::heap_size() != before {
-        GROWING.store(false, Ordering::Release);
+        GROWER.store(NO_GROWER, Ordering::Release);
         return true;
     }
     let limit = crate::mm::heap_limit();
@@ -321,7 +341,7 @@ fn grow(need: usize) -> bool {
             crate::mm::set_heap_size(mapped);
         }
     }
-    GROWING.store(false, Ordering::Release);
+    GROWER.store(NO_GROWER, Ordering::Release);
     if grown > 0 {
         kprintln!("  heap        : grown to {} MiB (limit {} MiB)", mapped >> 20, limit >> 20);
     }

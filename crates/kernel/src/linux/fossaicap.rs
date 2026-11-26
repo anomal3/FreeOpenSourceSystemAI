@@ -19,6 +19,28 @@
 //!
 //! | `FOSSAI_CAP_DMABUF` (`F`,8) | `CapDmabuf` out — the dma-buf ring       | 0 / `ENODEV`|
 //! | `FOSSAI_CAP_FRAME` (`F`,9)  | `CapFrame` in/out — the newest frame     | 0           |
+//! | `FOSSAI_CAP_CURSOR` (`F`,10)| `CapCursor` in/out — the pointer         | 0           |
+//!
+//! # One capture per open, per rectangle (26.11)
+//!
+//! Every open may start one capture (`START`; a second one on the same open
+//! is `EBUSY`). The kernel keeps one session per captured rectangle
+//! (`ui::capture`): OBS's sources on monitor 1 and monitor 2 are two opens
+//! and two sessions at the monitors' own sizes, a second source of the same
+//! monitor (or `/bin/screenrec` recording it) joins the session and costs no
+//! second copy. Before, one capture ran on the whole system and OBS captured
+//! the box around all its sources (5120x1440 for two monitors).
+//!
+//! # The pointer (26.11)
+//!
+//! `CURSOR` answers the pointer over the open's capture: its picture
+//! (`0xAARRGGBB`, copied only when `have_serial` is old), hotspot, place in
+//! the captured rectangle and whether the compositor drew it into the
+//! composed frames itself (`CAP_CURSOR_IN_FRAME`). OBS starts its capture
+//! without `CAP_POINTER` and draws the pointer as its own quad: over a ring
+//! frame, and over a fullscreen game's buffer, which never has the pointer
+//! (the display draws it as a hardware cursor). A pointer move costs no frame
+//! copy any more.
 //!
 //! # Zero copy for OBS on the GPU (25.11)
 //!
@@ -63,7 +85,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::e;
 use super::ipc::get;
@@ -88,6 +109,8 @@ const IDENTIFY: usize = 7;
 /// 25.11: the dma-buf ring and the newest frame (zero copy for OBS).
 const DMABUF: usize = 8;
 const FRAME: usize = 9;
+/// 26.11: the pointer over the capture.
+const CURSOR: usize = 10;
 
 /// Buffers in the dma-buf ring.
 const RING: usize = 3;
@@ -150,10 +173,21 @@ struct Ring {
     copied: u64,
 }
 
+/// The capture of one open (26.11): its kernel session.
+#[derive(Clone, Copy)]
+struct Use {
+    session: u32,
+    /// The pointer is patched into the frames (`CAP_POINTER`).
+    pointer: bool,
+    /// The open samples a fullscreen game's buffer now (`FRAME`).
+    client: bool,
+    started_ms: u64,
+}
+
 /// One open of the node.
 struct Device {
-    /// This open started the running capture.
-    started: AtomicBool,
+    /// The capture this open started.
+    session: Mutex<Option<Use>>,
     /// `read`: the monitor text taken at the first read, and how far it is read.
     text: Mutex<Option<(Vec<u8>, usize)>>,
     /// 25.11: the dma-buf ring (`FOSSAI_CAP_DMABUF`).
@@ -230,10 +264,36 @@ impl Object for Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if self.started.load(Ordering::Relaxed) && crate::ui::capture::active() {
-            crate::ui::capture::syscall(user_abi::CAP_STOP, 0, 0);
-            crate::kprintln!("  capture     : /dev/fossai-capture closed, capture ended");
+        if self.session.lock().is_some() {
+            stop(self, "/dev/fossai-capture closed");
         }
+    }
+}
+
+/// End the open's capture (`STOP`, close).
+fn stop(device: &Device, why: &str) -> i64 {
+    let Some(used) = device.session.lock().take() else {
+        return -ENODATA;
+    };
+    *device.ring.lock() = None;
+    match crate::ui::capture::close_session(used.session, used.pointer, used.client) {
+        Some(grabs) => crate::kprintln!("  capture     : stopped after {grabs} grab(s) (session {}, {why})", used.session),
+        None => crate::kprintln!("  capture     : one consumer of session {} left ({why})", used.session),
+    }
+    0
+}
+
+/// The open's capture.
+fn used(device: &Device) -> Option<Use> {
+    *device.session.lock()
+}
+
+/// The open samples the game's buffer (`on`) or composed frames.
+fn set_client(device: &Device, on: bool) {
+    let mut session = device.session.lock();
+    if let Some(used) = session.as_mut().filter(|used| used.client != on) {
+        used.client = on;
+        crate::ui::capture::set_client(used.session, on);
     }
 }
 
@@ -249,7 +309,7 @@ pub fn open(linux: &str, flags: usize) -> Option<i64> {
     if linux != PATH {
         return None;
     }
-    let object: Arc<dyn Object> = Arc::new(Device { started: AtomicBool::new(false), text: Mutex::new(None), ring: Mutex::new(None) });
+    let object: Arc<dyn Object> = Arc::new(Device { session: Mutex::new(None), text: Mutex::new(None), ring: Mutex::new(None) });
     Some(match crate::user::with_current(|program| {
         let fd = program.files.install_object(object, false)?;
         program.files.set_cloexec(fd, flags & O_CLOEXEC != 0);
@@ -281,33 +341,25 @@ pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
     if (request >> 8) & 0xff != usize::from(b'F') {
         return Some(-e::ENOTTY);
     }
-    let capture = crate::ui::capture::source_syscall;
+    let capture = crate::ui::capture::syscall;
     Some(match request & 0xff {
         INFO => errno(capture(user_abi::CAP_INFO, arg, 0)),
-        START => {
-            let answer = errno(capture(user_abi::CAP_START, arg, 0));
-            if answer == 0 {
-                device.started.store(true, Ordering::Relaxed);
-                // OBS's source captures for its preview whether it records
-                // or not: no red «recording» indicator for it (24.11).
-                crate::ui::capture::mark_shared();
-            }
-            answer
-        }
-        GRAB => match get::<[u64; 2]>(arg) {
-            Ok([buf, have]) => {
+        START => start(device, arg),
+        GRAB => match (get::<[u64; 2]>(arg), used(device)) {
+            (Ok([buf, have]), Some(used)) => {
                 // 25.11: a source back on the CPU copy needs the mirror kept
                 // up to date (see `FRAME`).
-                crate::ui::capture::set_client(false);
-                errno(capture(user_abi::CAP_GRAB, buf as usize, have as usize))
+                set_client(device, false);
+                errno(crate::ui::capture::grab(used.session, buf as usize, have, used.pointer))
             }
-            Err(err) => err,
+            (Err(err), _) => err,
+            (_, None) => -ENODATA,
         },
-        STOP => {
-            device.started.store(false, Ordering::Relaxed);
-            errno(capture(user_abi::CAP_STOP, 0, 0))
-        }
-        STATUS => errno(capture(user_abi::CAP_STATUS, arg, 0)),
+        STOP => stop(device, "stopped by the program"),
+        STATUS => match used(device) {
+            Some(used) => errno(crate::ui::capture::session_status(used.session, used.started_ms, arg)),
+            None => errno(write_idle(arg)),
+        },
         WINDOWS => match get::<[u64; 2]>(arg) {
             Ok([buf, len]) => errno(capture(user_abi::CAP_WINDOWS, buf as usize, len as usize)),
             Err(err) => err,
@@ -315,16 +367,49 @@ pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
         IDENTIFY => errno(capture(user_abi::CAP_IDENTIFY, arg, 0)),
         DMABUF => dmabuf(device, arg),
         FRAME => frame(device, arg),
+        CURSOR => cursor(device, arg),
         _ => -e::ENOTTY,
     })
 }
 
+/// `FOSSAI_CAP_START`: the open's capture (one per open).
+fn start(device: &Device, arg: usize) -> i64 {
+    let Ok(spec) = get::<user_abi::CapSpec>(arg) else { return -e::EFAULT };
+    let mut session = device.session.lock();
+    if session.is_some() {
+        return -EBUSY;
+    }
+    match crate::ui::capture::open_session(&spec) {
+        Ok(id) => {
+            *session = Some(Use { session: id, pointer: spec.flags & user_abi::CAP_POINTER != 0, client: false, started_ms: crate::time::uptime_ms() });
+            0
+        }
+        Err(err) => errno(err),
+    }
+}
+
+/// `FOSSAI_CAP_STATUS` without a capture on the open: «none».
+fn write_idle(arg: usize) -> i64 {
+    if super::ipc::put(arg, user_abi::CapStatus::default()).is_err() { user_abi::ERR_BAD_ADDRESS } else { 0 }
+}
+
+/// `FOSSAI_CAP_CURSOR`: the pointer over the open's capture.
+fn cursor(device: &Device, arg: usize) -> i64 {
+    let Some(used) = used(device) else { return -ENODATA };
+    let Ok(mut args) = get::<user_abi::CapCursor>(arg) else { return -e::EFAULT };
+    let answer = crate::ui::capture::cursor(used.session, &mut args);
+    if answer < 0 {
+        return errno(answer);
+    }
+    if super::ipc::put(arg, args).is_err() { -e::EFAULT } else { 0 }
+}
+
 /// `FOSSAI_CAP_DMABUF`: a ring for the running capture of this open.
 fn dmabuf(device: &Device, arg: usize) -> i64 {
-    if !device.started.load(Ordering::Relaxed) {
+    let Some(used) = used(device) else {
         return -ENODATA;
-    }
-    let Some((width, height)) = crate::ui::capture::size() else {
+    };
+    let Some((width, height)) = crate::ui::capture::size(used.session) else {
         return -ENODATA;
     };
     let stride = (width * 4).next_multiple_of(STRIDE_ALIGN);
@@ -367,9 +452,11 @@ fn close_fds(fds: &[i32]) {
 /// `FOSSAI_CAP_FRAME`: the newest frame - a game's buffer or a ring slot.
 fn frame(device: &Device, arg: usize) -> i64 {
     let Ok(mut args) = get::<CapFrame>(arg) else { return -e::EFAULT };
+    let Some(used) = used(device) else { return -ENODATA };
+    let id = used.session;
     let mut ring = device.ring.lock();
     let Some(ring) = ring.as_mut() else { return -ENODATA };
-    if crate::ui::capture::size() != Some((ring.width, ring.height)) {
+    if crate::ui::capture::size(id) != Some((ring.width, ring.height)) {
         // The capture was restarted on another size: a new ring is needed.
         return -ENODATA;
     }
@@ -377,12 +464,13 @@ fn frame(device: &Device, arg: usize) -> i64 {
     args.fd = -1;
     args.flags = 0;
     // A fullscreen game scanned out from its own buffer: that buffer.
-    let game = crate::ui::capture::direct_source().and_then(|(phys, pitch)| {
+    let game = crate::ui::capture::direct_source(id).and_then(|(phys, pitch)| {
         let bo = crate::linux::drm::exported_by_frame(phys)?;
         (pitch >= ring.width * 4 && u64::from(pitch) * u64::from(ring.height) <= bo.size).then_some((phys, pitch, bo))
     });
-    crate::ui::capture::set_client(game.is_some());
+    set_client(device, game.is_some());
     if let Some((phys, pitch, bo)) = game {
+        crate::ui::capture::touch(id);
         args.buffer = phys;
         args.slot = -1;
         args.width = ring.width;
@@ -409,7 +497,7 @@ fn frame(device: &Device, arg: usize) -> i64 {
     let stride = ring.stride as usize;
     let answer = {
         let Some(frames) = ring.bos[next].frames() else { return -e::EINVAL };
-        crate::ui::capture::grab_with(ring.copied, |w, h| {
+        crate::ui::capture::grab_with(id, ring.copied, used.pointer, |w, h| {
             if (w, h) != (ring.width, ring.height) || frames.len() * 4096 < stride * h as usize {
                 return Err(user_abi::ERR_NOT_FOUND);
             }

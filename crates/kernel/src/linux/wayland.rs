@@ -1499,7 +1499,34 @@ struct Client {
     /// object); when the monitors under surfaces were last looked up (ms).
     entered: Vec<(u32, u32)>,
     enter_checked_ms: u64,
+    /// 26.11: the cursor surface of `wl_pointer.set_cursor`, its hotspot
+    /// and the desktop window it is for; `image_due` - the image has not
+    /// reached the busy desktop yet.
+    cursor: Option<CursorSurface>,
+    /// 26.11 (Uot: "the turret does not follow the mouse"): relative motions
+    /// sent since the last report, their sum and how many found no
+    /// `wl_pointer` focus (Wine drops those: no `focused_hwnd`), or no
+    /// `zwp_relative_pointer_v1` at all.
+    rel_sent: u32,
+    rel_sum: (i64, i64),
+    rel_unfocused: u32,
+    rel_nobody: u32,
+    /// 26.11: the first relative motion of the active constraint is logged.
+    rel_told: bool,
 }
+
+/// 26.11: `wl_pointer.set_cursor` with a surface.
+#[derive(Clone, Copy)]
+struct CursorSurface {
+    surface: u32,
+    hot: (i32, i32),
+    slot: u32,
+    image_due: bool,
+}
+
+/// 26.11: numbers of cursor images (the desktop sends the adapter's
+/// cursor again when it changes).
+static CURSOR_IMAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
 
 /// A client gone with idle inhibitors alive: they end with it (22.11).
 impl Drop for Client {
@@ -1561,6 +1588,12 @@ impl Client {
             outputs_gen: 0,
             entered: Vec::new(),
             enter_checked_ms: 0,
+            cursor: None,
+            rel_sent: 0,
+            rel_sum: (0, 0),
+            rel_unfocused: 0,
+            rel_nobody: 0,
+            rel_told: false,
         }
     }
 
@@ -1642,6 +1675,9 @@ impl Client {
             self.popup_events(time);
             if !self.constraints.is_empty() {
                 self.sync_constraints();
+            }
+            if self.cursor.is_some_and(|cursor| cursor.image_due) {
+                self.send_cursor_image();
             }
             self.sync_enter(now);
             let now_us = crate::time::uptime_ns() / 1000;
@@ -2487,14 +2523,25 @@ impl Client {
             Obj::Pointer => match opcode {
                 // G3: `set_cursor(serial, surface, hx, hy)`: a null surface
                 // hides the pointer over the window (games drawing their own
-                // cursor - then a flipped output needs no cursor at all); a
-                // surface shows ours again (cursor images are not taken yet).
+                // cursor - then a flipped output needs no cursor at all).
+                // 26.11: a surface is the program's cursor image (Wine:
+                // `SetCursor` with a game's color cursor), shown over its
+                // window once the surface has a buffer - ours until then.
                 0 => {
                     let _serial = args.u32()?;
                     let surface = args.u32()?;
+                    let hot = (args.i32()?, args.i32()?);
                     let root = self.pointer_on.map(|on| self.root_of(on));
-                    if let Some(win) = root.and_then(|root| self.wins.iter().find(|win| win.surface == root && win.open.is_some())) {
-                        crate::ui::client_cursor(self.pid, win.slot, surface == 0);
+                    if let Some(slot) = root.and_then(|root| self.wins.iter().find(|win| win.surface == root && win.open.is_some())).map(|win| win.slot) {
+                        if surface == 0 {
+                            self.cursor = None;
+                            crate::ui::client_cursor(self.pid, slot, true);
+                        } else {
+                            self.cursor = Some(CursorSurface { surface, hot, slot, image_due: true });
+                            if !self.send_cursor_image() {
+                                crate::ui::client_cursor(self.pid, slot, false);
+                            }
+                        }
                     }
                 }
                 1 => self.delete(id),
@@ -3186,6 +3233,16 @@ impl Client {
                 }
             }
         }
+        // 26.11: a new image of the cursor surface.
+        if self.cursor.is_some_and(|cursor| cursor.surface == id) {
+            if let Some(cursor) = self.cursor.as_mut() {
+                cursor.image_due = true;
+            }
+            self.send_cursor_image();
+            self.feedbacks.extend(feedback.into_iter().map(|callback| (callback, id, id)));
+            self.feedback_presented(id, 0);
+            return;
+        }
         // Окно, которому принадлежит поверхность (через цепочку родителей).
         let mut root = id;
         for _ in 0..16 {
@@ -3404,6 +3461,24 @@ impl Client {
                     self.constraints[index].active = true;
                     kprintln!("  wayland     : #{} pointer {}", self.pid, if lock { "locked" } else { "confined" });
                     self.send(Msg::new(id, 0));
+                    self.rel_sent = 0;
+                    self.rel_sum = (0, 0);
+                    self.rel_unfocused = 0;
+                    self.rel_nobody = 0;
+                    self.rel_told = false;
+                    // 26.11: the desktop may have brought the pointer in from
+                    // elsewhere (another monitor) without a motion event:
+                    // the window gets `wl_pointer.enter` now, or Wine (no
+                    // `focused_hwnd`) drops every relative motion of the lock
+                    // - and a locked pointer never moves to enter later.
+                    let root = self.root_of(self.constraints[index].surface);
+                    if self.pointer_on.map(|on| self.root_of(on)) != Some(root) {
+                        if let Some((x, y)) = crate::ui::pointer_in_window(self.pid, slot) {
+                            let time = crate::time::uptime_ms() as u32;
+                            let target = self.pointer_motion_at(root, x + gx, y + gy, time);
+                            kprintln!("  wayland     : #{} pointer enters surface {target} for the constraint", self.pid);
+                        }
+                    }
                 }
                 Some(false) if active => self.end_constraint(index, Some(slot)),
                 _ => {}
@@ -3424,6 +3499,69 @@ impl Client {
         }
         kprintln!("  wayland     : #{} pointer {}", self.pid, if lock { "unlocked" } else { "unconfined" });
         self.send(Msg::new(id, 1));
+        self.report_relative();
+    }
+
+    /// 26.11: what relative motion the client got while its constraint was
+    /// active (Uot, hw: "the turret does not follow the mouse").
+    fn report_relative(&mut self) {
+        kprintln!(
+            "  wayland     : #{} {} relative motion(s) during the constraint, sum {},{}; {} without wl_pointer focus on the window, {} without zwp_relative_pointer_v1",
+            self.pid,
+            self.rel_sent,
+            self.rel_sum.0,
+            self.rel_sum.1,
+            self.rel_unfocused,
+            self.rel_nobody
+        );
+        self.rel_sent = 0;
+        self.rel_sum = (0, 0);
+        self.rel_unfocused = 0;
+        self.rel_nobody = 0;
+    }
+
+    /// 26.11: read the buffer of the cursor surface and hand it to the
+    /// desktop for the window. `false` - no image (no buffer, too big, the
+    /// desktop busy - then `image_due` stays and the next turn tries again).
+    fn send_cursor_image(&mut self) -> bool {
+        let Some(cursor) = self.cursor else {
+            return false;
+        };
+        let Some(Obj::Surface(state)) = self.objects.get(&cursor.surface) else {
+            return false;
+        };
+        let Some((_, buf)) = state.shown.as_ref() else {
+            return false;
+        };
+        let max = crate::ui::pointer::CUSTOM_MAX;
+        let (w, h) = (buf.width.min(max), buf.height.min(max));
+        let mut pixels = vec![0u32; (w * h) as usize];
+        let xrgb = buf.format == SHM_XRGB8888;
+        for row in 0..h {
+            let line = &mut pixels[(row * w) as usize..((row + 1) * w) as usize];
+            // SAFETY: the bytes of the `w` pixels of this row.
+            let bytes = unsafe { core::slice::from_raw_parts_mut(line.as_mut_ptr().cast::<u8>(), w as usize * 4) };
+            if !buf.mem.read(buf.offset + u64::from(row) * u64::from(buf.stride), bytes) {
+                return false;
+            }
+            if xrgb {
+                for pixel in line.iter_mut() {
+                    *pixel |= 0xff00_0000;
+                }
+            }
+        }
+        let image = crate::ui::pointer::CustomCursor {
+            pixels: Arc::new(pixels),
+            width: w,
+            height: h,
+            hot: cursor.hot,
+            key: CURSOR_IMAGES.fetch_add(1, Ordering::Relaxed),
+        };
+        let taken = crate::ui::client_cursor_image(self.pid, cursor.slot, image);
+        if let Some(cursor) = self.cursor.as_mut() {
+            cursor.image_due = !taken;
+        }
+        taken
     }
 
     /// G3: the client destroyed a constraint - the desktop forgets it.
@@ -3435,6 +3573,10 @@ impl Client {
         let c = self.constraints.remove(index);
         if let (Some((slot, _)), true) = (window, c.asked && !c.defunct) {
             crate::ui::constrain_pointer(self.pid, slot, None);
+        }
+        if c.active {
+            kprintln!("  wayland     : #{} pointer {} (constraint destroyed by the client)", self.pid, if c.lock { "unlocked" } else { "unconfined" });
+            self.report_relative();
         }
     }
 
@@ -4390,6 +4532,32 @@ impl Client {
                         let us = crate::time::uptime_ns() / 1000;
                         let relatives: Vec<u32> =
                             self.objects.iter().filter(|(_, obj)| matches!(obj, Obj::RelativePointer)).map(|(id, _)| *id).collect();
+                        // 26.11: counted for the lock report - Wine takes
+                        // relative motion only for the window that has the
+                        // `wl_pointer` focus (`enter`).
+                        self.rel_sent += 1;
+                        self.rel_sum.0 += i64::from(dx);
+                        self.rel_sum.1 += i64::from(dy);
+                        let focus = self.pointer_on.map(|on| self.root_of(on));
+                        if relatives.is_empty() {
+                            self.rel_nobody += 1;
+                        } else if focus != Some(surface) {
+                            self.rel_unfocused += 1;
+                        }
+                        let constrained = self.constraints.iter().any(|c| c.active);
+                        if constrained && !self.rel_told {
+                            self.rel_told = true;
+                            kprintln!(
+                                "  wayland     : #{} relative motion under the constraint: {dx},{dy} to {} zwp_relative_pointer_v1, wl_pointer focus {}",
+                                self.pid,
+                                relatives.len(),
+                                match self.pointer_on {
+                                    Some(on) if focus == Some(surface) => alloc::format!("on surface {on} of the window"),
+                                    Some(on) => alloc::format!("on surface {on} of another window"),
+                                    None => String::from("nowhere (Wine drops the motion)"),
+                                }
+                            );
+                        }
                         for relative in relatives {
                             self.send(
                                 Msg::new(relative, 0).u32((us >> 32) as u32).u32(us as u32).fixed(dx).fixed(dy).fixed(dx).fixed(dy),

@@ -243,6 +243,8 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         // Фаза С5: диспетчер задач.
         SYS_TASKS => tasks(a0, a1),
         SYS_KILL => kill(a0),
+        // 25.11.2026: priorities (Task Manager «Задать приоритет»).
+        user_abi::SYS_PRIORITY => priority(a0, a1, a2),
         // Фаза С7: диспетчер устройств.
         SYS_DEVICES => devices(a0, a1),
         // Фаза 55b: потоки.
@@ -2314,6 +2316,8 @@ fn open_spec(ptr: usize, popup: Option<(u32, (i32, i32))>) -> i64 {
         return ERR_BAD_ADDRESS;
     };
 
+    let marked = if popup.is_none() { beta_title(title) } else { None };
+    let title = marked.as_deref().unwrap_or(title);
     match super::open_window(title, spec.width, spec.height, popup) {
         Ok((surface, slot)) => {
             spec.surface = surface as u64;
@@ -2394,13 +2398,16 @@ fn tasks(ptr: usize, len: usize) -> i64 {
     for task in sched::snapshot() {
         // Снимок берётся до того, как спрашивать таблицу программ: у неё свой
         // замок, и брать его под замком планировщика нельзя.
+        // 25.11: nice and policy at the end (Task Manager «Приоритет»).
+        let nice = sched::prio::nice_of(task.slot);
+        let (policy, _) = sched::prio::policy_of(task.slot);
         let line = match super::program_facts(task.slot) {
             Some((path, uid)) => {
                 let kind = if task.daemon { "service" } else { "program" };
                 let name = path.rsplit('/').next().unwrap_or(task.name);
                 let pages = super::program_pages(task.slot).unwrap_or(0);
                 alloc::format!(
-                    "{}\t{name}\t{}\t{}\t{kind}\t{uid}\t{path}\t{}\t{pages}\t{}\t{}\n",
+                    "{}\t{name}\t{}\t{}\t{kind}\t{uid}\t{path}\t{}\t{pages}\t{}\t{}\t{nice}\t{policy}\n",
                     task.id.as_u32(),
                     task.state,
                     task.cpu_ms,
@@ -2411,7 +2418,7 @@ fn tasks(ptr: usize, len: usize) -> i64 {
             }
             // У задачи ядра своих страниц нет: стек и куча — ядерные.
             None => alloc::format!(
-                "{}\t{}\t{}\t{}\tkernel\t-\t\t{}\t-\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\tkernel\t-\t\t{}\t-\t{}\t{}\t{nice}\t{policy}\n",
                 task.id.as_u32(),
                 task.name,
                 task.state,
@@ -2429,6 +2436,47 @@ fn tasks(ptr: usize, len: usize) -> i64 {
         written += bytes.len();
     }
     written as i64
+}
+
+/// `priority(op, task, value)`: see [`user_abi::SYS_PRIORITY`].
+fn priority(op: usize, task: usize, value: usize) -> i64 {
+    use crate::sched::prio::{self, PrioError};
+    let Ok(task) = u32::try_from(task) else {
+        return user_abi::ERR_NOT_FOUND;
+    };
+    let answer = |err: PrioError| match err {
+        PrioError::NotFound => user_abi::ERR_NOT_FOUND,
+        PrioError::Permission | PrioError::Access => user_abi::ERR_PERMISSION,
+        PrioError::Invalid => ERR_BAD_ADDRESS,
+    };
+    let Some(slot) = prio::slot_of_task(task) else {
+        return user_abi::ERR_NOT_FOUND;
+    };
+    let nice = value as i32;
+    match op {
+        user_abi::PRIO_GET => {
+            let (policy, _) = prio::policy_of(slot);
+            i64::from(policy << 8) | i64::from(prio::nice_of(slot) - user_abi::NICE_MIN)
+        }
+        user_abi::PRIO_SET_PROCESS | user_abi::PRIO_SET_THREAD => {
+            if super::program_facts(slot).is_none() {
+                return user_abi::ERR_UNSUPPORTED;
+            }
+            let result = if op == user_abi::PRIO_SET_PROCESS {
+                prio::set_process_nice_checked(task, nice).map(|_| ())
+            } else {
+                prio::may_set_nice(slot, nice).map(|()| prio::set_nice(slot, nice))
+            };
+            match result {
+                Ok(()) => {
+                    crate::kprintln!("  prio        : #{} nice {nice} ({})", crate::sched::slot_task_id(slot).unwrap_or(0), if op == user_abi::PRIO_SET_PROCESS { "process" } else { "thread" });
+                    0
+                }
+                Err(err) => answer(err),
+            }
+        }
+        _ => user_abi::ERR_UNSUPPORTED,
+    }
 }
 
 /// `devices(ptr, len)`: перепись устройств текстом — см. договор у
@@ -2733,6 +2781,27 @@ fn winlimits(id: i64, min: usize, max: usize) -> i64 {
     }
 }
 
+/// The OBSOS browser is a beta (Roman, 26.11.2026): its window titles (title
+/// bar, taskbar, Alt+Tab) get " (BETA)" here, on the FossAi side - the browser
+/// sources are a snapshot of another project (F:\ObsosBrowser) and are not
+/// edited. Popups (menus, lists) have no title bar and stay as they are.
+fn beta_title(title: &str) -> Option<alloc::string::String> {
+    const OBSOS: &str = "/opt/obsos/bin/obsos";
+    if title.contains("BETA") {
+        return None;
+    }
+    let obsos = super::with_current(|program| program.path.ends_with(OBSOS)).unwrap_or(false);
+    if !obsos {
+        return None;
+    }
+    // "OBSOS — page" -> "OBSOS (BETA) — page": right after the name, so a long
+    // page title cut by the title bar does not cut the mark.
+    Some(match title.strip_prefix("OBSOS") {
+        Some(rest) => alloc::format!("OBSOS (BETA){rest}"),
+        None => alloc::format!("{title} (BETA)"),
+    })
+}
+
 /// `wintitle(id, ptr, len) -> 0` (фаза 62c). Строка проверяется так же, как
 /// заголовок в [`winopen`].
 fn wintitle(id: i64, ptr: usize, len: usize) -> i64 {
@@ -2752,6 +2821,8 @@ fn wintitle(id: i64, ptr: usize, len: usize) -> i64 {
     let Ok(title) = core::str::from_utf8(bytes) else {
         return ERR_BAD_ADDRESS;
     };
+    let marked = beta_title(title);
+    let title = marked.as_deref().unwrap_or(title);
     match super::title_window(slot, title) {
         Ok(()) => 0,
         Err(err) => window_errno(err),
@@ -3216,6 +3287,9 @@ fn pipe_write_waiting(writer: &super::pipe::Writer, ptr: usize, len: usize) -> i
 
 /// `SYS_FDCTL` (фаза 66b): режим дескриптора — см. договор.
 fn fdctl(fd: usize, op: usize, arg: usize) -> i64 {
+    if op == user_abi::FDCTL_TRUNCATE {
+        return fd_truncate(fd, arg as u64);
+    }
     let result = super::with_current(|program| match op {
         user_abi::FDCTL_NONBLOCK => program.files.set_nonblock(fd, arg != 0).map(|()| 0),
         user_abi::FDCTL_FLAGS => program
@@ -3226,6 +3300,26 @@ fn fdctl(fd: usize, op: usize, arg: usize) -> i64 {
     });
     match result {
         Some(Ok(answer)) => answer,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
+/// [`user_abi::FDCTL_TRUNCATE`] (26.11): `ftruncate` of native programs — the
+/// file must be open for writing; the length changes outside the program lock
+/// (disk I/O), as in the Linux layer.
+fn fd_truncate(fd: usize, length: u64) -> i64 {
+    let node = super::with_current(|program| {
+        if program.files.access_mode(fd)? != 2 {
+            return Err(FileError::BadFd);
+        }
+        program.files.node(fd)
+    });
+    match node {
+        Some(Ok(node)) => match node.truncate(length) {
+            Ok(()) => 0,
+            Err(err) => vfs_errno(err),
+        },
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
     }
