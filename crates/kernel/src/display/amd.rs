@@ -1208,10 +1208,10 @@ fn run_gametest(what: &str, limit_s: u32) -> Option<bool> {
     while super::nvidia_gametest::running() {
         crate::sched::sleep_ms(1000);
         ticks += 1;
-        // Один снимок экрана на шаг: когда пошли кадры, а у программ - когда окна уже открылись.
+        // Один снимок экрана на шаг: когда пошли кадры.
         let commits = wayland_commits();
         let busy = commits.wrapping_sub(last_commits) >= 5 && ticks >= 3;
-        if !shot && ((busy && what != "apps") || (what == "apps" && ticks == 25)) {
+        if !shot && busy {
             shots::burst(what);
             shot = true;
         }
@@ -1227,27 +1227,9 @@ fn run_gametest(what: &str, limit_s: u32) -> Option<bool> {
     Some(lines.iter().any(|line| line.contains("gametest: done in") && line.contains(", 0 failed")))
 }
 
-/// 7-Zip: упаковать каталог и проверить архив (своя программа, запускается ядром напрямую).
-fn seven_zip_check() -> Option<bool> {
-    if !matches!(crate::fs::list("/bin"), Some(Ok(ref entries)) if entries.iter().any(|e| e.name == "7zz")) {
-        return None;
-    }
-    let run = |line: &str| match crate::user::spawn(line, crate::vfs::perm::Credentials::ROOT) {
-        Ok(task) => {
-            let code = crate::sched::wait(task);
-            crate::kprintln!("  amdgpu     : 7zip: '{line}' -> {code:?}");
-            format!("{code:?}") == "Some(0)"
-        }
-        Err(err) => {
-            crate::kprintln!("  amdgpu     : 7zip: could not start '{line}': {err:?}");
-            false
-        }
-    };
-    Some(run("/bin/7zz a -bd /tmp/amd-check.7z /usr/share/wallpapers") && run("/bin/7zz t -bd /tmp/amd-check.7z"))
-}
-
-/// Ждать, пока флешка поставит пакеты в память, и пройти проверки: Vulkan, Direct3D 9/11/12, скорость, игра,
-/// программы (7-Zip, VLC, OBS). Каждый шаг - уведомлением на столе и строками `gametest|` в `LOG.TXT`.
+/// Ждать, пока флешка поставит пакеты в память, и пройти проверки: Vulkan, скорость Direct3D 9 (DXVK) и игра.
+/// Остальное (Direct3D 11/12, VLC, OBS, 7-Zip) проверено на RX 590 (0.8.37) и из прогона убрано, чтобы он не тянулся;
+/// запускается вручную: `gpu gametest hw amd -- d3d11|d3d12|apps`. Каждый шаг - уведомлением на столе и строками `gametest|` в `LOG.TXT`.
 fn radv_auto() {
     let present = |path: &str| matches!(crate::fs::list(path), Some(Ok(_)));
     // До 25 минут: пакеты с флешки - гигабайты.
@@ -1273,18 +1255,13 @@ fn radv_auto() {
     // Названия короткие: карточка уведомления узкая, длинное обрезается.
     let mut steps: Vec<(&str, &str, u32)> = alloc::vec![
         ("vk", "Vulkan", 600),
-        ("d3d", "Direct3D 9", 900),
-        ("d3d11", "Direct3D 11", 600),
-        ("d3d12", "Direct3D 12", 600),
-        ("vsync", "скорость", 600),
+        // Первым запуском Wine создаётся префикс.
+        ("vsync", "скорость", 900),
     ];
     if present("/opt/tmnf/bin") {
         steps.push(("tmnf", "Trackmania", 1900));
     }
-    if present("/opt/vlc/bin") || present("/opt/obs/bin") {
-        steps.push(("apps", "VLC и OBS", 300));
-    }
-    let total = steps.len() + 1;
+    let total = steps.len();
     let mut results: Vec<String> = Vec::new();
     let mut failed = 0u32;
     let mut record = |name: &str, verdict: Option<bool>, results: &mut Vec<String>| {
@@ -1307,10 +1284,6 @@ fn radv_auto() {
         if super::nvidia_gametest::running() {
             break;
         }
-    }
-    announce(&format!("Шаг {total}/{total}: 7-Zip"), "Не выключайте.", 120_000);
-    if let Some(ok) = seven_zip_check() {
-        record("7zip", Some(ok), &mut results);
     }
     crate::kprintln!("==== AMD TEST: summary: {} ====", results.join(", "));
     let bad: Vec<&str> = results.iter().filter(|line| !line.ends_with(" PASS")).map(String::as_str).collect();
