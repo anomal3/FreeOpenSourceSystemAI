@@ -228,6 +228,9 @@ struct Stream {
     origin: u64,
     /// Захват: сколько кадров отдано программе всего, без `boundary`.
     total: u64,
+    /// Воспроизведение: программа не успела записать (идёт недобор) и сколько раз так было.
+    starved: bool,
+    underruns: u64,
 }
 
 impl Default for Stream {
@@ -244,6 +247,8 @@ impl Default for Stream {
             capture: false,
             origin: 0,
             total: 0,
+            starved: false,
+            underruns: 0,
         }
     }
 }
@@ -293,6 +298,10 @@ impl Stream {
         if step < frames {
             // Недобор: карта играет тишину, долг не копится.
             self.rest = 0;
+            if self.state == STATE_RUNNING && !self.starved {
+                self.starved = true;
+                self.underruns += 1;
+            }
         }
         self.hw = self.wrap(self.hw + step);
         if self.state == STATE_DRAINING && self.queued() == 0 {
@@ -328,6 +337,7 @@ struct Pcm {
     written: core::sync::atomic::AtomicU64,
     feed_errors: core::sync::atomic::AtomicU64,
     started: core::sync::atomic::AtomicBool,
+    started_ms: core::sync::atomic::AtomicU64,
 }
 
 /// Playback streams that have written something and are still open. More
@@ -342,6 +352,7 @@ impl Pcm {
             written: core::sync::atomic::AtomicU64::new(0),
             feed_errors: core::sync::atomic::AtomicU64::new(0),
             started: core::sync::atomic::AtomicBool::new(false),
+            started_ms: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -371,11 +382,14 @@ impl Drop for Pcm {
             let _ = crate::sound::drain();
         }
         let frames = self.written.load(Relaxed);
+        let underruns = self.state.lock().underruns;
+        let open_s = crate::time::uptime_ms().saturating_sub(self.started_ms.load(Relaxed)) / 1000;
         crate::kprintln!(
-            "  snd         : playback closed: {frames} frames ({}.{} s) to {}, {} failed hand-over(s)",
+            "  snd         : playback closed: {frames} frames ({}.{} s) in {open_s} s to {}, {underruns} underrun(s) of the program, card ring ran dry {} time(s), {} failed hand-over(s)",
             frames / RATE,
             frames % RATE * 10 / RATE,
             Self::card(),
+            crate::sound::hda::take_dry(),
             self.feed_errors.load(Relaxed)
         );
     }
@@ -744,6 +758,7 @@ impl Pcm {
             use core::sync::atomic::Ordering::Relaxed;
             if take > 0 && !self.started.swap(true, Relaxed) {
                 let others = PLAYING.fetch_add(1, Relaxed);
+                self.started_ms.store(crate::time::uptime_ms(), Relaxed);
                 let pid = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
                 crate::kprintln!(
                     "  snd         : process {pid} ({}) starts playback, S16_LE 2 ch 48000 Hz -> {}{}",
@@ -769,6 +784,9 @@ impl Pcm {
             let mut stream = self.state.lock();
             stream.update();
             stream.appl = stream.wrap(stream.appl + take);
+            if take > 0 {
+                stream.starved = false;
+            }
             if stream.state == STATE_PREPARED && stream.queued() >= stream.start_threshold.max(1) {
                 stream.start();
             }

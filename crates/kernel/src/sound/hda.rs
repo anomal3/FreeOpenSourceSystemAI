@@ -170,6 +170,14 @@ pub const PERIOD_BYTES: usize = 4096;
 const PERIODS: usize = 8;
 const BUFFER_BYTES: usize = PERIOD_BYTES * PERIODS;
 
+/// Сколько раз кольцо опустело, пока поток шёл (программа не успела) - для журнала звука.
+static DRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Опустошения кольца с прошлого вызова.
+pub fn take_dry() -> u64 {
+    DRY.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Ждущий мьютекс: см. `virtio::snd` — драйвер спит, пока играет период.
 static HDA: crate::sync::Mutex<Option<Hda>> = crate::sync::Mutex::new(None);
 
@@ -845,7 +853,12 @@ impl Hda {
         if self.queued == 0 {
             // Всё сыграно (или ещё не начато): писать — со следующего за
             // тем, что играет сейчас, а до запуска — с начала кольца.
-            self.oldest = if self.running { (self.play + 1) % PERIODS } else { 0 };
+            // 26.11 (треск в игре на ПК): у работающего потока - через один период тишины (~21 мс запаса):
+            // сразу следующий карта могла начать раньше, чем он дописан.
+            if self.running {
+                DRY.fetch_add(1, Ordering::Relaxed);
+            }
+            self.oldest = if self.running { (self.play + 2) % PERIODS } else { 0 };
         }
         Ok((self.oldest + self.queued) % PERIODS)
     }
