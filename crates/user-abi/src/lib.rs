@@ -1153,6 +1153,7 @@ pub const SYS_MOUNTS: usize = 58;
 /// ещё `\t<байт с носителем>\t<байт по сети>` — сколько задача прочла и
 /// записала на диск (на уровне драйвера, мимо кэша) и отдала/получила по
 /// UDP и TCP за свою жизнь; диспетчер делает из них скорость разностью.
+/// Since 25.11 also `\t<nice -20..19>\t<policy>` (see [`SYS_PRIORITY`]).
 /// Род — `program`, `service` (программа, объявленная служебной) или
 /// `kernel`; у задачи ядра uid — `-`, путь пустой. Состояние — то же слово,
 /// что печатает `tasks` в оболочке. Не поместившееся отбрасывается по границе
@@ -1856,6 +1857,147 @@ pub const SYS_STATX: usize = 99;
 /// descriptor; `times == 0` — both «now». Owner or root, as `chmod`; a file
 /// system without stored times answers [`ERR_UNSUPPORTED`].
 pub const SYS_UTIMES: usize = 100;
+
+/// Priority of a task (25.11, Task Manager «Задать приоритет»):
+/// `(op, task id, value) -> answer`. A task id of 0 is the caller.
+///
+/// * [`PRIO_GET`] — answer `(policy << 8) | (nice + 20)`: nice -20..19 as
+///   0..39, the policy is a `SCHED_*` number of Linux ([`PRIO_POLICY_OTHER`],
+///   [`PRIO_POLICY_IDLE`]…).
+/// * [`PRIO_SET_PROCESS`] — `value` = nice (-20..19, as `i32`): every thread
+///   of the task's program.
+/// * [`PRIO_SET_THREAD`] — the same for this one thread.
+///
+/// Like Linux: anybody may lower the priority of his own program (raise
+/// nice); a higher priority (a lower nice) and other users' programs need
+/// root — [`ERR_PERMISSION`]. A kernel task — [`ERR_UNSUPPORTED`]; no such
+/// task — [`ERR_NOT_FOUND`]; nice out of range — [`ERR_BAD_ADDRESS`].
+pub const SYS_PRIORITY: usize = 101;
+
+/// [`SYS_PRIORITY`] operations.
+pub const PRIO_GET: usize = 0;
+pub const PRIO_SET_PROCESS: usize = 1;
+pub const PRIO_SET_THREAD: usize = 2;
+
+/// Scheduling policies (the numbers of Linux `SCHED_*`).
+pub const PRIO_POLICY_OTHER: u32 = 0;
+pub const PRIO_POLICY_FIFO: u32 = 1;
+pub const PRIO_POLICY_RR: u32 = 2;
+pub const PRIO_POLICY_BATCH: u32 = 3;
+pub const PRIO_POLICY_IDLE: u32 = 5;
+
+/// Lowest and highest nice.
+pub const NICE_MIN: i32 = -20;
+pub const NICE_MAX: i32 = 19;
+
+/// Weight of nice 0: the unit of [`nice_weight`].
+pub const NICE_0_WEIGHT: u32 = 1024;
+
+/// Weight of a `SCHED_IDLE` task (Linux: 3).
+pub const IDLE_POLICY_WEIGHT: u32 = 3;
+
+/// CPU weights of nice -20..19 — the table of Linux CFS
+/// (`sched_prio_to_weight`): each step of nice is ~1.25x the CPU, so two
+/// busy tasks one nice apart share it ~55/45, five apart ~75/25, ten apart
+/// ~90/10.
+pub const NICE_WEIGHTS: [u32; 40] = [
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, // -20..-11
+    9548, 7620, 6100, 4904, 3906, 3121, 2501, 1991, 1586, 1277, // -10..-1
+    1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, // 0..9
+    110, 87, 70, 56, 45, 36, 29, 23, 18, 15, // 10..19
+];
+
+/// CPU weight of a nice value (clamped to -20..19).
+#[must_use]
+pub const fn nice_weight(nice: i32) -> u32 {
+    let nice = if nice < NICE_MIN {
+        NICE_MIN
+    } else if nice > NICE_MAX {
+        NICE_MAX
+    } else {
+        nice
+    };
+    NICE_WEIGHTS[(nice - NICE_MIN) as usize]
+}
+
+/// Virtual run time charged for `ns` of real CPU time at `weight`: the
+/// scheduler runs the task with the least of it, so a task of twice the
+/// weight gets twice the CPU.
+#[must_use]
+pub const fn weighted_ns(ns: u64, weight: u32) -> u64 {
+    let weight = if weight == 0 { 1 } else { weight as u64 };
+    // u128: 10^19 ns times 1024 does not fit u64; the answer saturates.
+    let value = (ns as u128 * NICE_0_WEIGHT as u128) / weight as u128;
+    if value > u64::MAX as u128 { u64::MAX } else { value as u64 }
+}
+
+/// Priority classes of the Windows Task Manager («Задать приоритет») and
+/// the nice each one sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrioClass {
+    /// «Реального времени» — shown, never set from the menu.
+    Realtime,
+    /// «Высокий».
+    High,
+    /// «Выше среднего».
+    AboveNormal,
+    /// «Обычный».
+    Normal,
+    /// «Ниже среднего».
+    BelowNormal,
+    /// «Низкий».
+    Low,
+}
+
+impl PrioClass {
+    /// In the order of the Windows menu.
+    pub const ALL: [PrioClass; 6] =
+        [PrioClass::Realtime, PrioClass::High, PrioClass::AboveNormal, PrioClass::Normal, PrioClass::BelowNormal, PrioClass::Low];
+
+    /// The nice this class sets.
+    #[must_use]
+    pub const fn nice(self) -> i32 {
+        match self {
+            PrioClass::Realtime => -20,
+            PrioClass::High => -10,
+            PrioClass::AboveNormal => -5,
+            PrioClass::Normal => 0,
+            PrioClass::BelowNormal => 5,
+            PrioClass::Low => 10,
+        }
+    }
+
+    /// The class a task with this nice and policy is shown in.
+    #[must_use]
+    pub const fn of(nice: i32, policy: u32) -> PrioClass {
+        if policy == PRIO_POLICY_FIFO || policy == PRIO_POLICY_RR {
+            return PrioClass::Realtime;
+        }
+        if policy == PRIO_POLICY_IDLE {
+            return PrioClass::Low;
+        }
+        match nice {
+            i32::MIN..=-8 => PrioClass::High,
+            -7..=-3 => PrioClass::AboveNormal,
+            -2..=2 => PrioClass::Normal,
+            3..=7 => PrioClass::BelowNormal,
+            _ => PrioClass::Low,
+        }
+    }
+
+    /// The Russian name, as in Windows.
+    #[must_use]
+    pub const fn title(self) -> &'static str {
+        match self {
+            PrioClass::Realtime => "Реального времени",
+            PrioClass::High => "Высокий",
+            PrioClass::AboveNormal => "Выше среднего",
+            PrioClass::Normal => "Обычный",
+            PrioClass::BelowNormal => "Ниже среднего",
+            PrioClass::Low => "Низкий",
+        }
+    }
+}
 
 /// Answer of [`SYS_STATX`]. Times are seconds of the Unix epoch, UTC; zero —
 /// unknown (a file system without times, a file made without a clock).
@@ -3161,7 +3303,7 @@ mod tests {
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
             SYS_SOUND, SYS_LIVE_KEYS, SYS_KERNEL_COMMAND, SYS_CLIPBOARD, SYS_SETCLOCK, SYS_MODEM, SYS_FLOCK,
             SYS_FSWATCH, SYS_OPEN_WITH, SYS_SCREENCAP, SYS_WINLIMITS,
-            SYS_REGISTRY, SYS_CHMOD, SYS_STATX, SYS_UTIMES,
+            SYS_REGISTRY, SYS_CHMOD, SYS_STATX, SYS_UTIMES, SYS_PRIORITY,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(
@@ -3169,6 +3311,69 @@ mod tests {
                 "номер {number} выдан второй раз"
             );
         }
+    }
+
+    /// Nice weights (25.11): nice 0 is the unit, every step is ~1.25x, the
+    /// ends are clamped.
+    #[test]
+    fn nice_weights_step_by_a_quarter() {
+        assert_eq!(nice_weight(0), NICE_0_WEIGHT);
+        assert_eq!(nice_weight(-100), NICE_WEIGHTS[0]);
+        assert_eq!(nice_weight(100), NICE_WEIGHTS[39]);
+        for nice in NICE_MIN..NICE_MAX {
+            let ratio = nice_weight(nice) as f64 / nice_weight(nice + 1) as f64;
+            assert!((1.15..1.35).contains(&ratio), "nice {nice}: ratio {ratio}");
+        }
+        assert_eq!(weighted_ns(10_000_000, 1024), 10_000_000);
+        assert_eq!(weighted_ns(10_000_000, 2048), 5_000_000);
+        assert_eq!(weighted_ns(u64::MAX / 2, 15), u64::MAX);
+    }
+
+    /// The pick rule of the kernel scheduler on one CPU (25.11): at the end
+    /// of a 10 ms slice the running task stays while its virtual run time is
+    /// not above the least of the waiting ones. Busy tasks share the CPU by
+    /// weight.
+    fn simulate(nices: &[i32], slices: usize) -> Vec<f64> {
+        let mut vr = vec![0u64; nices.len()];
+        let mut ran = vec![0u64; nices.len()];
+        let mut current = 0;
+        for _ in 0..slices {
+            ran[current] += 10;
+            vr[current] += weighted_ns(10_000_000, nice_weight(nices[current]));
+            let best = (0..nices.len()).filter(|&t| t != current).min_by_key(|&t| vr[t]);
+            if let Some(best) = best {
+                if vr[best] < vr[current] {
+                    current = best;
+                }
+            }
+        }
+        let total: u64 = ran.iter().sum();
+        ran.iter().map(|&ms| ms as f64 / total as f64).collect()
+    }
+
+    #[test]
+    fn busy_tasks_share_by_weight() {
+        let share = simulate(&[0, 10], 1000);
+        assert!(share[0] >= 0.88 && share[0] <= 0.93, "nice 0 vs 10: {share:?}");
+        let share = simulate(&[0, 5], 1000);
+        assert!(share[0] >= 0.72 && share[0] <= 0.78, "nice 0 vs 5: {share:?}");
+        let share = simulate(&[0, 0], 1000);
+        assert!((share[0] - 0.5).abs() < 0.01, "nice 0 vs 0: {share:?}");
+        // The foreground boost (nice -3) against OBS at nice 5.
+        let share = simulate(&[-3, 5], 1000);
+        assert!(share[0] >= 0.83, "-3 vs 5: {share:?}");
+        // Nobody starves: nice 19 next to nice -20 still runs.
+        let share = simulate(&[-20, 19], 100_000);
+        assert!(share[1] > 0.0, "-20 vs 19: {share:?}");
+    }
+
+    #[test]
+    fn priority_classes_round_trip() {
+        for class in PrioClass::ALL {
+            assert_eq!(PrioClass::of(class.nice(), if class == PrioClass::Realtime { PRIO_POLICY_FIFO } else { PRIO_POLICY_OTHER }), class);
+        }
+        assert_eq!(PrioClass::of(5, PRIO_POLICY_OTHER), PrioClass::BelowNormal);
+        assert_eq!(PrioClass::of(0, PRIO_POLICY_IDLE), PrioClass::Low);
     }
 
     /// Имена клавиш, у которых нет символа, — числами.

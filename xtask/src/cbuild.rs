@@ -738,9 +738,9 @@ pub fn builtins(arch: Arch) -> PathBuf {
 /// `drmprobe`/`nvkprobe` (18.11.2026) — узел DRM nouveau для NVK (общий
 /// `drmprobe.h` рядом). `evdevprobe` (24.11.2026) — геймпад `/dev/input/event0`
 /// и его sysfs так, как их читает `winebus.sys` Proton.
-const LINUX_PROGRAMS: [&str; 17] = [
+const LINUX_PROGRAMS: [&str; 18] = [
     "hello", "futexv", "sigasync", "shmprobe", "wow32probe", "netlinkprobe", "ntsyncprobe", "heapgrow", "rwxprobe",
-    "futexlat", "hangprobe", "drmprobe", "nvkprobe", "forkpoll", "tlblat", "rdlat", "evdevprobe",
+    "futexlat", "hangprobe", "drmprobe", "nvkprobe", "forkpoll", "tlblat", "rdlat", "evdevprobe", "prioprobe",
 ];
 
 /// Общие флаги проверочных программ Linux.

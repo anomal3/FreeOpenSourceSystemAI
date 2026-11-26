@@ -977,6 +977,11 @@ fn with_desktop<R>(action: impl FnOnce(&mut Compositor) -> R) -> Option<R> {
     remember_shell_size(&mut desktop);
     // И фокус меняет только то, что проходит здесь.
     report_focus(&mut desktop);
+    // Whose program is in the foreground - the scheduler lifts it (25.11).
+    crate::sched::prio::note_focus(match desktop.focused_app() {
+        Some(App::Program(task, _)) => task,
+        _ => 0,
+    });
     // Where the focused window is - the monitor of a keyboard launch (25.11).
     origin::note_focus(desktop.focused_app().and_then(|app| desktop.find(app)).map(|window| {
         let r = window.rect;

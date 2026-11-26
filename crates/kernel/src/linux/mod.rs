@@ -49,6 +49,7 @@ pub mod ntsync;
 pub mod perfdiag;
 mod process;
 pub mod profile;
+mod sched_prio;
 pub mod signal;
 mod snd;
 mod special;
@@ -244,6 +245,8 @@ mod nr {
     pub const SCHED_SETSCHEDULER: usize = 144;
     pub const SCHED_GET_PRIORITY_MAX: usize = 146;
     pub const SCHED_GET_PRIORITY_MIN: usize = 147;
+    pub const SCHED_SETATTR: usize = 314;
+    pub const SCHED_GETATTR: usize = 315;
     pub const CLOCK_GETRES: usize = 229;
     pub const MKDIRAT: usize = 258;
     pub const RENAMEAT: usize = 264;
@@ -494,13 +497,14 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::FCHMODAT => fsops::chmod(a0, a1, a2),
             nr::FCHMOD => fsops::fchmod(a0, a1),
             nr::FCHOWN | nr::UTIMENSAT => 0,
-            nr::SCHED_GET_PRIORITY_MAX | nr::SCHED_GET_PRIORITY_MIN => 0,
-            // Приоритет `SCHED_OTHER` — ноль; поменять его нечем.
-            nr::SCHED_GETPARAM => match ipc::put(a1, 0i32) {
-                Ok(()) => 0,
-                Err(err) => err,
-            },
-            nr::SCHED_SETPARAM | nr::SCHED_SETSCHEDULER => 0,
+            // Priorities (25.11.2026, `sched_prio.rs`).
+            nr::SCHED_GET_PRIORITY_MAX => sched_prio::priority_range(a0, true),
+            nr::SCHED_GET_PRIORITY_MIN => sched_prio::priority_range(a0, false),
+            nr::SCHED_GETPARAM => sched_prio::sched_getparam(a0, a1),
+            nr::SCHED_SETPARAM => sched_prio::sched_setparam(a0, a1),
+            nr::SCHED_SETSCHEDULER => sched_prio::sched_setscheduler(a0, a1, a2),
+            nr::SCHED_SETATTR => sched_prio::sched_setattr(a0, a1, a2),
+            nr::SCHED_GETATTR => sched_prio::sched_getattr(a0, a1, a2, a3),
             nr::UNLINK => unlink(AT_FDCWD, a0),
             nr::UNLINKAT => unlink(a0, a1),
             nr::CLOSE => {
@@ -598,9 +602,10 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::PIPE => poll::pipe(a0, 0),
             nr::PIPE2 => poll::pipe(a0, a1),
             nr::PRCTL => thread::prctl(a0, a1),
-            nr::SCHED_SETAFFINITY | nr::SETPRIORITY => 0,
-            nr::GETPRIORITY => 20,
-            nr::SCHED_GETSCHEDULER => 0,
+            nr::SCHED_SETAFFINITY => 0,
+            nr::SETPRIORITY => sched_prio::setpriority(a0, a1, a2),
+            nr::GETPRIORITY => sched_prio::getpriority(a0, a1),
+            nr::SCHED_GETSCHEDULER => sched_prio::sched_getscheduler(a0),
             nr::CLOCK_NANOSLEEP => clock_nanosleep(a0, a1, a2),
             // Подкачки нет — память и так не выгружается (CoreCLR закрепляет
             // служебную страницу, фаза 74).
@@ -2984,6 +2989,7 @@ fn affinity(len: usize, out: usize) -> i64 {
 fn prlimit(resource: usize, _new: usize, old: usize) -> i64 {
     const RLIMIT_STACK: usize = 3;
     const RLIMIT_NOFILE: usize = 7;
+    const RLIMIT_NICE: usize = 13;
     const INFINITY: u64 = u64::MAX;
     if old != 0 {
         if !space::user_can(old, 16, PageFlags::WRITE) {
@@ -2992,6 +2998,9 @@ fn prlimit(resource: usize, _new: usize, old: usize) -> i64 {
         let value = match resource {
             RLIMIT_STACK => [8 << 20, INFINITY],
             RLIMIT_NOFILE => [1024, crate::user::files::LINUX_MAX_FILES as u64],
+            // 25.11 (priorities): 0, as a default Linux - nobody but root
+            // lowers his nice; wineserver then leaves unix nice alone.
+            RLIMIT_NICE => [0, 0],
             _ => [INFINITY, INFINITY],
         };
         // SAFETY: проверено строкой выше.

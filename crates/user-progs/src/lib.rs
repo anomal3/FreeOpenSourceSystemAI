@@ -516,6 +516,26 @@ pub fn kill(id: u32) -> i64 {
     unsafe { syscall(user_abi::SYS_KILL, id as usize, 0, 0) }
 }
 
+/// Nice (-20..19) and policy (`user_abi::PRIO_POLICY_*`) of a task (0 - the
+/// caller); `Err(code)` - no such task. See [`user_abi::SYS_PRIORITY`].
+pub fn priority(id: u32) -> Result<(i32, u32), i64> {
+    // SAFETY: the arguments are numbers.
+    let answer = unsafe { syscall(user_abi::SYS_PRIORITY, user_abi::PRIO_GET, id as usize, 0) };
+    if answer < 0 {
+        return Err(answer);
+    }
+    Ok(((answer & 0xFF) as i32 + user_abi::NICE_MIN, (answer >> 8) as u32))
+}
+
+/// Set nice (-20..19) for every thread of the program of task `id` (0 - the
+/// caller's), or for this one thread (`thread`). 0 or an `ERR_*` code. See
+/// [`user_abi::SYS_PRIORITY`].
+pub fn set_priority(id: u32, nice: i32, thread: bool) -> i64 {
+    let op = if thread { user_abi::PRIO_SET_THREAD } else { user_abi::PRIO_SET_PROCESS };
+    // SAFETY: the arguments are numbers.
+    unsafe { syscall(user_abi::SYS_PRIORITY, op, id as usize, nice as isize as usize) }
+}
+
 /// Продолжить программу на стеке в `bytes` байт, взятом у ядра, — для тех,
 /// кому мало обычного.
 ///
