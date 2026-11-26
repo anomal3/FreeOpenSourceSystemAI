@@ -163,6 +163,12 @@ pub enum Step {
     /// Дождаться первой по выводу из нескольких подстрок — где поведение
     /// законно разное: раздел состояния ext2 или btrfs (31.10).
     AwaitOneOf(&'static [&'static str], u64),
+    /// Send a command (first), wait for the end of its reply (second) and
+    /// require every needle in that **one** reply; if some is missing, send
+    /// the command again, up to the number of tries (26.11, `smp`): a claim
+    /// about one instant - two programs on processors at once - that a
+    /// service waking at that very moment may hide from one snapshot.
+    Together(&'static str, &'static str, &'static [&'static str], u32),
     /// Дождаться числа за подстрокой и сверить его с часами **хоста**.
     ///
     /// Число — секунды эпохи Unix; допуск задаётся в секундах. Существует
@@ -843,9 +849,13 @@ const SMP_STEPS: &[Step] = &[
     // Программе нужно время дойти до третьего кольца: загрузка образа — работа
     // ядра, и в ней задача тоже «исполняется», но проверять хочется жгущий цикл.
     Step::Wait(2_000),
-    Step::Line("tasks"),
-    Step::AwaitAny(": running #{} (program)", 15_000),
-    Step::AwaitAny(": running #{2} (program)", 15_000),
+    // Both in ONE `tasks` reply, asked up to 5 times (26.11): dhcp and sshd
+    // sleep to the same deadline and wake together; with the shell printing
+    // on a third processor one of them takes the fourth and the other, a
+    // fresh sleeper under CFS, preempts a spinner for that instant - the
+    // snapshot then honestly shows one program off its processor (failed
+    // 3 of 6 runs on 26.11 after the task priorities of c7ef918).
+    Step::Together("tasks", "cpu 3      :", &[": running #{} (program)", ": running #{2} (program)"], 5),
     // Где угодно в выводе, а не «после»: программа, найденная шагом выше, может
     // исполняться как раз на третьем процессоре, и тогда её строка **и есть**
     // строка `cpu 3` — курсор уже за ней. Так упал первый прогон на AArch64.
@@ -9589,6 +9599,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // Clean slate (26.11): the previous scenario on the shared disk may have
+            // removed this just before QEMU was killed, before writeback.
+            Step::Line("run /bin/pkg remove debian"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
             Step::Line("run /bin/pkg install /media/debian-12.fpk"),
             Step::Await("pkg: installed debian 12, ", 300_000),
             // `echo` из coreutils — самая короткая динамическая программа:
@@ -9723,6 +9737,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // Clean slate (26.11): the previous scenario on the shared disk may have
+            // removed this just before QEMU was killed, before writeback.
+            Step::Line("run /bin/pkg remove debian"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
             Step::Line("run /bin/pkg install /media/debian-12.fpk"),
             Step::Await("pkg: installed debian 12, ", 300_000),
             Step::Line("run /opt/debian/usr/libexec/fossai/netcheck 10.0.2.2 {echo}"),
@@ -9776,6 +9794,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // Clean slate (26.11): the previous scenario on the shared disk may have
+            // removed this just before QEMU was killed, before writeback.
+            Step::Line("run /bin/pkg remove debian"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
             Step::Line("run /bin/pkg install /media/debian-12.fpk"),
             Step::Await("pkg: installed debian 12, ", 300_000),
             // Узел DRM на SoftGpu — для проверки dma-buf без копии (D4).
@@ -9916,6 +9938,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // Clean slate (26.11): the previous scenario on the shared disk may have
+            // removed this just before QEMU was killed, before writeback.
+            Step::Line("run /bin/pkg remove debian"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
             Step::Line("run /bin/pkg install /media/debian-12.fpk"),
             // The install image may already hold Debian (obs, 23.11): left as found.
             Step::AwaitOneOf(&["pkg: installed debian 12, ", "debian is already installed"], 300_000),
@@ -10435,6 +10461,15 @@ pub const ALL: &[Scenario] = &[
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // 26.11: the installed-system chain runs `wayland` before us on the
+            // same disk; it removes Debian last and QEMU is killed right after,
+            // before writeback reaches the disk - pkg then said "debian is
+            // already installed" and this step waited 5 minutes for nothing.
+            // Start from a clean slate whatever the previous scenario left.
+            Step::Line("run /bin/pkg remove chromium"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
+            Step::Line("run /bin/pkg remove debian"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
             Step::Line("run /bin/pkg install /media/debian-12.fpk"),
             Step::Await("pkg: installed debian 12, ", 300_000),
             Step::Line("run /bin/pkg install /media/linuxweb-150.fpk"),
@@ -10475,6 +10510,12 @@ pub const ALL: &[Scenario] = &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // Clean slate (26.11): the previous scenario on the shared disk may have
+            // removed this just before QEMU was killed, before writeback.
+            Step::Line("run /bin/pkg remove wine"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
+            Step::Line("run /bin/pkg remove debian"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
             Step::Line("pkg install wine"),
             Step::Await("pkg: debian is needed first; installing it", 60_000),
             Step::Await("pkg: installed debian 12, ", 300_000),
@@ -12366,6 +12407,12 @@ pub const ALL: &[Scenario] = &[
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // Clean slate (26.11): the previous scenario on the shared disk may have
+            // removed this just before QEMU was killed, before writeback.
+            Step::Line("run /bin/pkg remove chromium"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
+            Step::Line("run /bin/pkg remove debian"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
             // Одной командой и по имени: пакет — с носителя, корень Debian,
             // который он требует, `pkg` ставит сам и первым.
             Step::Line("pkg install chromium"),

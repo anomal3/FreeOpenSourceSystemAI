@@ -1044,6 +1044,26 @@ fn play(
                 line.wait_for_one_of(needles, patience(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
             }
+            Step::Together(command, end, needles, tries) => {
+                let command = fill(command, &captured, &captured2);
+                let needles: Vec<String> = needles.iter().map(|n| fill(n, &captured, &captured2)).collect();
+                say!("  [{at:>6} мс] шаг {index}: {command:?} до {tries} раз, пока в одном ответе не будет всего из {needles:?}");
+                let mut found = false;
+                for attempt in 1..=*tries {
+                    if line
+                        .reply_has_all(&command, end, &needles, patience(15_000))
+                        .with_context(|| format!("шаг {index}"))?
+                    {
+                        found = true;
+                        break;
+                    }
+                    say!("             попытка {attempt}: не всё в одном ответе, ещё раз");
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                if !found {
+                    bail!("шаг {index}: ни в одном из {tries} ответов на {command:?} нет сразу всех {needles:?}");
+                }
+            }
             Step::AwaitAny(needle, timeout_ms) => {
                 let needle = fill(needle, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: ждём {needle:?} где угодно в выводе");

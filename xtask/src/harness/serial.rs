@@ -270,6 +270,21 @@ impl SerialLine {
         }
     }
 
+    /// Send `command`, wait for `end` in its reply and the end of that line,
+    /// and tell whether **every** needle is in this one reply (from the moment
+    /// the command was sent). For claims about one instant - "both programs
+    /// are on a processor at once" - that matches in two different replies
+    /// would not prove.
+    pub fn reply_has_all(&mut self, command: &str, end: &str, needles: &[String], timeout: Duration) -> Result<bool> {
+        let from = self.buffer.lock().expect("буфер линии").text.len();
+        self.write_line(command)?;
+        self.wait_for(end, timeout)?;
+        self.finish_line(Duration::from_secs(1));
+        let guard = self.buffer.lock().expect("буфер линии");
+        let reply = guard.text.get(from..).unwrap_or("");
+        Ok(needles.iter().all(|needle| reply.contains(needle.as_str())))
+    }
+
     /// Число сразу за первым вхождением подстроки во всём выводе (без
     /// ожидания и без сдвига курсора); `None` — подстроки или числа нет.
     pub fn seen_number(&self, prefix: &str) -> Option<u64> {

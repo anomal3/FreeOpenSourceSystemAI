@@ -254,10 +254,12 @@ unsafe impl GlobalAlloc for KernelHeap {
     }
 }
 
-/// Идёт ли рост кучи (см. [`grow`]).
-static GROWING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// CPU that holds [`GROWING`] (valid while it is set).
-static GROWER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+/// Who grows the heap now (see [`grow`]): the CPU number, or [`NO_GROWER`].
+/// One atomic for both "growing" and "by whom": with a separate flag an
+/// interrupt between taking the flag and recording the CPU did not recognise
+/// its own CPU and spun the whole patience with interrupts off.
+static GROWER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(NO_GROWER);
+const NO_GROWER: usize = usize::MAX;
 /// How long an allocation with interrupts off waits for another CPU's growth
 /// (spin iterations, tens of milliseconds; mapping 8 MiB takes far less).
 const GROW_WAIT_SPINS: u32 = 20_000_000;
@@ -273,14 +275,16 @@ const GROW_STEP: usize = 8 * 1024 * 1024;
 /// Кадры отображаются сразу за концом кучи вне её замка (эти адреса ещё
 /// ничьи), потом куча расширяется под замком. Растёт один: второй ждёт
 /// первого и перепроверяет размер. Из кода с закрытыми прерываниями
-/// (обработчик, держатель спин-замка) рост не ждёт — `false`, и выделение
-/// откажет, как раньше.
+/// (обработчик, держатель спин-замка) рост другого процессора ждётся
+/// ограниченное время ([`GROW_WAIT_SPINS`]); рост на своём же процессоре
+/// (прерывание поверх растущего) не ждётся — `false`, и выделение откажет.
 fn grow(need: usize) -> bool {
     use core::sync::atomic::Ordering;
     use crate::mm::FrameAllocator;
     let before = crate::mm::heap_size();
+    let me = crate::smp::cpu();
     let mut patience = GROW_WAIT_SPINS;
-    while GROWING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+    while let Err(grower) = GROWER.compare_exchange(NO_GROWER, me, Ordering::Acquire, Ordering::Relaxed) {
         // 26.11 (obsos-storage, OBSOS opening ~100 threads on the Rupor
         // page): an allocation with interrupts off on one CPU while another
         // CPU was growing the heap gave up at once - KERNEL HEAP EXHAUSTED
@@ -289,18 +293,16 @@ fn grow(need: usize) -> bool {
         // grower's own CPU (an interrupt over it) or a grower that never
         // comes back (preempted on this CPU) still fails as before.
         if !crate::arch::interrupts::enabled() {
-            if GROWER.load(Ordering::Relaxed) == crate::smp::cpu() || patience == 0 {
+            if grower == me || patience == 0 {
                 return false;
             }
             patience -= 1;
         }
         core::hint::spin_loop();
     }
-    GROWER.store(crate::smp::cpu(), Ordering::Relaxed);
     // Пока ждали, мог вырасти другой.
     if crate::mm::heap_size() != before {
-        GROWER.store(usize::MAX, Ordering::Relaxed);
-        GROWING.store(false, Ordering::Release);
+        GROWER.store(NO_GROWER, Ordering::Release);
         return true;
     }
     let limit = crate::mm::heap_limit();
@@ -339,8 +341,7 @@ fn grow(need: usize) -> bool {
             crate::mm::set_heap_size(mapped);
         }
     }
-    GROWER.store(usize::MAX, Ordering::Relaxed);
-    GROWING.store(false, Ordering::Release);
+    GROWER.store(NO_GROWER, Ordering::Release);
     if grown > 0 {
         kprintln!("  heap        : grown to {} MiB (limit {} MiB)", mapped >> 20, limit >> 20);
     }

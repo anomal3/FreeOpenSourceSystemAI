@@ -133,13 +133,13 @@ pub fn pump() {
         let mut moved = 0usize;
         while budget > 0 {
             let mut chunk = [0u8; 16];
-            let taken = {
+            let (taken, from) = {
                 let Some(tx) = TX.try_lock() else { break };
-                let run = ((tx.head - tx.tail) as usize).min(chunk.len()).min(budget);
+                let run = (tx.head.saturating_sub(tx.tail) as usize).min(chunk.len()).min(budget);
                 for (offset, byte) in chunk[..run].iter_mut().enumerate() {
                     *byte = tx.bytes[((tx.tail + offset as u64) % TX_CAPACITY as u64) as usize];
                 }
-                run
+                (run, tx.tail)
             };
             if taken == 0 {
                 break;
@@ -153,10 +153,26 @@ pub fn pump() {
                 break;
             }
             // Only the drainer moves the tail, so the bytes just sent are
-            // still the oldest ones in the queue.
-            if let Some(mut tx) = TX.try_lock() {
-                tx.tail += sent as u64;
-                QUEUED_TAIL.store(tx.tail, Ordering::Release);
+            // still the oldest ones in the queue - unless
+            // [`drain_and_stop_queue`] on a processor being stopped wrote the
+            // whole queue meanwhile (26.11, `smp`: the tail went past the head,
+            // `head - tail` wrapped and this loop resent the 128 KiB ring
+            // forever after "all tasks finished"). Move it only if untouched;
+            // a busy lock is a print on another processor - a moment.
+            let mut tries = 0u32;
+            loop {
+                if let Some(mut tx) = TX.try_lock() {
+                    if tx.tail == from {
+                        tx.tail = (from + sent as u64).min(tx.head);
+                        QUEUED_TAIL.store(tx.tail, Ordering::Release);
+                    }
+                    break;
+                }
+                tries += 1;
+                if tries > 10_000 {
+                    break;
+                }
+                core::hint::spin_loop();
             }
             budget = budget.saturating_sub(sent);
             moved += sent;
@@ -181,6 +197,29 @@ pub fn drain_and_stop_queue() {
     if !QUEUED.swap(false, Ordering::AcqRel) {
         return;
     }
+    // A drain in flight on another processor (the boot processor printing
+    // "all tasks finished" while this one stops) finishes its FIFO load
+    // first; a drainer stopped in the middle never will - bounded wait.
+    // Holding the flag keeps any other `pump` out while we write; it is
+    // given back after (the boot processor's tick turns the queue on again).
+    let mut patience = 50_000_000u32;
+    let mut mine = false;
+    while patience > 0 {
+        if PUMPING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            mine = true;
+            break;
+        }
+        patience -= 1;
+        core::hint::spin_loop();
+    }
+    drain_locked();
+    if mine {
+        PUMPING.store(false, Ordering::Release);
+    }
+}
+
+/// The body of [`drain_and_stop_queue`]: write the queue out with waiting.
+fn drain_locked() {
     let mut port = match SERIAL.try_lock() {
         Some(port) => port,
         None => return,
