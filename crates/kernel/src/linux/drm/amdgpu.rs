@@ -45,7 +45,7 @@
 //!   GPU, держит [`Installed`]; снятие страниц ждёт простоя GPU (`display::amd::hw`).
 //! * PRIME: dma-buf буферов в системной памяти.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -434,6 +434,29 @@ struct UserFence {
 
 static USER_FENCES: SpinLock<VecDeque<UserFence>> = SpinLock::new(VecDeque::new());
 
+/// Первые кадры буферов, отданных как dma-buf: по ним сервер Wayland узнаёт кадры, нарисованные картой.
+static SHARED_FRAMES: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
+
+/// Программа показала кадр из памяти с первым кадром `first` (`wl_surface.commit`): чем GPU должен кончить,
+/// прежде чем кадр можно читать. Всё, что в него рисует (и копия WSI), к этому моменту уже стоит в кольце, поэтому
+/// это последняя поданная отправка - независимо от того, передала ли Mesa свой забор (`IMPORT_SYNC_FILE`) или
+/// надеется на неявную синхронизацию ядра. `None` - не буфер карты или GPU уже всё выполнил.
+#[must_use]
+pub fn commit_fence(first: u64) -> Option<Fence> {
+    if !hw() || !SHARED_FRAMES.lock().contains(&first) {
+        return None;
+    }
+    let emitted = crate::display::amd::hw::emitted();
+    let busy = crate::display::amd::hw::poll() < emitted;
+    PERF_FRAMES.fetch_add(1, Ordering::Relaxed);
+    PERF_FRAMES_BUSY.fetch_add(u64::from(busy), Ordering::Relaxed);
+    busy.then(|| Fence::seq(fence_ctx(), emitted))
+}
+
+/// Показанные кадры карты и те из них, что GPU на момент показа ещё рисовал (для `amdgpu perf:`).
+static PERF_FRAMES: AtomicU64 = AtomicU64::new(0);
+static PERF_FRAMES_BUSY: AtomicU64 = AtomicU64::new(0);
+
 /// Освежить выполненный номер вопросом к карте и записать готовые пользовательские заборы.
 pub fn poll_fences() {
     if fence_ctx() == 0 {
@@ -618,6 +641,9 @@ impl Drop for AmdBo {
     fn drop(&mut self) {
         if let Some(offset) = self.vram {
             crate::display::amd::hw::vram_free(offset, self.size);
+        }
+        if let Some(first) = self.frames.first() {
+            SHARED_FRAMES.lock().remove(first);
         }
         crate::mm::frame::with(|pool| {
             for &frame in &self.frames {
@@ -1600,10 +1626,11 @@ fn perf_report() {
     }
     let submits = PERF_SUBMITS.swap(0, Ordering::Relaxed);
     let (ring, idle, empty) = crate::display::amd::hw::take_stats();
+    let (frames, busy) = (PERF_FRAMES.swap(0, Ordering::Relaxed), PERF_FRAMES_BUSY.swap(0, Ordering::Relaxed));
     let map = PERF_MAP_NS.swap(0, Ordering::Relaxed);
     let pages = PERF_PAGES.swap(0, Ordering::Relaxed);
     crate::kprintln!(
-        "amdgpu perf: {submits} submits in {} ms; the GPU had no queued work at {empty}; CPU blocked: ring full {} ms, drain {} ms; page tables {} ms ({pages} pages written)",
+        "amdgpu perf: {submits} submits in {} ms; the GPU had no queued work at {empty}; CPU blocked: ring full {} ms, drain {} ms; page tables {} ms ({pages} pages written); {busy} of {frames} frames were still being drawn at commit",
         now - since,
         ring / 1_000_000,
         idle / 1_000_000,
@@ -1938,6 +1965,9 @@ fn prime_handle_to_fd(file: &AmdFile, arg: usize) -> i64 {
     if bo.vram.is_some() {
         crate::kprintln!("amdgpu: PRIME export of a VRAM-only buffer ({} bytes) refused: the compositor needs CPU access", bo.size);
         return -e::EINVAL;
+    }
+    if let Some(&first) = bo.frames.first() {
+        SHARED_FRAMES.lock().insert(first);
     }
     let fd = super::install(Arc::new(AmdDmaBuf(bo)), false, args.flags & O_CLOEXEC != 0);
     if fd < 0 {

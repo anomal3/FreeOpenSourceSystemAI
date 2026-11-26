@@ -503,6 +503,12 @@ pub fn exported_by_frame(first: u64) -> Option<Arc<Bo>> {
     gem::exported_by_frame(first)
 }
 
+/// 26.11: a buffer whose memory starts at physical `first_frame` was committed
+/// (see `gem::frame_committed`).
+pub fn frame_committed(first_frame: u64) {
+    gem::frame_committed(first_frame);
+}
+
 /// 25.11: is the GPU still drawing the frame of the dma-buf whose memory
 /// starts at physical `first_frame` (see `gem::frame_pending`)?
 #[must_use]

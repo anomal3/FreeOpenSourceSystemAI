@@ -676,6 +676,12 @@ pub fn take_stats() -> (u64, u64, u64) {
     (RING_WAIT_NS.swap(0, Ordering::Relaxed), IDLE_WAIT_NS.swap(0, Ordering::Relaxed), IDLE_KICKS.swap(0, Ordering::Relaxed))
 }
 
+/// Номер последней поданной отправки.
+#[must_use]
+pub fn emitted() -> u64 {
+    EMITTED.load(Ordering::Acquire)
+}
+
 /// Номер последней выполненной отправки по кэшу (освежает [`poll`]); можно под любыми замками.
 #[must_use]
 pub fn completed() -> u64 {

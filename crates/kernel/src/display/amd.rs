@@ -1231,6 +1231,8 @@ fn run_gametest(what: &str, limit_s: u32) -> Option<bool> {
 /// Остальное (Direct3D 11/12, VLC, OBS, 7-Zip) проверено на RX 590 (0.8.37) и из прогона убрано, чтобы он не тянулся;
 /// запускается вручную: `gpu gametest hw amd -- d3d11|d3d12|apps`. Каждый шаг - уведомлением на столе и строками `gametest|` в `LOG.TXT`.
 fn radv_auto() {
+    // Тест идёт долго и без мыши: гашение экрана прятало бы ход и итог, а снимки выходили чёрными.
+    crate::power::inhibit(true);
     let present = |path: &str| matches!(crate::fs::list(path), Some(Ok(_)));
     // До 25 минут: пакеты с флешки - гигабайты.
     let started = crate::time::uptime_ms();

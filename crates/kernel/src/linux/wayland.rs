@@ -3163,6 +3163,10 @@ impl Client {
                 Some(Obj::Buffer(buf)) => Some((buffer, buf.clone())),
                 _ => None,
             });
+            // Кадр карты AMD: GPU может ещё рисовать его (`present` подождёт).
+            if let Some(first) = shown.as_ref().and_then(|(_, buf)| buf.mem.frame(0)) {
+                crate::linux::drm::frame_committed(first.0);
+            }
             let old = match self.objects.get_mut(&id) {
                 Some(Obj::Surface(state)) => {
                     let size = |shown: &Option<(u32, Buffer)>| shown.as_ref().map(|(_, buf)| (buf.width, buf.height));
@@ -3654,14 +3658,10 @@ impl Client {
         let Some(win) = self.wins.get(index) else {
             return false;
         };
-        match self.objects.get(&win.surface) {
-            Some(Obj::Surface(state)) => state
-                .shown
-                .as_ref()
-                .and_then(|(_, buf)| buf.mem.frame(0))
-                .is_some_and(|first| crate::linux::drm::frame_pending(first.0)),
-            _ => false,
-        }
+        // Все поверхности окна: Wine показывает кадр Vulkan подповерхностью.
+        let mut layers = Vec::new();
+        self.layers(win.surface, 0, 0, 0, &mut layers);
+        layers.iter().filter_map(|layer| layer.buf.mem.frame(0)).any(|first| crate::linux::drm::frame_pending(first.0))
     }
 
     /// Свести поверхность окна с подповерхностями и показать на столе.

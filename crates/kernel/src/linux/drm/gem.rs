@@ -435,6 +435,17 @@ const FENCE_SHOW_MAX_NS: u64 = 2_000_000_000;
 /// Frames noted with a pending fence since boot (perf-diag/`wldirect`).
 pub static FENCES_NOTED: AtomicU64 = AtomicU64::new(0);
 
+/// 26.11: кадр показан (`wl_surface.commit`) - у буфера карты AMD забор «всё поданное к этому моменту».
+pub fn frame_committed(first: u64) {
+    if let Some(fence) = super::amdgpu::commit_fence(first) {
+        note_pending(first, fence);
+    }
+}
+
+/// Столько сервер Wayland ждёт кадр карты AMD на месте, прежде чем отложить показ: при сотнях кадров в секунду
+/// следующий `commit` приходит раньше, чем сервер вернулся бы к отложенному, и тот не показался бы никогда.
+const FENCE_INLINE_NS: u64 = 4_000_000;
+
 fn note_pending(first: u64, fence: super::sync::Fence) {
     let now = crate::time::uptime_ns();
     let mut list = PENDING.lock();
@@ -454,6 +465,17 @@ pub fn frame_pending(first: u64) -> bool {
         return false;
     }
     super::sync::refresh();
+    let amd = super::amdgpu::fence_ctx();
+    let short = PENDING
+        .lock()
+        .iter()
+        .find(|(at, fence, _)| *at == first && amd != 0 && !fence.deps.is_empty() && fence.deps.iter().all(|&(ctx, _)| ctx == amd))
+        .map(|(_, fence, _)| fence.clone());
+    if let Some(fence) = short {
+        // Замок списка не держим; не успел за этот срок - кадр отложится, как обычно.
+        let deadline = crate::time::uptime_ns() + FENCE_INLINE_NS;
+        let _ = super::sync::wait_until(Some(deadline), || Ok(super::sync::signaled(&fence)));
+    }
     let now = crate::time::uptime_ns();
     let mut list = PENDING.lock();
     let Some(index) = list.iter().position(|(at, _, _)| *at == first) else {
