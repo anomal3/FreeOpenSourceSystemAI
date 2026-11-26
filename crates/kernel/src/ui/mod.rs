@@ -2451,6 +2451,16 @@ pub fn tick() {
         desktop.expire_identify();
         // Screen recorder (22.11): «Запись сохранена», a capture left behind.
         framegap::step(&"capture", || capture::tick(desktop));
+        // Сообщения ядра человеку (26.11, ход проверки видеокарты AMD): карточка над треем и колокол.
+        if let Some((title, text, ms)) = SYSTEM_NOTICE.lock().take() {
+            let art = appicon::tool_art("eventlog").unwrap_or(appicon::Art::Glyph(mini_ui::glyphicon::Icon::Log, mini_ui::paint::Tone::Bad, true));
+            let (area, panel_top) = desktop.toast_place();
+            toast::remember(&title, &text);
+            if let Some(mut toast) = toast::Toast::notice("Видеокарта", &title, &text, "Журнал событий", &art, String::from("/bin/eventlog"), fpk::Rights::ALL, area, panel_top, desktop.scale()) {
+                toast.until_ms = crate::time::uptime_ms() + ms;
+                desktop.show_toast(toast);
+            }
+        }
         // A btrfs commit failed (24.11): the batch of changes is lost - say so.
         if let Some(text) = crate::fs::btrfsfs::take_commit_failure() {
             let art = appicon::tool_art("eventlog").unwrap_or(appicon::Art::Glyph(mini_ui::glyphicon::Icon::Log, mini_ui::paint::Tone::Bad, true));
@@ -7947,4 +7957,12 @@ fn log_window(desktop: &Compositor, app: App, focused: bool) {
             window.bar()
         );
     }
+}
+
+/// Сообщение ядра, ждущее стола: (заголовок, текст, сколько держать, мс). Новое заменяет непоказанное.
+static SYSTEM_NOTICE: crate::sync::SpinLock<Option<(String, String, u64)>> = crate::sync::SpinLock::new(None);
+
+/// Показать человеку сообщение ядра карточкой на столе (и в списке уведомлений) на `ms` миллисекунд.
+pub fn system_notice(title: &str, text: &str, ms: u64) {
+    *SYSTEM_NOTICE.lock() = Some((String::from(title), String::from(text), ms));
 }

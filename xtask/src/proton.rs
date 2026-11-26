@@ -1160,6 +1160,7 @@ $W "$@" 2>&1 | {
         printf -v lo '%d.%02d' $((lo / 100)) $((lo % 100))
         printf -v hi '%d.%02d' $((hi / 100)) $((hi % 100))
         say "bench: $label avg $a fps (min $lo, max $hi, $n samples from $src), first frames after $((first / 10)).$((first % 10)) s, LP_NUM_THREADS=$LP_NUM_THREADS"
+        : > /tmp/fossai-bench.ok
     else
         say "bench: $label no frames in $secs s"
     fi
@@ -1322,25 +1323,31 @@ case $WHAT in vsync)
         step d3d9-vsync-$vs 600 $B $P --vsync $vs --bench=20,d3dprobe9-vsync-$vs --dxvk $X 9 20
     done ;;
 esac
-case $WHAT in rpresent)
-    # Режимы показа vkcube на видеокарте (окно на столе, 300 кадров каждый): 0 IMMEDIATE (без VSync, возможен
-    # разрыв), 1 MAILBOX, 2 FIFO (VSync). Для глаза: какой из них мерцает.
-    for m in 0 1 2; do
-        step vkcube-present-mode$m 120 $B $P --run=vkcube --wsi wayland --present_mode $m --c 300
+case $WHAT in apps)
+    # Программы из пакетов: открыть окно и убедиться, что через 30 с оно живо (ядро снимает экран на 25-й).
+    pids=
+    [ -f /opt/vlc/bin/fossai-vlc ] && { $B /opt/vlc/bin/fossai-vlc >/tmp/amd-vlc.log 2>&1 & vlc=$!; }
+    [ -f /opt/obs/bin/fossai-obs ] && { $B /opt/obs/bin/fossai-obs >/tmp/amd-obs.log 2>&1 & obs=$!; }
+    LD_LIBRARY_PATH= sleep 30
+    for app in vlc obs; do
+        pid=${!app}
+        [ -z "$pid" ] && continue
+        if kill -0 $pid 2>/dev/null; then
+            pass=$((pass + 1)); say "PASS $app is running after 30 s"
+        else
+            fail=$((fail + 1)); names="$names $app"; say "FAIL $app exited within 30 s"
+            while IFS= read -r line; do echo "$app: $line"; done < /tmp/amd-$app.log
+        fi
     done ;;
-esac
-case $WHAT in tmnfvs)
-    # Trackmania с VSync: сравнить с замером без навязанного VSync (в нём видео мерцало).
-    if [ -f /opt/tmnf/bin/tmnf ]; then
-        step tmnf-vsync-on 900 $B /opt/tmnf/bin/tmnf $GPUFLAG --vsync on --bench=30
-    else
-        say "tmnf: package not installed - skipped"
-    fi ;;
 esac
 case $WHAT in all|tmnf)
     # 5. TMNF через DXVK на NVK: замер 60 с (`bench:` - к/с), игра снимается.
     if [ -x /opt/tmnf/bin/tmnf ] || [ -f /opt/tmnf/bin/tmnf ]; then
-        step tmnf-nvk 1800 $B /opt/tmnf/bin/tmnf $GPUFLAG --bench=60
+        rm -f /tmp/fossai-bench.ok
+        if ! step tmnf-nvk 1800 $B /opt/tmnf/bin/tmnf $GPUFLAG --bench=60 && [ -f /tmp/fossai-bench.ok ]; then
+            # Игра сама не выходит: после замера её снимает `wineserver -k`, и код выхода не ноль.
+            fail=$((fail - 1)); pass=$((pass + 1)); names=${names% tmnf-nvk}; say "PASS tmnf-nvk (measured; the non-zero exit is from stopping the game)"
+        fi
     else
         say "tmnf: package not installed - skipped"
     fi ;;

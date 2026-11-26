@@ -335,17 +335,8 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     payload.push(read_payload(esp, &source)?);
                 }
             }
-            // Marker for the SMC auto start of the AMD card (21.11): only a build
-            // with FOSSAI_AMD_SMC_START=1 asks the kernel to start the SMC by itself.
-            // The second marker (FOSSAI_AMD_UCODE=1) also loads the CP/RLC/SDMA
-            // microcode through the started SMC (P3).
-            // The third marker (FOSSAI_AMD_RING=1) also starts the CP and tests the GFX ring (P4).
-            // The fourth marker (FOSSAI_AMD_GART=1) also enables the GART of VMID0 and tests it (P5).
-            // The fifth marker (FOSSAI_AMD_CS=1): fence, IB and the user VM (VMID 1) test (P5 step 2).
-            // The sixth marker (FOSSAI_AMD_SHADER=1): golden registers and the first compute shader (P6).
-            // The eighth marker (FOSSAI_AMD_RADV=1): after the live stick has installed Proton into RAM
-            // (FOSSAI_WITH_PROTON=1), the kernel runs vkprobe and vulkaninfo through RADV on the card.
-            // FOSSAI_AMD_RADV=2: после vkprobe/vulkaninfo/vkcube ещё Direct3D 9 через DXVK (префикс Wine - минуты).
+            // Драйвер AMD поднимается при загрузке сам; маркеры только просят проверки: FOSSAI_AMD_HW=1 -
+            // самотест железа, FOSSAI_AMD_RADV=2 - прогон Vulkan, Direct3D, игр и программ.
             if let Some(mode) = std::env::var("FOSSAI_AMD_RADV").ok().filter(|v| v == "1" || v == "2") {
                 payload.push(Payload {
                     path: String::from("FREEOS/AMD/RADV.TXT"),
@@ -359,48 +350,6 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                     path: String::from("FREEOS/AMD/HW.TXT"),
                     data: b"hw\n".to_vec(),
                     source: PathBuf::from("(FOSSAI_AMD_HW=1)"),
-                });
-            }
-            if std::env::var("FOSSAI_AMD_SHADER").is_ok_and(|v| v == "1") {
-                payload.push(Payload {
-                    path: String::from("FREEOS/AMD/SHADER.TXT"),
-                    data: b"shader\n".to_vec(),
-                    source: PathBuf::from("(FOSSAI_AMD_SHADER=1)"),
-                });
-            }
-            if std::env::var("FOSSAI_AMD_CS").is_ok_and(|v| v == "1") {
-                payload.push(Payload {
-                    path: String::from("FREEOS/AMD/CS.TXT"),
-                    data: b"cs\n".to_vec(),
-                    source: PathBuf::from("(FOSSAI_AMD_CS=1)"),
-                });
-            }
-            if std::env::var("FOSSAI_AMD_GART").is_ok_and(|v| v == "1") {
-                payload.push(Payload {
-                    path: String::from("FREEOS/AMD/GART.TXT"),
-                    data: b"gart\n".to_vec(),
-                    source: PathBuf::from("(FOSSAI_AMD_GART=1)"),
-                });
-            }
-            if std::env::var("FOSSAI_AMD_RING").is_ok_and(|v| v == "1") {
-                payload.push(Payload {
-                    path: String::from("FREEOS/AMD/RING.TXT"),
-                    data: b"ring\n".to_vec(),
-                    source: PathBuf::from("(FOSSAI_AMD_RING=1)"),
-                });
-            }
-            if std::env::var("FOSSAI_AMD_UCODE").is_ok_and(|v| v == "1") {
-                payload.push(Payload {
-                    path: String::from("FREEOS/AMD/UCODE.TXT"),
-                    data: b"ucode\n".to_vec(),
-                    source: PathBuf::from("(FOSSAI_AMD_UCODE=1)"),
-                });
-            }
-            if std::env::var("FOSSAI_AMD_SMC_START").is_ok_and(|v| v == "1") {
-                payload.push(Payload {
-                    path: String::from("FREEOS/AMD/START.TXT"),
-                    data: b"start\n".to_vec(),
-                    source: PathBuf::from("(FOSSAI_AMD_SMC_START=1)"),
                 });
             }
             // Браузер OBSOS (16.11, Роман: «в образ ещё браузер обсос запиши,
@@ -759,7 +708,7 @@ fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
         // переписывает их на месте (`usb::stick_settings`). Пробелы — «снимка
         // ещё нет».
         // Снимки экрана AMD-теста (25.11): ядро пишет в этот файл кадры с монитора (`display::amd::shots`).
-        logs.write_file_path(&mut dev, "FREEOS/SHOTS.BIN", &vec![0u8; 12 * 1024 * 1024])
+        logs.write_file_path(&mut dev, "FREEOS/SHOTS.BIN", &vec![0u8; 24 * 1024 * 1024])
             .map_err(|err| anyhow::anyhow!("не удалось записать файл снимков: {err}"))?;
         logs.write_file_path(&mut dev, "FREEOS/SETTINGS.DAT", &vec![b' '; 256 * 1024])
             .map_err(|err| anyhow::anyhow!("не удалось записать файл настроек: {err}"))?;

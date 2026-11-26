@@ -75,10 +75,10 @@ fn one(tag: &str) -> bool {
     crate::usb::stick_log::shots_write(slot * SLOT_BYTES, &out)
 }
 
-/// Серия из трёх кадров через 40 мс с подписью `tag` (имя шага проверки).
+/// Серия из двух кадров через 40 мс с подписью `tag` (имя шага проверки).
 pub fn burst(tag: &str) {
     let mut saved = 0;
-    for _ in 0..3 {
+    for _ in 0..2 {
         if one(tag) {
             saved += 1;
         }

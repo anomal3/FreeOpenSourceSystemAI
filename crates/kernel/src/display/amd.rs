@@ -1093,7 +1093,7 @@ pub fn probed() -> bool {
 /// Автозапуск драйвера при обычной загрузке (25.11): прошивки с флешки (`FREEOS/AMD/*.BIN`) -> SMC ->
 /// микрокод -> кольцо GFX -> GART -> узел DRM на карте (`/dev/dri/renderD128`, RADV). Никакие маркеры для этого
 /// не нужны; файл `FREEOS/AMD/NOAUTO.TXT` отключает запуск. Остальные маркеры добавляют проверки:
-/// `CS.TXT`, `SHADER.TXT`, `HW.TXT` - самотесты железа, `RADV.TXT` - прогон RADV и игр (`radv_auto`).
+/// `HW.TXT` - самотест железа, `RADV.TXT` - прогон RADV, игр и программ (`radv_auto`); ход виден уведомлениями стола.
 /// Если ступень не удалась, дальше не идём: экран и система работают без видеокарты.
 pub fn auto_task() {
     if super::firmware_only() {
@@ -1113,10 +1113,9 @@ pub fn auto_task() {
         crate::kprintln!("  amdgpu     : auto start is off (FREEOS/AMD/NOAUTO.TXT); 'amd smc start' by hand");
         return;
     }
-    let testing = ["CS.TXT", "SHADER.TXT", "HW.TXT", "RADV.TXT"].iter().any(|name| firmware_file(name).is_ok());
+    let testing = ["HW.TXT", "RADV.TXT"].iter().any(|name| firmware_file(name).is_ok());
     if testing {
         crate::kprintln!("==== AMD TEST: started. Stages: SMC, microcode, ring, GART, then the checks asked for by the markers. ====");
-        crate::kprintln!("==== AMD TEST: watch the '==== AMD TEST' lines; the last one says when it is safe to power off. ====");
     }
     let has = |lines: &[String], what: &str| lines.iter().any(|line| line.contains(what));
     let failed = |stage: &str| {
@@ -1140,13 +1139,7 @@ pub fn auto_task() {
     if !has(&polaris_gart(), "TEST PASSED") {
         return failed("GART");
     }
-    // Самотесты по маркерам.
-    if firmware_file("CS.TXT").is_ok() {
-        let _ = polaris_cs();
-    }
-    if firmware_file("SHADER.TXT").is_ok() {
-        let _ = polaris_shader();
-    }
+    // Самотест по маркеру.
     if firmware_file("HW.TXT").is_ok() {
         let lines = hw::selftest();
         let verdict = |what: &str| lines.iter().find(|l| l.contains(what)).map_or("no result", |l| if l.contains("PASSED") { "PASSED" } else { "FAILED" });
@@ -1155,6 +1148,11 @@ pub fn auto_task() {
             verdict("HW RESULT"),
             verdict("HW SHADER RESULT"),
             verdict("HW VRAM RESULT")
+        );
+        announce(
+            "Тест AMD начался",
+            &format!("Железо: бэкенд {}, шейдер {}, видеопамять {}. Дальше копируется Proton - не выключайте.", verdict("HW RESULT"), verdict("HW SHADER RESULT"), verdict("HW VRAM RESULT")),
+            120_000,
         );
         if let Some(speed) = lines.iter().find(|l| l.contains("HW VRAM SPEED")) {
             crate::kprintln!("==== AMD TEST: {speed} ====");
@@ -1191,13 +1189,64 @@ fn driver_ready() -> bool {
     }
 }
 
-/// Ждать, пока флешка поставит Debian и Proton в память, и прогнать RADV на настоящей карте:
-/// `gpu gametest hw -- vk` (vkprobe и vulkaninfo). Результат - строки `gametest|` в `LOG.TXT`.
+/// Сообщить и в журнал (латиницей - его читают с флешки), и уведомлением на столе.
+fn announce(title: &str, text: &str, ms: u64) {
+    crate::kprintln!("==== AMD TEST: {title} - {text} ====");
+    crate::ui::system_notice(title, text, ms);
+}
+
+/// Прогнать `gpu gametest hw -- {what}` и дождаться; `Some(true)` - всё прошло, `None` - не дождались.
+fn run_gametest(what: &str, limit_s: u32) -> Option<bool> {
+    let _ = super::nvidia_gametest::drain();
+    crate::kprintln!("  amdgpu     : radv: {}", super::nvidia_gametest::start(&format!("hw amd -- {what}")));
+    let mut ticks = 0u32;
+    let (mut last_commits, mut shot) = (wayland_commits(), false);
+    while super::nvidia_gametest::running() {
+        crate::sched::sleep_ms(1000);
+        ticks += 1;
+        // Один снимок экрана на шаг: когда пошли кадры, а у программ - когда окна уже открылись.
+        let commits = wayland_commits();
+        let busy = commits.wrapping_sub(last_commits) >= 5 && ticks >= 3;
+        if !shot && ((busy && what != "apps") || (what == "apps" && ticks == 25)) {
+            shots::burst(what);
+            shot = true;
+        }
+        last_commits = commits;
+        if ticks % 30 == 0 {
+            crate::kprintln!("  amdgpu     : radv: '{what}' still running ({ticks} s of up to {limit_s})");
+        }
+        if ticks > limit_s {
+            return None;
+        }
+    }
+    let lines = super::nvidia_gametest::drain();
+    Some(lines.iter().any(|line| line.contains("gametest: done in") && line.contains(", 0 failed")))
+}
+
+/// 7-Zip: упаковать каталог и проверить архив (своя программа, запускается ядром напрямую).
+fn seven_zip_check() -> Option<bool> {
+    if !matches!(crate::fs::list("/bin"), Some(Ok(ref entries)) if entries.iter().any(|e| e.name == "7zz")) {
+        return None;
+    }
+    let run = |line: &str| match crate::user::spawn(line, crate::vfs::perm::Credentials::ROOT) {
+        Ok(task) => {
+            let code = crate::sched::wait(task);
+            crate::kprintln!("  amdgpu     : 7zip: '{line}' -> {code:?}");
+            format!("{code:?}") == "Some(0)"
+        }
+        Err(err) => {
+            crate::kprintln!("  amdgpu     : 7zip: could not start '{line}': {err:?}");
+            false
+        }
+    };
+    Some(run("/bin/7zz a -bd /tmp/amd-check.7z /usr/share/wallpapers") && run("/bin/7zz t -bd /tmp/amd-check.7z"))
+}
+
+/// Ждать, пока флешка поставит пакеты в память, и пройти проверки: Vulkan, Direct3D 9/11/12, скорость, игра,
+/// программы (7-Zip, VLC, OBS). Каждый шаг - уведомлением на столе и строками `gametest|` в `LOG.TXT`.
 fn radv_auto() {
     let present = |path: &str| matches!(crate::fs::list(path), Some(Ok(_)));
-    crate::kprintln!("==== AMD TEST: hardware checks are DONE (see the amdgpu lines above). NEXT: RADV test. ====");
-    crate::kprintln!("==== AMD TEST: Proton is being copied from the stick into RAM - WAIT, do not power off. ====");
-    // До 25 минут: Proton с флешки - больше гигабайта. Строка состояния каждые 10 секунд.
+    // До 25 минут: пакеты с флешки - гигабайты.
     let started = crate::time::uptime_ms();
     let mut last_line = 0u64;
     loop {
@@ -1206,81 +1255,64 @@ fn radv_auto() {
         if ready || waited > 1500 {
             break;
         }
-        if waited >= last_line + 10 || last_line == 0 {
+        if waited >= last_line + 30 || last_line == 0 {
             last_line = waited.max(1);
-            crate::kprintln!(
-                "  amdgpu     : radv: waiting {waited} s of up to 1500: debian {}, proton {}, installer {}  (usually 2-8 min)",
-                if present("/opt/debian") { "in RAM" } else { "not yet" },
-                if present("/opt/proton/bin") { "in RAM" } else { "not yet" },
-                if crate::usb::storage::live_busy() { "still running" } else { "idle" }
-            );
+            announce("Копируются программы", &format!("Из флешки в память, прошло {waited} с (обычно 2-8 минут). Не выключайте."), 40_000);
         }
         crate::sched::sleep_ms(2000);
     }
     if !present("/opt/proton/bin") {
-        crate::kprintln!("==== AMD TEST: STOPPED - Proton did not appear in /opt (image without FOSSAI_WITH_PROTON=1, or the stick is too slow). You can power off; the log is in FREEOS\\LOG.TXT. ====");
+        announce("Тест AMD остановлен", "Proton не появился в /opt. Можно выключать, журнал на флешке.", 1_800_000);
         crate::usb::stick_log::flush_now();
         return;
     }
-    crate::kprintln!("==== AMD TEST: Proton is in RAM. Running RADV (vkprobe, vulkaninfo) on the card - about 1-3 min. ====");
-    crate::kprintln!("  amdgpu     : radv: {}", super::nvidia_gametest::start("hw amd -- vk"));
-    // Не уходить, пока проверка идёт: лог на флешку сбрасывает сама проверка.
-    let mut ticks = 0u32;
-    while super::nvidia_gametest::running() {
-        crate::sched::sleep_ms(1000);
-        ticks += 1;
-        if ticks % 15 == 0 {
-            crate::kprintln!("  amdgpu     : radv: the check is still running ({ticks} s)");
+    let mut steps: Vec<(&str, &str, u32)> = alloc::vec![
+        ("vk", "Vulkan: vkprobe, vulkaninfo, vkcube", 600),
+        ("d3d", "Direct3D 9 (DXVK), создаётся префикс Wine", 900),
+        ("d3d11", "Direct3D 11 (DXVK)", 600),
+        ("d3d12", "Direct3D 12 (vkd3d)", 600),
+        ("vsync", "Скорость без VSync", 600),
+    ];
+    if present("/opt/tmnf/bin") {
+        steps.push(("tmnf", "Игра Trackmania, замер 60 с (первый запуск долгий)", 1900));
+    }
+    if present("/opt/vlc/bin") || present("/opt/obs/bin") {
+        steps.push(("apps", "VLC и OBS: открыть окна", 300));
+    }
+    let total = steps.len() + 1;
+    let mut results: Vec<String> = Vec::new();
+    let mut failed = 0u32;
+    let mut record = |name: &str, verdict: Option<bool>, results: &mut Vec<String>| {
+        if verdict != Some(true) {
+            failed += 1;
+        }
+        results.push(format!("{name} {}", match verdict {
+            Some(true) => "PASS",
+            Some(false) => "FAIL",
+            None => "TIMEOUT",
+        }));
+    };
+    for (number, (what, title, limit)) in steps.into_iter().enumerate() {
+        let previous = results.last().map_or(String::new(), |last| format!("Прошлый шаг: {last}. "));
+        announce(&format!("Шаг {}/{total}: {title}", number + 1), &format!("{previous}Подождите, не выключайте."), 600_000);
+        let verdict = run_gametest(what, limit);
+        record(what, verdict, &mut results);
+        crate::usb::stick_log::flush_now();
+        // Прежняя проверка не закончилась - новую не запускать поверх.
+        if super::nvidia_gametest::running() {
+            break;
         }
     }
-    crate::usb::stick_log::flush_now();
-    // Маркер `radv d3d` (FOSSAI_AMD_RADV=2): ещё Direct3D 9/11/12 через DXVK и vkd3d на RADV, замер без VSync и,
-    // если на флешке есть игра, Trackmania с замером. Префикс Wine создаётся при первом запуске - минуты.
-    if firmware_file("RADV.TXT").is_ok_and(|text| text.windows(3).any(|w| w == b"d3d")) {
-        let mut steps: Vec<(&str, &str, u32)> = alloc::vec![
-            ("rpresent", "WATCH THE SCREEN: vkcube in 3 present modes (IMMEDIATE, MAILBOX, FIFO) - which one flickers?", 400),
-            ("d3d", "Direct3D 9 on DXVK (the Wine prefix is created first)", 900),
-            ("d3d11", "Direct3D 11 on DXVK", 600),
-            ("d3d12", "Direct3D 12 on vkd3d-proton", 600),
-            ("vsync", "Direct3D 9 without VSync, then with VSync (real speed)", 600),
-        ];
-        if matches!(crate::fs::list("/opt/tmnf/bin"), Some(Ok(_))) {
-            steps.push(("tmnf", "Trackmania Nations Forever, 60 s benchmark", 1900));
-            steps.push(("tmnfvs", "WATCH THE SCREEN: Trackmania with VSync on (does it flicker now?)", 1000));
-        }
-        let total = steps.len();
-        for (number, (what, title, limit)) in steps.into_iter().enumerate() {
-            crate::kprintln!("==== AMD TEST: step {}/{total} - {title}. WAIT (up to {} min). ====", number + 1, limit / 60);
-            crate::kprintln!("  amdgpu     : radv: {}", super::nvidia_gametest::start(&alloc::format!("hw amd -- {what}")));
-            let mut ticks = 0u32;
-            let (mut last_commits, mut bursts, mut next_burst) = (wayland_commits(), 0u32, 0u32);
-            while super::nvidia_gametest::running() {
-                crate::sched::sleep_ms(1000);
-                ticks += 1;
-                // Идут кадры (игра или проба рисуют) - снять серию с экрана: до двух на шаг, не чаще раза в 8 с.
-                let commits = wayland_commits();
-                if commits.wrapping_sub(last_commits) >= 5 && bursts < 2 && ticks >= next_burst {
-                    shots::burst(what);
-                    bursts += 1;
-                    next_burst = ticks + 8;
-                }
-                last_commits = commits;
-                if ticks % 15 == 0 {
-                    crate::kprintln!("  amdgpu     : radv: '{what}' still running ({ticks} s of up to {limit})");
-                }
-                if ticks > limit {
-                    crate::kprintln!("==== AMD TEST: '{what}' ran over {limit} s - giving up waiting (the log keeps what it has). ====");
-                    break;
-                }
-            }
-            crate::usb::stick_log::flush_now();
-            // Прежняя проверка не закончилась - новую не запускать поверх.
-            if super::nvidia_gametest::running() {
-                break;
-            }
-        }
+    announce(&format!("Шаг {total}/{total}: архиватор 7-Zip"), "Подождите, не выключайте.", 120_000);
+    if let Some(ok) = seven_zip_check() {
+        record("7zip", Some(ok), &mut results);
     }
-    crate::kprintln!("==== AMD TEST: FINISHED. You can power off now. The result is in FREEOS\\LOG.TXT (gametest| lines). ====");
+    let summary = results.join(", ");
+    announce(
+        if failed == 0 { "Тест AMD завершён: всё прошло" } else { "Тест AMD завершён: есть ошибки" },
+        &format!("{summary}. Можно выключать, журнал на флешке."),
+        1_800_000,
+    );
     crate::usb::stick_log::flush_now();
 }
 
