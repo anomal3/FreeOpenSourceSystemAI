@@ -487,6 +487,10 @@ impl SettingsView {
         ] {
             y = self.field_row(pass, x, y, w, field, label, note);
         }
+        // The classic window, per adapter (25.11, `/bin/ncpa`, «ncpa.cpl»):
+        // last on the page, so the keyboard order above stays as it was.
+        y = pass.group(x, y, w, "Дополнительно");
+        row(pass, x, y, w, Some(Fi::NetworkWired), "Настройка параметров адаптера", "Сетевые подключения: IP и DNS вручную, отключение, состояние", Ctl::Button("Открыть", Weight::Normal), Some(Deed::Launch("/bin/ncpa")));
     }
 
     /// Строка с полем ввода справа.

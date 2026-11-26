@@ -1181,6 +1181,10 @@ fn play(
                 // строке браузера).
                 let text = fill(text, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: набираем {text:?}");
+                // `{secret:NAME}` (25.11, `obsos-rupor`): the value of the
+                // host's FOSSAI_SECRET_NAME — a test account typed into a page;
+                // the log above shows only the placeholder, never the value.
+                let text = fill_secrets(&text).with_context(|| format!("шаг {index}"))?;
                 for name in keys::spell(&text).with_context(|| format!("шаг {index}"))? {
                     hmp.sendkey(&name).with_context(|| format!("шаг {index}"))?;
                     std::thread::sleep(KEY_DELAY);
@@ -1266,6 +1270,17 @@ fn play(
                 press_middle(qmp.as_deref_mut(), hmp, false)
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
+            }
+            Step::RightClickWith(keys) => {
+                say!("  [{at:>6} мс] шаг {index}: {keys}+щелчок правой");
+                hmp.sendkey(&format!("{keys} 700")).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(Duration::from_millis(200));
+                press_right(qmp.as_deref_mut(), hmp, true)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(POINTER_DELAY);
+                press_right(qmp.as_deref_mut(), hmp, false)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(Duration::from_millis(700) + KEY_DELAY);
             }
             Step::ClickWith(keys) => {
                 say!("  [{at:>6} мс] шаг {index}: {keys}+щелчок");
@@ -1661,7 +1676,7 @@ fn play(
             Step::Shot(name) => {
                 say!("  [{at:>6} мс] шаг {index}: снимок '{name}'");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
-                let png = ppm.with_extension("png");
+                let png = paths::shot_png(&ppm);
                 std::fs::create_dir_all(paths::test_dir()).ok();
                 let took = hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
                 report_slow_shot(index, took);
@@ -1672,7 +1687,7 @@ fn play(
             Step::ShotHead(name, head) => {
                 say!("  [{at:>6} мс] шаг {index}: снимок '{name}' выхода {head}");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
-                let png = ppm.with_extension("png");
+                let png = paths::shot_png(&ppm);
                 std::fs::create_dir_all(paths::test_dir()).ok();
                 let took = hmp.screendump_head(&ppm, "gpu0", *head).with_context(|| format!("шаг {index}"))?;
                 report_slow_shot(index, took);
@@ -1712,7 +1727,7 @@ fn play(
             Step::Painted(name) => {
                 say!("  [{at:>6} мс] шаг {index}: снимок '{name}' обязан быть нарисован");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
-                let png = ppm.with_extension("png");
+                let png = paths::shot_png(&ppm);
                 std::fs::create_dir_all(paths::test_dir()).ok();
                 let took = hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
                 report_slow_shot(index, took);
@@ -1731,7 +1746,7 @@ fn play(
                 // думает. Кадр, который отдаёт монитор, — это то, что показывает
                 // устройство.
                 let ppm = paths::test_dir().join(format!("{prefix}-screen.ppm"));
-                let png = ppm.with_extension("png");
+                let png = paths::shot_png(&ppm);
                 std::fs::create_dir_all(paths::test_dir()).ok();
                 let took = hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
                 report_slow_shot(index, took);
@@ -2736,6 +2751,25 @@ fn first_wrong(body: &[u8], pattern: scenarios::Pattern) -> Option<usize> {
 /// что запрос дошёл и ответ вернулся; поток в четверть мегабайта — что тело
 /// переливается кусками, а не собирается в памяти; ответ кусками — что чужое
 /// разбиение мы **не** пропускаем дальше, а отвечаем `502`.
+/// Replace `{secret:NAME}` with the host's environment variable
+/// `FOSSAI_SECRET_NAME` (see `Step::Type`): secrets never live in scenarios.
+fn fill_secrets(text: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("{secret:") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + "{secret:".len()..];
+        let end = tail.find('}').context("{secret:… without }")?;
+        let name = &tail[..end];
+        let value = std::env::var(format!("FOSSAI_SECRET_{name}"))
+            .with_context(|| format!("set FOSSAI_SECRET_{name} on the host for this scenario"))?;
+        out.push_str(&value);
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 fn start_host_site() -> Result<(HostServer, u16)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .context("не удалось занять порт под веб-сервер хоста")?;
@@ -2875,6 +2909,44 @@ fn start_host_site() -> Result<(HostServer, u16)> {
                     say!("             сайт хоста: образ отдан, {sent} байт");
                 });
                 return;
+            }
+            // A file the scenario prepared on the host (25.11, `proton-cef`:
+            // Roman's CEF build of Rupor, a tar of F:\cef-test) —
+            // `build/test/host-files/NAME`, plain names only; streamed in its
+            // own thread like the image above.
+            p if p.starts_with("/host-file/") => {
+                let name = &p["/host-file/".len()..];
+                let path = Path::new("build/test/host-files").join(name);
+                let file = (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) && !name.starts_with('.'))
+                    .then(|| std::fs::File::open(&path).ok())
+                    .flatten();
+                match file {
+                    Some(mut file) => {
+                        std::thread::spawn(move || {
+                            let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+                            );
+                            if stream.write_all(head.as_bytes()).is_err() {
+                                return;
+                            }
+                            match std::io::copy(&mut file, &mut stream) {
+                                Ok(sent) => say!("             сайт хоста: {} отдан, {sent} байт", path.display()),
+                                Err(err) => say!("             сайт хоста: {} оборван: {err}", path.display()),
+                            }
+                            stream.shutdown(std::net::Shutdown::Both).ok();
+                        });
+                        return;
+                    }
+                    None => {
+                        let body = "no such host file\n";
+                        format!(
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .into_bytes()
+                    }
+                }
             }
             "/chunked.txt" => {
                 // Ответ кусками. Наш прокси обязан отказаться его передавать:
@@ -3336,6 +3408,9 @@ fn prepare_drives(
     let drives = match scenario.target {
         Target::Live => {
             let esp = qemu::prepare_esp(built, true)?;
+            if scenarios::without_console(scenario.name) {
+                std::fs::remove_file(esp.join("FREEOS").join("CONSOLE"))?;
+            }
             if let Some(mode) = scenarios::screen_for(scenario.name) {
                 qemu::request_screen(&esp, mode)?;
             }
@@ -3363,6 +3438,13 @@ fn prepare_drives(
         Target::Iso => vec![Drive::Cdrom(image::build_iso(built, image::Kind::System)?)],
         Target::Installed => {
             let disk = prepare_installed_disk(arch, built.release)?;
+            // The console window at boot, as on the live ESP (25.11, see
+            // `qemu::prepare_esp`): the installer never writes it.
+            if scenarios::without_console(scenario.name) {
+                crate::diskfile::remove_esp_file(&disk, "FREEOS", "CONSOLE")?;
+            } else {
+                crate::diskfile::put_esp_file(&disk, "FREEOS", "CONSOLE", b"console\n")?;
+            }
             let forgotten = scenarios::forgotten_on_state(scenario.name);
             if !forgotten.is_empty() {
                 forget_on_state(&disk, forgotten)?;

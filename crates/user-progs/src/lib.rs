@@ -729,12 +729,18 @@ impl Line {
 
     /// Дописать текст.
     pub fn str(&mut self, text: &str) -> &mut Self {
-        for &byte in text.as_bytes() {
-            if self.used == Self::MAX {
+        // A full buffer is flushed on a character boundary (25.11): a write
+        // cut inside a Cyrillic letter is not UTF-8, and the kernel drops
+        // such a write whole — a long Russian log line vanished silently
+        // («7-Zip submenu 1 opened: …» of «Файлы»).
+        for ch in text.chars() {
+            let mut utf8 = [0u8; 4];
+            let bytes = ch.encode_utf8(&mut utf8).as_bytes();
+            if self.used + bytes.len() > Self::MAX {
                 self.flush();
             }
-            self.buffer[self.used] = byte;
-            self.used += 1;
+            self.buffer[self.used..self.used + bytes.len()].copy_from_slice(bytes);
+            self.used += bytes.len();
         }
         self
     }
@@ -1694,6 +1700,20 @@ pub fn close_socket(socket: i64) -> i64 {
     }
     // SAFETY: аргумент — число.
     unsafe { syscall(SYS_CLOSE_SOCKET, socket as usize, 0, 0) }
+}
+
+/// Apply a DHCP lease with its server, term and second DNS server (25.11).
+/// Root only; `ERR_PERMISSION` also when the adapter is set by hand or off.
+pub fn netconf_lease(lease: &user_abi::NetLease) -> i64 {
+    // SAFETY: the structure lives in the program's memory, its own length.
+    unsafe {
+        syscall(
+            SYS_NETCONF,
+            (lease as *const user_abi::NetLease) as usize,
+            core::mem::size_of::<user_abi::NetLease>(),
+            0,
+        )
+    }
 }
 
 /// Задать настройки интерфейса. Только root.

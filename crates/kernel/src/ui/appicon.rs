@@ -95,6 +95,8 @@ pub fn tool_art(program: &str) -> Option<Art> {
         "archiver" => "doc-archive",
         // «Фотографии» (24.11): the picture-document icon of the theme.
         "photos" => "doc-image",
+        // «Сетевые подключения» (25.11): the network icon of the theme.
+        "ncpa" => "network",
         _ => return None,
     };
     let (icon, tone) = match program {
@@ -114,6 +116,7 @@ pub fn tool_art(program: &str) -> Option<Art> {
         "screenrec" => (Icon::Camera, Tone::Bad),
         "doc-archive" => (Icon::Package, Tone::Warn),
         "doc-image" => (Icon::Camera, Tone::Accent),
+        "network" => (Icon::Network, Tone::Accent),
         _ => return None,
     };
     // Картинка темы значков (22.11), плитка — если в теме такой нет.

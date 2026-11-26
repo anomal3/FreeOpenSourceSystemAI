@@ -223,8 +223,11 @@ struct Editor {
     page_rows: core::cell::Cell<usize>,
     page_cols: core::cell::Cell<usize>,
     lang: Lang,
-    /// Открытое меню полосы и подсвеченный пункт.
+    /// Открытое меню полосы и подсвеченный пункт (`usize::MAX` — none:
+    /// the pointer left the rows).
     menu: Option<(Menu, usize)>,
+    /// Menu-bar title under the pointer (25.11: hover on the menu bar).
+    hot_head: Option<usize>,
     /// Открыто меню языков у строки состояния: подсвеченный пункт.
     lang_menu: Option<usize>,
     /// Состояние подсветки на начало каждой строки (см. `state_at`).
@@ -312,6 +315,7 @@ impl Editor {
             page_cols: core::cell::Cell::new(80),
             lang: Lang::Plain,
             menu: None,
+            hot_head: None,
             lang_menu: None,
             states: core::cell::RefCell::new(Vec::new()),
             undo: Vec::new(),
@@ -1347,7 +1351,7 @@ impl Plan {
     fn lang_menu(&self, ctx: Ctx, area: Rect) -> (Rect, Vec<kit::Entry<'static>>) {
         let entries: Vec<kit::Entry<'static>> = Lang::ALL
             .iter()
-            .map(|lang| kit::Entry { title: lang.name(), icon: None, danger: false, group: u8::from(*lang != Lang::Plain) })
+            .map(|lang| kit::Entry { title: lang.name(), icon: None, danger: false, group: u8::from(*lang != Lang::Plain), ..kit::Entry::NONE })
             .collect();
         let size = kit::menu_size(ctx, &entries);
         let rect = kit::place((self.lang.right() - size.0 as i32, self.status.y - size.1 as i32), size, area);
@@ -1364,11 +1368,12 @@ fn dropdown(ctx: Ctx, area: Rect, head: Rect, items: &[Item]) -> (Rect, Vec<Rect
     let mut y = head.bottom() + ctx.px(2) as i32 + pad as i32;
     let mut rows = Vec::new();
     for (index, item) in items.iter().enumerate() {
+        // 25.11: compact rows and separators of the shared menu style.
         if index > 0 && item.group != items[index - 1].group {
-            y += ctx.px(9) as i32;
+            y += ctx.px(7) as i32;
         }
-        rows.push(Rect::new(head.x + pad as i32, y, w - pad * 2, ctx.px(ITEM_H)));
-        y += ctx.px(ITEM_H) as i32;
+        rows.push(Rect::new(head.x + pad as i32, y, w - pad * 2, ctx.px(theme::MENU_ITEM_H)));
+        y += ctx.px(theme::MENU_ITEM_H) as i32;
     }
     let h = (y + pad as i32 - head.bottom() - ctx.px(2) as i32).max(0) as u32;
     let x = head.x.min(area.right() - w as i32).max(area.x);
@@ -1769,9 +1774,22 @@ impl Editor {
     fn draw_menu_bar(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
         let p = ctx.palette;
         let bar = kit::toolbar(ctx, s, plan.bar);
-        for ((menu, label), head) in MENUS.iter().zip(plan.heads) {
+        for (index, ((menu, label), head)) in MENUS.iter().zip(plan.heads).enumerate() {
+            // 25.11: the open menu's title is lit, and so is the title under
+            // the pointer (the tokens are translucent — drawn with their
+            // alpha; the opaque white plate hid the dark-theme title).
             if self.menu.is_some_and(|(open, _)| open == *menu) {
-                draw::rounded(s, head, ctx.px(4), p.hover1.color, 255);
+                if theme::is_classic() {
+                    mini_ui::classic::sunken(s, head, mini_ui::classic::unit(ctx.scale));
+                } else {
+                    draw::rounded(s, head, ctx.px(4), p.hover2.color, p.hover2.alpha);
+                }
+            } else if self.hot_head == Some(index) {
+                if theme::is_classic() {
+                    mini_ui::classic::bump(s, head, mini_ui::classic::unit(ctx.scale));
+                } else {
+                    draw::rounded(s, head, ctx.px(4), p.hover1.color, p.hover1.alpha);
+                }
             }
             paint::text(bar, s, Role::Body, head.x + ctx.px(10) as i32, paint::baseline(ctx, Role::Body, head), label, p.ink);
         }
@@ -1792,14 +1810,23 @@ impl Editor {
         let p = inner.palette;
         for (index, (item, row)) in items.iter().zip(&rows).enumerate() {
             if index > 0 && item.group != items[index - 1].group {
-                paint::separator(inner, s, row.x + ctx.px(8) as i32, row.y - ctx.px(5) as i32, row.w.saturating_sub(ctx.px(16)));
+                let line_y = row.y - ctx.px(4) as i32;
+                if theme::is_classic() {
+                    mini_ui::classic::groove_h(s, rect.x + ctx.px(3) as i32, line_y, rect.w.saturating_sub(ctx.px(6)), mini_ui::classic::unit(ctx.scale));
+                } else {
+                    paint::separator(inner, s, row.x + ctx.px(8) as i32, line_y, row.w.saturating_sub(ctx.px(16)));
+                }
             }
-            if index == selected {
-                draw::rounded(s, *row, ctx.px(4), p.hover1.color, 255);
+            // 25.11: the shared menu plate (pointer or arrows), as in every menu.
+            let on = index == selected;
+            if on {
+                kit::menu_highlight(inner, s, *row, true);
             }
-            paint::text(inner, s, Role::Body, row.x + ctx.px(12) as i32, paint::baseline(ctx, Role::Body, *row), &item.label, p.ink);
+            let ink = if on { p.ink } else { p.ink2 };
+            paint::text(inner, s, Role::Body, row.x + ctx.px(12) as i32, paint::baseline(ctx, Role::Body, *row), &item.label, ink);
             if !item.keys.is_empty() {
-                paint::text_right(inner, s, Role::Caption, row.right() - ctx.px(10) as i32, paint::baseline(ctx, Role::Caption, *row), item.keys, p.ink4);
+                let keys_ink = if on && theme::is_classic() { mini_ui::Color::rgb(0xFF, 0xFF, 0xFF) } else { p.ink4 };
+                paint::text_right(inner, s, Role::Caption, row.right() - ctx.px(10) as i32, paint::baseline(ctx, Role::Caption, *row), item.keys, keys_ink);
             }
         }
     }
@@ -1915,8 +1942,8 @@ impl App for Editor {
             let count = self.items(menu).len();
             let index = MENUS.iter().position(|(m, _)| *m == menu).unwrap_or(0);
             match code {
-                WIN_KEY_UP => self.menu = Some((menu, selected.saturating_sub(1))),
-                WIN_KEY_DOWN => self.menu = Some((menu, (selected + 1).min(count.saturating_sub(1)))),
+                WIN_KEY_UP => self.menu = Some((menu, if selected >= count { count.saturating_sub(1) } else { selected.saturating_sub(1) })),
+                WIN_KEY_DOWN => self.menu = Some((menu, if selected >= count { 0 } else { (selected + 1).min(count.saturating_sub(1)) })),
                 WIN_KEY_LEFT => self.menu = Some((MENUS[(index + MENUS.len() - 1) % MENUS.len()].0, 0)),
                 WIN_KEY_RIGHT => self.menu = Some((MENUS[(index + 1) % MENUS.len()].0, 0)),
                 ENTER => {
@@ -2129,6 +2156,38 @@ impl App for Editor {
             return true;
         }
         false
+    }
+
+    /// 25.11: hover on the menu bar and in the menus — the title under the
+    /// pointer is lit; with a menu open, moving to another title opens that
+    /// menu (as in Windows) and the row under the pointer is lit.
+    fn hover(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        if self.font_dialog.is_some() || self.dialog.is_some() || self.ask_save.is_some() {
+            return false;
+        }
+        let plan = Plan::new(ctx, area);
+        let before = (self.hot_head, self.menu, self.lang_menu);
+        let head_at = plan.heads.iter().position(|head| head.contains(x, y));
+        self.hot_head = head_at;
+        if let Some((menu, _)) = self.menu {
+            if let Some(index) = head_at.filter(|index| MENUS[*index].0 != menu) {
+                self.menu = Some((MENUS[index].0, usize::MAX));
+            } else if head_at.is_none() {
+                let head = MENUS.iter().position(|(m, _)| *m == menu).map(|index| plan.heads[index]).unwrap_or(Rect::EMPTY);
+                let items = self.items(menu);
+                let (_, rows) = dropdown(ctx, area, head, &items);
+                let lit = rows.iter().position(|row| row.contains(x, y)).unwrap_or(usize::MAX);
+                self.menu = Some((menu, lit));
+            }
+        } else if let Some(selected) = self.lang_menu {
+            let (rect, entries) = plan.lang_menu(ctx, area);
+            if let Some(index) = kit::menu_hit(ctx, rect, &entries, x, y) {
+                if index != selected {
+                    self.lang_menu = Some(index);
+                }
+            }
+        }
+        before != (self.hot_head, self.menu, self.lang_menu)
     }
 
     fn wheel(&mut self, clicks: i32) -> bool {

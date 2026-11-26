@@ -257,7 +257,152 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("filetypes/.aac/default", VLC),
     ("filetypes/.wma/default", VLC),
     ("filetypes/.mka/default", VLC),
+    // Context-menu verbs (25.11, see [`verbs`]): «Расположение файла» on
+    // files always; with Shift — «Копировать как путь» on files and
+    // «Удалить содержимое папки» on folders.
+    ("shell/file/location/caption", "Расположение файла"),
+    ("shell/file/location/command", VERB_LOCATION),
+    ("shell/file/location/icon", "folder"),
+    ("shell/file/copyaspath/caption", "Копировать как путь"),
+    ("shell/file/copyaspath/command", VERB_COPY_AS_PATH),
+    ("shell/file/copyaspath/extended", "1"),
+    ("shell/folder/emptyfolder/caption", "Удалить содержимое папки"),
+    ("shell/folder/emptyfolder/command", VERB_EMPTY_FOLDER),
+    ("shell/folder/emptyfolder/extended", "1"),
 ];
+
+// ---------------------------------------------------------------------------
+// Context-menu verbs (`shell` hive, 25.11)
+// ---------------------------------------------------------------------------
+//
+// Roman 25.11: items of the right-click menus come from the store, so a
+// package (or the person) adds one without code — like `HKCR\*\shell\<verb>`.
+//
+// * `shell/<type>/<verb>/caption` — the text of the item (required);
+// * `shell/<type>/<verb>/command` — what it runs (required): a command line,
+//   `%1` is replaced by the path (no `%1` — the path is appended), or one of
+//   the built-in actions [`VERB_LOCATION`], [`VERB_COPY_AS_PATH`],
+//   [`VERB_EMPTY_FOLDER`];
+// * `shell/<type>/<verb>/icon` — an icon name (optional);
+// * `shell/<type>/<verb>/extended` = `1` — shown only when Shift is held
+//   while the menu opens (Windows «extended verbs»);
+// * `shell/<type>/<verb>/hidden` = `1` — switched off (in the user scope it
+//   hides a built-in verb).
+//
+// `<type>`: `file`, `folder`, `desktop` (the empty desktop), `shortcut`
+// (a program shortcut), `*` (files and folders), or `.ext` (files of that
+// extension). Used by the desktop (kernel) and «Файлы».
+
+/// Built-in action: open «Файлы» at the containing folder with the item
+/// selected («Расположение файла»).
+pub const VERB_LOCATION: &str = "@location";
+/// Built-in action: the full path, quoted, to the clipboard («Копировать как
+/// путь»).
+pub const VERB_COPY_AS_PATH: &str = "@copy-as-path";
+/// Built-in action: ask, then move everything inside the folder to the
+/// recycle bin («Удалить содержимое папки»).
+pub const VERB_EMPTY_FOLDER: &str = "@empty-folder";
+
+/// Most verbs a menu shows (the menu surfaces are sized for it).
+pub const MAX_VERBS: usize = 6;
+
+/// One context-menu item from the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verb {
+    pub id: String,
+    pub caption: String,
+    pub command: String,
+    pub icon: Option<String>,
+    pub extended: bool,
+}
+
+impl Verb {
+    /// The command line for `path`: `%1` replaced, or the path appended.
+    /// Built-in actions (`@…`) come back as they are.
+    #[must_use]
+    pub fn command_for(&self, path: &str) -> String {
+        if self.command.starts_with('@') {
+            return self.command.clone();
+        }
+        if self.command.contains("%1") {
+            return self.command.replace("%1", path);
+        }
+        alloc::format!("{} {path}", self.command)
+    }
+}
+
+/// The types of an item for [`verbs`], most specific first.
+#[must_use]
+pub fn verb_types(name: &str, directory: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if directory {
+        out.push(String::from("folder"));
+    } else {
+        if let Some((_, ext)) = name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()) {
+            out.push(alloc::format!(".{}", ext.to_ascii_lowercase()));
+        }
+        out.push(String::from("file"));
+    }
+    out.push(String::from("*"));
+    out
+}
+
+/// Verbs for an item of `types` ([`verb_types`], or `["desktop"]`,
+/// `["shortcut"]`) from the merged keys under `shell/` (`reg_list("shell/")`,
+/// `config::registry::list(None, "shell/")` — built-ins included). A verb id
+/// met under a more specific type wins; extended verbs only with `shift`;
+/// at most [`MAX_VERBS`], in key order.
+#[must_use]
+pub fn verbs(pairs: &[(String, String)], types: &[&str], shift: bool) -> Vec<Verb> {
+    let mut out: Vec<Verb> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for kind in types {
+        let head = alloc::format!("shell/{kind}/");
+        // Verb ids of this type, in key order.
+        let mut ids: Vec<&str> = Vec::new();
+        for (key, _) in pairs {
+            if let Some(rest) = key.strip_prefix(head.as_str()) {
+                if let Some((id, _)) = rest.split_once('/') {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        for id in ids {
+            if seen.iter().any(|known| known == id) {
+                continue;
+            }
+            seen.push(String::from(id));
+            let field = |name: &str| {
+                let key = alloc::format!("{head}{id}/{name}");
+                pairs.iter().find(|(known, _)| *known == key).map(|(_, value)| value.clone())
+            };
+            if field("hidden").is_some_and(|value| value.trim() == "1") {
+                continue;
+            }
+            let (Some(caption), Some(command)) = (field("caption"), field("command")) else { continue };
+            if caption.trim().is_empty() || command.trim().is_empty() {
+                continue;
+            }
+            let extended = field("extended").is_some_and(|value| value.trim() == "1");
+            if extended && !shift {
+                continue;
+            }
+            out.push(Verb { id: String::from(id), caption, command, icon: field("icon").filter(|icon| !icon.is_empty()), extended });
+            if out.len() == MAX_VERBS {
+                break;
+            }
+        }
+        if out.len() == MAX_VERBS {
+            break;
+        }
+    }
+    // The everyday verbs first, the extended ones (Shift) after them — the
+    // menu without Shift is the same menu, only shorter.
+    out.sort_by_key(|verb| verb.extended);
+    out
+}
 
 /// The photo viewer of the system («Фотографии», 24.11).
 pub const PHOTOS: &str = "/bin/photos";
@@ -466,6 +611,26 @@ pub fn stem_chars(name: &str, directory: bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_verbs() {
+        let mut pairs: Vec<(String, String)> = BUILTIN.iter().filter(|(key, _)| key.starts_with("shell/")).map(|(k, v)| (String::from(*k), String::from(*v))).collect();
+        pairs.push((String::from("shell/.txt/edit/caption"), String::from("Изменить")));
+        pairs.push((String::from("shell/.txt/edit/command"), String::from("/bin/notepad %1")));
+        let types = verb_types("a.TXT", false);
+        assert_eq!(types, ["\u{2e}txt", "file", "*"]);
+        let refs: Vec<&str> = types.iter().map(String::as_str).collect();
+        let plain = verbs(&pairs, &refs, false);
+        assert_eq!(plain.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), ["edit", "location"]);
+        assert_eq!(plain[0].command_for("/x/a.txt"), "/bin/notepad /x/a.txt");
+        let shifted = verbs(&pairs, &refs, true);
+        assert_eq!(shifted.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), ["edit", "location", "copyaspath"]);
+        let folder = verbs(&pairs, &["folder", "*"], false);
+        assert!(folder.is_empty());
+        assert_eq!(verbs(&pairs, &["folder", "*"], true)[0].command, VERB_EMPTY_FOLDER);
+        pairs.push((String::from("shell/file/location/hidden"), String::from("1")));
+        assert!(verbs(&pairs, &["file"], false).is_empty());
+    }
 
     #[test]
     fn hive_round_trip() {

@@ -612,6 +612,33 @@ done
 # живёт до перезагрузки. Журнал DXVK - туда же, а не `ИГРА_d3d9.log` в
 # каталог игры (строки журнала по-прежнему идут и в stderr).
 C=$HOME/.cache/fossai-proton
+# Живая флешка (25.11, hw-log19: D2R «данные пропали»): корень - FAT32 в
+# памяти, дом и префикс - в RAM, при перезагрузке пропадали сохранения игр
+# (`Saved Games`, `Documents`, `AppData`) и кеши шейдеров. Постоянное место -
+# первый записываемый диск /usb1../usb9 (exFAT/FAT32/ext2/btrfs, не сама
+# флешка /usb): `ДИСК/FossAi/proton` - туда кеши, а папки профиля Wine
+# становятся ссылками туда же (ниже, после префикса). `FOSSAI_PROTON_STORE=
+# КАТАЛОГ` - своё место, `=off` - как раньше.
+S=
+if [ "${FOSSAI_PROTON_STORE:-auto}" = auto ]; then
+    live=0; vols=()
+    while read -r dev point kind rest; do
+        case $point in /) [ "$kind" = FAT32 ] && live=1 ;; /usb[1-9]) case $kind in exFAT|FAT32|ext2|btrfs) vols+=("$point") ;; esac ;; esac
+    done < /proc/mounts
+    if [ $live = 1 ]; then
+        for v in "${vols[@]}"; do
+            if LD_LIBRARY_PATH= mkdir -p "$v/FossAi/proton" 2>/dev/null && [ -w "$v/FossAi/proton" ]; then S=$v/FossAi/proton; break; fi
+        done
+    fi
+elif [ "$FOSSAI_PROTON_STORE" != off ]; then
+    S=$FOSSAI_PROTON_STORE
+    LD_LIBRARY_PATH= mkdir -p "$S" 2>/dev/null || S=
+fi
+if [ -n "$S" ]; then
+    C=$S/cache
+    echo "fossai-proton: live system - game saves and shader caches kept in $S"
+    echo "fossai-proton: live system - game saves and shader caches kept in $S" > /dev/kmsg 2>/dev/null
+fi
 export MESA_SHADER_CACHE_DIR=${MESA_SHADER_CACHE_DIR:-$C/mesa}
 export MESA_SHADER_CACHE_MAX_SIZE=${MESA_SHADER_CACHE_MAX_SIZE:-1G}
 export DXVK_SHADER_CACHE_PATH=${DXVK_SHADER_CACHE_PATH:-$C/dxvk}
@@ -921,6 +948,24 @@ esac
                     $P/bin/wineserver -w\n\
                 fi\n\
             fi ;; esac\n", r#"
+# Живая флешка (25.11): папки профиля, куда игры пишут сохранения и
+# настройки, - ссылки в постоянное место `$S` (выбрано выше). Что уже есть в
+# RAM-папке, сначала копируется туда (не затирая сохранённое).
+if [ -n "$S" ] && [ -d "$WINEPREFIX/drive_c/users" ]; then
+    U=$WINEPREFIX/drive_c/users/steamuser
+    LD_LIBRARY_PATH= mkdir -p "$U/AppData"
+    for d in "Saved Games" "Documents" "AppData/Roaming" "AppData/LocalLow"; do
+        t=$S/profile/$d
+        [ -L "$U/$d" ] && [ "$(LD_LIBRARY_PATH= readlink "$U/$d")" = "$t" ] && continue
+        LD_LIBRARY_PATH= mkdir -p "$t" || continue
+        if [ -d "$U/$d" ] && [ ! -L "$U/$d" ]; then
+            LD_LIBRARY_PATH= cp -rn "$U/$d/." "$t/" && LD_LIBRARY_PATH= rm -rf "$U/$d"
+        else
+            LD_LIBRARY_PATH= rm -f "$U/$d"
+        fi
+        [ -e "$U/$d" ] || LD_LIBRARY_PATH= ln -s "$t" "$U/$d"
+    done
+fi
 # Буквы дисков (20.11): каждый подключённый том (/usb1.., /usb, /data,
 # /mnt/*, /media/*) - своя буква в ПРЕФИКС/dosdevices, чтобы пути вида
 # F:\D2RLAN работали. Тома и метки - из /proc/mounts ядра (устройство

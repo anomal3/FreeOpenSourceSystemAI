@@ -170,6 +170,14 @@ fn main() -> Status {
     }
     log::init();
     logln!("FossAi installer");
+    // The boot manager arms the UEFI watchdog for 5 minutes before starting
+    // a boot option (UEFI spec 7.5); on expiry OVMF and real firmware do a
+    // cold reset. The installer is interactive and copying Proton+TMNF takes
+    // longer than that: the machine rebooted mid-copy (25.11) and looped.
+    match uefi::boot::set_watchdog_timer(0, 0x1_0000, None) {
+        Ok(()) => logln!("[boot] firmware watchdog disabled"),
+        Err(err) => logln!("[boot] cannot disable the firmware watchdog: {err:?}"),
+    }
 
     let Some(mut display) = Display::open() else {
         // Единственное место, где установщик пишет в консоль прошивки: экрана

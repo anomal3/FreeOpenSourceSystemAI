@@ -152,7 +152,8 @@ static GROUPS: [Group; 9] = [
         icon: Fi::Globe,
         tint: (0x6C, 0xD4, 0x9C),
         items: &[
-            item("Состояние сети", "адрес, шлюз, DNS, карта", Fi::NetworkWired, Go::Page("network"), "network ethernet ncpa.cpl internet ip dns"),
+            item("Сетевые подключения", "адаптеры: IP и DNS вручную или автоматически, отключение", Fi::NetworkWired, Go::Prog("ncpa"), "ncpa.cpl network connections adapter ethernet ip dns static dhcp"),
+            item("Состояние сети", "адрес, шлюз, DNS, карта", Fi::Globe, Go::Page("network"), "network ethernet internet ip dns"),
             item("Беспроводная сеть", "Wi-Fi на странице «Сеть»", Fi::Wifi, Go::Page("network"), "wifi wireless wlan"),
             item("Сетевые инструменты", "ping, DNS, порты, соединения", Fi::Activity, Go::Planned("функция запланирована (фаза П4)"), "ping netstat tools"),
             item("Удалённый доступ", "закладки SSH/SFTP", Fi::Terminal, Go::Planned("функция запланирована (фаза П4); ssh и sftp есть в терминале"), "remote ssh sftp mstsc rdp"),

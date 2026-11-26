@@ -266,12 +266,34 @@ pub fn prime_handle_to_fd(file: &DrmFile, arg: usize) -> i64 {
     if bo.no_share {
         return -e::EPERM;
     }
+    note_exported(&bo);
     let fd = super::install(Arc::new(DmaBuf(bo)), false, args.flags & O_CLOEXEC != 0);
     if fd < 0 {
         return fd;
     }
     args.fd = fd as i32;
     if put(arg, args).is_err() { -e::EFAULT } else { 0 }
+}
+
+/// 25.11 (OBS zero copy): exported system-memory buffers by their first
+/// physical frame - the desktop knows a fullscreen game's buffer only by the
+/// address it scans out (`Window::scanout_source`); the screen capture hands
+/// the same buffer to OBS as a dma-buf through it ([`exported_by_frame`]).
+static EXPORTED: SpinLock<Vec<(u64, Weak<Bo>)>> = SpinLock::new(Vec::new());
+
+fn note_exported(bo: &Arc<Bo>) {
+    let Some(first) = bo.frames().and_then(|frames| frames.first().copied()) else {
+        return;
+    };
+    let mut list = EXPORTED.lock();
+    list.retain(|(at, weak)| *at != first && weak.strong_count() > 0);
+    list.push((first, Arc::downgrade(bo)));
+}
+
+/// The exported buffer whose memory starts at physical `first`, if it lives.
+#[must_use]
+pub fn exported_by_frame(first: u64) -> Option<Arc<Bo>> {
+    EXPORTED.lock().iter().find(|(at, _)| *at == first).and_then(|(_, weak)| weak.upgrade())
 }
 
 /// `DRM_IOCTL_PRIME_FD_TO_HANDLE`: ручка для dma-buf; уже есть у файла —
@@ -325,7 +347,7 @@ impl Object for DmaBuf {
 /// ioctl на dma-buf: `DMA_BUF_IOCTL_SYNC` — память когерентна, делать
 /// нечего; неявная синхронизация через sync_file (EXPORT/IMPORT) — нет
 /// (`ENOTTY`: Mesa тогда обходится без неё).
-pub fn dmabuf_ioctl(_object: &Arc<dyn Object>, request: u32, arg: usize) -> i64 {
+pub fn dmabuf_ioctl(dmabuf: &Arc<dyn Object>, request: u32, arg: usize) -> i64 {
     const SYNC: u32 = 0x4008_6200;
     // `struct dma_buf_export_sync_file` / `dma_buf_import_sync_file`:
     // `{u32 flags; s32 fd}` (Linux 6.0+). Mesa WSI (`wsi_common_drm.c`)
@@ -354,6 +376,8 @@ pub fn dmabuf_ioctl(_object: &Arc<dyn Object>, request: u32, arg: usize) -> i64 
         // Неявной синхронизации у стола нет: он читает кадр сразу после
         // `commit`. Поэтому забор кадра (конец отрисовки на GPU) ждётся
         // здесь, до показа, — не дольше 2 с (сторож канала — 10 с).
+        // 25.11: by default not here - the fence is noted on the buffer and
+        // the Wayland server waits for it before the show ([`frame_pending`]).
         IMPORT_SYNC_FILE => {
             let Ok(args) = get::<[u32; 2]>(arg) else { return -e::EFAULT };
             if args[0] & !3 != 0 || args[0] == 0 {
@@ -361,6 +385,15 @@ pub fn dmabuf_ioctl(_object: &Arc<dyn Object>, request: u32, arg: usize) -> i64 
             }
             let Some(object) = super::object_of(args[1] as usize) else { return -e::EBADF };
             let Some(sync) = object.as_any().downcast_ref::<super::sync::SyncFile>() else { return -e::EINVAL };
+            super::sync::refresh();
+            if super::sync::signaled(&sync.0) {
+                return 0;
+            }
+            let first = dmabuf.as_any().downcast_ref::<DmaBuf>().and_then(|buf| buf.bo().frames().and_then(|frames| frames.first().copied()));
+            if let (true, Some(first)) = (FENCE_ASYNC.load(Ordering::Relaxed), first) {
+                note_pending(first, sync.0.clone());
+                return 0;
+            }
             let deadline = crate::time::uptime_ns() + 2_000_000_000;
             match super::sync::wait_until(Some(deadline), || Ok(super::sync::signaled(&sync.0))) {
                 Ok(()) => 0,
@@ -373,4 +406,65 @@ pub fn dmabuf_ioctl(_object: &Arc<dyn Object>, request: u32, arg: usize) -> i64 
         }
         _ => -e::ENOTTY,
     }
+}
+
+// ---- frame fences for the desktop (25.11) -------------------------------------
+
+/// 25.11 (hw-log19: `DMA_BUF_IMPORT_SYNC_FILE` 3611x in 30 s, 3.2 ms each,
+/// worst 19.5 ms, in GOH): the frame fence Mesa WSI puts on the dma-buf at
+/// present was waited for inside the ioctl - the game's present thread (DXVK:
+/// the same queue thread that submits the next frame) stood until the GPU
+/// finished, so CPU and GPU never overlapped. Now the fence is noted for the
+/// buffer and the Wayland server shows the buffer once the fence is done
+/// ([`frame_pending`]), like a compositor with implicit sync on Linux.
+/// `wldirect fence wait` - the old wait in the ioctl.
+pub static FENCE_ASYNC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Pending frame fences: first physical frame of the buffer, the fence, and
+/// when it was noted (ns).
+static PENDING: SpinLock<Vec<(u64, super::sync::Fence, u64)>> = SpinLock::new(Vec::new());
+
+/// The longest a frame waits for its fence before it is shown anyway (as
+/// the old wait in the ioctl).
+const FENCE_SHOW_MAX_NS: u64 = 2_000_000_000;
+
+/// Frames noted with a pending fence since boot (perf-diag/`wldirect`).
+pub static FENCES_NOTED: AtomicU64 = AtomicU64::new(0);
+
+fn note_pending(first: u64, fence: super::sync::Fence) {
+    let now = crate::time::uptime_ns();
+    let mut list = PENDING.lock();
+    // A buffer gets a new frame fence only after the client had it back, so
+    // its older entry is over; done or too old entries go too.
+    list.retain(|(at, old, since)| *at != first && now.saturating_sub(*since) < FENCE_SHOW_MAX_NS && !super::sync::signaled(old));
+    list.push((first, fence, now));
+    FENCES_NOTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Is the GPU still drawing the frame in the dma-buf whose memory starts at
+/// physical `first` (a fence imported at present not done yet)? Past
+/// [`FENCE_SHOW_MAX_NS`] - no (logged): the frame is shown anyway.
+#[must_use]
+pub fn frame_pending(first: u64) -> bool {
+    if PENDING.lock().is_empty() {
+        return false;
+    }
+    super::sync::refresh();
+    let now = crate::time::uptime_ns();
+    let mut list = PENDING.lock();
+    let Some(index) = list.iter().position(|(at, _, _)| *at == first) else {
+        return false;
+    };
+    let (_, fence, since) = &list[index];
+    if super::sync::signaled(fence) {
+        list.swap_remove(index);
+        return false;
+    }
+    if now.saturating_sub(*since) >= FENCE_SHOW_MAX_NS {
+        list.swap_remove(index);
+        drop(list);
+        crate::kprintln!("nvgpu: dma-buf frame fence not done in 2 s - shown anyway");
+        return false;
+    }
+    true
 }

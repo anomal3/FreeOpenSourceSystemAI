@@ -111,4 +111,12 @@ pub trait Card: Send {
     fn interrupts(&self) -> bool {
         false
     }
+
+    /// Link on the wire and its speed in Mbit/s, as the card reports them
+    /// (25.11, «Сетевые подключения»: «Состояние среды», «Скорость»).
+    /// `None` — the card cannot tell (virtio, USB, Wi-Fi): the window says
+    /// «нет данных» rather than inventing a number.
+    fn link(&self) -> Option<(bool, u32)> {
+        None
+    }
 }

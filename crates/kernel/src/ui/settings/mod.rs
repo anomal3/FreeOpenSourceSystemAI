@@ -1503,8 +1503,8 @@ impl SettingsView {
             Deed::NetDhcp => {
                 self.report = Some(match crate::net::persist::forget() {
                     Ok(true) => {
-                        kprintln!("  settings    : address back to DHCP, /etc/network.cfg removed");
-                        Report::ok(String::from("адрес будет получаться по DHCP со следующего запуска"))
+                        kprintln!("  settings    : address back to DHCP");
+                        Report::ok(String::from("адрес снова получается по DHCP"))
                     }
                     Ok(false) => Report::ok(String::from("адрес и так получается по DHCP")),
                     Err(err) => Report::bad(format!("не записано: {err}")),

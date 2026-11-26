@@ -85,6 +85,9 @@ const RTO_MS: u64 = 300;
 /// Предел, до которого растёт задержка между повторами.
 const RTO_MAX_MS: u64 = 4_000;
 
+/// Smallest timer once the round trip is measured (25.11): 200 ms, as Linux.
+const RTO_MIN_MS: u64 = 200;
+
 /// Сколько раз повторять, прежде чем признать соединение мёртвым.
 const MAX_RETRIES: u32 = 6;
 
@@ -172,6 +175,19 @@ pub struct Connection {
     pub retransmit_at: u64,
     pub rto_ms: u64,
     pub retries: u32,
+    /// Smoothed round trip and its variation (RFC 6298, 25.11): the timer
+    /// follows the measured path instead of a fixed 300 ms — on a loaded
+    /// machine (hw-log19: 7.7 % retransmissions during a 40 MB page) the
+    /// fixed timer fired before the acknowledgement was even read. Zero —
+    /// not measured yet.
+    pub srtt_ms: u64,
+    pub rttvar_ms: u64,
+    /// The timer without back-off: what an acknowledgement returns to.
+    pub rto_base: u64,
+    /// The segment being timed: acknowledged when the ack reaches this
+    /// number; sent at `rtt_at` (zero — none timed).
+    pub rtt_seq: u32,
+    pub rtt_at: u64,
     /// Когда закончится `TIME_WAIT`.
     pub expires_at: u64,
 
@@ -214,6 +230,11 @@ impl Connection {
             retransmit_at: 0,
             rto_ms: RTO_MS,
             retries: 0,
+            srtt_ms: 0,
+            rttvar_ms: 0,
+            rto_base: RTO_MS,
+            rtt_seq: 0,
+            rtt_at: 0,
             expires_at: 0,
             need_ack: false,
             ack_now: false,
@@ -251,9 +272,14 @@ impl Connection {
     }
 
     /// Снять подтверждённое с головы очереди отправки.
-    pub fn acknowledge(&mut self, ack: u32) {
+    pub fn acknowledge(&mut self, ack: u32, now: u64) {
         if !tcp::after(ack, self.snd_una) {
             return;
+        }
+        // A round-trip sample: the timed segment is acknowledged.
+        if self.rtt_at != 0 && !tcp::after(self.rtt_seq, ack) {
+            self.sample_rtt(now.saturating_sub(self.rtt_at));
+            self.rtt_at = 0;
         }
         let mut acked = ack.wrapping_sub(self.snd_una) as usize;
         // `FIN` занимает номер, но байтом в очереди не лежит: подтверждение
@@ -266,7 +292,7 @@ impl Connection {
         }
         self.snd_una = ack;
         self.retries = 0;
-        self.rto_ms = RTO_MS;
+        self.rto_ms = self.rto_base;
         // Таймер повторной передачи заводится заново, только если ещё есть что
         // подтверждать. Таймер на пустую очередь — это повтор в никуда.
         self.retransmit_at = 0;
@@ -370,8 +396,31 @@ impl Connection {
     /// объявлялось мёртвым — на исправной связи, посреди работающей загрузки.
     pub fn disarm(&mut self) {
         self.retransmit_at = 0;
-        self.rto_ms = RTO_MS;
+        self.rto_ms = self.rto_base;
         self.retries = 0;
+    }
+
+    /// Start timing a segment that ends at `end`, unless one is timed
+    /// already or this is a repeat (Karn's rule: a repeat's ack is ambiguous).
+    pub fn time_segment(&mut self, end: u32, now: u64) {
+        if self.rtt_at == 0 && self.retries == 0 {
+            self.rtt_seq = end;
+            self.rtt_at = now.max(1);
+        }
+    }
+
+    /// RFC 6298: SRTT, RTTVAR and RTO = SRTT + 4·RTTVAR, within
+    /// [`RTO_MIN_MS`]..[`RTO_MAX_MS`].
+    fn sample_rtt(&mut self, rtt: u64) {
+        if self.srtt_ms == 0 {
+            self.srtt_ms = rtt.max(1);
+            self.rttvar_ms = rtt / 2;
+        } else {
+            let delta = self.srtt_ms.abs_diff(rtt);
+            self.rttvar_ms = (3 * self.rttvar_ms + delta) / 4;
+            self.srtt_ms = ((7 * self.srtt_ms + rtt) / 8).max(1);
+        }
+        self.rto_base = (self.srtt_ms + 4 * self.rttvar_ms.max(10)).clamp(RTO_MIN_MS, RTO_MAX_MS);
     }
 
     /// Пора ли повторять.
@@ -385,6 +434,8 @@ impl Connection {
     /// не справляется, — это не настойчивость, а вклад в затор.
     pub fn back_off(&mut self, now: u64) {
         self.retries += 1;
+        // The timed segment goes again: its acknowledgement says nothing.
+        self.rtt_at = 0;
         self.rto_ms = (self.rto_ms * 2).min(RTO_MAX_MS);
         self.retransmit_at = now + self.rto_ms;
     }

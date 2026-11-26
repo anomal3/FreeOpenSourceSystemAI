@@ -365,8 +365,17 @@ pub fn cell(ctx: Ctx, s: &mut Surface, column: Rect, x: i32, row: Rect, role: Ro
 // ---------------------------------------------------------------------------
 // Контекстное меню
 // ---------------------------------------------------------------------------
+//
+// 25.11 (Roman, Windows 11 reference): a compact raised card a step off the
+// window tone ([`theme::menu_bg`]), the item under the pointer or the
+// keyboard on a neutral plate with an accent pill, disabled items grey, a
+// bold default item, an icons column, shortcut text on the right and «›» for
+// items with a submenu. One level of cascading submenus: [`Cascade`].
 
 /// Пункт меню.
+///
+/// Build it with [`Entry::new`] and the `const` setters, or as a literal
+/// ending with `..Entry::NONE` — new fields then do not break callers.
 #[derive(Clone, Copy)]
 pub struct Entry<'a> {
     pub title: &'a str,
@@ -375,23 +384,111 @@ pub struct Entry<'a> {
     pub danger: bool,
     /// Номер группы. Между группами — разделитель.
     pub group: u8,
+    /// Shortcut text on the right, grey («Ctrl+C», «Del»).
+    pub keys: Option<&'a str>,
+    /// Greyed out: drawn, never runs, skipped by the arrow keys.
+    pub disabled: bool,
+    /// The default item (what a double click does) — bold, as in Windows.
+    pub bold: bool,
+    /// Has a submenu: «›» on the right; hovering it or pressing → opens the
+    /// children (see [`Cascade`]).
+    pub submenu: bool,
 }
 
-const MENU_PAD: u32 = 6;
-const MENU_SEPARATOR: u32 = 9;
+impl<'a> Entry<'a> {
+    /// The empty item — the base for `..Entry::NONE` in literals.
+    pub const NONE: Entry<'static> =
+        Entry { title: "", icon: None, danger: false, group: 0, keys: None, disabled: false, bold: false, submenu: false };
+
+    #[must_use]
+    pub const fn new(title: &'a str) -> Self {
+        Entry { title, icon: None, danger: false, group: 0, keys: None, disabled: false, bold: false, submenu: false }
+    }
+    #[must_use]
+    pub const fn icon(mut self, icon: Icon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+    #[must_use]
+    pub const fn group(mut self, group: u8) -> Self {
+        self.group = group;
+        self
+    }
+    #[must_use]
+    pub const fn danger(mut self) -> Self {
+        self.danger = true;
+        self
+    }
+    #[must_use]
+    pub const fn keys(mut self, keys: &'a str) -> Self {
+        self.keys = Some(keys);
+        self
+    }
+    #[must_use]
+    pub const fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+    #[must_use]
+    pub const fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+    #[must_use]
+    pub const fn submenu(mut self) -> Self {
+        self.submenu = true;
+        self
+    }
+}
+
+/// Поле карточки вокруг пунктов.
+const MENU_PAD: u32 = 4;
+/// Высота полосы разделителя (черта посередине).
+const MENU_SEPARATOR: u32 = 7;
+/// Поле строки слева и справа.
+const MENU_ROW_L: u32 = 10;
+const MENU_ROW_R: u32 = 10;
+/// Колонка значков.
+const MENU_ICON: u32 = 16;
+const MENU_ICON_GAP: u32 = 10;
+/// Просвет между подписью и сочетанием клавиш.
+const MENU_KEYS_GAP: u32 = 28;
+/// Место под «›».
+const MENU_ARROW: u32 = 18;
+/// Наименьшая ширина карточки.
+const MENU_MIN_W: u32 = 180;
+/// Скругление карточки — как у меню стола (`context::MENU_RADIUS`).
+const MENU_RADIUS: u32 = 6;
+
+const fn title_role(entry: &Entry<'_>) -> Role {
+    if entry.bold { Role::Title } else { Role::Body }
+}
 
 /// Размер карточки меню.
 #[must_use]
 pub fn menu_size(ctx: Ctx, entries: &[Entry<'_>]) -> (u32, u32) {
-    let widest = entries.iter().map(|entry| ctx.face(Role::Body).width(entry.title)).max().unwrap_or(0);
+    let small = ctx.face(Role::Caption);
+    let widest = entries
+        .iter()
+        .map(|entry| {
+            let tail = match entry.keys {
+                Some(keys) => small.width(keys) + ctx.px(MENU_KEYS_GAP),
+                None if entry.submenu => ctx.px(MENU_ARROW + 8),
+                None => 0,
+            };
+            ctx.face(title_role(entry)).width(entry.title) + tail
+        })
+        .max()
+        .unwrap_or(0);
     let mut h = ctx.px(MENU_PAD) * 2;
     for (index, entry) in entries.iter().enumerate() {
         if index > 0 && entry.group != entries[index - 1].group {
             h += ctx.px(MENU_SEPARATOR);
         }
-        h += ctx.px(theme::MENU_ROW_H);
+        h += ctx.px(theme::MENU_ITEM_H);
     }
-    (widest + ctx.px(14 + 14 + 10 + 12) + ctx.px(12), h)
+    let w = widest + ctx.px(MENU_PAD * 2 + MENU_ROW_L + MENU_ICON + MENU_ICON_GAP + MENU_ROW_R + 8);
+    (w.max(ctx.px(MENU_MIN_W)), h)
 }
 
 /// Поставить карточку размером `size` у точки `at`, не выпуская из `area`.
@@ -407,19 +504,22 @@ pub fn place(at: (i32, i32), size: (u32, u32), area: Rect) -> Rect {
 pub fn card(ctx: Ctx, s: &mut Surface, rect: Rect) -> Ctx {
     let p = ctx.palette;
     if theme::is_classic() {
+        // Windows 98 menus: the raised grey face with the 3D edge.
         classic::panel(s, rect, classic::unit(ctx.scale));
-        return ctx.on(theme::panel_bg());
+        return ctx.on(theme::win98::FACE);
     }
-    draw::shadow(s, rect, ctx.px(theme::R_CARD), ctx.px(18), crate::Color::rgb(0, 0, 0), 90);
-    draw::rounded(s, rect, ctx.px(theme::R_CARD), ctx.flat(p.panel), 255);
-    draw::rounded_stroke(s, rect, ctx.px(theme::R_CARD), p.line3.color, p.line3.alpha);
-    ctx.on(theme::panel_bg())
+    let bg = theme::menu_bg();
+    let r = ctx.px(MENU_RADIUS);
+    draw::shadow(s, Rect::new(rect.x, rect.y + ctx.pxi(2), rect.w, rect.h), r, ctx.px(14), crate::Color::rgb(0, 0, 0), if theme::is_dark() { 110 } else { 60 });
+    draw::rounded(s, rect, r, bg, 255);
+    draw::rounded_stroke(s, rect, r, p.line3.color, p.line3.alpha);
+    ctx.on(bg)
 }
 
 /// Прямоугольник пункта `index` в карточке `rect`.
 fn entry_rect(ctx: Ctx, rect: Rect, entries: &[Entry<'_>], index: usize) -> Rect {
     let pad = ctx.px(MENU_PAD);
-    let row_h = ctx.px(theme::MENU_ROW_H);
+    let row_h = ctx.px(theme::MENU_ITEM_H);
     let mut y = rect.y + pad as i32;
     for (at, entry) in entries.iter().enumerate().take(index + 1) {
         if at > 0 && entry.group != entries[at - 1].group {
@@ -432,58 +532,81 @@ fn entry_rect(ctx: Ctx, rect: Rect, entries: &[Entry<'_>], index: usize) -> Rect
     Rect::new(rect.x + pad as i32, y, rect.w.saturating_sub(pad * 2), row_h)
 }
 
-/// Нарисовать меню с выбранным пунктом `selected`.
+/// The highlight plate of a menu item (pointer or keyboard): neutral plate
+/// and a short accent pill on the left, as Windows 11 lists do; classic —
+/// the navy Windows 98 selection. Public: the desktop menus of the kernel
+/// and the menu bars of programs draw the same plate.
+pub fn menu_highlight(ctx: Ctx, s: &mut Surface, row: Rect, enabled: bool) {
+    if theme::is_classic() {
+        if enabled {
+            paint::row(ctx, s, row, RowState::Selected);
+        }
+        return;
+    }
+    draw::rounded(s, row, ctx.px(theme::R_ROW), theme::menu_hover(), 255);
+    if enabled {
+        let h = ctx.px(14).min(row.h);
+        let w = ctx.px(3);
+        draw::rounded(s, Rect::new(row.x + ctx.pxi(1), row.y + (row.h as i32 - h as i32) / 2, w, h), w / 2, ctx.palette.acc, 255);
+    }
+}
+
+/// Нарисовать меню с выбранным пунктом `selected` (`usize::MAX` — ни одного).
 pub fn draw_menu(ctx: Ctx, s: &mut Surface, rect: Rect, entries: &[Entry<'_>], selected: usize) {
     let inner = card(ctx, s, rect);
     let p = inner.palette;
+    let classic = theme::is_classic();
     for (index, entry) in entries.iter().enumerate() {
         let row = entry_rect(inner, rect, entries, index);
         if index > 0 && entry.group != entries[index - 1].group {
-            let line_y = row.y - ctx.px(MENU_SEPARATOR) as i32 + ctx.px(4) as i32;
-            if theme::is_classic() {
-                classic::groove_h(s, rect.x + ctx.px(4) as i32, line_y, rect.w.saturating_sub(ctx.px(8)), classic::unit(ctx.scale));
+            let line_y = row.y - ctx.px(MENU_SEPARATOR) as i32 / 2 - 1;
+            if classic {
+                classic::groove_h(s, rect.x + ctx.px(3) as i32, line_y, rect.w.saturating_sub(ctx.px(6)), classic::unit(ctx.scale));
             } else {
-                paint::separator(inner, s, rect.x + ctx.px(12) as i32, line_y, rect.w.saturating_sub(ctx.px(24)));
+                paint::separator(inner, s, rect.x + ctx.px(MENU_PAD + 6) as i32, line_y, rect.w.saturating_sub(ctx.px((MENU_PAD + 6) * 2)));
             }
         }
         let on = index == selected;
-        paint::row(inner, s, row, if on { RowState::Selected } else { RowState::Idle });
-        let side = ctx.px(14);
-        if let Some(icon) = entry.icon {
-            glyphicon::draw(
-                s,
-                icon,
-                row.x + ctx.px(14) as i32,
-                row.y + (row.h as i32 - side as i32) / 2,
-                side,
-                if on && theme::is_classic() {
-                    crate::Color::rgb(0xFF, 0xFF, 0xFF)
-                } else if entry.danger {
-                    p.bad_ink
-                } else {
-                    p.ink3
-                },
-                255,
-            );
+        let enabled = !entry.disabled;
+        if on {
+            menu_highlight(inner, s, row, enabled);
         }
-        let ink = if entry.danger {
+        let lit_classic = on && classic && enabled;
+        let white = crate::Color::rgb(0xFF, 0xFF, 0xFF);
+        let ink = if !enabled {
+            if classic { theme::win98::SHADE } else { p.ink6 }
+        } else if lit_classic {
+            white
+        } else if entry.danger {
             p.bad_ink
         } else if on {
             p.ink
         } else {
             p.ink2
         };
-        let text_x = row.x + ctx.px(14 + 14 + 10) as i32;
-        paint::text_clipped(
-            inner,
-            s,
-            Role::Body,
-            text_x,
-            paint::baseline(inner, Role::Body, row),
-            (row.right() - text_x - ctx.px(12) as i32).max(0) as u32,
-            entry.title,
-            ink,
-        );
+        let side = ctx.px(MENU_ICON);
+        if let Some(icon) = entry.icon {
+            let icon_ink = if !enabled || lit_classic || entry.danger { ink } else { p.ink3 };
+            glyphicon::draw(s, icon, row.x + ctx.px(MENU_ROW_L) as i32, row.y + (row.h as i32 - side as i32) / 2, side, icon_ink, 255);
+        }
+        // Right side: the shortcut or the submenu arrow.
+        let mut right = row.right() - ctx.px(MENU_ROW_R) as i32;
+        if let Some(keys) = entry.keys {
+            let face = ctx.face(Role::Caption);
+            let width = face.width(keys);
+            let kx = right - width as i32;
+            let keys_ink = if lit_classic { white } else if enabled { p.ink4 } else { ink };
+            paint::text_clipped(inner, s, Role::Caption, kx, paint::baseline(inner, Role::Caption, row), width, keys, keys_ink);
+            right = kx - ctx.px(12) as i32;
+        } else if entry.submenu {
+            let arrow = ctx.px(12);
+            let arrow_ink = if lit_classic { white } else if enabled { p.ink3 } else { ink };
+            glyphicon::draw(s, Icon::ChevronRight, right - arrow as i32, row.y + (row.h as i32 - arrow as i32) / 2, arrow, arrow_ink, 255);
+            right -= ctx.px(MENU_ARROW) as i32;
+        }
+        let role = title_role(entry);
+        let text_x = row.x + ctx.px(MENU_ROW_L + MENU_ICON + MENU_ICON_GAP) as i32;
+        paint::text_clipped(inner, s, role, text_x, paint::baseline(inner, role, row), (right - text_x).max(0) as u32, entry.title, ink);
     }
 }
 
@@ -494,6 +617,264 @@ pub fn menu_hit(ctx: Ctx, rect: Rect, entries: &[Entry<'_>], x: i32, y: i32) -> 
         return None;
     }
     (0..entries.len()).find(|index| entry_rect(ctx, rect, entries, *index).contains(x, y))
+}
+
+/// Where the submenu of item `index` of the card `rect` goes: to the right of
+/// the card, its first row level with the item; no room on the right — to the
+/// left; kept inside `area`.
+#[must_use]
+pub fn submenu_rect(ctx: Ctx, rect: Rect, entries: &[Entry<'_>], index: usize, children: &[Entry<'_>], area: Rect) -> Rect {
+    let (w, h) = menu_size(ctx, children);
+    let row = entry_rect(ctx, rect, entries, index.min(entries.len().saturating_sub(1)));
+    let gap = ctx.pxi(2);
+    let mut x = rect.right() + gap;
+    if x + w as i32 > area.right() {
+        x = rect.x - gap - w as i32;
+    }
+    place((x, row.y - ctx.px(MENU_PAD) as i32), (w, h), area)
+}
+
+/// Next enabled item from `from` in direction `step` (wraps; `usize::MAX` —
+/// start from the edge).
+fn step_enabled(entries: &[Entry<'_>], from: usize, down: bool) -> usize {
+    let n = entries.len();
+    if n == 0 {
+        return usize::MAX;
+    }
+    let mut at = if from >= n {
+        if down { n - 1 } else { 0 }
+    } else {
+        from
+    };
+    for _ in 0..n {
+        at = if down { (at + 1) % n } else { (at + n - 1) % n };
+        if !entries[at].disabled {
+            return at;
+        }
+    }
+    from
+}
+
+/// A key for [`Cascade::key`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuKey {
+    Up,
+    Down,
+    Left,
+    Right,
+    Enter,
+    Escape,
+}
+
+/// What a click or a key in a [`Cascade`] menu asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pick {
+    /// Not for the menu (a click outside — the caller closes the menu).
+    Outside,
+    /// Handled inside the menu (highlight moved, submenu opened); redraw.
+    Inside,
+    /// Run item `.0` of the card, or child `.1` of its submenu.
+    Run(usize, Option<usize>),
+    /// Close the menu (Escape on the card).
+    Close,
+}
+
+/// Hover and keyboard state of a menu with one level of cascading submenus
+/// (25.11). The caller keeps the entries (and the children of every item
+/// with `submenu: true`) and the card rect; `Cascade` remembers what is lit
+/// and which submenu is open, and answers what to run.
+///
+/// ```ignore
+/// let children = |i: usize| -> Vec<Entry> { if i == 3 { seven_zip() } else { Vec::new() } };
+/// menu.cascade.draw(ctx, s, rect, &entries, &children, area);
+/// // pointer move:  if menu.cascade.hover(ctx, rect, &entries, &children, area, x, y) { redraw }
+/// // click:         match menu.cascade.click(ctx, rect, &entries, &children, area, x, y) { Pick::Run(i, sub) => .., Pick::Outside => close, _ => redraw }
+/// // key:           match menu.cascade.key(MenuKey::Down, &entries, &children) { .. }
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct Cascade {
+    /// Lit item of the card (`usize::MAX` — none).
+    pub selected: usize,
+    /// Item whose submenu is open.
+    pub open: Option<usize>,
+    /// Lit item of the open submenu.
+    pub sub_selected: usize,
+    /// The keyboard is in the submenu.
+    pub in_sub: bool,
+}
+
+impl Default for Cascade {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Cascade {
+    /// Fresh state: nothing lit (the pointer or the first arrow key lights an
+    /// item), no submenu.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { selected: usize::MAX, open: None, sub_selected: usize::MAX, in_sub: false }
+    }
+
+    /// The open submenu: its rect and items.
+    pub fn sub<'e, F>(&self, ctx: Ctx, rect: Rect, entries: &[Entry<'_>], children: &F, area: Rect) -> Option<(Rect, Vec<Entry<'e>>)>
+    where
+        F: Fn(usize) -> Vec<Entry<'e>>,
+    {
+        let index = self.open?;
+        let items = children(index);
+        if items.is_empty() {
+            return None;
+        }
+        Some((submenu_rect(ctx, rect, entries, index, &items, area), items))
+    }
+
+    /// Does the menu (card or open submenu) cover the point.
+    pub fn contains<'e, F>(&self, ctx: Ctx, rect: Rect, entries: &[Entry<'_>], children: &F, area: Rect, x: i32, y: i32) -> bool
+    where
+        F: Fn(usize) -> Vec<Entry<'e>>,
+    {
+        rect.contains(x, y) || self.sub(ctx, rect, entries, children, area).is_some_and(|(sub, _)| sub.contains(x, y))
+    }
+
+    /// Draw the card and the open submenu.
+    pub fn draw<'e, F>(&self, ctx: Ctx, s: &mut Surface, rect: Rect, entries: &[Entry<'_>], children: &F, area: Rect)
+    where
+        F: Fn(usize) -> Vec<Entry<'e>>,
+    {
+        // The parent of an open submenu stays lit while the pointer is there.
+        let lit = if self.selected < entries.len() { self.selected } else { self.open.unwrap_or(usize::MAX) };
+        draw_menu(ctx, s, rect, entries, lit);
+        if let Some((sub, items)) = self.sub(ctx, rect, entries, children, area) {
+            draw_menu(ctx, s, sub, &items, self.sub_selected);
+        }
+    }
+
+    /// Pointer moved. Returns `true` when something changed (redraw).
+    pub fn hover<'e, F>(&mut self, ctx: Ctx, rect: Rect, entries: &[Entry<'_>], children: &F, area: Rect, x: i32, y: i32) -> bool
+    where
+        F: Fn(usize) -> Vec<Entry<'e>>,
+    {
+        let before = (self.selected, self.open, self.sub_selected, self.in_sub);
+        if let Some((sub, items)) = self.sub(ctx, rect, entries, children, area) {
+            if sub.contains(x, y) {
+                self.sub_selected = menu_hit(ctx, sub, &items, x, y).unwrap_or(usize::MAX);
+                self.selected = self.open.unwrap_or(usize::MAX);
+                self.in_sub = true;
+                return before != (self.selected, self.open, self.sub_selected, self.in_sub);
+            }
+        }
+        match menu_hit(ctx, rect, entries, x, y) {
+            Some(index) => {
+                self.selected = index;
+                self.in_sub = false;
+                if entries[index].submenu && !entries[index].disabled {
+                    if self.open != Some(index) {
+                        self.open = Some(index);
+                        self.sub_selected = usize::MAX;
+                    }
+                } else if self.open.is_some() {
+                    // Windows closes the submenu when the pointer rests on
+                    // another item of the card.
+                    self.open = None;
+                    self.sub_selected = usize::MAX;
+                }
+            }
+            // Off the menu: nothing lit, but an open submenu stays.
+            None => {
+                self.selected = usize::MAX;
+                self.sub_selected = usize::MAX;
+            }
+        }
+        before != (self.selected, self.open, self.sub_selected, self.in_sub)
+    }
+
+    /// Mouse click.
+    pub fn click<'e, F>(&mut self, ctx: Ctx, rect: Rect, entries: &[Entry<'_>], children: &F, area: Rect, x: i32, y: i32) -> Pick
+    where
+        F: Fn(usize) -> Vec<Entry<'e>>,
+    {
+        if let Some((sub, items)) = self.sub(ctx, rect, entries, children, area) {
+            if sub.contains(x, y) {
+                return match menu_hit(ctx, sub, &items, x, y) {
+                    Some(child) if !items[child].disabled && !items[child].submenu => Pick::Run(self.open.unwrap_or(0), Some(child)),
+                    _ => Pick::Inside,
+                };
+            }
+        }
+        if !rect.contains(x, y) {
+            return Pick::Outside;
+        }
+        match menu_hit(ctx, rect, entries, x, y) {
+            Some(index) if entries[index].disabled => Pick::Inside,
+            Some(index) if entries[index].submenu => {
+                self.selected = index;
+                self.open = Some(index);
+                Pick::Inside
+            }
+            Some(index) => Pick::Run(index, None),
+            None => Pick::Inside,
+        }
+    }
+
+    /// Keyboard: ↑↓ move (skipping disabled), → or Enter on a submenu item
+    /// enters it, ← or Esc leaves it, Enter runs, Esc on the card closes.
+    pub fn key<'e, F>(&mut self, key: MenuKey, entries: &[Entry<'_>], children: &F) -> Pick
+    where
+        F: Fn(usize) -> Vec<Entry<'e>>,
+    {
+        if self.in_sub {
+            if let Some(parent) = self.open {
+                let items = children(parent);
+                match key {
+                    MenuKey::Up | MenuKey::Down => {
+                        self.sub_selected = step_enabled(&items, self.sub_selected, key == MenuKey::Down);
+                        return Pick::Inside;
+                    }
+                    MenuKey::Enter | MenuKey::Right => {
+                        return match items.get(self.sub_selected) {
+                            Some(item) if !item.disabled && key == MenuKey::Enter => Pick::Run(parent, Some(self.sub_selected)),
+                            _ => Pick::Inside,
+                        };
+                    }
+                    MenuKey::Left | MenuKey::Escape => {
+                        self.in_sub = false;
+                        self.open = None;
+                        self.sub_selected = usize::MAX;
+                        self.selected = parent;
+                        return Pick::Inside;
+                    }
+                }
+            }
+            self.in_sub = false;
+        }
+        match key {
+            MenuKey::Up | MenuKey::Down => {
+                self.selected = step_enabled(entries, self.selected, key == MenuKey::Down);
+                if self.open.is_some_and(|open| open != self.selected) {
+                    self.open = None;
+                }
+                Pick::Inside
+            }
+            MenuKey::Right | MenuKey::Enter => match entries.get(self.selected) {
+                Some(entry) if entry.submenu && !entry.disabled => {
+                    let items = children(self.selected);
+                    self.open = Some(self.selected);
+                    self.in_sub = true;
+                    self.sub_selected = step_enabled(&items, usize::MAX, true);
+                    Pick::Inside
+                }
+                Some(entry) if !entry.disabled && key == MenuKey::Enter => Pick::Run(self.selected, None),
+                _ => Pick::Inside,
+            },
+            MenuKey::Left => {
+                self.open = None;
+                Pick::Inside
+            }
+            MenuKey::Escape => Pick::Close,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

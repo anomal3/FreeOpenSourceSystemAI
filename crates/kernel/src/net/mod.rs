@@ -27,6 +27,7 @@
 //! здесь короткие, и единственное, что делается под ним долго, — это ожидание
 //! свободного дескриптора в передающей очереди.
 
+pub mod adapter;
 pub mod arp;
 pub mod atl1c;
 pub mod card;
@@ -218,6 +219,10 @@ struct Interface {
     /// там уходит медленно, и подтверждение на каждый сегмент ограничивало
     /// приём ~280 сегментами в секунду, 350 КиБ/с).
     defer_acks: bool,
+    /// Per-adapter settings of «Сетевые подключения» (25.11, see [`adapter`]):
+    /// switched on, address by DHCP or by hand, DNS by hand, the alternate
+    /// DNS server, the last lease and since when the address is there.
+    cfg: adapter::State,
 }
 
 /// «Карта» машины без сети: только петля (`lo`). Наружу ничего не уходит и
@@ -318,6 +323,7 @@ fn start_loopback() {
         next_id: 1,
         looped: alloc::collections::VecDeque::new(),
         defer_acks: false,
+        cfg: adapter::State::new(),
     });
     match crate::sched::spawn_daemon("net", service_task) {
         Ok(id) => crate::kprintln!("  network     : no card; loopback 127.0.0.1/8 only, task {id}"),
@@ -472,6 +478,7 @@ fn start(device: alloc::boxed::Box<dyn Card>) {
         next_id: 1,
         looped: alloc::collections::VecDeque::new(),
         defer_acks: false,
+        cfg: adapter::State::new(),
     });
 
     // Задача-приёмник заводится сразу и служебной: она работает, пока работает
@@ -598,13 +605,17 @@ pub struct Status {
 pub fn status() -> Option<Status> {
     let guard = INTERFACE.lock();
     let iface = guard.as_ref()?;
+    // A switched-off adapter («Отключить», 25.11) has no address for anyone:
+    // the tray, «Параметры» and the Linux layer see it as not connected.
+    let off = !iface.cfg.enabled;
+    let hide = |value: Ipv4| if off { Ipv4::UNSPECIFIED } else { value };
     Some(Status {
         name: iface.device.name(),
         mac: iface.mac,
-        address: iface.address,
-        netmask: iface.netmask,
-        gateway: iface.gateway,
-        dns: iface.dns,
+        address: hide(iface.address),
+        netmask: hide(iface.netmask),
+        gateway: hide(iface.gateway),
+        dns: hide(iface.dns),
         link: iface.device.stats(),
         counters: iface.counters,
         sockets: iface.sockets.stats(),
@@ -713,10 +724,14 @@ pub fn configure(address: Ipv4, netmask: Ipv4, gateway: Ipv4) -> Result<(), NetE
     if !gateway.is_unspecified() && !gateway.same_network(address, netmask) {
         return Err(NetError::NoRoute);
     }
+    // «Длительность» of the adapter's status counts from a new address.
+    if address != iface.address {
+        iface.cfg.since_ms = crate::time::uptime_ms();
+    }
     iface.address = address;
     iface.netmask = netmask;
     iface.gateway = gateway;
-    HAS_ADDRESS.store(!address.is_unspecified(), core::sync::atomic::Ordering::Release);
+    HAS_ADDRESS.store(!address.is_unspecified() && iface.cfg.enabled, core::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -731,18 +746,32 @@ pub fn configure_all(
     gateway: Ipv4,
     dns: Ipv4,
 ) -> Result<(), NetError> {
+    let before = status().map(|s| (s.address, s.netmask, s.gateway));
     configure(address, netmask, gateway)?;
-    // В журнал ядра: на телефоне адрес от DHCP видно только по кабелю.
-    crate::kprintln!("  network     : address {address}, gateway {gateway}, dns {dns}");
+    // В журнал ядра: на телефоне адрес от DHCP видно только по кабелю. A
+    // renewal with the same address changes nothing (connections, ARP stay)
+    // and says so (25.11, hw-log19: five identical lines looked like resets).
+    if before == Some((address, netmask, gateway)) {
+        crate::kprintln!("  network     : lease renewed, address {address} unchanged");
+    } else {
+        crate::kprintln!("  network     : address {address}, gateway {gateway}, dns {dns}");
+    }
     if !dns.is_unspecified() {
         let mut guard = INTERFACE.lock();
-        guard.as_mut().ok_or(NetError::NoDevice)?.dns = dns;
+        let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+        // DNS servers set by hand (25.11) outlive any lease.
+        if !iface.cfg.dns_manual {
+            iface.dns = dns;
+        }
     }
     if !DIAG_STARTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
         let _ = crate::sched::spawn_daemon("net-diag", diag_task);
     }
     Ok(())
 }
+
+/// Retransmissions already told to the log (the first 20 of a boot).
+static RETRANSMITS_TOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 static DIAG_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -785,8 +814,18 @@ fn diag_task() {
 /// Адрес сервера имён, если он известен.
 pub fn dns_server() -> Option<Ipv4> {
     let guard = INTERFACE.lock();
-    let dns = guard.as_ref()?.dns;
-    (!dns.is_unspecified()).then_some(dns)
+    let iface = guard.as_ref()?;
+    let dns = if iface.dns.is_unspecified() { iface.cfg.dns2 } else { iface.dns };
+    (!dns.is_unspecified() && iface.cfg.enabled).then_some(dns)
+}
+
+/// The alternate DNS server (25.11, «Альтернативный DNS-сервер»): asked when
+/// the preferred one is silent.
+pub fn dns_alternate() -> Option<Ipv4> {
+    let guard = INTERFACE.lock();
+    let iface = guard.as_ref()?;
+    let dns = iface.cfg.dns2;
+    (!dns.is_unspecified() && dns != iface.dns && iface.cfg.enabled).then_some(dns)
 }
 
 // ---------------------------------------------------------------------------
@@ -1253,6 +1292,12 @@ pub fn service_task() {
                 flush_acks(iface);
                 break;
             };
+            // A switched-off adapter (25.11) still empties the card's ring —
+            // and drops what came: the machine is not on this network now.
+            if !iface.cfg.enabled {
+                iface.counters.ignored += 1;
+                continue;
+            }
             // Кадр разбирается под тем же локом: ответ на него уйдёт через ту
             // же карту, и отпускать лок между «поняли, что это ARP-запрос» и
             // «ответили на него» незачем. Чистые подтверждения — после пачки
@@ -1315,6 +1360,11 @@ pub fn service_task() {
                 FRAME_PENDING.swap(false, Ordering::AcqRel)
             });
             FRAME_PENDING.store(false, Ordering::Release);
+        } else if batch > 0 {
+            // Polled card under load (25.11, hw-log19: the RTL8125 ring
+            // overflowed during a 40 MB page): frames came this pass, more
+            // are likely — look again after a millisecond, not five.
+            crate::sched::sleep_ms(1);
         } else {
             crate::sched::sleep_ms(POLL_INTERVAL_MS);
         }
@@ -1596,7 +1646,7 @@ fn handle_tcp(
                     // всё прочее означает собеседника, отвечающего не нам.
                     if segment.acknowledgement == conn.snd_nxt {
                         conn.rcv_nxt = segment.sequence.wrapping_add(1);
-                        conn.acknowledge(segment.acknowledgement);
+                        conn.acknowledge(segment.acknowledgement, now);
                         conn.state = stream::State::Established;
                         conn.need_ack = true;
                     } else {
@@ -1612,7 +1662,7 @@ fn handle_tcp(
             }
             stream::State::SynReceived => {
                 if segment.has(tcp::ACK) && segment.acknowledgement == conn.snd_nxt {
-                    conn.acknowledge(segment.acknowledgement);
+                    conn.acknowledge(segment.acknowledgement, now);
                     conn.state = stream::State::Established;
                     hand_over = conn.listener.is_some();
                     // Данные могли приехать вместе с подтверждением.
@@ -1626,7 +1676,7 @@ fn handle_tcp(
             | stream::State::Closing
             | stream::State::LastAck => {
                 if segment.has(tcp::ACK) {
-                    conn.acknowledge(segment.acknowledgement);
+                    conn.acknowledge(segment.acknowledgement, now);
                 }
                 conn.accept_data(segment.sequence, segment.payload);
 
@@ -1861,6 +1911,8 @@ fn tcp_pump(iface: &mut Interface, index: usize) {
         }
         if span > 0 {
             conn.arm(now);
+            // One round-trip sample at a time, never on a repeat (Karn).
+            conn.time_segment(out_seq.wrapping_add(span), now);
         }
         // Больше отправлять нечего — выходим; иначе цикл продолжит выгребать
         // очередь по сегменту за виток.
@@ -1890,6 +1942,11 @@ fn tcp_tick(iface: &mut Interface) {
         // который на исправной сети никогда не ноль, — то есть бесполезный.
         let mut counted = false;
         if let Some(conn) = iface.streams.at(index) {
+            // An acknowledgement that covered only part of what is in flight
+            // stops the timer (`acknowledge`), and with nothing new to send
+            // nobody started it again: a lost segment at the tail then waited
+            // forever (25.11, page loads stalling in OBSOS). Re-arm here.
+            conn.arm(now);
             if conn.timed_out(now) {
                 if conn.in_flight() == 0 {
                     // Таймер сработал, а повторять нечего: всё, что мы
@@ -1920,6 +1977,15 @@ fn tcp_tick(iface: &mut Interface) {
                 } else {
                     counted = conn.snd_nxt != conn.snd_una;
                     conn.back_off(now);
+                    // The first retransmissions of a boot to the log, with
+                    // the round trip measured: whether they are losses or a
+                    // timer too short for a loaded machine.
+                    if counted && RETRANSMITS_TOLD.fetch_add(1, Ordering::Relaxed) < 20 {
+                        crate::kprintln!(
+                            "  tcp         : retransmit to {}:{} after {} ms (srtt {} ms, try {})",
+                            conn.remote, conn.remote_port, conn.rto_ms / 2, conn.srtt_ms, conn.retries
+                        );
+                    }
                     // Go-Back-N: всё неподтверждённое отправляется заново с
                     // головы окна. Выборочного повтора у нас нет, потому что
                     // нет и выборочных подтверждений.
@@ -1999,6 +2065,10 @@ fn send_ipv4(
     // адрес у него появится, и делает это с `0.0.0.0` на `255.255.255.255`. Так
     // написано в RFC 2131, и без этого исключения аренду взять невозможно.
     if iface.address.is_unspecified() && !destination.is_broadcast() {
+        return Err(NetError::NoAddress);
+    }
+    // «Отключить» in «Сетевые подключения» (25.11): nothing leaves the card.
+    if !iface.cfg.enabled {
         return Err(NetError::NoAddress);
     }
 
@@ -2119,6 +2189,13 @@ pub fn resolve(name: &str, timeout_ms: u64) -> Result<Ipv4, NetError> {
     // задачи.
     let result = resolve_with(owner, index, server, name, timeout_ms, ATTEMPTS);
     let _ = socket_close(owner, index);
+    // The preferred server is silent — ask the alternate one (25.11).
+    if let (Err(NetError::Timeout), Some(alternate)) = (result, dns_alternate()) {
+        let index = socket_open(owner)?;
+        let again = resolve_with(owner, index, alternate, name, timeout_ms, ATTEMPTS);
+        let _ = socket_close(owner, index);
+        return again;
+    }
     result
 }
 

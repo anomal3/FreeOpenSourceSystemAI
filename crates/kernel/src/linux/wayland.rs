@@ -367,6 +367,9 @@ fn monitor_of(rect: Rect) -> Option<(Rect, u64)> {
 /// How often the monitor of a window is looked up again (it can be dragged
 /// to another monitor).
 const PACE_RECHECK_MS: u64 = 500;
+/// 25.11: how long a show refused by the busy desktop is retried every
+/// millisecond (then the 16 ms poll, as for a window the desktop lost).
+const BUSY_FAST_RETRY_MS: u64 = 250;
 pub fn set_ping(on: bool) {
     PING.store(on, Ordering::Relaxed);
 }
@@ -1214,6 +1217,12 @@ struct Win {
     /// кадры показываются с частотой монитора, последний побеждает.
     presented_us: u64,
     hold_until_us: u64,
+    /// 25.11: uptime (ms) of the first show the busy desktop refused in a
+    /// row; 0 - the last show went through.
+    busy_ms: u64,
+    /// 25.11: since when (us) the show waits for the GPU frame fence; 0 -
+    /// not waiting.
+    fence_us: u64,
     /// G3: frame of the monitor the window is on (us) and when it was looked
     /// up (ms): pacing follows the window's own monitor.
     pace_us: u64,
@@ -2933,6 +2942,8 @@ impl Client {
                     stash: None,
                     presented_us: 0,
                     hold_until_us: 0,
+                    busy_ms: 0,
+                    fence_us: 0,
                     pace_us: 0,
                     pace_at_ms: 0,
                     limits: ((0, 0), (0, 0)),
@@ -3512,7 +3523,21 @@ impl Client {
     fn frames_due_at(&self) -> Option<u64> {
         let frames = (!self.frames_due.is_empty()).then(|| self.frame_answered_us.saturating_add(self.client_frame_us()).div_ceil(1000));
         // И к сроку отложенного показа кадра без темпа (D7).
-        let mut held = self.wins.iter().filter(|win| win.dirty && win.hold_until_us != 0).map(|win| win.hold_until_us.div_ceil(1000)).min();
+        // 25.11 (hw-log19: 'busy' 2000-4300 per 30 s in GOH/UoT): a show the
+        // busy desktop refused (dirty, no hold) is tried again next
+        // millisecond - it waited for the next client request or the 16 ms
+        // poll, and a FIFO game waited with it for its frame callback.
+        // Only for a while after the first refusal: a window the desktop
+        // lost keeps the old 16 ms poll.
+        let now_ms = crate::time::uptime_ms();
+        let mut held = self
+            .wins
+            .iter()
+            .filter(|win| {
+                win.dirty && (win.hold_until_us != 0 || win.fence_us != 0 || (win.busy_ms != 0 && now_ms.saturating_sub(win.busy_ms) < BUSY_FAST_RETRY_MS))
+            })
+            .map(|win| win.hold_until_us.div_ceil(1000))
+            .min();
         // G3: a buffer held for a flip - look again next millisecond.
         if !self.scan_held.is_empty() {
             held = Some(0);
@@ -3578,10 +3603,37 @@ impl Client {
     /// Показать окно ([`Self::present_now`]); показано — запомнить когда и
     /// ответить `presented` его кадрам (D7).
     fn present(&mut self, index: usize) {
+        // 25.11: the GPU still draws this frame (its fence was noted at
+        // present instead of waited for in the client) - show it when done;
+        // the server looks again next millisecond (`frames_due_at`).
+        if self.fence_pending(index) {
+            let win = &mut self.wins[index];
+            win.dirty = true;
+            if win.fence_us == 0 {
+                win.fence_us = (crate::time::uptime_ns() / 1000).max(1);
+                FENCE_HELD.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        if let Some(win) = self.wins.get_mut(index) {
+            if win.fence_us != 0 {
+                FENCE_HELD_US.fetch_add((crate::time::uptime_ns() / 1000).saturating_sub(win.fence_us), Ordering::Relaxed);
+                win.fence_us = 0;
+            }
+        }
         self.present_now(index);
         let Some(win) = self.wins.get_mut(index) else {
             return;
         };
+        // 25.11: since when the desktop refuses this show (busy) - the
+        // server tries again next millisecond for a while (`frames_due_at`).
+        if win.dirty && win.open.is_some() {
+            if win.busy_ms == 0 {
+                win.busy_ms = crate::time::uptime_ms().max(1);
+            }
+        } else {
+            win.busy_ms = 0;
+        }
         if win.dirty || win.open.is_none() {
             return;
         }
@@ -3594,6 +3646,22 @@ impl Client {
         // `ZERO_COPY` (8): окно показывает буфер клиента без копии.
         let (root, flags) = (win.surface, if win.adopted.is_some() { 8 } else { 0 });
         self.feedback_presented(root, flags);
+    }
+
+    /// 25.11: does the buffer of window `index` wait for its GPU frame fence
+    /// (`drm::frame_pending`, dma-bufs only)?
+    fn fence_pending(&self, index: usize) -> bool {
+        let Some(win) = self.wins.get(index) else {
+            return false;
+        };
+        match self.objects.get(&win.surface) {
+            Some(Obj::Surface(state)) => state
+                .shown
+                .as_ref()
+                .and_then(|(_, buf)| buf.mem.frame(0))
+                .is_some_and(|first| crate::linux::drm::frame_pending(first.0)),
+            _ => false,
+        }
     }
 
     /// Свести поверхность окна с подповерхностями и показать на столе.
@@ -4721,6 +4789,16 @@ fn has_alpha(layers: &[Layer]) -> bool {
 
 /// Показ окна без копии (D4, 20.11.2026; `wlzerocopy off` — как раньше).
 pub static ZERO_COPY: AtomicBool = AtomicBool::new(true);
+
+/// 25.11: shows that waited for the GPU frame fence, and the time waited.
+static FENCE_HELD: AtomicU64 = AtomicU64::new(0);
+static FENCE_HELD_US: AtomicU64 = AtomicU64::new(0);
+
+/// 25.11: `(shows held for the frame fence, us waited in all)` since boot.
+#[must_use]
+pub fn fence_held() -> (u64, u64) {
+    (FENCE_HELD.load(Ordering::Relaxed), FENCE_HELD_US.load(Ordering::Relaxed))
+}
 
 /// G3: buffers of gone clients a display may still scan out.
 static SCAN_GRAVE: crate::sync::SpinLock<Vec<Buffer>> = crate::sync::SpinLock::new(Vec::new());

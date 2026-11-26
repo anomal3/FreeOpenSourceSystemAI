@@ -75,6 +75,7 @@ pub mod thumbs;
 pub mod snaplay;
 pub mod toast;
 pub mod launch;
+pub mod origin;
 pub mod traypop;
 pub mod trash;
 pub mod wallart;
@@ -787,10 +788,23 @@ pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
     // складывает слои, а не рисует два независимых прямоугольника. Теперь
     // монитор системы это программа (`/bin/sysmon`), её поднимает супервизор, и
     // перекрытие получается то же самое — только окно приходит снаружи ядра.
-    let Some(terminal) = build(&desktop, App::Terminal) else {
-        return false;
-    };
-    desktop.push(terminal);
+    //
+    // С 25.11 окно оболочки на загрузке не открывается (Роман: «при загрузке
+    // открывается терминал и сыплет журналом»): оболочка работает и без
+    // него — читает серийную линию и разбирает ввод стола, — а окно
+    // открывается по просьбе («Пуск» → «Терминал», Win+R `cmd`). Журнал —
+    // в «Журнале событий» и в файле журнала. Стенд просит окно меткой
+    // `\FREEOS\CONSOLE` ([`boot_info::BOOT_CONSOLE`]): его сценарии набирают в
+    // оболочку и смотрят на неё. Телефон — как был: там окно оболочки и есть
+    // экран разработчика.
+    if boot_flags & boot_info::BOOT_CONSOLE != 0 || theme::is_mobile() {
+        let Some(terminal) = build(&desktop, App::Terminal) else {
+            return false;
+        };
+        desktop.push(terminal);
+    } else {
+        kprintln!("  desktop     : no console window at boot (Start -> Terminal opens the shell)");
+    }
 
     desktop.refresh_panel(&status_now());
     desktop.present();
@@ -963,6 +977,11 @@ fn with_desktop<R>(action: impl FnOnce(&mut Compositor) -> R) -> Option<R> {
     remember_shell_size(&mut desktop);
     // И фокус меняет только то, что проходит здесь.
     report_focus(&mut desktop);
+    // Where the focused window is - the monitor of a keyboard launch (25.11).
+    origin::note_focus(desktop.focused_app().and_then(|app| desktop.find(app)).map(|window| {
+        let r = window.rect;
+        (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2)
+    }));
     // Возвращать стол можно только с пустой очередью, и проверка идёт под тем
     // же замком, под которым пишущий кладёт в неё текст (см. [`write`]). Иначе
     // текст, положенный между «очередь пуста» и «стол на месте», ждал бы в
@@ -1172,8 +1191,10 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
         return desktop.mobile_rect();
     }
     // От угла рабочей области: панель может стоять сверху или слева (20.11).
-    let p = desktop.primary_work();
-    let rect = layout_local(desktop, app).translate(p.x, p.y);
+    // The monitor the launch came from (25.11, `origin`): the click, the
+    // focused window, else the primary.
+    let p = desktop.work_at(origin::current());
+    let rect = layout_local(desktop, app, p).translate(p.x, p.y);
     // Окна-программы встают каскадом; диалоги — строго по центру.
     match app {
         App::Terminal | App::Settings => desktop.cascade(rect),
@@ -1182,12 +1203,12 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
 }
 
 /// [`layout`] в координатах основного монитора.
-fn layout_local(desktop: &Compositor, app: App) -> Rect {
+fn layout_local(desktop: &Compositor, app: App, area: Rect) -> Rect {
     // Раскладка считается от размера экрана, а не задана числами: прошивка
     // вправе дать и 800×600, и 1920×1080, и окно, не помещающееся на экран,
     // выглядело бы как испорченная графика.
-    let width = desktop.primary_work().w;
-    let work = desktop.primary_work().h.max(1);
+    let width = area.w;
+    let work = area.h.max(1);
 
     // На телефоне окно занимает экран целиком — от строки состояния до
     // полоски жеста у низа (04.11, как у iPhone): дока под программой нет,
@@ -2418,6 +2439,7 @@ pub fn tick() {
             }
         }
         desktop.expire_toast();
+        desktop.context_hover_tick();
         // «Определить» (24.11): plates asked by «Параметры» or OBS.
         let identify = IDENTIFY_MS.swap(0, Ordering::Relaxed);
         if identify != 0 {
@@ -2549,6 +2571,13 @@ pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
         let answer = with_desktop(|desktop| {
             desktop.set_deferred(defer);
             let answer = dispatch_on(desktop, event, &status);
+            // A key of the keyboard bound for the shell while no window shows
+            // it (no console window since 25.11, or it was closed): typed on
+            // the bare desktop, it would run commands nobody sees. The serial
+            // line (the harness, a cable) still types into the shell.
+            let answer = answer.filter(|key| {
+                key.mods.contains(crate::input::Modifiers::SERIAL) || desktop.terminal_app_of(active_session()).is_some()
+            });
             desktop.set_deferred(false);
             if !defer {
                 desktop.present();
@@ -2781,6 +2810,12 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
     }
 
     if desktop.menu_open() {
+        // A program chosen with the keyboard opens on Start's monitor.
+        if event.pressed && event.code == KeyCode::Enter {
+            if let Some((x, y)) = desktop.menu_point() {
+                origin::note_click(x, y);
+            }
+        }
         handle_menu(desktop, event, status);
         return None;
     }
@@ -3273,6 +3308,12 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     if relative != (0, 0) {
         send_relative(desktop, relative);
     }
+    // A click is where a launch comes from (25.11, `origin`): a double-click
+    // on the right monitor opens the program there.
+    if event.buttons.contains(Buttons::LEFT) || event.buttons.contains(Buttons::RIGHT) {
+        let (x, y) = desktop.pointer_position();
+        origin::note_click(x, y);
+    }
 
     if dx != 0 || dy != 0 {
         // Перетаскивание — это движение окна вслед за указателем на то же
@@ -3500,7 +3541,21 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 desktop.mark_menu_area();
                 desktop.refresh_panel(status);
             }
-            desktop.open_context(x, y, items);
+            // 25.11: items from the settings store (`shell` hive) join the
+            // menu of a file, a folder and the empty desktop.
+            let items_with_verbs = with_store_verbs(desktop, items, what);
+            desktop.open_context(x, y, &items_with_verbs);
+            // «7-Zip ▸» (25.11): names of the picked icons for its items;
+            // without 7-Zip in the system the item is grey.
+            if items_with_verbs.contains(&context::Action::Submenu(context::Sub::SevenZip)) {
+                if context::zip_available() {
+                    let zip = zip_info(desktop);
+                    kprintln!("  desktop     : 7-Zip menu for {} ({:?})", if zip.archive { "an archive" } else { "files" }, zip);
+                    desktop.context_zip(zip);
+                } else {
+                    desktop.context_set_off(alloc::vec![context::Action::Submenu(context::Sub::SevenZip)]);
+                }
+            }
             // Ярлык программы на столе на панель пока не закрепляется — из
             // «Пуска» (20.11).
             if items.contains(&context::Action::PinTaskbar) {
@@ -4797,6 +4852,18 @@ fn program_mods(mods: Modifiers) -> i32 {
 
 /// Отдать событие активному окну.
 fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
+    // A key from the serial line (the harness, a cable) is the kernel shell's,
+    // whatever window has the focus (25.11): a program window that took the
+    // focus - a Wine/Proton window above all, which stays open for good -
+    // swallowed every serial line, and the shell looked dead. Only the keys of
+    // the terminal window itself (tabs, scrollback) still apply.
+    if event.mods.contains(Modifiers::SERIAL) {
+        if !matches!(desktop.focused_app(), Some(App::Terminal | App::TermWin(_)) | None) {
+            let session = desktop.front_terminal().and_then(|app| desktop.find(app)).map_or(0, |window| window.active_session());
+            ACTIVE_SESSION.store(session, Ordering::Relaxed);
+            return Some(event);
+        }
+    }
     // Отпускание клавиши, нажатие которой досталось окну программы, — ему же
     // (фаза 62c), где бы ни был фокус теперь, и больше никому: оболочке оно
     // ни к чему, а нажатия она и не видела.
@@ -5686,6 +5753,15 @@ fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
     }
 }
 
+/// The shell of the first tab should print its prompt again (its window was
+/// just opened anew, see [`launch`]).
+static REPROMPT: AtomicBool = AtomicBool::new(false);
+
+/// Take the request to print the prompt again (the shell's loop asks).
+pub fn take_reprompt() -> bool {
+    REPROMPT.swap(false, Ordering::Relaxed)
+}
+
 /// Диспетчер задач: поднять его окно, если оно есть, иначе запустить
 /// `/bin/taskmgr` (Ctrl+Shift+Esc).
 fn open_task_manager(desktop: &mut Compositor) {
@@ -5728,7 +5804,15 @@ fn launch(desktop: &mut Compositor, app: App) {
     // систему: меню просто не откроет программу.
     if let Some(window) = build(desktop, app) {
         desktop.push(window);
+        // A fresh terminal window has an empty grid while the shell of the
+        // first tab waits at a prompt printed long ago (or never shown: no
+        // console window at boot, 25.11) - it prints the prompt again.
+        if app == App::Terminal {
+            REPROMPT.store(true, Ordering::Relaxed);
+            crate::sched::wake_input();
+        }
         kprintln!("  desktop     : opened '{}'", app.title());
+        log_output(desktop, app);
         log_window(desktop, app, true);
         log_focus(desktop);
     } else {
@@ -6198,6 +6282,15 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             }
             desktop.refresh_panel(status);
         }
+        context::Action::Verb(index) => {
+            run_verb(desktop, index);
+            desktop.refresh_panel(status);
+        }
+        context::Action::Zip(zip) => {
+            desktop.close_context();
+            run_zip(desktop, zip);
+            desktop.refresh_panel(status);
+        }
         context::Action::OpenLocation => {
             desktop.close_context();
             // Ярлык пакета: команда запуска, и каталог программы в ней —
@@ -6594,6 +6687,154 @@ fn entry_facts(path: &str, label: &str) -> String {
     }
 }
 
+/// The picked desktop icons (25.11, «7-Zip ▸»): the ones marked, else the
+/// one the menu is open on.
+fn zip_paths(desktop: &Compositor) -> alloc::vec::Vec<(String, String)> {
+    let mut entries = selected_entries(desktop);
+    if entries.is_empty() {
+        entries.extend(selected_entry(desktop));
+    }
+    entries
+}
+
+/// What «7-Zip ▸» offers for the picked icons (25.11): archive items when
+/// every one is an archive; the names 7-Zip would give.
+fn zip_info(desktop: &Compositor) -> context::ZipInfo {
+    let entries = zip_paths(desktop);
+    let paths: alloc::vec::Vec<&str> = entries.iter().map(|(path, _)| path.as_str()).collect();
+    let single_dir = paths.len() == 1 && desktop.icon_selection().is_some_and(|index| matches!(desktop.icon_kind(index), Some(icons::Kind::Folder)));
+    let name = |ext: &str| String::from(context::base_name(&sysconf::filetypes::add_to_target(&paths, single_dir, ext)));
+    context::ZipInfo {
+        archive: !paths.is_empty() && !single_dir && paths.iter().all(|path| sysconf::filetypes::is_archive(path)),
+        add_7z: name("7z"),
+        add_zip: name("zip"),
+        folder: paths.first().map(|path| sysconf::filetypes::archive_stem(context::base_name(path))).unwrap_or_default(),
+    }
+}
+
+/// Run an item of «7-Zip ▸» (25.11): `/bin/archiver` with the picked icons
+/// (an archive command — with the first archive). The launch line is at most
+/// 255 bytes: what does not fit is left out, as for «Свойства».
+fn run_zip(desktop: &mut Compositor, zip: context::Zip) {
+    let entries = zip_paths(desktop);
+    let one = matches!(zip, context::Zip::Open | context::Zip::OpenAs(_) | context::Zip::Extract);
+    let mut line = String::from("/bin/archiver");
+    let command = zip.command();
+    if !command.is_empty() {
+        line.push(' ');
+        line.push_str(&command);
+    }
+    let mut count = 0;
+    for (path, _) in entries.iter().take(if one { 1 } else { usize::MAX }) {
+        let word = panel::pct(path);
+        if line.len() + word.len() + 1 > 250 {
+            break;
+        }
+        line.push(' ');
+        line.push_str(&word);
+        count += 1;
+    }
+    if count == 0 {
+        return;
+    }
+    kprintln!("  desktop     : 7-Zip {zip:?} for {count} item(s)");
+    start(desktop, &line);
+}
+
+/// Verbs of the open desktop menu (25.11): the verb and the path it acts on.
+static VERBS: SpinLock<alloc::vec::Vec<(sysconf::store::Verb, String)>> = SpinLock::new(alloc::vec::Vec::new());
+
+/// `items` with the verbs of the settings store for what the menu is opened
+/// on (`what`: "entry" — a file or folder of the desktop, "desktop" — the
+/// empty desktop): before «Свойства» when the menu ends with it, else at the
+/// end. Extended verbs (`extended=1`) only while Shift is held.
+fn with_store_verbs(desktop: &mut Compositor, items: &[context::Action], what: &str) -> alloc::vec::Vec<context::Action> {
+    use sysconf::store;
+    let mut out = items.to_vec();
+    let target = match what {
+        "entry" => selected_entry(desktop).map(|(path, label)| {
+            let directory = desktop.icon_selection().is_some_and(|index| matches!(desktop.icon_kind(index), Some(icons::Kind::Folder)));
+            (path, store::verb_types(&label, directory))
+        }),
+        "desktop" => Some((context::desktop_dir(), alloc::vec![String::from("desktop")])),
+        _ => None,
+    };
+    let Some((path, types)) = target else {
+        VERBS.lock().clear();
+        desktop.context_verbs(alloc::vec::Vec::new());
+        return out;
+    };
+    let shift = crate::input::modifiers().contains(crate::input::Modifiers::SHIFT);
+    let pairs = crate::config::registry::list(None, "shell/");
+    let refs: alloc::vec::Vec<&str> = types.iter().map(String::as_str).collect();
+    let verbs = store::verbs(&pairs, &refs, shift);
+    kprintln!(
+        "  desktop     : menu verbs{} [{}]",
+        if shift { " (shift)" } else { "" },
+        verbs.iter().map(|verb| verb.id.as_str()).collect::<alloc::vec::Vec<_>>().join(", ")
+    );
+    desktop.context_verbs(verbs.iter().map(|verb| (verb.caption.clone(), verb.icon.clone())).collect());
+    let at = if out.last() == Some(&context::Action::Properties) { out.len() - 1 } else { out.len() };
+    for index in (0..verbs.len()).rev() {
+        out.insert(at, context::Action::Verb(index as u8));
+    }
+    *VERBS.lock() = verbs.into_iter().map(|verb| (verb, path.clone())).collect();
+    out
+}
+
+/// Run verb `index` of the open desktop menu (25.11).
+fn run_verb(desktop: &mut Compositor, index: u8) {
+    use sysconf::store;
+    let Some((verb, path)) = VERBS.lock().get(usize::from(index)).cloned() else {
+        desktop.close_context();
+        return;
+    };
+    kprintln!("  desktop     : verb '{}' on '{path}'", verb.id);
+    match verb.command.as_str() {
+        store::VERB_LOCATION => {
+            desktop.close_context();
+            // «Файлы» on the folder with the item selected (`files <file>`).
+            start(desktop, &alloc::format!("/bin/files {path}"));
+        }
+        store::VERB_COPY_AS_PATH => {
+            desktop.close_context();
+            clipboard::set_text(alloc::format!("\"{path}\""));
+            kprintln!("  desktop     : copied as path \"{path}\"");
+        }
+        store::VERB_EMPTY_FOLDER => {
+            let children: alloc::vec::Vec<(String, String)> = match crate::fs::list(&path) {
+                Some(Ok(entries)) => entries
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .filter(|name| name != "." && name != "..")
+                    .map(|name| (alloc::format!("{}/{name}", path.trim_end_matches('/')), name))
+                    .collect(),
+                _ => alloc::vec::Vec::new(),
+            };
+            if children.is_empty() {
+                desktop.context_note("Папка уже пуста");
+                return;
+            }
+            desktop.close_context();
+            let label = String::from(context::base_name(&path));
+            let question = alloc::format!("Удалить содержимое папки «{label}»? Объектов: {}", children.len());
+            *DELETE_PENDING.lock() = children;
+            EMPTY_PENDING.store(false, Ordering::Relaxed);
+            let rect = layout(desktop, App::DeleteAsk);
+            if let Some(window) = Window::dialog(App::DeleteAsk, rect, desktop.scale(), Dialog::Delete { question, forever: false }) {
+                desktop.push(window);
+                kprintln!("  desktop     : opened '{}' to empty '{path}'", App::DeleteAsk.title());
+                log_focus(desktop);
+            }
+        }
+        command if command.starts_with('@') => desktop.context_note("Неизвестное действие"),
+        _ => {
+            desktop.close_context();
+            start(desktop, &verb.command_for(&path));
+        }
+    }
+}
+
 /// Что ждёт ответа окна «Удаление файла»: путь и подпись.
 static DELETE_PENDING: SpinLock<alloc::vec::Vec<(String, String)>> = SpinLock::new(alloc::vec::Vec::new());
 
@@ -6816,6 +7057,8 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
     // Задание процесса — для заставки запуска (21.11): окно ли это
     // запущенной игры. Тоже до стола.
     let job = crate::user::job_of_task(task);
+    // Where it was launched from (25.11): its monitor, not the primary.
+    let from = origin::of_task(task, job);
     let opened = with_desktop(|desktop| {
         if desktop.index_of(app).is_some() {
             return Err(WindowError::Exists);
@@ -6828,9 +7071,14 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         let (chrome_w, chrome_h) = if framed { Window::chrome_for(scale) } else { (0, 0) };
         let full_w = w.saturating_add(chrome_w);
         let full_h = h.saturating_add(chrome_h);
-        // Окно программы открывается на основном мониторе, по центру его
-        // рабочей области.
-        let p = desktop.primary_work();
+        // Окно программы открывается по центру рабочей области монитора, с
+        // которого его запустили (25.11, `origin`); следующее окно той же
+        // программы (диалог) — над её окном, на его мониторе.
+        let parent = desktop.task_window_rect(task);
+        let p = match parent {
+            Some(rect) => desktop.work_at(Some((rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2))),
+            None => desktop.work_at(from),
+        };
         let screen = p.w;
         let work = p.h.max(1);
         // На телефоне окно программы открывается во весь экран, как у Android
@@ -6841,6 +7089,13 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         let mobile = theme::is_mobile();
         let rect = if mobile {
             desktop.app_area()
+        } else if let Some(over) = parent {
+            // Над окном программы, в пределах его монитора.
+            let x = over.x + (over.w as i32 - full_w as i32) / 2;
+            let y = over.y + (over.h as i32 - full_h as i32) / 2;
+            let x = x.min(p.right() - full_w as i32).max(p.x);
+            let y = y.min(p.bottom() - full_h as i32).max(p.y);
+            desktop.cascade(Rect::new(x, y, full_w, full_h))
         } else {
             // По центру; второе окно на том же месте — каскадом (20.11).
             desktop.cascade(Rect::new(
@@ -6872,6 +7127,7 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
             "  desktop     : opened '{title}' for {}",
             crate::sched::TaskId::new(task)
         );
+        log_output(desktop, app);
         log_window(desktop, app, true);
         desktop.refresh_panel(&status_now());
         desktop.present();
@@ -7188,8 +7444,14 @@ pub fn direct_command(argument: &str) -> String {
             FLIP.store(true, Ordering::Relaxed);
         }
         "flip off" => crate::display::nvidia_disp::FLIP.store(false, Ordering::Relaxed),
+        // 25.11: game frame fences - waited for by the Wayland server before
+        // the show (async, default) or in the game's present call (wait).
+        #[cfg(target_arch = "x86_64")]
+        "fence async" => crate::linux::drm::set_fence_async(true),
+        #[cfg(target_arch = "x86_64")]
+        "fence wait" => crate::linux::drm::set_fence_async(false),
         "" => {}
-        _ => return String::from("  wldirect: usage `wldirect [on|off|flip on|flip timed|flip off]`"),
+        _ => return String::from("  wldirect: usage `wldirect [on|off|flip on|flip timed|flip off|fence async|fence wait]`"),
     }
     with_desktop(|desktop| {
         desktop.repaint_all();
@@ -7197,7 +7459,7 @@ pub fn direct_command(argument: &str) -> String {
     });
     let (pieces, ns, points, flips) = direct_stats();
     let flip = if !crate::display::nvidia_disp::FLIP.load(Ordering::Relaxed) {
-        "off (`wldirect flip on` to try)"
+        "off (`wldirect flip on` turns it back on)"
     } else if crate::display::nvidia_disp::FLIP_STOPPED.load(Ordering::Relaxed) {
         "stopped after a display error (`wldirect flip on` tries again)"
     } else if crate::display::nvidia_disp::FLIP_TIMED.load(Ordering::Relaxed) {
@@ -7205,11 +7467,17 @@ pub fn direct_command(argument: &str) -> String {
     } else {
         "on"
     };
+    #[cfg(target_arch = "x86_64")]
+    let ((fence_async, noted), (held, held_us)) = (crate::linux::drm::fence_stats(), crate::linux::wayland::fence_held());
+    #[cfg(not(target_arch = "x86_64"))]
+    let ((fence_async, noted), (held, held_us)) = ((false, 0u64), (0u64, 0u64));
     let line = alloc::format!(
-        "  wldirect: {} ({pieces} direct copies, {} us each, {} Kpx each; {flips} frames scanned out of client buffers since boot; scanout flip {flip})",
+        "  wldirect: {} ({pieces} direct copies, {} us each, {} Kpx each; {flips} frames scanned out of client buffers since boot; scanout flip {flip}; frame fences {} - {noted} noted, {held} shows waited {} us each)",
         if compositor::DIRECT.load(Ordering::Relaxed) { "on" } else { "off" },
         ns / pieces.max(1) / 1000,
         points / pieces.max(1) / 1000,
+        if fence_async { "async (the desktop waits)" } else { "wait (in the game's present)" },
+        held_us / held.max(1),
     );
     // The owner's logs show what was switched (hw-log14: not visible).
     if !argument.trim().is_empty() {
@@ -7637,6 +7905,18 @@ fn name_of(desktop: &Compositor, app: App) -> String {
 /// размер экрана, — то есть отдельно под каждую архитектуру, потому что режимы
 /// у них разные (на 14.09.2026 загрузчик ставит 1280×720 на OVMF и 1024×768 на
 /// ramfb), а с фазы С6a режим ещё и меняется на ходу.
+/// Which monitor a new window opened on (25.11, `origin`; the
+/// `launch-monitor` scenario waits for it).
+fn log_output(desktop: &Compositor, app: App) {
+    if desktop.output_rects().len() < 2 {
+        return;
+    }
+    if let Some(rect) = desktop.rect_of(app) {
+        let output = desktop.output_near(rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2);
+        kprintln!("  desktop     : '{}' opens on output {output}", name_of(desktop, app));
+    }
+}
+
 fn log_window(desktop: &Compositor, app: App, focused: bool) {
     let Some(rect) = desktop.rect_of(app) else {
         return;

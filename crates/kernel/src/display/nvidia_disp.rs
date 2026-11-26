@@ -55,10 +55,12 @@ const OBJ_VRAM: u32 = 0x2020;
 const OBJ_FB: u32 = 0x2040;
 const OBJ_SYS: u32 = 0x2060;
 
-/// G3: direct scanout of fullscreen client buffers (`wldirect flip on`).
-/// Off by default until checked on the RTX 3060 (sysmem scanout, notifier,
-/// cursor channel - see ROADMAP "Scan-out flip").
-pub static FLIP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// G3: direct scanout of fullscreen client buffers (`wldirect flip on|off`).
+/// On by default since 25.11 (hw-log19: every game frame was copied, ~1-2 ms
+/// of 2560x1440 per frame on the desktop path, Windows flips): a flip the
+/// display does not take stops flips by itself ([`FLIP_STOPPED`], picture of
+/// the desktop again), `wldirect flip off` is the manual way back.
+pub static FLIP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 /// G3: flips stopped after the display misbehaved (a flip not taken in
 /// [`FLIP_TIMEOUT_MS`]); `wldirect flip on` clears it.
 pub static FLIP_STOPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

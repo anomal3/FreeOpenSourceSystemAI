@@ -584,6 +584,18 @@ fn report(old: &Mark, new: &Mark, queue: &Queue, forced: bool) {
             wl[8] / wl[7].max(1) / 1000,
         );
     }
+    // 25.11: game frames whose show waited for the GPU frame fence in the
+    // desktop (not in the game's present call any more).
+    {
+        static HELD_LAST: AtomicU64 = AtomicU64::new(0);
+        static HELD_US_LAST: AtomicU64 = AtomicU64::new(0);
+        let (held, held_us) = super::wayland::fence_held();
+        let held_window = held.saturating_sub(HELD_LAST.swap(held, Ordering::Relaxed));
+        let us_window = held_us.saturating_sub(HELD_US_LAST.swap(held_us, Ordering::Relaxed));
+        if held_window > 0 {
+            let _ = write!(line, "; {held_window} shows waited for the GPU frame fence ({} us each)", us_window / held_window);
+        }
+    }
     kprintln!("  perf-diag   : {line}");
 }
 

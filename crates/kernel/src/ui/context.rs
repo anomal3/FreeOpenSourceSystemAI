@@ -57,8 +57,8 @@ use crate::vfs::perm::Access;
 
 /// Поле внутри карточки (макет 07–12: 4).
 const CARD_PAD: u32 = 4;
-/// Высота строки меню.
-const ROW_H: u32 = 32;
+/// Высота строки меню (25.11: compact like Windows 11 — was 32).
+const ROW_H: u32 = mini_ui::theme::MENU_ITEM_H;
 /// Зазор между строками.
 const ROW_GAP: u32 = 0;
 /// Поле для ответа и вопроса — шире, чем у строки.
@@ -72,12 +72,17 @@ const ICON: u32 = 16;
 const KEYS_GAP: u32 = 32;
 /// Место под стрелку подменю.
 const ARROW: u32 = 24;
+/// Widest «7-Zip ▸» submenu (25.11): file names in its items.
+const ZIP_SUB_W: u32 = 440;
 /// Скругление карточки меню — как у меню Windows 11, меньше, чем у окон.
 pub const MENU_RADIUS: u32 = 6;
 /// Просвет между значком и подписью.
 const ICON_GAP: u32 = 10;
 /// Поле разделителя сверху и снизу.
-const SEP_PAD: u32 = 4;
+const SEP_PAD: u32 = 3;
+/// How long the pointer rests on another row of the card before the open
+/// submenu closes (25.11; Windows: `MenuShowDelay` 400 ms).
+const SUB_CLOSE_MS: u64 = 400;
 /// Подсказка под вопросом об удалении — она же задаёт наименьшую ширину меню.
 const CONFIRM_HINT: &str = "Enter или Y — удалить    Esc или N — отмена";
 
@@ -177,6 +182,11 @@ pub enum Action {
     HideIcon,
     /// «Управление» of «Этот компьютер» — `/bin/compmgmt` (24.11).
     Manage,
+    /// Verb `n` from the settings store (`shell` hive, 25.11,
+    /// `sysconf::store::verbs`): caption in [`ContextMenu::set_verbs`].
+    Verb(u8),
+    /// An item of the «7-Zip ▸» submenu (25.11).
+    Zip(Zip),
 }
 
 /// Какое подменю открывает пункт.
@@ -186,11 +196,79 @@ pub enum Sub {
     Sort,
     New,
     OpenWith,
+    /// «7-Zip ▸» (25.11, as the 7-Zip shell extension of Windows).
+    SevenZip,
+    /// «Открыть архив ▸» — by type, inside «7-Zip ▸».
+    ZipOpenAs,
+    /// «CRC SHA ▸» inside «7-Zip ▸».
+    ZipHash,
+}
+
+/// What an item of «7-Zip ▸» does (25.11): `/bin/archiver` with the picked
+/// icons ([`Zip::command`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Zip {
+    Open,
+    /// «Открыть архив ▸ тип» — index in [`ZIP_TYPES`].
+    OpenAs(u8),
+    Extract,
+    ExtractHere,
+    ExtractTo,
+    Test,
+    Add,
+    Add7z,
+    AddZip,
+    /// «CRC SHA ▸ метод» — index in [`ZIP_HASHES`].
+    Hash(u8),
+}
+
+/// Types of «Открыть архив ▸» (7-Zip: `*` — any, `#` — parser).
+pub const ZIP_TYPES: [&str; 7] = ["*", "#", "7z", "zip", "tar", "rar", "iso"];
+
+/// «CRC SHA ▸»: menu words and `-scrc` methods.
+pub const ZIP_HASHES: [(&str, &str); 5] = [("CRC-32", "CRC32"), ("CRC-64", "CRC64"), ("SHA-1", "SHA1"), ("SHA-256", "SHA256"), ("*", "*")];
+
+/// What the «7-Zip ▸» submenu needs to know of the picked icons.
+#[derive(Clone, Default, Debug)]
+pub struct ZipInfo {
+    /// Every picked entry is an archive (by extension).
+    pub archive: bool,
+    /// File names of «Добавить к "…7z"» and «Добавить к "…zip"».
+    pub add_7z: String,
+    pub add_zip: String,
+    /// Folder name of «Распаковать в "…\"».
+    pub folder: String,
+}
+
+impl Zip {
+    /// `/bin/archiver` arguments before the paths.
+    #[must_use]
+    pub fn command(self) -> String {
+        match self {
+            Zip::Open => String::new(),
+            Zip::OpenAs(index) => alloc::format!("--type {}", ZIP_TYPES.get(usize::from(index)).copied().unwrap_or("*")),
+            Zip::Extract => String::from("--extract"),
+            Zip::ExtractHere => String::from("--extract-here"),
+            Zip::ExtractTo => String::from("--extract-to"),
+            Zip::Test => String::from("--test"),
+            Zip::Add => String::from("--add"),
+            Zip::Add7z => String::from("--7z"),
+            Zip::AddZip => String::from("--zip"),
+            Zip::Hash(index) => alloc::format!("--hash {}", ZIP_HASHES.get(usize::from(index)).map_or("CRC32", |(_, key)| *key)),
+        }
+    }
+}
+
+/// Is 7-Zip in the system (the submenu is shown only then).
+#[must_use]
+pub fn zip_available() -> bool {
+    exists("/bin/7zz") && exists("/bin/archiver")
 }
 
 impl Action {
     /// Все пункты, какие бывают, — по ним считается размер поверхности.
-    const ALL: [Action; 43] = [
+    const ALL: [Action; 44] = [
+        Action::Submenu(Sub::SevenZip),
         Action::HideIcon,
         Action::Manage,
         Action::TabRename,
@@ -283,24 +361,27 @@ impl Action {
 
     /// Меню папки на столе — как в Windows: открыть, терминал здесь, затем
     /// правка.
-    /// Макет 09.
+    /// Макет 09. 25.11: «7-Zip ▸» in the upper block, where the 7-Zip shell
+    /// extension puts it in Windows (it replaced the grey «Сжать в архив»).
     pub const ON_FOLDER: [Action; 10] = [
         Action::Open,
         Action::OpenNewWindow,
         Action::OpenInTerminal,
         Action::PinQuick,
+        Action::Submenu(Sub::SevenZip),
         Action::Cut,
         Action::Copy,
         Action::Rename,
         Action::Delete,
-        Action::Compress,
         Action::Properties,
     ];
 
-    /// Меню файла (макет 10): «Открыть с помощью ›» — подменю.
-    pub const ON_FILE: [Action; 7] = [
+    /// Меню файла (макет 10): «Открыть с помощью ›» — подменю; 25.11 —
+    /// «7-Zip ›» under it.
+    pub const ON_FILE: [Action; 8] = [
         Action::Open,
         Action::Submenu(Sub::OpenWith),
+        Action::Submenu(Sub::SevenZip),
         Action::Cut,
         Action::Copy,
         Action::Rename,
@@ -412,6 +493,20 @@ impl Action {
             Action::TabDetach => "Переместить в новое окно",
             Action::HideIcon => "Скрыть с рабочего стола",
             Action::Manage => "Управление",
+            Action::Verb(_) => "Команда",
+            // 7-Zip (25.11); the labels with names come from `label`.
+            Action::Submenu(Sub::SevenZip) => "7-Zip",
+            Action::Submenu(Sub::ZipOpenAs) | Action::Zip(Zip::Open) => "Открыть архив",
+            Action::Submenu(Sub::ZipHash) => "CRC SHA",
+            Action::Zip(Zip::OpenAs(_)) => "Тип архива",
+            Action::Zip(Zip::Extract) => "Распаковать",
+            Action::Zip(Zip::ExtractHere) => "Распаковать здесь",
+            Action::Zip(Zip::ExtractTo) => "Распаковать в папку",
+            Action::Zip(Zip::Test) => "Тестировать",
+            Action::Zip(Zip::Add) => "Добавить к архиву…",
+            Action::Zip(Zip::Add7z) => "Добавить к 7z",
+            Action::Zip(Zip::AddZip) => "Добавить к zip",
+            Action::Zip(Zip::Hash(_)) => "Контрольная сумма",
         }
     }
 
@@ -450,6 +545,9 @@ impl Action {
             Action::TaskManager => 4,
             Action::TabRename | Action::TabDetach => 14,
             Action::TabClose | Action::TabCloseOthers => 15,
+            Action::Verb(_) => 16,
+            Action::Submenu(Sub::SevenZip) => 18,
+            Action::Submenu(Sub::ZipOpenAs | Sub::ZipHash) | Action::Zip(_) => 19,
         }
     }
 
@@ -501,6 +599,9 @@ impl Action {
             Action::TabClose | Action::TabCloseOthers => Some(Icon::Close),
             Action::HideIcon => None,
             Action::Manage => Some(Icon::Computer),
+            Action::Verb(_) => None,
+            Action::Submenu(Sub::SevenZip) => Some(Icon::Package),
+            Action::Submenu(Sub::ZipOpenAs | Sub::ZipHash) | Action::Zip(_) => None,
         }
     }
 
@@ -515,7 +616,7 @@ impl Action {
             Action::Delete | Action::EmptyTrash | Action::DeleteShortcut => Some(Fi::Trash),
             Action::PinTaskbar | Action::PinStart | Action::PinQuick => Some(Fi::Pin),
             Action::Submenu(Sub::Sort) => Some(Fi::Sort),
-            Action::Compress => Some(Fi::Compress),
+            Action::Compress | Action::Submenu(Sub::SevenZip) => Some(Fi::Compress),
             Action::RunAsAdmin => Some(Fi::ShieldAdmin),
             Action::OpenInTerminal => Some(Fi::OpenTerminal),
             Action::Personalize => Some(Fi::Palette),
@@ -537,6 +638,11 @@ impl Action {
             Action::Properties => Some("Alt+Enter"),
             _ => None,
         }
+    }
+
+    /// The default item of the menu — bold (25.11).
+    const fn is_default(self) -> bool {
+        matches!(self, Action::Open)
     }
 
     /// Есть ли за пунктом действие. Нет — пункт серый и не нажимается.
@@ -610,6 +716,12 @@ pub struct ContextMenu {
     cross: bool,
     /// Пункты, погашенные этим открытием (у одного окна «Закрыть все окна»).
     off: Vec<Action>,
+    /// Verbs from the store for this opening (25.11): caption and icon name.
+    verbs: Vec<(String, Option<String>)>,
+    /// A plain card row under the pointer while a submenu is open, and
+    /// since when (25.11): resting there [`SUB_CLOSE_MS`] closes the
+    /// submenu, as in Windows — passing over it on the way does not.
+    stray: Option<(usize, u64)>,
     /// Подменю (›): своя поверхность рядом с карточкой. Заводится вместе с
     /// меню, а не при открытии подменю — память в разборе ввода не просят.
     sub_surface: Surface,
@@ -624,6 +736,18 @@ pub struct ContextMenu {
     /// Что перерисовать на экране под подменю: оно появилось, сменилось или
     /// ушло. В координатах экрана.
     sub_damage: Rect,
+    /// The picked icons for «7-Zip ▸» (25.11, [`ContextMenu::set_zip`]).
+    zip: ZipInfo,
+    /// The second level (25.11): «7-Zip ▸ CRC SHA ▸», «7-Zip ▸ Открыть
+    /// архив ▸» — a surface of its own next to the submenu; its damage goes
+    /// with the submenu's.
+    sub2_surface: Surface,
+    sub2_items: Vec<Action>,
+    sub2_rect: Rect,
+    /// Row of the submenu whose submenu is open.
+    sub2_parent: Option<usize>,
+    sub2_selected: usize,
+    sub2_focus: bool,
 }
 
 impl ContextMenu {
@@ -654,12 +778,23 @@ impl ContextMenu {
             // Список окон группы на панели задач — до двенадцати строк.
             .max(height_for(ctx, &[Action::Window(0); 12]))
             // Файл с шестью программами «Открыть с помощью».
-            .max(height_for(ctx, &[Action::Open; 9]));
+            .max(height_for(ctx, &[Action::Open; 9]))
+            // 25.11: the longest list with all the store verbs after it, and
+            // two rows of reserve for items other menus add.
+            .max(height_for(ctx, &{
+                let mut list = [Action::Verb(0); Action::ON_FOLDER.len() + sysconf::store::MAX_VERBS + 2];
+                list[..Action::ON_FOLDER.len()].copy_from_slice(&Action::ON_FOLDER);
+                list
+            }));
         let surface = Surface::new(width, height, theme::wall_average(theme::palette()))?;
         // Подменю: до шести программ «Открыть с помощью» и «Выбрать другую».
         let mut longest_sub = [Action::OpenWith(0); 7];
         longest_sub[6] = Action::ChooseProgram;
-        let sub_surface = Surface::new(width, rows_height(ctx, &longest_sub), theme::wall_average(theme::palette()))?;
+        // 25.11: «7-Zip ▸» of an archive has ten rows with file names in
+        // them — wider and longer than «Открыть с помощью».
+        let sub_h = rows_height(ctx, &longest_sub).max(rows_height(ctx, &[Action::Zip(Zip::Open); 10]));
+        let sub_surface = Surface::new(width.max(ctx.px(ZIP_SUB_W)), sub_h, theme::wall_average(theme::palette()))?;
+        let sub2_surface = Surface::new(ctx.px(220), rows_height(ctx, &[Action::Zip(Zip::Open); ZIP_TYPES.len()]), theme::wall_average(theme::palette()))?;
         Some(Self {
             surface,
             rect: Rect::new(0, 0, width, height),
@@ -674,6 +809,8 @@ impl ContextMenu {
             handlers: Vec::new(),
             cross: false,
             off: Vec::new(),
+            verbs: Vec::new(),
+            stray: None,
             sub_surface,
             sub_items: Vec::new(),
             sub_rect: Rect::EMPTY,
@@ -681,7 +818,19 @@ impl ContextMenu {
             sub_selected: usize::MAX,
             sub_focus: false,
             sub_damage: Rect::EMPTY,
+            zip: ZipInfo::default(),
+            sub2_surface,
+            sub2_items: Vec::new(),
+            sub2_rect: Rect::EMPTY,
+            sub2_parent: None,
+            sub2_selected: usize::MAX,
+            sub2_focus: false,
         })
+    }
+
+    /// What «7-Zip ▸» of this opening offers (25.11).
+    pub fn set_zip(&mut self, zip: ZipInfo) {
+        self.zip = zip;
     }
 
     /// Погасить пункты этого открытия (их действие сейчас ни к чему).
@@ -707,7 +856,116 @@ impl ContextMenu {
                 items.push(Action::ChooseProgram);
                 items
             }
+            // As the 7-Zip shell extension (25.11): an archive — open,
+            // extract, test, then add; anything else — add; «CRC SHA ▸» last.
+            Sub::SevenZip if self.zip.archive => alloc::vec![
+                Action::Zip(Zip::Open),
+                Action::Submenu(Sub::ZipOpenAs),
+                Action::Zip(Zip::Extract),
+                Action::Zip(Zip::ExtractHere),
+                Action::Zip(Zip::ExtractTo),
+                Action::Zip(Zip::Test),
+                Action::Zip(Zip::Add),
+                Action::Zip(Zip::Add7z),
+                Action::Zip(Zip::AddZip),
+                Action::Submenu(Sub::ZipHash),
+            ],
+            Sub::SevenZip => alloc::vec![Action::Zip(Zip::Add), Action::Zip(Zip::Add7z), Action::Zip(Zip::AddZip), Action::Submenu(Sub::ZipHash)],
+            Sub::ZipOpenAs => (0..ZIP_TYPES.len()).map(|index| Action::Zip(Zip::OpenAs(index as u8))).collect(),
+            Sub::ZipHash => (0..ZIP_HASHES.len()).map(|index| Action::Zip(Zip::Hash(index as u8))).collect(),
         }
+    }
+
+    /// Width of a submenu card (25.11: up to its own surface, which is wider
+    /// than the menu — «Добавить к "длинное имя.7z"»).
+    fn sub_width(&self, ctx: Ctx, items: &[Action], limit: u32) -> u32 {
+        let face = ctx.face(Role::Body);
+        let small = ctx.face(Role::Caption);
+        let widest = items
+            .iter()
+            .map(|action| {
+                let tail = match (action.keys(), action) {
+                    (Some(keys), _) => small.width(keys) + ctx.px(KEYS_GAP),
+                    (None, Action::Submenu(_)) => ctx.px(ARROW + 12),
+                    _ => 0,
+                };
+                face.width(&self.label(*action)) + tail
+            })
+            .max()
+            .unwrap_or(0);
+        let width = widest + ctx.px(ICON + ICON_GAP) + ctx.px(CARD_PAD * 2 + ROW_PAD_L + ROW_PAD_R) + ctx.px(12);
+        width.clamp(ctx.px(160).min(limit), limit)
+    }
+
+    /// Open the submenu of row `index` of the submenu (25.11) — to its right
+    /// (no room — to its left), first row level with the item.
+    fn open_sub2(&mut self, index: usize) {
+        let Some(Action::Submenu(sub)) = self.sub_items.get(index).copied() else {
+            return;
+        };
+        if self.sub2_parent == Some(index) {
+            return;
+        }
+        self.close_sub2();
+        let ctx = self.ctx();
+        let items = self.sub_items_for(sub);
+        let width = self.sub_width(ctx, &items, self.sub2_surface.width());
+        let height = rows_height(ctx, &items).min(self.sub2_surface.height());
+        let layout = plan(ctx, Rect::new(0, 0, self.sub_rect.w, self.sub_rect.h), &self.sub_items);
+        let row_y = layout.rows.get(index).map_or(0, |slot| slot.rect.y);
+        let gap = ctx.px(CARD_PAD) as i32;
+        let mut x = self.sub_rect.right() + gap;
+        if x + width as i32 > self.area.right() {
+            x = self.sub_rect.x - gap - width as i32;
+        }
+        let y = (self.sub_rect.y + row_y - ctx.px(CARD_PAD) as i32).clamp(self.area.y, (self.area.bottom() - height as i32).max(self.area.y));
+        self.sub2_items = items;
+        self.sub2_rect = Rect::new(x.max(self.area.x), y, width, height);
+        self.sub2_parent = Some(index);
+        self.sub2_selected = usize::MAX;
+        self.sub2_focus = false;
+        // The row of the open submenu stays lit.
+        self.sub_selected = index;
+        self.redraw_sub();
+        self.redraw_sub2();
+        crate::kprintln!("  desktop     : submenu 2 '{}' at {},{} {}x{}", self.label(Action::Submenu(sub)), self.sub2_rect.x, self.sub2_rect.y, self.sub2_rect.w, self.sub2_rect.h);
+    }
+
+    fn close_sub2(&mut self) {
+        if self.sub2_parent.take().is_some() {
+            self.sub_damage = self.sub_damage.union(&self.sub2_rect);
+            self.sub2_focus = false;
+        }
+    }
+
+    /// The second-level submenu on screen, if open.
+    #[must_use]
+    pub fn sub2_layer(&self) -> Option<(&Surface, Rect)> {
+        self.sub2_parent.filter(|_| self.open && self.sub_parent.is_some()).map(|_| (&self.sub2_surface, self.sub2_rect))
+    }
+
+    fn redraw_sub2(&mut self) {
+        let ctx = self.ctx();
+        let p = ctx.palette;
+        let card = Rect::new(0, 0, self.sub2_rect.w, self.sub2_rect.h);
+        let glass = theme::menu_bg();
+        let inner = ctx.on(glass);
+        let radius = ctx.px(MENU_RADIUS);
+        let layout = plan(ctx, card, &self.sub2_items);
+        let labels: Vec<String> = self.sub2_items.iter().map(|action| self.label(*action)).collect();
+        let s = &mut self.sub2_surface;
+        s.fill(Rect::new(0, 0, s.width(), card.h), glass);
+        if theme::is_classic() {
+            mini_ui::classic::raised(s, card, mini_ui::classic::unit(ctx.scale));
+        } else {
+            draw::rounded_stroke(s, card, radius, p.line3.color, p.line3.alpha);
+            draw::crown(s, card, radius, p.crown.color, p.crown.alpha);
+        }
+        draw_lines(inner, s, card, &layout.lines);
+        for (index, slot) in layout.rows.iter().enumerate() {
+            draw_row(inner, s, slot, &labels[index], None, index == self.sub2_selected, true);
+        }
+        self.sub_damage = self.sub_damage.union(&self.sub2_rect);
     }
 
     /// Открыть подменю пункта `index` — справа от карточки, первая строка
@@ -723,7 +981,7 @@ impl ContextMenu {
         self.close_sub();
         let ctx = self.ctx();
         let items = self.sub_items_for(sub);
-        let width = self.width_of(ctx, &items).min(self.sub_surface.width());
+        let width = self.sub_width(ctx, &items, self.sub_surface.width());
         let height = rows_height(ctx, &items).min(self.sub_surface.height());
         let layout = plan(ctx, self.card(), &self.items);
         let row_y = layout.rows.get(index).map_or(0, |slot| slot.rect.y);
@@ -747,10 +1005,32 @@ impl ContextMenu {
             self.sub_rect.w,
             self.sub_rect.h
         );
+        crate::kprintln!("  desktop     : submenu rows: {}", self.rows_line(&self.sub_items));
+    }
+
+    /// The pointer rested on a plain row of the card (25.11): the open
+    /// submenu goes after [`SUB_CLOSE_MS`]. Called from the desktop tick.
+    pub fn hover_tick(&mut self) {
+        let Some((row, since)) = self.stray else { return };
+        if !self.open || self.sub_parent.is_none() || self.sub_focus {
+            self.stray = None;
+            return;
+        }
+        if crate::time::uptime_ms().saturating_sub(since) >= SUB_CLOSE_MS {
+            self.stray = None;
+            self.close_sub();
+            if row != self.selected {
+                self.selected = row;
+            }
+            self.redraw();
+            crate::kprintln!("  desktop     : submenu closed (pointer on row {row})");
+        }
     }
 
     /// Закрыть подменю, оставив карточку.
     fn close_sub(&mut self) {
+        self.stray = None;
+        self.close_sub2();
         if self.sub_parent.take().is_some() {
             self.sub_damage = self.sub_damage.union(&self.sub_rect);
             self.sub_focus = false;
@@ -771,19 +1051,24 @@ impl ContextMenu {
     /// Накрывает ли меню (с подменю) точку экрана.
     #[must_use]
     pub fn contains(&self, x: i32, y: i32) -> bool {
-        self.open && (self.rect.contains(x, y) || (self.sub_parent.is_some() && self.sub_rect.contains(x, y)))
+        self.open
+            && (self.rect.contains(x, y)
+                || (self.sub_parent.is_some() && self.sub_rect.contains(x, y))
+                || self.sub2_layer().is_some_and(|(_, rect)| rect.contains(x, y)))
     }
 
     fn redraw_sub(&mut self) {
         let ctx = self.ctx();
         let p = ctx.palette;
         let card = Rect::new(0, 0, self.sub_rect.w, self.sub_rect.h);
-        let glass = ctx.flat(p.win);
+        // 25.11: the menu tone — a raised step off the window colour.
+        let glass = theme::menu_bg();
         let inner = ctx.on(glass);
         let radius = ctx.px(MENU_RADIUS);
         let layout = plan(ctx, card, &self.sub_items);
         let labels: Vec<String> = self.sub_items.iter().map(|action| self.label(*action)).collect();
         let enabled: Vec<bool> = self.sub_items.iter().map(|action| self.is_enabled(*action)).collect();
+        let glyphs: Vec<Option<Icon>> = self.sub_items.iter().map(|action| self.icon_of(*action)).collect();
         let s = &mut self.sub_surface;
         s.fill(Rect::new(0, 0, s.width(), card.h), glass);
         if theme::is_classic() {
@@ -795,9 +1080,32 @@ impl ContextMenu {
         }
         draw_lines(inner, s, card, &layout.lines);
         for (index, slot) in layout.rows.iter().enumerate() {
-            draw_row(inner, s, slot, &labels[index], index == self.sub_selected, enabled[index]);
+            draw_row(inner, s, slot, &labels[index], glyphs[index], index == self.sub_selected, enabled[index]);
         }
         self.sub_damage = self.sub_damage.union(&self.sub_rect);
+    }
+
+    /// Verbs of the store for the next opening (25.11): caption and icon
+    /// name, in the order of their [`Action::Verb`] numbers.
+    pub fn set_verbs(&mut self, verbs: Vec<(String, Option<String>)>) {
+        self.verbs = verbs;
+    }
+
+    /// Icon of a row: a verb's from its name, the rest — their own.
+    fn icon_of(&self, action: Action) -> Option<Icon> {
+        match action {
+            Action::Verb(index) => match self.verbs.get(usize::from(index)).and_then(|(_, icon)| icon.as_deref()) {
+                Some("folder") => Some(Icon::Folder),
+                Some("file") => Some(Icon::File),
+                Some("terminal") => Some(Icon::Terminal),
+                Some("delete" | "trash" | "close") => Some(Icon::Close),
+                Some("settings") => Some(Icon::Settings),
+                Some("info") => Some(Icon::Info),
+                Some("package" | "archive") => Some(Icon::Package),
+                _ => None,
+            },
+            other => other.icon(),
+        }
     }
 
     /// Программы «Открыть с помощью» для следующего открытия.
@@ -820,6 +1128,16 @@ impl ContextMenu {
                 Some((name, _)) => name.clone(),
                 None => String::from(action.title()),
             },
+            Action::Verb(index) => match self.verbs.get(usize::from(index)) {
+                Some((caption, _)) => caption.clone(),
+                None => String::from(action.title()),
+            },
+            // 7-Zip (25.11): the names, as the shell extension writes them.
+            Action::Zip(Zip::ExtractTo) => alloc::format!("Распаковать в \"{}\\\"", self.zip.folder),
+            Action::Zip(Zip::Add7z) => alloc::format!("Добавить к \"{}\"", self.zip.add_7z),
+            Action::Zip(Zip::AddZip) => alloc::format!("Добавить к \"{}\"", self.zip.add_zip),
+            Action::Zip(Zip::OpenAs(index)) => String::from(ZIP_TYPES.get(usize::from(index)).copied().unwrap_or("*")),
+            Action::Zip(Zip::Hash(index)) => String::from(ZIP_HASHES.get(usize::from(index)).map_or("*", |(word, _)| *word)),
             _ => String::from(action.title()),
         }
     }
@@ -837,6 +1155,7 @@ impl ContextMenu {
                     (None, Action::Submenu(_)) => ctx.px(ARROW + 12),
                     _ => 0,
                 };
+                let face = if action.is_default() { ctx.face(Role::Title) } else { face };
                 face.width(&self.label(*action)) + tail
             })
             .max()
@@ -883,6 +1202,21 @@ impl ContextMenu {
         self.close_sub();
         self.open = true;
         self.redraw();
+        crate::kprintln!("  desktop     : context rows: {}", self.rows_line(&self.items));
+    }
+
+    /// The labels of `items` for the log (25.11): ` | ` between rows, ` || `
+    /// where a separator line stands — the stand aims at a row by its label
+    /// (`Aim::ContextLabel`), not by a number that every new item shifts.
+    fn rows_line(&self, items: &[Action]) -> String {
+        let mut out = String::new();
+        for (index, action) in items.iter().enumerate() {
+            if index > 0 {
+                out.push_str(if items[index - 1].group() != action.group() { " || " } else { " | " });
+            }
+            out.push_str(&self.label(*action));
+        }
+        out
     }
 
     pub fn close(&mut self) {
@@ -897,6 +1231,10 @@ impl ContextMenu {
     pub fn action_at(&self, x: i32, y: i32) -> Option<Action> {
         if self.is_editing() {
             return None;
+        }
+        if let Some((_, rect)) = self.sub2_layer().filter(|(_, rect)| rect.contains(x, y)) {
+            let layout = plan(self.ctx(), Rect::new(0, 0, rect.w, rect.h), &self.sub2_items);
+            return layout.rows.iter().find(|slot| slot.rect.contains(x - rect.x, y - rect.y)).map(|slot| slot.action);
         }
         if self.sub_parent.is_some() && self.sub_rect.contains(x, y) {
             let local = (x - self.sub_rect.x, y - self.sub_rect.y);
@@ -950,7 +1288,41 @@ impl ContextMenu {
     }
 
     fn menu_key(&mut self, code: KeyCode) -> Reply {
+        // The second level (25.11): «CRC SHA ▸», «Открыть архив ▸».
+        if self.sub2_focus && self.sub2_parent.is_some() {
+            let count = self.sub2_items.len().max(1);
+            return match code {
+                KeyCode::Up => {
+                    self.sub2_selected = if self.sub2_selected >= count { count - 1 } else { (self.sub2_selected + count - 1) % count };
+                    self.redraw_sub2();
+                    Reply::Handled
+                }
+                KeyCode::Down => {
+                    self.sub2_selected = if self.sub2_selected >= count { 0 } else { (self.sub2_selected + 1) % count };
+                    self.redraw_sub2();
+                    Reply::Handled
+                }
+                KeyCode::Enter => match self.sub2_items.get(self.sub2_selected).copied() {
+                    Some(action) => Reply::Run(action),
+                    None => Reply::Handled,
+                },
+                KeyCode::Left | KeyCode::Escape => {
+                    self.close_sub2();
+                    self.redraw_sub();
+                    Reply::Handled
+                }
+                _ => Reply::Ignored,
+            };
+        }
         if self.sub_focus && self.sub_parent.is_some() {
+            if let (KeyCode::Right | KeyCode::Enter, Some(Action::Submenu(_))) = (code, self.sub_items.get(self.sub_selected).copied()) {
+                let row = self.sub_selected;
+                self.open_sub2(row);
+                self.sub2_focus = true;
+                self.sub2_selected = 0;
+                self.redraw_sub2();
+                return Reply::Handled;
+            }
             let count = self.sub_items.len().max(1);
             return match code {
                 KeyCode::Up => {
@@ -1010,12 +1382,35 @@ impl ContextMenu {
 
     /// Поставить выделение на пункт под указателем.
     pub fn select_action(&mut self, action: Action) {
+        // A row of the second level (25.11): lit there; its parents stay lit.
+        if self.sub2_parent.is_some() {
+            if let Some(index) = self.sub2_items.iter().position(|item| *item == action) {
+                self.stray = None;
+                if index != self.sub2_selected {
+                    self.sub2_selected = index;
+                    self.redraw_sub2();
+                }
+                if let Some(parent) = self.sub2_parent.filter(|parent| *parent != self.sub_selected) {
+                    self.sub_selected = parent;
+                    self.redraw_sub();
+                }
+                return;
+            }
+        }
         // Пункт подменю — подсветить там; карточка остаётся как есть.
         if self.sub_parent.is_some() {
             if let Some(index) = self.sub_items.iter().position(|item| *item == action) {
+                self.stray = None;
                 if index != self.sub_selected {
                     self.sub_selected = index;
                     self.redraw_sub();
+                }
+                // 25.11: a row with its own submenu opens it; another row of
+                // this submenu closes the one that was open.
+                if matches!(action, Action::Submenu(_)) {
+                    self.open_sub2(index);
+                } else {
+                    self.close_sub2();
                 }
                 // В карточке подсвечен пункт этого подменю, а не тот, над
                 // которым указатель прошёл по дороге.
@@ -1027,11 +1422,15 @@ impl ContextMenu {
             }
         }
         // Указатель на пункте с подменю открывает его. На обычном пункте
-        // подменю не закрывается: по дороге к нему указатель проходит над
-        // соседними строками (Windows ждёт для этого полсекунды).
+        // подменю не закрывается сразу: по дороге к нему указатель проходит
+        // над соседними строками; задержался на строке — закроется
+        // ([`ContextMenu::hover_tick`], 25.11, как в Windows).
         if let Some(index) = self.items.iter().position(|item| *item == action) {
             if matches!(action, Action::Submenu(_)) {
                 self.open_sub(index);
+                self.stray = None;
+            } else if self.sub_parent.is_some() && self.stray.map(|(row, _)| row) != Some(index) {
+                self.stray = Some((index, crate::time::uptime_ms()));
             }
         }
         let (row, cross) = match action {
@@ -1049,7 +1448,11 @@ impl ContextMenu {
 
     /// Убрать подсветку: указатель ушёл с карточки.
     pub fn select_none(&mut self) {
-        if self.sub_selected != usize::MAX && self.sub_parent.is_some() {
+        if self.sub2_selected != usize::MAX && self.sub2_parent.is_some() {
+            self.sub2_selected = usize::MAX;
+            self.redraw_sub2();
+        }
+        if self.sub_selected != usize::MAX && self.sub_parent.is_some() && self.sub2_parent.is_none() {
             self.sub_selected = usize::MAX;
             self.redraw_sub();
         }
@@ -1070,6 +1473,9 @@ impl ContextMenu {
         self.redraw();
         if self.sub_parent.is_some() {
             self.redraw_sub();
+        }
+        if self.sub2_parent.is_some() {
+            self.redraw_sub2();
         }
         if !self.open {
             self.damage = Rect::EMPTY;
@@ -1097,7 +1503,9 @@ impl ContextMenu {
         // Своя подложка — цвет окна, а не обоев под стеклом (Роман, 24.10:
         // меню сливалось со столом), и скругление меньше, как у меню
         // Windows 11.
-        let glass = ctx.flat(p.win);
+        // 25.11 (Roman, Windows 11 menus): not the window colour either —
+        // the menu tone, a raised step off it (`theme::menu_bg`).
+        let glass = theme::menu_bg();
         let inner = ctx.on(glass);
         let radius = ctx.px(MENU_RADIUS);
         let layout = plan(ctx, card, &self.items);
@@ -1124,10 +1532,11 @@ impl ContextMenu {
                 let selected = if self.selected < self.items.len() { self.selected } else { self.sub_parent.unwrap_or(usize::MAX) };
                 let labels: Vec<String> = self.items.iter().map(|action| self.label(*action)).collect();
                 let enabled: Vec<bool> = self.items.iter().map(|action| self.is_enabled(*action)).collect();
+                let glyphs: Vec<Option<Icon>> = self.items.iter().map(|action| self.icon_of(*action)).collect();
                 let s = &mut self.surface;
                 draw_lines(inner, s, card, &layout.lines);
                 for (index, slot) in layout.rows.iter().enumerate() {
-                    draw_row(inner, s, slot, &labels[index], index == selected, enabled[index]);
+                    draw_row(inner, s, slot, &labels[index], glyphs[index], index == selected, enabled[index]);
                     if matches!(slot.action, Action::Window(_)) {
                         draw_cross(inner, s, slot.rect, index == selected, index == selected && self.cross);
                     }
@@ -1292,16 +1701,17 @@ fn draw_lines(ctx: Ctx, s: &mut Surface, card: Rect, lines: &[i32]) {
 /// Нарисовать строку меню (макет 07–12): значок 16, подпись, справа —
 /// сочетание клавиш серым или стрелка подменю. Подсветка — плоская, как
 /// `--hov` макета; погашенный пункт — серый и без подсветки.
-fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool, enabled: bool) {
+fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, icon_glyph: Option<Icon>, selected: bool, enabled: bool) {
     let p = ctx.palette;
     let lit = selected && enabled;
     let classic = theme::is_classic();
-    if lit {
-        // Классика (22.11): пункт под указателем — тёмно-синий, белым.
-        paint::row(ctx, s, slot.rect, if classic { RowState::Selected } else { RowState::Hover });
+    if selected {
+        // 25.11: the shared menu plate (neutral, accent pill; a disabled
+        // item gets the plate without the pill). Classic (22.11): navy.
+        mini_ui::kit::menu_highlight(ctx, s, slot.rect, enabled);
     }
     let ink = if !enabled {
-        if classic { theme::win98::SHADE } else { p.ink4 }
+        if classic { theme::win98::SHADE } else { p.ink6 }
     } else if lit && classic {
         Color::rgb(0xFF, 0xFF, 0xFF)
     } else if lit {
@@ -1315,7 +1725,7 @@ fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool,
     let icon = ctx.px(ICON);
     if let Some(line) = slot.action.line_icon() {
         iconset::draw(s, line, slot.rect.x + pad_l as i32, slot.rect.y + (slot.rect.h as i32 - icon as i32) / 2, icon, ink, 255);
-    } else if let Some(glyph) = slot.action.icon() {
+    } else if let Some(glyph) = icon_glyph {
         glyphicon::draw(s, glyph, slot.rect.x + pad_l as i32, slot.rect.y + (slot.rect.h as i32 - icon as i32) / 2, icon, ink, 255);
     }
     // Справа: сочетание или стрелка подменю.
@@ -1334,7 +1744,9 @@ fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool,
     // Отступ подписи один и тот же со значком и без него: строка без картинки,
     // подтянутая к краю, ломает колонку подписей.
     let x = slot.rect.x + (pad_l + icon + ctx.px(ICON_GAP)) as i32;
-    paint::text_clipped(ctx, s, Role::Body, x, paint::baseline(ctx, Role::Body, slot.rect), (right - x).max(0) as u32, label, ink);
+    // The default item (what a double click does) is bold, as in Windows.
+    let role = if slot.action.is_default() { Role::Title } else { Role::Body };
+    paint::text_clipped(ctx, s, role, x, paint::baseline(ctx, role, slot.rect), (right - x).max(0) as u32, label, ink);
 }
 
 /// Каталог стола — там появляется всё, что создаётся его меню.

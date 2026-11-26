@@ -1086,7 +1086,7 @@ impl Compositor {
     }
 
     /// Монитор под точкой, а если она в щели между ними — ближайший.
-    fn output_near(&self, x: i32, y: i32) -> usize {
+    pub fn output_near(&self, x: i32, y: i32) -> usize {
         self.output_at(x, y).unwrap_or_else(|| {
             let mut best = 0;
             let mut best_d = i64::MAX;
@@ -1132,6 +1132,34 @@ impl Compositor {
             *area = self.work_rect_of(i);
         }
         (areas, n)
+    }
+
+    /// Work area of the monitor under the point (or nearest to it) - where
+    /// a window launched from there opens (25.11, `ui::origin`). The
+    /// primary's when `at` is `None` and on the phone.
+    #[must_use]
+    pub fn work_at(&self, at: Option<(i32, i32)>) -> Rect {
+        match at {
+            Some((x, y)) if !theme::is_mobile() => self.work_rect_of(self.output_near(x, y)),
+            _ => self.primary_work(),
+        }
+    }
+
+    /// Centre of the monitor «Пуск» is open on (25.11: a program chosen in
+    /// it with the keyboard opens there).
+    #[must_use]
+    pub fn menu_point(&self) -> Option<(i32, i32)> {
+        let o = self.menu_output.unwrap_or_else(|| self.primary_index());
+        self.output_rects().get(o).map(|r| (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2))
+    }
+
+    /// Where the window of task `task` stands that its new window (a dialog,
+    /// a second window) opens over (25.11): the focused one of the task, or
+    /// its topmost not minimized ordinary window.
+    #[must_use]
+    pub fn task_window_rect(&self, task: u32) -> Option<Rect> {
+        let mine = |window: &&Window| matches!(window.app, App::Program(owner, _) if owner == task) && !window.minimized && !window.popup;
+        self.windows.get(self.focus).filter(mine).or_else(|| self.windows.iter().rev().find(mine)).map(|window| window.rect)
     }
 
     /// Рабочая область монитора, на котором середина прямоугольника.
@@ -1547,7 +1575,9 @@ impl Compositor {
     #[must_use]
     pub fn cascade(&self, rect: Rect) -> Rect {
         let step = Window::title_height(self.scale) as i32;
-        let work = self.primary_work();
+        // The monitor the window is on (25.11: windows open on the monitor
+        // they were launched from, not only on the primary).
+        let work = self.work_rect_under(rect);
         let mut out = rect;
         for _ in 0..16 {
             let taken = self
@@ -4592,10 +4622,32 @@ impl Compositor {
         }
     }
 
+    /// The open submenu of the desktop menu closes when the pointer rests on
+    /// another row (25.11).
+    pub fn context_hover_tick(&mut self) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.hover_tick();
+        }
+    }
+
+    /// What «7-Zip ▸» of the open menu offers (25.11).
+    pub fn context_zip(&mut self, zip: super::context::ZipInfo) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.set_zip(zip);
+        }
+    }
+
     /// Программы «Открыть с помощью» для следующего открытия меню.
     pub fn context_handlers(&mut self, handlers: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>) {
         if let Some(menu) = self.context.as_mut() {
             menu.set_handlers(handlers);
+        }
+    }
+
+    /// Verbs of the settings store for the next opening of the menu (25.11).
+    pub fn context_verbs(&mut self, verbs: alloc::vec::Vec<(alloc::string::String, Option<alloc::string::String>)>) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.set_verbs(verbs);
         }
     }
 
@@ -5352,6 +5404,15 @@ impl Compositor {
         if super::capture::active() {
             let drawn = !self.hw_cursor && !theme::is_mobile() && plan.iter().all(Option::is_none);
             super::capture::note_pointer(&self.pointer, drawn);
+            // 25.11 (OBS zero copy): outputs shown straight from a client
+            // buffer - OBS may sample that buffer itself.
+            let mut sources = alloc::vec::Vec::new();
+            for (index, at) in plan.iter().enumerate().take(self.outputs.len()) {
+                if let Some(Ok((phys, pitch))) = at.and_then(|at| self.windows.get(at)).map(Window::scanout_source) {
+                    sources.push((self.outputs[index].rect, phys, pitch));
+                }
+            }
+            super::capture::note_direct(&sources);
         }
         if !self.damage_overflow && self.damage_count == 0 {
             return;
@@ -5461,7 +5522,10 @@ impl Compositor {
             let Some((at, window)) = top else {
                 continue;
             };
-            if window.fullscreen && window.rect == o && !dims(window.app) && window.direct_pixels().is_some() {
+            // 25.11: fullscreen, or a frameless window that covers the whole
+            // monitor by itself (borderless "fullscreen" of Wine games) - the
+            // panel checks above keep the taskbar case composed.
+            if window.rect == o && !dims(window.app) && window.direct_pixels().is_some() {
                 plan[index] = Some(at);
             }
         }
@@ -5489,6 +5553,11 @@ impl Compositor {
                 if now.is_some() { "shows a fullscreen window directly" } else { "composes again" },
                 now.or(was).map_or_else(|| alloc::string::String::from("-"), |app| self.label(app))
             );
+            if now.is_none() {
+                if let Some(app) = was {
+                    crate::kprintln!("  scanout     : composed on {} again (was '{}')", self.out_label(index), self.label(app));
+                }
+            }
             self.direct[index] = now;
             // A new window (or none) - the display may flip it again.
             self.flip_block[index] = None;
@@ -5517,8 +5586,9 @@ impl Compositor {
                     let o = self.outputs[index].rect;
                     let local = Rect::new(part.x - o.x, part.y - o.y, part.w, part.h);
                     self.flip_touched[index] = Some(self.flip_touched[index].map_or(local, |r| r.union(&local)));
-                    // Screen recorder (22.11): the frame is the client buffer.
-                    if super::capture::active() {
+                    // Screen recorder (22.11): the frame is the client buffer
+                    // (25.11: not copied when OBS samples that buffer itself).
+                    if super::capture::active() && super::capture::mirror_direct() {
                         if let Some(shown) = self.windows.get(window) {
                             if let Some(pixels) = shown.direct_pixels() {
                                 super::capture::put(part, pixels, part.x - shown.rect.x, part.y - shown.rect.y);
@@ -5574,6 +5644,8 @@ impl Compositor {
                 Err(why) => {
                     if self.flip_note[index].as_deref() != Some(why.as_str()) {
                         crate::kprintln!("  desktop     : output {index} does not flip: {why}");
+                        let client = self.windows.get(at).map_or_else(|| alloc::string::String::from("-"), |w| self.label(w.app));
+                        crate::kprintln!("  scanout     : not direct on {} for '{client}': {why} (one copy per frame instead)", self.out_label(index));
                         self.flip_note[index] = Some(why);
                     }
                 }
@@ -5616,6 +5688,14 @@ impl Compositor {
                                 "  desktop     : output {index} {}",
                                 if want.is_some() { "scans the fullscreen window's buffer out directly (no copy)" } else { "scans its frame buffer out again" }
                             );
+                            let client = plan[index]
+                                .and_then(|at| self.windows.get(at))
+                                .map_or_else(|| alloc::string::String::from("-"), |w| self.label(w.app));
+                            if want.is_some() {
+                                crate::kprintln!("  scanout     : direct on {} for '{client}' (page flip to the client buffer, no copy)", self.out_label(index));
+                            } else {
+                                crate::kprintln!("  scanout     : {} shows the desktop frame buffer again", self.out_label(index));
+                            }
                         }
                         if want.is_some() {
                             self.flip_note[index] = Some(alloc::string::String::new());
@@ -5627,6 +5707,7 @@ impl Compositor {
                     Err(crate::display::FlipError::Refused(why)) => {
                         if want.is_some() {
                             crate::kprintln!("  desktop     : output {index} does not flip: the display refused - {why}");
+                            crate::kprintln!("  scanout     : not direct on {}: the display refused - {why}", self.out_label(index));
                             self.flip_note[index] = Some(why.clone());
                             self.flip_block[index] = Some(why);
                             if self.flipped[index].is_none() {
@@ -5717,8 +5798,9 @@ impl Compositor {
         let w = window.rect;
         out.screen.blit(pixels, (part.x - o.x, part.y - o.y), Rect::new(part.x - w.x, part.y - w.y, part.w, part.h));
         // Screen recorder (22.11): without the pointer patch (it is patched
-        // into grabbed frames, see `capture::note_pointer`).
-        if super::capture::active() {
+        // into grabbed frames, see `capture::note_pointer`; 25.11: not when
+        // OBS samples the client buffer itself).
+        if super::capture::active() && super::capture::mirror_direct() {
             super::capture::put(part, pixels, part.x - w.x, part.y - w.y);
         }
         if !self.hw_cursor && self.pointer.is_visible() {
@@ -5734,6 +5816,18 @@ impl Compositor {
         // The flush is counted in the direct time (not in `note_flush`).
         crate::display::flush_output(out.backend, out.primary, part.x - o.x, part.y - o.y, part.w, part.h);
         super::note_direct(crate::time::uptime_ns().wrapping_sub(started), u64::from(part.w) * u64::from(part.h));
+    }
+
+    /// Monitor name for the `scanout:` log lines (25.11): `output N 'model'`.
+    fn out_label(&self, index: usize) -> alloc::string::String {
+        let Some(out) = self.outputs.get(index) else {
+            return alloc::format!("output {index}");
+        };
+        let backend = out.backend;
+        match crate::display::outputs::list().into_iter().find(|o| o.backend == backend) {
+            Some(o) if !o.name.is_empty() => alloc::format!("output {index} '{}'", o.name),
+            _ => alloc::format!("output {index}"),
+        }
     }
 
     /// Window name for the log (G3).
@@ -6370,6 +6464,11 @@ impl Compositor {
                 self.drop_shadow(back, menu.rect, band, dy, r);
                 self.stack(back, menu.surface(), menu.rect, band, dy, r);
                 if let Some((surface, rect)) = menu.sub_layer() {
+                    self.drop_shadow(back, rect, band, dy, r);
+                    self.stack(back, surface, rect, band, dy, r);
+                }
+                // «7-Zip ▸ CRC SHA ▸» (25.11): the second level.
+                if let Some((surface, rect)) = menu.sub2_layer() {
                     self.drop_shadow(back, rect, band, dy, r);
                     self.stack(back, surface, rect, band, dy, r);
                 }

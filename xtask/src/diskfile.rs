@@ -94,3 +94,98 @@ impl disk::BlockDevice for DiskFile {
         self.file.flush().map_err(|_| disk::Error::Io)
     }
 }
+
+/// Put a small file on the EFI system partition of a disk image (25.11:
+/// `\FREEOS\CONSOLE` - the harness asks the installed system for its console
+/// window at boot, as `qemu::prepare_esp` does on the live ESP). `dir` is
+/// created if missing; an existing file is replaced.
+pub fn put_esp_file(path: &Path, dir: &str, name: &str, contents: &[u8]) -> Result<()> {
+    let fs = open_esp(path)?;
+    {
+        let root = fs.root_dir();
+        let folder = match root.open_dir(dir) {
+            Ok(folder) => folder,
+            Err(_) => root.create_dir(dir).with_context(|| format!("не удалось создать \\{dir} на ESP"))?,
+        };
+        let mut file = folder.create_file(name).with_context(|| format!("не удалось создать \\{dir}\\{name} на ESP"))?;
+        file.truncate()?;
+        file.write_all(contents)?;
+        file.flush()?;
+    }
+    fs.unmount().context("ESP образа не закрылась")?;
+    Ok(())
+}
+
+/// Remove a file from the ESP of a disk image; a missing file is fine.
+pub fn remove_esp_file(path: &Path, dir: &str, name: &str) -> Result<()> {
+    let fs = open_esp(path)?;
+    if let Ok(folder) = fs.root_dir().open_dir(dir) {
+        let _ = folder.remove(name);
+    }
+    fs.unmount().context("ESP образа не закрылась")?;
+    Ok(())
+}
+
+/// The FAT of the image's EFI system partition.
+fn open_esp(path: &Path) -> Result<fatfs::FileSystem<Partition>> {
+    let (first, last) = {
+        let mut dev = DiskFile::open(path, 512)?;
+        let table = disk::gpt::read(&mut dev).map_err(|err| anyhow::anyhow!("на образе {} нет GPT: {err}", path.display()))?;
+        let esp = table.find(disk::gpt::ESP_TYPE).ok_or_else(|| anyhow::anyhow!("на образе {} нет ESP", path.display()))?;
+        (esp.first_lba, esp.last_lba)
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("не удалось открыть образ {}", path.display()))?;
+    let part = Partition { file, start: first * 512, len: (last + 1 - first) * 512, pos: 0 };
+    fatfs::FileSystem::new(part, fatfs::FsOptions::new()).context("ESP образа не читается как FAT")
+}
+
+/// A partition of an image file as a seekable stream (for `fatfs`).
+struct Partition {
+    file: File,
+    start: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl Read for Partition {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = (buf.len() as u64).min(self.len.saturating_sub(self.pos)) as usize;
+        self.file.seek(SeekFrom::Start(self.start + self.pos))?;
+        let got = self.file.read(&mut buf[..n])?;
+        self.pos += got as u64;
+        Ok(got)
+    }
+}
+
+impl Write for Partition {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = (buf.len() as u64).min(self.len.saturating_sub(self.pos)) as usize;
+        self.file.seek(SeekFrom::Start(self.start + self.pos))?;
+        let put = self.file.write(&buf[..n])?;
+        self.pos += put as u64;
+        Ok(put)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Seek for Partition {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let next = match to {
+            SeekFrom::Start(at) => at as i64,
+            SeekFrom::End(delta) => self.len as i64 + delta,
+            SeekFrom::Current(delta) => self.pos as i64 + delta,
+        };
+        if next < 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before the partition"));
+        }
+        self.pos = next as u64;
+        Ok(self.pos)
+    }
+}

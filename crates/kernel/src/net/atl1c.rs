@@ -630,6 +630,11 @@ impl Card for Atl1c {
         "atl1c"
     }
 
+    fn link(&self) -> Option<(bool, u32)> {
+        // SAFETY: the register window is mapped for the card's lifetime.
+        Some(unsafe { link_speed(self.regs) }.map_or((false, 0), |(speed, _)| (true, u32::from(speed))))
+    }
+
     fn mac(&self) -> [u8; 6] {
         self.mac
     }

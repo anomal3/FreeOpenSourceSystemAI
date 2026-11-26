@@ -325,6 +325,18 @@ pub fn prepare_esp(built: &Built, unattended: bool) -> Result<PathBuf> {
             .with_context(|| format!("не удалось удалить {}", autorun.display()))?;
     }
 
+    // The console window at boot (25.11): a person's system starts without
+    // the terminal, the harness types into the shell and looks at it, so its
+    // runs ask for the window with `\FREEOS\CONSOLE` (the bootloader turns it
+    // into `BOOT_CONSOLE`). A scenario checking the person's boot removes it
+    // (`scenarios::without_console`).
+    let console = esp.join("FREEOS").join("CONSOLE");
+    if unattended {
+        std::fs::write(&console, b"console\n").with_context(|| format!("не удалось записать {}", console.display()))?;
+    } else if console.is_file() {
+        std::fs::remove_file(&console).with_context(|| format!("не удалось удалить {}", console.display()))?;
+    }
+
     // Выбор разрешения из «Параметров» ложится на ESP рядом с меткой, а каталог
     // ESP у воркера один на все его прогоны. Оставленный, он увёл бы следующий
     // сценарий в чужой режим, и всё, что целится мышью по размеру экрана,

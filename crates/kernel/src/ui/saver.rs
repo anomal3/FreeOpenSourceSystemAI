@@ -28,6 +28,7 @@
 //! Без своего выбора — галерея обоев [`GALLERY`]. Смена фото — плавная
 //! ([`FADE_MS`]).
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -865,6 +866,43 @@ impl Mask {
         Some(Self { w: zw, h: zh, alpha })
     }
 
+    /// Line of text rasterized by the TrueType font at `px` - its own size,
+    /// not a zoomed heading (25.11, Roman: the floating clock is blurry while
+    /// the lock-screen clock is crisp).
+    fn ttf(font: &ttf::Font, text: &str, px: f32) -> Option<Self> {
+        let metrics = font.line_metrics(px);
+        let ascent = ceil(metrics.ascent) as i32;
+        let h = ceil(metrics.ascent + metrics.descent).max(1) as u32;
+        let glyphs: Vec<ttf::Bitmap> = text.chars().map(|ch| font.rasterize(ch, px)).collect();
+        let advance: f32 = glyphs.iter().map(|g| g.advance).sum();
+        let w = (ceil(advance).max(0) as u32 + 4).max(1);
+        let mut alpha = Vec::new();
+        alpha.try_reserve_exact((w * h) as usize).ok()?;
+        alpha.resize((w * h) as usize, 0u8);
+        let mut pen = 2.0f32;
+        for glyph in &glyphs {
+            let x0 = (pen + 0.5) as i32 + glyph.left;
+            let y0 = ascent + glyph.top;
+            for gy in 0..glyph.height {
+                let y = y0 + gy as i32;
+                if y < 0 || y >= h as i32 {
+                    continue;
+                }
+                for gx in 0..glyph.width {
+                    let x = x0 + gx as i32;
+                    if x < 0 || x >= w as i32 {
+                        continue;
+                    }
+                    let cover = glyph.coverage[(gy * glyph.width + gx) as usize];
+                    let at = (y as u32 * w + x as u32) as usize;
+                    alpha[at] = alpha[at].max(cover);
+                }
+            }
+            pen += glyph.advance;
+        }
+        Some(Self { w, h, alpha })
+    }
+
     /// Без пустых строк сверху и снизу: межстрочный запас шрифта, увеличенный
     /// в разы, разводил часы и дату слишком далеко.
     fn trimmed(self) -> Self {
@@ -1210,14 +1248,82 @@ fn info_text() -> String {
     format!("ЦП {busy} %    Память {} из {}", size(used), size(total))
 }
 
+/// The saver's TrueType face (Inter, as the interface), loaded while the
+/// saver is up and dropped with it (876 KiB is not worth keeping for a
+/// screen that is shown now and then). `Some(None)` - tried, not there.
+static FONT: SpinLock<Option<Option<Box<ttf::Font>>>> = SpinLock::new(None);
+
+/// Where the face lives (`cbuild::SYSTEM_FONTS`).
+const FONT_PATH: &str = "/usr/share/fonts/fossai/Inter.ttf";
+
+/// Take the saver's face out of [`FONT`] (loading it the first time) - out
+/// of the spin lock, so rasterizing does not run with interrupts off. Put
+/// it back with [`put_font`].
+fn take_font() -> Option<Box<ttf::Font>> {
+    let known = FONT.lock().take();
+    match known {
+        Some(font) => font,
+        None => {
+            let font = match crate::fs::read(FONT_PATH, 4 << 20) {
+                Some(Ok((bytes, _))) => ttf::Font::parse(bytes).map(Box::new),
+                _ => None,
+            };
+            kprintln!("  saver       : clock face {}", if font.is_some() { "Inter (TrueType, at the monitor's size)" } else { "built-in (no Inter.ttf)" });
+            font
+        }
+    }
+}
+
+fn put_font(font: Option<Box<ttf::Font>>) {
+    *FONT.lock() = Some(font);
+}
+
+/// `f32::ceil` without `std`.
+fn ceil(x: f32) -> i32 {
+    let t = x as i32;
+    if (t as f32) < x { t + 1 } else { t }
+}
+
 /// Надпись заставки для монитора высотой `height` и ключ её содержимого.
-fn build_mask(height: u32) -> (Mask, String) {
+/// `known` - the key of the shown one: the same - `None`, nothing to build
+/// (the clock is checked every second, and rasterizing it anew each time
+/// costs for nothing).
+fn build_mask(height: u32, known: &str) -> Option<(Mask, String)> {
     let clock = CLOCK.load(Ordering::Relaxed);
     let info = INFO.load(Ordering::Relaxed);
     let clock_text = clock.then(|| crate::time::clock_text().unwrap_or_else(|| String::from("FossAi")));
     let date = if clock { date_text() } else { None };
     let info_line = info.then(info_text);
     let key = format!("{clock_text:?}|{date:?}|{info_line:?}|{height}");
+    if key == known {
+        return None;
+    }
+    let font = take_font();
+    let mask = font.as_deref().map_or_else(
+        || zoomed_mask(height, clock_text.as_deref(), date.as_deref(), info_line.as_deref()),
+        |font| {
+            // Sizes as the zoomed text had (a fifth of the monitor for the
+            // clock), now in real pixels of this monitor.
+            let h = height as f32;
+            let mut parts = Vec::new();
+            if let Some(text) = &clock_text {
+                parts.extend(Mask::ttf(font, text, h / 5.0));
+            }
+            if let Some(text) = &date {
+                parts.extend(Mask::ttf(font, text, (h / 22.0).max(18.0)));
+            }
+            if let Some(text) = &info_line {
+                parts.extend(Mask::ttf(font, text, (h / 40.0).max(14.0)));
+            }
+            Mask::stack(parts, height / 45)
+        },
+    );
+    put_font(font);
+    Some((mask, key))
+}
+
+/// The inscription from the built-in faces zoomed (no TrueType face).
+fn zoomed_mask(height: u32, clock_text: Option<&str>, date: Option<&str>, info_line: Option<&str>) -> Mask {
     let scale = if height >= 1000 { mini_ui::Scale::TWO } else { mini_ui::Scale::ONE };
     let ctx = Ctx::scaled(scale);
     let heading = u32::from(ctx.face(Role::Heading).line).max(1);
@@ -1227,17 +1333,17 @@ fn build_mask(height: u32) -> (Mask, String) {
     // sharper they are.
     let big = Ctx::scaled(mini_ui::Scale::TWO);
     let big_line = u32::from(big.face(Role::Heading).line).max(1);
-    if let Some(text) = &clock_text {
+    if let Some(text) = clock_text {
         parts.extend(Mask::text(big, Role::Heading, text, (height / 5 / big_line).clamp(2, 8)));
     }
-    if let Some(text) = &date {
+    if let Some(text) = date {
         let (face, zoom) = if height >= 600 { (big, (height / 22 / big_line).clamp(1, 3)) } else { (ctx, (height / 20 / heading).clamp(1, 3)) };
         parts.extend(Mask::text(face, Role::Heading, text, zoom));
     }
-    if let Some(text) = &info_line {
+    if let Some(text) = info_line {
         parts.extend(Mask::text(ctx, Role::Body, text, (height / 34 / body).clamp(1, 2)));
     }
-    (Mask::stack(parts, height / 45), key)
+    Mask::stack(parts, height / 45)
 }
 
 // ---------------------------------------------------------------------------
@@ -1279,7 +1385,9 @@ pub fn start(preview: bool) -> bool {
     let height = rects.iter().map(|r| r.h).min().unwrap_or(720);
     let index = INDEX.load(Ordering::Relaxed);
     let (outs, first) = build_outs(&rects, index);
-    let (mask, key) = build_mask(height);
+    let Some((mask, key)) = build_mask(height, "") else {
+        return false;
+    };
     let shown = Shown { outs, mask, pos: (120, 700), vel: (1, -1), preview, old: None, fade: 255 };
     FADE_AT.store(0, Ordering::Relaxed);
     REBUILD.store(false, Ordering::Relaxed);
@@ -1334,6 +1442,8 @@ pub fn end_on(desktop: &mut super::compositor::Compositor) {
     };
     let locks = LOCK.load(Ordering::Relaxed) && !old.preview;
     drop(old);
+    let font = FONT.lock().take();
+    drop(font);
     if locks && !desktop.locked() {
         desktop.lock_screen();
     }
@@ -1400,10 +1510,9 @@ pub fn tick() {
     if now >= CHECKED_MS.load(Ordering::Relaxed) + 1000 {
         CHECKED_MS.store(now, Ordering::Relaxed);
         let height = RECTS.lock().iter().map(|r| r.h).min().unwrap_or(720);
-        let (fresh, key) = build_mask(height);
-        let mut shown_key = KEY.lock();
-        if *shown_key != key {
-            *shown_key = key;
+        let known = KEY.lock().clone();
+        if let Some((fresh, key)) = build_mask(height, &known) {
+            *KEY.lock() = key;
             mask = Some(fresh);
         }
     }

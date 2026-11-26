@@ -2,9 +2,13 @@
 
 Этот файл ставится вместе с пакетом `obsos` (`/opt/obsos/share/NOTICE.md`) и
 показывается в «О программе» браузера и в «Параметры → О системе →
-Сторонние компоненты». Код FreeOS — GPL-3.0-only; компоненты ниже остаются
+Сторонние компоненты». Код OBSOS — © 2026 Roman, MIT или Apache-2.0
+(`MIT OR Apache-2.0`), код FreeOS — GPL-3.0-only; компоненты ниже остаются
 под своими лицензиями. Файлы под MPL-2.0, взятые почти как есть, сохраняют
 свой заголовок с лицензией (MPL действует пофайлово).
+
+Исходники OBSOS (оболочка, правки крейтов Servo):
+https://github.com/anomal3/OBSOS
 
 Исходники FreeOS вместе со всеми правками сторонних компонентов
 (`ports/servo/mozjs/freeos.patch` и т. п.):
@@ -19,7 +23,7 @@ https://github.com/anomal3/FreeOpenSourceSystemAI
 | **ICU** (Intl в SpiderMonkey) | © Unicode, Inc. и участники | Unicode License v3 (`Unicode-3.0`) |
 | **ICU4X** (обёртки Intl в `mozjs_sys`) | © Unicode, Inc. и участники | Unicode-3.0 |
 | **egui** | © Emil Ernerfeldt и участники | MIT или Apache-2.0 |
-| **egui_software_backend** (с правкой FreeOS, `ports/servo/egui-software-backend`) | © DGriffin91 (github.com/DGriffin91) и участники | MIT или Apache-2.0 |
+| **egui_software_backend** (с правкой FreeOS, `third_party/egui-software-backend` в репозитории OBSOS) | © DGriffin91 (github.com/DGriffin91) и участники | MIT или Apache-2.0 |
 | **RustCrypto**: `argon2`, `chacha20poly1305`, `sha2` (хранилище паролей) | © RustCrypto Developers | MIT или Apache-2.0 |
 | **zlib** (`libz-sys`) | © Jean-loup Gailly, Mark Adler | Zlib |
 | **HarfBuzz** (`harfbuzz-sys`) | © HarfBuzz contributors | MIT («Old MIT») |

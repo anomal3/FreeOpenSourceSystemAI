@@ -402,6 +402,10 @@ impl Modifiers {
     /// Caps Lock **залипший**, а не нажатый: это состояние, а не клавиша.
     pub const CAPS: Self = Self(1 << 4);
     pub const NUM_LOCK: Self = Self(1 << 5);
+    /// Not a modifier: the event came from the serial line (the byte decoder
+    /// of [`ascii`], 25.11) and not from a keyboard. The desktop lets serial
+    /// keys reach the shell even when no window shows it.
+    pub const SERIAL: Self = Self(1 << 6);
 
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
@@ -644,6 +648,21 @@ pub fn post(code: KeyCode, pressed: bool) {
         // ввода, потому что именно оно уже показано на экране эхом. Выбросив
         // старое, мы получили бы строку, не совпадающую с тем, что видит
         // пользователь.
+        queue.dropped += 1;
+    }
+}
+
+/// [`post`] for a key synthesized from the serial line: the event carries
+/// [`Modifiers::SERIAL`] (the modifier state itself is shared, as before).
+pub fn post_serial(code: KeyCode, pressed: bool) {
+    announce();
+    let Some(mut queue) = QUEUE.try_lock() else {
+        DROPPED_LOCKED_OUT.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    queue.posted += 1;
+    let mods = queue.apply(code, pressed).union(Modifiers::SERIAL);
+    if !queue.push(KeyEvent { code, pressed, mods }) {
         queue.dropped += 1;
     }
 }

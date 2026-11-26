@@ -4,11 +4,16 @@
 //!
 //! ```text
 //! archiver                         пустое окно: «Открыть архив…», «Создать архив…»
-//! archiver АРХИВ                   содержимое архива: папки, извлечь, проверить, добавить
-//! archiver --extract АРХИВ         «Извлечь все…»: куда, затем ход и закрытие
-//! archiver --extract-here АРХИВ…   «Извлечь сюда»: рядом с архивом, без вопросов
-//! archiver --add ПУТЬ…             «Добавить в архив…»: имя, формат, сжатие, пароль
-//! archiver --zip ПУТЬ…             «Сжать в ZIP»: ИМЯ.zip рядом, без вопросов
+//! archiver АРХИВ                   окно как 7-Zip File Manager: меню, панель, адрес, столбцы
+//! archiver --type ТИП АРХИВ        «Открыть архив ▸ ТИП» (`-tТИП`: 7z, zip, *, # …)
+//! archiver --extract АРХИВ         «Распаковать»: куда, затем ход и закрытие
+//! archiver --extract-here АРХИВ…   «Распаковать здесь»: рядом с архивом, без вопросов
+//! archiver --extract-to АРХИВ…     «Распаковать в "ИМЯ\"»: папка по имени архива
+//! archiver --test АРХИВ…           «Тестировать»: итог окном
+//! archiver --add ПУТЬ…             «Добавить к архиву…»: имя, формат, сжатие, пароль
+//! archiver --7z ПУТЬ…              «Добавить к "ИМЯ.7z"» (имя — как у 7-Zip)
+//! archiver --zip ПУТЬ…             «Добавить к "ИМЯ.zip"»
+//! archiver --hash МЕТОД ПУТЬ…      «CRC SHA ▸ МЕТОД» (CRC32 CRC64 SHA1 SHA256 *): итог окном
 //! ```
 //!
 //! Пути с пробелом приходят `%20` (как `files --properties`), длинный список
@@ -79,6 +84,12 @@ struct Item {
     /// «24.11.2026 10:00»; пусто — неизвестно.
     modified: String,
     encrypted: bool,
+    /// The columns of 7-Zip File Manager (25.11): `Attributes`, `CRC`,
+    /// `Method`, `Block` of `-slt`.
+    attributes: String,
+    crc: Option<u32>,
+    method: String,
+    block: String,
 }
 
 /// Сведения об архиве целиком.
@@ -88,6 +99,10 @@ struct Info {
     method: String,
     physical: u64,
     solid: bool,
+    blocks: String,
+    headers: u64,
+    /// The banner line of 7zz («7-Zip (z) 26.06 …») — «О программе».
+    banner: String,
 }
 
 /// Строка списка текущей папки архива.
@@ -98,6 +113,87 @@ struct Row {
     packed: u64,
     modified: String,
     encrypted: bool,
+    attributes: String,
+    /// A folder: the sum of the CRCs inside (as 7-Zip shows it).
+    crc: Option<u32>,
+    method: String,
+    block: String,
+    /// Folders and files inside a folder row (all levels).
+    folders: u32,
+    files: u32,
+}
+
+/// Columns of the list, as in 7-Zip File Manager: title, width in layout
+/// points (the first stretches), numbers on the right.
+const COLUMNS: [(&str, u32, bool); 10] = [
+    ("Имя", 0, false),
+    ("Размер", 120, true),
+    ("Сжатый", 120, true),
+    ("Изменён", 140, false),
+    ("Атрибуты", 84, false),
+    ("CRC", 92, true),
+    ("Зашифрован", 104, false),
+    ("Метод", 120, false),
+    ("Блок", 60, true),
+    ("Папки", 70, true),
+];
+
+/// Bytes with groups of three, as 7-Zip writes them: «354 550 709».
+fn grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+impl Row {
+    /// Text of column `column`.
+    fn cell(&self, column: usize) -> String {
+        match column {
+            0 => self.name.clone(),
+            1 => if self.folder && self.size == 0 && self.files == 0 { String::new() } else { grouped(self.size) },
+            2 => if self.packed == 0 && self.folder { String::new() } else { grouped(self.packed) },
+            3 => self.modified.clone(),
+            4 => self.attributes.clone(),
+            5 => self.crc.map_or_else(String::new, |crc| format!("{crc:08X}")),
+            6 => String::from(if self.encrypted { "+" } else { "-" }),
+            7 => self.method.clone(),
+            8 => self.block.clone(),
+            _ => if self.folder { self.folders.to_string() } else { String::new() },
+        }
+    }
+}
+
+/// Order rows by column `column` (folders first, as 7-Zip does).
+fn sort_rows(rows: &mut [Row], column: usize, descending: bool) {
+    rows.sort_by(|a, b| {
+        let key = match column {
+            1 => a.size.cmp(&b.size),
+            2 => a.packed.cmp(&b.packed),
+            3 => date_key(&a.modified).cmp(&date_key(&b.modified)),
+            4 => a.attributes.cmp(&b.attributes),
+            5 => a.crc.cmp(&b.crc),
+            6 => a.encrypted.cmp(&b.encrypted),
+            7 => a.method.cmp(&b.method),
+            8 => a.block.len().cmp(&b.block.len()).then_with(|| a.block.cmp(&b.block)),
+            9 => a.folders.cmp(&b.folders),
+            _ => core::cmp::Ordering::Equal,
+        };
+        let key = key.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        b.folder.cmp(&a.folder).then(if descending { key.reverse() } else { key })
+    });
+}
+
+/// «24.11.2026 10:00» → «2026.11.24 10:00» for ordering.
+fn date_key(text: &str) -> String {
+    let (date, time) = text.split_once(' ').unwrap_or((text, ""));
+    let parts: Vec<&str> = date.split('.').collect();
+    if parts.len() == 3 { format!("{}.{}.{} {time}", parts[2], parts[1], parts[0]) } else { text.to_string() }
 }
 
 /// Разобрать вывод `7zz l -slt`.
@@ -109,6 +205,9 @@ fn parse_listing(text: &str) -> (Info, Vec<Item>) {
     let mut seen_archive = false;
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
+        if info.banner.is_empty() && line.trim_start().starts_with("7-Zip") {
+            info.banner = line.trim().to_string();
+        }
         if line.starts_with("----------") {
             in_items = true;
             continue;
@@ -129,6 +228,8 @@ fn parse_listing(text: &str) -> (Info, Vec<Item>) {
                 "Method" if seen_archive => info.method = value.to_string(),
                 "Physical Size" => info.physical = value.trim().parse().unwrap_or(0),
                 "Solid" => info.solid = value.trim() == "+",
+                "Blocks" => info.blocks = value.trim().to_string(),
+                "Headers Size" => info.headers = value.trim().parse().unwrap_or(0),
                 _ => {}
             }
             continue;
@@ -144,8 +245,13 @@ fn parse_listing(text: &str) -> (Info, Vec<Item>) {
                 if value.starts_with('D') {
                     item.folder = true;
                 }
+                // «D_ drwxr-xr-x» / «A_ -rw-r--r--»: the Windows letters.
+                item.attributes = value.split_whitespace().next().unwrap_or("").trim_end_matches('_').to_string();
             }
             "Encrypted" => item.encrypted = value.trim() == "+",
+            "CRC" => item.crc = u32::from_str_radix(value.trim(), 16).ok(),
+            "Method" => item.method = value.trim().to_string(),
+            "Block" => item.block = value.trim().to_string(),
             _ => {}
         }
     }
@@ -189,28 +295,61 @@ fn rows_of(items: &[Item], dir: &str) -> Vec<Row> {
             None => (rest, false),
         };
         let folder = deeper || item.folder;
-        match rows.iter_mut().find(|row| row.name == name && row.folder == folder) {
-            Some(row) => {
-                if deeper && !item.folder {
-                    row.size += item.size;
-                    row.packed += item.packed;
+        let at = match rows.iter().position(|row| row.name == name && row.folder == folder) {
+            Some(at) => at,
+            None => {
+                rows.push(Row {
+                    name: name.to_string(),
+                    folder,
+                    size: 0,
+                    packed: 0,
+                    modified: String::new(),
+                    encrypted: false,
+                    attributes: String::from(if folder { "D" } else { "" }),
+                    crc: None,
+                    method: String::new(),
+                    block: String::new(),
+                    folders: 0,
+                    files: 0,
+                });
+                rows.len() - 1
+            }
+        };
+        let row = &mut rows[at];
+        row.encrypted |= item.encrypted;
+        if deeper {
+            // Something inside a folder row: count it, sum sizes and CRCs.
+            if item.folder {
+                row.folders += 1;
+            } else {
+                row.files += 1;
+                row.size += item.size;
+                row.packed += item.packed;
+                if let Some(crc) = item.crc {
+                    row.crc = Some(row.crc.unwrap_or(0).wrapping_add(crc));
                 }
-                row.encrypted |= item.encrypted;
-                if !deeper && !item.modified.is_empty() {
-                    row.modified = item.modified.clone();
+                if row.method.is_empty() {
+                    row.method = item.method.clone();
                 }
             }
-            None => rows.push(Row {
-                name: name.to_string(),
-                folder,
-                size: if deeper && item.folder { 0 } else { item.size },
-                packed: if deeper && item.folder { 0 } else { item.packed },
-                modified: if deeper { String::new() } else { item.modified.clone() },
-                encrypted: item.encrypted,
-            }),
+        } else {
+            // The entry itself.
+            if !item.modified.is_empty() {
+                row.modified = item.modified.clone();
+            }
+            if !item.attributes.is_empty() {
+                row.attributes = item.attributes.clone();
+            }
+            if !item.folder {
+                row.size = item.size;
+                row.packed = item.packed;
+                row.crc = item.crc;
+                row.method = item.method.clone();
+                row.block = item.block.clone();
+            }
         }
     }
-    rows.sort_by(|a, b| b.folder.cmp(&a.folder).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    sort_rows(&mut rows, 0, false);
     rows
 }
 
@@ -224,10 +363,23 @@ enum JobKind {
     List,
     /// Извлечь в папку; `open` — открыть потом этот файл (двойной щелчок по
     /// файлу внутри архива), `show` — открыть папку в «Файлах».
-    Extract { dest: String, open: Option<String>, show: bool },
+    /// `then_delete` — «Переместить» (25.11): these names leave the archive
+    /// after they are out.
+    Extract { dest: String, open: Option<String>, show: bool, then_delete: Vec<String> },
     Test,
     Add { archive: String },
     Delete,
+    /// «CRC SHA» (25.11): `7zz h -scrc<method>` of files on disk.
+    Hash { method: String, what: String },
+}
+
+/// What the action window does with the archives after the first
+/// (`--extract-here`, `--extract-to`, `--test` take several).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Queue {
+    Here,
+    To,
+    Test,
 }
 
 struct Job {
@@ -468,6 +620,9 @@ enum Pick {
     ExtractTo,
     AddFiles,
     SaveArchive,
+    /// «Копировать» / «Переместить» of the toolbar (25.11): where to.
+    CopyTo,
+    MoveTo,
 }
 
 /// Вопрос посреди окна.
@@ -478,6 +633,69 @@ enum Overlay {
     Message(String, String, bool),
     /// Удалить выбранное из архива? (0 — «Удалить», 1 — «Отмена».)
     Delete(usize),
+    /// A table of facts (25.11): «Информация» (archive properties), «CRC
+    /// SHA» results, «О программе». `copy` — a «Копировать» button.
+    Facts { title: String, rows: Vec<(String, String)>, copy: bool },
+}
+
+/// Menu bar of the window (25.11, as 7-Zip File Manager).
+const MENUS: [&str; 6] = ["Файл", "Правка", "Вид", "Избранное", "Сервис", "Справка"];
+
+/// Toolbar of the window, in the order and with the words of 7-Zip.
+const TOOLS: [&str; 7] = ["Добавить", "Извлечь", "Тестировать", "Копировать", "Переместить", "Удалить", "Информация"];
+
+/// What a menu item or a toolbar button does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cmd {
+    Open,
+    OpenArchive,
+    Add,
+    Extract,
+    Test,
+    CopyTo,
+    MoveTo,
+    Delete,
+    Info,
+    CloseArchive,
+    Exit,
+    CreateArchive,
+    SelectAll,
+    SelectNone,
+    Invert,
+    Sort(u8),
+    Up,
+    Refresh,
+    FavAdd,
+    Fav(u8),
+    FavClear,
+    /// Checksum of the archive file (index in [`HASHES`]).
+    Hash(u8),
+    About,
+}
+
+/// «CRC SHA» methods: menu words and the `-scrc` key.
+const HASHES: [(&str, &str); 5] = [("CRC-32", "CRC32"), ("CRC-64", "CRC64"), ("SHA-1", "SHA1"), ("SHA-256", "SHA256"), ("*", "*")];
+
+const TOOL_CMDS: [Cmd; 7] = [Cmd::Add, Cmd::Extract, Cmd::Test, Cmd::CopyTo, Cmd::MoveTo, Cmd::Delete, Cmd::Info];
+
+/// An item of a menu of the bar.
+struct BarItem {
+    label: String,
+    keys: Option<&'static str>,
+    cmd: Cmd,
+    group: u8,
+    enabled: bool,
+}
+
+/// Favourites: `archiver/favorites/<n>` = `archive\tfolder inside` (user scope).
+const FAVORITES: usize = 10;
+
+fn favorites() -> Vec<(String, String)> {
+    (0..FAVORITES)
+        .filter_map(|index| user_progs::reg_get_in("user", &format!("archiver/favorites/{index}")))
+        .filter_map(|value| value.split_once('\t').map(|(archive, dir)| (archive.to_string(), dir.to_string())))
+        .filter(|(archive, _)| !archive.is_empty())
+        .collect()
 }
 
 struct Archiver {
@@ -502,53 +720,86 @@ struct Archiver {
     quit_after: bool,
     /// Очередь `--extract-here`: архивы, которые ещё ждут.
     queue: Vec<String>,
+    queue_kind: Queue,
+    /// Results of `--test` over several archives.
+    tested: Vec<(String, bool)>,
     done: bool,
+    /// Sorted by column `.0`, descending `.1` (25.11).
+    sort: (usize, bool),
+    /// Open menu of the bar and its lit item.
+    bar: Option<(usize, usize)>,
+    /// Toolbar button under the pointer.
+    hot: Option<usize>,
+    /// `-t<type>` of «Открыть архив ▸» (25.11): empty — 7-Zip guesses.
+    type_arg: String,
 }
 
 // ---------------------------------------------------------------------------
 // Раскладка
 // ---------------------------------------------------------------------------
 
+/// The window of 7-Zip File Manager (25.11): menu bar, toolbar of big
+/// buttons, address row with «вверх», the list, the status line.
 struct Plan {
+    menubar: Rect,
+    heads: [Rect; 6],
     toolbar: Rect,
-    buttons: [Rect; 5],
-    crumbs: Rect,
+    buttons: [Rect; 7],
     up: Rect,
+    address: Rect,
     table: Table,
+    columns: Vec<Rect>,
     status: Rect,
 }
 
-const TOOL_LABELS: [&str; 5] = ["Извлечь…", "Проверить", "Добавить…", "Удалить", "Открыть…"];
-
 impl Plan {
     fn new(ctx: Ctx, area: Rect) -> Self {
-        let frame = kit::Frame::new(ctx, area);
-        let pad = ctx.px(12) as i32;
-        let bh = ctx.px(32);
-        let by = frame.toolbar.y + (frame.toolbar.h as i32 - bh as i32) / 2;
+        let pad = ctx.px(6) as i32;
+        let menubar = Rect::new(area.x, area.y, area.w, ctx.px(30).min(area.h));
         let face = ctx.face(Role::Body);
-        let mut x = frame.toolbar.x + pad;
-        let mut buttons = [Rect::EMPTY; 5];
-        for (index, label) in TOOL_LABELS.iter().enumerate() {
-            let w = face.width(label) + ctx.px(28 + 22);
-            if index == 4 {
-                // «Открыть…» — у правого края.
-                buttons[index] = Rect::new(frame.toolbar.right() - pad - w as i32, by, w, bh);
-            } else {
-                buttons[index] = Rect::new(x, by, w, bh);
-                x += w as i32 + ctx.px(6) as i32;
-            }
+        let mut heads = [Rect::EMPTY; 6];
+        let mut x = menubar.x + pad;
+        for (index, label) in MENUS.iter().enumerate() {
+            let w = face.width(label) + ctx.px(20);
+            heads[index] = Rect::new(x, menubar.y + ctx.pxi(3), w, menubar.h.saturating_sub(ctx.px(6)));
+            x += w as i32;
         }
-        let crumb_h = ctx.px(36);
-        let crumb_row = Rect::new(frame.body.x, frame.body.y, frame.body.w, crumb_h);
-        let up = Rect::new(crumb_row.x + pad, crumb_row.y + ctx.px(4) as i32, ctx.px(28), ctx.px(28));
-        let crumbs = Rect::new(up.right() + ctx.px(8) as i32, crumb_row.y + ctx.px(4) as i32, (crumb_row.right() - pad - up.right() - ctx.px(8) as i32).max(0) as u32, ctx.px(28));
-        let body = Rect::new(frame.body.x, crumb_row.bottom(), frame.body.w, frame.body.h.saturating_sub(crumb_h));
-        Self { toolbar: frame.toolbar, buttons, crumbs, up, table: Table::new(ctx, body), status: frame.status }
+        let toolbar = Rect::new(area.x, menubar.bottom(), area.w, ctx.px(64));
+        let small = ctx.face(Role::Caption);
+        let mut buttons = [Rect::EMPTY; 7];
+        let mut x = toolbar.x + pad;
+        for (index, label) in TOOLS.iter().enumerate() {
+            let w = (small.width(label) + ctx.px(20)).max(ctx.px(76));
+            buttons[index] = Rect::new(x, toolbar.y + ctx.pxi(4), w, toolbar.h.saturating_sub(ctx.px(8)));
+            x += w as i32 + ctx.pxi(2);
+        }
+        let row = Rect::new(area.x, toolbar.bottom(), area.w, ctx.px(38));
+        let up = Rect::new(row.x + pad + ctx.pxi(2), row.y + ctx.pxi(5), ctx.px(28), ctx.px(28));
+        let address = Rect::new(up.right() + ctx.pxi(6), up.y, (row.right() - pad - up.right() - ctx.pxi(6)).max(0) as u32, ctx.px(28));
+        let status_h = ctx.px(theme::STATUS_H);
+        let status = Rect::new(area.x, (area.bottom() - status_h as i32).max(row.bottom()), area.w, status_h);
+        let body = Rect::new(area.x, row.bottom(), area.w, (status.y - row.bottom()).max(0) as u32);
+        let table = Table::new(ctx, body);
+        let widths: Vec<u32> = COLUMNS.iter().map(|(_, w, _)| ctx.px(*w)).collect();
+        let columns = table.columns(ctx, &widths, ctx.px(200));
+        Self { menubar, heads, toolbar, buttons, up, address, table, columns, status }
     }
 
     fn step(&self) -> u32 {
         self.table.row_h
+    }
+
+    /// Column under `x` in the header.
+    fn column_at(&self, x: i32) -> Option<usize> {
+        let shown: Vec<(usize, Rect)> = self.columns.iter().copied().enumerate().filter(|(_, rect)| rect.w > 0).collect();
+        for (at, (index, rect)) in shown.iter().enumerate() {
+            let left = if at == 0 { self.table.header.x } else { rect.x - (rect.x - shown[at - 1].1.right()).max(0) };
+            let right = shown.get(at + 1).map_or(self.table.header.right(), |(_, next)| next.x);
+            if x >= left && x < right {
+                return Some(*index);
+            }
+        }
+        None
     }
 }
 
@@ -693,7 +944,13 @@ impl Archiver {
             password: None,
             quit_after: false,
             queue: Vec::new(),
+            queue_kind: Queue::Here,
+            tested: Vec::new(),
             done: false,
+            sort: (0, false),
+            bar: None,
+            hot: None,
+            type_arg: String::new(),
         }
     }
 
@@ -718,6 +975,7 @@ impl Archiver {
     fn set_dir(&mut self, dir: &str) {
         self.dir = dir.to_string();
         self.rows = rows_of(&self.items, &self.dir);
+        sort_rows(&mut self.rows, self.sort.0, self.sort.1);
         self.selected = 0;
         self.picked = alloc::vec![false; self.rows.len()];
         self.scroll.reset();
@@ -770,6 +1028,18 @@ impl Archiver {
         if self.job.is_some() {
             return;
         }
+        // «Открыть архив ▸ тип» (25.11): the type goes to every command on
+        // this archive (not to «Добавить», which names its own, nor to `h`).
+        let typed;
+        let args = if !self.type_arg.is_empty() && archive == self.archive && !args.contains(" -t") && !matches!(kind, JobKind::Hash { .. }) {
+            typed = match args.split_once(' ') {
+                Some((command, rest)) => format!("{command} {} {rest}", self.type_arg),
+                None => args.to_string(),
+            };
+            typed.as_str()
+        } else {
+            args
+        };
         match Job::start(kind, archive, args, password) {
             Ok(job) => self.job = Some(job),
             Err(text) => {
@@ -781,6 +1051,12 @@ impl Archiver {
 
     /// Извлечь `names` (пусто — всё) архива в `dest`.
     fn extract_items(&mut self, dest: &str, names: Vec<String>, open: Option<String>, show: bool) {
+        self.extract_then(dest, names, open, show, Vec::new());
+    }
+
+    /// Extract `names` (empty — all) to `dest`; then delete `then_delete`
+    /// from the archive («Переместить», 25.11).
+    fn extract_then(&mut self, dest: &str, names: Vec<String>, open: Option<String>, show: bool, then_delete: Vec<String>) {
         let mut args = format!("x -y -aoa -bso1 -bse1 -bsp1 -sccUTF-8 {} {}", quoted(&format!("-o{dest}")), quoted(&self.archive));
         if !names.is_empty() {
             match list_file(&names) {
@@ -793,7 +1069,7 @@ impl Archiver {
         }
         let password = self.password.clone();
         let archive = self.archive.clone();
-        self.run(JobKind::Extract { dest: dest.to_string(), open, show }, &archive, &args, password.as_deref());
+        self.run(JobKind::Extract { dest: dest.to_string(), open, show, then_delete }, &archive, &args, password.as_deref());
     }
 
     fn extract_here(&mut self, archive: &str) {
@@ -802,17 +1078,61 @@ impl Archiver {
         // затираются — новые получают «_1» (`-aou`).
         let args = format!("x -y -aou -bso1 -bse1 -bsp1 -sccUTF-8 {} {}", quoted(&format!("-o{dir}")), quoted(archive));
         let password = self.password.clone();
-        self.run(JobKind::Extract { dest: dir, open: None, show: false }, archive, &args, password.as_deref());
+        self.run(JobKind::Extract { dest: dir, open: None, show: false, then_delete: Vec::new() }, archive, &args, password.as_deref());
+    }
+
+    /// «Распаковать в "имя\"» (25.11): a folder named as the archive next
+    /// to it (7zz makes it), the archive goes inside.
+    fn extract_to_folder(&mut self, archive: &str) {
+        let dest = join(&parent(archive), &sysconf::filetypes::archive_stem(file_name(archive)));
+        let _ = mkdir(&dest, 0o755);
+        let args = format!("x -y -aou -bso1 -bse1 -bsp1 -sccUTF-8 {} {}", quoted(&format!("-o{dest}")), quoted(archive));
+        let password = self.password.clone();
+        self.run(JobKind::Extract { dest, open: None, show: false, then_delete: Vec::new() }, archive, &args, password.as_deref());
+    }
+
+    /// Test `archive` (the open one or one of `--test`).
+    fn test_archive(&mut self, archive: &str) {
+        let args = format!("t -bso1 -bse1 -bsp1 -sccUTF-8 {}", quoted(archive));
+        let password = self.password.clone();
+        self.run(JobKind::Test, archive, &args, password.as_deref());
+    }
+
+    /// «CRC SHA ▸ method» (25.11): checksums of `paths` on disk.
+    fn hash(&mut self, paths: &[String], method: &str) {
+        let Some(list) = list_file(paths) else {
+            self.overlay = Overlay::Message(String::from("Не удалось посчитать"), String::from("Не записать список файлов в /tmp."), true);
+            return;
+        };
+        let what = match paths {
+            [one] => file_name(one).to_string(),
+            many => format!("{} объект(ов)", many.len()),
+        };
+        let args = format!("h -bso1 -bse1 -sccUTF-8 -scrc{method} -scsUTF-8 {}", quoted(&format!("@{list}")));
+        let first = paths.first().cloned().unwrap_or_default();
+        self.run(JobKind::Hash { method: method.to_string(), what }, &first, &args, None);
+    }
+
+    /// The next archive of the action window.
+    fn next_in_queue(&mut self) -> bool {
+        if self.queue.is_empty() {
+            return false;
+        }
+        let next = self.queue.remove(0);
+        match self.queue_kind {
+            Queue::Here => self.extract_here(&next),
+            Queue::To => self.extract_to_folder(&next),
+            Queue::Test => self.test_archive(&next),
+        }
+        true
     }
 
     fn test(&mut self) {
         if self.archive.is_empty() {
             return;
         }
-        let args = format!("t -bso1 -bse1 -bsp1 -sccUTF-8 {}", quoted(&self.archive));
-        let password = self.password.clone();
         let archive = self.archive.clone();
-        self.run(JobKind::Test, &archive, &args, password.as_deref());
+        self.test_archive(&archive);
     }
 
     fn add_files(&mut self, archive: &str, sources: &[String], format: usize, level: usize, password: Option<&str>) {
@@ -838,7 +1158,16 @@ impl Archiver {
     }
 
     fn delete_chosen(&mut self) {
-        let names: Vec<String> = self.chosen().into_iter().filter_map(|index| self.rows.get(index)).map(|row| self.inner_path(row)).collect();
+        let names = self.chosen_names();
+        self.delete_names(names);
+    }
+
+    /// Inner paths of the chosen rows.
+    fn chosen_names(&self) -> Vec<String> {
+        self.chosen().into_iter().filter_map(|index| self.rows.get(index)).map(|row| self.inner_path(row)).collect()
+    }
+
+    fn delete_names(&mut self, names: Vec<String>) {
         if names.is_empty() {
             return;
         }
@@ -884,12 +1213,11 @@ impl Archiver {
                 let keep = self.dir.clone();
                 self.set_dir(&keep);
             }
-            JobKind::Extract { dest, open, show } => {
+            JobKind::Extract { dest, open, show, then_delete } => {
                 if !ok {
                     let why = error_lines(&text);
                     println(&format!("archiver: extract to '{dest}' failed: {why}"));
                     self.overlay = Overlay::Message(String::from("Ошибка при извлечении"), why, true);
-                    self.quit_after = false;
                     self.queue.clear();
                     return;
                 }
@@ -903,19 +1231,48 @@ impl Archiver {
                     let id = spawn(&format!("/bin/files {dest}"));
                     println(&format!("archiver: showing '{dest}' in Files ({id})"));
                 }
-                if let Some(next) = (!self.queue.is_empty()).then(|| self.queue.remove(0)) {
-                    self.extract_here(&next);
+                if !then_delete.is_empty() {
+                    // «Переместить»: out — now away from the archive.
+                    println(&format!("archiver: moving {} item(s) out of '{}'", then_delete.len(), job.archive));
+                    self.note = Some(format!("Перемещено в {dest}"));
+                    self.delete_names(then_delete);
+                    return;
                 }
+                self.next_in_queue();
             }
             JobKind::Test => {
+                self.tested.push((job.archive.clone(), ok));
                 if ok {
                     println(&format!("archiver: test of '{}' ok", job.archive));
-                    self.overlay = Overlay::Message(String::from("Ошибок не найдено"), format!("Архив «{}» проверен: все файлы целы.", file_name(&job.archive)), false);
                 } else {
-                    let why = error_lines(&text);
-                    println(&format!("archiver: test of '{}' failed: {why}", job.archive));
-                    self.overlay = Overlay::Message(String::from("Архив повреждён"), why, true);
+                    println(&format!("archiver: test of '{}' failed: {}", job.archive, error_lines(&text)));
                 }
+                if self.next_in_queue() {
+                    return;
+                }
+                let tested = core::mem::take(&mut self.tested);
+                let bad: Vec<&(String, bool)> = tested.iter().filter(|(_, ok)| !*ok).collect();
+                self.overlay = match (tested.len(), bad.is_empty()) {
+                    (1, true) => Overlay::Message(String::from("Ошибок не найдено"), format!("Архив «{}» проверен: все файлы целы.", file_name(&job.archive)), false),
+                    (1, false) => Overlay::Message(String::from("Архив повреждён"), error_lines(&text), true),
+                    (n, true) => Overlay::Message(String::from("Ошибок не найдено"), format!("Проверено архивов: {n}, все файлы целы."), false),
+                    (n, false) => Overlay::Message(
+                        String::from("Есть ошибки"),
+                        format!("Проверено архивов: {n}, с ошибками: {} ({}).", bad.len(), bad.iter().map(|(path, _)| file_name(path)).collect::<Vec<_>>().join(", ")),
+                        true,
+                    ),
+                };
+            }
+            JobKind::Hash { method, what } => {
+                if !ok {
+                    let why = error_lines(&text);
+                    println(&format!("archiver: checksum {method} failed: {why}"));
+                    self.overlay = Overlay::Message(String::from("Не удалось посчитать"), why, true);
+                    return;
+                }
+                let rows = hash_rows(&text);
+                println(&format!("archiver: checksum {method} of {what}: {}", rows.iter().map(|(key, value)| format!("{key} {value}")).collect::<Vec<_>>().join("; ")));
+                self.overlay = Overlay::Facts { title: format!("Контрольные суммы — {what}"), rows, copy: true };
             }
             JobKind::Add { archive } => {
                 if !ok {
@@ -964,6 +1321,8 @@ impl Archiver {
                 Options::folder().title("Куда извлечь").dir(&dir)
             }
             Pick::AddFiles => Options::open().title("Добавить в архив").dir(&home_dir()),
+            Pick::CopyTo => Options::folder().title("Копировать в").dir(&here),
+            Pick::MoveTo => Options::folder().title("Переместить в").dir(&here),
             Pick::SaveArchive => {
                 let (dir, name) = match &self.mode {
                     Mode::Add(form) => (parent(&form.name.text), file_name(&form.name.text).to_string()),
@@ -1003,6 +1362,17 @@ impl Archiver {
                 if let Mode::Add(form) = &mut self.mode {
                     form.name = Line::new(&path);
                 }
+            }
+            // «Копировать» — the chosen rows out to the folder; «Переместить»
+            // — and then away from the archive (25.11).
+            Pick::CopyTo | Pick::MoveTo => {
+                let names = self.chosen_names();
+                if names.is_empty() {
+                    return;
+                }
+                println(&format!("archiver: {} {} item(s) to '{path}'", if pick == Pick::MoveTo { "moving" } else { "copying" }, names.len()));
+                let then_delete = if pick == Pick::MoveTo { names.clone() } else { Vec::new() };
+                self.extract_then(&path, names, None, false, then_delete);
             }
         }
     }
@@ -1061,6 +1431,207 @@ impl Archiver {
         let _ = failed;
     }
 
+    // ---- Menu bar and toolbar (25.11) -------------------------------------
+
+    /// Items of menu `menu` of the bar.
+    fn bar_items(&self, menu: usize) -> Vec<BarItem> {
+        let open = !self.archive.is_empty();
+        let rows = !self.rows.is_empty();
+        let item = |label: &str, keys: Option<&'static str>, cmd: Cmd, group: u8, enabled: bool| BarItem { label: label.to_string(), keys, cmd, group, enabled };
+        match menu {
+            0 => alloc::vec![
+                item("Открыть", Some("Enter"), Cmd::Open, 0, rows),
+                item("Открыть архив…", Some("Ctrl+O"), Cmd::OpenArchive, 0, true),
+                item("Создать архив…", None, Cmd::CreateArchive, 0, true),
+                item("Добавить файлы…", None, Cmd::Add, 1, open),
+                item("Извлечь…", Some("Ctrl+E"), Cmd::Extract, 1, open),
+                item("Тестировать", Some("Ctrl+T"), Cmd::Test, 1, open),
+                item("Копировать в…", None, Cmd::CopyTo, 2, rows),
+                item("Переместить в…", None, Cmd::MoveTo, 2, rows),
+                item("Удалить", Some("Del"), Cmd::Delete, 2, rows),
+                item("Свойства архива", Some("Ctrl+I"), Cmd::Info, 3, open),
+                item("Закрыть архив", None, Cmd::CloseArchive, 4, open),
+                item("Выход", Some("Alt+F4"), Cmd::Exit, 4, true),
+            ],
+            1 => alloc::vec![
+                item("Выделить всё", Some("Ctrl+A"), Cmd::SelectAll, 0, rows),
+                item("Снять выделение", Some("Esc"), Cmd::SelectNone, 0, rows),
+                item("Обратить выделение", None, Cmd::Invert, 0, rows),
+            ],
+            2 => {
+                let mut items: Vec<BarItem> = COLUMNS
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| matches!(index, 0 | 1 | 2 | 3 | 5 | 7))
+                    .map(|(index, (title, _, _))| {
+                        let mark = if self.sort.0 == index { if self.sort.1 { "  ↓" } else { "  ↑" } } else { "" };
+                        BarItem { label: format!("Упорядочить: {}{mark}", if *title == "CRC" { title.to_string() } else { title.to_lowercase() }), keys: None, cmd: Cmd::Sort(index as u8), group: 0, enabled: open }
+                    })
+                    .collect();
+                items.push(item("Вверх на один уровень", Some("Backspace"), Cmd::Up, 1, open && !self.dir.is_empty()));
+                items.push(item("Обновить", Some("Ctrl+R"), Cmd::Refresh, 1, open));
+                items
+            }
+            3 => {
+                let mut items = alloc::vec![item("Добавить папку в избранное", None, Cmd::FavAdd, 0, open)];
+                for (index, (archive, dir)) in favorites().iter().enumerate() {
+                    let label = if dir.is_empty() { file_name(archive).to_string() } else { format!("{}/{dir}", file_name(archive)) };
+                    items.push(item(&label, None, Cmd::Fav(index as u8), 1, true));
+                }
+                if items.len() > 1 {
+                    items.push(item("Очистить избранное", None, Cmd::FavClear, 2, true));
+                }
+                items
+            }
+            4 => {
+                let mut items: Vec<BarItem> = HASHES
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (word, _))| {
+                        let label = if *word == "*" { String::from("Контрольные суммы архива: все") } else { format!("Контрольная сумма архива: {word}") };
+                        BarItem { label, keys: None, cmd: Cmd::Hash(index as u8), group: 0, enabled: open }
+                    })
+                    .collect();
+                items.push(item("Тестировать архив", None, Cmd::Test, 1, open));
+                items
+            }
+            _ => alloc::vec![item("О программе 7-Zip", None, Cmd::About, 0, true)],
+        }
+    }
+
+    /// Run a command of the bar, the toolbar or a shortcut.
+    fn run_cmd(&mut self, cmd: Cmd) {
+        self.bar = None;
+        println(&format!("archiver: command {cmd:?}"));
+        let open = !self.archive.is_empty();
+        match cmd {
+            Cmd::Open => self.open_selected(),
+            Cmd::OpenArchive => self.pick(Pick::OpenArchive),
+            Cmd::CreateArchive => self.start_add_form(Vec::new()),
+            Cmd::Add if open => self.pick(Pick::AddFiles),
+            Cmd::Extract if open => self.pick(Pick::ExtractTo),
+            Cmd::Test if open => self.test(),
+            Cmd::CopyTo if !self.rows.is_empty() => self.pick(Pick::CopyTo),
+            Cmd::MoveTo if !self.rows.is_empty() => self.pick(Pick::MoveTo),
+            Cmd::Delete if !self.rows.is_empty() => self.overlay = Overlay::Delete(1),
+            Cmd::Info if open => self.show_info(),
+            Cmd::CloseArchive => {
+                self.archive.clear();
+                self.items.clear();
+                self.rows.clear();
+                self.dir.clear();
+                self.info = Info::default();
+                self.type_arg.clear();
+            }
+            Cmd::Exit => self.done = true,
+            Cmd::SelectAll => self.picked = alloc::vec![true; self.rows.len()],
+            Cmd::SelectNone => self.picked.iter_mut().for_each(|slot| *slot = false),
+            Cmd::Invert => {
+                self.picked.resize(self.rows.len(), false);
+                self.picked.iter_mut().for_each(|slot| *slot = !*slot);
+            }
+            Cmd::Sort(column) => self.sort_by(usize::from(column)),
+            Cmd::Up => {
+                self.go_up();
+            }
+            Cmd::Refresh if open => self.list(),
+            Cmd::FavAdd if open => {
+                let mut list = favorites();
+                list.retain(|(archive, dir)| !(archive == &self.archive && dir == &self.dir));
+                list.insert(0, (self.archive.clone(), self.dir.clone()));
+                list.truncate(FAVORITES);
+                save_favorites(&list);
+                println(&format!("archiver: favorite '{}' '/{}'", self.archive, self.dir));
+                self.note = Some(String::from("Добавлено в избранное"));
+            }
+            Cmd::Fav(index) => {
+                if let Some((archive, dir)) = favorites().get(usize::from(index)).cloned() {
+                    self.type_arg.clear();
+                    self.open_archive(&archive);
+                    self.dir = dir;
+                }
+            }
+            Cmd::FavClear => save_favorites(&[]),
+            Cmd::Hash(index) if open => {
+                let method = HASHES[usize::from(index).min(HASHES.len() - 1)].1;
+                let archive = alloc::vec![self.archive.clone()];
+                self.hash(&archive, method);
+            }
+            Cmd::About => {
+                let banner = if self.info.banner.is_empty() { String::from("7-Zip 26.06") } else { self.info.banner.clone() };
+                self.overlay = Overlay::Facts {
+                    title: String::from("О программе 7-Zip"),
+                    rows: alloc::vec![
+                        (String::from("Версия"), banner.split(" : ").next().unwrap_or(&banner).to_string()),
+                        (String::from("Автор"), String::from("Igor Pavlov, 7-zip.org (GNU LGPL)")),
+                        (String::from("Программа"), String::from(SEVENZIP)),
+                        (String::from("Окно"), String::from("Архиватор 7-Zip FossAi")),
+                    ],
+                    copy: false,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    /// Sort by column `column`; the same column again — the other way.
+    fn sort_by(&mut self, column: usize) {
+        self.sort = if self.sort.0 == column { (column, !self.sort.1) } else { (column, false) };
+        let name = self.rows.get(self.selected).map(|row| row.name.clone());
+        sort_rows(&mut self.rows, self.sort.0, self.sort.1);
+        self.picked = alloc::vec![false; self.rows.len()];
+        if let Some(at) = name.and_then(|name| self.rows.iter().position(|row| row.name == name)) {
+            self.selected = at;
+        }
+        println(&format!("archiver: sorted by {} {}", COLUMNS[column].0, if self.sort.1 { "desc" } else { "asc" }));
+    }
+
+    /// «Информация» (25.11): the chosen entry and the archive.
+    fn show_info(&mut self) {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        if let Some(row) = self.rows.get(self.selected) {
+            rows.push((String::from("Имя"), self.inner_path(row)));
+            for column in 1..COLUMNS.len() {
+                let value = row.cell(column);
+                if !value.is_empty() && !(column == 9 && !row.folder) {
+                    rows.push((COLUMNS[column].0.to_string(), value));
+                }
+            }
+            if row.folder {
+                rows.push((String::from("Файлы"), row.files.to_string()));
+            }
+        }
+        // A blank row: the archive goes into the second column.
+        if !rows.is_empty() {
+            rows.push((String::new(), String::new()));
+        }
+        let files = self.items.iter().filter(|item| !item.folder).count();
+        let folders = self.items.iter().filter(|item| item.folder).count();
+        let size: u64 = self.items.iter().map(|item| item.size).sum();
+        let packed: u64 = self.items.iter().map(|item| item.packed).sum();
+        rows.push((String::from("Архив"), self.archive.clone()));
+        rows.push((String::from("Тип"), if self.info.kind.is_empty() { String::from("?") } else { self.info.kind.clone() }));
+        if !self.info.method.is_empty() {
+            rows.push((String::from("Метод"), self.info.method.clone()));
+        }
+        rows.push((String::from("Непрерывный"), String::from(if self.info.solid { "+" } else { "-" })));
+        if !self.info.blocks.is_empty() {
+            rows.push((String::from("Блоков"), self.info.blocks.clone()));
+        }
+        rows.push((String::from("Физический размер"), grouped(self.info.physical)));
+        if self.info.headers > 0 {
+            rows.push((String::from("Размер заголовков"), grouped(self.info.headers)));
+        }
+        rows.push((String::from("Папок / файлов"), format!("{folders} / {files}")));
+        rows.push((String::from("Размер / сжатый"), format!("{} / {}", grouped(size), grouped(packed))));
+        if size > 0 {
+            let physical = if packed > 0 { packed } else { self.info.physical };
+            rows.push((String::from("Степень сжатия"), format!("{} %", physical.saturating_mul(100) / size)));
+        }
+        println(&format!("archiver: info of '{}' ({} rows)", self.archive, rows.len()));
+        self.overlay = Overlay::Facts { title: String::from("Информация"), rows, copy: false };
+    }
+
     fn submit_password(&mut self) {
         let Overlay::Password(line, ask) = core::mem::replace(&mut self.overlay, Overlay::None) else { return };
         if line.text.is_empty() {
@@ -1072,6 +1643,36 @@ impl Archiver {
         let password = self.password.clone();
         self.run(ask.retry, &ask.archive, &args, password.as_deref());
     }
+}
+
+fn save_favorites(list: &[(String, String)]) {
+    for index in 0..FAVORITES {
+        let key = format!("archiver/favorites/{index}");
+        let _ = match list.get(index) {
+            Some((archive, dir)) => user_progs::reg_set("user", &key, &format!("{archive}\t{dir}")),
+            None => user_progs::reg_remove("user", &key),
+        };
+    }
+}
+
+/// Rows of the «CRC SHA» window from `7zz h` (25.11): «CRC32  for data:
+/// 4E2D…», «SHA256 for data and names: …», «Size: 12».
+fn hash_rows(text: &str) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for line in text.lines().map(|line| line.trim_matches(['\r', '\x08', ' '])) {
+        if let Some((key, value)) = line.split_once(" for data and names:") {
+            rows.push((format!("{} (данные и имена)", key.trim()), value.trim().to_string()));
+        } else if let Some((key, value)) = line.split_once(" for data:") {
+            rows.push((format!("{} (данные)", key.trim()), value.trim().to_string()));
+        } else if let Some(value) = line.strip_prefix("Size:") {
+            rows.push((String::from("Размер"), grouped(value.trim().parse().unwrap_or(0))));
+        } else if let Some(value) = line.strip_prefix("Files:") {
+            rows.push((String::from("Файлов"), value.trim().to_string()));
+        } else if let Some(value) = line.strip_prefix("Folders:") {
+            rows.push((String::from("Папок"), value.trim().to_string()));
+        }
+    }
+    rows
 }
 
 /// Открыть файл программой по умолчанию (первая из «Открыть с помощью»).
@@ -1099,7 +1700,9 @@ fn open_with_default(path: &str) {
 impl App for Archiver {
     fn size_limits(&self) -> app::SizeLimits {
         match self.mode {
-            Mode::Browse => app::SizeLimits::min(560, 360),
+            // Action windows (`--hash`, `--test` …): only their card.
+            Mode::Browse if self.quit_after => app::SizeLimits::min(400, 200),
+            Mode::Browse => app::SizeLimits::min(640, 440),
             Mode::Add(_) => app::SizeLimits::fixed(560, 470),
             Mode::Extract(_) => app::SizeLimits::fixed(560, 300),
         }
@@ -1202,7 +1805,7 @@ impl App for Archiver {
                 }
                 return true;
             }
-            Overlay::Message(..) => {
+            Overlay::Message(..) | Overlay::Facts { .. } => {
                 if matches!(code, ENTER | ESCAPE | SPACE) {
                     self.close_overlay();
                 }
@@ -1282,14 +1885,47 @@ impl App for Archiver {
             }
             Mode::Browse => {}
         }
+        // The open menu of the bar takes the keys (25.11).
+        if let Some((menu, selected)) = self.bar {
+            let items = self.bar_items(menu);
+            let step = |from: usize, down: bool| -> usize {
+                let n = items.len();
+                if n == 0 {
+                    return from;
+                }
+                let mut at = if from >= n { if down { n - 1 } else { 0 } } else { from };
+                for _ in 0..n {
+                    at = if down { (at + 1) % n } else { (at + n - 1) % n };
+                    if items[at].enabled {
+                        return at;
+                    }
+                }
+                from
+            };
+            match code {
+                ESCAPE => self.bar = None,
+                user_progs::WIN_KEY_LEFT => self.bar = Some(((menu + MENUS.len() - 1) % MENUS.len(), usize::MAX)),
+                user_progs::WIN_KEY_RIGHT => self.bar = Some(((menu + 1) % MENUS.len(), usize::MAX)),
+                WIN_KEY_UP => self.bar = Some((menu, step(selected, false))),
+                WIN_KEY_DOWN => self.bar = Some((menu, step(selected, true))),
+                ENTER => {
+                    if let Some(item) = items.get(selected).filter(|item| item.enabled) {
+                        let cmd = item.cmd;
+                        self.run_cmd(cmd);
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
         if ctrl {
             match char::from_u32(latin).map(|ch| ch.to_ascii_lowercase()) {
-                Some('o') => self.pick(Pick::OpenArchive),
-                Some('e') if !self.archive.is_empty() => self.pick(Pick::ExtractTo),
-                Some('t') => self.test(),
-                Some('a') => {
-                    self.picked = alloc::vec![true; self.rows.len()];
-                }
+                Some('o') => self.run_cmd(Cmd::OpenArchive),
+                Some('e') => self.run_cmd(Cmd::Extract),
+                Some('t') => self.run_cmd(Cmd::Test),
+                Some('a') => self.run_cmd(Cmd::SelectAll),
+                Some('r') => self.run_cmd(Cmd::Refresh),
+                Some('i') => self.run_cmd(Cmd::Info),
                 _ => return false,
             }
             return true;
@@ -1361,6 +1997,20 @@ impl App for Archiver {
                 }
                 return true;
             }
+            Overlay::Facts { rows, copy, .. } => {
+                let groups = fact_groups(rows);
+                let card = facts_card(ctx, area, groups.iter().map(|group| group.len()).max().unwrap_or(0), groups.len());
+                let [copy_button, ok] = card_buttons(ctx, card);
+                if ok.contains(x, y) {
+                    self.close_overlay();
+                } else if *copy && copy_button.contains(x, y) {
+                    let text: Vec<String> = rows.iter().filter(|(key, _)| !key.is_empty()).map(|(key, value)| format!("{key}: {value}")).collect();
+                    if user_progs::clipboard_set(&text.join("\n")) {
+                        println("archiver: checksums copied");
+                    }
+                }
+                return true;
+            }
             Overlay::Delete(_) => {
                 let ask = delete_ask(self.chosen().len());
                 match kit::ask_hit(ctx, area, &ask, x, y) {
@@ -1427,8 +2077,43 @@ impl App for Archiver {
             }
             Mode::Browse => {}
         }
+        let plan = Plan::new(ctx, area);
+        // The menu bar (25.11): an open menu takes the click first.
+        if let Some((menu, _)) = self.bar {
+            let items = self.bar_items(menu);
+            let rect = dropdown_rect(ctx, area, plan.heads[menu], &items);
+            if rect.contains(x, y) {
+                let entries = bar_entries(&items);
+                if let Some(index) = kit::menu_hit(ctx, rect, &entries, x, y) {
+                    if items[index].enabled {
+                        let cmd = items[index].cmd;
+                        self.run_cmd(cmd);
+                    }
+                }
+                return true;
+            }
+            self.bar = match plan.heads.iter().position(|head| head.contains(x, y)) {
+                Some(head) if head != menu => Some((head, usize::MAX)),
+                _ => None,
+            };
+            return true;
+        }
+        if let Some(head) = plan.heads.iter().position(|head| head.contains(x, y)) {
+            self.bar = Some((head, usize::MAX));
+            println(&format!("archiver: menu '{}' opened", MENUS[head]));
+            return true;
+        }
+        if let Some(index) = plan.buttons.iter().position(|rect| rect.contains(x, y)) {
+            println(&format!("archiver: toolbar '{}'", TOOLS[index]));
+            let cmd = if TOOL_CMDS[index] == Cmd::Add && self.archive.is_empty() { Cmd::CreateArchive } else { TOOL_CMDS[index] };
+            self.run_cmd(cmd);
+            return true;
+        }
+        if plan.up.contains(x, y) {
+            return self.go_up();
+        }
         if self.archive.is_empty() {
-            let [open, create] = empty_buttons(ctx, area);
+            let [open, create] = empty_buttons(ctx, plan.table.list);
             if open.contains(x, y) {
                 self.pick(Pick::OpenArchive);
             } else if create.contains(x, y) {
@@ -1436,20 +2121,11 @@ impl App for Archiver {
             }
             return true;
         }
-        let plan = Plan::new(ctx, area);
-        if let Some(index) = plan.buttons.iter().position(|rect| rect.contains(x, y)) {
-            match index {
-                0 => self.pick(Pick::ExtractTo),
-                1 => self.test(),
-                2 => self.pick(Pick::AddFiles),
-                3 if !self.rows.is_empty() => self.overlay = Overlay::Delete(1),
-                4 => self.pick(Pick::OpenArchive),
-                _ => {}
+        if plan.table.header.contains(x, y) {
+            if let Some(column) = plan.column_at(x) {
+                self.sort_by(column);
             }
             return true;
-        }
-        if plan.up.contains(x, y) {
-            return self.go_up();
         }
         let list = plan.table.list;
         let content = self.rows.len() as u32 * plan.step();
@@ -1496,6 +2172,36 @@ impl App for Archiver {
         self.scroll.release()
     }
 
+    /// Pointer over the window (25.11): the lit item of the open menu
+    /// follows it, the menus of the bar switch under it, a toolbar button
+    /// under it is lit.
+    fn hover(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        if !matches!(self.mode, Mode::Browse) || self.quit_after {
+            return false;
+        }
+        let plan = Plan::new(ctx, area);
+        let before = (self.bar, self.hot);
+        if let Some((menu, _)) = self.bar {
+            if let Some(head) = plan.heads.iter().position(|head| head.contains(x, y)) {
+                if head != menu {
+                    self.bar = Some((head, usize::MAX));
+                }
+            } else {
+                let items = self.bar_items(menu);
+                let rect = dropdown_rect(ctx, area, plan.heads[menu], &items);
+                if let Some(index) = kit::menu_hit(ctx, rect, &bar_entries(&items), x, y) {
+                    self.bar = Some((menu, index));
+                }
+            }
+        }
+        self.hot = if self.bar.is_none() { plan.buttons.iter().position(|rect| rect.contains(x, y)) } else { None };
+        before != (self.bar, self.hot)
+    }
+
+    fn leave(&mut self) -> bool {
+        self.hot.take().is_some()
+    }
+
     fn wheel_at(&mut self, area: Rect, ctx: Ctx, clicks: i32) -> bool {
         if !matches!(self.mode, Mode::Browse) {
             return false;
@@ -1511,8 +2217,15 @@ impl App for Archiver {
             Mode::Extract(form) => draw_extract(ctx, s, area, form),
             // Окно-действие («Извлечь сюда», «Сжать в ZIP») — только ход.
             Mode::Browse if self.quit_after => {}
-            Mode::Browse if self.archive.is_empty() && self.job.is_none() => draw_empty(ctx, s, area),
-            Mode::Browse => self.draw_browser(ctx, s, area),
+            Mode::Browse => {
+                self.draw_browser(ctx, s, area);
+                if let Some((menu, selected)) = self.bar {
+                    let plan = Plan::new(ctx, area);
+                    let items = self.bar_items(menu);
+                    let rect = dropdown_rect(ctx, area, plan.heads[menu], &items);
+                    kit::draw_menu(ctx, s, rect, &bar_entries(&items), selected);
+                }
+            }
         }
         if let Some(job) = &self.job {
             if !matches!(job.kind, JobKind::List) || !self.archive.is_empty() {
@@ -1524,8 +2237,73 @@ impl App for Archiver {
             Overlay::Password(line, ask) => draw_password(ctx, s, area, line, ask),
             Overlay::Message(title, text, bad) => draw_message(ctx, s, area, title, text, *bad),
             Overlay::Delete(focus) => kit::draw_ask(ctx, s, area, &delete_ask(self.chosen().len()), *focus),
+            Overlay::Facts { title, rows, copy } => draw_facts(ctx, s, area, title, rows, *copy),
         }
     }
+}
+
+/// Entries of a menu of the bar for `kit`.
+fn bar_entries(items: &[BarItem]) -> Vec<kit::Entry<'_>> {
+    items
+        .iter()
+        .map(|item| kit::Entry { title: &item.label, keys: item.keys, group: item.group, disabled: !item.enabled, ..kit::Entry::NONE })
+        .collect()
+}
+
+/// Where the menu of the bar under `head` drops.
+fn dropdown_rect(ctx: Ctx, area: Rect, head: Rect, items: &[BarItem]) -> Rect {
+    kit::place((head.x, head.bottom() + ctx.pxi(2)), kit::menu_size(ctx, &bar_entries(items)), area)
+}
+
+/// Groups of facts: a blank row starts the next column.
+fn fact_groups(rows: &[(String, String)]) -> Vec<&[(String, String)]> {
+    rows.split(|(key, _)| key.is_empty()).filter(|group| !group.is_empty()).collect()
+}
+
+/// The card of [`Overlay::Facts`]: `rows` lines (the longest column) and
+/// buttons; two columns are wider.
+fn facts_card(ctx: Ctx, area: Rect, rows: usize, columns: usize) -> Rect {
+    let line = u32::from(ctx.face(Role::Body).line) + ctx.px(6);
+    let h = ctx.px(20 + 34 + 20 + 32 + 20) + line * rows.max(1) as u32;
+    let w = ctx.px(if columns > 1 { 820 } else { 640 }).min(area.w.saturating_sub(ctx.px(24)));
+    let h = h.min(area.h.saturating_sub(ctx.px(16)));
+    Rect::new(area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 2, w, h)
+}
+
+fn draw_facts(ctx: Ctx, s: &mut Surface, area: Rect, title: &str, rows: &[(String, String)], copy: bool) {
+    let p = ctx.palette;
+    draw::blend_rect(s, area, mini_ui::Color::rgb(0, 0, 0), 70);
+    let groups = fact_groups(rows);
+    let longest = groups.iter().map(|group| group.len()).max().unwrap_or(0);
+    let card = facts_card(ctx, area, longest, groups.len());
+    let inner = kit::card(ctx, s, card);
+    let pad = ctx.px(20) as i32;
+    let g = ctx.px(20);
+    iconset::draw(s, Fi::Info, card.x + pad, card.y + pad, g, p.acc, 255);
+    paint::text_clipped(inner, s, Role::Title, card.x + pad + g as i32 + ctx.pxi(10), card.y + pad, card.w.saturating_sub(pad as u32 * 2 + g + ctx.px(10)), title, p.ink);
+    let face = ctx.face(Role::Body);
+    let line = i32::from(face.line) + ctx.pxi(6);
+    let [copy_button, ok] = card_buttons(ctx, card);
+    let column_w = (card.w.saturating_sub(pad as u32 * 2) / groups.len().max(1) as u32) as i32;
+    for (at, group) in groups.iter().enumerate() {
+        let left = card.x + pad + column_w * at as i32;
+        let right = left + column_w - if at + 1 < groups.len() { ctx.pxi(16) } else { 0 };
+        let key_w = group.iter().map(|(key, _)| face.width(key)).max().unwrap_or(0).min(column_w as u32 / 2) + ctx.px(16);
+        let mut y = card.y + pad + ctx.pxi(34);
+        for (key, value) in group.iter() {
+            if y + line > copy_button.y - ctx.pxi(8) {
+                break;
+            }
+            paint::text_clipped(inner, s, Role::Body, left, y, key_w, key, p.ink3);
+            let vx = left + key_w as i32;
+            paint::text_clipped(inner, s, Role::Body, vx, y, (right - vx).max(0) as u32, value, p.ink);
+            y += line;
+        }
+    }
+    if copy {
+        paint::button(inner, s, copy_button, Weight::Normal, "Копировать", false);
+    }
+    paint::button(inner, s, ok, Weight::Primary, "ОК", false);
 }
 
 fn delete_ask(count: usize) -> kit::Ask<'static> {
@@ -1562,44 +2340,102 @@ impl Archiver {
     fn draw_browser(&self, ctx: Ctx, s: &mut Surface, area: Rect) {
         let p = ctx.palette;
         let plan = Plan::new(ctx, area);
-        let bar = kit::toolbar(ctx, s, plan.toolbar);
-        let icons = [Fi::FolderOpen, Fi::ShieldCheck, Fi::Plus, Fi::Trash, Fi::Compress];
-        for (index, (rect, label)) in plan.buttons.iter().zip(TOOL_LABELS).enumerate() {
-            let weight = if index == 0 { Weight::Primary } else { Weight::Normal };
-            paint::button(bar, s, *rect, weight, "", false);
-            let g = ctx.px(16);
-            let ink = if index == 0 { mini_ui::Color::rgb(0xFF, 0xFF, 0xFF) } else { p.ink2 };
-            iconset::draw(s, icons[index], rect.x + ctx.px(12) as i32, rect.y + (rect.h - g) as i32 / 2, g, ink, 255);
-            paint::text(bar, s, if index == 0 { Role::Label } else { Role::Body }, rect.x + ctx.px(34) as i32, paint::baseline(bar, Role::Body, *rect), label, ink);
-        }
+        let open = !self.archive.is_empty();
 
-        // Путь внутри архива.
-        paint::icon_button(ctx, s, plan.up, Icon::Up, Weight::Ghost, false);
-        paint::sunk(ctx, s, plan.crumbs, ctx.px(theme::R_ROW));
-        // Архив › папка › папка — звенья, между ними шеврон.
-        let g = ctx.px(16);
-        iconset::draw(s, Fi::Compress, plan.crumbs.x + ctx.px(10) as i32, plan.crumbs.y + (plan.crumbs.h - g) as i32 / 2, g, p.acc, 255);
-        let y = paint::baseline(ctx, Role::Body, plan.crumbs);
-        let right = plan.crumbs.right() - ctx.px(10) as i32;
-        let mut x = plan.crumbs.x + ctx.px(34) as i32;
-        let parts: Vec<&str> = core::iter::once(file_name(&self.archive)).chain(self.dir.split('/').filter(|part| !part.is_empty())).collect();
-        for (index, part) in parts.iter().enumerate() {
-            if index > 0 {
-                let c = ctx.px(12);
-                glyphicon::draw(s, Icon::ChevronRight, x + ctx.px(4) as i32, plan.crumbs.y + (plan.crumbs.h - c) as i32 / 2, c, p.ink4, 255);
-                x += (c + ctx.px(8)) as i32;
+        // Menu bar (25.11, 7-Zip File Manager): Файл Правка Вид Избранное
+        // Сервис Справка.
+        let bar = kit::toolbar(ctx, s, plan.menubar);
+        for (index, (label, head)) in MENUS.iter().zip(plan.heads).enumerate() {
+            if self.bar.is_some_and(|(menu, _)| menu == index) {
+                kit::menu_highlight(bar, s, head, false);
             }
-            let room = (right - x).max(0) as u32;
-            let ink = if index + 1 == parts.len() { p.ink } else { p.ink3 };
-            paint::text_clipped(ctx, s, Role::Body, x, y, room, part, ink);
-            x += ctx.face(Role::Body).width(part).min(room) as i32;
+            paint::text(bar, s, Role::Body, head.x + ctx.pxi(10), paint::baseline(bar, Role::Body, head), label, p.ink);
         }
 
-        // Таблица.
+        // Toolbar: big icons over words, in 7-Zip's order and colours.
+        let tools = kit::toolbar(ctx, s, plan.toolbar);
+        let tints = [
+            mini_ui::Color::rgb(0x2E, 0xA0, 0x43),
+            mini_ui::Color::rgb(0x2F, 0x6F, 0xDB),
+            mini_ui::Color::rgb(0x16, 0xA2, 0xB8),
+            mini_ui::Color::rgb(0x12, 0x8C, 0x78),
+            mini_ui::Color::rgb(0x3D, 0x55, 0xC8),
+            mini_ui::Color::rgb(0xD9, 0x3B, 0x3B),
+            mini_ui::Color::rgb(0xD8, 0x9A, 0x12),
+        ];
+        let icons = [Fi::Plus, Fi::Download, Fi::Check, Fi::Copy, Fi::ArrowRight, Fi::X, Fi::Info];
+        for (index, rect) in plan.buttons.iter().enumerate() {
+            let enabled = match TOOL_CMDS[index] {
+                Cmd::Add => true,
+                Cmd::CopyTo | Cmd::MoveTo | Cmd::Delete => !self.rows.is_empty(),
+                _ => open,
+            };
+            if self.hot == Some(index) && enabled {
+                kit::menu_highlight(tools, s, *rect, false);
+            }
+            let g = ctx.px(26);
+            let ink = if enabled { tints[index] } else { p.ink6 };
+            iconset::draw(s, icons[index], rect.x + (rect.w as i32 - g as i32) / 2, rect.y + ctx.pxi(4), g, ink, 255);
+            let label = Rect::new(rect.x, rect.y + g as i32 + ctx.pxi(6), rect.w, u32::from(ctx.face(Role::Caption).line));
+            paint::text_centered(tools, s, Role::Caption, label, TOOLS[index], if enabled { p.ink2 } else { p.ink6 });
+        }
+
+        // Address row: «вверх» and the path, the archive as a folder of it.
+        paint::icon_button(ctx, s, plan.up, Icon::Up, Weight::Ghost, false);
+        paint::sunk(ctx, s, plan.address, ctx.px(theme::R_ROW));
+        let g = ctx.px(18);
+        let icon = Rect::new(plan.address.x + ctx.pxi(8), plan.address.y + (plan.address.h as i32 - g as i32) / 2, g, g);
+        if !user_progs::icons::draw(s, icon, if open { "doc-archive" } else { "archiver" }) {
+            iconset::draw(s, Fi::Compress, icon.x, icon.y, g, p.acc, 255);
+        }
+        let path = if open {
+            let mut path = format!("{}/", self.archive);
+            if !self.dir.is_empty() {
+                path.push_str(&self.dir);
+                path.push('/');
+            }
+            path
+        } else {
+            String::new()
+        };
+        let tx = icon.right() + ctx.pxi(8);
+        paint::text_clipped(ctx, s, Role::Body, tx, paint::baseline(ctx, Role::Body, plan.address), (plan.address.right() - tx - ctx.pxi(8)).max(0) as u32, &path, p.ink);
+
         let table = plan.table;
-        let columns = table.columns(ctx, &[0, ctx.px(110), ctx.px(110), ctx.px(150)], ctx.px(180));
-        table.draw_header(ctx, s, &columns, &["Имя", "Размер", "Сжатый", "Изменён"]);
         let list = table.list;
+        if !open {
+            if self.job.is_none() {
+                draw_empty(ctx, s, list);
+            }
+            kit::status_bar(ctx, s, plan.status, "Откройте архив или создайте новый");
+            return;
+        }
+
+        // Header: titles, the sorted column with its arrow.
+        let columns = &plan.columns;
+        // The line (or the classic buttons) of the shared header; the titles
+        // here: numbers' titles on the right like the numbers, the sorted
+        // one with its arrow.
+        table.draw_header(ctx, s, columns, &[""; COLUMNS.len()]);
+        let caps_face = ctx.face(Role::MonoCaps);
+        let caps_width = |text: &str| caps_face.width(text) + theme::CAPS_TRACKING * ctx.scale * text.chars().count().saturating_sub(1) as u32;
+        let head_y = paint::baseline(ctx, Role::MonoCaps, table.header);
+        let a = ctx.px(10);
+        for (index, rect) in columns.iter().enumerate() {
+            if rect.w == 0 {
+                continue;
+            }
+            let (title, _, numeric) = COLUMNS[index];
+            let sorted = index == self.sort.0;
+            let w = caps_width(title);
+            let arrow = if sorted { a + ctx.px(4) } else { 0 };
+            let x = if numeric { rect.right() - ctx.pxi(14) - (w + arrow) as i32 } else { rect.x };
+            paint::caps(ctx, s, x, head_y, title);
+            if sorted {
+                glyphicon::draw(s, if self.sort.1 { Icon::ChevronDown } else { Icon::ChevronUp }, x + (w + ctx.px(4)) as i32, table.header.y + (table.header.h as i32 - a as i32) / 2, a, p.acc, 255);
+            }
+        }
+
         let step = plan.step();
         let content = self.rows.len() as u32 * step;
         self.scroll.sync(list.h, content, step);
@@ -1620,13 +2456,24 @@ impl Archiver {
             if !user_progs::icons::draw(s, icon, kind.icon) {
                 glyphicon::draw(s, if row.folder { Icon::Folder } else { Icon::File }, icon.x, icon.y, icon.w, p.ink3, 255);
             }
-            let name = if row.encrypted && !row.folder { format!("{} *", row.name) } else { row.name.clone() };
-            kit::cell(ctx, s, columns[0], icon.right() + ctx.px(10) as i32, rect, Role::Body, &name, if state == RowState::Selected { p.ink } else { ink });
-            let size = if row.folder && row.size == 0 { String::new() } else { size_text(row.size) };
-            let packed = if row.folder || row.packed == 0 { String::new() } else { size_text(row.packed) };
-            kit::cell(ctx, s, columns[1], columns[1].x, rect, Role::Body, &size, ink);
-            kit::cell(ctx, s, columns[2], columns[2].x, rect, Role::Body, &packed, ink);
-            kit::cell(ctx, s, columns[3], columns[3].x, rect, Role::Caption, &row.modified, ink);
+            kit::cell(ctx, s, columns[0], icon.right() + ctx.px(10) as i32, rect, Role::Body, &row.name, if state == RowState::Selected { p.ink } else { ink });
+            for (column, rect_c) in columns.iter().enumerate().skip(1) {
+                if rect_c.w == 0 {
+                    continue;
+                }
+                let text = row.cell(column);
+                if text.is_empty() {
+                    continue;
+                }
+                let role = if matches!(column, 3 | 4 | 7 | 8) { Role::Caption } else { Role::Body };
+                if COLUMNS[column].2 {
+                    // Numbers on the right edge of their column.
+                    let right = rect_c.right() - ctx.pxi(14);
+                    paint::text_right(ctx, s, role, right, paint::baseline(ctx, role, rect), &text, ink);
+                } else {
+                    kit::cell(ctx, s, *rect_c, rect_c.x, rect, role, &text, ink);
+                }
+            }
         }
         if let Some(bar) = ScrollBar::vertical(ctx, list, content, &self.scroll) {
             bar.draw(ctx, s, &self.scroll);
@@ -1636,7 +2483,12 @@ impl Archiver {
         }
 
         let picked = self.picked.iter().filter(|slot| **slot).count();
-        let mut status = if picked > 0 { format!("Отмечено: {picked} из {}", self.rows.len()) } else { kit::items_text(self.rows.len()) };
+        let mut status = if picked > 0 {
+            let bytes: u64 = self.rows.iter().zip(&self.picked).filter(|(_, on)| **on).map(|(row, _)| row.size).sum();
+            kit::selected_text(picked, bytes)
+        } else {
+            kit::items_text(self.rows.len())
+        };
         if !self.info.kind.is_empty() {
             status.push_str(&format!("   ·   {}", self.info.kind));
             if !self.info.method.is_empty() {
@@ -1657,25 +2509,27 @@ impl Archiver {
 }
 
 fn empty_buttons(ctx: Ctx, area: Rect) -> [Rect; 2] {
-    let bw = ctx.px(180);
-    let bh = ctx.px(36);
-    let y = area.y + area.h as i32 / 2 + ctx.px(40) as i32;
+    let bw = ctx.px(170);
+    let bh = ctx.px(34);
+    let y = area.y + area.h as i32 / 2 + ctx.pxi(24);
     let gap = ctx.px(12) as i32;
     let x = area.x + (area.w as i32 - (bw as i32 * 2 + gap)) / 2;
     [Rect::new(x, y, bw, bh), Rect::new(x + bw as i32 + gap, y, bw, bh)]
 }
 
+/// No archive open: an invitation inside the list.
 fn draw_empty(ctx: Ctx, s: &mut Surface, area: Rect) {
     let p = ctx.palette;
-    let tile_side = ctx.px(72);
-    let tile = Rect::new(area.x + (area.w as i32 - tile_side as i32) / 2, area.y + area.h as i32 / 2 - ctx.px(110) as i32, tile_side, tile_side);
-    draw::rounded(s, tile, ctx.px(16), ctx.flat(p.acctint), 255);
-    draw::rounded_stroke(s, tile, ctx.px(16), p.accedge, 255);
-    let g = ctx.px(40);
-    iconset::draw(s, Fi::Compress, tile.x + (tile.w - g) as i32 / 2, tile.y + (tile.h - g) as i32 / 2, g, p.acc_ink, 255);
-    let line = Rect::new(area.x, tile.bottom() + ctx.px(14) as i32, area.w, u32::from(ctx.face(Role::Heading).line));
+    let tile_side = ctx.px(56);
+    let tile = Rect::new(area.x + (area.w as i32 - tile_side as i32) / 2, area.y + area.h as i32 / 2 - ctx.pxi(96), tile_side, tile_side);
+    if !user_progs::icons::draw(s, tile, "archiver") {
+        draw::rounded(s, tile, ctx.px(14), ctx.flat(p.acctint), 255);
+        let g = ctx.px(32);
+        iconset::draw(s, Fi::Compress, tile.x + (tile.w - g) as i32 / 2, tile.y + (tile.h - g) as i32 / 2, g, p.acc_ink, 255);
+    }
+    let line = Rect::new(area.x, tile.bottom() + ctx.px(8) as i32, area.w, u32::from(ctx.face(Role::Heading).line));
     paint::text_centered(ctx, s, Role::Heading, line, "Архиватор 7-Zip", p.ink);
-    let sub = Rect::new(area.x, line.bottom() + ctx.px(4) as i32, area.w, u32::from(ctx.face(Role::Body).line));
+    let sub = Rect::new(area.x, line.bottom() + ctx.px(2) as i32, area.w, u32::from(ctx.face(Role::Body).line));
     paint::text_centered(ctx, s, Role::Body, sub, "7z, zip, rar, tar, gz, xz, bz2, iso, cab и другие", p.ink3);
     let [open, create] = empty_buttons(ctx, area);
     paint::button(ctx, s, open, Weight::Primary, "Открыть архив…", false);
@@ -1818,6 +2672,7 @@ fn draw_progress(ctx: Ctx, s: &mut Surface, area: Rect, job: &Job) {
         JobKind::Test => String::from("Проверка архива…"),
         JobKind::Add { .. } => String::from("Сжатие…"),
         JobKind::Delete => String::from("Удаление из архива…"),
+        JobKind::Hash { .. } => String::from("Подсчёт контрольных сумм…"),
     };
     let room = card.w.saturating_sub(pad as u32 * 2);
     let mut y = card.y + pad;
@@ -1945,34 +2800,69 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
     let scale = app::ui_scale(&info);
     let mut archiver = Archiver::new();
-    let mut size = app::window_size(&info, (860, 560));
+    let mut size = app::window_size(&info, (1100, 640));
     match command.as_str() {
         "--add" => {
             let sources = paths_of(&args, 2);
             archiver.start_add_form(sources);
             size = ((560u32 * scale).min(info.screen_w), (470u32 * scale).min(info.screen_h));
         }
-        "--zip" => {
+        // «Добавить к "имя.7z"» / «Добавить к "имя.zip"» of the 7-Zip menu
+        // (25.11): next to the first, named as 7-Zip names it, no questions.
+        "--7z" | "--zip" => {
             let sources = paths_of(&args, 2);
-            if let Some(first) = sources.first() {
-                let dir = parent(first);
-                let base = if sources.len() == 1 { stem(file_name(first)) } else { file_name(&dir).to_string() };
-                let name = free_name(&dir, if base.is_empty() || base == "/" { "Архив" } else { &base }, ".zip");
+            if !sources.is_empty() {
+                let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
+                let (ext, format) = if command == "--7z" { ("7z", 0) } else { ("zip", 1) };
+                let name = sysconf::filetypes::add_to_target(&refs, sources.len() == 1 && is_dir(&sources[0]), ext);
+                println(&format!("archiver: adding {} item(s) to '{name}'", sources.len()));
                 archiver.quit_after = true;
-                archiver.add_files(&name, &sources, 1, 2, None);
+                archiver.add_files(&name, &sources, format, 2, None);
             }
             size = ((500u32 * scale).min(info.screen_w), (260u32 * scale).min(info.screen_h));
         }
-        "--extract-here" => {
+        // «Распаковать здесь», «Распаковать в "имя\"», «Тестировать» — of
+        // one or several archives, one after another.
+        "--extract-here" | "--extract-to" | "--test" => {
             let mut archives = paths_of(&args, 2);
             if !archives.is_empty() {
                 let first = archives.remove(0);
                 archiver.queue = archives;
                 archiver.archive = first.clone();
                 archiver.quit_after = true;
-                archiver.extract_here(&first);
+                match command.as_str() {
+                    "--extract-here" => archiver.extract_here(&first),
+                    "--extract-to" => {
+                        archiver.queue_kind = Queue::To;
+                        archiver.extract_to_folder(&first);
+                    }
+                    _ => {
+                        archiver.queue_kind = Queue::Test;
+                        archiver.test_archive(&first);
+                    }
+                }
             }
             size = ((500u32 * scale).min(info.screen_w), (260u32 * scale).min(info.screen_h));
+        }
+        // «CRC SHA ▸ метод» (25.11): `--hash CRC32|CRC64|SHA1|SHA256|* ПУТЬ…`.
+        "--hash" => {
+            let method = args.get(2).unwrap_or("CRC32").to_string();
+            let paths = paths_of(&args, 3);
+            if !paths.is_empty() {
+                archiver.quit_after = true;
+                archiver.hash(&paths, &method);
+            }
+            size = ((680u32 * scale).min(info.screen_w), (360u32 * scale).min(info.screen_h));
+        }
+        // «Открыть архив ▸ тип» (25.11): `--type 7z АРХИВ`.
+        "--type" => {
+            let kind = args.get(2).unwrap_or("*").to_string();
+            let archive = paths_of(&args, 3).into_iter().next().unwrap_or_default();
+            if !archive.is_empty() {
+                archiver.type_arg = format!("-t{kind}");
+                println(&format!("archiver: opening '{archive}' as type {kind}"));
+                archiver.open_archive(&archive);
+            }
         }
         "--extract" => {
             let archive = paths_of(&args, 2).into_iter().next().unwrap_or_default();

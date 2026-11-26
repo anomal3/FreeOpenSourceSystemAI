@@ -130,6 +130,12 @@ pub enum Aim {
     /// Пункт открытого подменю (›) меню стола — так же: номер и черты над
     /// ним. Место подменю — из строки `desktop     : submenu at`.
     SubItem(usize, i32),
+    /// Пункт меню стола по началу подписи (25.11): номер и черты над ним —
+    /// из строки `desktop     : context rows:` (` | ` между пунктами, ` || `
+    /// там, где черта). Новый пункт меню не сдвигает такой прицел.
+    ContextLabel(&'static str),
+    /// То же для открытого подменю (`desktop     : submenu rows:`).
+    SubLabel(&'static str),
     /// Середина окна.
     Middle(&'static str),
     /// Вкладка терминала в полосе-заголовке окна с таким именем (20.11):
@@ -226,11 +232,12 @@ const ICON_MARGIN: i32 = 28;
 const ICON_TILE: i32 = 46;
 
 /// Строка меню стола и поле вокруг списка.
-const CONTEXT_ROW_H: i32 = 32;
+/// `theme::MENU_ITEM_H` (25.11: compact menus).
+const CONTEXT_ROW_H: i32 = 28;
 const CONTEXT_ROW_GAP: i32 = 0;
 const CONTEXT_PAD: i32 = 4;
 /// Поле разделительной черты сверху и снизу.
-const CONTEXT_SEP_PAD: i32 = 4;
+const CONTEXT_SEP_PAD: i32 = 3;
 
 /// Классика (22.11, набор «Простой»): по последней строке `look` в журнале
 /// (`desktop     : look simple [outline,classic] depth 32`, «Параметры» и
@@ -362,6 +369,26 @@ fn context_submenu(log: &str) -> Result<Rect> {
         .context("в журнале нет открытого подменю")
 }
 
+/// Row of the last menu log line `marker` (`a | b || c`) whose label starts
+/// with `label`: its number and the separator lines above it (25.11).
+fn row_by_label(log: &str, marker: &str, label: &str) -> Result<(usize, i32)> {
+    let line = log
+        .lines()
+        .filter_map(|line| line.split(marker).nth(1))
+        .last()
+        .with_context(|| format!("в журнале нет строки '{marker}'"))?;
+    let mut row = 0usize;
+    for (breaks, group) in (0i32..).zip(line.split(" || ")) {
+        for item in group.split(" | ") {
+            if item.trim_end().starts_with(label) {
+                return Ok((row, breaks));
+            }
+            row += 1;
+        }
+    }
+    bail!("в меню нет пункта '{label}': {line}")
+}
+
 /// `53,48 800x576 (focused)` → прямоугольник.
 fn parse_placement(rest: &str) -> Option<Rect> {
     let mut parts = rest.split_whitespace();
@@ -469,6 +496,11 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         // сдвигается, чтобы не выехать, и прицел по точке щелчка попадал бы
         // мимо. Строка — высота глифа на масштаб меню плюс отступы по четыре
         // точки; масштаб меню ограничен двойкой самим столом.
+        Aim::ContextLabel(label) | Aim::SubLabel(label) => {
+            let sub = matches!(aim, Aim::SubLabel(_));
+            let (index, breaks) = row_by_label(log, if sub { "desktop     : submenu rows: " } else { "desktop     : context rows: " }, label)?;
+            return resolve(if sub { Aim::SubItem(index, breaks) } else { Aim::ContextItem(index, breaks) }, log);
+        }
         Aim::ContextItem(index, breaks) | Aim::SubItem(index, breaks) => {
             let rect = if matches!(aim, Aim::SubItem(..)) { context_submenu(log)? } else { context_menu(log)? };
             let scale = ui_scale(log)?;

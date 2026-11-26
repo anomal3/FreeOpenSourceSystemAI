@@ -91,6 +91,9 @@ const ALIASES: &[(&str, &str, &str)] = &[
     ("msconfig", "/bin/startup", "Автозагрузка"),
     ("startup", "/bin/startup", "Автозагрузка"),
     ("sysmon", "/bin/sysmon", "Монитор системы"),
+    // 25.11: «Сетевые подключения».
+    ("ncpa.cpl", "/bin/ncpa", "Сетевые подключения"),
+    ("ncpa", "/bin/ncpa", "Сетевые подключения"),
     ("mc", "/bin/mc", "Midnight Commander"),
 ];
 

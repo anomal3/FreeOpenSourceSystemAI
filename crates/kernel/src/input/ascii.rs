@@ -40,7 +40,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::{KeyCode, post};
+use super::{KeyCode, post_serial as post};
 use crate::sync::SpinLock;
 
 /// Состояние разбора escape-последовательности.

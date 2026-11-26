@@ -25,7 +25,7 @@
 use alloc::format;
 use alloc::string::String;
 
-use crate::{config, kprintln};
+use crate::config;
 use crate::net::ipv4::Ipv4;
 
 /// Имя файла настроек — в `/etc` и в эталоне.
@@ -65,36 +65,6 @@ impl Settings {
             dns: Ipv4::UNSPECIFIED,
         }
     }
-
-    /// Длина префикса маски. `None` — маска дырявая либо не задана.
-    #[must_use]
-    pub fn prefix(&self) -> Option<u32> {
-        self.netmask.prefix()
-    }
-
-    /// Записать в том виде, в каком файл читается обратно.
-    #[must_use]
-    pub fn to_text(&self) -> String {
-        match self.mode {
-            Mode::Dhcp => String::from("mode=dhcp\n"),
-            Mode::Static => {
-                let mut out = String::from("mode=static\n");
-                out.push_str(&format!("address={}\n", self.address));
-                out.push_str(&format!("netmask={}\n", self.netmask));
-                // Пустые строки пишутся, а не опускаются: файл, в котором ключ
-                // отсутствует, и файл, в котором он пуст, читаются одинаково,
-                // но человеку показывают разное — во втором видно, что поле
-                // существует и его можно заполнить.
-                if !self.gateway.is_unspecified() {
-                    out.push_str(&format!("gateway={}\n", self.gateway));
-                }
-                if !self.dns.is_unspecified() {
-                    out.push_str(&format!("dns={}\n", self.dns));
-                }
-                out
-            }
-        }
-    }
 }
 
 /// Разобрать текст настроек.
@@ -130,55 +100,73 @@ pub fn parse(text: &str) -> Settings {
     out
 }
 
-/// Прочитать настройки. `None` — файла нет ни в `/etc`, ни в эталоне.
+/// Прочитать старый файл `/etc/network.cfg`. `None` — файла нет ни в `/etc`,
+/// ни в эталоне. Since 25.11 only a fallback of [`super::adapter::load`].
 #[must_use]
-pub fn load() -> Option<Settings> {
+pub fn load_file() -> Option<Settings> {
     let (bytes, _) = config::read(CONFIG, LIMIT)?;
     let text = core::str::from_utf8(&bytes).ok()?;
     Some(parse(text))
 }
 
-/// Записать настройки в `/etc/network.cfg`.
-pub fn store(settings: &Settings) -> Result<(), crate::vfs::VfsError> {
-    config::write(CONFIG, &settings.to_text())
-}
-
-/// Убрать файл: адрес снова спрашивается у сети.
-pub fn forget() -> Result<bool, crate::vfs::VfsError> {
+/// Remove the old file (the settings store speaks for the card now).
+pub fn forget_file() -> Result<bool, crate::vfs::VfsError> {
     config::reset(CONFIG)
 }
 
-/// Применить постоянные настройки, если они есть.
+/// The card's IPv4 settings (25.11: from the settings store, see
+/// [`super::adapter`]). `None` — no card.
+#[must_use]
+pub fn load() -> Option<Settings> {
+    let status = crate::net::status()?;
+    let saved = super::adapter::load(status.mac);
+    Some(Settings {
+        mode: if saved.dhcp { Mode::Dhcp } else { Mode::Static },
+        address: saved.address,
+        netmask: saved.netmask,
+        gateway: saved.gateway,
+        dns: saved.dns1,
+    })
+}
+
+/// A static address from «Параметры»: applied at once (DHCP stands down) and
+/// kept in the settings store; a DNS server given is kept as set by hand.
+pub fn store(settings: &Settings) -> Result<(), String> {
+    let gateway = if settings.gateway.is_unspecified() { String::from("-") } else { format!("{}", settings.gateway) };
+    let line = format!("ipv4 static {} {} {gateway}", settings.address, settings.netmask);
+    let answer = super::adapter::command(&line);
+    if let Some(why) = answer.iter().find_map(|line| line.strip_prefix("error ")) {
+        return Err(String::from(why));
+    }
+    if !settings.dns.is_unspecified() {
+        let answer = super::adapter::command(&format!("dns {}", settings.dns));
+        if let Some(why) = answer.iter().find_map(|line| line.strip_prefix("error ")) {
+            return Err(String::from(why));
+        }
+    }
+    Ok(())
+}
+
+/// Back to DHCP — at once. `Ok(false)` — it was DHCP already.
+pub fn forget() -> Result<bool, String> {
+    let was_static = load().is_some_and(|settings| settings.mode == Mode::Static);
+    let answer = super::adapter::command("ipv4 dhcp");
+    if let Some(why) = answer.iter().find_map(|line| line.strip_prefix("error ")) {
+        return Err(String::from(why));
+    }
+    let _ = super::adapter::command("dns auto");
+    Ok(was_static)
+}
+
+/// Применить постоянные настройки, если они есть (25.11: per card, from the
+/// settings store — [`super::adapter::adopt`]).
 ///
 /// Зовётся один раз, после того как поднялась сетевая карта, и **до** запуска
-/// служб: `/bin/dhcp` смотрит в этот же файл и, увидев `mode=static`,
-/// отступается. Порядок обязателен — иначе аренда, приехавшая на секунду позже,
+/// служб: `/bin/dhcp` смотрит на флаги `NetInfo` и, увидев ручной адрес,
+/// ждёт. Порядок обязателен — иначе аренда, приехавшая на секунду позже,
 /// перезаписала бы то, что человек задал сам.
 pub fn adopt() {
-    let Some(settings) = load() else {
-        return;
-    };
-    if settings.mode != Mode::Static {
-        kprintln!("  network     : DHCP by {}/{CONFIG}", config::ETC);
-        return;
-    }
-    match crate::net::configure_all(
-        settings.address,
-        settings.netmask,
-        settings.gateway,
-        settings.dns,
-    ) {
-        Ok(()) => kprintln!(
-            "  network     : {}/{} static from {}/{CONFIG}",
-            settings.address,
-            settings.prefix().unwrap_or(0),
-            config::ETC
-        ),
-        // Настройки с носителя могут быть какими угодно, и отказ здесь — не
-        // повод не загрузиться. Сказать о нём надо вслух: молчание выглядело бы
-        // как «адрес применён», а его нет.
-        Err(err) => kprintln!("  network     : {}/{CONFIG} rejected: {err}", config::ETC),
-    }
+    super::adapter::adopt();
 }
 
 // Тестов здесь нет намеренно: ядро под хост не собирается, и `#[cfg(test)]`

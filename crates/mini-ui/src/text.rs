@@ -383,6 +383,11 @@ pub struct TextGrid {
     /// `Color` на ячейку стоили бы шесть байт за экран, где почти все ячейки
     /// одного цвета, и не перекрашивались бы вместе с темой.
     attrs: Vec<Attr>,
+    /// Строка экрана продолжается в следующей: её перенесло по правому
+    /// краю, а не концом строки (25.11). По этим меткам [`Self::rebind`]
+    /// собирает строки заново и переносит их по новой ширине, как Windows
+    /// Terminal, — сужение окна больше не отрезает напечатанное справа.
+    wraps: Vec<bool>,
     /// Цвет, которым печатается следующий символ.
     attr: Attr,
     col: u32,
@@ -418,12 +423,36 @@ pub struct TextGrid {
 struct Line {
     cells: Vec<char>,
     attrs: Vec<Attr>,
+    /// Продолжается в следующей строке (перенос по краю, см. `wraps`).
+    wrapped: bool,
 }
 
 /// Сколько строк помнит прокрутка. Строки хранятся без хвостовых пробелов, и
 /// обычный вывод — это десяток-другой знаков на строку: пять тысяч строк
 /// обходятся в сотни килобайт, а не в мегабайты полной ширины окна.
 pub const SCROLLBACK: usize = 5000;
+
+/// Свежий экран сетки: ячейки, цвета и метки переноса.
+struct Screen {
+    cells: Vec<char>,
+    attrs: Vec<Attr>,
+    wraps: Vec<bool>,
+}
+
+impl Screen {
+    fn blank(len: usize, rows: usize) -> Option<Self> {
+        let mut cells = Vec::new();
+        cells.try_reserve_exact(len).ok()?;
+        cells.resize(len, ' ');
+        let mut attrs = Vec::new();
+        attrs.try_reserve_exact(len).ok()?;
+        attrs.resize(len, Attr::DEFAULT);
+        let mut wraps = Vec::new();
+        wraps.try_reserve_exact(rows).ok()?;
+        wraps.resize(rows, false);
+        Some(Self { cells, attrs, wraps })
+    }
+}
 
 /// Шаг табуляции в символах.
 const TAB_STOP: u32 = 8;
@@ -449,6 +478,9 @@ impl TextGrid {
         let mut attrs = Vec::new();
         attrs.try_reserve_exact(len).ok()?;
         attrs.resize(len, Attr::DEFAULT);
+        let mut wraps = Vec::new();
+        wraps.try_reserve_exact(rows as usize).ok()?;
+        wraps.resize(rows as usize, false);
 
         Some(Self {
             origin: (area.x as u32, area.y as u32),
@@ -458,6 +490,7 @@ impl TextGrid {
             cell: (cell_w, cell_h),
             cells,
             attrs,
+            wraps,
             attr: Attr::DEFAULT,
             col: 0,
             row: 0,
@@ -707,11 +740,18 @@ impl TextGrid {
         let start = (row * self.cols) as usize;
         let cells = &self.cells[start..start + self.cols as usize];
         let attrs = &self.attrs[start..start + self.cols as usize];
-        let len = (0..cells.len())
-            .rev()
-            .find(|&at| cells[at] != ' ' || attrs[at] != Attr::DEFAULT)
-            .map_or(0, |at| at + 1);
-        let mut line = Line { cells: Vec::new(), attrs: Vec::new() };
+        let wrapped = self.wraps.get(row as usize).copied().unwrap_or(false);
+        // Перенесённая строка хранится во всю ширину: пробелы в её конце —
+        // часть текста, который продолжается ниже.
+        let len = if wrapped {
+            cells.len()
+        } else {
+            (0..cells.len())
+                .rev()
+                .find(|&at| cells[at] != ' ' || attrs[at] != Attr::DEFAULT)
+                .map_or(0, |at| at + 1)
+        };
+        let mut line = Line { cells: Vec::new(), attrs: Vec::new(), wrapped };
         // Памяти не хватило — строка просто не запоминается: прокрутка —
         // удобство, и ронять из-за неё вывод нельзя.
         if line.cells.try_reserve_exact(len).is_err() || line.attrs.try_reserve_exact(len).is_err() {
@@ -766,10 +806,17 @@ impl TextGrid {
     /// содержимого изменение размера стирало бы всё, что напечатано, — то есть
     /// вело бы себя как очистка экрана, чего от рамки окна никто не ждёт.
     ///
-    /// Что не помещается — обрезается снизу и справа; курсор остаётся в
-    /// пределах новой сетки. `false`, если в новую область не влезает ни одна
-    /// ячейка или не хватило памяти: сетка при этом остаётся прежней, и
-    /// вызывающий вправе отказаться от изменения размера.
+    /// С 25.11 — как в Windows Terminal: строки (вместе с прокруткой)
+    /// собираются по меткам переноса в целые и переносятся заново по новой
+    /// ширине ([`Self::reflow`]); при увеличении высоты строки возвращаются
+    /// из прокрутки на экран, при уменьшении уходят в неё. Прежде сужение
+    /// отрезало текст справа навсегда, а уменьшение высоты уносило верх в
+    /// прокрутку, откуда он уже не возвращался — после «развернуть» и
+    /// «восстановить» напечатанное пропадало (замечание Романа, 25.11).
+    ///
+    /// `false`, если в новую область не влезает ни одна ячейка или не
+    /// хватило памяти: сетка при этом остаётся прежней, и вызывающий вправе
+    /// отказаться от изменения размера.
     pub fn rebind(&mut self, surface: &mut Surface, area: Rect) -> bool {
         let (cell_w, cell_h) = self.cell;
         let cols = area.w / cell_w;
@@ -777,45 +824,63 @@ impl TextGrid {
         if cols == 0 || rows == 0 || area.x < 0 || area.y < 0 {
             return false;
         }
-
         let Some(len) = (cols as usize).checked_mul(rows as usize) else {
             return false;
         };
-        let mut cells = Vec::new();
-        if cells.try_reserve_exact(len).is_err() {
+        let Some(mut screen) = Screen::blank(len, rows as usize) else {
             return false;
-        }
-        cells.resize(len, ' ');
-        let mut attrs = Vec::new();
-        if attrs.try_reserve_exact(len).is_err() {
-            return false;
-        }
-        attrs.resize(len, Attr::DEFAULT);
+        };
 
-        // Строки переносятся с начала: терминал печатает сверху вниз. Если
-        // строка курсора в новую высоту не влезает, верхние строки уходят в
-        // прокрутку (терминал T5) — так строка, где набирают, остаётся на
-        // виду, а ушедшее можно поднять колесом.
-        let shift = (self.row + 1).saturating_sub(rows);
-        for row in 0..shift {
-            self.keep_line(row);
-        }
-        let keep_cols = cols.min(self.cols) as usize;
-        let keep_rows = rows.min(self.rows - shift) as usize;
-        for row in 0..keep_rows {
-            let from = (row + shift as usize) * self.cols as usize;
-            let to = row * cols as usize;
-            cells[to..to + keep_cols].copy_from_slice(&self.cells[from..from + keep_cols]);
-            attrs[to..to + keep_cols].copy_from_slice(&self.attrs[from..from + keep_cols]);
+        let reflowed = if cols == self.cols && rows == self.rows {
+            None
+        } else {
+            self.reflow(cols, rows)
+        };
+        match reflowed {
+            Some((scrollback, lines, (row, col))) => {
+                for (index, line) in lines.iter().enumerate() {
+                    let to = index * cols as usize;
+                    let n = line.cells.len().min(cols as usize);
+                    screen.cells[to..to + n].copy_from_slice(&line.cells[..n]);
+                    screen.attrs[to..to + n].copy_from_slice(&line.attrs[..n]);
+                    screen.wraps[index] = line.wrapped;
+                }
+                let base = self.scrolled - self.scrollback.len() as u64;
+                self.scrolled = base + scrollback.len() as u64;
+                self.scrollback = scrollback;
+                self.row = row;
+                self.col = col;
+            }
+            // Тот же размер (сменилось только место) или памяти на перенос
+            // не хватило — прежний перенос: строки с начала, что не влезает,
+            // обрезается.
+            None => {
+                let shift = (self.row + 1).saturating_sub(rows);
+                for row in 0..shift {
+                    self.keep_line(row);
+                }
+                let keep_cols = cols.min(self.cols) as usize;
+                let keep_rows = rows.min(self.rows - shift) as usize;
+                for row in 0..keep_rows {
+                    let from = (row + shift as usize) * self.cols as usize;
+                    let to = row * cols as usize;
+                    screen.cells[to..to + keep_cols].copy_from_slice(&self.cells[from..from + keep_cols]);
+                    screen.attrs[to..to + keep_cols].copy_from_slice(&self.attrs[from..from + keep_cols]);
+                    screen.wraps[row] = cols == self.cols && self.wraps[row + shift as usize];
+                }
+                self.col = self.col.min(cols - 1);
+                self.row = (self.row - shift).min(rows - 1);
+            }
         }
 
         self.origin = (area.x as u32, area.y as u32);
         self.cols = cols;
         self.rows = rows;
-        self.cells = cells;
-        self.attrs = attrs;
-        self.col = self.col.min(cols - 1);
-        self.row = (self.row - shift).min(rows - 1);
+        self.cells = screen.cells;
+        self.attrs = screen.attrs;
+        self.wraps = screen.wraps;
+        self.col = self.col.min(cols);
+        self.row = self.row.min(rows - 1);
         self.view = 0;
         self.selection = None;
         // Курсор нарисован на прежней поверхности, которой больше нет.
@@ -838,10 +903,131 @@ impl TextGrid {
         true
     }
 
+    /// Перенести прокрутку и экран по ширине `cols`: собрать строки по
+    /// меткам переноса и разрезать заново. Возвращает новую прокрутку,
+    /// строки экрана (не больше `rows`) и место курсора; `None` — не
+    /// хватило памяти (прежнее состояние не тронуто).
+    ///
+    /// Экран берётся до строки курсора или последней непустой, что ниже;
+    /// пустые строки под ними — не текст. Низ текста встаёт к низу окна,
+    /// если всё не помещается, иначе текст — сверху, как был.
+    #[allow(clippy::type_complexity)]
+    fn reflow(&self, cols: u32, rows: u32) -> Option<(VecDeque<Line>, Vec<Line>, (u32, u32))> {
+        let width = cols as usize;
+        let old = self.cols as usize;
+        let last_text = (0..self.rows as usize)
+            .rev()
+            .find(|&row| {
+                let at = row * old;
+                self.cells[at..at + old].iter().zip(&self.attrs[at..at + old]).any(|(c, a)| *c != ' ' || *a != Attr::DEFAULT)
+            })
+            .unwrap_or(0);
+        let end = last_text.max(self.row as usize) + 1;
+
+        let mut out: Vec<Line> = Vec::new();
+        out.try_reserve(self.scrollback.len() + end).ok()?;
+        let mut acc = Line { cells: Vec::new(), attrs: Vec::new(), wrapped: false };
+        // Курсор: сквозное место в собираемой строке, пока её не выпустили;
+        // потом — строка и столбец в `out`.
+        let mut cursor_in_acc: Option<usize> = None;
+        let mut cursor: Option<(usize, u32)> = None;
+
+        let emit = |acc: &mut Line, cursor_in_acc: &mut Option<usize>, out: &mut Vec<Line>, cursor: &mut Option<(usize, u32)>| -> Option<()> {
+            let content = acc.cells.len();
+            let mut chunks = content.div_ceil(width).max(1);
+            if let Some(off) = *cursor_in_acc {
+                // Курсор сразу за полной строкой стоит «в ожидании переноса»
+                // (столбец = ширина), а не в начале следующей.
+                let (row, col) = if off > 0 && off % width == 0 && off >= content {
+                    (off / width - 1, width as u32)
+                } else {
+                    (off / width, (off % width) as u32)
+                };
+                chunks = chunks.max(row + 1);
+                *cursor = Some((out.len() + row, col));
+                *cursor_in_acc = None;
+            }
+            out.try_reserve(chunks).ok()?;
+            for chunk in 0..chunks {
+                let from = (chunk * width).min(content);
+                let to = ((chunk + 1) * width).min(content);
+                let mut line = Line { cells: Vec::new(), attrs: Vec::new(), wrapped: chunk + 1 < chunks };
+                line.cells.try_reserve_exact(to - from).ok()?;
+                line.attrs.try_reserve_exact(to - from).ok()?;
+                line.cells.extend_from_slice(&acc.cells[from..to]);
+                line.attrs.extend_from_slice(&acc.attrs[from..to]);
+                out.push(line);
+            }
+            acc.cells.clear();
+            acc.attrs.clear();
+            Some(())
+        };
+
+        let take = |acc: &mut Line, cells: &[char], attrs: &[Attr], wrapped: bool| -> Option<()> {
+            // Конец строки — без пробелов цвета окна; у перенесённой — целиком.
+            let len = if wrapped {
+                cells.len()
+            } else {
+                (0..cells.len()).rev().find(|&at| cells[at] != ' ' || attrs[at] != Attr::DEFAULT).map_or(0, |at| at + 1)
+            };
+            acc.cells.try_reserve(len).ok()?;
+            acc.attrs.try_reserve(len).ok()?;
+            acc.cells.extend_from_slice(&cells[..len]);
+            acc.attrs.extend_from_slice(&attrs[..len]);
+            Some(())
+        };
+
+        for line in &self.scrollback {
+            take(&mut acc, &line.cells, &line.attrs, line.wrapped)?;
+            if !line.wrapped {
+                emit(&mut acc, &mut cursor_in_acc, &mut out, &mut cursor)?;
+            }
+        }
+        for row in 0..end {
+            let at = row * old;
+            let wrapped = self.wraps[row] && row + 1 < end;
+            let start = acc.cells.len();
+            take(&mut acc, &self.cells[at..at + old], &self.attrs[at..at + old], wrapped)?;
+            if row == self.row as usize {
+                cursor_in_acc = Some(start + self.col as usize);
+            }
+            if !wrapped {
+                emit(&mut acc, &mut cursor_in_acc, &mut out, &mut cursor)?;
+            }
+        }
+
+        let total = out.len();
+        let (cursor_line, cursor_col) = cursor.unwrap_or((total.saturating_sub(1), 0));
+        let mut top = total.saturating_sub(rows as usize);
+        if cursor_line < top {
+            top = cursor_line;
+        }
+        let mut screen: Vec<Line> = out.split_off(top);
+        screen.truncate(rows as usize);
+        // Прокрутка помнит не больше [`SCROLLBACK`] строк: старые — прочь.
+        let drop = out.len().saturating_sub(SCROLLBACK);
+        let mut scrollback = VecDeque::new();
+        scrollback.try_reserve(out.len() - drop).ok()?;
+        for mut line in out.into_iter().skip(drop) {
+            if !line.wrapped {
+                let len = (0..line.cells.len())
+                    .rev()
+                    .find(|&at| line.cells[at] != ' ' || line.attrs[at] != Attr::DEFAULT)
+                    .map_or(0, |at| at + 1);
+                line.cells.truncate(len);
+                line.attrs.truncate(len);
+            }
+            scrollback.push_back(line);
+        }
+        let row = (cursor_line - top).min(rows as usize - 1) as u32;
+        Some((scrollback, screen, (row, cursor_col.min(cols))))
+    }
+
     /// Очистить сетку и залить её область фоном.
     pub fn clear(&mut self, surface: &mut Surface) {
         self.cells.fill(' ');
         self.attrs.fill(Attr::DEFAULT);
+        self.wraps.fill(false);
         self.col = 0;
         self.row = 0;
         self.cursor_drawn = false;
@@ -949,6 +1135,15 @@ impl TextGrid {
             1 => (0, position + 1),
             _ => (0, total),
         };
+        // Стёртые целиком строки больше ничего не продолжают.
+        let (first, last) = match mode {
+            0 => (self.row as usize, self.rows as usize),
+            1 => (0, self.row as usize),
+            _ => (0, self.rows as usize),
+        };
+        for flag in self.wraps.iter_mut().take(last).skip(first) {
+            *flag = false;
+        }
         self.erase_range(surface, from, to.min(total));
     }
 
@@ -963,6 +1158,11 @@ impl TextGrid {
             1 => (start, position + 1),
             _ => (start, end),
         };
+        if mode != 1 {
+            if let Some(flag) = self.wraps.get_mut(self.row as usize) {
+                *flag = false;
+            }
+        }
         self.erase_range(surface, from, to.min(end));
     }
 
@@ -1096,6 +1296,10 @@ impl TextGrid {
         self.keep_line(0);
         self.cells.copy_within(cols.., 0);
         self.attrs.copy_within(cols.., 0);
+        self.wraps.copy_within(1.., 0);
+        if let Some(flag) = self.wraps.last_mut() {
+            *flag = false;
+        }
         let last = (self.rows as usize - 1) * cols;
         self.cells[last..].fill(' ');
         // Освободившаяся строка получает цвета окна, а не последний
@@ -1167,6 +1371,10 @@ impl TextGrid {
     fn write_char(&mut self, surface: &mut Surface, ch: char) {
         match ch {
             '\n' => {
+                // Конец строки, а не перенос: строка больше не продолжается.
+                if let Some(flag) = self.wraps.get_mut(self.row as usize) {
+                    *flag = false;
+                }
                 self.newline(surface);
                 return;
             }
@@ -1190,6 +1398,9 @@ impl TextGrid {
         // Перенос по правому краю: строка длиннее сетки продолжается снизу и
         // может утащить за собой прокрутку, поэтому проверка идёт до вывода.
         if self.col >= self.cols {
+            if let Some(flag) = self.wraps.get_mut(self.row as usize) {
+                *flag = true;
+            }
             self.newline(surface);
         }
         // Управляющие знаки, кроме разобранных выше, в ячейку не попадают: у
@@ -1199,5 +1410,71 @@ impl TextGrid {
         let ch = if (ch as u32) < 0x20 || ch == '\u{7F}' { '?' } else { ch };
         self.put_cell(surface, self.col, self.row, ch);
         self.col += 1;
+    }
+}
+
+#[cfg(test)]
+mod reflow_tests {
+    use super::*;
+
+    fn grid(cols: u32, rows: u32) -> (TextGrid, Surface) {
+        let face = &typeface::data::MONONORMAL;
+        let (cw, ch) = typeface::cell(face);
+        let surface = Surface::new(cw * 200, ch * 100, Color::rgb(0, 0, 0)).unwrap();
+        let grid = TextGrid::new(Rect::new(0, 0, cw * cols, ch * rows), face, Color::rgb(255, 255, 255), Color::rgb(0, 0, 0)).unwrap();
+        (grid, surface)
+    }
+
+    fn resize(grid: &mut TextGrid, surface: &mut Surface, cols: u32, rows: u32) {
+        let (cw, ch) = grid.cell;
+        assert!(grid.rebind(surface, Rect::new(0, 0, cw * cols, ch * rows)));
+    }
+
+    /// Every line, scrollback then screen, joined by wrap marks.
+    fn text(grid: &TextGrid) -> String {
+        let mut out = String::new();
+        let first = grid.scrolled - grid.scrollback.len() as u64;
+        for line in first..grid.scrolled + u64::from(grid.rows) {
+            let row: String = (0..grid.cols).map(|col| grid.cell_at(line, col).0).collect();
+            let wrapped = if line < grid.scrolled {
+                grid.scrollback[(line - first) as usize].wrapped
+            } else {
+                grid.wraps[(line - grid.scrolled) as usize]
+            };
+            if wrapped {
+                out.push_str(&row);
+            } else {
+                out.push_str(row.trim_end());
+                out.push('\n');
+            }
+        }
+        out.trim_end().into()
+    }
+
+    #[test]
+    fn narrow_then_wide_keeps_text() {
+        let (mut grid, mut surface) = grid(20, 5);
+        grid.write_str(&mut surface, "0123456789abcdefghij-tail\nline two\n$ ");
+        let before = text(&grid);
+        resize(&mut grid, &mut surface, 7, 3);
+        assert_eq!(text(&grid), before);
+        resize(&mut grid, &mut surface, 40, 10);
+        assert_eq!(text(&grid), before);
+        // All of it is back on the screen, the cursor after the prompt.
+        assert_eq!(grid.scrollback.len(), 0);
+        assert_eq!(grid.cursor_at(), (2, 2));
+    }
+
+    #[test]
+    fn shrink_then_grow_brings_lines_back() {
+        let (mut grid, mut surface) = grid(30, 10);
+        for n in 0..8 {
+            grid.write_str(&mut surface, &alloc::format!("line {n}\n"));
+        }
+        resize(&mut grid, &mut surface, 30, 3);
+        assert_eq!(grid.cursor_at().0, 2);
+        resize(&mut grid, &mut surface, 30, 10);
+        assert_eq!(grid.cell_at(grid.scrolled, 0).0, 'l');
+        assert_eq!(grid.cursor_at(), (8, 0));
     }
 }
