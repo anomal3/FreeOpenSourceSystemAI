@@ -2845,6 +2845,25 @@ fn start_host_site() -> Result<(HostServer, u16)> {
                 )
                 .into_bytes()
             }
+            // OBSOS local storage (26.11, `obsos-storage`): a visit counter in
+            // localStorage, reported as a console warning — OBSOS copies those
+            // into the kernel log ("app log"). `#reset` starts from zero.
+            "/storage.html" => {
+                let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>OBSOS storage</title>\
+                    <style>body{font-family:sans-serif;margin:32px;background:#eef6ee}h1{font-size:40px}</style></head>\
+                    <body><h1 id=\"n\">?</h1><script>\
+                    if(location.hash=='#reset')localStorage.removeItem('obsos-visits');\
+                    var n=(parseInt(localStorage.getItem('obsos-visits')||'0',10)||0)+1;\
+                    localStorage.setItem('obsos-visits',String(n));\
+                    document.getElementById('n').textContent='localStorage visit '+n;\
+                    console.warn('obsos-storage: visit '+n);\
+                    </script></body></html>\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
             "/stream.bin" => {
                 let length = scenarios::SITE_STREAM_BYTES;
                 let mut answer = format!(

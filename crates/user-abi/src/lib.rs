@@ -1527,6 +1527,10 @@ pub const FDCTL_FLAGS: usize = 2;
 /// Бит ответа [`FDCTL_FLAGS`]: дескриптор не ждёт.
 pub const FD_NONBLOCK: i64 = 1;
 
+/// [`SYS_FDCTL`] (26.11): new length of a file open for writing — the
+/// argument (`ftruncate`; SQLite's journal in OBSOS). Not a file open for
+/// writing — [`ERR_BAD_FD`]; a file system without it — its error.
+pub const FDCTL_TRUNCATE: usize = 3;
 /// Звук: `(действие, адрес, длина) -> ответ` (фаза 67f).
 ///
 /// Действия — `SOUND_*`. Отсчёты — 16 бит со знаком, little-endian, два канала

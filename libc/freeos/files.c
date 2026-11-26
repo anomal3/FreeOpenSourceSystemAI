@@ -471,18 +471,17 @@ int renameat2(int from_dir, const char *from, int to_dir, const char *to, unsign
     return renameat(from_dir, from, to_dir, to);
 }
 
-/* Обрезать файл ядро умеет только до нуля — открытием с `O_TRUNC`; любая
- * другая длина — `ENOSYS`, как у `ftruncate`. */
+/* `truncate` — through `ftruncate` (26.11.2026; before only to zero). */
 int truncate(const char *path, off_t length) {
-    if (length != 0) {
-        errno = ENOSYS;
-        return -1;
-    }
-    int fd = open(path, O_WRONLY | O_TRUNC);
+    int fd = open(path, length == 0 ? (O_WRONLY | O_TRUNC) : O_WRONLY);
     if (fd < 0) {
         return -1;
     }
-    return close(fd);
+    int code = length == 0 ? 0 : ftruncate(fd, length);
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return code;
 }
 
 /* Сведений о свободном месте на томе ядро не отдаёт: вызова нет. */
@@ -558,13 +557,16 @@ int lstat(const char *path, struct stat *out) {
     return stat(path, out);
 }
 
-/* Обрезать открытый файл ядро не умеет: укоротить можно только открытием с
- * `O_TRUNC`, и только до нуля. */
+/* Length of an open file (26.11.2026): `SYS_FDCTL` `FDCTL_TRUNCATE`, the
+ * file must be open for writing. SQLite (localStorage of OBSOS) truncates its
+ * rollback journal with it. */
 int ftruncate(int fd, off_t length) {
-    (void)fd;
-    (void)length;
-    errno = ENOSYS;
-    return -1;
+    if (length < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    long code = freeos_syscall(SYS_FDCTL, fd, FREEOS_FDCTL_TRUNCATE, (long)length);
+    return code < 0 ? freeos_set_errno(code) : 0;
 }
 
 /* Кеша блоков у ядра нет — запись уходит на носитель до возврата из `write`.

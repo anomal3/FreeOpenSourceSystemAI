@@ -18649,7 +18649,7 @@ by interrupt` и `network : receive task …, woken by interrupt`; при бол
 адаптера; повышение прав для не-root; MSI-X и разгрузки RTL8125 (контрольные суммы,
 TSO); SACK/быстрый повтор по тройному дублю ACK в TCP.
 
-## OBSOS: вход в Rupor web (web.pynop.online) и журнал страниц (25.11, hw-log19) - **исправлено в коде OBSOS, пакет не пересобран**
+## OBSOS: вход в Rupor web (web.pynop.online) и журнал страниц (25.11, hw-log19) - **OBSOS rebuilt 26.11: localStorage works; Servo IndexedDB panic on Rupor - TODO in OBSOS**
 
 Роман: в OBSOS не войти в Rupor (Blazor WebAssembly + SignalR). Разбор на
 настоящем Servo 0.8 (servoshell того же выпуска, без окна, через WebDriver) с
@@ -18712,6 +18712,32 @@ Servo с нуля — часы и десятки ГБ на C: (Docker) — ну�
 `obsos-fix.js` в `~/.config/obsos/default/userscripts/` чинит только поля). Эмодзи на странице Rupor — квадраты (нет
 шрифта эмодзи). `navigator.serviceWorker` в Servo нет (PWA без офлайна, на вход
 не влияет).
+
+**Rebuild 26.11** (from the OBSOS repo, `ports/servo/OBSOS_REV` = c8f9827): the builder
+image `fossai-builder` rebuilt (~5 min; apt retries in the Dockerfile, deb.debian.org
+dropped connections), Servo from scratch in empty volumes: x86_64 ~11 min, aarch64
+~9 min (16 threads). `build-servoprobe.sh`: host `cc` before OBSOS's `cargo xtask
+vendor`; its own Cargo.lock in the volume (`/cache/obsos-lock-ARCH`,
+`resolver.lockfile-path`): OBSOS's Cargo.lock has libc 0.2.191 and mio 1.2.5, so the
+FreeOS copies (libc 0.2.189, mio 1.2.4) stayed unused and libc did not build for
+freeos. The OBSOS repo is not changed.
+- **cause 3** (found by scenario `obsos-storage`): without WAL SQLite truncates its
+  journal with `ftruncate`, which native programs did not have (`ENOSYS`): `Failed to
+  get storage environment: SystemIoFailure 1546` (SQLITE_IOERR_TRUNCATE),
+  localStorage threw QuotaExceededError. Now `SYS_FDCTL` `FDCTL_TRUNCATE` (a file
+  open for writing; `Node::truncate`, like `ftruncate` of the Linux layer) and
+  `ftruncate`/`truncate` in `libc/freeos/files.c` (after a change: `cargo xtask sdk`
+  and relink OBSOS).
+- scenario `obsos-storage` (no account): host page `/storage.html` counts its visits
+  in localStorage (console.warn, an `app log` line), the browser is closed and opened
+  again (`visit 2`), then web.pynop.online/Account/Login. Run 26.11: visit 1, visit 2
+  after the restart (localStorage persists), `app log` lines present, the Rupor login
+  page came up (window title = the Blazor app's title). **Fails later:** Servo 0.8
+  panics in IndexedDB on the Rupor page - `idbdatabase.rs:169 clear_upgrade_transaction
+  called but no upgrade transaction is set` (script thread, abort, browser gone). Before,
+  IndexedDB never opened (SQLite errors); now the engine reaches this bug. **TODO (OBSOS
+  repo, vendored servo-script):** no panic without an upgrade transaction; until then
+  the Rupor login in OBSOS probably still breaks off.
 
 ## Rupor на CEF (F:\cef-test) под Proton — чёрное окно (25.11, hw-log19) - **причина найдена, не исправлено**
 
