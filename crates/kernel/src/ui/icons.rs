@@ -1459,7 +1459,9 @@ fn system_items() -> Vec<Item> {
     if matches!(crate::fs::list("/opt/obsos/bin"), Some(Ok(_))) {
         out.push(Item {
             kind: Kind::Program(Icon::Network),
-            label: String::from("Браузер"),
+            // BETA (Roman, 26.11.2026): the browser is marked everywhere a
+            // user sees it (title bar - user/syscall.rs `beta_title`).
+            label: String::from("Браузер (BETA)"),
             path: Some(OBSOS_COMMAND.to_string()),
             shortcut: None,
         });
@@ -1494,7 +1496,7 @@ fn mobile_items() -> Vec<Item> {
     // модем, а набрать номер можно уже сейчас.
     out.push(program(Icon::Phone, "Телефон", PHONE_COMMAND));
     // Браузер — OBSOS (10.11.2026): Servo с JavaScript, лежит на разделе `cache`.
-    out.push(program(Icon::Network, "OBSOS", OBSOS_COMMAND));
+    out.push(program(Icon::Network, "OBSOS (BETA)", OBSOS_COMMAND));
     out.push(app(App::Terminal, "Терминал"));
     out.push(app(App::Settings, "Настройки"));
     out.push(program(Icon::Folder, FILES_LABEL, FILES_COMMAND));

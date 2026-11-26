@@ -2864,6 +2864,32 @@ fn start_host_site() -> Result<(HostServer, u16)> {
                 )
                 .into_bytes()
             }
+            // OBSOS WebGL/WebRTC (26.11, `obsos-webgl`): what the page gets on
+            // FossAi. WebGL needs a GPU connection (surfman) Servo does not have
+            // under swgl, so the honest answer is getContext() == null; WebRTC
+            // needs GStreamer, which the FossAi build does not have. A 2D canvas
+            // shows the page itself runs.
+            "/webgl.html" => {
+                let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>OBSOS WebGL</title>\
+                    <style>body{font-family:sans-serif;margin:32px;background:#eef2fb}h1{font-size:32px}p{font-size:20px}</style></head>\
+                    <body><h1>WebGL / WebRTC</h1><p id=\"r\">?</p><canvas id=\"c\" width=\"240\" height=\"80\"></canvas><script>\
+                    var err='',gl=null,gl2=null;\
+                    try{gl=document.createElement('canvas').getContext('webgl')}catch(e){err+=' webgl:'+e}\
+                    try{gl2=document.createElement('canvas').getContext('webgl2')}catch(e){err+=' webgl2:'+e}\
+                    var rtc=typeof window.RTCPeerConnection;\
+                    var gum=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);\
+                    var x=document.getElementById('c').getContext('2d');\
+                    x.fillStyle='#2b5797';x.fillRect(0,0,240,80);x.fillStyle='#fff';x.font='24px sans-serif';x.fillText('2D canvas ok',20,50);\
+                    var s='webgl='+(gl?'yes':'no')+' webgl2='+(gl2?'yes':'no')+' rtc='+rtc+' getUserMedia='+gum+err;\
+                    document.getElementById('r').textContent=s;\
+                    console.warn('obsos-webgl: '+s);\
+                    </script></body></html>\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
             "/stream.bin" => {
                 let length = scenarios::SITE_STREAM_BYTES;
                 let mut answer = format!(

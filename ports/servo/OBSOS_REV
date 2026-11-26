@@ -1,8 +1,10 @@
-c8f98272dd1f3e59c569e630d3f70a275862b799
-# Source since 26.11.2026: F:\ObsosBrowser (git anomal3/OBSOS) - the WORKING TREE
-# over the commit above, with uncommitted work (multi-window, chrome.rs, obsos://
-# pages, devtools, automation, logs/perf, GPU path for Windows, IndexedDB and
-# shadow-root <style> fixes in vendored servo-script). Not a git revision: the
-# snapshot build/obsos-src/.obsos-source has the file list and diff-sha256
-# (built from diff-sha256 484f6c967641d4468cf55a451f29f7eddbc051d920e77b67a855511234bdf2cc).
-# Snapshot: powershell -File ports\servo\snapshot-obsos.ps1
+f29cb49b4796aad2e120795321043dc75df852b3
+# OBSOS v0.1.1 (git anomal3/OBSOS, main, 26.11.2026), on Roman's PC
+# F:\ObsosBrowser - a clean tree at this commit: multi-window, chrome.rs,
+# obsos:// pages, devtools, automation, logs/perf, GPU path for Windows,
+# WebGL on the Windows desktop (surfman edits), WebRTC calls (TURN from
+# iceServers, track enabled/stop, data channels, getUserMedia permission bar -
+# GStreamer only, off on FossAi), CSS mask-image icons (servo-layout; off on
+# FossAi), vendored servo-script fixes (IndexedDB, shadow-root <style>).
+# Snapshot: powershell -File ports\servo\snapshot-obsos.ps1 (build/obsos-src,
+# .obsos-source shows "head: f29cb49..." and "dirty: 0 files").

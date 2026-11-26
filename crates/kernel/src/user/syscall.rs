@@ -2316,6 +2316,8 @@ fn open_spec(ptr: usize, popup: Option<(u32, (i32, i32))>) -> i64 {
         return ERR_BAD_ADDRESS;
     };
 
+    let marked = if popup.is_none() { beta_title(title) } else { None };
+    let title = marked.as_deref().unwrap_or(title);
     match super::open_window(title, spec.width, spec.height, popup) {
         Ok((surface, slot)) => {
             spec.surface = surface as u64;
@@ -2779,6 +2781,27 @@ fn winlimits(id: i64, min: usize, max: usize) -> i64 {
     }
 }
 
+/// The OBSOS browser is a beta (Roman, 26.11.2026): its window titles (title
+/// bar, taskbar, Alt+Tab) get " (BETA)" here, on the FossAi side - the browser
+/// sources are a snapshot of another project (F:\ObsosBrowser) and are not
+/// edited. Popups (menus, lists) have no title bar and stay as they are.
+fn beta_title(title: &str) -> Option<alloc::string::String> {
+    const OBSOS: &str = "/opt/obsos/bin/obsos";
+    if title.contains("BETA") {
+        return None;
+    }
+    let obsos = super::with_current(|program| program.path.ends_with(OBSOS)).unwrap_or(false);
+    if !obsos {
+        return None;
+    }
+    // "OBSOS — page" -> "OBSOS (BETA) — page": right after the name, so a long
+    // page title cut by the title bar does not cut the mark.
+    Some(match title.strip_prefix("OBSOS") {
+        Some(rest) => alloc::format!("OBSOS (BETA){rest}"),
+        None => alloc::format!("{title} (BETA)"),
+    })
+}
+
 /// `wintitle(id, ptr, len) -> 0` (фаза 62c). Строка проверяется так же, как
 /// заголовок в [`winopen`].
 fn wintitle(id: i64, ptr: usize, len: usize) -> i64 {
@@ -2798,6 +2821,8 @@ fn wintitle(id: i64, ptr: usize, len: usize) -> i64 {
     let Ok(title) = core::str::from_utf8(bytes) else {
         return ERR_BAD_ADDRESS;
     };
+    let marked = beta_title(title);
+    let title = marked.as_deref().unwrap_or(title);
     match super::title_window(slot, title) {
         Ok(()) => 0,
         Err(err) => window_errno(err),

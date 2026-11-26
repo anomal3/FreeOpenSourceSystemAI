@@ -300,8 +300,9 @@ fn servo_package(arch: Arch, probes: bool) -> Result<Option<Vec<u8>>> {
     // OBSOS — Open Browser for System Open Source («Обсос»; Роман, 08.11.2026):
     // браузер FreeOS на движке Servo.
     let mut servo = Builder::new(Kind::Package, "obsos", "0.1");
-    servo.field("summary", "OBSOS, the FreeOS web browser (Servo engine, SpiderMonkey, software rendering)");
-    servo.field("about", "браузер OBSOS (Open Browser for System Open Source) на движке Servo");
+    // BETA (Roman, 26.11.2026): name, description and caption say so.
+    servo.field("summary", "OBSOS (BETA), the FreeOS web browser (Servo engine, SpiderMonkey, software rendering)");
+    servo.field("about", "браузер OBSOS (BETA, Open Browser for System Open Source) на движке Servo; WebGL и звонки WebRTC на FossAi пока не работают");
     // Как у NetSurf: окна, файлы (база SQLite, кеш), сеть (TLS через петлю у
     // depsprobe — без `net` даже bind на 127.0.0.1 отказан). `jit` — когда
     // SpiderMonkey пойдёт с JIT (N12).
@@ -326,7 +327,7 @@ fn servo_package(arch: Arch, probes: bool) -> Result<Option<Vec<u8>>> {
         let data = fs::read(&browser).with_context(|| format!("не удалось прочитать {}", browser.display()))?;
         servo.file(&Entry { path: String::from("bin/obsos"), mode: 0o755, uid: 0, gid: 0, data });
         // Имя с пояснением — по одному «OBSOS» непонятно, что это (Роман).
-        servo.field("caption", "OBSOS — Браузер");
+        servo.field("caption", "OBSOS (BETA) — Браузер");
         servo.field("start", "/opt/obsos/bin/obsos");
     }
     // Авторство и лицензии (N8): MPL-2.0 и Unicode требуют, чтобы уведомление

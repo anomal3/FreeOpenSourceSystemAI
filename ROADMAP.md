@@ -18942,6 +18942,50 @@ servo-paint для нескольких окон).
   несколько окон на программу?), `scale_factor` для HiDPI; когда Роман
   закоммитит ObsosBrowser — перезакрепить `OBSOS_REV` на настоящий коммит.
 
+### 26.11 (позже): правки OBSOS с WebGL и WebRTC, браузер помечен BETA
+
+Роман: «Там правки по OBSOS браузеру пришли, надо их добавить — там WebGL и
+WebRTC, и браузер обязательно в FossAi пометить как BETA».
+- **Снимок**: прошлая работа в ObsosBrowser закоммичена (39bf29e), сверху 16
+  файлов, затем всё закоммичено как **f29cb49 = OBSOS v0.1.1** (чистое дерево;
+  `OBSOS_REV` теперь настоящий коммит, `.obsos-source`: dirty 0): WebGL
+  на Windows (правки surfman/wgl, `connection()` у GPU-контекста страниц,
+  `dom_webgl2_enabled`), звонки WebRTC (TURN из `iceServers`,
+  `track.enabled/stop`, каналы данных не создаются по кругу, вопрос «Сайт просит доступ к микрофону/камере»,
+  JS-прослойка `addTrack`/`connectionState`), `mask-image` для значков
+  (servo-layout). Пересобрано без правок в F:\ObsosBrowser: x86_64 и aarch64.
+- **Что из этого на FossAi**: **WebGL — нет**, честный отказ: у obsos-fossai нет
+  фичи Servo `webgl`, а программный вывод swgl не даёт `connection()` (surfman
+  без программного бэкенда, OSMesa в surfman 0.14 нет) — `getContext('webgl')`
+  и `'webgl2'` возвращают `null`, браузер не падает. **WebRTC — нет**: нужен
+  GStreamer (`servo/media-gstreamer`), у нас движок медиа `dummy`, и
+  `Platform::webrtc_available()` у FossAi по умолчанию `false` —
+  `RTCPeerConnection` странице не виден. `mask-image` на FossAi выключен самим
+  obsos-core (`!cfg!(target_os="freeos")`, «не проверялось»). Проверка —
+  сценарий **`obsos-webgl`** (страница `/webgl.html` хоста: `webgl=no webgl2=no
+  rtc=undefined`, 2D-холст рисуется).
+- **BETA** (всё на стороне FossAi, снимок не правился): ярлык стола «Браузер
+  (BETA)», значок телефона «OBSOS (BETA)» (`ui/icons.rs`); подпись пакета
+  `caption` «OBSOS (BETA) — Браузер» (её показывают «Пуск», закреплённые
+  `pkg:obsos`, «Открыть с помощью»), `summary`/`about` пакета (`package.rs`),
+  умолчание `apps/obsos/caption` (`sysconf/store.rs`); **заголовок окна**:
+  ядро вставляет « (BETA)» после «OBSOS» в заголовки окон программы
+  `/opt/obsos/bin/obsos` (`user/syscall.rs::beta_title`, вызовы winopen и
+  wintitle; всплывающие окна не трогаются) — «OBSOS (BETA) — <страница>» в
+  полосе заголовка, на панели задач и в Alt+Tab. Сценарии ждут теперь
+  «OBSOS (BETA) — Браузер».
+- **Проверено в QEMU x86_64** (26.11): `install`, `obsos-storage` (visit 1/2,
+  страница входа Rupor), `obsos-webgl`: страница получила `webgl=no webgl2=no
+  rtc=undefined getUserMedia=false` (Servo: «The rendering context has no
+  surfman connection, WebGL will be unavailable»), без паник; снимки
+  `photos\tests\obsos-webgl-x86_64-release-obsos-beta-{desktop,webgl}.png` —
+  ярлык «Браузер (BETA)», уведомление «OBSOS (BETA) — Браузер установлен»,
+  заголовок «OBSOS (BETA) — OBSOS WebGL».
+- **TODO**: WebGL на FossAi — только с бэкендом surfman поверх нашего GL (Mesa
+  есть лишь в слое Linux) или программным GL под нативный freeos; звонки — с
+  GStreamer под freeos. Метка в боковой шапке хрома («OBSOS», chrome.rs) —
+  только правкой obsos-core; сейчас BETA в заголовке окна от ядра.
+
 ## OBS для стримов: видеокарта по умолчанию, кадры через dma-buf, x264 для игр (25.11) - **сделано в коде, проверено в QEMU, проверить на железе**
 
 Роман: стример должен играть и писать/транслировать, как на Windows. В hw-log19
