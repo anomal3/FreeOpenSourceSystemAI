@@ -64,7 +64,12 @@ const F11: u32 = WIN_KEY_F1 + 10;
 const FILE_LIMIT: usize = 256 * 1024 * 1024;
 
 /// Extensions shown when walking a folder.
-const KNOWN: [&str; 7] = ["jpg", "jpeg", "jpe", "png", "bmp", "gif", "qoi"];
+const KNOWN: [&str; 8] = ["jpg", "jpeg", "jpe", "png", "bmp", "gif", "qoi", "webp"];
+
+/// WebP samples of the bench (the test files of `crates/webp`): a lossy
+/// 32×24 and an animation of two 8×8 frames (100 and 200 ms).
+const SAMPLE_WEBP: &[u8] = include_bytes!("../../../../webp/tests/data/lossy.webp");
+const SAMPLE_WEBP_ANIM: &[u8] = include_bytes!("../../../../webp/tests/data/anim.webp");
 
 /// Most zoom: 3200 %.
 const MAX_ZOOM: u64 = 32 * ONE;
@@ -135,6 +140,20 @@ struct Shown {
     /// Quarter turns clockwise of the view.
     turns: u8,
     took_ms: u64,
+    /// Animated GIF: all frames, the one on screen and when the next is due.
+    anim: Option<Anim>,
+    /// EXIF orientation the photo was turned by (1 — none).
+    orientation: u8,
+}
+
+/// Frames of an animation being played (27.11).
+struct Anim {
+    frames: Vec<decode::Picture>,
+    delays: Vec<u32>,
+    at: usize,
+    due: u64,
+    /// Rounds played (the bench waits for the first).
+    rounds: u32,
 }
 
 enum State {
@@ -365,14 +384,37 @@ impl Photos {
         }
         let result = read_file(&path).and_then(|data| decode::decode(&data, self.budget, self.packer));
         match result {
-            Ok(Decoded { picture, src_w, src_h, format, wall_ok, frames }) => {
+            Ok(Decoded { picture, src_w, src_h, format, wall_ok, frames, animation, orientation }) => {
                 let took = monotonic_ms().saturating_sub(started);
                 let (w, h) = (picture.w, picture.h);
                 println(&format!(
                     "photos: shown {name} {w}x{h} {format} in {took} ms{}",
                     if (w, h) != (src_w, src_h) { format!(" (shrunk from {src_w}x{src_h})") } else { String::new() }
                 ));
-                self.state = State::Ready(Shown { path, pyramid: Pyramid::new(picture), src_w, src_h, format, wall_ok, frames, turns: 0, took_ms: took });
+                if orientation > 1 {
+                    println(&format!("photos: {name}: EXIF orientation {orientation} applied"));
+                }
+                let anim = animation.map(|animation| {
+                    println(&format!("photos: {name}: animation of {} frame(s) playing", animation.frames.len()));
+                    let first = animation.delays.first().copied().unwrap_or(100);
+                    Anim { frames: animation.frames, delays: animation.delays, at: 0, due: monotonic_ms() + u64::from(first), rounds: 0 }
+                });
+                if anim.is_none() && frames > 1 {
+                    println(&format!("photos: {name}: {frames} frame(s), too big to play — the first shown"));
+                }
+                self.state = State::Ready(Shown {
+                    path,
+                    pyramid: Pyramid::new(picture),
+                    src_w,
+                    src_h,
+                    format,
+                    wall_ok,
+                    frames,
+                    turns: 0,
+                    took_ms: took,
+                    anim,
+                    orientation,
+                });
                 self.reset_view();
             }
             Err(why) => {
@@ -514,6 +556,37 @@ impl Photos {
         let Some((w, h)) = self.base_size() else { return false };
         let (dw, dh) = render::scaled_size(w, h, self.zoom_in(view));
         !self.fit && (dw as u32 > view.w || dh as u32 > view.h)
+    }
+
+    /// Next frame of an animated GIF when its time comes (`true` — repaint).
+    /// The frame replaces the shown picture, turned like the view.
+    fn animate(&mut self) -> bool {
+        let State::Ready(shown) = &mut self.state else { return false };
+        let Some(anim) = shown.anim.as_mut() else { return false };
+        let now = monotonic_ms();
+        if now < anim.due || anim.frames.len() < 2 {
+            return false;
+        }
+        anim.at = (anim.at + 1) % anim.frames.len();
+        if anim.at == 0 {
+            anim.rounds += 1;
+            if anim.rounds == 1 {
+                println(&format!("photos: animation went round ({} frame(s))", anim.frames.len()));
+            }
+        }
+        let delay = u64::from(anim.delays.get(anim.at).copied().unwrap_or(100));
+        // Late (a slow paint): the next frame from now, not a burst to catch up.
+        anim.due = if now > anim.due + delay { now + delay } else { anim.due + delay };
+        let Ok(frame) = anim.frames[anim.at].try_clone() else { return false };
+        let mut pyramid = Pyramid::new(frame);
+        for _ in 0..shown.turns {
+            if pyramid.rotate(true).is_err() {
+                return false;
+            }
+        }
+        shown.pyramid = pyramid;
+        self.scaled.replace(None);
+        true
     }
 
     fn rotate(&mut self, clockwise: bool) {
@@ -822,7 +895,26 @@ impl Photos {
             rows.push(("Размеры", format!("{} × {} точек", shown.src_w, shown.src_h)));
             let mp = (shown.src_w * shown.src_h + 50_000) / 100_000;
             rows.push(("Мегапиксели", format!("{},{} Мп", mp / 10, mp % 10)));
-            rows.push(("Формат", if shown.frames > 1 { format!("{} (анимация, кадров: {}; показан первый)", shown.format, shown.frames) } else { String::from(shown.format) }));
+            rows.push((
+                "Формат",
+                match (&shown.anim, shown.frames) {
+                    (Some(anim), _) => format!("{} (анимация, кадров: {})", shown.format, anim.frames.len()),
+                    (None, frames) if frames > 1 => format!("{} (анимация, кадров: {}; велика для памяти — показан первый)", shown.format, frames),
+                    _ => String::from(shown.format),
+                },
+            ));
+            if shown.orientation > 1 {
+                let how = match shown.orientation {
+                    2 => "отражено по горизонтали",
+                    3 => "повёрнуто на 180°",
+                    4 => "отражено по вертикали",
+                    5 => "отражено и повёрнуто на 90° влево",
+                    6 => "повёрнуто на 90° вправо",
+                    7 => "отражено и повёрнуто на 90° вправо",
+                    _ => "повёрнуто на 90° влево",
+                };
+                rows.push(("Ориентация (EXIF)", String::from(how)));
+            }
             let base = shown.pyramid.base();
             if (base.w, base.h) != (shown.src_w, shown.src_h) && shown.turns % 2 == 0 {
                 rows.push(("Показано", format!("{} × {} (уменьшено для памяти)", base.w, base.h)));
@@ -972,6 +1064,7 @@ impl App for Photos {
                 self.load();
                 dirty = true;
             }
+            State::Ready(_) => dirty |= self.animate(),
             _ => {}
         }
         dirty
@@ -1436,6 +1529,11 @@ fn samples(dir: &str) -> i64 {
             if write_file(&join(dir, "01-photo.jpg"), &data).is_ok() {
                 written += 1;
             }
+            // The same photo «from a phone held upright»: EXIF orientation 6
+            // (turn 90° right to view).
+            if data.starts_with(&[0xFF, 0xD8]) && write_file(&join(dir, "05-exif-6.jpg"), &decode::with_exif_orientation(&data, 6)).is_ok() {
+                written += 1;
+            }
         }
     }
     let (w, h) = (800usize, 600usize);
@@ -1465,6 +1563,31 @@ fn samples(dir: &str) -> i64 {
     }
     if write_file(&join(dir, "03-palette.gif"), &decode::write_gif(gw, gh, &palette, &indices)).is_ok() {
         written += 1;
+    }
+    // Animated: a red, green and blue ball crossing the frame, 0,4 s each.
+    let (aw, ah) = (240usize, 160usize);
+    let anim: Vec<Vec<u8>> = [(0xE0u8, 40usize), (0x1C, 120), (0x03, 200)]
+        .iter()
+        .map(|&(colour, cx)| {
+            let mut frame = alloc::vec![0xFFu8; aw * ah];
+            for y in 0..ah {
+                for x in 0..aw {
+                    let (dx, dy) = (x as i64 - cx as i64, y as i64 - 80);
+                    if dx * dx + dy * dy < 30 * 30 {
+                        frame[y * aw + x] = colour;
+                    }
+                }
+            }
+            frame
+        })
+        .collect();
+    if write_file(&join(dir, "06-anim.gif"), &decode::write_gif_anim(aw, ah, &palette, &anim, 40)).is_ok() {
+        written += 1;
+    }
+    for (name, data) in [("07-lossy.webp", SAMPLE_WEBP), ("08-anim.webp", SAMPLE_WEBP_ANIM)] {
+        if write_file(&join(dir, name), data).is_ok() {
+            written += 1;
+        }
     }
     let (bw, bh) = (1024usize, 768usize);
     let mut rgb = alloc::vec![0u8; bw * bh * 3];
@@ -1506,6 +1629,13 @@ fn probe(dir: &str, budget: usize) -> i64 {
                     mid[2],
                     monotonic_ms() - started
                 ));
+                if decoded.orientation > 1 {
+                    println(&format!("photos: probe {} exif orientation {} shown {}x{}", entry.name, decoded.orientation, p.w, p.h));
+                }
+                if let Some(animation) = &decoded.animation {
+                    let total: u32 = animation.delays.iter().sum();
+                    println(&format!("photos: probe {} animation {} frame(s) {} ms", entry.name, animation.frames.len(), total));
+                }
             }
             Err(why) => {
                 failed += 1;

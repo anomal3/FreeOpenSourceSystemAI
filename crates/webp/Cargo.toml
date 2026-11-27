@@ -1,0 +1,14 @@
+[package]
+name = "webp"
+description = "WebP decoder (lossy, lossless, alpha, animation) for FossAi; no_std + alloc port of image-webp 0.2.4."
+version = "0.2.4"
+edition = "2021"
+# Upstream license is kept for this port (see LICENSE-MIT / LICENSE-APACHE).
+license = "MIT OR Apache-2.0"
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

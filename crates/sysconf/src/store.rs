@@ -231,6 +231,9 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("filetypes/.gif/openwith/photos", PHOTOS),
     ("filetypes/.qoi/default", PHOTOS),
     ("filetypes/.qoi/openwith/photos", PHOTOS),
+    // WebP since 27.11 (`crates/webp`).
+    ("filetypes/.webp/default", PHOTOS),
+    ("filetypes/.webp/openwith/photos", PHOTOS),
     // «Видеоплеер VLC» (пакет `vlc`, 24.11): video and sound files; skipped
     // while the package is not installed (`command_program`).
     ("filetypes/.mp4/default", VLC),

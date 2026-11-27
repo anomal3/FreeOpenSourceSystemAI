@@ -1,7 +1,10 @@
 //! Picture decoders of «Фотографии» (24.11.2026): JPEG (`zune-jpeg`, baseline
-//! and progressive), PNG (all colour types, 1–16 bits, Adam7 interlacing,
-//! `tRNS`), BMP (1/4/8-bit palettes, 24 and 32 bits, no compression), GIF
-//! (the first frame; the frame count is reported) and QOI.
+//! and progressive; EXIF orientation applied, 27.11), PNG (all colour types,
+//! 1–16 bits, Adam7 interlacing, `tRNS`), BMP (1/4/8-bit palettes, 24 and 32
+//! bits, no compression), GIF (animated since 27.11: every frame composed
+//! with its disposal and time while they fit the budget), WebP (27.11:
+//! lossy, lossless, alpha, animation — `crates/webp`, a no_std port of
+//! image-webp) and QOI.
 //!
 //! The format is taken from the signature, not from the extension: a «.jpg»
 //! that is really a PNG is common among downloaded pictures. Pixels come out
@@ -74,12 +77,27 @@ impl Picture {
         px.resize(w * h, 0);
         Ok(Self { w, h, px })
     }
+
+    /// A copy (fallible: pictures are big).
+    pub fn try_clone(&self) -> Result<Self, &'static str> {
+        let mut px = Vec::new();
+        px.try_reserve_exact(self.px.len()).map_err(|_| "недостаточно памяти")?;
+        px.extend_from_slice(&self.px);
+        Ok(Self { w: self.w, h: self.h, px })
+    }
+}
+
+/// Frames of an animated picture, composed on the canvas, and how long each
+/// stays (ms).
+pub struct Animation {
+    pub frames: Vec<Picture>,
+    pub delays: Vec<u32>,
 }
 
 /// What came out of a file.
 pub struct Decoded {
     pub picture: Picture,
-    /// Size in the file (before a shrink).
+    /// Size in the file (before a shrink; after the EXIF turn).
     pub src_w: usize,
     pub src_h: usize,
     pub format: &'static str,
@@ -87,12 +105,24 @@ pub struct Decoded {
     pub wall_ok: bool,
     /// Frames of an animated GIF (the first is shown).
     pub frames: usize,
+    /// All frames, when an animated picture fits the budget.
+    pub animation: Option<Animation>,
+    /// EXIF orientation of a JPEG (1 = as stored; 2–8 were applied).
+    pub orientation: u8,
 }
 
 /// Decode `data`. `budget` — most pixels kept (bigger is shrunk).
 pub fn decode(data: &[u8], budget: usize, packer: Packer) -> Result<Decoded, &'static str> {
+    let mut animation = None;
+    let mut orientation = 1;
     let (picture, format, wall_ok, frames) = if data.starts_with(&[0xFF, 0xD8]) {
-        (jpeg(data, budget, packer)?, "JPEG", true, 1)
+        let picture = jpeg(data, budget, packer)?;
+        // Phones store the sensor picture and say how to turn it (EXIF tag
+        // 0x0112); Windows «Фотографии» shows it turned, so do we.
+        orientation = exif_orientation(data);
+        let picture = if orientation > 1 { orient(picture, orientation)? } else { picture };
+        // `wallconv` does not read EXIF: a turned photo goes as a BMP copy.
+        (picture, "JPEG", orientation == 1, 1)
     } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
         let (picture, interlaced) = png(data, packer)?;
         (picture, "PNG", !interlaced, 1)
@@ -100,18 +130,197 @@ pub fn decode(data: &[u8], budget: usize, packer: Packer) -> Result<Decoded, &'s
         let (picture, plain) = bmp(data, packer)?;
         (picture, "BMP", plain, 1)
     } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
-        let (picture, frames) = gif(data, packer)?;
+        let (picture, frames, frames_kept) = gif(data, packer, budget)?;
+        animation = frames_kept;
         (picture, "GIF", false, frames)
     } else if data.starts_with(b"qoif") {
         (qoi(data, packer)?, "QOI", true, 1)
     } else if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
-        return Err("формат WebP пока не поддерживается");
+        let (picture, frames, frames_kept) = webp(data, packer, budget)?;
+        animation = frames_kept;
+        (picture, "WebP", false, frames)
     } else {
-        return Err("это не картинка JPEG, PNG, BMP, GIF или QOI");
+        return Err("это не картинка JPEG, PNG, BMP, GIF, WebP или QOI");
     };
     let (src_w, src_h) = (picture.w, picture.h);
-    let picture = if picture.w * picture.h > budget { shrink_to_budget(picture, budget)? } else { picture };
-    Ok(Decoded { picture, src_w, src_h, format, wall_ok, frames })
+    let picture = if picture.w * picture.h > budget {
+        // Frames are kept only when all of them fit; a shrunk one does not.
+        animation = None;
+        shrink_to_budget(picture, budget)?
+    } else {
+        picture
+    };
+    Ok(Decoded { picture, src_w, src_h, format, wall_ok, frames, animation, orientation })
+}
+
+// ── WebP ────────────────────────────────────────────────────────────────────
+
+/// RGBA8 rows into packed pixels over the checkerboard.
+fn from_rgba(w: usize, h: usize, rgba: &[u8], packer: Packer) -> Result<Picture, &'static str> {
+    let mut out = Picture::alloc(w, h)?;
+    for (i, (slot, c)) in out.px.iter_mut().zip(rgba.chunks_exact(4)).enumerate() {
+        *slot = packer.pack_alpha(c[0], c[1], c[2], c[3], i % w, i / w);
+    }
+    Ok(out)
+}
+
+fn webp_error(error: &webp::DecodingError) -> &'static str {
+    match error {
+        webp::DecodingError::MemoryLimitExceeded | webp::DecodingError::ImageTooLarge => "фото WebP слишком большое для свободной памяти",
+        _ => "файл WebP повреждён или не поддерживается",
+    }
+}
+
+/// WebP (lossy VP8, lossless VP8L, alpha, animation) through `crates/webp`:
+/// all frames of an animation when they fit `budget`, else the first one.
+fn webp(data: &[u8], packer: Packer, budget: usize) -> Result<(Picture, usize, Option<Animation>), &'static str> {
+    let (w, h) = webp::dimensions(data).map_err(|e| webp_error(&e))?;
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
+        return Err("неверный размер WebP");
+    }
+    // The RGBA of a frame is 4 bytes a pixel, our copy 4 more: half the budget.
+    match webp::decode_frames(data, (budget / 2) as u64) {
+        Ok((_, _, decoded)) if decoded.len() > 1 => {
+            let count = decoded.len();
+            let mut frames = Vec::new();
+            let mut delays = Vec::new();
+            frames.try_reserve_exact(count).map_err(|_| "недостаточно памяти")?;
+            for (rgba, delay) in decoded {
+                frames.push(from_rgba(w, h, &rgba, packer)?);
+                // Like GIF: a frame of 0–10 ms is shown 100 ms.
+                delays.push(if delay <= 10 { 100 } else { delay });
+            }
+            let first = frames[0].try_clone()?;
+            Ok((first, count, Some(Animation { frames, delays })))
+        }
+        Ok((_, _, mut decoded)) if decoded.len() == 1 => {
+            let (rgba, _) = decoded.remove(0);
+            Ok((from_rgba(w, h, &rgba, packer)?, 1, None))
+        }
+        // Too many frames for memory (or none): the first frame alone.
+        _ => {
+            let image = webp::decode(data).map_err(|e| webp_error(&e))?;
+            let picture = from_rgba(image.width as usize, image.height as usize, &image.rgba, packer)?;
+            Ok((picture, image.frames.max(1) as usize, None))
+        }
+    }
+}
+
+// ── EXIF orientation ────────────────────────────────────────────────────────
+
+/// The EXIF orientation of a JPEG (tag 0x0112 of IFD0 in the APP1 «Exif»
+/// segment); 1 when absent or unreadable.
+#[must_use]
+pub fn exif_orientation(data: &[u8]) -> u8 {
+    let mut at = 2;
+    while at + 4 <= data.len() {
+        if data[at] != 0xFF {
+            return 1;
+        }
+        let marker = data[at + 1];
+        match marker {
+            // Fill bytes and markers without a length.
+            0xFF => {
+                at += 1;
+                continue;
+            }
+            0x01 | 0xD0..=0xD8 => {
+                at += 2;
+                continue;
+            }
+            // Picture data starts (or ends): no EXIF before it.
+            0xDA | 0xD9 => return 1,
+            _ => {}
+        }
+        let len = usize::from(u16::from_be_bytes([data[at + 2], data[at + 3]]));
+        let Some(segment) = data.get(at + 4..at + 2 + len) else {
+            return 1;
+        };
+        if marker == 0xE1 && segment.starts_with(b"Exif\0\0") {
+            return tiff_orientation(&segment[6..]).unwrap_or(1);
+        }
+        at += 2 + len;
+    }
+    1
+}
+
+/// Orientation from a TIFF header + IFD0 (both byte orders).
+fn tiff_orientation(tiff: &[u8]) -> Option<u8> {
+    let little = match tiff.get(..2)? {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let u16_at = |at: usize| -> Option<u16> {
+        let b = tiff.get(at..at + 2)?;
+        Some(if little { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) })
+    };
+    let u32_at = |at: usize| -> Option<u32> {
+        let b = tiff.get(at..at + 4)?;
+        Some(if little { u32::from_le_bytes([b[0], b[1], b[2], b[3]]) } else { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) })
+    };
+    let ifd = u32_at(4)? as usize;
+    let count = usize::from(u16_at(ifd)?);
+    for i in 0..count.min(512) {
+        let entry = ifd + 2 + i * 12;
+        if u16_at(entry)? == 0x0112 {
+            // SHORT, one value, in the first two bytes of the value field.
+            let value = u16_at(entry + 8)?;
+            return (1..=8).contains(&value).then_some(value as u8);
+        }
+    }
+    None
+}
+
+/// Apply EXIF orientation 2–8: the picture as the camera meant it.
+fn orient(src: Picture, orientation: u8) -> Result<Picture, &'static str> {
+    let (w, h) = (src.w, src.h);
+    let swap = orientation >= 5;
+    let (ow, oh) = if swap { (h, w) } else { (w, h) };
+    let mut out = Picture::alloc(ow, oh)?;
+    for y in 0..oh {
+        for x in 0..ow {
+            // Destination (x, y) from source (sx, sy).
+            let (sx, sy) = match orientation {
+                2 => (w - 1 - x, y),
+                3 => (w - 1 - x, h - 1 - y),
+                4 => (x, h - 1 - y),
+                5 => (y, x),
+                6 => (y, h - 1 - x),
+                7 => (w - 1 - y, h - 1 - x),
+                8 => (w - 1 - y, x),
+                _ => (x, y),
+            };
+            out.px[y * ow + x] = src.px[sy * w + sx];
+        }
+    }
+    Ok(out)
+}
+
+/// A JPEG with an EXIF APP1 segment saying `orientation` put right after SOI
+/// (the bench: a phone photo stored sideways).
+#[must_use]
+pub fn with_exif_orientation(jpeg: &[u8], orientation: u8) -> Vec<u8> {
+    // TIFF little endian, IFD0 at 8 with one entry: 0x0112 SHORT 1 = value.
+    let mut tiff = Vec::new();
+    tiff.extend_from_slice(b"II*\0");
+    tiff.extend_from_slice(&8u32.to_le_bytes());
+    tiff.extend_from_slice(&1u16.to_le_bytes());
+    tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+    tiff.extend_from_slice(&3u16.to_le_bytes());
+    tiff.extend_from_slice(&1u32.to_le_bytes());
+    tiff.extend_from_slice(&u16::from(orientation).to_le_bytes());
+    tiff.extend_from_slice(&[0, 0]);
+    tiff.extend_from_slice(&0u32.to_le_bytes());
+    let mut out = Vec::with_capacity(jpeg.len() + tiff.len() + 16);
+    out.extend_from_slice(&jpeg[..2]);
+    out.extend_from_slice(&[0xFF, 0xE1]);
+    out.extend_from_slice(&((2 + 6 + tiff.len()) as u16).to_be_bytes());
+    out.extend_from_slice(b"Exif\0\0");
+    out.extend_from_slice(&tiff);
+    out.extend_from_slice(&jpeg[2..]);
+    out
 }
 
 /// Integer factor so that `w*h/k²` fits the budget.
@@ -601,8 +810,26 @@ fn lzw(data: &[u8], min_size: u8, count: usize) -> Result<Vec<u8>, &'static str>
     Ok(out)
 }
 
-/// GIF: the first frame on the logical screen; how many frames there are.
-fn gif(data: &[u8], packer: Packer) -> Result<(Picture, usize), &'static str> {
+/// Fill `rect` of the canvas with the checkerboard (GIF disposal 2, «restore
+/// to background»: browsers and Windows clear to transparent).
+fn clear_rect(canvas: &mut Picture, packer: Packer, left: usize, top: usize, w: usize, h: usize) {
+    for y in top..(top + h).min(canvas.h) {
+        for x in left..(left + w).min(canvas.w) {
+            canvas.px[y * canvas.w + x] = packer.pack_alpha(0, 0, 0, 0, x, y);
+        }
+    }
+}
+
+/// Shortest frame time (ms): browsers show 0 and 10 ms frames for 100 ms.
+fn gif_delay(centis: u32) -> u32 {
+    if centis <= 1 { 100 } else { centis * 10 }
+}
+
+/// GIF: the first frame on the logical screen, how many frames there are
+/// and, for an animation that fits `budget` pixels, every frame composed on
+/// the canvas (disposal methods 0–3, transparency, own palettes, interlace)
+/// with its time.
+fn gif(data: &[u8], packer: Packer, budget: usize) -> Result<(Picture, usize, Option<Animation>), &'static str> {
     if data.len() < 13 {
         return Err("файл GIF обрезан");
     }
@@ -615,16 +842,28 @@ fn gif(data: &[u8], packer: Packer) -> Result<(Picture, usize), &'static str> {
         global = data.get(at..at + len).ok_or("файл GIF обрезан")?;
         at += len;
     }
+    // Graphic control of the next image: transparent index, time, disposal.
     let mut transparent: Option<u8> = None;
-    let mut picture: Option<Picture> = None;
+    let mut delay = 0u32;
+    let mut disposal = 0u8;
+    let mut canvas: Option<Picture> = None;
+    let mut first: Option<Picture> = None;
+    let mut kept: Vec<Picture> = Vec::new();
+    let mut delays: Vec<u32> = Vec::new();
+    // Frames are kept while they fit; one too many — the first frame only.
+    let mut keep = true;
     let mut frames = 0usize;
     while at < data.len() {
         match data[at] {
             0x21 => {
                 let label = *data.get(at + 1).ok_or("файл GIF обрезан")?;
-                if label == 0xF9 && picture.is_none() {
+                if label == 0xF9 {
                     if let Some(block) = data.get(at + 2..at + 7) {
-                        transparent = (block[0] == 4 && block[1] & 1 != 0).then_some(block[4]);
+                        if block[0] == 4 {
+                            transparent = (block[1] & 1 != 0).then_some(block[4]);
+                            disposal = (block[1] >> 2) & 7;
+                            delay = le16(block, 2);
+                        }
                     }
                 }
                 at = sub_blocks(data, at + 2, None)?;
@@ -643,23 +882,31 @@ fn gif(data: &[u8], packer: Packer) -> Result<(Picture, usize), &'static str> {
                 }
                 let min_size = *data.get(at).ok_or("файл GIF обрезан")?;
                 at += 1;
-                if picture.is_some() {
+                if first.is_some() && !keep {
                     at = sub_blocks(data, at, None)?;
                     continue;
                 }
                 let mut stream = Vec::new();
                 at = sub_blocks(data, at, Some(&mut stream))?;
-                let (w, h) = (sw.max(left + iw).max(1), sh.max(top + ih).max(1));
-                if w > MAX_SIDE || h > MAX_SIDE {
-                    return Err("неверный размер GIF");
-                }
-                let indices = lzw(&stream, min_size, iw * ih)?;
-                let mut out = Picture::alloc(w, h)?;
-                for y in 0..h {
-                    for x in 0..w {
-                        out.px[y * w + x] = packer.pack_alpha(0, 0, 0, 0, x, y);
+                if canvas.is_none() {
+                    let (w, h) = (sw.max(left + iw).max(1), sh.max(top + ih).max(1));
+                    if w > MAX_SIDE || h > MAX_SIDE {
+                        return Err("неверный размер GIF");
                     }
+                    let mut fresh = Picture::alloc(w, h)?;
+                    clear_rect(&mut fresh, packer, 0, 0, w, h);
+                    canvas = Some(fresh);
                 }
+                let Some(canvas) = canvas.as_mut() else { break };
+                let (w, h) = (canvas.w, canvas.h);
+                // A broken later frame ends the animation, the frames before stay.
+                let indices = match lzw(&stream, min_size, iw * ih) {
+                    Ok(indices) => indices,
+                    Err(why) if first.is_none() => return Err(why),
+                    Err(_) => break,
+                };
+                // Disposal 3 («restore to previous») needs the canvas before.
+                let before = if disposal == 3 && keep { canvas.try_clone().ok() } else { None };
                 // Interlaced rows come in four passes.
                 let rows: Vec<usize> = if iflags & 0x40 != 0 {
                     let mut order = Vec::with_capacity(ih);
@@ -672,23 +919,73 @@ fn gif(data: &[u8], packer: Packer) -> Result<(Picture, usize), &'static str> {
                 };
                 for (n, &row) in rows.iter().enumerate() {
                     let y = top + row;
+                    if y >= h {
+                        continue;
+                    }
                     for i in 0..iw {
                         let index = indices[n * iw + i];
-                        if transparent == Some(index) {
+                        let x = left + i;
+                        if transparent == Some(index) || x >= w {
                             continue;
                         }
-                        let x = left + i;
                         let c = table.get(usize::from(index) * 3..usize::from(index) * 3 + 3).unwrap_or(&[0, 0, 0]);
-                        out.px[y * w + x] = packer.pack(c[0], c[1], c[2]);
+                        canvas.px[y * w + x] = packer.pack(c[0], c[1], c[2]);
                     }
                 }
-                picture = Some(out);
+                if first.is_none() {
+                    first = Some(canvas.try_clone()?);
+                } else if keep {
+                    // Every frame plus the shown copy within the budget.
+                    if (kept.len() + 3) * w * h > budget {
+                        keep = false;
+                        kept = Vec::new();
+                        delays = Vec::new();
+                    } else {
+                        match canvas.try_clone() {
+                            Ok(frame) => kept.push(frame),
+                            Err(_) => {
+                                keep = false;
+                                kept = Vec::new();
+                                delays = Vec::new();
+                            }
+                        }
+                    }
+                }
+                if keep {
+                    delays.push(gif_delay(delay));
+                }
+                match disposal {
+                    2 => clear_rect(canvas, packer, left, top, iw, ih),
+                    3 => {
+                        if let Some(before) = before {
+                            *canvas = before;
+                        }
+                    }
+                    _ => {}
+                }
+                transparent = None;
+                delay = 0;
+                disposal = 0;
             }
             0x3B => break,
             _ => break,
         }
     }
-    picture.map(|p| (p, frames.max(1))).ok_or("в файле GIF нет кадров")
+    let first = first.ok_or("в файле GIF нет кадров")?;
+    let animation = if keep && !kept.is_empty() {
+        // Frame 0 again at the head: the viewer walks `frames` round.
+        match first.try_clone() {
+            Ok(zero) => {
+                kept.insert(0, zero);
+                delays.truncate(kept.len());
+                Some(Animation { frames: kept, delays })
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    Ok((first, frames.max(1), animation))
 }
 
 // ── Samples for the test bench ──────────────────────────────────────────────
@@ -771,6 +1068,39 @@ pub fn write_gif(w: usize, h: usize, palette: &[[u8; 3]; 256], indices: &[u8]) -
     for c in palette {
         out.extend_from_slice(c);
     }
+    put_gif_image(&mut out, w, h, indices);
+    out.push(0x3B);
+    out
+}
+
+/// Animated GIF89a: `frames` (full-size index pictures), each shown
+/// `delay_cs` hundredths of a second, looping forever (NETSCAPE2.0).
+#[must_use]
+pub fn write_gif_anim(w: usize, h: usize, palette: &[[u8; 3]; 256], frames: &[Vec<u8>], delay_cs: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"GIF89a");
+    out.extend_from_slice(&(w as u16).to_le_bytes());
+    out.extend_from_slice(&(h as u16).to_le_bytes());
+    out.extend_from_slice(&[0xF7, 0, 0]);
+    for c in palette {
+        out.extend_from_slice(c);
+    }
+    out.extend_from_slice(&[0x21, 0xFF, 11]);
+    out.extend_from_slice(b"NETSCAPE2.0");
+    out.extend_from_slice(&[3, 1, 0, 0, 0]);
+    for indices in frames {
+        // Graphic control: disposal 1 (leave), no transparency.
+        out.extend_from_slice(&[0x21, 0xF9, 4, 1 << 2]);
+        out.extend_from_slice(&delay_cs.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        put_gif_image(&mut out, w, h, indices);
+    }
+    out.push(0x3B);
+    out
+}
+
+/// Image descriptor at 0,0 and 8-bit LZW data of `indices`.
+fn put_gif_image(out: &mut Vec<u8>, w: usize, h: usize, indices: &[u8]) {
     out.push(0x2C);
     out.extend_from_slice(&[0, 0, 0, 0]);
     out.extend_from_slice(&(w as u16).to_le_bytes());
@@ -804,6 +1134,4 @@ pub fn write_gif(w: usize, h: usize, palette: &[[u8; 3]; 256], indices: &[u8]) -
         out.extend_from_slice(block);
     }
     out.push(0);
-    out.push(0x3B);
-    out
 }
