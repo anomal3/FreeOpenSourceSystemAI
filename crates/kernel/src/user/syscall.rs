@@ -187,7 +187,7 @@ unsafe fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_POLL => poll(a0, a1, a2 as i64),
         SYS_TIMES => times(a0),
         // Фаза 47a: окно у программы.
-        SYS_WINOPEN => winopen(a0),
+        SYS_WINOPEN => winopen(a0, a1),
         SYS_WINCOMMIT => wincommit(a0 as i64, a1, a2),
         SYS_WINEVENT => winevent(a0 as i64, a1),
         SYS_WINCLOSE => winclose(a0 as i64),
@@ -2292,8 +2292,22 @@ fn window_errno(err: super::WindowError) -> i64 {
 /// дописывает адрес поверхности и номер окна. Поэтому проверка прав — на
 /// запись, а не на чтение: страница, доступная только на чтение, сделала бы
 /// ответ невозможным уже после того, как окно заведено.
-fn winopen(ptr: usize) -> i64 {
-    open_spec(ptr, None)
+///
+/// `flags` (27.11): `WIN_STYLE_*` applied before the window is first shown
+/// (zero - none; older programs pass zero), the same as [`winstyle`] right
+/// after - but without a frame in the middle of the screen first.
+fn winopen(ptr: usize, flags: usize) -> i64 {
+    if flags == 0 {
+        return open_spec(ptr, None);
+    }
+    let known = user_abi::WIN_STYLE_RESIZABLE | user_abi::WIN_STYLE_DIALOG | user_abi::WIN_STYLE_AT_START | user_abi::WIN_STYLE_FULLSCREEN;
+    if flags & !(known as usize) != 0 {
+        return ERR_UNSUPPORTED;
+    }
+    crate::ui::set_open_style(sched::current().as_u32(), Some(flags as u32));
+    let answer = open_spec(ptr, None);
+    crate::ui::set_open_style(0, None);
+    answer
 }
 
 /// `winpopup(ptr на WindowSpec, owner, (x << 32) | y) -> 0` (фаза 62e).

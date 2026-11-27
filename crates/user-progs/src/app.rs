@@ -641,10 +641,22 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
 
 /// Попросить окно столько раз, сколько нужно. Всё, кроме «попробуйте ещё»,
 /// окончательно: окна такого размера не дадут, сколько ни проси.
+/// Style flags for the window at its opening (27.11, [`open_style`]).
+static OPEN_STYLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The window [`run`] opens gets these `WIN_STYLE_*` flags already at the
+/// opening (call before [`run`]): «Выполнить» stands at the Start button from
+/// its first frame instead of jumping there from the middle of the screen.
+/// [`App::window_style`] still says the style afterwards.
+pub fn open_style(flags: u32) {
+    OPEN_STYLE.store(flags, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn open_patiently(spec: &Spec, width: u32, height: u32) -> Option<Window> {
     let deadline = monotonic_ms() + OPEN_WAIT_MS;
+    let style = OPEN_STYLE.load(core::sync::atomic::Ordering::Relaxed);
     loop {
-        match Window::open(spec.title, width, height) {
+        match Window::open_styled(spec.title, width, height, style) {
             Ok(window) => return Some(window),
             Err(code) if code != crate::ERR_AGAIN => {
                 println(&format!("{}: FAILED opening the window: {code}", spec.name));

@@ -4203,6 +4203,11 @@ pub const ALL: &[Scenario] = &[
             Step::Expect("window      : 'Terminal'"),
             // ── «Выполнить»: calc
             Step::Line("run -b /bin/run"),
+            // The style comes with SYS_WINOPEN (27.11): the window is placed
+            // at the Start button inside the opening, before the first frame -
+            // it no longer opens in the middle and jumps.
+            Step::Await("desktop     : 'Run' styled at its opening", 30_000),
+            Step::Await("desktop     : 'Run' placed at the Start button", 15_000),
             Step::Await("window      : 'Run' at", 30_000),
             Step::Await("run: ready", 15_000),
             // Маленький диалог у кнопки «Пуск», только крестик (20.11).

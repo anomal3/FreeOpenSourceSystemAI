@@ -181,6 +181,13 @@ impl Window {
     /// только если он не освободился за две секунды, и это уже не «попробуйте
     /// ещё», а «что-то не так».
     pub fn open(title: &str, width: u32, height: u32) -> Result<Self, i64> {
+        Self::open_styled(title, width, height, 0)
+    }
+
+    /// [`Window::open`] with `WIN_STYLE_*` flags applied before the window is
+    /// first shown (27.11, third argument of `SYS_WINOPEN`): a dialog at the
+    /// Start button does not flash in the middle of the screen first.
+    pub fn open_styled(title: &str, width: u32, height: u32, flags: u32) -> Result<Self, i64> {
         let mut spec = WindowSpec {
             title: title.as_ptr() as u64,
             title_len: title.len() as u64,
@@ -192,7 +199,7 @@ impl Window {
         let result = insist(|| {
             // SAFETY: структура живёт в памяти программы и доступна ей на
             // запись; заголовок — живой срез, переживающий вызов.
-            unsafe { syscall(SYS_WINOPEN, core::ptr::from_mut(&mut spec) as usize, 0, 0) }
+            unsafe { syscall(SYS_WINOPEN, core::ptr::from_mut(&mut spec) as usize, flags as usize, 0) }
         });
         if result < 0 {
             return Err(result);

@@ -7215,6 +7215,12 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
             "  desktop     : opened '{title}' for {}",
             crate::sched::TaskId::new(task)
         );
+        // Style flags given with the request (27.11): before the first frame.
+        let style = OPEN_STYLE.lock().take().filter(|(owner, _)| *owner == task);
+        if let Some((_, flags)) = style {
+            kprintln!("  desktop     : '{title}' styled at its opening ({flags:#x})");
+            let _ = apply_style(desktop, task, slot, flags);
+        }
         log_output(desktop, app);
         log_window(desktop, app, true);
         desktop.refresh_panel(&status_now());
@@ -7770,8 +7776,28 @@ static FULL_ASKED: crate::sync::SpinLock<alloc::vec::Vec<(u32, u32)>> = crate::s
 
 /// Запомнить, что умеет окно программы (фаза 62b, `user_abi::SYS_WINSTYLE`).
 pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError> {
-    let app = App::Program(task, slot);
     with_desktop(|desktop| {
+        apply_style(desktop, task, slot, flags)?;
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Style flags a program gave to `SYS_WINOPEN` itself (27.11): applied by
+/// [`open_window_framed`] before the window is first shown - «Выполнить»
+/// opened in the middle and then jumped to the Start button.
+static OPEN_STYLE: SpinLock<Option<(u32, u32)>> = SpinLock::new(None);
+
+/// The next window of `task` opens with style `flags` (`None` - forget).
+pub fn set_open_style(task: u32, flags: Option<u32>) {
+    *OPEN_STYLE.lock() = flags.map(|flags| (task, flags));
+}
+
+/// [`style_window`] inside the desktop lock (no present).
+fn apply_style(desktop: &mut Compositor, task: u32, slot: u32, flags: u32) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    {
         let focused = desktop.focused_app() == Some(app);
         let Some(window) = desktop.find(app) else {
             return Err(WindowError::NoWindow);
@@ -7830,10 +7856,8 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
                 desktop.repaint_all();
             }
         }
-        desktop.present();
         Ok(())
-    })
-    .unwrap_or_else(|| Err(unavailable()))
+    }
 }
 
 /// «Определить» asked (24.11): how long to show the plates, ms; zero — not

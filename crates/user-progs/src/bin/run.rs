@@ -679,5 +679,7 @@ pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     // пустым полем посередине); подсказки ложатся поверх кнопок.
     let width = (480u32 * scale).min(info.screen_w);
     let height = (250u32 * scale).min(info.screen_h);
+    // At the Start button from the first frame (27.11).
+    app::open_style(user_abi::WIN_STYLE_DIALOG | user_abi::WIN_STYLE_AT_START);
     app::run(&SPEC, &info, (width, height), |_, _| Runner::new())
 }
