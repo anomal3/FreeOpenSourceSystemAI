@@ -1458,6 +1458,21 @@ fn clipboard(action: usize, ptr: usize, len: usize) -> i64 {
         }
         user_abi::CLIP_SEQ => i64::from(crate::ui::clipboard::seq()),
         // 27.11: drag and drop with the desktop (`ui::dragdrop`).
+        // 27.11: desktop icons dropped on a program window (`ui::dragdrop`).
+        user_abi::CLIP_TAKE => {
+            if len == 0 || !space::user_can(ptr, len, PageFlags::WRITE) {
+                return ERR_BAD_ADDRESS;
+            }
+            let Some(wire) = crate::ui::dragdrop::take_handoff() else {
+                return 0;
+            };
+            if wire.len() > len {
+                return ERR_BAD_ADDRESS;
+            }
+            // SAFETY: диапазон проверен по таблицам программы на запись.
+            unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, wire.len()) }.copy_from_slice(wire.as_bytes());
+            wire.len() as i64
+        }
         user_abi::CLIP_DRAG | user_abi::CLIP_DROP => {
             if len > 64 * 1024 || (len > 0 && !space::user_can(ptr, len, PageFlags::READ)) {
                 return ERR_BAD_ADDRESS;

@@ -2431,6 +2431,16 @@ impl Compositor {
         }
     }
 
+    /// The carried icons were released over a program window (27.11): the
+    /// ghost goes, the icons stay in their cells.
+    pub fn cancel_icon_lift(&mut self) {
+        if self.ghost.as_ref().is_some_and(|(_, program)| !program) {
+            self.set_drag_ghost(None, false);
+        }
+        let damage = self.icons.cancel_lift();
+        self.icon_damage(damage);
+    }
+
     /// Положить несомые значки по сетке и запомнить их места.
     pub fn drop_icons(&mut self) {
         if self.ghost.as_ref().is_some_and(|(_, program)| !program) {

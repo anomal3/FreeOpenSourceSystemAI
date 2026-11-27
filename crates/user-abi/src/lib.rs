@@ -1621,6 +1621,13 @@ pub const CLIP_DRAG: usize = 6;
 /// (the desktop folder, or a folder icon on the desktop) - the program puts
 /// the things there itself; zero - not dropped on the desktop.
 pub const CLIP_DROP: usize = 7;
+/// [`SYS_CLIPBOARD`] (27.11): did the desktop drop its icons on a program
+/// window? The answer (written to the buffer, its length returned; zero -
+/// nothing): `c` (Ctrl - copy), `M` (Shift - move) or `m` (as the program's
+/// own drag: the same volume moves, another copies), then the paths, a line
+/// each. Taken once and only fresh: the window under the pointer asks when
+/// it hears the pointer after the release.
+pub const CLIP_TAKE: usize = 8;
 /// Самый длинный текст буфера обмена.
 pub const CLIP_MAX: usize = 4 * 1024 * 1024;
 

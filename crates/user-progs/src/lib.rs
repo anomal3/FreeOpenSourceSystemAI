@@ -1850,6 +1850,25 @@ pub fn drop_target(paths: &[alloc::string::String]) -> Option<alloc::string::Str
     core::str::from_utf8(&buffer[..count]).ok().map(alloc::string::String::from)
 }
 
+/// Desktop icons dropped on this program's window (27.11, `CLIP_TAKE`):
+/// `(mode, paths)` - `'c'` copy (Ctrl), `'M'` move (Shift), `'m'` the
+/// program's rule (the same volume moves, another copies). Asked when the
+/// window hears the pointer; taken once.
+#[must_use]
+pub fn desktop_drop_take() -> Option<(char, alloc::vec::Vec<alloc::string::String>)> {
+    let mut buffer = alloc::vec![0u8; 64 * 1024];
+    // SAFETY: буфер живёт в памяти программы, длина — его собственная.
+    let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, user_abi::CLIP_TAKE, buffer.as_mut_ptr() as usize, buffer.len()) };
+    if result <= 0 {
+        return None;
+    }
+    let text = core::str::from_utf8(&buffer[..(result as usize).min(buffer.len())]).ok()?;
+    let mut lines = text.split('\n');
+    let mode = lines.next()?.chars().next()?;
+    let paths: alloc::vec::Vec<alloc::string::String> = lines.filter(|line| !line.is_empty()).map(alloc::string::String::from).collect();
+    (!paths.is_empty()).then_some((mode, paths))
+}
+
 /// Номер изменения буфера обмена (растёт при каждом, 24.11).
 #[must_use]
 pub fn clipboard_seq() -> u32 {

@@ -3223,10 +3223,12 @@ fn icon_gesture_to(desktop: &mut Compositor, x: i32, y: i32) {
 }
 
 /// Левую кнопку отпустили: положить значки по сетке или убрать рамку.
-fn icon_gesture_end(desktop: &mut Compositor) {
+fn icon_gesture_end(desktop: &mut Compositor, x: i32, y: i32) {
     if let Some(state) = ICON_HOLD.lock().take() {
         if state.lifted {
-            desktop.drop_icons();
+            if !icons_to_window(desktop, x, y) {
+                desktop.drop_icons();
+            }
         } else {
             open_icon(desktop, state.index);
         }
@@ -3237,7 +3239,9 @@ fn icon_gesture_end(desktop: &mut Compositor) {
     };
     match gesture {
         IconGesture::Carry { moved: true, .. } => {
-            desktop.drop_icons();
+            if !icons_to_window(desktop, x, y) {
+                desktop.drop_icons();
+            }
             // Перенос — не щелчок: следующий щелчок не должен стать вторым
             // щелчком двойного.
             LAST_ICON.store(u32::MAX, core::sync::atomic::Ordering::Relaxed);
@@ -3251,6 +3255,48 @@ fn icon_gesture_end(desktop: &mut Compositor) {
             }
         }
     }
+}
+
+/// Carried desktop icons released over a program window (27.11, ROADMAP:
+/// "desktop icons cannot be dropped into Files"): they stay in their cells,
+/// and the window under the pointer takes their files (`CLIP_TAKE`) - Files
+/// moves or copies them into the folder under the pointer by the Windows
+/// rule (the same volume moves, Ctrl copies, Shift moves). `false` - not
+/// over a program window: lay them on the grid.
+fn icons_to_window(desktop: &mut Compositor, x: i32, y: i32) -> bool {
+    let Some((app, local_x, local_y)) = desktop.program_under(x, y) else {
+        return false;
+    };
+    // Files and folders of the desktop only: a program shortcut keeps its
+    // command in the same `path` field.
+    let paths: alloc::vec::Vec<alloc::string::String> = desktop
+        .marked_icons()
+        .into_iter()
+        .filter(|index| matches!(desktop.icon_kind(*index), Some(icons::Kind::File | icons::Kind::Folder)))
+        .filter_map(|index| desktop.icon_path(index))
+        .collect();
+    desktop.cancel_icon_lift();
+    if paths.is_empty() {
+        kprintln!("  desktop     : icons released over a window, nothing to hand (no files)");
+        return true;
+    }
+    let mods = crate::input::modifiers();
+    let mode = if mods.contains(Modifiers::CTRL) {
+        'c'
+    } else if mods.contains(Modifiers::SHIFT) {
+        'M'
+    } else {
+        'm'
+    };
+    dragdrop::hand_off(&paths, mode);
+    kprintln!("  desktop     : {} icon(s) dropped on a program window (mode {mode})", paths.len());
+    // The window hears the pointer at once (it may not move after the
+    // release) and asks for the things.
+    if let Some(window) = desktop.find(app) {
+        window.push_move(WinEvent { kind: WIN_MOVE, code: 0, x: local_x, y: local_y });
+    }
+    desktop.set_hovered(Some(app));
+    true
 }
 
 /// Касание, разбудившее экран: до отпускания пальца оно только будит — как на
@@ -3643,7 +3689,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         if let Some((app, y0)) = card {
             card_end(desktop, app, y0, y, status);
         }
-        icon_gesture_end(desktop);
+        icon_gesture_end(desktop, x, y);
         SHADE_PULL.store(0, Ordering::Relaxed);
         *CONTENT_DRAG.lock() = None;
         if let Some(window) = desktop.find(App::Settings).filter(|w| w.settings_dragging()) {

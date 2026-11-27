@@ -21524,9 +21524,29 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("desktop     : renamed icon moved from"),
             Step::Wait(1_500),
             Step::ShotHead("04-renamed-head1", 1),
-            // A desktop icon carried: the same ghost, the icon stays in its
-            // cell until dropped.
+            // A desktop icon dropped into the «Файлы» window (ROADMAP 27.11:
+            // only Files -> desktop worked): the same volume - a move into
+            // the open folder; the icon goes from the desktop.
             Step::Aim(Aim::Point(1700, 300)),
+            Step::Press,
+            Step::Move(10, 10),
+            Step::Move(30, 40),
+            Step::Await("desktop     : drag ghost of 1 icon(s)", 15_000),
+            Step::Aim(Aim::Point(1100, 400)),
+            Step::Aim(Aim::FilesBody),
+            Step::Wait(800),
+            Step::Shot("05a-icon-over-files"),
+            Step::Release,
+            Step::Await("desktop     : 1 icon(s) dropped on a program window (mode m)", 15_000),
+            Step::Await("files: took 1 item(s) from the desktop into /root/Desktop/docs", 15_000),
+            Step::Await("files: pasted 1 item(s) into /root/Desktop/docs", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("05b-icon-in-files"),
+            Step::Line("ls /root/Desktop/docs"),
+            Step::Await("renamed.txt", 15_000),
+            // A desktop icon carried: the same ghost, the icon stays in its
+            // cell until dropped (the copy of a.txt dropped at 1700,530).
+            Step::Aim(Aim::Point(1700, 530)),
             Step::Press,
             Step::Move(10, 10),
             Step::Move(30, 40),

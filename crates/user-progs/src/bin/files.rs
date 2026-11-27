@@ -77,7 +77,7 @@ use user_progs::{
     Args, SysInfo, WIN_KEY_DELETE, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT,
     WIN_KEY_MENU, WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP,
     close, create, mkdir, monotonic_ms, mounts, open, open_write, println, read, readdir_raw, remove,
-    clipboard_get, clipboard_set, drag_ghost, drop_target, rename, spawn, stat, sysinfo, time_now, write,
+    clipboard_get, clipboard_set, desktop_drop_take, drag_ghost, drop_target, rename, spawn, stat, sysinfo, time_now, write,
 };
 
 /// Имя окна.
@@ -7234,10 +7234,16 @@ impl App for Files {
         if self.pointer.is_none() {
             self.item_watch = Some(monotonic_ms() + TAB_DROP_WATCH_MS);
         }
+        let entered = self.pointer.is_none();
         self.pointer = Some((x, y));
         let hot = self.hot_at(ctx, &plan, x, y);
         let changed = hot != self.hot;
         self.hot = hot;
+        // Desktop icons dropped here (27.11): the desktop pushes the pointer
+        // to the window right after the release.
+        if entered && self.take_desktop_drop() {
+            return true;
+        }
         // Всплывающая подсказка (24.11): строка под указателем — ждать, не
         // уйдёт ли он с неё; ушёл — подсказку убрать.
         let mut tip_gone = false;
@@ -7684,6 +7690,47 @@ impl Files {
             return true;
         }
         false
+    }
+
+    /// Desktop icons dropped on this window (27.11, ROADMAP: "desktop icons
+    /// cannot be dropped into Files"; `CLIP_TAKE`): into the folder row under
+    /// the pointer or the open folder - Ctrl copies, Shift moves, otherwise
+    /// the same volume moves and another copies, as in Explorer.
+    fn take_desktop_drop(&mut self) -> bool {
+        let Some((mode, paths)) = desktop_drop_take() else {
+            return false;
+        };
+        if self.on_computer() || self.preview.is_some() || self.job.is_some() || self.error.is_some() {
+            println(&format!("files: {} item(s) from the desktop refused (busy)", paths.len()));
+            self.note = Some(String::from("Сюда нельзя положить: откройте папку"));
+            return true;
+        }
+        let dir = match self.hot {
+            Hot::Row(index) => self.rows.get(index).filter(|row| row.directory && !row.is_volume()).map(|row| join(&self.path, &row.name)),
+            _ => None,
+        }
+        .unwrap_or_else(|| self.path.clone());
+        let points = mount_points();
+        let copy = match mode {
+            'c' => true,
+            'M' => false,
+            _ => paths.first().is_some_and(|path| mount_of(&points, path) != mount_of(&points, &dir)),
+        };
+        let into = dir.trim_end_matches('/');
+        // A folder into itself or below it - refused, as in Explorer.
+        if paths.iter().any(|path| into == path.trim_end_matches('/') || into.starts_with(&format!("{}/", path.trim_end_matches('/')))) {
+            println(&format!("files: {} item(s) from the desktop refused: a folder into itself", paths.len()));
+            self.note = Some(String::from("Нельзя положить папку саму в себя"));
+            return true;
+        }
+        // Moving to the folder they are already in - nothing to do.
+        if !copy && paths.iter().all(|path| path.trim_end_matches('/').rsplit_once('/').map_or("", |(parent, _)| parent) == into) {
+            println(&format!("files: {} item(s) from the desktop are already in {dir}", paths.len()));
+            return false;
+        }
+        println(&format!("files: took {} item(s) from the desktop into {dir}{}", paths.len(), if copy { " (copy)" } else { "" }));
+        self.drop_paths(paths, dir, copy);
+        true
     }
 
     /// Что подсвечено под указателем `x, y`. Пока открыто меню, свойства или

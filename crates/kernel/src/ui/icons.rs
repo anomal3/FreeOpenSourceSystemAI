@@ -1277,6 +1277,14 @@ impl Icons {
         Some(Ghost { face, key: under.pixel(), hot, solid })
     }
 
+    /// The carried icons were released over a program window (27.11): they
+    /// stay in their cells (the window takes the files).
+    pub fn cancel_lift(&mut self) -> Rect {
+        let damage = self.lifted_area();
+        self.lift = None;
+        damage
+    }
+
     /// Где сейчас нарисованы несомые значки (с поправкой на сдвиг).
     fn lifted_area(&self) -> Rect {
         let Some((dx, dy)) = self.lift else {

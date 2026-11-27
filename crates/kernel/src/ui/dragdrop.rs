@@ -149,3 +149,31 @@ pub fn take_drop(paths: &[String]) -> Option<String> {
     );
     Some(dir)
 }
+
+/// Desktop icons released over a program window (27.11, ROADMAP: "desktop
+/// icons cannot be dropped into Files"): when (ms) and the wire for
+/// `CLIP_TAKE` - `c` (Ctrl: copy), `M` (Shift: move) or `m` (the program
+/// decides: the same volume moves, another copies), then a path a line.
+static HANDOFF: SpinLock<Option<(u64, String)>> = SpinLock::new(None);
+
+/// How long the window under the pointer has to take the icons.
+const HANDOFF_FRESH_MS: u64 = 1_500;
+
+/// The desktop's things `paths` were released over a program window; the
+/// window takes them with `CLIP_TAKE` when it hears the pointer.
+pub fn hand_off(paths: &[String], mode: char) {
+    let mut wire = String::new();
+    wire.push(mode);
+    for path in paths {
+        wire.push('\n');
+        wire.push_str(path);
+    }
+    *HANDOFF.lock() = Some((crate::time::uptime_ms(), wire));
+}
+
+/// `CLIP_TAKE`: things the desktop dropped on a window, if fresh (taken
+/// once).
+pub fn take_handoff() -> Option<String> {
+    let (at, wire) = HANDOFF.lock().take()?;
+    (crate::time::uptime_ms().saturating_sub(at) <= HANDOFF_FRESH_MS).then_some(wire)
+}
