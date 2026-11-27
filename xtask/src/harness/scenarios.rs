@@ -11025,7 +11025,8 @@ pub const ALL: &[Scenario] = &[
             Step::AwaitAny("==== Shutting down", 300_000),
             Step::AwaitAny("capture     : stopped after", 120_000),
             Step::Wait(20_000),
-            Step::Line("fossai-obs --check-colors last 10"),
+            // The bars come ~17 s after the first F9 (second click) and stay 20 s.
+            Step::Line("fossai-obs --check-colors last 28"),
             Step::AwaitOneOf(&["fossai-obs: colors OK", "fossai-obs: colors FAILED"], 600_000),
             Step::Expect("fossai-obs: colors OK (8 bars, h264 bt709 tv)"),
             Step::Expect("fossai-obs: colors OK (8 bars, mjpeg"),
