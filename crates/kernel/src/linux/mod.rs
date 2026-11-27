@@ -496,7 +496,8 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::CHMOD => fsops::chmod(AT_FDCWD, a0, a1),
             nr::FCHMODAT => fsops::chmod(a0, a1, a2),
             nr::FCHMOD => fsops::fchmod(a0, a1),
-            nr::FCHOWN | nr::UTIMENSAT => 0,
+            nr::FCHOWN => 0,
+            nr::UTIMENSAT => fsops::utimensat(a0, a1, a2, a3),
             // Priorities (25.11.2026, `sched_prio.rs`).
             nr::SCHED_GET_PRIORITY_MAX => sched_prio::priority_range(a0, true),
             nr::SCHED_GET_PRIORITY_MIN => sched_prio::priority_range(a0, false),
@@ -1076,10 +1077,16 @@ const S_IFLNK: u32 = 0o120_000;
 
 /// Записать `struct stat` в память программы.
 fn put_stat(out: usize, kind: u32, mode: u16, uid: u32, gid: u32, size: u64, mtime: u32, ino: u64) -> i64 {
+    put_stat_times(out, kind, mode, uid, gid, size, crate::vfs::Times { mtime, atime: mtime, ctime: mtime }, ino)
+}
+
+/// `struct stat` with the three times of a file apart (27.11: access,
+/// modification, status change — `Node::times`; whole seconds).
+#[allow(clippy::too_many_arguments)]
+fn put_stat_times(out: usize, kind: u32, mode: u16, uid: u32, gid: u32, size: u64, times: crate::vfs::Times, ino: u64) -> i64 {
     if out % 8 != 0 || !space::user_can(out, size_of::<LinuxStat>(), PageFlags::WRITE) {
         return -e::EFAULT;
     }
-    let time = [i64::from(mtime), 0];
     let value = LinuxStat {
         // Номер узла — не ноль: утилиты сравнивают пары (dev, ino), и нули у
         // всех сделали бы все файлы одним. Настоящих номеров ядро не отдаёт;
@@ -1097,9 +1104,9 @@ fn put_stat(out: usize, kind: u32, mode: u16, uid: u32, gid: u32, size: u64, mti
         size: size as i64,
         blksize: 4096,
         blocks: size.div_ceil(512) as i64,
-        atime: time,
-        mtime: time,
-        ctime: time,
+        atime: [i64::from(times.atime), 0],
+        mtime: [i64::from(times.mtime), 0],
+        ctime: [i64::from(times.ctime), 0],
         ..LinuxStat::default()
     };
     // SAFETY: буфер проверен на запись `LinuxStat` целиком.
@@ -1233,7 +1240,7 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
         NodeKind::File => S_IFREG,
     };
     let ino = ino_of_node(&*node).unwrap_or_else(|| ino_of(&path));
-    put_stat(out, kind, meta.mode, meta.uid, meta.gid, meta.size, meta.mtime, ino)
+    put_stat_times(out, kind, meta.mode, meta.uid, meta.gid, meta.size, node.times(), ino)
 }
 
 fn fstat(fd: usize, out: usize) -> i64 {
@@ -1277,17 +1284,23 @@ fn fstat(fd: usize, out: usize) -> i64 {
             // дескриптора: `ld.so` узнаёт уже загруженную библиотеку по паре
             // (dev, ino), и `libc.so.6`, открытая под тем же номером 3, что до
             // неё `libselinux.so.1`, сошла бы за неё (первый прогон `ls`, 71b).
+            // Times of the file itself (27.11: `fstat` answered 0 — 1970 for
+            // `ls -l` of an open file, `make` and `tar` comparing dates).
+            let mut times = crate::vfs::Times::default();
             let ino = match crate::user::with_current(|program| program.files.file_or_dir(fd)) {
                 // Разделяемая память — по самому объекту памяти (фаза 71h):
                 // Chromium открывает `/dev/shm/имя` дважды и сверяет номера.
                 // Файл и каталог тома — по номеру inode, как `stat` по пути.
                 Some(Ok(node)) => match node.shared_memory() {
                     Some(mem) => alloc::sync::Arc::as_ptr(&mem) as usize as u64,
-                    None => ino_of_node(&*node).unwrap_or(alloc::sync::Arc::as_ptr(&node) as *const () as usize as u64),
+                    None => {
+                        times = node.times();
+                        ino_of_node(&*node).unwrap_or(alloc::sync::Arc::as_ptr(&node) as *const () as usize as u64)
+                    }
                 },
                 _ => 0x1000 + fd as u64,
             };
-            put_stat(out, kind, info.mode, info.uid, info.gid, info.size, 0, ino)
+            put_stat_times(out, kind, info.mode, info.uid, info.gid, info.size, times, ino)
         }
         Some(Err(err)) => file_errno(err),
         None => -e::ESRCH,

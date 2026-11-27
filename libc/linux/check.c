@@ -279,6 +279,29 @@ int main(int argc, char **argv) {
                 access("x86_64-linux-gnu/libc.so.6", R_OK) == 0;
     check(moved, "chdir, getcwd and a relative path");
 
+    /* Времена файла (27.11): fstat видит «сейчас» у нового файла (раньше 0),
+     * futimens ставит оба времени, utimensat с UTIME_OMIT не трогает время
+     * доступа, stat по пути отдаёт три времени раздельно. */
+    const char *timed = "/tmp/linuxcheck-times";
+    unlink(timed);
+    time_t started = time(NULL);
+    int tfd = open(timed, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    struct stat tinfo;
+    int fresh = tfd >= 0 && write(tfd, "t", 1) == 1 && fstat(tfd, &tinfo) == 0 && tinfo.st_mtime + 5 >= started;
+    check(fresh, "fstat of a new file says now in st_mtime");
+    struct timespec both[2] = {{1000000000, 0}, {1234567890, 0}};
+    int set_fd = tfd >= 0 && futimens(tfd, both) == 0 && fstat(tfd, &tinfo) == 0 && tinfo.st_atime == 1000000000 &&
+                 tinfo.st_mtime == 1234567890;
+    check(set_fd, "futimens sets both times, fstat sees them");
+    struct timespec only_m[2] = {{0, UTIME_OMIT}, {1300000000, 0}};
+    int set_path = utimensat(AT_FDCWD, timed, only_m, 0) == 0 && stat(timed, &tinfo) == 0 &&
+                   tinfo.st_atime == 1000000000 && tinfo.st_mtime == 1300000000;
+    check(set_path, "utimensat with UTIME_OMIT keeps the access time");
+    int set_now = utimensat(AT_FDCWD, timed, NULL, 0) == 0 && stat(timed, &tinfo) == 0 && tinfo.st_mtime + 5 >= started;
+    check(set_now, "utimensat(NULL) sets now");
+    if (tfd >= 0) close(tfd);
+    unlink(timed);
+
     /* Большой блок — mmap glibc. */
     char *big = malloc(64 << 20);
     int big_ok = big != NULL;

@@ -11607,10 +11607,24 @@ Windows идут по местному времени (UTC+4), и NTP посре
 образа dperson; иначе запись — ACCESS_DENIED); снимки
 `build/test/{file-times,clock-rtc,smb}-x86_64-release-*.png`.
 
-Осталось (TODO): слой Linux — `utimensat` по-прежнему «согласие» без дела,
-`fstat` по дескриптору отдаёт `mtime` 0 (`linux/mod.rs`, зона агента Proton);
-доли секунды (`st_mtim.tv_nsec`) — ноль; время доступа при чтении не
-обновляется (как `noatime`); переключение по NTP проверено тестом решения и
+**Доделано 27.11 (слой Linux):** `utimensat`/`futimens` (`linux/fsops.rs`)
+ставят времена по-настоящему: путь от `dirfd`, нулевой путь и `AT_EMPTY_PATH`
+— сам дескриптор, `UTIME_NOW`/`UTIME_OMIT`, `times == NULL` — «сейчас»,
+`AT_SYMLINK_NOFOLLOW` у ссылки слоя — тихий успех, неверные `tv_nsec` —
+`EINVAL`; ФС без времён (FAT только чтение) и корень только для чтения —
+успех, как `chmod`. `stat`/`fstat` отдают три времени раздельно
+(`Node::times`: доступ, изменение, смена состояния; `put_stat_times`), `fstat`
+открытого файла — его времена, а не 0. Проверка: `linuxcheck` (сценарий
+`linux-debian`): `fstat` нового файла — «сейчас», `futimens` → `fstat`,
+`utimensat` с `UTIME_OMIT` → `stat`, `utimensat(NULL)`.
+
+Осталось (TODO): доли секунды (`st_mtim.tv_nsec`) — ноль: VFS хранит целые
+секунды (`vfs::Times` — u32; ext2 со 128-байтовым inode долей и не хранит,
+btrfs хранит — нужна новая ширина `Times` и `set_times` во всех ФС); время
+доступа при чтении не обновляется (как `noatime`; `relatime` Linux —
+обновлять, если `atime` < `mtime` или старше суток, — запись inode на каждое
+первое чтение, решить отдельно); `statx` слоя Linux — `ENOSYS` (glibc
+отступает к `fstatat`); переключение по NTP проверено тестом решения и
 на железе ещё нет (QEMU без пояса на живой системе сдвига не делает).
 
 ## Разработка под FossAi и .NET (Роман 23.11)

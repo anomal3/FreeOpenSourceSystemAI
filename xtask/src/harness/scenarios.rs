@@ -9709,6 +9709,12 @@ pub const ALL: &[Scenario] = &[
             Step::Await("linuxcheck: ok pipe and poll", 30_000),
             Step::Await("linuxcheck: ok readdir, openat and fstatat from a directory descriptor", 30_000),
             Step::Await("linuxcheck: ok chdir, getcwd and a relative path", 30_000),
+            // 27.11: file times through the Linux layer (fstat, futimens,
+            // utimensat with UTIME_OMIT and NULL).
+            Step::Await("linuxcheck: ok fstat of a new file says now in st_mtime", 30_000),
+            Step::Await("linuxcheck: ok futimens sets both times, fstat sees them", 30_000),
+            Step::Await("linuxcheck: ok utimensat with UTIME_OMIT keeps the access time", 30_000),
+            Step::Await("linuxcheck: ok utimensat(NULL) sets now", 30_000),
             Step::Await("linuxcheck: ok malloc of 64 MiB", 30_000),
             // Фаза 71d: процессы — fork, execve, wait4, posix_spawn, kill.
             Step::Await("linuxcheck: ok fork, getppid, _exit and waitpid; memory is a copy", 60_000),

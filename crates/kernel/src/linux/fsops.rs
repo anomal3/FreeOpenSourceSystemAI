@@ -74,6 +74,82 @@ pub fn fchmod(fd: usize, mode: usize) -> i64 {
     }
 }
 
+/// `utimensat`/`futimens` (27.11; before — «success» doing nothing): `cp -p`,
+/// `tar`, `rsync`, `touch`, 7-Zip and Wine set the times of files they make.
+/// `times` — two `timespec` (access, modification) or 0 for «now»; a
+/// `tv_nsec` of `UTIME_NOW`/`UTIME_OMIT` — now / keep. The file systems keep
+/// whole seconds (`vfs::Times`), the nanoseconds are dropped. A null path
+/// (glibc `futimens`) or `AT_EMPTY_PATH` — the descriptor `dir` itself.
+pub fn utimensat(dir: usize, ptr: usize, times: usize, flags: usize) -> i64 {
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const UTIME_OMIT: i64 = (1 << 30) - 2;
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_EMPTY_PATH: usize = 0x1000;
+    let wanted: [[i64; 2]; 2] = if times == 0 {
+        [[0, UTIME_NOW], [0, UTIME_NOW]]
+    } else {
+        if !space::user_can(times, 32, PageFlags::READ) {
+            return -e::EFAULT;
+        }
+        // SAFETY: 32 readable bytes of the program (checked above).
+        unsafe { core::ptr::read_unaligned(times as *const [[i64; 2]; 2]) }
+    };
+    let now = crate::time::now_unix_u32();
+    let mut picked = [None; 2];
+    for (slot, [seconds, nanos]) in picked.iter_mut().zip(wanted) {
+        *slot = match nanos {
+            UTIME_OMIT => None,
+            UTIME_NOW => Some(now),
+            nanos if !(0..1_000_000_000).contains(&nanos) => return -e::EINVAL,
+            // 32-bit seconds on disk (ext2): before 1970 or after 2106 clamped.
+            _ => Some(seconds.clamp(0, i64::from(u32::MAX)) as u32),
+        };
+    }
+    let [atime, mtime] = picked;
+    if atime.is_none() && mtime.is_none() {
+        return 0;
+    }
+    let cred = crate::user::credentials();
+    let by_fd = ptr == 0 || (flags & AT_EMPTY_PATH != 0 && space::user_can(ptr, 1, PageFlags::READ) && {
+        // SAFETY: one readable byte (checked just before).
+        unsafe { core::ptr::read(ptr as *const u8) == 0 }
+    });
+    let node = if by_fd {
+        if dir == AT_FDCWD {
+            return -e::EFAULT;
+        }
+        match crate::user::with_current(|program| program.files.file_or_dir(dir)) {
+            Some(Ok(node)) => node,
+            Some(Err(err)) => return file_errno(err),
+            None => return -e::ESRCH,
+        }
+    } else {
+        let linux = match linux_path(dir, ptr) {
+            Ok(path) => path,
+            Err(err) => return err,
+        };
+        // A link of the layer keeps no times of its own: `lutimes` on it is
+        // a quiet success, as on file systems without link times.
+        if flags & AT_SYMLINK_NOFOLLOW != 0 && super::links::target(&linux).is_some() {
+            return 0;
+        }
+        let linux = super::links::follow(&linux);
+        let path = crate::linux_path::resolve(&linux, cred);
+        match crate::fs::resolve_as(cred, &path, crate::vfs::perm::Access::NONE) {
+            Some(Ok(node)) => alloc::sync::Arc::from(node),
+            Some(Err(err)) => return vfs_errno(err),
+            None => return -e::ENOENT,
+        }
+    };
+    match crate::fs::set_times_node(cred, &*node, atime, mtime) {
+        Ok(()) => 0,
+        // No stored times (FAT read-only, special files) or a read-only
+        // root — as before, `chmod` answers the same.
+        Err(crate::vfs::VfsError::Unsupported | crate::vfs::VfsError::ReadOnly) => 0,
+        Err(err) => vfs_errno(err),
+    }
+}
+
 /// `mkdir`/`mkdirat`.
 pub fn mkdir(dir: usize, ptr: usize, mode: usize) -> i64 {
     let linux = match linux_path(dir, ptr) {
