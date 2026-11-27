@@ -276,11 +276,17 @@ fn stop(device: &Device, why: &str) -> i64 {
         return -ENODATA;
     };
     *device.ring.lock() = None;
+    crate::ui::capture::hold_game(key_of(device), None);
     match crate::ui::capture::close_session(used.session, used.pointer, used.client) {
         Some(grabs) => crate::kprintln!("  capture     : stopped after {grabs} grab(s) (session {}, {why})", used.session),
         None => crate::kprintln!("  capture     : one consumer of session {} left ({why})", used.session),
     }
     0
+}
+
+/// The open as a key of its held game buffer (`capture::hold_game`).
+fn key_of(device: &Device) -> usize {
+    core::ptr::from_ref(device) as usize
 }
 
 /// The open's capture.
@@ -350,6 +356,7 @@ pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
                 // 25.11: a source back on the CPU copy needs the mirror kept
                 // up to date (see `FRAME`).
                 set_client(device, false);
+                crate::ui::capture::hold_game(key_of(device), None);
                 errno(crate::ui::capture::grab(used.session, buf as usize, have, used.pointer))
             }
             (Err(err), _) => err,
@@ -469,6 +476,8 @@ fn frame(device: &Device, arg: usize) -> i64 {
         (pitch >= ring.width * 4 && u64::from(pitch) * u64::from(ring.height) <= bo.size).then_some((phys, pitch, bo))
     });
     set_client(device, game.is_some());
+    // 27.11: the buffer stays away from the game until the next `FRAME`.
+    crate::ui::capture::hold_game(key_of(device), game.as_ref().map(|(phys, pitch, _)| (*phys, u64::from(*pitch) * u64::from(ring.height))));
     if let Some((phys, pitch, bo)) = game {
         crate::ui::capture::touch(id);
         args.buffer = phys;

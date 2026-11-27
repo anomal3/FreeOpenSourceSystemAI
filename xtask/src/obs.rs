@@ -662,6 +662,74 @@ LD_LIBRARY_PATH= mkdir -p "$L" "$MESA_SHADER_CACHE_DIR"
 # Строки запуска - в терминал и в ~/.cache/fossai-obs/launch.log (из «Пуска»
 # терминала нет).
 say() { echo "fossai-obs: $*"; echo "$(LD_LIBRARY_PATH= date '+%F %T') $*" >> "$L/launch.log"; [ -w /dev/kmsg ] && echo "fossai-obs: $*" > /dev/kmsg; }
+# `--check-colors [ФАЙЛ|last [СЕКУНДА]]` (27.11, hw-log20 «цвет капец при
+# записи»): запись полос `screenrec --bars-show` (на весь экран) - Y/U/V
+# середины каждой полосы через ffprobe (lavfi signalstats, кадр на СЕКУНДЕ
+# записи, по умолчанию 1) против ожидаемых
+# по матрице и диапазону, которые объявляет сам файл (H.264 - должен
+# объявлять BT.709 limited; MJPEG - JFIF, BT.601 full). Таблица - та же,
+# что `BARS` в screenrec.
+if [ "$1" = --check-colors ]; then
+    f=$2 at=${3:-1}
+    if [ -z "$f" ] || [ "$f" = last ]; then
+        f=
+        for m in "$HOME"/Videos/*.mp4 "$HOME"/Videos/*.mkv "$HOME"/Videos/*.avi; do [ -e "$m" ] && { [ -z "$f" ] || [ "$m" -nt "$f" ]; } && f=$m; done
+    fi
+    [ -n "$f" ] && [ -e "$f" ] || { echo "fossai-obs: colors FAILED: no recording ${f:-in $HOME/Videos}"; exit 1; }
+    { export LOCPATH=$P/locale LC_ALL=C.UTF-8; } 2>/dev/null
+    meta=$($P/bin/ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,pix_fmt,color_range,color_space,color_transfer,color_primaries -of default=nw=1 "$f" 2>&1)
+    codec= pix= range= space= trc= prim=
+    # Lines by IFS, not a here-string (that is a file in /tmp).
+    set -f; IFS=$'\n'
+    for line in $meta; do
+        v=${line#*=}
+        case "${line%%=*}" in codec_name) codec=$v ;; pix_fmt) pix=$v ;; color_range) range=$v ;; color_space) space=$v ;; color_transfer) trc=$v ;; color_primaries) prim=$v ;; esac
+    done
+    IFS=$' \t\n'; set +f
+    full=0; [ "$range" = pc ] && full=1; case "$pix" in yuvj*) full=1 ;; esac
+    m709=0; [ "$space" = bt709 ] && m709=1
+    tagged=1; [ "$codec" = h264 ] && ! { [ "$space" = bt709 ] && [ "$range" = tv ]; } && tagged=0
+    echo "fossai-obs: colors of $f: $codec $pix, matrix ${space:-unknown}, range ${range:-unknown}, primaries ${prim:-unknown}, transfer ${trc:-unknown}"
+    rnd() { if (($1 >= 0)); then R=$((($1 + $2 / 2) / $2)); else R=$((-((-$1 + $2 / 2) / $2))); fi; }
+    k=0 bad=0
+    for c in 255,255,255 128,128,128 0,0,0 255,0,0 0,255,0 0,0,255 255,255,0 40,90,170; do
+        r8=${c%%,*}; g8=${c#*,}; b8=${g8#*,}; g8=${g8%%,*}
+        if [ $m709 = 1 ]; then
+            L=$((2126 * r8 + 7152 * g8 + 722 * b8)) U=$((-1146 * r8 - 3854 * g8 + 5000 * b8)) V=$((5000 * r8 - 4542 * g8 - 458 * b8))
+        else
+            L=$((2990 * r8 + 5870 * g8 + 1140 * b8)) U=$((-1687 * r8 - 3313 * g8 + 5000 * b8)) V=$((5000 * r8 - 4187 * g8 - 813 * b8))
+        fi
+        if [ $full = 1 ]; then
+            rnd $L 10000; wy=$R; rnd $U 10000; wu=$((128 + R)); rnd $V 10000; wv=$((128 + R))
+        else
+            rnd $((219 * L)) 2550000; wy=$((16 + R)); rnd $((224 * U)) 2550000; wu=$((128 + R)); rnd $((224 * V)) 2550000; wv=$((128 + R))
+        fi
+        out=$($P/bin/ffprobe -v error -f lavfi -i "movie='$f':seek_point=$at,crop=w=iw/32:h=ih/8:x=iw*$((2 * k + 1))/16-iw/64:y=ih/2-ih/16,signalstats" -read_intervals '%+#1' -show_entries frame_tags=lavfi.signalstats.YAVG,lavfi.signalstats.UAVG,lavfi.signalstats.VAVG -of default=nw=1 2>&1)
+        gy= gu= gv=
+        set -f; IFS=$'\n'
+        for line in $out; do
+            val=${line#*=}; val=${val%%.*}
+            case "${line%%=*}" in *YAVG) gy=$val ;; *UAVG) gu=$val ;; *VAVG) gv=$val ;; esac
+        done
+        IFS=$' \t\n'; set +f
+        verdict=ok
+        if [ -z "$gy" ] || [ -z "$gu" ] || [ -z "$gv" ]; then
+            verdict="NO VALUES (${out//$'\n'/ | })"
+        else
+            for d in $((gy - wy)) $((gu - wu)) $((gv - wv)); do ((d > 6 || d < -6)) && verdict=WRONG; done
+        fi
+        [ "$verdict" = ok ] || bad=$((bad + 1))
+        echo "fossai-obs: colors bar $k rgb $c: got Y $gy U $gu V $gv, want Y $wy U $wu V $wv - $verdict"
+        k=$((k + 1))
+    done
+    if [ $bad = 0 ] && [ $tagged = 1 ]; then
+        echo "fossai-obs: colors OK (8 bars, $codec ${space:-bt601} ${range:-pc})"
+        exit 0
+    fi
+    [ $tagged = 1 ] || echo "fossai-obs: colors: H.264 without BT.709 limited tags - players guess the matrix"
+    echo "fossai-obs: colors FAILED ($bad of 8 bars off)"
+    exit 1
+fi
 # OpenGL (25.11, Роман: видеокарта по умолчанию, но только с откатом): есть
 # узел рендера (/dev/dri/renderD128 - NVIDIA через узел nouveau ядра) -
 # zink (OpenGL поверх Vulkan) на NVK, с проверкой до запуска (eglinfo должен
@@ -773,16 +841,22 @@ newest; before=$NEWEST
 # into launch.log and the kernel log (Roman sends that one): `OBS: Loading
 # up OpenGL on adapter ...`, `OBS: [fossai-capture] frames: ...` (the
 # encoder lines too if recording starts early). Every 15 s for 2 minutes.
+# 27.11 (hw-log20): a relay keeps the log it found first - the relay of a GPU
+# start went on reading the log of the next OBS (on the CPU) and reported
+# llvmpipe for it.
 relay() {
-    local i log line n shown=0
+    local i log= line n shown=0
     for ((i = 0; i < 8; i++)); do
         LD_LIBRARY_PATH= sleep 15
-        newest; log=$NEWEST
-        { [ -z "$log" ] || [ "$log" = "$1" ]; } && continue
+        if [ -z "$log" ]; then
+            newest
+            { [ -z "$NEWEST" ] || [ "$NEWEST" = "$1" ]; } && continue
+            log=$NEWEST
+        fi
         n=0
         while IFS= read -r line; do
             case "$line" in
-                *"Loading up OpenGL on adapter"*|*"[fossai-capture] frames:"*|*"[fossai-capture] dma-buf"*|*"[fossai-capture] game buffer"*|*"[x264 encoder"*"preset:"*|*"[x264 encoder"*"threads"*)
+                *"Loading up OpenGL on adapter"*|*"[fossai-capture] frames:"*|*"[fossai-capture] dma-buf"*|*"[fossai-capture] colours"*|*"[fossai-capture] game buffer"*|*"[x264 encoder"*"preset:"*|*"[x264 encoder"*"threads"*|*"Failed to "*)
                     n=$((n + 1)); [ $n -gt $shown ] && { shown=$n; say "OBS: ${line#*: }"; } ;;
             esac
         done < "$log"

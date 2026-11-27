@@ -846,6 +846,58 @@ pub fn set_client(id: u32, on: bool) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 27.11 (hw-log20): the game buffer a source samples is not the game's to draw
+// into until the source moves on
+// ---------------------------------------------------------------------------
+
+/// Game buffers handed to a source by `FRAME`: `(consumer key, physical
+/// address, length, ms of uptime when handed)`. One per consumer.
+static GAME_HELD: SpinLock<Vec<(usize, u64, u64, u64)>> = SpinLock::new(Vec::new());
+
+/// A held buffer is let go after this long without the next `FRAME` (a
+/// source that stopped asking must not keep a game's buffer forever).
+const GAME_HOLD_MS: u64 = 250;
+
+/// Consumer `key` samples the game buffer `(phys, len)` from now on (`None`
+/// - no game buffer any more). Until its next `FRAME` the Wayland server
+/// does not give that buffer back to the game ([`game_held`]).
+///
+/// hw-log20 (D2R at 160-180 fps under OBS, «картинка трясётся»): the
+/// display refused flips, the desktop showed the game by a copy and gave
+/// every buffer back as soon as the next one came; OBS sampled «the game's
+/// buffer» 30 times a second while the game was already drawing a newer
+/// frame into it - frames out of order and half drawn in the preview and
+/// the recording.
+pub fn hold_game(key: usize, buffer: Option<(u64, u64)>) {
+    let now = crate::time::uptime_ms();
+    let mut held = GAME_HELD.lock();
+    held.retain(|&(k, _, _, _)| k != key);
+    if let Some((phys, len)) = buffer {
+        held.push((key, phys, len, now));
+    }
+}
+
+/// May a source still sample the client buffer at `phys` (`len` bytes)?
+/// Held by [`hold_game`], or it is the directly shown buffer of a session
+/// whose source samples game buffers (the desktop notes the new buffer of
+/// the window only with its next frame - a `FRAME` in between hands the one
+/// noted). The Wayland server keeps such a buffer from the client.
+#[must_use]
+pub fn game_held(phys: u64, len: u64) -> bool {
+    if !active() {
+        return false;
+    }
+    let overlaps = |p: u64, l: u64| phys < p.saturating_add(l) && p < phys.saturating_add(len);
+    let now = crate::time::uptime_ms();
+    if GAME_HELD.lock().iter().any(|&(_, p, l, since)| now.saturating_sub(since) < GAME_HOLD_MS && overlaps(p, l)) {
+        return true;
+    }
+    SESSIONS.lock().iter().any(|session| {
+        session.clients > 0 && session.direct.is_some_and(|(p, pitch)| overlaps(p, u64::from(pitch) * u64::from(session.rect.h)))
+    })
+}
+
 /// `over` on `under` with `alpha` (channel-wise, format-agnostic).
 fn blend(under: u32, over: u32, alpha: u8) -> u32 {
     let a = u32::from(alpha);

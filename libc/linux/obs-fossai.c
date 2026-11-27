@@ -49,6 +49,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -410,6 +411,12 @@ struct stream {
 		uint64_t used;
 	} game_tex[GAME_MAX];
 	enum frame_mode logged;
+	/// How colours were drawn, as last logged (0 - not yet).
+	int srgb_logged;
+	/// 27.11: the first CHECK_SIDE rows of the ring buffers mapped for the
+	/// readback check of the first import (NULL - none or done).
+	void *check_map[RING_MAX];
+	uint32_t check_stride;
 	gs_texture_t *cursor_tex;
 	uint32_t cursor_serial;
 };
@@ -923,6 +930,80 @@ static gs_texture_t *import_dmabuf(int fd, uint32_t width, uint32_t height, uint
 	return tex;
 }
 
+// Side of the square the readback check compares (top left of the frame).
+#define CHECK_SIDE 16
+
+static void drop_check_map(struct stream *s, int i)
+{
+	if (s->check_map[i])
+		munmap(s->check_map[i], (size_t)s->check_stride * CHECK_SIDE);
+	s->check_map[i] = NULL;
+}
+
+// Draw the top left CHECK_SIDE square of `tex` into a texture of ours, read it
+// back and compare it with the same pixels through the CPU (`map`, rows at
+// `stride`). Colour channels only, off by at most 2. Unable to tell (no
+// render target, no staging) counts as the same.
+static bool readback_matches(gs_texture_t *tex, const uint8_t *map, uint32_t stride)
+{
+	const uint32_t n = CHECK_SIDE;
+	gs_texrender_t *tr = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+	gs_stagesurf_t *stage = gs_stagesurface_create(n, n, GS_BGRA);
+	bool same = true, told = false;
+	int bad = 0;
+	uint32_t got = 0, want = 0;
+	if (tr && stage && gs_texrender_begin(tr, n, n)) {
+		gs_ortho(0.0f, (float)n, 0.0f, (float)n, -100.0f, 100.0f);
+		const bool previous = gs_framebuffer_srgb_enabled();
+		gs_enable_framebuffer_srgb(false);
+		gs_blend_state_push();
+		gs_enable_blending(false);
+		gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_OPAQUE);
+		gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), tex);
+		while (gs_effect_loop(effect, "Draw"))
+			gs_draw_sprite_subregion(tex, 0, 0, 0, n, n);
+		gs_blend_state_pop();
+		gs_enable_framebuffer_srgb(previous);
+		gs_texrender_end(tr);
+		gs_stage_texture(stage, gs_texrender_get_texture(tr));
+		uint8_t *data = NULL;
+		uint32_t line = 0;
+		if (gs_stagesurface_map(stage, &data, &line)) {
+			told = true;
+			for (uint32_t y = 0; y < n; y++) {
+				for (uint32_t x = 0; x < n; x++) {
+					const uint8_t *a = data + (size_t)y * line + x * 4;
+					const uint8_t *b = map + (size_t)y * stride + x * 4;
+					for (int c = 0; c < 3; c++) {
+						if (abs((int)a[c] - (int)b[c]) > 2) {
+							if (!bad) {
+								memcpy(&got, a, 4);
+								memcpy(&want, b, 4);
+							}
+							bad++;
+							break;
+						}
+					}
+				}
+			}
+			gs_stagesurface_unmap(stage);
+		}
+	}
+	if (stage)
+		gs_stagesurface_destroy(stage);
+	if (tr)
+		gs_texrender_destroy(tr);
+	if (bad) {
+		same = false;
+		blog(LOG_WARNING, "[fossai-capture] dma-buf readback differs: %d of %u points (first: GPU 0x%08x, memory 0x%08x)",
+		     bad, n * n, got, want);
+	} else {
+		blog(LOG_INFO, "[fossai-capture] dma-buf readback %s",
+		     told ? "matches the memory (16x16 points)" : "not possible - trusted");
+	}
+	return same;
+}
+
 static void drop_ring_textures(struct stream *s)
 {
 	for (int i = 0; i < RING_MAX; i++) {
@@ -962,6 +1043,8 @@ static void sweep_streams_locked(void)
 		*at = s->next;
 		drop_ring_textures(s);
 		drop_game_textures(s);
+		for (int i = 0; i < RING_MAX; i++)
+			drop_check_map(s, i);
 		if (s->cpu_tex)
 			gs_texture_destroy(s->cpu_tex);
 		if (s->cursor_tex)
@@ -992,7 +1075,14 @@ static gs_texture_t *frame_texture_locked(struct stream *s)
 										 r->fourcc, r->modifier)
 								 : NULL;
 				ok = ok && s->ring_tex[i];
+				// 27.11: a CPU view of the same memory for the readback check.
+				drop_check_map(s, i);
+				if (ok && g_dmabuf == 0 && r->fds[i] >= 0) {
+					void *map = mmap(NULL, (size_t)r->stride * CHECK_SIDE, PROT_READ, MAP_SHARED, r->fds[i], 0);
+					s->check_map[i] = map == MAP_FAILED ? NULL : map;
+				}
 			}
+			s->check_stride = r->stride;
 			// The textures keep the buffers; the descriptors are not needed.
 			close_ring_fds_locked(s);
 			if (!ok) {
@@ -1003,6 +1093,19 @@ static gs_texture_t *frame_texture_locked(struct stream *s)
 			if (g_dmabuf == 0)
 				blog(LOG_INFO, "[fossai-capture] dma-buf import works");
 			g_dmabuf = 1;
+		}
+		// 27.11: the first frame shown is read back from the GPU and compared
+		// with the memory the kernel wrote (zink/NVK importing system memory
+		// can only be checked on real hardware).
+		if (s->slot >= 0 && s->slot < RING_MAX && s->check_map[s->slot] && s->ring_tex[s->slot]) {
+			bool same = readback_matches(s->ring_tex[s->slot], s->check_map[s->slot], s->check_stride);
+			for (int i = 0; i < RING_MAX; i++)
+				drop_check_map(s, i);
+			if (!same) {
+				drop_ring_textures(s);
+				dmabuf_failed("the GPU reads other pixels than the kernel wrote");
+				return NULL;
+			}
 		}
 		if (!s->game)
 			drop_game_textures(s);
@@ -1151,18 +1254,39 @@ static void capture_render(void *data, gs_effect_t *unused)
 			s = at;
 	gs_texture_t *tex = s ? frame_texture_locked(s) : NULL;
 	if (tex) {
-		gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_OPAQUE);
 		const bool linear_srgb = gs_get_linear_srgb();
 		const bool previous = gs_framebuffer_srgb_enabled();
 		gs_enable_framebuffer_srgb(linear_srgb);
+		// 27.11 (hw-log20, «цвет капец при записи»): a dma-buf texture
+		// (ring, game buffer) is an EGLImage of a UNORM format (XR24/XB24):
+		// `gs_effect_set_texture_srgb` only switches GL_TEXTURE_SRGB_DECODE,
+		// which does nothing on a non-sRGB format - the sRGB values went in
+		// as linear and the sRGB framebuffer encoded them once more (pale,
+		// washed-out picture in the preview and in every recording). Such
+		// textures are decoded in the shader (DrawSrgbDecompress); OBS's own
+		// textures (CPU copy) keep the sRGB view.
+		const bool dmabuf_tex = s->mode != MODE_CPU;
+		gs_effect_t *effect = obs_get_base_effect(linear_srgb && dmabuf_tex ? OBS_EFFECT_DEFAULT : OBS_EFFECT_OPAQUE);
+		const char *tech = linear_srgb && dmabuf_tex ? "DrawSrgbDecompress" : "Draw";
 		gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
-		if (linear_srgb)
+		if (linear_srgb && !dmabuf_tex)
 			gs_effect_set_texture_srgb(image, tex);
 		else
 			gs_effect_set_texture(image, tex);
-		while (gs_effect_loop(effect, "Draw"))
+		// The frame is opaque: no blending with what is under the source
+		// (the X channel of XR24 may read as anything on some drivers).
+		gs_blend_state_push();
+		gs_enable_blending(false);
+		while (gs_effect_loop(effect, tech))
 			gs_draw_sprite_subregion(tex, 0, 0, 0, want.w, want.h);
+		gs_blend_state_pop();
 		gs_enable_framebuffer_srgb(previous);
+		if (s->srgb_logged != (int)(linear_srgb && dmabuf_tex) + 1) {
+			s->srgb_logged = (int)(linear_srgb && dmabuf_tex) + 1;
+			blog(LOG_INFO, "[fossai-capture] colours: %s", linear_srgb && dmabuf_tex
+				? "dma-buf frame decoded from sRGB in the shader (linear canvas)"
+				: (linear_srgb ? "sRGB texture view (linear canvas)" : "frame drawn as is (sRGB canvas)"));
+		}
 		// The pointer: unless it is in the frame already (the compositor
 		// drew it, or an old kernel patched it in).
 		if ((want.flags & CAP_POINTER) && !g_old_kernel_cursor && s->cur.visible && s->cur.serial &&

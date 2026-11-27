@@ -233,6 +233,80 @@ fn write_all(fd: i64, mut data: &[u8]) -> bool {
     true
 }
 
+/// 27.11 (hw-log20, «цвет капец при записи»): the colour bars of the
+/// recording check, left to right. `fossai-obs --check-colors` keeps the same
+/// table: white and black (range), mid grey (the transfer curve: an sRGB
+/// value taken as linear and encoded again comes out ~188), the primaries
+/// (matrix), yellow and the desktop's blue.
+const BARS: [(u8, u8, u8); 8] = [(255, 255, 255), (128, 128, 128), (0, 0, 0), (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (40, 90, 170)];
+
+/// `--bars FILE [W H]`: the bars as a 24-bit BMP (shown full screen by
+/// «Фотографии» while a recording runs).
+fn write_bars(path: &str, w: u32, h: u32) -> i64 {
+    let (w, h) = (w.clamp(64, 8192), h.clamp(64, 8192));
+    let row = (w as usize * 3).next_multiple_of(4);
+    let size = 54 + row * h as usize;
+    let mut out = Vec::with_capacity(size);
+    let le32 = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(&v.to_le_bytes());
+    out.extend_from_slice(b"BM");
+    le32(&mut out, size as u32);
+    le32(&mut out, 0);
+    le32(&mut out, 54);
+    le32(&mut out, 40);
+    le32(&mut out, w);
+    le32(&mut out, h);
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    for v in [0, (row * h as usize) as u32, 2835, 2835, 0, 0] {
+        le32(&mut out, v);
+    }
+    let mut line = Vec::with_capacity(row);
+    for x in 0..w {
+        let (r, g, b) = BARS[(x as usize * BARS.len()) / w as usize];
+        line.extend_from_slice(&[b, g, r]);
+    }
+    line.resize(row, 0);
+    // Bottom-up rows, all the same.
+    for _ in 0..h {
+        out.extend_from_slice(&line);
+    }
+    let fd = open_write(path, true, true);
+    let ok = fd >= 0 && write_all(fd, &out);
+    if fd >= 0 {
+        close(fd);
+    }
+    let table: Vec<String> = BARS.iter().map(|(r, g, b)| format!("{r},{g},{b}")).collect();
+    println(&format!("screenrec: bars {w}x{h} {} {path}: {}", if ok { "written to" } else { "FAILED to write" }, table.join(" ")));
+    i64::from(!ok)
+}
+
+/// `--bars-show`: [`BARS`] over the whole monitor (Esc closes).
+struct BarsWindow;
+
+impl App for BarsWindow {
+    fn draw(&self, s: &mut Surface, area: Rect, _ctx: Ctx) {
+        let n = BARS.len() as u32;
+        for (i, &(r, g, b)) in BARS.iter().enumerate() {
+            let x0 = area.x + (area.w * i as u32 / n) as i32;
+            let x1 = area.x + (area.w * (i as u32 + 1) / n) as i32;
+            s.fill(Rect::new(x0, area.y, (x1 - x0) as u32, area.h), mini_ui::Color::rgb(r, g, b));
+        }
+    }
+    fn key(&mut self, code: u32) -> bool {
+        if code == 0x1B {
+            println("screenrec: bars closed");
+            exit(0);
+        }
+        false
+    }
+    fn fullscreen(&self) -> bool {
+        true
+    }
+    fn title(&self) -> Option<String> {
+        Some(String::from("Полосы цвета — Запись экрана"))
+    }
+}
+
 /// Where the last recording went (the window shows it and opens its folder).
 fn last_path_file() -> String {
     format!("{}/.config/screenrec.last", user_progs::filedlg::home_dir())
@@ -1356,6 +1430,11 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     let flag = |name: &str| (1..args.len()).any(|i| args.get(i) == Some(name));
     let value = |name: &str| (1..args.len()).find(|&i| args.get(i) == Some(name)).and_then(|i| args.get(i + 1)).map(String::from);
     user_progs::heap_size(16 * 1024 * 1024);
+    if let Some(path) = value("--bars") {
+        let at = (1..args.len()).find(|&i| args.get(i) == Some("--bars")).unwrap_or(0);
+        let num = |i: usize| args.get(i).and_then(|v| v.parse::<u32>().ok());
+        exit(write_bars(&path, num(at + 2).unwrap_or(1280), num(at + 3).unwrap_or(800)));
+    }
     if let Some(path) = value("--probe") {
         // `last` — the file of the last recording.
         let path = if path == "last" { read_text(&last_path_file(), 4096).map(|t| t.trim().to_string()).unwrap_or(path) } else { path };
@@ -1431,6 +1510,11 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         }
     }
     let info = app::start(&SPEC);
+    if flag("--bars-show") {
+        // 27.11: the bars full screen, for the colour check of recordings.
+        println("screenrec: bars shown full screen");
+        app::run(&SPEC, &info, (640, 400), |_, _| BarsWindow)
+    }
     let scale = app::ui_scale(&info);
     // A screen that leaves less than 640 points under the window title
     // (720p) gets the closer rows; the window is then as high as they are.

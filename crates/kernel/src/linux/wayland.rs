@@ -4927,8 +4927,15 @@ static SCAN_GRAVE: crate::sync::SpinLock<Vec<Buffer>> = crate::sync::SpinLock::n
 /// G3: may a display still read this buffer (a page flip to it, or away
 /// from it, not on screen yet)? Only physically contiguous buffers are
 /// ever scanned out.
+///
+/// 27.11 (hw-log20): also a buffer a screen capture source (OBS) samples as
+/// «the game's buffer» - given back to the game only when the source moved
+/// on (`capture::game_held`), else the game draws the next frame into what
+/// OBS shows and records.
 fn scanned(buf: &Buffer) -> bool {
-    if !crate::display::flip_any() {
+    let flips = crate::display::flip_any();
+    let capture = crate::ui::capture::active();
+    if !flips && !capture {
         return false;
     }
     let len = u64::from(buf.stride) * u64::from(buf.height);
@@ -4938,7 +4945,7 @@ fn scanned(buf: &Buffer) -> bool {
     let Some(phys) = (ptr as u64).checked_sub(crate::mm::PHYS_MAP_BASE as u64) else {
         return false;
     };
-    crate::display::flip_scanning(phys, len)
+    (flips && crate::display::flip_scanning(phys, len)) || (capture && crate::ui::capture::game_held(phys, len))
 }
 
 /// Кадр, который окно может показать прямо из памяти клиента: один
