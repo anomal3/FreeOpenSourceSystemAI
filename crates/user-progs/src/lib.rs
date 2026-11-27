@@ -1814,6 +1814,42 @@ pub fn clipboard_get_files() -> Option<(alloc::vec::Vec<alloc::string::String>, 
     (!paths.is_empty()).then_some((paths, cut))
 }
 
+/// The desktop shows a half-transparent copy of dragged things under the
+/// pointer (27.11, `CLIP_DRAG`): `items` - up to three `(is a folder, name)`,
+/// the first in front; `count` - how many in all. Empty `items` - take it
+/// away.
+pub fn drag_ghost(items: &[(bool, &str)], count: usize) -> bool {
+    let mut wire = alloc::string::String::new();
+    if !items.is_empty() {
+        wire.push_str(&alloc::format!("{count}"));
+        for (folder, name) in items.iter().take(3) {
+            wire.push('\n');
+            wire.push_str(if *folder { "d " } else { "f " });
+            wire.push_str(&name.replace('\n', " "));
+        }
+    }
+    // SAFETY: строка живёт в памяти программы, длина — её собственная.
+    let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, user_abi::CLIP_DRAG, wire.as_ptr() as usize, wire.len()) };
+    result == 0
+}
+
+/// Was the drag of `paths` released on the desktop (27.11, `CLIP_DROP`)?
+/// The folder to put them in (the desktop folder or a folder icon there);
+/// `None` - somewhere else.
+#[must_use]
+pub fn drop_target(paths: &[alloc::string::String]) -> Option<alloc::string::String> {
+    let wire = paths.join("\n");
+    let mut buffer = alloc::vec![0u8; wire.len().max(4096) + 1];
+    buffer[..wire.len()].copy_from_slice(wire.as_bytes());
+    // SAFETY: буфер живёт в памяти программы, длина — его собственная.
+    let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, user_abi::CLIP_DROP, buffer.as_mut_ptr() as usize, buffer.len()) };
+    if result <= 0 {
+        return None;
+    }
+    let count = (result as usize).min(buffer.len());
+    core::str::from_utf8(&buffer[..count]).ok().map(alloc::string::String::from)
+}
+
 /// Номер изменения буфера обмена (растёт при каждом, 24.11).
 #[must_use]
 pub fn clipboard_seq() -> u32 {

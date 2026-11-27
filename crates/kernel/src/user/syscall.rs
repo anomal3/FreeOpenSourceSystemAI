@@ -1457,6 +1457,35 @@ fn clipboard(action: usize, ptr: usize, len: usize) -> i64 {
             0
         }
         user_abi::CLIP_SEQ => i64::from(crate::ui::clipboard::seq()),
+        // 27.11: drag and drop with the desktop (`ui::dragdrop`).
+        user_abi::CLIP_DRAG | user_abi::CLIP_DROP => {
+            if len > 64 * 1024 || (len > 0 && !space::user_can(ptr, len, PageFlags::READ)) {
+                return ERR_BAD_ADDRESS;
+            }
+            // Копия — до замка: страница программы может прийти по касанию.
+            let bytes = if len == 0 { alloc::vec::Vec::new() } else {
+                // SAFETY: диапазон проверен по таблицам программы на чтение.
+                unsafe { core::slice::from_raw_parts(ptr as *const u8, len) }.to_vec()
+            };
+            let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+            let Ok(text) = core::str::from_utf8(&bytes[..end]) else {
+                return ERR_BAD_PATH;
+            };
+            if action == user_abi::CLIP_DRAG {
+                return if crate::ui::dragdrop::request_ghost(text) { 0 } else { ERR_BAD_PATH };
+            }
+            let paths: alloc::vec::Vec<alloc::string::String> = text.split('\n').filter(|line| !line.is_empty()).map(alloc::string::String::from).collect();
+            let Some(dir) = crate::ui::dragdrop::take_drop(&paths) else {
+                return 0;
+            };
+            let count = dir.len();
+            if count > len || !space::user_can(ptr, count, PageFlags::WRITE) {
+                return ERR_BAD_ADDRESS;
+            }
+            // SAFETY: диапазон проверен по таблицам программы на запись.
+            unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, count) }.copy_from_slice(dir.as_bytes());
+            count as i64
+        }
         user_abi::CLIP_GET | user_abi::CLIP_GET_FILES => {
             let text = if action == user_abi::CLIP_GET { crate::ui::clipboard() } else { crate::ui::clipboard::files_wire() };
             let count = text.len().min(len);

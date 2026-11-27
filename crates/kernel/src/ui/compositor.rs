@@ -91,6 +91,10 @@ const SHADOW_DROP: u32 = 10;
 /// прямоугольники лежит в самом столе (см. [`Compositor::out_rects`]).
 pub const MAX_OUTPUTS: usize = 8;
 
+/// How opaque the drag ghost is, of 255 (27.11): what is under it shows
+/// through, as in Windows.
+const GHOST_ALPHA: u8 = 175;
+
 /// G3 (21.11): fullscreen fast path on/off (`ui direct on|off`, for A/B).
 pub static DIRECT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
@@ -311,6 +315,10 @@ pub struct Compositor {
     /// Контур перетаскивания (20.11, «Оформление»): где окажется окно, если
     /// его отпустить. Само окно стоит на месте до отпускания.
     outline: Option<Rect>,
+    /// What is dragged (27.11, hw-log20): a half-transparent picture under
+    /// the pointer over all layers - desktop icons, or rows of «Файлы»
+    /// (`SYS_CLIPBOARD`/`CLIP_DRAG`). `true` - asked by a program.
+    ghost: Option<(super::icons::Ghost, bool)>,
     /// Отпускание: отложенный размер применяется и в режиме контура.
     settling: bool,
     /// Какие края тянут ([`super::window::EDGE_LEFT`] и прочие).
@@ -563,6 +571,7 @@ impl Compositor {
             moved: None,
             pending_size: None,
             outline: None,
+            ghost: None,
             settling: false,
             resize_edges: 0,
             hovered: None,
@@ -1950,9 +1959,96 @@ impl Compositor {
     /// Один объединяющий при быстром движении накрыл бы полэкрана, тогда как
     /// настоящих изменений два пятна размером с курсор.
     pub fn move_pointer(&mut self, dx: i32, dy: i32) {
+        let ghost = self.ghost_rect();
         self.move_pointer_by(dx, dy);
+        self.ghost_moved(ghost);
         if self.cursor_hidden_by.is_some() || !self.client_cursors.is_empty() {
             self.sync_client_cursor();
+        }
+    }
+
+    /// Where the drag ghost is drawn now.
+    fn ghost_rect(&self) -> Option<Rect> {
+        let (ghost, _) = self.ghost.as_ref()?;
+        let (x, y) = self.pointer.position();
+        Some(ghost.rect_at(x, y))
+    }
+
+    /// The pointer moved: the ghost leaves `before` and comes to its new place.
+    fn ghost_moved(&mut self, before: Option<Rect>) {
+        let after = self.ghost_rect();
+        if before != after {
+            for rect in [before, after].into_iter().flatten() {
+                self.mark(rect);
+            }
+        }
+    }
+
+    /// Show (`Some`) or take away the drag ghost (27.11); `program` - asked by
+    /// a program window (`CLIP_DRAG`), not by the desktop icons.
+    pub fn set_drag_ghost(&mut self, ghost: Option<super::icons::Ghost>, program: bool) {
+        if let Some(rect) = self.ghost_rect() {
+            self.mark(rect);
+        }
+        self.ghost = ghost.map(|ghost| (ghost, program));
+        if let Some(rect) = self.ghost_rect() {
+            self.mark(rect);
+        }
+    }
+
+    /// Is a ghost asked by a program shown.
+    #[must_use]
+    pub fn program_ghost(&self) -> bool {
+        self.ghost.as_ref().is_some_and(|(_, program)| *program)
+    }
+
+    /// The drag ghost of things a program drags: `(is a folder, name)`, the
+    /// first in front, `count` in all.
+    pub fn show_program_ghost(&mut self, items: &[(bool, alloc::string::String)], count: usize) -> bool {
+        let items: alloc::vec::Vec<super::icons::Item> = items
+            .iter()
+            .map(|(folder, name)| super::icons::Item {
+                kind: if *folder { Kind::Folder } else { Kind::File },
+                label: name.clone(),
+                path: None,
+                shortcut: None,
+            })
+            .collect();
+        let refs: alloc::vec::Vec<&super::icons::Item> = items.iter().collect();
+        let ghost = self.icons.ghost(&refs, count);
+        let shown = ghost.is_some();
+        self.set_drag_ghost(ghost, true);
+        shown
+    }
+
+    /// Is the point on the bare desktop: no window, panel or open menu over
+    /// it, on one of the monitors.
+    #[must_use]
+    pub fn bare_desktop_at(&self, x: i32, y: i32) -> bool {
+        let on_screen = self.out_rects[..self.outputs.len().min(MAX_OUTPUTS)].iter().any(|rect| rect.contains(x, y)) || self.outputs.is_empty();
+        on_screen && self.window_at(x, y).is_none() && self.panel_at(x, y).is_none() && !self.menu_open() && !self.context_open()
+    }
+
+    /// The desktop grid cell under a point (27.11, files dropped there).
+    #[must_use]
+    pub fn icon_slot_at(&self, x: i32, y: i32) -> Option<usize> {
+        self.icons.slot_at(x, y)
+    }
+
+    /// The cell of the desktop icon with this path (for the log).
+    #[must_use]
+    pub fn icon_slot_of(&self, path: &str) -> Option<usize> {
+        self.icons.slot_of_path(path)
+    }
+
+    /// Keep the place of the desktop icon `old` (a path) for its new path
+    /// `new` (27.11): saved before the desktop is re-read under the new name.
+    pub fn keep_icon_place(&mut self, old: &str, new: &str) {
+        if let Some(places) = self.icons.places_renamed(old, new) {
+            super::icons::set_places(&places);
+            if let Err(err) = super::prefs::store_icon_places(&places) {
+                crate::kprintln!("  desktop     : icon places not saved: {err}");
+            }
         }
     }
 
@@ -1997,7 +2093,9 @@ impl Compositor {
     /// это тот, кто хранит прежнее положение. Заодно из ответа исчезает та
     /// часть движения, которую съел край экрана.
     pub fn move_pointer_to(&mut self, x_fraction: u16, y_fraction: u16) -> (i32, i32) {
+        let ghost = self.ghost_rect();
         let moved = self.move_pointer_at(x_fraction, y_fraction);
+        self.ghost_moved(ghost);
         if self.cursor_hidden_by.is_some() || !self.client_cursors.is_empty() {
             self.sync_client_cursor();
         }
@@ -2323,10 +2421,21 @@ impl Compositor {
     pub fn lift_icons(&mut self, dx: i32, dy: i32) {
         let damage = self.icons.lift(dx, dy);
         self.icon_damage(damage);
+        // The first step shows the ghost of the carried icons (27.11).
+        if self.ghost.is_none() {
+            let ghost = self.icons.lift_ghost();
+            if ghost.is_some() {
+                crate::kprintln!("  desktop     : drag ghost of {} icon(s)", self.icons.marked().len());
+            }
+            self.set_drag_ghost(ghost, false);
+        }
     }
 
     /// Положить несомые значки по сетке и запомнить их места.
     pub fn drop_icons(&mut self) {
+        if self.ghost.as_ref().is_some_and(|(_, program)| !program) {
+            self.set_drag_ghost(None, false);
+        }
         let before = self.icons.bounds();
         let (damage, places) = self.icons.drop_lifted();
         self.icon_damage(damage.union(&before).union(&self.icons.bounds()));
@@ -2664,6 +2773,15 @@ impl Compositor {
         self.icons.reload();
         let after = self.icons.bounds();
         self.mark_layer(before.union(&after));
+        // Files dropped on the desktop took their cells, renamed ones kept
+        // theirs (27.11).
+        if let Some(places) = self.icons.take_places() {
+            super::icons::set_places(&places);
+            match super::prefs::store_icon_places(&places) {
+                Ok(()) => crate::kprintln!("  desktop     : icon places updated, saved"),
+                Err(err) => crate::kprintln!("  desktop     : icon places updated, not saved: {err}"),
+            }
+        }
     }
 
     /// Попадание в панель задач.
@@ -6522,6 +6640,10 @@ impl Compositor {
                 self.drop_shadow(back, rect, band, dy, r);
                 self.stack(back, shade.surface(), rect, band, dy, r);
             }
+        }
+        // What is dragged (27.11): a half-transparent copy under the pointer.
+        if let (Some((ghost, _)), Some(rect)) = (self.ghost.as_ref(), self.ghost_rect()) {
+            ghost.blit(back, band, dy, rect, GHOST_ALPHA);
         }
         // Контур перетаскивания (20.11) — над всеми слоями, под указателем.
         if let Some(ghost) = self.outline {

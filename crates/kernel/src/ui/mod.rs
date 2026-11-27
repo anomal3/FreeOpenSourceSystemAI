@@ -50,6 +50,7 @@ pub mod context;
 pub mod deskcfg;
 pub mod deskicons;
 pub mod dialog;
+pub mod dragdrop;
 pub mod ending;
 pub mod icons;
 pub mod lock;
@@ -3019,6 +3020,11 @@ fn press_middle(desktop: &mut Compositor, x: i32, y: i32) {
 /// захватившему, если указатель ушёл, что ушёл: пока держали кнопку, ни того,
 /// ни другого оно не слышало.
 fn release_pointer(desktop: &mut Compositor, x: i32, y: i32, button: u32, status: &Status) {
+    // A program's drag ends (27.11): its ghost goes, a release on the
+    // desktop is remembered for `CLIP_DROP` - before the window hears it.
+    if button == 1 && desktop.captured().is_some() {
+        dragdrop::released(desktop, x, y);
+    }
     let Some(app) = desktop.release_capture(button) else {
         return;
     };
@@ -3262,6 +3268,8 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     if desktop.ending() {
         return;
     }
+    // A program asked for (or took away) its drag ghost (27.11).
+    dragdrop::apply(desktop);
     // The screensaver (22.11) ends on the first motion or click, which goes
     // no further.
     let saver_up = desktop.saver_showing();
@@ -6525,9 +6533,17 @@ fn finish_icon_edit(desktop: &mut Compositor, accept: Option<String>) {
         (Some(name), Some(path)) if !name.is_empty() && name != label => match context::rename_entry(&path, &name) {
             Ok(target) => {
                 kprintln!("  desktop     : renamed '{path}' to '{}'", context::base_name(&target));
+                // 27.11 (hw-log20): the icon keeps its cell under the new
+                // name - places are remembered by path.
+                let was = desktop.icon_slot_of(&path);
+                desktop.keep_icon_place(&path, &target);
                 desktop.reload_icons();
                 desktop.select_icon_path(&target);
                 log_icons(desktop);
+                match (was, desktop.icon_slot_of(&target)) {
+                    (Some(was), Some(now)) if was == now => kprintln!("  desktop     : renamed icon keeps its cell {now}"),
+                    (was, now) => kprintln!("  desktop     : renamed icon moved from cell {was:?} to {now:?}"),
+                }
             }
             Err(err) => kprintln!("  desktop     : cannot rename '{path}': {err}"),
         },

@@ -1608,6 +1608,19 @@ pub const CLIP_GET_FILES: usize = 4;
 /// [`SYS_CLIPBOARD`] (24.11): номер изменения буфера (растёт при каждом) —
 /// без копирования содержимого.
 pub const CLIP_SEQ: usize = 5;
+/// [`SYS_CLIPBOARD`] (27.11): the program drags things - the desktop shows a
+/// half-transparent copy of their icons under the pointer over all windows
+/// until the left button is released. Text: the count, a line feed, then up
+/// to three `d <name>` (folder) / `f <name>` (file) lines, the first in
+/// front. Empty text - take the copy away. Ignored unless the program's
+/// window holds the left button.
+pub const CLIP_DRAG: usize = 6;
+/// [`SYS_CLIPBOARD`] (27.11): where did the drag end? In: the dragged paths,
+/// one per line, ended by a zero byte or the length; the buffer is reused
+/// for the answer. Answer: the length of the folder written to the buffer
+/// (the desktop folder, or a folder icon on the desktop) - the program puts
+/// the things there itself; zero - not dropped on the desktop.
+pub const CLIP_DROP: usize = 7;
 /// Самый длинный текст буфера обмена.
 pub const CLIP_MAX: usize = 4 * 1024 * 1024;
 

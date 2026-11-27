@@ -179,6 +179,63 @@ pub enum EditReply {
     Cancel,
 }
 
+/// A drag ghost (27.11, hw-log20): the picture of what is dragged, drawn
+/// half-transparent under the pointer over all layers. Points of the `key`
+/// colour are not drawn (the picture is painted on that colour, the average
+/// wallpaper, as the icon grid is).
+pub struct Ghost {
+    pub face: Surface,
+    pub key: u32,
+    /// The point of the picture under the pointer.
+    pub hot: (i32, i32),
+    /// A part drawn opaque (the counter: half-transparent it was unreadable
+    /// on the dark wallpaper), in the picture's coordinates.
+    pub solid: Rect,
+}
+
+impl Ghost {
+    /// Where the picture stands with the pointer at `x, y`.
+    #[must_use]
+    pub fn rect_at(&self, x: i32, y: i32) -> Rect {
+        Rect::new(x - self.hot.0, y - self.hot.1, self.face.width(), self.face.height())
+    }
+
+    /// Blend the picture into the band of the frame at `at` (screen), `alpha`
+    /// of 255.
+    pub fn blit(&self, back: &mut Surface, band: Rect, dy: i32, at: Rect, alpha: u8) {
+        let visible = at.intersect(&band);
+        if visible.is_empty() {
+            return;
+        }
+        let from_x = (visible.x - at.x) as usize;
+        let width = visible.w as usize;
+        let screen_x = visible.x.max(0) as usize;
+        for row in 0..visible.h {
+            let src_y = (visible.y - at.y) as u32 + row;
+            let dst_y = (visible.y + dy) as u32 + row;
+            let (Some(source), Some(target)) = (
+                self.face.row(src_y).get(from_x..from_x + width),
+                back.row_mut(dst_y).get_mut(screen_x..screen_x + width),
+            ) else {
+                continue;
+            };
+            for (column, (dst, src)) in target.iter_mut().zip(source).enumerate() {
+                if *src == self.key {
+                    continue;
+                }
+                let a = if self.solid.contains((from_x + column) as i32, src_y as i32) { 255 } else { u32::from(alpha) };
+                let mut out = *dst & 0xFF00_0000;
+                for shift in [0u32, 8, 16] {
+                    let s = (*src >> shift) & 0xFF;
+                    let d = (*dst >> shift) & 0xFF;
+                    out |= ((s * a + d * (255 - a)) / 255) << shift;
+                }
+                *dst = out;
+            }
+        }
+    }
+}
+
 /// Значки стола: их места и то, какой из них выбран.
 pub struct Icons {
     /// Масштаб — тот же, что у всего стола.
@@ -238,6 +295,9 @@ pub struct Icons {
     /// Имена записей реестра пакетов при последнем перечитывании: сменились —
     /// значки пакетов пора перечитать (см. [`Icons::packages_changed`]).
     packages: String,
+    /// Icons took cells they were dropped on (27.11): the places are to be
+    /// saved (see [`Icons::take_places`]).
+    places_changed: bool,
 }
 
 /// Места значков, запомненные в `desktop.cfg` (`место=ключ` через `|`).
@@ -250,6 +310,34 @@ const MAX_SLOT: usize = 4096;
 /// Места значков — из настроек при загрузке.
 pub fn set_places(list: &str) {
     *PLACES.lock() = String::from(list);
+}
+
+/// Files dropped on the desktop (27.11, hw-log20): the paths they will have
+/// in the desktop folder and the cell they were dropped on. The copy (or the
+/// move) is done by the program that dragged them and may take a while; the
+/// icon takes its cell when it appears (see [`Icons::place_items`]).
+static EXPECTED: crate::sync::SpinLock<Vec<(String, usize)>> = crate::sync::SpinLock::new(Vec::new());
+
+/// Renames inside the desktop folder seen by [`desktop_folder_changed`]:
+/// old and new path. [`Icons::reload`] moves their places.
+static MOVED: crate::sync::SpinLock<Vec<(String, String)>> = crate::sync::SpinLock::new(Vec::new());
+
+/// Re-read the desktop at the next tick even if the folder did not change
+/// (a move inside the desktop folder only moves icons).
+static RELOAD_SOON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The icons of `paths` go to the cells from `slot` on, in this order.
+pub fn expect_at(paths: &[String], slot: usize) {
+    let mut expected = EXPECTED.lock();
+    expected.retain(|(path, _)| !paths.contains(path));
+    for path in paths {
+        expected.push((path.clone(), slot.min(MAX_SLOT - 1)));
+    }
+    // A mistaken drop must not keep a list forever.
+    let extra = expected.len().saturating_sub(64);
+    expected.drain(..extra);
+    drop(expected);
+    RELOAD_SOON.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// По чему значок узнаётся в файле мест: путь (файл стола, команда ярлыка),
@@ -344,6 +432,18 @@ pub fn desktop_folder_changed(can: bool) -> bool {
     // «Параметры папок» сменили (24.11): стол перечитывается тем же путём.
     if refresh_folder_options() {
         *pending = true;
+    }
+    // Files dropped on the desktop wait for their cells (27.11).
+    if RELOAD_SOON.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        *pending = true;
+    }
+    // A name changed inside the desktop folder by anyone («Файлы», the
+    // shell; 27.11): the icon keeps its cell under the new name.
+    for from in events.iter().filter(|event| event.wd == 1 && event.cookie != 0 && event.mask & crate::fs::notify::MOVED_FROM != 0) {
+        if let Some(to) = events.iter().find(|event| event.wd == 1 && event.cookie == from.cookie && event.mask & crate::fs::notify::MOVED_TO != 0) {
+            let base = dir.trim_end_matches('/');
+            MOVED.lock().push((alloc::format!("{base}/{}", from.name), alloc::format!("{base}/{}", to.name)));
+        }
     }
     let leaf = dir.rsplit('/').next().unwrap_or("");
     // Каталог стола наблюдается первым (номер 1); у родителя — только
@@ -442,6 +542,7 @@ impl Icons {
             top: 0,
             origin: (0, 0),
             packages: String::new(),
+            places_changed: false,
         };
         icons.items = system_items();
         icons.place_items();
@@ -461,9 +562,33 @@ impl Icons {
             self.slots = (0..count).collect();
             return;
         }
-        let places = PLACES.lock();
         let mut taken: Vec<usize> = Vec::new();
+        // Files just dropped on the desktop (27.11): their cells first, the
+        // first free from the one they were dropped on.
+        let mut placed_new = false;
+        {
+            let mut expected = EXPECTED.lock();
+            for (index, item) in self.items.iter().enumerate() {
+                let Some(path) = item.path.as_deref().filter(|_| matches!(item.kind, Kind::Folder | Kind::File)) else {
+                    continue;
+                };
+                let Some(at) = expected.iter().position(|(wanted, _)| wanted == path) else {
+                    continue;
+                };
+                let (_, mut slot) = expected.remove(at);
+                while taken.contains(&slot) && slot < MAX_SLOT - 1 {
+                    slot += 1;
+                }
+                self.slots[index] = slot;
+                taken.push(slot);
+                placed_new = true;
+            }
+        }
+        let places = PLACES.lock();
         for (index, item) in self.items.iter().enumerate() {
+            if self.slots[index] != usize::MAX {
+                continue;
+            }
             let key = key_of(item);
             let saved = places.split('|').find_map(|entry| {
                 let (slot, name) = entry.split_once('=')?;
@@ -475,6 +600,7 @@ impl Icons {
             }
         }
         drop(places);
+        self.places_changed |= placed_new;
         let mut next = 0;
         for index in 0..count {
             if self.slots[index] != usize::MAX {
@@ -488,11 +614,58 @@ impl Icons {
         }
     }
 
+    /// The places to save when dropped files took their cells or renamed
+    /// ones kept theirs (27.11).
+    pub fn take_places(&mut self) -> Option<String> {
+        core::mem::take(&mut self.places_changed).then(|| self.places_text())
+    }
+
+    /// The places of all icons with the icon of `old` (a path) kept under
+    /// the name `new` (27.11, hw-log20: an icon renamed on the second
+    /// monitor jumped to the first free cell of the primary - places are
+    /// remembered by path, and the new path had none). `None` - no such icon.
+    #[must_use]
+    pub fn places_renamed(&self, old: &str, new: &str) -> Option<String> {
+        let at = self.index_of_path(old)?;
+        Some(self.places_with(&[(at, new)]))
+    }
+
+    /// The cell of the icon with this path (for the log).
+    #[must_use]
+    pub fn slot_of_path(&self, path: &str) -> Option<usize> {
+        self.index_of_path(path).and_then(|at| self.slots.get(at).copied())
+    }
+
+    /// The grid cell under the point `x, y` of the desktop; `None` left of or
+    /// above the grid (a monitor left of the primary has no grid).
+    #[must_use]
+    pub fn slot_at(&self, x: i32, y: i32) -> Option<usize> {
+        if theme::is_mobile() {
+            return None;
+        }
+        let ctx = self.ctx();
+        let margin = ctx.px(theme::ICON_MARGIN) as i32;
+        let step_x = ctx.px(theme::ICON_CELL_W + theme::ICON_GAP).max(1) as i32;
+        let step_y = ctx.px(theme::ICON_CELL_H + theme::ICON_GAP).max(1) as i32;
+        let (fx, fy) = (x - self.origin.0 - margin, y - self.origin.1 - margin);
+        if fx < 0 || fy < 0 {
+            return None;
+        }
+        let rows = self.rows.max(1) as i32;
+        let slot = (fx / step_x) * rows + (fy / step_y).min(rows - 1);
+        usize::try_from(slot).ok().filter(|slot| *slot < MAX_SLOT)
+    }
+
     /// Места значков строкой для файла настроек: `место=ключ` через `|`.
     fn places_text(&self) -> String {
+        self.places_with(&[])
+    }
+
+    /// [`Self::places_text`], each icon `.0` of `renamed` under the key `.1`.
+    fn places_with(&self, renamed: &[(usize, &str)]) -> String {
         let mut text = String::new();
         for (index, item) in self.items.iter().enumerate() {
-            let key = key_of(item);
+            let key = renamed.iter().find(|(at, _)| *at == index).map_or_else(|| key_of(item), |(_, key)| *key);
             if key.contains('|') || key.contains('\n') {
                 continue;
             }
@@ -573,6 +746,18 @@ impl Icons {
             .filter(|(_, marked)| **marked)
             .map(|(item, _)| String::from(key_of(item)))
             .collect();
+        // Files renamed in the desktop folder (27.11): their cells - and the
+        // cells of all others, which a new name order would shuffle - are
+        // kept under the new names.
+        let moved = core::mem::take(&mut *MOVED.lock());
+        let renamed: Vec<(usize, &str)> = moved
+            .iter()
+            .filter_map(|(old, new)| Some((self.index_of_path(old)?, new.as_str())))
+            .collect();
+        if !renamed.is_empty() && !theme::is_mobile() {
+            set_places(&self.places_with(&renamed));
+            self.places_changed = true;
+        }
 
         self.items = system_items();
         self.selected = None;
@@ -1029,16 +1214,67 @@ impl Icons {
         damage
     }
 
-    /// Нести выделенные значки: сдвиг от точки, где их взяли. Первый сдвиг
-    /// убирает их из картинки сетки — дальше они рисуются поверх неё.
+    /// Нести выделенные значки: сдвиг от точки, где их взяли.
+    ///
+    /// 27.11 (Roman, hw-log20: "I see no shadow of what I drag"): the icons
+    /// stay in their cells, as in Windows, and a half-transparent copy goes
+    /// under the pointer over all layers (see [`Self::lift_ghost`] and the
+    /// compositor's drag ghost). Before they were taken out of the grid and
+    /// drawn shifted in the icon layer - under every window and opaque.
     pub fn lift(&mut self, dx: i32, dy: i32) -> Rect {
-        let before = self.lifted_area();
-        let first = self.lift.is_none();
         self.lift = Some((dx, dy));
-        if first {
-            self.rebuild();
+        Rect::EMPTY
+    }
+
+    /// The half-transparent copy of the carried (marked) icons: up to three
+    /// stacked, a counter when more than one.
+    #[must_use]
+    pub fn lift_ghost(&self) -> Option<Ghost> {
+        let marked = self.marked();
+        let items: Vec<&Item> = marked.iter().filter_map(|at| self.items.get(*at)).collect();
+        self.ghost(&items, items.len())
+    }
+
+    /// A drag ghost for `items` (the first is in front), `count` things in
+    /// all. The picture is a cell with the icon and its label, up to two more
+    /// tiles behind it up and to the right, and a counter on the tile when
+    /// `count` is above one; the pointer holds it by the middle of the tile.
+    #[must_use]
+    pub fn ghost(&self, items: &[&Item], count: usize) -> Option<Ghost> {
+        let front = items.first()?;
+        let ctx = self.ctx();
+        let p = ctx.palette;
+        let shift = ctx.px(7) as i32;
+        let (w, h) = (ctx.px(theme::ICON_CELL_W), ctx.px(theme::ICON_CELL_H));
+        let under = ctx.under;
+        let mut face = Surface::new(w + shift as u32 * 2, h + shift as u32 * 2, under)?;
+        let cell = Rect::new(0, shift * 2, w, h);
+        // Behind first, the farthest first.
+        for (depth, item) in items.iter().enumerate().skip(1).take(2).rev() {
+            let back = cell.translate(shift * depth as i32, -shift * depth as i32);
+            let tile = self.tile_in(back);
+            self.draw_tile(&mut face, tile, item);
         }
-        before.union(&self.lifted_area())
+        let r = ctx.px(theme::R_CARD);
+        draw::rounded(&mut face, cell, r, p.hover2.color, p.hover2.alpha);
+        draw::rounded_stroke(&mut face, cell, r, p.accline.color, p.accline.alpha);
+        let tile = self.tile_in(cell);
+        self.draw_tile(&mut face, tile, front);
+        let ink = if super::wallpaper::white_labels() { mini_ui::Color::rgb(0xFF, 0xFF, 0xFF) } else { p.ink };
+        self.draw_label(&mut face, cell, tile, usize::MAX, front, ink);
+        let mut solid = Rect::EMPTY;
+        if count > 1 {
+            let text = alloc::format!("{count}");
+            let label = ctx.face(Role::Label);
+            let side = ctx.px(22).max(label.width(&text) + ctx.px(12));
+            let badge = Rect::new(tile.right() - side as i32 / 2, tile.y - ctx.px(6) as i32, side, ctx.px(22));
+            draw::rounded(&mut face, badge, badge.h / 2, p.acc, 255);
+            let x = badge.x + (badge.w as i32 - label.width(&text) as i32) / 2;
+            paint::text(ctx, &mut face, Role::Label, x, paint::baseline(ctx, Role::Label, badge), &text, mini_ui::Color::rgb(0xFF, 0xFF, 0xFF));
+            solid = badge;
+        }
+        let hot = (cell.x + w as i32 / 2, tile.y + tile.h as i32 / 2);
+        Some(Ghost { face, key: under.pixel(), hot, solid })
     }
 
     /// Где сейчас нарисованы несомые значки (с поправкой на сдвиг).
@@ -1104,15 +1340,8 @@ impl Icons {
     /// значок ложился поверх закрывающего его окна.
     pub fn draw(&self, back: &mut Surface, band: Rect, dy: i32) {
         self.draw_grid(back, band, dy);
-        // Несомые значки — поверх сетки, со сдвигом от своих мест.
-        if let Some((lx, ly)) = self.lift {
-            for at in self.marked() {
-                let cell = self.cell(at).translate(lx, ly);
-                if !cell.intersect(&band).is_empty() {
-                    self.draw_one(back, cell, dy, at, &self.items[at], true);
-                }
-            }
-        }
+        // Несомые значки (27.11) — призраком над всеми слоями, у указателя
+        // (`Compositor::set_drag_ghost`); здесь они стоят на своих местах.
         // Рамка выделения: полупрозрачная заливка и обводка цветом акцента.
         if let Some(rect) = self.band {
             let visible = rect.intersect(&band);
@@ -1162,7 +1391,7 @@ impl Icons {
         }
         for index in 0..self.items.len() {
             let cell = self.cell(index);
-            if cell.intersect(&band).is_empty() || (self.lift.is_some() && self.is_marked(index)) {
+            if cell.intersect(&band).is_empty() {
                 continue;
             }
             let item = &self.items[index];
@@ -1190,10 +1419,6 @@ impl Icons {
             return;
         };
         for index in 0..self.items.len() {
-            // Несомые значки в картинку не входят: их рисует `draw` поверх.
-            if self.lift.is_some() && self.is_marked(index) {
-                continue;
-            }
             let cell = self.cell(index);
             let local = cell.translate(-area.x, -area.y);
             let item = &self.items[index];
@@ -1221,16 +1446,37 @@ impl Icons {
             draw::rounded_stroke(back, cell, r, p.accline.color, p.accline.alpha);
         }
 
+        let tile = self.tile_in(cell);
+        self.draw_tile(back, tile, item);
+
+        // Подпись — до двух строк. Одна строка обрезала бы «This computer» на
+        // «This comp…», а три сделали бы сетку неровной: высота ячейки задана
+        // числом, и третья строка выехала бы на соседнюю ячейку.
+        // На картинке FossAi подпись белая при любой теме — картинка тёмная и
+        // одна на обе темы (как подписи на обоях Windows).
+        let ink = if super::wallpaper::white_labels() {
+            mini_ui::Color::rgb(0xFF, 0xFF, 0xFF)
+        } else if selected {
+            p.ink
+        } else {
+            p.ink2
+        };
+        self.draw_label(back, cell, tile, index, item, ink);
+    }
+
+    /// Where the tile stands in a cell (screen coordinates of the cell).
+    fn tile_in(&self, cell: Rect) -> Rect {
+        let ctx = self.ctx();
         // Плитка на телефоне крупнее: в неё целятся пальцем, а не курсором.
         // Сорок шесть точек — это девять миллиметров на мониторе и четыре с
         // половиной на панели телефона, то есть вдвое меньше подушечки пальца.
         let side = ctx.px(if theme::is_mobile() { theme::M_TILE } else { theme::ICON_TILE });
-        let tile = Rect::new(
-            cell.x + (cell.w as i32 - side as i32) / 2,
-            cell.y + ctx.px(CELL_PAD) as i32,
-            side,
-            side,
-        );
+        Rect::new(cell.x + (cell.w as i32 - side as i32) / 2, cell.y + ctx.px(CELL_PAD) as i32, side, side)
+    }
+
+    /// The picture of an icon in its tile (without the label).
+    fn draw_tile(&self, back: &mut Surface, tile: Rect, item: &Item) {
+        let ctx = self.ctx();
         match &item.shortcut {
             // Ярлык программы: её значок — картинка без плитки, как в Windows,
             // или значок набора на плитке — и стрелка ярлыка в углу.
@@ -1274,21 +1520,14 @@ impl Icons {
                 }
             }
         }
+    }
 
-        // Подпись — до двух строк. Одна строка обрезала бы «This computer» на
-        // «This comp…», а три сделали бы сетку неровной: высота ячейки задана
-        // числом, и третья строка выехала бы на соседнюю ячейку.
+    /// The label under the tile (or the name field while it is edited).
+    fn draw_label(&self, back: &mut Surface, cell: Rect, tile: Rect, index: usize, item: &Item, ink: mini_ui::Color) {
+        let ctx = self.ctx();
+        let p = ctx.palette;
         let pad = ctx.px(CELL_PAD);
         let room = cell.w.saturating_sub(pad * 2);
-        // На картинке FossAi подпись белая при любой теме — картинка тёмная и
-        // одна на обе темы (как подписи на обоях Windows).
-        let ink = if super::wallpaper::white_labels() {
-            mini_ui::Color::rgb(0xFF, 0xFF, 0xFF)
-        } else if selected {
-            p.ink
-        } else {
-            p.ink2
-        };
         let step = u32::from(ctx.face(Role::Label).line);
         let mut y = tile.bottom() + ctx.px(theme::ICON_LABEL_GAP) as i32;
         // Подпись правят на месте: поле на всю ширину ячейки, набранное — с

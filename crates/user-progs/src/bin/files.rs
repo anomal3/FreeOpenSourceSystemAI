@@ -77,7 +77,7 @@ use user_progs::{
     Args, SysInfo, WIN_KEY_DELETE, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT,
     WIN_KEY_MENU, WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP,
     close, create, mkdir, monotonic_ms, mounts, open, open_write, println, read, readdir_raw, remove,
-    clipboard_get, clipboard_set, rename, spawn, stat, sysinfo, time_now, write,
+    clipboard_get, clipboard_set, drag_ghost, drop_target, rename, spawn, stat, sysinfo, time_now, write,
 };
 
 /// Имя окна.
@@ -1034,6 +1034,8 @@ struct Files {
     emptying: Option<(String, usize)>,
     /// Ctrl зажат — перетаскивание копирует (нажатие и `WIN_KEYUP`).
     ctrl_held: bool,
+    /// Shift held (27.11): a drag moves, even to another volume.
+    shift_held: bool,
     /// Рамка выделения по пустому месту (21.11).
     band: Option<Band>,
     /// Ширины столбцов «Дата», «Тип», «Размер» в точках макета (21.11:
@@ -1442,6 +1444,7 @@ impl Files {
             press_mods: 0,
             emptying: None,
             ctrl_held: false,
+            shift_held: false,
             band: None,
             cols: COLS_DEFAULT,
             col_drag: None,
@@ -4071,8 +4074,9 @@ impl Files {
 
     /// Копирует ли перетаскивание в `dir` (а не переносит): с Ctrl — всегда,
     /// без него — между разными томами, как в Проводнике.
+    /// Shift (27.11) - always move.
     fn drag_copies(&self, drag: &Drag, dir: &str) -> bool {
-        self.ctrl_held || mount_of(&drag.points, dir) != mount_of(&drag.points, &self.path)
+        self.ctrl_held || (!self.shift_held && mount_of(&drag.points, dir) != mount_of(&drag.points, &self.path))
     }
 
     /// Указатель с зажатой кнопкой: тянуть строку, подсветить папку под ним.
@@ -4171,7 +4175,17 @@ impl Files {
             drag.active = true;
             drag.points = mount_points();
             println(&format!("files: dragging {} item(s)", dragged.len()));
+            // 27.11 (hw-log20): the desktop shows a half-transparent copy of
+            // the icons under the pointer, also outside this window.
+            let from = drag.from;
+            let mut order: Vec<usize> = alloc::vec![from];
+            order.extend(dragged.iter().copied().filter(|index| *index != from));
+            let items: Vec<(bool, &str)> = order.iter().filter_map(|index| self.rows.get(*index)).take(3).map(|row| (row.directory, row.name.as_str())).collect();
+            drag_ghost(&items, dragged.len());
         }
+        let Some(drag) = self.drag.as_mut() else {
+            return false;
+        };
         drag.out = !area.contains(x, y);
         drag.target = target;
         drag.active
@@ -4312,8 +4326,27 @@ impl Files {
                 ClickAfter::Nothing => false,
             };
         }
+        // The desktop took the ghost away at the release; say it anyway.
+        drag_ghost(&[], 0);
         let paths: Vec<String> = self.dragged(&drag).iter().filter_map(|index| self.rows.get(*index)).map(|row| join(&self.path, &row.name)).collect();
         let Some((dir, _)) = drag.target.clone() else {
+            // Released on the desktop (27.11, hw-log20: "dragging a file to
+            // the desktop does not copy it"): into the desktop folder (or a
+            // folder icon there), the same rule as between folders - the
+            // same volume moves, another copies, Ctrl copies, Shift moves.
+            if drag.out && !paths.is_empty() {
+                if let Some(dir) = drop_target(&paths) {
+                    let copy = self.drag_copies(&drag, &dir);
+                    println(&format!("files: dropped {} item(s) on the desktop into {dir}{}", paths.len(), if copy { " (copy)" } else { "" }));
+                    if !copy && dir.trim_end_matches('/') == self.path.trim_end_matches('/') {
+                        // From the desktop folder to the desktop: only the
+                        // icons move (the desktop placed them).
+                        return true;
+                    }
+                    self.drop_paths(paths, dir, copy);
+                    return true;
+                }
+            }
             if drag.out && !paths.is_empty() {
                 let copy = self.ctrl_held;
                 return self.offer_items(&paths, copy);
@@ -4358,11 +4391,13 @@ impl Files {
                 let verb = if self.drag_copies(drag, dir) { "+ Копировать в" } else { "→ Переместить в" };
                 format!("{verb} «{}»: {label}", place_title(dir, &self.home).rsplit('/').next().unwrap_or(dir))
             }
-            None if drag.out => format!("{label} — в другое окно «Файлов»{}", if self.ctrl_held { " (копия)" } else { "" }),
+            None if drag.out => format!("{label} — на рабочий стол или в окно «Файлов»{}", if self.ctrl_held { " (копия)" } else { "" }),
             None => label,
         };
         let w = ctx.face(Role::Body).width(&label) + ctx.px(20);
-        let chip = Rect::new(drag.at.0 + ctx.px(14) as i32, drag.at.1 + ctx.px(10) as i32, w, ctx.px(28));
+        // Under the ghost the desktop draws at the pointer (27.11): the icon
+        // cell is held by the middle of its tile, ~70 points below it.
+        let chip = Rect::new(drag.at.0 - ctx.px(20) as i32, drag.at.1 + ctx.px(72) as i32, w, ctx.px(28));
         let inner = kit::card(ctx, s, chip);
         paint::text(inner, s, Role::Body, chip.x + ctx.px(10) as i32, paint::baseline(ctx, Role::Body, chip), &label, p.ink);
     }
@@ -6918,7 +6953,13 @@ impl App for Files {
             self.ctrl_held = true;
             return self.drag.as_ref().is_some_and(|drag| drag.active);
         }
-        if matches!(code, user_abi::WIN_KEY_SHIFT | user_abi::WIN_KEY_ALT) {
+        // Shift during a drag (27.11, as in Explorer) - move even between
+        // volumes.
+        if code == user_abi::WIN_KEY_SHIFT {
+            self.shift_held = true;
+            return self.drag.as_ref().is_some_and(|drag| drag.active);
+        }
+        if matches!(code, user_abi::WIN_KEY_ALT) {
             return false;
         }
         self.tip = None;
@@ -7082,6 +7123,7 @@ impl App for Files {
     fn click_with(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32, mods: i32) -> bool {
         self.press_mods = mods;
         self.ctrl_held = mods & WIN_MOD_CTRL != 0;
+        self.shift_held = mods & WIN_MOD_SHIFT != 0;
         let idle = self.menu.is_none() && self.pop.is_none() && self.job.is_none() && self.props.is_none() && self.preview.is_none();
         if mods & (WIN_MOD_CTRL | WIN_MOD_SHIFT) != 0 && idle && !self.on_computer() {
             let plan = layout(ctx, area);
@@ -7125,6 +7167,10 @@ impl App for Files {
     fn key_up(&mut self, code: u32) -> bool {
         if code == user_abi::WIN_KEY_CTRL {
             self.ctrl_held = false;
+            return self.drag.as_ref().is_some_and(|drag| drag.active);
+        }
+        if code == user_abi::WIN_KEY_SHIFT {
+            self.shift_held = false;
             return self.drag.as_ref().is_some_and(|drag| drag.active);
         }
         false
@@ -7587,10 +7633,10 @@ impl Files {
             println(&format!("files: {count} item(s) taken by another window"));
             self.note = Some(format!("Объектов передано в другое окно: {count}"));
         } else {
-            // Стол брошенное не принимает (его значки рисует ядро, договора
-            // «бросить файл на стол» нет) — на «Рабочий стол» слева можно.
+            // The desktop takes drops since 27.11 (`CLIP_DROP`, see
+            // `on_release`); here the pointer was over another window.
             println(&format!("files: nobody took {count} item(s)"));
-            self.note = Some(String::from("Отпустите над папкой, вкладкой или окном «Файлов»"));
+            self.note = Some(String::from("Отпустите над папкой, рабочим столом или окном «Файлов»"));
         }
         true
     }
