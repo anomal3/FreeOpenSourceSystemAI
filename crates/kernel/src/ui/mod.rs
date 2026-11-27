@@ -4709,6 +4709,7 @@ fn choose_program(desktop: &mut Compositor, path: &str) {
     }
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = sysconf::filetypes::extension(name);
+    let spare = dialog::open_with_spare(choices.len()) * desktop.scale();
     let dialog = Dialog::OpenWith(dialog::OpenWith {
         path: String::from(path),
         ext,
@@ -4717,7 +4718,11 @@ fn choose_program(desktop: &mut Compositor, path: &str) {
         selected: 0,
         always: true,
     });
-    let rect = layout(desktop, App::OpenWith);
+    // Высота по числу программ (27.11), по центру той же рабочей области.
+    let mut rect = layout(desktop, App::OpenWith);
+    let spare = spare.min(rect.h / 2);
+    rect.h -= spare;
+    rect.y += (spare / 2) as i32;
     if let Some(window) = Window::dialog(App::OpenWith, rect, desktop.scale(), dialog) {
         desktop.push(window);
         kprintln!("  desktop     : opened '{}' for '{path}'", App::OpenWith.title());
