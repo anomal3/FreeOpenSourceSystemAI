@@ -1309,6 +1309,19 @@ pub fn seek(fd: i64, offset: i64, whence: usize) -> i64 {
     unsafe { syscall(SYS_SEEK, fd as usize, offset as usize, whence) }
 }
 
+/// Bring everything written to the disks (27.11, `FDCTL_SYNC` 1): call it
+/// after writing a record that must survive a pulled plug (`pkg`'s registry).
+pub fn sync() -> bool {
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(user_abi::SYS_FDCTL, 0, user_abi::FDCTL_SYNC, 1) == 0 }
+}
+
+/// `fsync` of an open file (27.11, `FDCTL_SYNC` 0).
+pub fn fsync(fd: usize) -> bool {
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(user_abi::SYS_FDCTL, fd, user_abi::FDCTL_SYNC, 0) == 0 }
+}
+
 /// Размер открытого файла в байтах.
 ///
 /// Написано через `seek`, а не через `stat`: `stat` спрашивает про имя, а имя

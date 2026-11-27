@@ -87,6 +87,18 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         _ => usage(),
     };
 
+    // Install and remove change /opt and the registry: bring them to the
+    // disk before saying we are done (27.11, ROADMAP: a plug pulled right
+    // after `pkg remove`/`install` left the registry out of step with /opt -
+    // native programs had no `sync`).
+    if matches!(args.get(1), Some("install" | "remove")) {
+        if user_progs::sync() {
+            println("  pkg: synced to disk");
+        } else {
+            println("  pkg: sync to disk failed");
+        }
+    }
+
     exit(code)
 }
 

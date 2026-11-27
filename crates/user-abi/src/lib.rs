@@ -1531,6 +1531,13 @@ pub const FD_NONBLOCK: i64 = 1;
 /// argument (`ftruncate`; SQLite's journal in OBSOS). Not a file open for
 /// writing — [`ERR_BAD_FD`]; a file system without it — its error.
 pub const FDCTL_TRUNCATE: usize = 3;
+/// [`SYS_FDCTL`] (27.11): bring what was written to the disks - `fsync` of
+/// native programs. The argument: 0 - the volumes of this open file
+/// (`fsync`), 1 - every volume (`sync`; the descriptor is not looked at). An
+/// answer of zero means the data is on the media (as far as the volume
+/// knows); a write lost to a pulled plug after it is not the program's.
+/// `pkg` calls it after its registry (ROADMAP 27.11).
+pub const FDCTL_SYNC: usize = 4;
 
 /// Звук: `(действие, адрес, длина) -> ответ` (фаза 67f).
 ///

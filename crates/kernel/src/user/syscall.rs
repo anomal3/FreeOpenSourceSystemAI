@@ -3348,6 +3348,22 @@ fn fdctl(fd: usize, op: usize, arg: usize) -> i64 {
     if op == user_abi::FDCTL_TRUNCATE {
         return fd_truncate(fd, arg as u64);
     }
+    // 27.11: `sync`/`fsync` of native programs. Every volume either way,
+    // outside the program lock (disk I/O): the volumes keep no per-file
+    // dirty list, the same as `sync`/`fsync` in the Linux layer.
+    if op == user_abi::FDCTL_SYNC {
+        if arg == 0 {
+            match super::with_current(|program| program.files.node(fd).map(|_| ())) {
+                Some(Ok(())) => {}
+                Some(Err(err)) => return errno(err),
+                None => return ERR_NO_PROGRAM,
+            }
+        } else if arg != 1 {
+            return ERR_UNSUPPORTED;
+        }
+        crate::fs::fsync_all();
+        return 0;
+    }
     let result = super::with_current(|program| match op {
         user_abi::FDCTL_NONBLOCK => program.files.set_nonblock(fd, arg != 0).map(|()| 0),
         user_abi::FDCTL_FLAGS => program

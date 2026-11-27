@@ -16723,6 +16723,8 @@ pub const ALL: &[Scenario] = &[
             // тянет его зависимости (24.10).
             Step::Await("settings    : started '/bin/pkg install hello'", 15_000),
             Step::Await("pkg: installed hello 1.0, 2 file(s)", 60_000),
+            // The registry and /opt reach the disk before pkg exits (27.11).
+            Step::Await("pkg: synced to disk", 30_000),
             // Перечитать список: окно рисует то, что видит, а увидеть новое
             // оно может только заново пройдясь по реестру.
             Step::Key("left"),
@@ -16737,6 +16739,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("settings    : started '/bin/pkg remove hello'", 15_000),
             Step::Await("pkg: removed hello, 2 file(s)", 60_000),
+            Step::Await("pkg: synced to disk", 30_000),
 
             // Окно закрывается **до** команды оболочке, и это не уборка: ввод
             // достаётся активному окну, а активно сейчас окно «Параметры».
