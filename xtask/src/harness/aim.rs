@@ -113,6 +113,10 @@ pub enum Aim {
     /// сообщения (фаза N7c): размер окна зависит от ширины текста, а место
     /// кнопок от угла — нет.
     ProgramCorner(&'static str, i32, i32),
+    /// Point of a program window counted from its top right corner (27.11):
+    /// `dx` left of the right edge, `y` below the top of the logged window -
+    /// Chromium's "Restore pages?" bubble hangs under the app menu.
+    ProgramTopRight(&'static str, i32, i32),
     /// Пустое место правее любого окна из раскладки по умолчанию.
     ///
     /// Нужно там, где окна открыты: [`Aim::Empty`] стоит в середине экрана, а
@@ -488,6 +492,10 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         Aim::ProgramCorner(title, dx, dy) => {
             let rect = window(log, title)?;
             (rect.x + rect.w - dx, rect.y + rect.h - dy)
+        }
+        Aim::ProgramTopRight(title, dx, y) => {
+            let rect = window(log, title)?;
+            (rect.x + rect.w - dx, rect.y + y)
         }
         Aim::Empty => (width / 2, height / 3),
         Aim::EmptyBelow => (width / 2, height * 3 / 4),

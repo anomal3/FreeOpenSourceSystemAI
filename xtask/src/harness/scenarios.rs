@@ -12679,6 +12679,121 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("KERNEL PANIC"),
         ],
     },
+    // Chromium media and crashes (27.11, Roman on 0.9.1121: "Chromium falls
+    // all the time - restore tabs and it falls, tooltips and it falls; icons
+    // black; no microphone"). The host page `media.html` has emoji buttons
+    // with tooltips, plays a 440 Hz tone and asks for the microphone; the
+    // console lines `fossai-media: …` say what the page got. Then a real
+    // browser crash (`chrome://inducebrowsercrashforrealz`) must end as a
+    // signal with the kernel's crash line (crashpad re-raises through
+    // `rt_tgsigqueueinfo`, which was missing), and the next start's
+    // "Restore pages?" bubble is clicked.
+    Scenario {
+        name: "chromium-media",
+        about: "Chromium: эмодзи и подсказки, звук страницы через ALSA ядра, getUserMedia, падение браузера и «Restore pages?».",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: true,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "2G",
+        extra: &[
+            "-cpu", "max", "-smp", "2",
+            "-audiodev", "wav,id=snd0,path={wav}", "-device", "intel-hda", "-device", "hda-output,audiodev=snd0",
+        ],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::Line("run /bin/pkg remove chromium"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
+            Step::Line("run /bin/pkg remove debian"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
+            Step::Line("pkg install chromium"),
+            Step::Await("pkg: installed debian 12, ", 300_000),
+            Step::Await("pkg: installed chromium 150, ", 1_800_000),
+            // No icon count: the shared disk may carry another package.
+            Step::Await("desktop     : packages changed, ", 30_000),
+            // The shell line holds 256 characters: no `--log-level` (INFO is
+            // the default) and no autoplay flag - the page plays on a click.
+            Step::Line("run -b /opt/debian/bin/bash /opt/chromium/bin/chromium --enable-logging=stderr --use-fake-ui-for-media-stream --unsafely-treat-insecure-origin-as-secure=http://10.0.2.2:{site} http://10.0.2.2:{site}/media.html"),
+            Step::Capture("started as #", 15_000),
+            Step::Await("'FossAi media - Chromium'", 300_000),
+            Step::Await("fossai-media: devices", 240_000),
+            Step::Wait(10_000),
+            Step::Aim(Aim::Program("FossAi media - Chromium", 600, 450)),
+            Step::Click,
+            Step::Await("fossai-media: play ok", 120_000),
+            Step::Wait(20_000),
+            Step::Heard(500),
+            Step::Move(1, 0),
+            Step::Wait(2_000),
+            Step::Painted("chromium-media"),
+            // Tooltip of the first button (a `title`): Chromium shows it as
+            // its own surface after a second of hovering.
+            Step::Aim(Aim::Program("FossAi media - Chromium", 160, 150)),
+            Step::Wait(1_000),
+            Step::Move(2, 0),
+            Step::Wait(15_000),
+            Step::Shot("chromium-tooltip"),
+            Step::Move(0, 3),
+            Step::Wait(10_000),
+            // Context menu (xdg_popup) and closing it by a click beside.
+            Step::Aim(Aim::Program("FossAi media - Chromium", 500, 420)),
+            Step::RightClick,
+            Step::Await("popup ", 120_000),
+            Step::Wait(15_000),
+            Step::Shot("chromium-media-menu"),
+            Step::Aim(Aim::Program("FossAi media - Chromium", 200, 520)),
+            Step::Click,
+            Step::Await("popup closed", 60_000),
+            Step::Wait(5_000),
+            // An unclean end of the browser (the next start offers "Restore
+            // pages?"): killed by the shell. (`chrome://inducebrowsercrashforrealz`
+            // typed into the omnibox crashed it once - "crashed: its handler
+            // re-raises signal 11" - but typing reaches the omnibox unreliably
+            // under TCG.)
+            Step::Line("kill {}"),
+            Step::Await(" gone", 120_000),
+            Step::Wait(20_000),
+            // Next start: "Restore pages?" under the app menu; Restore.
+            Step::Line("run -b /opt/debian/bin/bash /opt/chromium/bin/chromium --enable-logging=stderr --use-fake-ui-for-media-stream --unsafely-treat-insecure-origin-as-secure=http://10.0.2.2:{site} http://10.0.2.2:{site}/media.html"),
+            Step::Await("'FossAi media - Chromium'", 300_000),
+            Step::Wait(60_000),
+            Step::Move(1, 0),
+            Step::Shot("chromium-restore-bubble"),
+            Step::Aim(Aim::ProgramTopRight("FossAi media - Chromium", 51, 185)),
+            Step::Click,
+            Step::Wait(60_000),
+            Step::Move(1, 0),
+            Step::Shot("chromium-restored"),
+            // Quit (restored pages may be a second window): Ctrl+Shift+Q.
+            Step::Key("ctrl-shift-q"),
+            Step::Await("/opt/debian/bin/bash: exited with code 0", 120_000),
+            // The crash after "Restore" (hw-log20): `wl_pointer.leave` with
+            // the destroyed bubble surface - a protocol error for libwayland.
+            Step::Absent("libwayland: unknown object"),
+            Step::Line("run /bin/pkg remove chromium"),
+            Step::Await("pkg: removed chromium", 300_000),
+            Step::Line("run /bin/pkg remove debian"),
+            Step::Await("pkg: removed debian", 120_000),
+            Step::Absent("protocol error on object"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
     Scenario {
         name: "doom",
         about: "Первая игра на SDL2 (фазы 68d, 68e): пакет freedoom с носителя, doomgeneric с данными Freedoom — заставка, меню, новая игра, выстрелы со звуком, крестик.",

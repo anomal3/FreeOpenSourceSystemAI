@@ -2845,6 +2845,65 @@ fn start_host_site() -> Result<(HostServer, u16)> {
                 )
                 .into_bytes()
             }
+            // Chromium media page (27.11, `chromium-media`): emoji buttons with
+            // tooltips (`title`), a looping 440 Hz tone (autoplay, else on the
+            // first click - the autoplay flag did not fit the 256-character
+            // shell line), getUserMedia and the
+            // device list. Results go to console.log - with
+            // `--enable-logging=stderr` Chromium prints them into the log as
+            // `CONSOLE` lines; the title stays fixed for the harness aim.
+            "/media.html" => {
+                let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>FossAi media</title>\
+                    <style>body{margin:0;padding:24px;background:#20262e;color:#fff;font-family:sans-serif}\
+                    button{font-size:36px;width:300px;height:140px;margin:0 16px 16px 0;background:#3a4452;color:#fff;border:0;border-radius:12px}</style></head>\
+                    <body><button id=\"mic\" title=\"Микрофон: подсказка\">🎤 Mic</button><button title=\"Экран\">🖥 Screen</button>\
+                    <button title=\"Рука\">✋ Hand</button><p style=\"font-size:28px\">👂 📷 😀 ❤ ⭐ 🔊</p><p id=\"out\"></p><script>\
+                    function t(s){console.log('fossai-media: '+s);document.getElementById('out').textContent+=s+' | ';}\
+                    var a=new Audio('/tone.wav');a.loop=true;function p(){a.play().then(function(){t('play ok')},function(e){t('play '+e.name)});}\
+                    p();document.addEventListener('pointerdown',function(){if(a.paused)p();});\
+                    if(!navigator.mediaDevices){t('mic no mediaDevices');}else{\
+                    navigator.mediaDevices.getUserMedia({audio:true}).then(function(s){var k=s.getAudioTracks()[0];t('mic ok '+(k?k.label:'?'));},\
+                    function(e){t('mic '+e.name+' '+e.message);}).then(function(){return navigator.mediaDevices.enumerateDevices();})\
+                    .then(function(d){t('devices '+d.map(function(x){return x.kind+':'+(x.label||'-');}).join(','));});}\
+                    </script></body></html>\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
+            // Three seconds of 440 Hz, 48 kHz 16-bit stereo, for `media.html`.
+            "/tone.wav" => {
+                let rate = 48_000u32;
+                let frames = rate * 3;
+                let mut pcm = Vec::with_capacity(frames as usize * 4);
+                for i in 0..frames {
+                    let v = ((i as f64 * 440.0 * std::f64::consts::TAU / f64::from(rate)).sin() * 12_000.0) as i16;
+                    pcm.extend_from_slice(&v.to_le_bytes());
+                    pcm.extend_from_slice(&v.to_le_bytes());
+                }
+                let mut wav = Vec::with_capacity(44 + pcm.len());
+                wav.extend_from_slice(b"RIFF");
+                wav.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
+                wav.extend_from_slice(b"WAVEfmt ");
+                wav.extend_from_slice(&16u32.to_le_bytes());
+                wav.extend_from_slice(&1u16.to_le_bytes());
+                wav.extend_from_slice(&2u16.to_le_bytes());
+                wav.extend_from_slice(&rate.to_le_bytes());
+                wav.extend_from_slice(&(rate * 4).to_le_bytes());
+                wav.extend_from_slice(&4u16.to_le_bytes());
+                wav.extend_from_slice(&16u16.to_le_bytes());
+                wav.extend_from_slice(b"data");
+                wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+                wav.extend_from_slice(&pcm);
+                let mut answer = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n",
+                    wav.len()
+                )
+                .into_bytes();
+                answer.extend_from_slice(&wav);
+                answer
+            }
             // Страница для NetSurf (начато 03.11): без скриптов, зато со
             // стилями, которые видно на снимке, — цветной заголовок, рамка,
             // таблица и ссылка. Не тот же `page.html`: тот проверяет

@@ -1621,6 +1621,19 @@ impl Client {
     /// Убрать объект, который клиент уничтожил, и вернуть ему номер.
     fn delete(&mut self, id: u32) {
         self.objects.remove(&id);
+        // A destroyed surface loses the pointer and keyboard focus without
+        // `leave` (27.11.2026): after `delete_id` the client has forgotten the
+        // id, and a later `wl_pointer.leave(serial, id)` is "unknown object
+        // (28), message leave(uo)" - libwayland calls it a protocol error and
+        // Chromium CHECKs (WaylandEventWatcher::WlDisplayCheckForErrors).
+        // That was the crash after "Restore pages?" and on tooltips: the
+        // bubble or tooltip under the pointer is a surface Chromium destroys.
+        if self.pointer_on == Some(id) {
+            self.pointer_on = None;
+        }
+        if self.keyboard_on == Some(id) {
+            self.keyboard_on = None;
+        }
         self.send(Msg::new(1, 1).u32(id));
     }
 

@@ -80,10 +80,24 @@ const FONTS_CONF: &str = "<?xml version=\"1.0\"?>\n\
     \t<alias><family>sans-serif</family><prefer><family>DejaVu Sans</family></prefer></alias>\n\
     \t<alias><family>serif</family><prefer><family>DejaVu Sans</family></prefer></alias>\n\
     \t<alias><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>\n\
+    \t<alias><family>emoji</family><prefer><family>Noto Color Emoji</family></prefer></alias>\n\
     </fontconfig>\n";
 
+/// Color emoji font (`fonts-noto-color-emoji`).
+const EMOJI_FONT: &str = "usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+
+/// ALSA `default` for Chromium: playback to the kernel device, no capture
+/// (see the sound note in [`build`]). Chromium writes S16_LE stereo 48 kHz
+/// itself - the kernel device's own format - so `plug` passes `writei`
+/// straight through. Not over `mmap_emul` as VLC: there Chromium's writes
+/// never reached the device and `snd_pcm_avail_update` grew past the buffer
+/// ("ALSA returned 98437 of 4096 frames available", QEMU 27.11).
+const ALSA_CONF: &str = "pcm.fossai_out { type plug slave.pcm \"hw:0,0\" }\n\
+    pcm.!default { type asym playback.pcm \"fossai_out\" capture.pcm \"fossai_no_microphone\" }\n\
+    ctl.!default { type hw card 0 }\n";
+
 /// Пакеты: путь в архиве и SHA-256 из `Packages` bookworm (снимок 20261020).
-const PACKAGES: [(&str, &str); 103] = [
+const PACKAGES: [(&str, &str); 104] = [
     ("pool/main/a/at-spi2-core/at-spi2-common_2.46.0-5_all.deb", "441bc1c6cefdc01f519310abf55823deb868898480dee09a05aa44e8c83cabc2"),
     ("pool/main/c/chromium/chromium_150.0.7871.100-1~deb12u1_amd64.deb", "9eb054fb52bbcd7a8c6407484be2337298ff8b1e19af14af2e7b497fa190ce4f"),
     // Данные ICU, снимки V8, ресурсы и en-US (см. [`COMMON_FILES`]).
@@ -91,6 +105,9 @@ const PACKAGES: [(&str, &str); 103] = [
     ("pool/main/f/fontconfig/fontconfig_2.14.1-4_amd64.deb", "010e57c24a983eecc39aab8a84219a716c10901e03bacd1927331388656f890f"),
     ("pool/main/f/fontconfig/fontconfig-config_2.14.1-4_amd64.deb", "281c66e46b95f045a0282a6c7a03b33de0e9a08d016897a759aaf4a04adfddbe"),
     ("pool/main/f/fonts-dejavu/fonts-dejavu-core_2.37-6_all.deb", "8892669e51aab4dc56682c8e39d8ddb7d70fad83c369344e1e240bf3ca22bb76"),
+    // Color emoji (27.11): web apps draw their icons with emoji (Rupor's
+    // meeting buttons); with DejaVu only they were boxes or black outlines.
+    ("pool/main/f/fonts-noto-color-emoji/fonts-noto-color-emoji_2.042-0+deb12u1_all.deb", "a5ab0f69c7938423862320d9aca5dd187b3fd879d6a9a57dd52e17c3fa8d2751"),
     ("pool/main/g/gcc-12/gcc-12-base_12.2.0-14+deb12u1_amd64.deb", "1896a2aacf4ad681ff5eacc24a5b0ca4d5d9c9b9c9e4b6de5197bc1e116ea619"),
     ("pool/main/a/alsa-lib/libasound2_1.2.8-1+b1_amd64.deb", "44c77b076a7b11ae99712439022d822245b1994c435da564ebd320bb676faf4c"),
     ("pool/main/a/alsa-lib/libasound2-data_1.2.8-1_all.deb", "fe0780d2d3674b2977e0acb0d48b448ad72ba1642564b7dc537f55e839984c2d"),
@@ -258,7 +275,31 @@ pub fn build(arch: Arch) -> Result<()> {
             }
         }
     }
+    if let Some((data, mode)) = follow(&extra, EMOJI_FONT, 0) {
+        files.push((String::from("fonts/NotoColorEmoji.ttf"), data.clone(), mode));
+    } else {
+        bail!("в пакетах нет {EMOJI_FONT}");
+    }
     files.push((String::from("fonts/fonts.conf"), FONTS_CONF.as_bytes().to_vec(), 0o644));
+    // Sound (27.11): ALSA settings of libasound2-data and our own - as for
+    // VLC, OBS and Proton. Without them Chromium's audio service had no
+    // `alsa.conf` (the Debian root has none), never opened /dev/snd and on
+    // hw-log20 spun on `openat` - a page played nothing. Playback: `plug`
+    // over `mmap_emul` over the kernel device. Capture: the kernel's only
+    // capture device is the desktop loopback (Stereo mix) - handed to a web
+    // call as a "microphone" it would send the call's own sound back, so
+    // `default` has no capture until the kernel has a real microphone input
+    // (getUserMedia then fails honestly and Rupor says "listen only").
+    for (path, node) in &extra {
+        if let Some(rest) = path.strip_prefix("usr/share/alsa/") {
+            if matches!(node, Node::File { .. }) {
+                if let Some((data, mode)) = follow(&extra, path, 0) {
+                    files.push((format!("share/alsa/{rest}"), data.clone(), mode));
+                }
+            }
+        }
+    }
+    files.push((String::from("share/alsa/fossai.conf"), ALSA_CONF.as_bytes().to_vec(), 0o644));
     // Значок программы — её собственный, из `hicolor` пакета (ярлык на столе
     // и кнопка панели задач рисуют его, как в Windows).
     let icon = ["128x128", "256x256", "64x64", "48x48"].iter().find_map(|size| {
@@ -309,6 +350,14 @@ pub fn build(arch: Arch) -> Result<()> {
         # в / легло бы в корень Debian и пережило бы удаление пакета.\n\
         export HOME=${HOME:-/root}\n\
         export TMPDIR=${TMPDIR:-$HOME}\n\
+        # Звук — ALSA ядра (27.11): настройки libasound и своё `default`.\n\
+        export ALSA_CONFIG_DIR=/opt/chromium/share/alsa\n\
+        export ALSA_CONFIG_PATH=/opt/chromium/share/alsa/alsa.conf:/opt/chromium/share/alsa/fossai.conf\n\
+        # Строки падения Chromium (FATAL, Check failed) — ещё и в журнал ядра:\n\
+        # со стола stderr никуда не идёт, и на железе падение было немым.\n\
+        if [ -w /dev/kmsg ]; then\n\
+          exec 2> >(while IFS= read -r l; do printf '%s\\n' \"$l\" >&2; case $l in *:FATAL:*|*'Check failed'*) printf 'chromium: %.400s\\n' \"$l\" > /dev/kmsg ;; esac; done)\n\
+        fi\n\
         platform=--ozone-platform=wayland\n\
         case \" $* \" in *\" --headless\"*) platform= ;; esac\n\
         exec /opt/chromium/chrome/chromium --no-sandbox --disable-gpu $platform \\\n\

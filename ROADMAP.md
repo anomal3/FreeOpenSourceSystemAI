@@ -19466,6 +19466,93 @@ pointer on surface 3 (persistent)`, `pointer locked`, нажатия идут в
 короткий захват с подсказкой); `wp_cursor_shape_v1` (формы курсора по имени);
 масштаб поверхности курсора (`set_buffer_scale`) не учитывается (у нас 1).
 
+## Chromium: немые падения, эмодзи, звук (27.11, hw-log20 на 0.9.1121) — **сделано в коде, проверить на железе**
+
+Роман: «Chromium падает часто: восстановить вкладки — падает, подсказки —
+падает; значки чёрные; микрофона нет; демонстрация экрана пустая».
+
+**Падения.** Все 6 сессий Chromium в hw-log20 кончились одинаково:
+`system call 297 is not implemented`, затем «main thread exited». crashpad
+ставит свой обработчик сигналов даже без `chrome_crashpad_handler` (его нет в
+пакете — это и есть `#GP` дочернего процесса при каждом запуске, безвредно),
+ловит сбой главного потока и перевыбрасывает сигнал через
+`rt_tgsigqueueinfo`; на `ENOSYS` он делает `_exit` — браузер исчезал без
+следа. Сделано: `rt_tgsigqueueinfo`/`rt_sigqueueinfo` (`linux/signal.rs`;
+положительный `si_code` — только себе, как в Linux) и строка журнала
+`#N crashed: its handler re-raises signal S (si_code, si_addr); last fault of
+the thread: vector V as signal S at rip X (файл+смещение)` — последний
+доставленный обработчику отказ запоминается по потоку. Обёртка
+`/opt/chromium/bin/chromium` пересылает строки `:FATAL:` и `Check failed` из
+stderr в `/dev/kmsg` (`kmsg: chromium: …`) — со стола stderr никуда не шёл.
+
+**Первопричина — наш сервер Wayland** (поймана в QEMU сценарием
+`chromium-media`, имя функции — по `chromium-dbgsym` 150.0.7871.100 из
+snapshot debian-debug): щелчок «Restore» → `libwayland: unknown object (28),
+message leave(uo)` → CHECK в `ui::WaylandEventWatcher::WlDisplayCheckForErrors`
+(chromium+0x324dd45). Пузырь «Restore pages?» (и подсказка) — поверхность
+под указателем, которую Chromium уничтожает; ядро отвечало `delete_id`, но
+`pointer_on` оставалось на ней, и следующий `wl_pointer.leave` нёс уже
+забытый клиентом id — для libwayland это ошибка протокола. Исправлено в
+`Client::delete` (`linux/wayland.rs`): уничтоженная поверхность теряет фокус
+указателя и клавиатуры без `leave`.
+
+**`int3` → SIGTRAP.** Ворота IDT вектора 3 были с DPL 0: `int3` программы
+процессор превращал в #GP (код 0x1a = «IDT, вектор 3») → SIGSEGV. Любой CHECK
+Chromium (`int3; ud2`) выглядел как обращение по плохому адресу, Wine видел
+точки останова как нарушения доступа. Теперь DPL 3, как в Linux: #BP →
+SIGTRAP с `si_code` SI_KERNEL (`arch/x86_64/interrupts.rs`).
+
+**Значки.** «Значки» Rupor — эмодзи (👂🎤📷🖥✋😀); в пакете был только
+DejaVu. Добавлен `fonts-noto-color-emoji` 2.042 (`fonts/NotoColorEmoji.ttf`,
+алиас `emoji` в `fonts.conf`).
+
+**Звук.** У Chromium не было настроек ALSA (корень Debian без
+`alsa.conf`): аудиослужба на железе крутила `openat` (1,25 млн за 30 с) и
+не открывала `/dev/snd`. Теперь `share/alsa` из libasound2-data и своё
+`fossai.conf`: `default` = asym, вывод — `plug` прямо на `hw:0,0` (Chromium
+пишет S16_LE 2 ch 48 кГц сам; через `mmap_emul`, как у VLC, его записи не
+доходили до устройства). Ядро (`linux/snd.rs`): ioctl `XRUN` — libasound
+`hw` сам зовёт его, когда avail дошёл до stop_threshold, и ждёт `-EPIPE`;
+`ENOSYS` Chromium получал как ответ avail («Failed querying available frames:
+Function not implemented»), и звук не шёл.
+
+**Микрофон — нет, честно.** Входа HDA в ядре нет; единственный захват —
+отвод «Стерео микшер». Отдать его звонку как микрофон нельзя (собеседники
+слышали бы себя), поэтому захват `default` для Chromium не определён:
+getUserMedia → NotReadableError, Rupor показывает «Только прослушивание».
+Явно выбранный в списке устройств «Стерео микшер» работает. TODO: вход HDA
+(АЦП → пин микрофона, входной поток DMA) — на железе Романа AMD 1022:15e3,
+кодек 0 (сейчас только DAC 2 → пины 20, 27); 1–2 дня, проверка на железе.
+В OBSOS (BETA) микрофона нет по другой причине: WebRTC там выключен (нет
+GStreamer) — ожидаемо.
+
+**Демонстрация экрана — план.** Chromium на Wayland берёт экран только через
+xdg-desktop-portal (D-Bus) + PipeWire; в системе нет ни D-Bus, ни PipeWire, ни
+V4L2. Окно «Choose what to share» поэтому только с вкладками. Порядок:
+(1) вкладка Chromium — уже внутри браузера, без портала (проверить на железе
+пустой список вкладок); (2) «экран как камера»: V4L2-устройство
+`/dev/video0` в слое Linux поверх захвата мониторов ядра (5b0221c) —
+QUERYCAP/ENUM_FMT/S_FMT/REQBUFS/mmap/QBUF/DQBUF/STREAMON, около дня; Rupor
+покажет экран кнопкой «Камера»; (3) настоящий getDisplayMedia: шина D-Bus
+(один процесс-брокер), портал ScreenCast (CreateSession/SelectSources/Start/
+OpenPipeWireRemote) и минимальный сервер протокола PipeWire (core, registry,
+узел-поток, SPA POD формат, буферы memfd) — несколько дней.
+
+**Проверка.** Сценарий `chromium-media` (страница хоста `/media.html` +
+`/tone.wav`; `install` перед ним): эмодзи и подсказка (снимки
+`chromium-media`, `chromium-tooltip`), звук 440 Гц в WAV QEMU (intel-hda),
+getUserMedia/enumerateDevices в строках `fossai-media:`, контекстное меню,
+`kill` браузера, перезапуск, пузырь «Restore pages?» и щелчок «Restore» —
+без `libwayland: unknown object`. Путь crashpad проверен прогоном с
+`chrome://inducebrowsercrashforrealz` (QEMU 27.11: «#24 crashed: its handler
+re-raises signal 11 … chromium+0x5e156e8» = `CrashBrowserProcessIntentionally`,
+затем «killed by signal 11»); набор в омнибокс под TCG ненадёжен, в сценарии
+вместо него `kill`. Строка оболочки — не длиннее 256 символов (флаги урезаны).
+
+**Не сделано / заметки.** Запасные процессы страниц Chromium выходят сразу
+после старта (было и 23.11) — не разбиралось. `chrome_crashpad_handler` в
+пакет не кладётся (дочерний `#GP`/`#BP` при каждом запуске — его FATAL).
+
 ## Регрессия 26.11: smp, chromium, рост кучи — **сделано**
 
 - **smp** падал не на старте процессоров (все 4 онлайн), а на снимке `tasks`:

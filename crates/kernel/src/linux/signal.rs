@@ -283,6 +283,91 @@ pub fn tgkill(tgid: usize, tid: usize, sig: usize) -> i64 {
     result
 }
 
+/// The last processor fault each thread got as a signal (27.11.2026): rip and
+/// `tid << 16 | sig << 8 | vector`. A crash handler that re-raises its signal
+/// ([`tgsigqueueinfo`]) is logged with it - hw-log20: Chromium's crashpad
+/// caught a fault in the browser's main thread and the log only said
+/// "system call 297 is not implemented".
+static LAST_FAULT_RIP: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::new(0) }; sched::MAX_TASKS];
+static LAST_FAULT_WHAT: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::new(0) }; sched::MAX_TASKS];
+
+/// Signals a crash handler re-raises: ILL, TRAP, ABRT, BUS, FPE, SEGV, SYS.
+fn is_crash_signal(sig: usize) -> bool {
+    matches!(sig, 4 | 5 | 6 | 7 | 8 | 11 | 31)
+}
+
+/// `rt_tgsigqueueinfo(tgid, tid, sig, info)` (27.11.2026). Crash handlers
+/// (crashpad in Chromium, Breakpad, .NET) restore the default action and
+/// re-raise the caught signal with its original `siginfo`; crashpad treats
+/// any failure but `EPERM` as "cannot re-raise" and calls `_exit` - the
+/// browser vanished without a word on every crash. The signal is queued
+/// like `tgkill` (the default action then kills the process with it, as in
+/// Linux); `siginfo` beyond the signal number is not kept.
+pub fn tgsigqueueinfo(tgid: usize, tid: usize, sig: usize, info: usize) -> i64 {
+    if sig == 0 || sig > 64 {
+        return -e::EINVAL;
+    }
+    let (code, addr) = if space::user_can(info, 24, PageFlags::READ) {
+        // SAFETY: checked for reading in the running program's space.
+        unsafe { (core::ptr::read_unaligned((info + 8) as *const i32), core::ptr::read_unaligned((info + 16) as *const u64)) }
+    } else {
+        return -e::EFAULT;
+    };
+    let own = crate::user::with_current(|program| program.linux_pid).unwrap_or(0) as usize;
+    // Linux: a positive si_code (a kernel-made siginfo) only to oneself.
+    if code >= 0 && tgid != own {
+        return -e::EPERM;
+    }
+    if is_crash_signal(sig) {
+        report_crash(sig, code, addr);
+    }
+    tgkill(tgid, tid, sig)
+}
+
+/// `rt_sigqueueinfo(pid, sig, info)`: as [`tgsigqueueinfo`] to the process.
+pub fn sigqueueinfo(pid: usize, sig: usize, info: usize) -> i64 {
+    if sig > 64 {
+        return -e::EINVAL;
+    }
+    let own = crate::user::with_current(|program| program.linux_pid).unwrap_or(0) as usize;
+    if sig != 0 && space::user_can(info, 24, PageFlags::READ) {
+        // SAFETY: checked for reading in the running program's space.
+        let (code, addr) =
+            unsafe { (core::ptr::read_unaligned((info + 8) as *const i32), core::ptr::read_unaligned((info + 16) as *const u64)) };
+        if code >= 0 && pid != own {
+            return -e::EPERM;
+        }
+        if pid == own && is_crash_signal(sig) {
+            report_crash(sig, code, addr);
+        }
+    }
+    kill(pid, sig)
+}
+
+/// A program's crash handler re-raises `sig`: what it caught, and the last
+/// fault this thread got as a signal (where in which file). Up to 32 a boot.
+fn report_crash(sig: usize, code: i32, addr: u64) {
+    static SHOWN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if SHOWN.fetch_add(1, Ordering::Relaxed) >= 32 {
+        return;
+    }
+    let slot = sched::current_slot();
+    let me = sched::current();
+    let what = LAST_FAULT_WHAT[slot].load(Ordering::Relaxed);
+    let rip = LAST_FAULT_RIP[slot].load(Ordering::Relaxed);
+    let fault = if what != 0 && (what >> 16) as u32 == me.as_u32() {
+        alloc::format!(
+            "last fault of the thread: vector {} as signal {} at rip {rip:#x} ({})",
+            what & 0xff,
+            (what >> 8) & 0xff,
+            place_of(rip)
+        )
+    } else {
+        alloc::string::String::from("no processor fault in this thread (abort, CHECK or a signal from elsewhere)")
+    };
+    crate::kprintln!("  linux       : {me} crashed: its handler re-raises signal {sig} (si_code {code:#x}, si_addr {addr:#x}); {fault}");
+}
+
 fn raise_on(slot: usize, sig: usize) -> i64 {
     if sig == 0 {
         return 0;
@@ -586,8 +671,8 @@ pub fn deliver_fault(frame: &mut crate::arch::TrapFrame, vector: u8, addr: usize
     let (sig, code, at) = match vector {
         // FPE_INTDIV.
         0 => (SIGFPE, 1, frame.rip),
-        // TRAP_BRKPT.
-        3 => (SIGTRAP, 1, 0),
+        // `int3`: Linux x86-64 gives SI_KERNEL (27.11.2026).
+        3 => (SIGTRAP, 0x80, 0),
         // ILL_ILLOPN.
         6 => (SIGILL, 2, frame.rip),
         // SI_KERNEL: у общей защиты адреса нет.
@@ -683,6 +768,11 @@ pub fn deliver_fault(frame: &mut crate::arch::TrapFrame, vector: u8, addr: usize
             }
         }
     }
+    LAST_FAULT_RIP[slot].store(frame.rip, Ordering::Relaxed);
+    LAST_FAULT_WHAT[slot].store(
+        u64::from(sched::current().as_u32()) << 16 | (sig as u64) << 8 | u64::from(vector),
+        Ordering::Relaxed,
+    );
     let fault = Fault { code, addr: at, trapno: u64::from(vector), err: frame.error };
     enter_handler(frame, slot, sig, action, action.handler, mask, mask, Some(fault));
     true

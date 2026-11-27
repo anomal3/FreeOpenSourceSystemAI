@@ -1077,6 +1077,15 @@ fn load_idt() {
         unsafe {
             (*idt).0[usize::from(vector)] = if vector == VECTOR_SYSCALL {
                 GateDescriptor::syscall(stub(vector))
+            } else if vector == VECTOR_BREAKPOINT {
+                // `int3` from a program (27.11.2026): DPL 3 as in Linux, so it
+                // is #BP → SIGTRAP. With DPL 0 the CPU turned it into #GP
+                // (error 0x1a = IDT vector 3) → SIGSEGV: every CHECK of
+                // Chromium (`int3; ud2`) looked like a wild memory access,
+                // and Wine saw breakpoints as access violations.
+                let mut gate = GateDescriptor::new(stub(vector), ist);
+                gate.flags = GATE_PRESENT | GATE_DPL3 | GATE_TYPE_INTERRUPT;
+                gate
             } else {
                 GateDescriptor::new(stub(vector), ist)
             };

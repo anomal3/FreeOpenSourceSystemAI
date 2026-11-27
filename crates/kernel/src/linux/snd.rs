@@ -56,6 +56,7 @@ const STATE_OPEN: i32 = 0;
 const STATE_SETUP: i32 = 1;
 const STATE_PREPARED: i32 = 2;
 const STATE_RUNNING: i32 = 3;
+const STATE_XRUN: i32 = 4;
 const STATE_DRAINING: i32 = 5;
 
 /// Версии протоколов: PCM 2.0.13 (до `USER_PVERSION`), управление 2.0.7.
@@ -656,8 +657,24 @@ impl Pcm {
             }
             // DRAIN: доиграть записанное.
             0x44 => self.drain(nonblock),
-            // PAUSE, RESUME, XRUN: не нужны libasound для воспроизведения Wine.
-            0x45 | 0x47 | 0x48 => -e::ENOSYS,
+            // XRUN (27.11): libasound's `hw` avail_update asks for it itself
+            // when avail reaches stop_threshold (the program fell behind) and
+            // then answers -EPIPE; the program recovers with PREPARE.
+            // ENOSYS here was handed to Chromium as the avail ("Failed
+            // querying available frames: Function not implemented") and its
+            // sound never played.
+            0x48 => {
+                let mut stream = self.state.lock();
+                match stream.state {
+                    STATE_RUNNING | STATE_PREPARED | STATE_DRAINING => {
+                        stream.state = STATE_XRUN;
+                        0
+                    }
+                    _ => -e::EBADFD,
+                }
+            }
+            // PAUSE, RESUME: не нужны libasound для воспроизведения Wine.
+            0x45 | 0x47 => -e::ENOSYS,
             // REWIND, FORWARD: назад/вперёд нельзя — 0 кадров.
             0x46 | 0x49 => 0,
             // WRITEI_FRAMES: struct snd_xferi { result, buf, frames }.

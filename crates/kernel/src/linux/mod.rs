@@ -139,6 +139,8 @@ mod nr {
     pub const GETDENTS64: usize = 217;
     pub const FADVISE64: usize = 221;
     pub const TGKILL: usize = 234;
+    pub const RT_SIGQUEUEINFO: usize = 129;
+    pub const RT_TGSIGQUEUEINFO: usize = 297;
     pub const READLINKAT: usize = 267;
     pub const FACCESSAT: usize = 269;
     pub const DUP3: usize = 292;
@@ -594,6 +596,8 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::KILL => signal::kill(a0, a1),
             nr::TKILL => signal::tgkill(0, a0, a1),
             nr::TGKILL => signal::tgkill(a0, a1, a2),
+            nr::RT_TGSIGQUEUEINFO => signal::tgsigqueueinfo(a0, a1, a2, a3),
+            nr::RT_SIGQUEUEINFO => signal::sigqueueinfo(a0, a1, a2),
             nr::CLONE => thread::clone(frame, a0, a1, a2, a3, a4),
             nr::CLONE3 => thread::clone3(frame, a0, a1),
             nr::POLL => poll::poll(a0, a1, a2 as i32 as i64),
