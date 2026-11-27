@@ -400,6 +400,17 @@ fn pin_key_of_group(group: &str) -> Option<String> {
     Some(alloc::format!("pkg:{name}"))
 }
 
+/// Ключ закрепления ярлыка программы на столе (27.11) по его команде:
+/// пакет с этой строкой запуска (`pkg:<имя>`), иначе программа манифеста
+/// «Пуска» или пакет из `/opt` по первому слову команды.
+fn pin_key_of_command(command: &str) -> Option<String> {
+    let command = command.trim();
+    if let Some(launcher) = panel::list_packages().into_iter().find(|launcher| launcher.start.trim() == command) {
+        return Some(alloc::format!("pkg:{}", launcher.name));
+    }
+    pin_key_of_group(command.split_whitespace().next()?)
+}
+
 /// Ключ программы, для которой открыто меню кнопки панели.
 static PIN_KEY: SpinLock<Option<String>> = SpinLock::new(None);
 
@@ -3590,6 +3601,17 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
             })
         };
         if let Some((items, what)) = target {
+            // «Закрепить/Открепить на панели задач» у ярлыка программы (27.11;
+            // до того серым): ключ — тот же, что у кнопки окна этой программы.
+            let shortcut_pin = if items.contains(&context::Action::PinTaskbar) {
+                let key = desktop.icon_selection().and_then(|index| desktop.icon_path(index)).and_then(|command| pin_key_of_command(&command));
+                context::UNPIN_TASKBAR.store(key.as_deref().is_some_and(deskcfg::task_pinned), Ordering::Relaxed);
+                let known = key.is_some();
+                *PIN_KEY.lock() = key;
+                known
+            } else {
+                true
+            };
             // Открытое меню запуска закрывается: два меню разом — это два
             // ответа на один щелчок.
             if desktop.menu_open() {
@@ -3615,9 +3637,8 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                     desktop.context_set_off(alloc::vec![context::Action::Submenu(context::Sub::SevenZip)]);
                 }
             }
-            // Ярлык программы на столе на панель пока не закрепляется — из
-            // «Пуска» (20.11).
-            if items.contains(&context::Action::PinTaskbar) {
+            // Ярлык программы, чей ключ закрепления неизвестен, — серым.
+            if !shortcut_pin {
                 desktop.context_set_off(alloc::vec![context::Action::PinTaskbar]);
             }
             // «Вставить» — серым, пока в буфере обмена нет файлов (24.11).

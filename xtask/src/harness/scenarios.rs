@@ -8984,8 +8984,22 @@ pub const ALL: &[Scenario] = &[
             Step::Await("for button", 15_000),
             Step::Wait(1_000),
             Step::Shot("06b-recent"),
-            Step::Key("esc"),
-            Step::Await("desktop     : context menu closed", 15_000),
+            // «Закрепить на панели задач» from the button menu (ROADMAP: the
+            // item was said to be grey) and back - the disk is shared, the
+            // next scenarios count buttons.
+            Step::Aim(Aim::ContextLabel("Закрепить на панели задач")),
+            Step::Click,
+            Step::Await("desktop     : taskbar pinned 'notepad'", 15_000),
+            // Pinned buttons stand first: Notepad moves to the first button.
+            Step::Wait(700),
+            Step::Shot("06c-pinned"),
+            Step::Aim(Aim::TaskButton(0)),
+            Step::RightClick,
+            Step::Await("for button", 15_000),
+            Step::Aim(Aim::ContextLabel("Открепить от панели задач")),
+            Step::Click,
+            Step::Await("desktop     : taskbar unpinned 'notepad'", 15_000),
+            Step::Wait(700),
             Step::Key("alt-f4"),
             Step::Await("notepad: closing on request", 15_000),
             Step::Await("desktop     : closed the window of ", 15_000),
