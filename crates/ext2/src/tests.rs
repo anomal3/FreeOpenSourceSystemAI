@@ -340,6 +340,38 @@ fn running_out_of_space_is_an_error() {
     );
 }
 
+/// Оценка места, по которой установщик отказывает до записи (27.11): свежий
+/// том отдаёт под данные почти всё `data_bytes`, а файл, которому по
+/// `file_bytes` хватает свободного, действительно помещается — и занимает
+/// ровно обещанное.
+#[test]
+fn planned_room_matches_what_the_writer_takes() {
+    for block_size in [BlockSize::B1024, BlockSize::B4096] {
+        let (mut dev, mut writer) = formatted(40 * 1024 * 1024 / 512, block_size);
+        let geometry = writer.geometry();
+        let block = u64::from(block_size.bytes());
+        let free = writer.free_bytes();
+        let room = geometry.data_bytes();
+        // Разница — корневой каталог и lost+found: несколько блоков.
+        assert!(free <= room && room - free <= 64 * block, "{block_size:?}: {free} of {room}");
+
+        assert_eq!(geometry.file_bytes(0), 0);
+        assert_eq!(geometry.file_bytes(1), block);
+        assert_eq!(geometry.file_bytes(12 * block), 12 * block);
+        assert_eq!(geometry.file_bytes(12 * block + 1), 14 * block);
+
+        let mut len = free;
+        while geometry.file_bytes(len) > free {
+            len -= block;
+        }
+        let payload = vec![0x5au8; len as usize];
+        writer
+            .write_file_path(&mut dev, "fits.bin", &payload, 0o644, 0, 0)
+            .expect("файл по оценке помещается");
+        assert_eq!(free - writer.free_bytes(), geometry.file_bytes(len), "{block_size:?}");
+    }
+}
+
 /// Разбор суперблока обязан возвращать ту же геометрию, что была при
 /// форматировании: это единственная связь между писателем и читателем.
 #[test]

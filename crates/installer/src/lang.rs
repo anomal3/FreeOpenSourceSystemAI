@@ -76,6 +76,9 @@ pub struct Strings {
     pub disk_install_media: &'static str,
     pub disk_read_only: &'static str,
     pub disk_too_small: &'static str,
+    pub disk_no_room: &'static str,
+    pub no_room_need: &'static str,
+    pub no_room_have: &'static str,
 
     pub confirm_heading: &'static str,
     pub confirm_warning: &'static str,
@@ -146,6 +149,9 @@ pub static ENGLISH: Strings = Strings {
     disk_install_media: "install media",
     disk_read_only: "read-only",
     disk_too_small: "too small",
+    disk_no_room: "not enough space",
+    no_room_need: "Not enough space for the system on this disk: needs",
+    no_room_have: "available",
 
     confirm_heading: "Confirm",
     confirm_warning: "The disk below will be erased completely. This cannot be undone.",
@@ -221,6 +227,9 @@ pub static RUSSIAN: Strings = Strings {
     disk_install_media: "носитель установки",
     disk_read_only: "только чтение",
     disk_too_small: "слишком мал",
+    disk_no_room: "мало места",
+    no_room_need: "Не хватает места для системы на этом диске: нужно",
+    no_room_have: "есть",
 
     confirm_heading: "Подтверждение",
     confirm_warning: "Диск ниже будет стерт полностью. Отменить это будет нельзя.",

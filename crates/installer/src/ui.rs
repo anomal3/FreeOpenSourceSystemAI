@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use mini_ui::widget::{self, Canvas, DARK};
 
-use crate::App;
+use crate::{App, Failure};
 use crate::Stage;
 use crate::install::{self, Step};
 use crate::lang::{Language, Strings};
@@ -164,6 +164,13 @@ fn disk_pick(canvas: &mut Canvas, app: &App, strings: &Strings) {
         return;
     }
 
+    // Чего не хватает выбранному диску — над списком, а не под ним: длинный
+    // список вытеснил бы строку за край экрана (27.11).
+    if let Some(Err(install::Error::NoRoom { need, have })) = app.plans.get(app.disk_index) {
+        canvas.paragraph(&no_room_text(strings, *need, *have), canvas.theme().warning);
+        canvas.gap(1);
+    }
+
     let labels: Vec<String> = app
         .disks
         .iter()
@@ -173,6 +180,8 @@ fn disk_pick(canvas: &mut Canvas, app: &App, strings: &Strings) {
                 strings.disk_install_media
             } else if disk.read_only {
                 strings.disk_read_only
+            } else if matches!(app.plans.get(index), Some(Err(install::Error::NoRoom { .. }))) {
+                strings.disk_no_room
             } else if !app.disk_ok(index) {
                 strings.disk_too_small
             } else {
@@ -277,7 +286,11 @@ fn done(canvas: &mut Canvas, strings: &Strings) {
 
 fn failed(canvas: &mut Canvas, app: &App, strings: &Strings) {
     if let Some(reason) = app.failure {
-        canvas.paragraph(reason.text(strings), canvas.theme().warning);
+        if let Failure::Install(install::Error::NoRoom { need, have }) = reason {
+            canvas.paragraph(&no_room_text(strings, need, have), canvas.theme().warning);
+        } else {
+            canvas.paragraph(reason.text(strings), canvas.theme().warning);
+        }
         canvas.gap(1);
     }
     canvas.paragraph(strings.failed_body, canvas.theme().dim);
@@ -321,6 +334,17 @@ fn scrolled_list(canvas: &mut Canvas, items: &[&str], selected: usize) {
     let end = start + capacity;
     canvas.list(&items[start..end], selected - start);
     canvas.hint(&format!("{} / {}", selected + 1, items.len()));
+}
+
+/// «Не хватает места: нужно X, есть Y.»
+fn no_room_text(strings: &Strings, need: u64, have: u64) -> String {
+    format!(
+        "{} {}, {} {}.",
+        strings.no_room_need,
+        size_text(need),
+        strings.no_room_have,
+        size_text(have)
+    )
 }
 
 /// Читаемый размер раздела.

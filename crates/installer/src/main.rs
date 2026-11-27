@@ -108,6 +108,7 @@ impl Failure {
             }
             Failure::Install(install::Error::Payload(_)) => strings.error_no_payload,
             Failure::Install(install::Error::TooSmall) => strings.disk_too_small,
+            Failure::Install(install::Error::NoRoom { .. }) => strings.disk_no_room,
             Failure::Install(install::Error::Disk) => strings.error_disk,
             Failure::Install(install::Error::RootFs) => strings.error_root_fs,
         }
@@ -125,7 +126,7 @@ pub struct App {
     /// Считается заранее, при перечислении: иначе «слишком мал» выяснялось бы
     /// уже после того, как человек выбрал диск и нажал Enter, — то есть в
     /// худший момент.
-    pub plans: Vec<Option<Plan>>,
+    pub plans: Vec<Result<Plan, install::Error>>,
     pub disk_index: usize,
     pub confirm_index: usize,
     pub account: Draft,
@@ -150,14 +151,14 @@ impl App {
     /// Разметка под выбранный диск.
     #[must_use]
     pub fn plan(&self) -> Option<&Plan> {
-        self.plans.get(self.disk_index)?.as_ref()
+        self.plans.get(self.disk_index)?.as_ref().ok()
     }
 
     /// Годится ли диск под установку.
     #[must_use]
     pub fn disk_ok(&self, index: usize) -> bool {
         self.disks.get(index).is_some_and(Disk::is_usable)
-            && self.plans.get(index).is_some_and(Option::is_some)
+            && self.plans.get(index).is_some_and(Result::is_ok)
     }
 }
 
@@ -204,14 +205,13 @@ fn main() -> Status {
     };
 
     let disks = disks::enumerate();
-    let total = payload.total_bytes();
-    let plans: Vec<Option<Plan>> = disks
+    let plans: Vec<Result<Plan, install::Error>> = disks
         .iter()
         .map(|disk| {
             if !disk.is_usable() {
-                return None;
+                return Err(install::Error::Disk);
             }
-            Plan::for_disk(disk, total).ok()
+            Plan::for_disk(disk, &payload)
         })
         .collect();
 
@@ -230,7 +230,7 @@ fn main() -> Status {
     run(&mut display, &mut app, &mut Some(payload))
 }
 
-fn fresh_app(disks: Vec<Disk>, plans: Vec<Option<Plan>>, payload_summary: Vec<String>) -> App {
+fn fresh_app(disks: Vec<Disk>, plans: Vec<Result<Plan, install::Error>>, payload_summary: Vec<String>) -> App {
     App {
         stage: Stage::Language,
         language: Language::English,
@@ -466,12 +466,19 @@ fn perform(display: &mut Display, app: &mut App, payload: &mut Payload) {
         app.failure = Some(Failure::Install(install::Error::Disk));
         return;
     };
-    let Some(plan) = app.plans.get(app.disk_index).and_then(Option::as_ref) else {
-        app.stage = Stage::Failed;
-        app.failure = Some(Failure::Install(install::Error::TooSmall));
-        return;
+    let plan = match app.plans.get(app.disk_index) {
+        Some(Ok(plan)) => *plan,
+        Some(Err(err)) => {
+            app.stage = Stage::Failed;
+            app.failure = Some(Failure::Install(*err));
+            return;
+        }
+        None => {
+            app.stage = Stage::Failed;
+            app.failure = Some(Failure::Install(install::Error::TooSmall));
+            return;
+        }
     };
-    let plan = *plan;
     let account = core::mem::take(&mut app.account);
     let language = app.language;
     let timezone = ui::timezone_text(ui::TIMEZONE_MIN + app.timezone as i32);

@@ -50,6 +50,10 @@ const WANTED_ESP: u64 = 512 * 1024 * 1024;
 /// ужать до размера полезной нагрузки.
 const ESP_SLACK: u64 = 32 * 1024 * 1024;
 
+/// Запас на корне сверх файлов комплекта: каталоги, `/os-release`, ветки
+/// состояния и то немногое, что система допишет туда сама.
+const ROOT_SLACK: u64 = 16 * 1024 * 1024;
+
 /// Метка корневого тома.
 const ROOT_LABEL: &str = "FreeOS";
 
@@ -69,6 +73,9 @@ pub struct Plan {
 pub enum Error {
     /// Диск слишком мал под задуманную разметку.
     TooSmall,
+    /// Комплект не помещается на корневой раздел этого диска (байты): отказ
+    /// при планировании, до того как диск стёрт и копирование началось.
+    NoRoom { need: u64, have: u64 },
     /// Носитель отказал.
     Disk,
     /// Не удалось создать корневую файловую систему.
@@ -111,7 +118,34 @@ impl Plan {
     /// работающими. Раздел, вмещающий ровно один комплект, сделал бы обновление
     /// невозможным, и выяснилось бы это в момент, когда обновляться уже
     /// понадобилось.
-    pub fn for_disk(disk: &Disk, payload: u64) -> Result<Self, Error> {
+    pub fn for_disk(disk: &Disk, payload: &Payload) -> Result<Self, Error> {
+        let plan = Self::layout_for(disk, payload.esp_bytes())?;
+        let Some(root) = plan.layout.root else { return Ok(plan) };
+        // Корень проверяется здесь, при перечислении дисков (27.11): раньше
+        // переполнение выяснялось посреди копирования пакетов, и установщик
+        // молча висел (Proton + TMNF + OBS на стенде). Оценка — та же
+        // геометрия ext2, что получит `ext2::format`, и те же блоки, что займёт
+        // каждый файл, плюс запас на каталоги и мелочь (`ROOT_SLACK`).
+        let sector = disk.block_size;
+        let geometry = ext2::Geometry::plan_on(root.first_lba, root.sectors(), sector)
+            .map_err(|_| Error::TooSmall)?;
+        let have = geometry.data_bytes();
+        let need = payload.root_sizes().map(|len| geometry.file_bytes(len)).sum::<u64>() + ROOT_SLACK;
+        logln!(
+            "[install] root room on {} {}: need {} MiB, have {} MiB",
+            disk.bus,
+            disk.size_text(),
+            need >> 20,
+            have >> 20
+        );
+        if need > have {
+            logln!("[install] not enough room on the root slot: need {need} bytes, have {have}");
+            return Err(Error::NoRoom { need, have });
+        }
+        Ok(plan)
+    }
+
+    fn layout_for(disk: &Disk, payload: u64) -> Result<Self, Error> {
         let sectors = disk.sectors;
         let sector = disk.block_size as usize;
         let usable = disk.bytes();
@@ -280,13 +314,7 @@ pub fn run(
         };
         // На ESP едет только то, что читает прошивка. Программы, пакеты и
         // ключи — ниже, на разделы, где есть права.
-        if matches!(
-            what,
-            payload::What::Program
-                | payload::What::Package
-                | payload::What::Keys
-                | payload::What::Defaults
-        ) {
+        if what.on_root() {
             continue;
         }
         // Ядро и образ RAM-диска ложатся под именем **слота A**, а не под

@@ -79,6 +79,14 @@ pub enum What {
     Package,
 }
 
+impl What {
+    /// Едет ли файл на корневой раздел (а не на ESP).
+    #[must_use]
+    pub const fn on_root(self) -> bool {
+        matches!(self, What::Program | What::Keys | What::Defaults | What::Package)
+    }
+}
+
 /// Открытый установочный носитель вместе с описью.
 pub struct Payload {
     root: Directory,
@@ -745,10 +753,19 @@ impl Payload {
         self.root.open(path, FileMode::Read, FileAttribute::empty()).is_ok()
     }
 
-    /// Суммарный объём переносимого.
+    /// Объём того, что ложится на ESP (загрузчик, ядро, образ RAM-диска).
+    ///
+    /// До 27.11 ESP размечался от всего комплекта, пакеты `.fpk` включая, —
+    /// хотя они едут на корень: с Proton, TMNF и OBS на носителе ESP съедал
+    /// гигабайты, а корень, которому они нужны, сжимался до переполнения.
     #[must_use]
-    pub fn total_bytes(&self) -> u64 {
-        self.items.iter().map(|item| item.size).sum()
+    pub fn esp_bytes(&self) -> u64 {
+        self.items.iter().filter(|item| !item.what.on_root()).map(|item| item.size).sum()
+    }
+
+    /// Длины файлов, которые ложатся на корневой раздел.
+    pub fn root_sizes(&self) -> impl Iterator<Item = u64> + '_ {
+        self.items.iter().filter(|item| item.what.on_root()).map(|item| item.size)
     }
 
     /// Прочитать файл целиком.

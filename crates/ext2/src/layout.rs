@@ -437,6 +437,49 @@ impl Geometry {
         backup + 2 + self.inode_table_blocks
     }
 
+    /// Сколько байт тома остаётся под файлы и каталоги: блоки всех групп без
+    /// служебных (копии суперблока, дескрипторы, битовые карты, таблица inode).
+    ///
+    /// Установщик сверяет с этим комплект **до** записи (27.11): переполненный
+    /// корень раньше выяснялся посреди копирования пакетов.
+    #[must_use]
+    pub fn data_bytes(&self) -> u64 {
+        let blocks: u64 = (0..self.groups)
+            .map(|group| {
+                u64::from(
+                    self.blocks_in_group(group)
+                        .saturating_sub(self.group_overhead_blocks(group)),
+                )
+            })
+            .sum();
+        blocks * u64::from(self.block_size.bytes())
+    }
+
+    /// Сколько байт тома займёт обычный файл длиной `len`: данные, округлённые
+    /// до блока, и блоки косвенной адресации (12 прямых указателей, затем
+    /// одинарный, двойной и тройной косвенные).
+    #[must_use]
+    pub const fn file_bytes(&self, len: u64) -> u64 {
+        let block = self.block_size.bytes() as u64;
+        let per = self.block_size.pointers_per_block() as u64;
+        let data = len.div_ceil(block);
+        let mut meta = 0;
+        if data > 12 {
+            let rest = data - 12;
+            meta += 1;
+            if rest > per {
+                let rest = rest - per;
+                let second = if rest > per * per { per } else { rest.div_ceil(per) };
+                meta += 1 + second;
+                if rest > per * per {
+                    let leaves = (rest - per * per).div_ceil(per);
+                    meta += 1 + leaves.div_ceil(per) + leaves;
+                }
+            }
+        }
+        (data + meta) * block
+    }
+
     /// Блок с битовой картой блоков группы.
     #[must_use]
     pub const fn block_bitmap_block(&self, group: u32) -> u32 {
