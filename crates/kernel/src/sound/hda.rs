@@ -366,6 +366,16 @@ impl Hda {
             // Intel звук идёт с треском — так делает и Linux.
             // SAFETY: регистр конфигурации контроллера HDA Intel.
             unsafe { device.write_config8(0x44, device.config8(0x44) & !0x07) };
+            // 27.11 (треск на ПК, 8086:8c20; при этом ни одного пропуска в счётчиках): `DEVC` (0x78),
+            // бит 11 «Enable No Snoop». С ним контроллер читает отсчёты из памяти мимо кэша процессора и может
+            // взять то, что там лежало раньше, - шипение и треск. Linux (`azx_init_pci`) этот бит снимает.
+            let devc = u16::from(device.config8(0x78)) | (u16::from(device.config8(0x79)) << 8);
+            let no_snoop = devc & (1 << 11) != 0;
+            if no_snoop {
+                // SAFETY: тот же регистр конфигурации, меняется только бит No Snoop.
+                unsafe { device.write_config8(0x79, device.config8(0x79) & !(1 << 3)) };
+            }
+            kprintln!("  hda         : Intel DEVC {devc:#06x}: no-snoop {}", if no_snoop { "was on - turned off" } else { "was already off" });
         }
         let bar = device.memory_bar(0).ok_or(HdaError::BadBar)?;
         let regs = bar.to_direct_map();
@@ -809,6 +819,7 @@ impl Hda {
             bytes = &bytes[take..];
             if used + take == PERIOD_BYTES {
                 self.filling = None;
+                self.flush_period(slot);
                 self.offer()?;
             } else {
                 self.filling = Some((slot, used + take));
@@ -826,6 +837,7 @@ impl Hda {
                 let data = self.buffer.as_ptr::<u8>().add(slot * PERIOD_BYTES + used);
                 core::ptr::write_bytes(data, 0, PERIOD_BYTES - used);
             }
+            self.flush_period(slot);
             self.offer()?;
         }
         if self.queued > 0 && !self.running {
@@ -925,6 +937,23 @@ impl Hda {
     fn zero_period(&self, period: usize) {
         // SAFETY: период внутри буфера; устройство его уже прошло.
         unsafe { core::ptr::write_bytes(self.buffer.as_ptr::<u8>().add(period * PERIOD_BYTES), 0, PERIOD_BYTES) };
+        self.flush_period(period);
+    }
+
+    /// Выгнать период из кэша процессора в память: контроллер, читающий мимо кэша (No Snoop), увидит то,
+    /// что записано. Стоит 64 строки кэша на 21 мс звука.
+    fn flush_period(&self, period: usize) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: адреса внутри буфера (`period < PERIODS`); `clflush` не меняет содержимое памяти.
+        unsafe {
+            let from = self.buffer.as_ptr::<u8>().add(period * PERIOD_BYTES);
+            for at in (0..PERIOD_BYTES).step_by(64) {
+                core::arch::asm!("clflush [{}]", in(reg) from.add(at), options(nostack, preserves_flags));
+            }
+            core::arch::asm!("mfence", options(nostack, preserves_flags));
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = period;
     }
 
     // --- регистры ------------------------------------------------------------
