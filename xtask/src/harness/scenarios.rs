@@ -18496,6 +18496,10 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_000),
             Step::Line("rm /home/roman/copy.txt"),
             Step::Wait(1_000),
+            // Настройки прошлого прогона (шрифт, перенос) — прочь: меню и окно
+            // «Шрифт» ниже идут от встроенного шрифта и выключенного переноса.
+            Step::Line("rm /home/roman/.config/notepad.cfg"),
+            Step::Wait(1_000),
             Step::Line("run -b /bin/notepad /home/roman/note.txt"),
             Step::Await("window      : 'Notepad' at", 30_000),
             Step::Await("notepad: new file /home/roman/note.txt", 15_000),
@@ -18596,15 +18600,47 @@ pub const ALL: &[Scenario] = &[
             Step::Shot("05a-replace"),
             Step::Key("ret"),
             Step::Await("notepad: replaced 1", 15_000),
+            // С учётом регистра (27.11, «Aa», Alt+C): «MAIN» в «fn main() {»
+            // не находится, без учёта — 1:4.
+            Step::Key("ctrl-f"),
+            Step::Repeat("backspace", 3),
+            Step::Type("MAIN"),
+            Step::Key("alt-c"),
+            Step::Await("notepad: match case on", 15_000),
+            Step::Key("ret"),
+            Step::Await("notepad: 'MAIN' not found", 15_000),
+            Step::Wait(800),
+            Step::Shot("05b-case"),
+            Step::Key("alt-c"),
+            Step::Await("notepad: match case off", 15_000),
+            Step::Key("ret"),
+            Step::Await("notepad: found 'MAIN' at 1:4", 15_000),
+            // F3 — далее, Shift+F3 — ранее, оба по кругу: «(» в строках 1 и 3.
+            Step::Repeat("backspace", 4),
+            Step::Type("("),
+            Step::Key("ret"),
+            Step::Await("notepad: found '(' at 1:8", 15_000),
+            Step::Key("f3"),
+            Step::Await("notepad: found '(' at 3:9", 15_000),
+            Step::Key("shift-f3"),
+            Step::Await("notepad: found '(' at 1:8 (up)", 15_000),
+            Step::Key("shift-f3"),
+            Step::Await("notepad: found '(' at 3:9 (up)", 15_000),
             Step::Key("esc"),
-            // Перенос по словам: «Вид», второй пункт.
+            // Длинная строка — для переноса.
+            Step::Key("end"),
+            Step::Key("ret"),
+            Step::Type("// word wrap: this long comment line does not fit into the notepad window and with word wrap on it breaks into several screen rows at the spaces, like Windows Notepad does."),
+            // Перенос по словам (27.11: меню «Формат», как в Блокноте Windows),
+            // первый пункт.
             Step::Key("f10"),
             Step::Key("right"),
             Step::Key("right"),
-            Step::Key("down"),
             Step::Key("ret"),
             Step::Await("notepad: wrap on", 15_000),
-            // «Шрифт…» — третий пункт «Вида».
+            Step::Wait(1_000),
+            Step::Shot("05c-wrap"),
+            // «Шрифт…» — второй пункт «Формата».
             Step::Key("f10"),
             Step::Key("right"),
             Step::Key("right"),
@@ -18628,6 +18664,16 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : closed the window of ", 15_000),
             Step::Line("cat /home/roman/.config/notepad.cfg"),
             Step::Await("size=16", 15_000),
+            Step::Await("wrap=1", 15_000),
+            Step::Wait(1_000),
+            // Перенос помнится между запусками, как в Windows.
+            Step::Line("run -b /bin/notepad /home/roman/main.rs"),
+            Step::Await("notepad: wrap on (remembered)", 30_000),
+            Step::Await("notepad: opened /home/roman/main.rs", 15_000),
+            Step::Wait(1_000),
+            Step::Key("alt-f4"),
+            Step::Await("notepad: closing on request", 15_000),
+            Step::Await("desktop     : closed the window of ", 15_000),
             Step::Wait(1_000),
 
             // ── Калькулятор ──────────────────────────────────────────────────

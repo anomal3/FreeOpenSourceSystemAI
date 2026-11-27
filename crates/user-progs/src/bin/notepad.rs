@@ -25,7 +25,11 @@
 //!   (TrueType, растеризуются на лету — `crates/ttf`) или встроенный
 //!   моноширинный; выбор помнится в `~/.config/notepad.cfg`.
 //!
-//! Перенос строк выключен: длинная строка уезжает вправо вслед за кареткой.
+//! * Поиск и замена, как в Блокноте Windows: Ctrl+F, F3 / Shift+F3 (далее /
+//!   ранее, по кругу), Ctrl+H (Заменить, Заменить все — Alt+A), «Aa» (Alt+C) —
+//!   с учётом регистра.
+//! * Формат → Перенос по словам (помнится в `notepad.cfg`, `wrap=1`); без
+//!   переноса длинная строка уезжает вправо вслед за кареткой.
 //! Текст — UTF-8; файл, который не UTF-8, не открывается, а не превращается в
 //! мусор при сохранении.
 
@@ -48,7 +52,7 @@ use mini_ui::paint::{self, Ctx, Weight};
 use mini_ui::syntax::{self, Kind, Lang};
 use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface, theme};
-use user_abi::{Dirent, KIND_DIRECTORY, WIN_MOD_CTRL, WIN_MOD_SHIFT};
+use user_abi::{Dirent, KIND_DIRECTORY, WIN_MOD_ALT, WIN_MOD_CTRL, WIN_MOD_SHIFT};
 use user_progs::app::{self, App, Spec};
 use user_progs::filedlg::{Dialog, Filter, Options, Outcome};
 use user_progs::{
@@ -159,11 +163,14 @@ enum EditKind {
 enum Menu {
     File,
     Edit,
+    Format,
     View,
     Syntax,
 }
 
-const MENUS: [(Menu, &str); 4] = [(Menu::File, "Файл"), (Menu::Edit, "Правка"), (Menu::View, "Вид"), (Menu::Syntax, "Синтаксис")];
+/// Order of the Windows Notepad bar: File, Edit, Format, View (+ our Syntax).
+const MENUS: [(Menu, &str); 5] =
+    [(Menu::File, "Файл"), (Menu::Edit, "Правка"), (Menu::Format, "Формат"), (Menu::View, "Вид"), (Menu::Syntax, "Синтаксис")];
 
 /// Команда меню.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -184,6 +191,7 @@ enum Cmd {
     Font,
     Find,
     FindNext,
+    FindPrev,
     Replace,
     Wrap,
     Lang(usize),
@@ -267,6 +275,15 @@ struct FindBar {
     replace: bool,
     /// Курсор в поле замены (иначе — в поле поиска).
     in_with: bool,
+    /// «С учётом регистра» (кнопка «Aa», Alt+C — как в Блокноте Windows).
+    case: bool,
+}
+
+impl FindBar {
+    /// Text as compared: as is with «Aa», lowercased without.
+    fn fold(&self, text: &str) -> String {
+        if self.case { text.to_string() } else { text.to_lowercase() }
+    }
 }
 
 /// Высота панели поиска.
@@ -827,13 +844,14 @@ impl Editor {
                 item("Выделить всё", "Ctrl+A", Cmd::SelectAll, 2),
                 item("Найти…", "Ctrl+F", Cmd::Find, 3),
                 item("Найти далее", "F3", Cmd::FindNext, 3),
+                item("Найти ранее", "Shift+F3", Cmd::FindPrev, 3),
                 item("Заменить…", "Ctrl+H", Cmd::Replace, 3),
             ],
-            Menu::View => vec![
-                item(if self.numbers { "✓ Номера строк" } else { "   Номера строк" }, "", Cmd::LineNumbers, 0),
+            Menu::Format => vec![
                 item(if self.wrap { "✓ Перенос по словам" } else { "   Перенос по словам" }, "", Cmd::Wrap, 0),
-                item("Шрифт…", "", Cmd::Font, 1),
+                item("Шрифт…", "", Cmd::Font, 0),
             ],
+            Menu::View => vec![item(if self.numbers { "✓ Номера строк" } else { "   Номера строк" }, "", Cmd::LineNumbers, 0)],
             Menu::Syntax => Lang::ALL
                 .iter()
                 .enumerate()
@@ -870,11 +888,16 @@ impl Editor {
                 // Выделенное — сразу в поле поиска, как в Блокноте Windows.
                 let what = self.selected_text().filter(|text| !text.contains('\n')).or_else(|| self.find.as_ref().map(|bar| bar.what.clone())).unwrap_or_default();
                 let with = self.find.as_ref().map(|bar| bar.with.clone()).unwrap_or_default();
-                self.find = Some(FindBar { what, with, replace: cmd == Cmd::Replace, in_with: false });
+                let case = self.find.as_ref().is_some_and(|bar| bar.case);
+                self.find = Some(FindBar { what, with, replace: cmd == Cmd::Replace, in_with: false, case });
             }
-            Cmd::FindNext => {
+            Cmd::FindNext | Cmd::FindPrev => {
                 if self.find.as_ref().is_some_and(|bar| !bar.what.is_empty()) {
-                    self.find_next();
+                    if cmd == Cmd::FindNext {
+                        self.find_next();
+                    } else {
+                        self.find_prev();
+                    }
                 } else {
                     self.run(Cmd::Find);
                 }
@@ -883,6 +906,8 @@ impl Editor {
                 self.wrap = !self.wrap;
                 self.left = 0;
                 println(&format!("notepad: wrap {}", if self.wrap { "on" } else { "off" }));
+                // Windows Notepad remembers word wrap between runs.
+                self.save_font_settings();
             }
             Cmd::Lang(index) => self.set_lang(Lang::ALL[index]),
         }
@@ -903,6 +928,10 @@ impl Editor {
         let size = sysconf::value(&text, "size").and_then(|value| value.trim().parse::<u32>().ok()).filter(|size| (8..=48).contains(size)).unwrap_or(12);
         let path = sysconf::value(&text, "font").map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
         let label = path.as_deref().map_or_else(|| String::from(BUILTIN_FONT), |path| font_label(path.rsplit('/').next().unwrap_or(path)));
+        self.wrap = sysconf::value(&text, "wrap").is_some_and(|value| value.trim() == "1");
+        if self.wrap {
+            println("notepad: wrap on (remembered)");
+        }
         self.set_font(label, path, size);
     }
 
@@ -917,7 +946,7 @@ impl Editor {
     fn save_font_settings(&self) {
         let dir = format!("{}/.config", self.home);
         let _ = user_progs::mkdir(&dir, 0o755);
-        let text = format!("font={}\nsize={}\n", self.font.path.as_deref().unwrap_or(""), self.font.size);
+        let text = format!("font={}\nsize={}\nwrap={}\n", self.font.path.as_deref().unwrap_or(""), self.font.size, u8::from(self.wrap));
         let fd = open_write(&self.settings_path(), true, true);
         if fd >= 0 {
             write(fd, text.as_bytes());
@@ -1107,6 +1136,20 @@ impl Editor {
     /// Клавиша панели поиска. `false` — не её (пусть разбирает текст).
     fn find_key(&mut self, code: u32, mods: i32, latin: u32) -> bool {
         let ctrl = mods & WIN_MOD_CTRL != 0;
+        let alt = mods & WIN_MOD_ALT != 0;
+        // Alt+C — «С учётом регистра», Alt+A / Ctrl+Alt+Enter — «Заменить все»
+        // (the access keys of the Windows Notepad find dialog).
+        if alt && char::from_u32(latin).map(|ch| ch.to_ascii_lowercase()) == Some('c') {
+            self.toggle_case();
+            return true;
+        }
+        if (alt && char::from_u32(latin).map(|ch| ch.to_ascii_lowercase()) == Some('a')) || (ctrl && alt && code == ENTER) {
+            if self.find.as_ref().is_some_and(|bar| bar.replace) {
+                self.replace_all();
+                return true;
+            }
+            return false;
+        }
         if ctrl {
             // Ctrl+F / Ctrl+H — переключить вид панели; остальное — тексту.
             return matches!(char::from_u32(latin).map(|ch| ch.to_ascii_lowercase()), Some('f' | 'h')) && {
@@ -1148,19 +1191,69 @@ impl Editor {
         true
     }
 
-    /// Найти следующее вхождение после каретки (без учёта регистра, по кругу).
+    /// «Aa»: искать с учётом регистра или без.
+    fn toggle_case(&mut self) {
+        if let Some(bar) = self.find.as_mut() {
+            bar.case = !bar.case;
+            println(&format!("notepad: match case {}", if bar.case { "on" } else { "off" }));
+        }
+    }
+
+    /// Один символ строки `row` в виде для сравнения (длина в символах та же,
+    /// иначе строка пропускается: `İ` в нижнем регистре — два символа).
+    fn folded(&self, row: usize) -> Option<Vec<char>> {
+        let bar = self.find.as_ref()?;
+        let line = &self.lines[row];
+        let folded: Vec<char> = bar.fold(line).chars().collect();
+        (folded.len() == line.chars().count()).then_some(folded)
+    }
+
+    /// Найти следующее вхождение после каретки (по кругу).
     fn find_next(&mut self) -> bool {
-        let Some(what) = self.find.as_ref().map(|bar| bar.what.to_lowercase()).filter(|what| !what.is_empty()) else {
+        self.find_step(true)
+    }
+
+    /// Shift+F3: предыдущее вхождение перед кареткой (по кругу).
+    fn find_prev(&mut self) -> bool {
+        self.find_step(false)
+    }
+
+    fn find_step(&mut self, forward: bool) -> bool {
+        let Some((what, shown)) = self.find.as_ref().filter(|bar| !bar.what.is_empty()).map(|bar| (bar.fold(&bar.what), bar.what.clone())) else {
             return false;
         };
-        let start = self.selection().map_or((self.row, self.col), |(_, end)| end);
+        let pattern: Vec<char> = what.chars().collect();
+        let start = match self.selection() {
+            Some((begin, end)) => {
+                if forward {
+                    end
+                } else {
+                    begin
+                }
+            }
+            None => (self.row, self.col),
+        };
         let total = self.lines.len();
         for step in 0..=total {
-            let row = (start.0 + step) % total;
-            let line: Vec<char> = self.lines[row].to_lowercase().chars().collect();
-            let pattern: Vec<char> = what.chars().collect();
-            let from = if step == 0 { start.1 } else { 0 };
-            let found = (from..line.len().saturating_sub(pattern.len()).saturating_add(1)).find(|at| line.get(*at..*at + pattern.len()) == Some(&pattern[..]));
+            let row = if forward { (start.0 + step) % total } else { (start.0 + total * 2 - step) % total };
+            let Some(line) = self.folded(row) else {
+                continue;
+            };
+            let last = line.len().checked_sub(pattern.len());
+            let hit = |at: &usize| line.get(*at..*at + pattern.len()) == Some(&pattern[..]);
+            let found = match (forward, last) {
+                (_, None) => None,
+                (true, Some(last)) => {
+                    let from = if step == 0 { start.1 } else { 0 };
+                    (from..=last).find(hit)
+                }
+                (false, Some(last)) => {
+                    // Back: the match must end at or before the caret on the
+                    // start row; the last step re-reads the start row whole.
+                    let till = if step == 0 { start.1.checked_sub(pattern.len()).map(|at| at.min(last)) } else { Some(last) };
+                    till.and_then(|till| (0..=till).rev().find(hit))
+                }
+            };
             if let Some(at) = found {
                 self.anchor = Some((row, at));
                 self.row = row;
@@ -1169,21 +1262,22 @@ impl Editor {
                 if self.row < self.top || self.row >= self.top + self.page_rows.get() {
                     self.top = self.row.saturating_sub(self.page_rows.get() / 3);
                 }
-                println(&format!("notepad: found '{what}' at {}:{}", row + 1, at + 1));
+                println(&format!("notepad: found '{shown}' at {}:{}{}", row + 1, at + 1, if forward { "" } else { " (up)" }));
                 return true;
             }
         }
-        println(&format!("notepad: '{what}' not found"));
-        self.note = Some(format!("«{what}» не найдено"));
+        println(&format!("notepad: '{shown}' not found"));
+        self.note = Some(format!("Не удаётся найти «{shown}»"));
         false
     }
 
     /// Заменить найденное (выделенное) и перейти к следующему.
     fn replace_one(&mut self) {
-        let Some((what, with)) = self.find.as_ref().map(|bar| (bar.what.to_lowercase(), bar.with.clone())) else {
+        let Some((what, with)) = self.find.as_ref().map(|bar| (bar.fold(&bar.what), bar.with.clone())) else {
             return;
         };
-        if self.selected_text().is_some_and(|text| text.to_lowercase() == what) {
+        let case = self.find.as_ref().is_some_and(|bar| bar.case);
+        if self.selected_text().is_some_and(|text| if case { text == what } else { text.to_lowercase() == what }) {
             self.checkpoint(EditKind::Other);
             self.delete_selection();
             self.insert_text(&with);
@@ -1200,13 +1294,14 @@ impl Editor {
         if what.is_empty() {
             return;
         }
-        let lower = what.to_lowercase();
-        let pattern: Vec<char> = lower.chars().collect();
+        let case = self.find.as_ref().is_some_and(|bar| bar.case);
+        let fold = |text: &str| if case { text.to_string() } else { text.to_lowercase() };
+        let pattern: Vec<char> = fold(&what).chars().collect();
         self.checkpoint(EditKind::Other);
         let mut count = 0usize;
         for line in &mut self.lines {
             let chars: Vec<char> = line.chars().collect();
-            let low: Vec<char> = line.to_lowercase().chars().collect();
+            let low: Vec<char> = fold(line).chars().collect();
             if low.len() != chars.len() {
                 continue;
             }
@@ -1234,8 +1329,9 @@ impl Editor {
         self.note = Some(format!("Заменено: {count}"));
     }
 
-    /// Раскладка панели поиска: поле поиска, поле замены, кнопки.
-    fn find_plan(&self, ctx: Ctx, plan: &Plan) -> (Rect, Rect, Rect, [Rect; 3]) {
+    /// Раскладка панели поиска: полоса, поле поиска, поле замены, кнопки
+    /// (Найти далее, Заменить, Заменить все, «Aa» — с учётом регистра).
+    fn find_plan(&self, ctx: Ctx, plan: &Plan) -> (Rect, Rect, Rect, [Rect; 4]) {
         let bar = Rect::new(plan.text.x, plan.text.y, plan.text.w, ctx.px(FIND_H));
         let pad = ctx.px(8) as i32;
         let h = ctx.px(28);
@@ -1245,7 +1341,9 @@ impl Editor {
         let with = Rect::new(what.right() + pad, y, field_w, h);
         let face = ctx.face(Role::Body);
         let mut x = if self.find.as_ref().is_some_and(|f| f.replace) { with.right() + pad } else { what.right() + pad };
-        let mut buttons = [Rect::EMPTY; 3];
+        let mut buttons = [Rect::EMPTY; 4];
+        buttons[3] = Rect::new(x, y, h + ctx.px(8), h);
+        x += buttons[3].w as i32 + pad;
         for (slot, label) in buttons.iter_mut().zip(["Найти далее", "Заменить", "Заменить все"]) {
             let w = face.width(label) + ctx.px(20);
             *slot = Rect::new(x, y, w, h);
@@ -1290,6 +1388,13 @@ impl Editor {
             }
             paint::button(inner, s, *rect, if index == 0 { Weight::Primary } else { Weight::Normal }, label, false);
         }
+        // «Aa»: pressed look (accent outline and tint) while matching case.
+        let case = buttons[3];
+        paint::button(inner, s, case, Weight::Normal, "Aa", false);
+        if find.case {
+            draw::rounded_stroke(s, case, ctx.px(4), p.acc, 255);
+            draw::rounded_stroke(s, Rect::new(case.x + 1, case.y + 1, case.w.saturating_sub(2), case.h.saturating_sub(2)), ctx.px(3), p.acc, 255);
+        }
     }
 
     fn find_click(&mut self, ctx: Ctx, plan: &Plan, x: i32) -> bool {
@@ -1311,6 +1416,7 @@ impl Editor {
             }
             Some(1) if replace => self.replace_one(),
             Some(2) if replace => self.replace_all(),
+            Some(3) => self.toggle_case(),
             _ => return false,
         }
         true
@@ -1323,7 +1429,7 @@ impl Editor {
 
 struct Plan {
     bar: Rect,
-    heads: [Rect; 4],
+    heads: [Rect; MENUS.len()],
     text: Rect,
     status: Rect,
     /// Имя языка справа в строке состояния — щелчок открывает меню языков.
@@ -1335,7 +1441,7 @@ impl Plan {
         let bar = Rect::new(area.x, area.y, area.w, ctx.px(MENU_H));
         let status = Rect::new(area.x, area.bottom() - ctx.px(STATUS_H) as i32, area.w, ctx.px(STATUS_H));
         let text = Rect::new(area.x, bar.bottom(), area.w, (status.y - bar.bottom()).max(0) as u32);
-        let mut heads = [Rect::EMPTY; 4];
+        let mut heads = [Rect::EMPTY; MENUS.len()];
         let mut x = bar.x + ctx.px(6) as i32;
         for (index, (_, label)) in MENUS.iter().enumerate() {
             let w = ctx.face(Role::Body).width(label) + ctx.px(20);
@@ -1969,7 +2075,7 @@ impl App for Editor {
             return true;
         }
         if code == F3 {
-            self.run(Cmd::FindNext);
+            self.run(if mods & WIN_MOD_SHIFT != 0 { Cmd::FindPrev } else { Cmd::FindNext });
             return true;
         }
         // F10 — полоса меню, как в Windows.
