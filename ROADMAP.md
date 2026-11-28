@@ -11198,10 +11198,27 @@ aarch64 выстрел, сделанный через 4 с после выбор
   был пустым), сервер рамкой стола обрамляет app_id `vlc` (как Xwayland
   Рупора).
 
+**Доделано 27.11 — лишние попытки вывода и «качание» окна:** своя `vlc`
+(`fossai-vlc.c`) подменяет `avcodec_default_get_format` libavcodec: модуль
+`avcodec` VLC зовёт её первой и потом перебирает тот же список форматов, а
+список — изменяемая копия `ff_get_format` (`av_memdup`), так что из него
+вынимаются аппаратные форматы (флаг `AV_PIX_FMT_FLAG_HWACCEL` по
+`av_pix_fmt_desc_get`; только если остаётся программный). VLC не видит
+`can_hwaccel` и не создаёт вывод под VA-API/VDPAU — вывод один (строка
+`fossai-vlc: N hardware pixel format(s) of FFmpeg dropped`, счётчик
+`fossai-vlc: video buffers #N` — по пулу wl_shm на вывод; в QEMU FFmpeg
+предлагал 4 аппаратных формата). Окно больше не «качается»: вывод создаётся
+один раз. Сценарий `vlc` (`install,vlc`, прошёл 27.11 и 28.11 на
+пересобранном пакете): в обоих запусках VLC (первый и `--loop`) — ровно
+`video buffers #1`.
+- Подстройку окна под видео (`qt-video-autoresize=1`, как у VLC в Windows)
+  пробовали включить — второй запуск (`--loop`, окно с запомненным размером)
+  падал в Qt Wayland: `wl_subsurface.place_above` с пустым соседом, «The
+  Wayland connection experienced a fatal error». Оставлена выключенной; TODO —
+  разобрать порядок подповерхностей Qt (`QWaylandSubSurface`) при смене
+  размера и сервер (`wayland.rs`, `place_above`).
+
 **Осталось (TODO)**:
-- две лишние попытки вывода (VA-API/VDPAU) на старте — подменить выбор
-  формата FFmpeg без аппаратных или вернуть подстройку окна, когда их не
-  станет;
 - `ld.so` glibc, запущенный как программа (`/opt/vlc/glibc/ld.so prog`),
   падает в слое Linux (#GP в `ld.so+0x1de67`) — обход переписанным
   `PT_INTERP`;

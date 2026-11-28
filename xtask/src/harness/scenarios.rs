@@ -11169,6 +11169,12 @@ pub const ALL: &[Scenario] = &[
             Step::AwaitAny("inhibits the screensaver", 60_000),
             Step::Absent("cannot create buffers"),
             Step::Wait(3_000),
+            // 27.11: FFmpeg's VA-API/VDPAU formats are taken out of its offer
+            // (fossai-vlc.c), so VLC makes one video output, not three - the
+            // window no longer jumps at the start.
+            Step::Expect("hardware pixel format(s) of FFmpeg dropped"),
+            Step::Expect("fossai-vlc: video buffers #1"),
+            Step::Absent("fossai-vlc: video buffers #2"),
             Step::Move(1, 0),
             Step::Wait(1_000),
             Step::Painted("vlc-playing"),
