@@ -19663,7 +19663,7 @@ getUserMedia → NotReadableError, Rupor показывает «Только п�
 В OBSOS (BETA) микрофона нет по другой причине: WebRTC там выключен (нет
 GStreamer) — ожидаемо.
 
-**Демонстрация экрана — план.** Chromium на Wayland берёт экран только через
+**Демонстрация экрана — план** (28.11: путь (3) сделан — раздел «Демонстрация экрана в Chromium» ниже). Chromium на Wayland берёт экран только через
 xdg-desktop-portal (D-Bus) + PipeWire; в системе нет ни D-Bus, ни PipeWire, ни
 V4L2. Окно «Choose what to share» поэтому только с вкладками. Порядок:
 (1) вкладка Chromium — уже внутри браузера, без портала (проверить на железе
@@ -19798,6 +19798,112 @@ code 0» за 120 с) 28.11 не проходит — и **без** микроф
 Realtek (coef) нет — если на ALC897/ALC1220 тишина при `plugged`, сравнить
 путь из журнала с Linux (`/proc/asound/card0/codec#0`). Вход virtio-snd не
 сделан.
+
+## Демонстрация экрана в Chromium: портал ScreenCast + PipeWire (28.11, Роман: «демонстрация экрана пустая») — **этап 1 сделан, проверить на железе**
+
+**Выбранный путь — (а), настоящие службы Debian + свой портал.** Chromium на
+Wayland берёт экран только так: WebRTC (`BaseCapturerPipeWire`) через GDBus
+зовёт `org.freedesktop.portal.ScreenCast` на сессионной шине, получает номер
+узла PipeWire и дескриптор соединения с демоном (`OpenPipeWireRemote`) и
+подключает к узлу свой поток (`pw_stream`, libpipewire грузится `dlopen`).
+Свой сервер протокола PipeWire (client-node, активации в разделяемой
+памяти, SPA POD, согласование буферов) — несколько дней и вечная погоня за
+совместимостью; настоящий `pipewire` 0.3.65 из Debian — та же версия, что
+грузит Chromium, и слой Linux уже умеет всё, что ему нужно (AF_UNIX +
+SCM_RIGHTS, memfd, eventfd, timerfd, epoll). Поэтому в пакете
+`linuxweb-150.fpk` теперь:
+
+- `libexec/dbus-daemon` (dbus 1.14.10, сессионная шина, `share/dbus/session.conf`
+  — один пользователь, всё разрешено);
+- `libexec/pipewire` + 9 модулей (`lib/pipewire-0.3`: protocol-native,
+  client-node, client-device, adapter, link-factory, metadata,
+  spa-node-factory, session-manager, access) + SPA (`lib/spa-0.2`: support,
+  videoconvert, audioconvert); свой `share/pipewire/pipewire.conf`
+  (minimal.conf без ALSA/rt/profiler), `client.conf` Debian;
+- `libexec/fossai-portal` — **своя программа** (`libc/linux/fossai-portal.c`,
+  C, libdbus + libpipewire, собирается clang-ом под glibc Debian из
+  заголовков `-dev` пакетов, `xtask/src/chromium.rs::build_portal`):
+  - портал: владеет `org.freedesktop.portal.Desktop`, ScreenCast версии 4
+    (CreateSession / SelectSources / Start / OpenPipeWireRemote, сигналы
+    `Request.Response`, `Session.Close`, свойства `AvailableSourceTypes`=1
+    (мониторы), `AvailableCursorModes`=3, `version`, Introspect;
+    `host.portal.Registry.Register` — пустой успех); прочие интерфейсы —
+    ошибка (Chromium откатывается, напр. выбор файлов);
+  - производитель: на каждый Start — `pw_stream` (Video/Source, драйвер
+    графа) с кадрами из захвата монитора ядра (`/dev/fossai-capture`,
+    FOSSAI_CAP_START/GRAB/STATUS — те же сессии, что у OBS и записи экрана),
+    BGRx/RGBx, размер монитора, до 30 кадров/с (новый кадр ядра или раз в
+    секунду); буферы — **свои memfd** (`PW_STREAM_FLAG_ALLOC_BUFFERS`, как у
+    xdg-desktop-portal-wlr): буферы, выделенные демоном, приходят клиенту
+    как `MemPtr` внутри общего блока, а WebRTC 150
+    (`shared_screencast_stream.cc::ProcessBuffer`) берёт только MemFd/DmaBuf
+    и `MemPtr` молча выбрасывает — поток «шёл», а `<video>` оставался пустым;
+    указатель встроен в кадр (Chromium не передаёт `cursor_mode`, спрятан —
+    только по явному 1);
+  - мини-менеджер сессий: WirePlumber нет, поэтому портал сам смотрит
+    реестр и создаёт `link-factory` между своим портом и входным портом
+    видеопотока клиента (по `target.object`/`node.target`, а если цели нет
+    и поток один — к нему);
+  - монитор — основной; `FOSSAI_SCREENCAST_MONITOR=N` — другой (TODO: выбор);
+  - `FOSSAI_PORTAL_TEST=1` — испытательная картинка вместо ядра (проверка на
+    любом Linux).
+- `bin/fossai-screencast` (`libc/linux/fossai-screencast.sh`) — запускает
+  три службы, если они не живы (pid-файлы в `$XDG_RUNTIME_DIR/fossai-screencast`),
+  ждёт готовности (сокет шины, `pipewire-0`, файл готовности портала),
+  строки `screencast: dbus/pipewire/portal started (pid, с)` или
+  `... did not start: <хвост журнала>` в журнал ядра; предупреждения
+  pipewire/dbus — строками `pipewire: …`/`dbus: …` туда же.
+- Обёртка `bin/chromium`: `XDG_SESSION_TYPE=wayland` (без него
+  `DesktopCapturer::IsRunningUnderWayland()` ложь и PipeWire не пробуется —
+  отсюда и были «только вкладки»), переменные PipeWire, `LD_LIBRARY_PATH`
+  + `lib/pipewire-0.3` (у модулей RUNPATH — каталог Debian), запуск
+  `fossai-screencast` (кроме `--headless`), `--enable-features=WebRTCPipeWireCapturer`.
+
+**Ядро.** `/proc/<pid>/root` (и `self`) — пустой особый каталог
+(`linux/special.rs`): module-access pipewire открывает его, ища
+`.flatpak-info`; ошибка открытия = «клиент в песочнице», и демон держал
+клиента «занятым» навсегда (поток портала висел в `connecting`).
+
+**Попутно.** В слое Linux нет `/dev/fd`, а подстановка процесса bash
+(`>(...)`) идёт через `/dev/fd/63`: пересылка строк FATAL Chromium в журнал
+ядра (27.11) не работала вовсе («/opt/chromium/bin/chromium: line 20:
+/dev/fd/63: No such file or directory»). Теперь `coproc` (обычные pipe).
+
+**Проверка.** Вне FossAi (Linux-сервер, те же .deb, портал с
+`FOSSAI_PORTAL_TEST=1`): клиент как у WebRTC (GDBus + `pw_context_connect_fd`)
+— 90 кадров; настоящий Chromium 150 из пакета в `--headless=new` с
+`XDG_SESSION_TYPE=wayland` — `fossai-screen: frames 300 640x360` за 10 с
+(так и найдена причина с MemPtr: `CaptureFrame` всегда ERROR при живом
+потоке). В QEMU — сценарий `chromium-screenshare` (`install,chromium-screenshare`,
+проходит, 1 мин 44 с): страница хоста `/screen.html` зовёт getDisplayMedia
+(`--use-fake-ui-for-media-stream` выбирает экран без окна выбора);
+`screencast: dbus/pipewire/portal started`, `capture: started 1280x720 at
+0,0 (30 fps, pointer on)`, `fossai-portal: … Start … stream node 17`,
+`link node 17 port 18 -> node 20 port 21`, `memfd buffers of 3686400 bytes`,
+`fossai-screen: ok 1280x720 screen:0:0 monitor`, `frames 30/60/90/120
+1280x720` (≈10 кадров/с под TCG); снимок `chromium-screenshare` — в
+`<video>` 640x360 сам стол (проверено по пикселям: 225 цветовых корзин,
+средняя яркость 91); после `kill` браузера — `session … closed (the program
+left the bus)`, `capture: stopped after 178 grab(s)`.
+
+**Что смотреть на железе.** Rupor (web.pynop.online) → демонстрация экрана:
+в окне Chromium «Choose what to share» должна появиться вкладка «Entire
+screen» (на Wayland это один пункт, выбор экрана — у портала: основной
+монитор). Журнал: `screencast: … started`, `fossai-portal: Start … monitor 1
+(2560x1440)`, `stream N: frame 1`, `link node`; если пусто —
+`screencast: … did not start`, `pipewire:`-строки.
+
+**TODO / этапы дальше.**
+1. Выбор монитора/окна: родное окно FossAi при SelectSources (сейчас —
+   основной монитор); «Window» (AvailableSourceTypes 2) через
+   `FOSSAI_CAP_WINDOWS`.
+2. Окно выбора Chromium без fake UI (обычный путь пользователя) — снять в
+   сценарии и проверить щелчками; persist/restore_token.
+3. dma-buf вместо memfd (NVIDIA/NVK, GPU Chromium) — сейчас `--disable-gpu`, shm.
+4. Метаданные указателя (cursor_mode 4) вместо встраивания; повреждённые
+   области (VideoDamage).
+5. Запасной путь (б) — V4L2 `/dev/video0` поверх захвата — не делали: путь
+   (а) заработал.
 
 ## Регрессия 26.11: smp, chromium, рост кучи — **сделано**
 

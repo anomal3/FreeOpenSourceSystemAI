@@ -12971,6 +12971,76 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("KERNEL PANIC"),
         ],
     },
+    // Screen sharing (28.11, Roman: "the screen share is empty" - only tabs
+    // in "Choose what to share"). Chromium's WebRTC takes the screen through
+    // the ScreenCast portal on the D-Bus session bus and a PipeWire stream:
+    // the package starts dbus-daemon, pipewire and fossai-portal before the
+    // browser (`screencast:` lines), the host page `screen.html` calls
+    // getDisplayMedia (the fake UI picks the screen), the portal makes a
+    // stream from the kernel capture of the primary monitor and links it to
+    // Chromium's, the page counts the frames its <video> shows.
+    Scenario {
+        name: "chromium-screenshare",
+        about: "Chromium: демонстрация экрана - getDisplayMedia через портал ScreenCast (D-Bus) и поток PipeWire из захвата монитора ядра.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: true,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "2G",
+        extra: &["-cpu", "max", "-smp", "2"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::Line("run /bin/pkg remove chromium"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
+            Step::Line("run /bin/pkg remove debian"),
+            Step::Await("/bin/pkg: exited with code", 180_000),
+            Step::Line("pkg install chromium"),
+            Step::Await("pkg: installed debian 12, ", 300_000),
+            Step::Await("pkg: installed chromium 150, ", 1_800_000),
+            Step::Await("desktop     : packages changed, ", 30_000),
+            Step::Line("run -b /opt/debian/bin/bash /opt/chromium/bin/chromium --enable-logging=stderr --use-fake-ui-for-media-stream --unsafely-treat-insecure-origin-as-secure=http://10.0.2.2:{site} http://10.0.2.2:{site}/screen.html"),
+            Step::Capture("started as #", 15_000),
+            // The services, then the browser.
+            Step::AwaitAny("screencast: dbus started", 120_000),
+            Step::AwaitAny("screencast: pipewire started", 120_000),
+            Step::AwaitAny("fossai-portal: ready", 120_000),
+            Step::AwaitAny("screencast: portal started", 30_000),
+            Step::Await("'FossAi screen - Chromium'", 300_000),
+            // The portal calls, the stream and the link to Chromium's stream.
+            Step::AwaitAny("fossai-portal: CreateSession from ", 240_000),
+            Step::AwaitAny("fossai-portal: Start ", 120_000),
+            Step::AwaitAny("fossai-portal: OpenPipeWireRemote ", 120_000),
+            Step::AwaitAny("fossai-portal: link node ", 120_000),
+            Step::AwaitAny("fossai-screen: ok ", 120_000),
+            Step::AwaitAny("fossai-screen: frames 30 ", 240_000),
+            Step::Wait(10_000),
+            Step::Move(1, 0),
+            Step::Shot("chromium-screenshare"),
+            // The browser's end closes the session and the kernel capture.
+            Step::Line("kill {}"),
+            Step::Await(" gone", 120_000),
+            Step::AwaitAny("fossai-portal: session ", 60_000),
+            Step::Absent("screencast: dbus did not start"),
+            Step::Absent("libwayland: unknown object"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
     Scenario {
         name: "doom",
         about: "Первая игра на SDL2 (фазы 68d, 68e): пакет freedoom с носителя, doomgeneric с данными Freedoom — заставка, меню, новая игра, выстрелы со звуком, крестик.",

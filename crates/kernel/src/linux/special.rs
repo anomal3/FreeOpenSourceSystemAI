@@ -216,6 +216,12 @@ fn directory(path: &str) -> Option<Vec<(String, NodeKind)>> {
             let tid = crate::sched::current().as_u32();
             Some(alloc::vec![(format!("{tid}"), NodeKind::Directory)])
         }
+        // `/proc/<pid>/root` of any process (28.11.2026): PipeWire's
+        // module-access opens it to look for `.flatpak-info`; failing to
+        // open it makes every client a sandboxed one that waits for
+        // permissions forever. Empty: the file is not there, the client
+        // runs on the host (the root is the same for every process).
+        _ if proc_root(path) => Some(Vec::new()),
         // `/proc/net`, `/sys/class/net/<имя>` (16.11.2026); `/dev/dri` и
         // каталоги sysfs узла DRM (NVK, 18.11.2026).
         // `/dev/input` and sysfs of the gamepads (24.11.2026); `/sys/class`
@@ -228,6 +234,14 @@ fn directory(path: &str) -> Option<Vec<(String, NodeKind)>> {
             found.or_else(|| super::evdev::directory(path))
         }
     }
+}
+
+/// `/proc/self/root`, `/proc/<pid>/root`.
+fn proc_root(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/proc/").and_then(|rest| rest.strip_suffix("/root")) else {
+        return false;
+    };
+    rest == "self" || rest == "thread-self" || (!rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Есть ли такой особый путь — для `stat` и `access`.

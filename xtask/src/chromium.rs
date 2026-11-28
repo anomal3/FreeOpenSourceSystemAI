@@ -99,7 +99,7 @@ const ALSA_CONF: &str = "pcm.fossai_out { type plug slave.pcm \"hw:0,0\" }\n\
     ctl.!default { type hw card 0 }\n";
 
 /// Пакеты: путь в архиве и SHA-256 из `Packages` bookworm (снимок 20261020).
-const PACKAGES: [(&str, &str); 104] = [
+const PACKAGES: [(&str, &str); 112] = [
     ("pool/main/a/at-spi2-core/at-spi2-common_2.46.0-5_all.deb", "441bc1c6cefdc01f519310abf55823deb868898480dee09a05aa44e8c83cabc2"),
     ("pool/main/c/chromium/chromium_150.0.7871.100-1~deb12u1_amd64.deb", "9eb054fb52bbcd7a8c6407484be2337298ff8b1e19af14af2e7b497fa190ce4f"),
     // Данные ICU, снимки V8, ресурсы и en-US (см. [`COMMON_FILES`]).
@@ -206,6 +206,16 @@ const PACKAGES: [(&str, &str); 104] = [
     ("pool/main/libx/libxrender/libxrender1_0.9.10-1.1_amd64.deb", "b2a6d160578f359220101947c8d67059b44704a251e688de1d0b744fefedfd1a"),
     ("pool/main/libz/libzstd/libzstd1_1.5.4+dfsg2-5_amd64.deb", "6315b5ac38b724a710fb96bf1042019398cb656718b1522279a5185ed39318fa"),
     ("pool/main/x/xkeyboard-config/xkb-data_2.35.1-1_all.deb", "28a79c61b785f403da93af58c39aed13c022032935e3e54362c6707169cfe982"),
+    // Screen sharing (28.11): the session bus, the PipeWire daemon, its
+    // modules and SPA plugins (see [`screencast`]).
+    ("pool/main/d/dbus/dbus-daemon_1.14.10-1~deb12u1_amd64.deb", "d35e43de83f7df870196d292a60a56d320c47ce503bc586b30e47a192090302e"),
+    ("pool/main/a/apparmor/libapparmor1_3.0.8-3_amd64.deb", "4b79f49eafc2017374da9ec206b5495433eadd2b1ea078c3895c99e72825e9d3"),
+    ("pool/main/a/audit/libaudit1_3.0.9-1_amd64.deb", "30954df4b5a7c505661ba8ae5e6ea94f5805e408899fb400783bb166eb5ff306"),
+    ("pool/main/libc/libcap-ng/libcap-ng0_0.8.3-1+b3_amd64.deb", "b4b54769c77e4a71c8b33aee4d600ba28a9994a1c6f60d55d4ebe7fc44882e07"),
+    ("pool/main/p/pipewire/pipewire-bin_0.3.65-3+deb12u1_amd64.deb", "68d541517e36ac78f24f0d213dece0d249f6160eb554898f25d99cac4195d9f8"),
+    ("pool/main/p/pipewire/libpipewire-0.3-0_0.3.65-3+deb12u1_amd64.deb", "0e7efe124beb112cde106b14c5c7b95ef890444b9604503e142f9f1bf8d4112d"),
+    ("pool/main/p/pipewire/libpipewire-0.3-modules_0.3.65-3+deb12u1_amd64.deb", "8a06e05f1f37d4dec66a4e413dbfe9919cc2e8bf7679031652f9e5913965f7f6"),
+    ("pool/main/p/pipewire/libspa-0.2-modules_0.3.65-3+deb12u1_amd64.deb", "9f6a09c85dfe4dffc26420eb8fec916c3bc016752b7a0ea5c50eaaa775bf26c1"),
     ("pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb", "d7dd1d1411fedf27f5e27650a6eff20ef294077b568f4c8c5e51466dc7c08ce4"),
 ];
 
@@ -302,6 +312,8 @@ pub fn build(arch: Arch) -> Result<()> {
         }
     }
     files.push((String::from("share/alsa/fossai.conf"), ALSA_CONF.as_bytes().to_vec(), 0o644));
+    // Screen sharing (28.11): D-Bus, PipeWire and fossai-portal.
+    screencast(&cache, &base, &extra, &mut files)?;
     // Значок программы — её собственный, из `hicolor` пакета (ярлык на столе
     // и кнопка панели задач рисуют его, как в Windows).
     let icon = ["128x128", "256x256", "64x64", "48x48"].iter().find_map(|size| {
@@ -340,12 +352,11 @@ pub fn build(arch: Arch) -> Result<()> {
     // `fork` готовой заготовки, без `execve` и загрузки сотни библиотек.
     let script = "#!/bin/bash\n\
         # Chromium (фазы 71h, 71i): библиотеки и шрифты — рядом, песочницы нет.\n\
-        export LD_LIBRARY_PATH=/opt/chromium/lib\n\
+        export LD_LIBRARY_PATH=/opt/chromium/lib:/opt/chromium/lib/pipewire-0.3\n\
         export FONTCONFIG_FILE=/opt/chromium/fonts/fonts.conf\n\
         export XDG_RUNTIME_DIR=/run/user/0\n\
         export WAYLAND_DISPLAY=wayland-0\n\
-        # Шины D-Bus в системе нет: адрес — сокет, которого нет, и отказ\n\
-        # соединения Chromium разбирает сам (без адреса он падает).\n\
+        # The session bus: dbus-daemon started by bin/fossai-screencast (28.11).\n\
         export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
         export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket\n\
         # Профиль и сокет профиля — в $HOME (дом того, кто вошёл): новое\n\
@@ -358,13 +369,22 @@ pub fn build(arch: Arch) -> Result<()> {
         # Строки падения Chromium (FATAL, Check failed) — ещё и в журнал ядра:\n\
         # со стола stderr никуда не идёт, и на железе падение было немым.\n\
         if [ -w /dev/kmsg ]; then\n\
-          exec 2> >(while IFS= read -r l; do printf '%s\\n' \"$l\" >&2; case $l in *:FATAL:*|*'Check failed'*) printf 'chromium: %.400s\\n' \"$l\" > /dev/kmsg ;; esac; done)\n\
+          # coproc, not >(...): FossAi has no /dev/fd for process substitution (28.11).\n\
+          coproc FATAL { while IFS= read -r l; do printf '%s\\n' \"$l\" >&2; case $l in *:FATAL:*|*'Check failed'*) printf 'chromium: %.400s\\n' \"$l\" > /dev/kmsg ;; esac; done; }\n\
+          exec 2>&${FATAL[1]}\n\
         fi\n\
+        # Screen sharing (28.11): WebRTC takes the screen through the\n\
+        # ScreenCast portal and PipeWire only under XDG_SESSION_TYPE=wayland;\n\
+        # bin/fossai-screencast starts the bus, PipeWire and fossai-portal.\n\
+        export XDG_SESSION_TYPE=wayland\n\
+        export PIPEWIRE_RUNTIME_DIR=/run/user/0 PIPEWIRE_CONFIG_DIR=/opt/chromium/share/pipewire\n\
+        export SPA_PLUGIN_DIR=/opt/chromium/lib/spa-0.2 PIPEWIRE_MODULE_DIR=/opt/chromium/lib/pipewire-0.3\n\
+        case \" $* \" in *\" --headless\"*) ;; *) \"$BASH\" /opt/chromium/bin/fossai-screencast ;; esac\n\
         platform=--ozone-platform=wayland\n\
         case \" $* \" in *\" --headless\"*) platform= ;; esac\n\
         exec /opt/chromium/chrome/chromium --no-sandbox --disable-gpu $platform \\\n\
           --no-first-run --no-default-browser-check --password-store=basic --ipc-connection-timeout=120 \\\n\
-          --disable-features=HttpsUpgrades,OmniboxDefaultTypedNavigationsToHttps \"$@\"\n";
+          --enable-features=WebRTCPipeWireCapturer --disable-features=HttpsUpgrades,OmniboxDefaultTypedNavigationsToHttps \"$@\"\n";
     files.push((String::from("bin/chromium"), script.as_bytes().to_vec(), 0o755));
 
     let mut builder = Builder::new(Kind::Package, "chromium", "150");
@@ -435,4 +455,222 @@ pub(crate) fn needed(elf: &[u8]) -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+// ---- Screen sharing (28.11) -------------------------------------------------
+//
+// Chromium on Wayland shares the screen (getDisplayMedia, "Entire screen")
+// only through xdg-desktop-portal on the D-Bus session bus and a PipeWire
+// video stream. The package carries the real `dbus-daemon` and `pipewire` of
+// Debian 12 (pipewire 0.3.65 - the libpipewire Chromium loads with `dlopen`
+// is the same) and our `fossai-portal` (`libc/linux/fossai-portal.c`): the
+// ScreenCast portal and the producer of the screen streams from the kernel
+// capture (`/dev/fossai-capture`). `bin/fossai-screencast` starts the three
+// before the browser.
+
+/// Packages only for building `fossai-portal` (headers).
+const DEV_PACKAGES: [(&str, &str); 3] = [
+    ("pool/main/p/pipewire/libpipewire-0.3-dev_0.3.65-3+deb12u1_amd64.deb", "5dd9a75ea9d09791b38672b338a57a1b216727c94dcbb78b15a12ab411e99ff5"),
+    ("pool/main/p/pipewire/libspa-0.2-dev_0.3.65-3+deb12u1_amd64.deb", "22350821fe3abe1748240b5f45b5797cbcff6a6a9e4ff0dc4d3ac4d866c34894"),
+    ("pool/main/d/dbus/libdbus-1-dev_1.14.10-1~deb12u1_amd64.deb", "967a42e91eaa7d1885721b374a28cb0d30a0e63daaccf5e3594180bec6072c76"),
+];
+
+/// PipeWire modules the daemon ([`PIPEWIRE_CONF`]) and the clients
+/// ([`CLIENT_CONF`]: Chromium, fossai-portal) load. Their `RUNPATH` is
+/// Debian's module directory - the launcher puts `lib/pipewire-0.3` into
+/// `LD_LIBRARY_PATH` (`client-node` needs `protocol-native` by name).
+const PW_MODULES: [&str; 9] =
+    ["protocol-native", "metadata", "spa-node-factory", "client-node", "client-device", "adapter", "link-factory", "access", "session-manager"];
+
+/// SPA plugins: loop, system and log (`support`), the converters.
+const SPA_PLUGINS: [&str; 3] = ["support/libspa-support.so", "videoconvert/libspa-videoconvert.so", "audioconvert/libspa-audioconvert.so"];
+
+const PW_LIB: &str = "usr/lib/x86_64-linux-gnu/pipewire-0.3/";
+const SPA_LIB: &str = "usr/lib/x86_64-linux-gnu/spa-0.2/";
+
+/// The daemon: `minimal.conf` of Debian without ALSA, realtime and the
+/// profiler. `module-access` is required: without it a client stays "busy"
+/// (no permissions) and the daemon never reads its messages.
+const PIPEWIRE_CONF: &str = "context.properties = {\n\
+    \x20   core.daemon = true\n\
+    \x20   core.name = pipewire-0\n\
+    \x20   support.dbus = false\n\
+    \x20   mem.allow-mlock = false\n\
+    \x20   mem.warn-mlock = false\n\
+    \x20   link.max-buffers = 16\n\
+    \x20   log.level = 2\n\
+    }\n\
+    context.spa-libs = {\n\
+    \x20   support.* = support/libspa-support\n\
+    }\n\
+    context.modules = [\n\
+    \x20   { name = libpipewire-module-protocol-native }\n\
+    \x20   { name = libpipewire-module-metadata }\n\
+    \x20   { name = libpipewire-module-spa-node-factory }\n\
+    \x20   { name = libpipewire-module-client-node }\n\
+    \x20   { name = libpipewire-module-access }\n\
+    \x20   { name = libpipewire-module-adapter }\n\
+    \x20   { name = libpipewire-module-link-factory }\n\
+    ]\n\
+    context.objects = [\n\
+    \x20   { factory = metadata args = { metadata.name = default } }\n\
+    \x20   { factory = spa-node-factory args = { factory.name = support.node.driver node.name = Dummy-Driver node.group = pipewire.dummy priority.driver = 20000 } }\n\
+    ]\n";
+
+/// The clients (`client.conf` of Debian 0.3.65).
+const CLIENT_CONF: &str = "context.properties = {\n\
+    \x20   log.level = 0\n\
+    }\n\
+    context.spa-libs = {\n\
+    \x20   audio.convert.* = audioconvert/libspa-audioconvert\n\
+    \x20   support.* = support/libspa-support\n\
+    }\n\
+    context.modules = [\n\
+    \x20   { name = libpipewire-module-protocol-native }\n\
+    \x20   { name = libpipewire-module-client-node }\n\
+    \x20   { name = libpipewire-module-client-device }\n\
+    \x20   { name = libpipewire-module-adapter }\n\
+    \x20   { name = libpipewire-module-metadata }\n\
+    \x20   { name = libpipewire-module-session-manager }\n\
+    ]\n";
+
+/// The session bus: one user, everything allowed (the launcher passes the
+/// socket with `--address`).
+const SESSION_CONF: &str = "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \
+    \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
+    <busconfig>\n\
+    \x20 <type>session</type>\n\
+    \x20 <listen>unix:path=/run/user/0/bus</listen>\n\
+    \x20 <auth>EXTERNAL</auth>\n\
+    \x20 <policy context=\"default\">\n\
+    \x20   <allow send_destination=\"*\" eavesdrop=\"true\"/>\n\
+    \x20   <allow eavesdrop=\"true\"/>\n\
+    \x20   <allow own=\"*\"/>\n\
+    \x20 </policy>\n\
+    </busconfig>\n";
+
+/// Starts the services before the browser.
+const SCREENCAST_SCRIPT: &str = include_str!("../../libc/linux/fossai-screencast.sh");
+
+/// Put the screen sharing services into the package: `libexec/dbus-daemon`,
+/// `libexec/pipewire`, `libexec/fossai-portal`, the modules and plugins, the
+/// libraries they load that Chromium does not, the settings and the
+/// launcher.
+fn screencast(
+    cache: &std::path::Path,
+    base: &BTreeMap<String, Node>,
+    extra: &BTreeMap<String, Node>,
+    files: &mut Vec<(String, Vec<u8>, u32)>,
+) -> Result<()> {
+    let mut elves: Vec<Vec<u8>> = Vec::new();
+    for (from, to) in [("usr/bin/dbus-daemon", "libexec/dbus-daemon"), ("usr/bin/pipewire", "libexec/pipewire")] {
+        let (data, mode) = follow(extra, from, 0).with_context(|| format!("в пакетах нет {from}"))?;
+        elves.push(data.clone());
+        files.push((String::from(to), data.clone(), mode));
+    }
+    let mut have: BTreeSet<String> = BTreeSet::new();
+    for name in PW_MODULES {
+        let file = format!("libpipewire-module-{name}.so");
+        let (data, mode) = follow(extra, &format!("{PW_LIB}{file}"), 0).with_context(|| format!("в пакетах нет модуля {file}"))?;
+        elves.push(data.clone());
+        files.push((format!("lib/pipewire-0.3/{file}"), data.clone(), mode));
+        have.insert(file);
+    }
+    for plugin in SPA_PLUGINS {
+        let (data, mode) = follow(extra, &format!("{SPA_LIB}{plugin}"), 0).with_context(|| format!("в пакетах нет {plugin}"))?;
+        elves.push(data.clone());
+        files.push((format!("lib/spa-0.2/{plugin}"), data.clone(), mode));
+    }
+    let portal = build_portal(cache, extra)?;
+    elves.push(portal.clone());
+    files.push((String::from("libexec/fossai-portal"), portal, 0o755));
+    have.extend(files.iter().filter_map(|(path, ..)| path.strip_prefix("lib/").filter(|name| !name.contains('/')).map(String::from)));
+    let mut todo: Vec<String> = Vec::new();
+    for elf in &elves {
+        todo.extend(needed(elf).context("screencast: не разобран ELF")?);
+    }
+    let mut added = 0;
+    while let Some(name) = todo.pop() {
+        if !have.insert(name.clone()) {
+            continue;
+        }
+        if LIB_DIRS.iter().any(|dir| follow(base, &format!("{dir}/{name}"), 0).is_some()) {
+            continue;
+        }
+        let Some((data, mode)) = LIB_DIRS.iter().find_map(|dir| follow(extra, &format!("{dir}/{name}"), 0)) else {
+            bail!("screencast: библиотеки {name} нет ни в корне Debian, ни в пакетах");
+        };
+        todo.extend(needed(data).with_context(|| format!("{name}: не разобран ELF"))?);
+        files.push((format!("lib/{name}"), data.clone(), mode));
+        added += 1;
+    }
+    for (path, text) in [("share/pipewire/pipewire.conf", PIPEWIRE_CONF), ("share/pipewire/client.conf", CLIENT_CONF), ("share/dbus/session.conf", SESSION_CONF)] {
+        files.push((String::from(path), text.as_bytes().to_vec(), 0o644));
+    }
+    // A checkout with CRLF must not reach bash.
+    files.push((String::from("bin/fossai-screencast"), SCREENCAST_SCRIPT.replace('\r', "").into_bytes(), 0o755));
+    say!("chromium: screen sharing - dbus-daemon, pipewire, {} modules, fossai-portal, {added} more libraries", PW_MODULES.len());
+    Ok(())
+}
+
+/// Build `fossai-portal` (`libc/linux/fossai-portal.c`) with clang: the glibc
+/// sysroot of Debian 12, the headers of the `-dev` packages, linked against
+/// the package's `libpipewire-0.3.so.0` and `libdbus-1.so.3`.
+fn build_portal(cache: &std::path::Path, extra: &BTreeMap<String, Node>) -> Result<Vec<u8>> {
+    let mut dev: BTreeMap<String, Node> = BTreeMap::new();
+    unpack(cache, &DEV_PACKAGES, &mut dev)?;
+    let work = sdk::root().join("linux/fossai-portal");
+    let include = work.join("include");
+    let libs = work.join("lib");
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&libs)?;
+    for (path, node) in &dev {
+        if !matches!(node, Node::File { .. }) {
+            continue;
+        }
+        let rest = path
+            .strip_prefix("usr/include/")
+            .map(String::from)
+            .or_else(|| path.strip_prefix("usr/lib/x86_64-linux-gnu/dbus-1.0/include/").map(|rest| format!("dbus-arch/{rest}")));
+        let Some(rest) = rest else { continue };
+        if let Some((data, _)) = follow(&dev, path, 0) {
+            let to = include.join(rest);
+            fs::create_dir_all(to.parent().unwrap())?;
+            fs::write(&to, data)?;
+        }
+    }
+    let mut needed_libs = Vec::new();
+    for name in ["libpipewire-0.3.so.0", "libdbus-1.so.3"] {
+        let (data, _) = LIB_DIRS.iter().find_map(|dir| follow(extra, &format!("{dir}/{name}"), 0)).with_context(|| format!("в пакетах нет {name}"))?;
+        let to = libs.join(name);
+        fs::write(&to, data)?;
+        needed_libs.push(to);
+    }
+    let sysroot = crate::debian::glibc_sysroot()?;
+    let lib = sysroot.join("usr/lib/x86_64-linux-gnu");
+    let output = work.join("fossai-portal");
+    let mut cmd = std::process::Command::new(cbuild::llvm_tool("clang")?);
+    cmd.arg("--target=x86_64-linux-gnu")
+        .arg(format!("--sysroot={}", sysroot.display()))
+        .args(["-std=gnu11", "-O2", "-Wall", "-Werror", "-fPIE", "-pie", "-fuse-ld=lld", "-nostdlib"])
+        .arg("-Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2")
+        .arg(lib.join("Scrt1.o"))
+        .arg(lib.join("crti.o"));
+    for dir in ["pipewire-0.3", "spa-0.2", "dbus-1.0", "dbus-arch"] {
+        cmd.arg(format!("-I{}", include.join(dir).display()));
+    }
+    cmd.arg(cbuild::libc_dir().join("linux").join("fossai-portal.c"))
+        .args(&needed_libs)
+        .arg(format!("-L{}", lib.display()))
+        .arg(format!("-L{}", sysroot.join("lib/x86_64-linux-gnu").display()))
+        .arg("-lc")
+        .arg(lib.join("crtn.o"))
+        .arg("-o")
+        .arg(&output);
+    say!("> clang (glibc) fossai-portal.c");
+    let status = cmd.status().context("не удалось запустить clang")?;
+    if !status.success() {
+        bail!("fossai-portal.c не собрался ({status})");
+    }
+    Ok(fs::read(&output)?)
 }

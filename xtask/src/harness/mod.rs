@@ -2872,6 +2872,31 @@ fn start_host_site() -> Result<(HostServer, u16)> {
                 )
                 .into_bytes()
             }
+            // Screen sharing page (28.11, `chromium-screenshare`):
+            // getDisplayMedia on load (`--use-fake-ui-for-media-stream` picks
+            // the screen without the picker), the stream in a <video>, frames
+            // counted by requestVideoFrameCallback; results in console.log
+            // (`fossai-screen: ...` lines with `--enable-logging=stderr`).
+            "/screen.html" => {
+                let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>FossAi screen</title>\
+                    <style>body{margin:0;padding:16px;background:#20262e;color:#fff;font:20px sans-serif}\
+                    video{width:640px;height:360px;background:#000;border:3px solid #6cf}</style></head>\
+                    <body><p>getDisplayMedia</p><video id=\"v\" autoplay muted playsinline></video><p id=\"out\"></p><script>\
+                    function t(s){console.log('fossai-screen: '+s);document.getElementById('out').textContent+=s+' | ';}\
+                    var v=document.getElementById('v'),n=0;\
+                    if(!navigator.mediaDevices||!navigator.mediaDevices.getDisplayMedia){t('error no getDisplayMedia');}else{\
+                    navigator.mediaDevices.getDisplayMedia({video:true}).then(function(s){var k=s.getVideoTracks()[0],st=k.getSettings();\
+                    t('ok '+st.width+'x'+st.height+' '+(k.label||'-')+' '+(st.displaySurface||'-'));v.srcObject=s;\
+                    function f(){n++;if(n==1||(n%30==0&&n<=300))t('frames '+n+' '+v.videoWidth+'x'+v.videoHeight);v.requestVideoFrameCallback(f);}\
+                    v.requestVideoFrameCallback(f);k.onended=function(){t('ended');};},\
+                    function(e){t('error '+e.name+' '+e.message);});}\
+                    </script></body></html>\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
             // Three seconds of 440 Hz, 48 kHz 16-bit stereo, for `media.html`.
             "/tone.wav" => {
                 let rate = 48_000u32;
