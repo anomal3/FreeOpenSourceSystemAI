@@ -7620,6 +7620,27 @@ pub fn client_cursor_image(task: u32, slot: u32, image: pointer::CustomCursor) -
     .is_some()
 }
 
+/// 28.11: `wp_cursor_shape_v1.set_shape` - one of our cursors over the
+/// program window by name (`None` - the default: the desktop's own arrow).
+pub fn client_cursor_shape(task: u32, slot: u32, shape: Option<pointer::Shape>) {
+    with_desktop_waiting(|desktop| {
+        let image = shape.and_then(|shape| desktop.pointer_shape_image(shape));
+        desktop.set_client_image(App::Program(task, slot), image, false);
+        desktop.present();
+    });
+}
+
+/// 28.11: `wp_pointer_warp_v1` - the program puts the pointer at the content
+/// point `(x, y)` of its focused window. `false` - refused.
+pub fn warp_pointer(task: u32, slot: u32, x: i32, y: i32) -> bool {
+    with_desktop_waiting(|desktop| {
+        let done = desktop.warp_pointer(App::Program(task, slot), x, y);
+        desktop.present();
+        done
+    })
+    .unwrap_or(false)
+}
+
 /// G3: raise and focus a program window (`xdg_activation_v1.activate`).
 pub fn activate_window(task: u32, slot: u32) -> Result<(), WindowError> {
     let app = App::Program(task, slot);

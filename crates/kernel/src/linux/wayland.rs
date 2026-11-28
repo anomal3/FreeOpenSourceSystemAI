@@ -525,7 +525,7 @@ impl Args<'_> {
 // ---- объекты --------------------------------------------------------------------
 
 /// Глобальные объекты: номер в реестре, интерфейс, версия.
-const GLOBALS: [(u32, &str, u32); 18] = [
+const GLOBALS: [(u32, &str, u32); 20] = [
     (1, "wl_compositor", 4),
     (2, "wl_subcompositor", 1),
     (3, "wl_shm", 1),
@@ -586,7 +586,59 @@ const GLOBALS: [(u32, &str, u32); 18] = [
     // focus and may set it. Both names, the same objects.
     (18, "ext_data_control_manager_v1", 1),
     (19, "zwlr_data_control_manager_v1", 2),
+    // 28.11 (ROADMAP «Мышь в полноэкранных играх»): cursors by name (Wine,
+    // Qt, GTK set the arrow, text, hand and resize cursors so, without an
+    // image surface) and the pointer put by the program (`SetCursorPos` of
+    // Wine 11 - before, only a short lock with a position hint).
+    (20, "wp_cursor_shape_manager_v1", 1),
+    (21, "wp_pointer_warp_v1", 1),
 ];
+
+/// Last `wp_cursor_shape_device_v1.shape` of version 1 (`zoom_out`).
+const CURSOR_SHAPE_MAX: u32 = 34;
+
+/// 28.11: a premultiplied ARGB image `scale` times smaller - every output
+/// point the average of its `scale` x `scale` block (premultiplied channels
+/// average without dark fringes). A partial last block is dropped.
+fn downscale_argb(pixels: &[u32], w: u32, h: u32, scale: u32) -> (Vec<u32>, u32, u32) {
+    let (ow, oh) = (w / scale, h / scale);
+    let mut out = Vec::with_capacity((ow * oh) as usize);
+    let n = scale * scale;
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut sum = [0u32; 4];
+            for y in oy * scale..(oy + 1) * scale {
+                for x in ox * scale..(ox + 1) * scale {
+                    let p = pixels[(y * w + x) as usize];
+                    for (i, s) in sum.iter_mut().enumerate() {
+                        *s += (p >> (i * 8)) & 0xff;
+                    }
+                }
+            }
+            out.push(sum.iter().enumerate().fold(0u32, |acc, (i, s)| acc | ((s / n) << (i * 8))));
+        }
+    }
+    (out, ow, oh)
+}
+
+/// A `wp_cursor_shape_device_v1.shape` as one of our cursors; `None` - the
+/// default (our arrow, chosen by the desktop). Shapes we have no picture for
+/// take the nearest one (crosshair, cell, help, zoom - the arrow).
+fn cursor_shape(shape: u32) -> Option<crate::ui::pointer::Shape> {
+    use crate::ui::pointer::Shape;
+    Some(match shape {
+        4 | 16 | 17 => Shape::Hand,
+        9 | 10 => Shape::Text,
+        13 | 32 => Shape::Move,
+        14 | 15 => Shape::NotAllowed,
+        18 | 25 | 26 | 30 => Shape::ResizeEw,
+        19 | 22 | 27 | 31 => Shape::ResizeNs,
+        20 | 24 | 28 => Shape::ResizeNesw,
+        21 | 23 | 29 => Shape::ResizeNwse,
+        1 => return None,
+        _ => Shape::Arrow,
+    })
+}
 
 // ---- мониторы (G5, 22.11) ----------------------------------------------------------
 //
@@ -1106,6 +1158,12 @@ struct SurfaceState {
     told: u8,
     run: u8,
     run_unpaced: bool,
+    /// 28.11: `wl_surface.set_buffer_scale` - in effect and waiting for
+    /// `commit`. Our outputs are scale 1, so windows ignore it; a cursor
+    /// surface of scale N is drawn N times smaller (its hotspot is already
+    /// in surface points).
+    scale: u32,
+    scale_next: Option<u32>,
 }
 
 /// Кусок буфера и размер поверхности (`wp_viewport`, D4 20.11.2026): Wine
@@ -1165,6 +1223,8 @@ impl SurfaceState {
             told: 0,
             run: 0,
             run_unpaced: false,
+            scale: 1,
+            scale_next: None,
         }
     }
 
@@ -1346,6 +1406,11 @@ enum Obj {
     IdleInhibitManager,
     /// `zwp_idle_inhibitor_v1` (22.11).
     IdleInhibitor,
+    /// 28.11: `wp_cursor_shape_manager_v1`, its `wp_cursor_shape_device_v1`
+    /// and `wp_pointer_warp_v1`.
+    CursorShapeManager,
+    CursorShapeDevice,
+    PointerWarp,
 }
 
 impl Obj {
@@ -1402,6 +1467,9 @@ impl Obj {
             Self::Fractional(_) => "wp_fractional_scale_v1",
             Self::IdleInhibitManager => "zwp_idle_inhibit_manager_v1",
             Self::IdleInhibitor => "zwp_idle_inhibitor_v1",
+            Self::CursorShapeManager => "wp_cursor_shape_manager_v1",
+            Self::CursorShapeDevice => "wp_cursor_shape_device_v1",
+            Self::PointerWarp => "wp_pointer_warp_v1",
         }
     }
 }
@@ -1510,6 +1578,11 @@ struct Client {
     rel_nobody: u32,
     /// 26.11: the first relative motion of the active constraint is logged.
     rel_told: bool,
+    /// 28.11: the last cursor shape logged (`wp_cursor_shape_v1`), and the
+    /// pointer warps done and refused (`wp_pointer_warp_v1`; the first of
+    /// each and every 1000th are logged - games warp every frame).
+    shape_told: Option<u32>,
+    warps: (u32, u32),
 }
 
 /// 26.11: `wl_pointer.set_cursor` with a surface.
@@ -1591,6 +1664,51 @@ impl Client {
             rel_unfocused: 0,
             rel_nobody: 0,
             rel_told: false,
+            shape_told: None,
+            warps: (0, 0),
+        }
+    }
+
+    /// 28.11: `wp_pointer_warp_v1.warp_pointer` - surface point to the
+    /// window's content point (subsurface offsets up to the root, minus the
+    /// `set_window_geometry` corner) and the desktop puts the pointer there
+    /// if the window has the focus.
+    fn warp_pointer(&mut self, surface: u32, x: i32, y: i32) {
+        let (mut wx, mut wy, mut id) = (x, y, surface);
+        for _ in 0..8 {
+            match self.objects.get(&id) {
+                Some(Obj::Surface(SurfaceState { role: Role::Sub { parent, x, y, .. }, .. })) => {
+                    wx += *x;
+                    wy += *y;
+                    id = *parent;
+                }
+                _ => break,
+            }
+        }
+        let Some(win) = self.wins.iter().find(|win| win.surface == id && win.open.is_some()) else {
+            return;
+        };
+        let (gx, gy) = win.geometry.map_or((0, 0), |(x, y, _, _)| (x, y));
+        let slot = win.slot;
+        let done = crate::ui::warp_pointer(self.pid, slot, wx - gx, wy - gy);
+        // The client hears where the pointer is now (as from a move) - not
+        // under a lock: a locked pointer sends no `wl_pointer.motion` (the
+        // warp only moves the place it shows again).
+        if done && !self.constraints.iter().any(|c| c.active && c.lock) {
+            self.pointer_motion(surface, x, y, crate::time::uptime_ms() as u32);
+        }
+        let count = if done { &mut self.warps.0 } else { &mut self.warps.1 };
+        *count = count.wrapping_add(1);
+        if *count % 1000 == 1 {
+            kprintln!(
+                "  wayland     : #{} pointer warp to {},{} of surface {surface} {} ({} done, {} refused)",
+                self.pid,
+                x,
+                y,
+                if done { "done" } else { "refused (window without focus or point outside it)" },
+                self.warps.0,
+                self.warps.1
+            );
         }
     }
 
@@ -1989,6 +2107,49 @@ impl Client {
                     kprintln!("  wayland     : client #{} lets the screensaver run again", self.pid);
                 }
             }
+            // 28.11: `destroy`, `get_pointer(id, wl_pointer)`,
+            // `get_tablet_tool_v2(id, tool)` (no tablets: an inert device).
+            Obj::CursorShapeManager => match opcode {
+                0 => self.delete(id),
+                1 | 2 => {
+                    let (new, _of) = (args.u32()?, args.u32()?);
+                    self.objects.insert(new, Obj::CursorShapeDevice);
+                }
+                _ => {}
+            },
+            // `destroy`, `set_shape(serial, shape)`: one of our cursors over
+            // the window under the pointer, as `set_cursor` with a surface.
+            Obj::CursorShapeDevice => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let (_serial, shape) = (args.u32()?, args.u32()?);
+                    if shape == 0 || shape > CURSOR_SHAPE_MAX {
+                        self.fail(id, 1, "invalid cursor shape");
+                        return Ok(());
+                    }
+                    let root = self.pointer_on.map(|on| self.root_of(on));
+                    if let Some(slot) = root.and_then(|root| self.wins.iter().find(|win| win.surface == root && win.open.is_some())).map(|win| win.slot) {
+                        self.cursor = None;
+                        if self.shape_told != Some(shape) {
+                            self.shape_told = Some(shape);
+                            kprintln!("  wayland     : #{} cursor shape {shape} over its window", self.pid);
+                        }
+                        crate::ui::client_cursor_shape(self.pid, slot, cursor_shape(shape));
+                    }
+                }
+                _ => {}
+            },
+            // `destroy`, `warp_pointer(surface, pointer, x, y, serial)`.
+            Obj::PointerWarp => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let (surface, _pointer) = (args.u32()?, args.u32()?);
+                    let (x, y) = (args.i32()? >> 8, args.i32()? >> 8);
+                    let _serial = args.u32()?;
+                    self.warp_pointer(surface, x, y);
+                }
+                _ => {}
+            },
             Obj::Callback | Obj::Region | Obj::Output { .. } | Obj::Keyboard => {
                 // `destroy`/`release` у тех, у кого он есть, — нулевой.
                 let destroys = match object {
@@ -2593,6 +2754,8 @@ impl Client {
             16 => Obj::IdleInhibitManager,
             18 => Obj::DcManager(false),
             19 => Obj::DcManager(true),
+            20 => Obj::CursorShapeManager,
+            21 => Obj::PointerWarp,
             _ => Obj::XdgOutputManager(version),
         };
         self.objects.insert(new, object);
@@ -2889,6 +3052,18 @@ impl Client {
                 }
             }
             6 => self.commit(id),
+            // 28.11: `set_buffer_scale(scale)` - double-buffered; less than 1
+            // is the protocol error `invalid_scale`.
+            8 => {
+                let scale = args.i32()?;
+                if scale < 1 {
+                    self.fail(id, 0, "buffer scale must be at least 1");
+                    return Ok(());
+                }
+                if let Some(Obj::Surface(state)) = self.objects.get_mut(&id) {
+                    state.scale_next = Some(scale.min(8) as u32);
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -3140,6 +3315,9 @@ impl Client {
         if let Some(Obj::Surface(state)) = self.objects.get_mut(&id) {
             if let Some(hint) = state.tearing_next.take() {
                 state.tearing_async = hint;
+            }
+            if let Some(scale) = state.scale_next.take() {
+                state.scale = scale;
             }
             if attached && pending != Some(None) {
                 unpaced = state.tearing_async || !paced;
@@ -3525,7 +3703,10 @@ impl Client {
         let Some((_, buf)) = state.shown.as_ref() else {
             return false;
         };
-        let max = crate::ui::pointer::CUSTOM_MAX;
+        // 28.11: a scale-N cursor buffer (a HiDPI cursor theme) is N times
+        // the surface: read up to N x the largest image, then average N x N.
+        let scale = state.scale.max(1);
+        let max = crate::ui::pointer::CUSTOM_MAX * scale;
         let (w, h) = (buf.width.min(max), buf.height.min(max));
         let mut pixels = vec![0u32; (w * h) as usize];
         let xrgb = buf.format == SHM_XRGB8888;
@@ -3541,6 +3722,10 @@ impl Client {
                     *pixel |= 0xff00_0000;
                 }
             }
+        }
+        let (pixels, w, h) = if scale > 1 { downscale_argb(&pixels, w, h, scale) } else { (pixels, w, h) };
+        if w == 0 || h == 0 {
+            return false;
         }
         let image = crate::ui::pointer::CustomCursor {
             pixels: Arc::new(pixels),
@@ -4554,10 +4739,24 @@ impl Client {
                                 }
                             );
                         }
+                        let any = !relatives.is_empty();
                         for relative in relatives {
                             self.send(
                                 Msg::new(relative, 0).u32((us >> 32) as u32).u32(us as u32).fixed(dx).fixed(dy).fixed(dx).fixed(dy),
                             );
+                        }
+                        // 28.11: relative motion belongs to a `wl_pointer`
+                        // frame (relative-pointer-unstable-v1: grouped by
+                        // `wl_pointer.frame`). Wine GE accumulates it and
+                        // turns it into WM_INPUT only at the frame; under a
+                        // lock no absolute motion came with a frame, so the
+                        // deltas piled up unsent (proton-mouse: `accum=200,60`
+                        // and 0 WM_INPUT - the camera/turret did not move).
+                        if any {
+                            let pointers: Vec<u32> = self.objects.iter().filter(|(_, obj)| matches!(obj, Obj::Pointer)).map(|(id, _)| *id).collect();
+                            for pointer in pointers {
+                                self.send(Msg::new(pointer, 5));
+                            }
                         }
                     }
                     user_abi::WIN_FOCUS => {

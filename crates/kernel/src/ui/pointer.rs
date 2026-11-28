@@ -214,6 +214,33 @@ impl Pointer {
         !same
     }
 
+    /// 28.11 (`wp_cursor_shape_v1`): one of our shapes as a program cursor
+    /// image, at the size the desktop draws now (premultiplied like Wayland
+    /// images). The key is fixed per shape and size: setting the same shape
+    /// again does not resend the adapter cursor.
+    #[must_use]
+    pub fn shape_image(&self, shape: Shape) -> Option<CustomCursor> {
+        const SHAPE_KEY: usize = 1 << 40;
+        let large = self.large;
+        with_image(large, shape as usize, |image, hot| {
+            let mut pixels = Vec::with_capacity((image.width * image.height) as usize);
+            for y in 0..image.height {
+                for x in 0..image.width {
+                    let [r, g, b, a] = image.pixel(x, y);
+                    let pm = |c: u8| u32::from(c) * u32::from(a) / 255;
+                    pixels.push((u32::from(a) << 24) | (pm(r) << 16) | (pm(g) << 8) | pm(b));
+                }
+            }
+            CustomCursor {
+                pixels: Arc::new(pixels),
+                width: image.width,
+                height: image.height,
+                hot: (hot.0 as i32, hot.1 as i32),
+                key: SHAPE_KEY + shape as usize * 2 + usize::from(large),
+            }
+        })
+    }
+
     /// Прямоугольник, который занимает картинка курсора. Один на все формы —
     /// квадрат картинки, сдвинутый на точку прицела стрелки: смена формы
     /// стирает и прежнюю картинку.

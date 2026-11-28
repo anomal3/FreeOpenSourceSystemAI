@@ -6054,6 +6054,55 @@ impl Compositor {
         }
     }
 
+    /// 28.11: `wp_pointer_warp_v1` - the focused program window puts the
+    /// pointer at its content point `(x, y)`, like `SetCursorPos` on Windows
+    /// (Wine 11 warps so; before, only through a short lock with a position
+    /// hint). Refused for a window without the focus and for a point outside
+    /// its content. Under a lock the pointer stays hidden and the point is
+    /// where it shows again; a confinement keeps it inside its area.
+    pub fn warp_pointer(&mut self, app: App, x: i32, y: i32) -> bool {
+        if self.focused_app() != Some(app) {
+            return false;
+        }
+        let Some(window) = self.windows.iter().find(|window| window.app == app && !window.minimized) else {
+            return false;
+        };
+        let (ox, oy) = window.content_origin();
+        let body = Rect::new(ox, oy, window.rect.w.saturating_sub((ox - window.rect.x) as u32), window.rect.h.saturating_sub((oy - window.rect.y) as u32));
+        let (tx, ty) = (ox + x, oy + y);
+        if !body.contains(tx, ty) {
+            return false;
+        }
+        if let Some(c) = self.constraint.as_mut().filter(|c| c.app == app && c.active && c.lock) {
+            c.hint = Some((x, y));
+            return true;
+        }
+        let (tx, ty) = match self.confine_rect() {
+            Some(area) => (tx.clamp(area.x, area.right() - 1), ty.clamp(area.y, area.bottom() - 1)),
+            None => (tx, ty),
+        };
+        let ghost = self.ghost_rect();
+        let outs = self.out_rects;
+        let before = self.pointer.rect();
+        if self.pointer.move_to(tx, ty, &outs[..self.outputs.len().min(MAX_OUTPUTS)]) && !self.hand_cursor(false) {
+            self.mark(before);
+            let after = self.pointer.rect();
+            self.mark(after);
+        }
+        self.ghost_moved(ghost);
+        if self.cursor_hidden_by.is_some() || !self.client_cursors.is_empty() {
+            self.sync_client_cursor();
+        }
+        true
+    }
+
+    /// 28.11: one of our cursor shapes as a program cursor image
+    /// (`wp_cursor_shape_v1`), at the size drawn now.
+    #[must_use]
+    pub fn pointer_shape_image(&self, shape: super::pointer::Shape) -> Option<super::pointer::CustomCursor> {
+        self.pointer.shape_image(shape)
+    }
+
     /// Is the constraint of `app` active (`None` - none asked)?
     #[must_use]
     pub fn constraint_active(&self, app: App) -> Option<bool> {

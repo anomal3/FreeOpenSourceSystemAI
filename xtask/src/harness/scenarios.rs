@@ -9939,6 +9939,22 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(800),
             Step::Shot("wayland-cursor"),
             Step::Await("waylandcheck: ok wl_pointer.set_cursor with a surface is taken", 30_000),
+            // 28.11: a scale-2 cursor buffer 48x48 shown as 24x24, our text
+            // cursor by name (wp_cursor_shape_v1), the pointer put by the
+            // program (wp_pointer_warp_v1) and heard back as motion.
+            Step::Await("shows its own cursor image 24x24 (hotspot 6,6)", 30_000),
+            Step::Await("waylandcheck: scaled cursor shown", 30_000),
+            Step::Wait(800),
+            Step::Shot("wayland-cursor-scale2"),
+            Step::Await("waylandcheck: ok a scale-2 cursor surface is taken", 30_000),
+            Step::Await("waylandcheck: ok registry lists wp_cursor_shape_manager_v1 and wp_pointer_warp_v1", 30_000),
+            Step::Await("cursor shape 9 over its window", 30_000),
+            Step::Await("waylandcheck: cursor shape text shown", 30_000),
+            Step::Wait(800),
+            Step::Shot("wayland-cursor-shape"),
+            Step::Await("waylandcheck: ok wp_cursor_shape_device_v1.set_shape(text) is taken", 30_000),
+            Step::Await("pointer warp to 100,80 of surface", 30_000),
+            Step::Await("waylandcheck: ok wp_pointer_warp_v1 puts the pointer at 100,80 of the window", 30_000),
             Step::Await("waylandcheck: ok lock_pointer gets locked while the window has the focus and the pointer", 30_000),
             Step::Await("waylandcheck: waiting for relative motion", 30_000),
             Step::Wait(500),

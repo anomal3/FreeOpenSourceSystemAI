@@ -97,9 +97,12 @@ enum {
     /* ext_data_control_manager_v1 (Wine's clipboard sync) and its device. */
     ID_DCM, ID_DCDEV,
     /* 26.11: own cursor image (wl_pointer.set_cursor with a surface). */
-    ID_CSURF, ID_CPOOL, ID_CBUF, ID_SYNC8
+    ID_CSURF, ID_CPOOL, ID_CBUF, ID_SYNC8,
+    /* 28.11: a scale-2 cursor surface, cursor shapes by name, pointer warp. */
+    ID_CSURF2, ID_CPOOL2, ID_CBUF2, ID_SYNC9, ID_CSHAPE, ID_CSHAPEDEV, ID_SYNC10, ID_WARP, ID_SYNC11
 };
-static int synced8;
+static int synced8, synced9, synced10, synced11, warp_seen;
+static uint32_t global_cshape, global_warp;
 static uint32_t global_dcm, dc_offer;
 static int dc_text, dc_gnome, dc_sel, dc_files;
 /* Clipboard: the current offer and what it offers, the selection offer,
@@ -169,6 +172,8 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         if (!strcmp(interface, "zwp_pointer_constraints_v1")) global_constraints = name;
         if (!strcmp(interface, "xdg_activation_v1")) global_activation = name;
         if (!strcmp(interface, "wp_fractional_scale_manager_v1")) global_fractional = name;
+        if (!strcmp(interface, "wp_cursor_shape_manager_v1")) global_cshape = name;
+        if (!strcmp(interface, "wp_pointer_warp_v1")) global_warp = name;
         if (!strcmp(interface, "wl_output")) {
             if (!global_output) global_output = name;
             if (n_out < MAX_OUT) out_names[n_out++] = name;
@@ -273,6 +278,12 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
         synced7 = 1;
     } else if (id == ID_SYNC8 && opcode == 0) {
         synced8 = 1;
+    } else if (id == ID_SYNC9 && opcode == 0) {
+        synced9 = 1;
+    } else if (id == ID_SYNC10 && opcode == 0) {
+        synced10 = 1;
+    } else if (id == ID_SYNC11 && opcode == 0) {
+        synced11 = 1;
     } else if (id == ID_POPUP && opcode == 2) {
         repositioned_token = (int)args[0];
     } else if (id == ID_SYNC5 && opcode == 0) {
@@ -344,6 +355,7 @@ static void handle(uint32_t id, uint32_t opcode, uint32_t *args, int words) {
     } else if (id == ID_POINTER && opcode == 2) {
         /* motion(time, x, y) */
         int x = (int32_t)args[1] / 256, y = (int32_t)args[2] / 256;
+        if (x == 100 && y == 80) warp_seen = 1;
         if (confine2_on) {
             confine2_moves++;
             if (x < confine2_min_x) confine2_min_x = x;
@@ -1600,6 +1612,73 @@ int main(int argc, char **argv) {
     fflush(stdout);
     wait_for(&never, 3000);
     check(synced8 && !protocol_error, "wl_pointer.set_cursor with a surface is taken");
+
+    /* 28.11 (ROADMAP: mouse in fullscreen games): a scale-2 cursor buffer
+     * 48x48 is a 24x24 cursor (the kernel logs the size it shows), our
+     * cursors by name (wp_cursor_shape_v1: text), and the pointer put by the
+     * program (wp_pointer_warp_v1, Wine 11's SetCursorPos) - the client
+     * hears the new place as wl_pointer.motion 100,80. */
+    begin(ID_COMPOSITOR, 0); /* create_surface */
+    put(ID_CSURF2);
+    end();
+    shm_buffer(ID_CPOOL2, ID_CBUF2, 48, 48, 0xff00ffffu);
+    begin(ID_CSURF2, 8); /* set_buffer_scale(2) */
+    put(2);
+    end();
+    show(ID_CSURF2, ID_CBUF2, 48, 48);
+    begin(ID_POINTER, 0); /* set_cursor(serial, surface, hx, hy) in surface points */
+    put(0);
+    put(ID_CSURF2);
+    put(6);
+    put(6);
+    end();
+    begin(ID_DISPLAY, 0);
+    put(ID_SYNC9);
+    end();
+    wait_for(&synced9, 5000);
+    say("scaled cursor shown");
+    wait_for(&never, 2000);
+    check(synced9 && !protocol_error, "a scale-2 cursor surface is taken");
+    check(global_cshape && global_warp, "registry lists wp_cursor_shape_manager_v1 and wp_pointer_warp_v1");
+    if (global_cshape) {
+        bind_global(global_cshape, "wp_cursor_shape_manager_v1", 1, ID_CSHAPE);
+        begin(ID_CSHAPE, 1); /* get_pointer(id, pointer) */
+        put(ID_CSHAPEDEV);
+        put(ID_POINTER);
+        end();
+        begin(ID_CSHAPEDEV, 1); /* set_shape(serial, text) */
+        put(0);
+        put(9);
+        end();
+        begin(ID_DISPLAY, 0);
+        put(ID_SYNC10);
+        end();
+        wait_for(&synced10, 5000);
+        say("cursor shape text shown");
+        wait_for(&never, 2000);
+        check(synced10 && !protocol_error, "wp_cursor_shape_device_v1.set_shape(text) is taken");
+        begin(ID_CSHAPEDEV, 1); /* set_shape(serial, default) */
+        put(0);
+        put(1);
+        end();
+    }
+    if (global_warp) {
+        bind_global(global_warp, "wp_pointer_warp_v1", 1, ID_WARP);
+        warp_seen = 0;
+        begin(ID_WARP, 1); /* warp_pointer(surface, pointer, x, y, serial) */
+        put(ID_SURFACE);
+        put(ID_POINTER);
+        put(100 * 256);
+        put(80 * 256);
+        put(0);
+        end();
+        begin(ID_DISPLAY, 0);
+        put(ID_SYNC11);
+        end();
+        wait_for(&synced11, 5000);
+        wait_for(&warp_seen, 3000);
+        check(warp_seen && !protocol_error, "wp_pointer_warp_v1 puts the pointer at 100,80 of the window");
+    }
 
     if (global_relative && global_constraints) {
         bind_global(global_relative, "zwp_relative_pointer_manager_v1", 1, ID_RELMGR);
