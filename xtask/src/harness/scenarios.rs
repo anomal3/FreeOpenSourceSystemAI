@@ -19666,6 +19666,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("sockfd: end of stream reads as zero", 30_000),
             Step::Await("sockfd: fstat says socket", 15_000),
             Step::Await("sockfd: nonblocking connect finished", 30_000),
+            // SO_RCVTIMEO of native sockets (28.11).
+            Step::Await("sockfd: udp read timed out after ", 15_000),
             Step::Await("sockfd: client done", 15_000),
             // Сервер: блокирующий `accept`, эхо до конца потока клиента.
             Step::Line("run -b /bin/sockfd serve 2000"),

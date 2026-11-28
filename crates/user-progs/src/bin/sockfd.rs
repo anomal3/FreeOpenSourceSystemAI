@@ -13,10 +13,10 @@
 #![no_main]
 
 use user_abi::{
-    ERR_IN_PROGRESS, KIND_SOCKET, POLL_IN, POLL_OUT, PollFd, SOCKCTL_ACCEPT, SOCKCTL_BIND,
-    SOCKCTL_CONNECT, SOCKCTL_LISTEN, SOCKCTL_SHUTDOWN, SockInfo, Stat,
+    ERR_AGAIN, ERR_IN_PROGRESS, KIND_SOCKET, POLL_IN, POLL_OUT, PollFd, SOCKCTL_ACCEPT, SOCKCTL_BIND,
+    SOCKCTL_CONNECT, SOCKCTL_LISTEN, SOCKCTL_RCVTIMEO, SOCKCTL_SHUTDOWN, SockInfo, Stat,
 };
-use user_progs::{Args, Line, close, error, exit, fstat, poll, read, sock_info, sockctl, sockfd, write};
+use user_progs::{Args, Line, close, error, exit, fstat, poll, read, sock_info, sockctl, sockfd, uptime_ms, write};
 
 /// Сколько ждать ответа эхо-сервера.
 const REPLY_MS: i64 = 10_000;
@@ -122,6 +122,30 @@ fn client(address: u32, port: u16) -> ! {
         .str("sockfd: nonblocking connect finished, local port ")
         .num(u64::from(info.local_port))
         .end();
+    close(fd);
+
+    // Read timeout (28.11, SOCKCTL_RCVTIMEO = SO_RCVTIMEO): a UDP socket
+    // nobody writes to - a blocking read answers ERR_AGAIN after the limit
+    // instead of waiting forever.
+    let fd = sockfd(false, false);
+    if fd < 0 {
+        fail("udp socket", fd);
+    }
+    let code = sockctl(fd, SOCKCTL_BIND, 0);
+    if code < 0 {
+        fail("udp bind", code);
+    }
+    let code = sockctl(fd, SOCKCTL_RCVTIMEO, 300);
+    if code < 0 {
+        fail("read timeout", code);
+    }
+    let start = uptime_ms();
+    let got = read(fd, &mut buffer);
+    let waited = uptime_ms() - start;
+    if got != ERR_AGAIN || !(250..3_000).contains(&waited) {
+        fail("udp read with a 300 ms limit", got);
+    }
+    Line::new().str("sockfd: udp read timed out after ").num(waited).str(" ms (limit 300)").end();
     close(fd);
 
     Line::new().str("sockfd: client done").end();

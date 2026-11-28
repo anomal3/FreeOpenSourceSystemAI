@@ -1305,6 +1305,9 @@ mod tests {
             "SOCKCTL_SHUTDOWN" => abi::SOCKCTL_SHUTDOWN as i64,
             "SOCKCTL_NONBLOCK" => abi::SOCKCTL_NONBLOCK as i64,
             "SOCKCTL_INFO" => abi::SOCKCTL_INFO as i64,
+            "SOCKCTL_RCVTIMEO" => abi::SOCKCTL_RCVTIMEO as i64,
+            "SOCKCTL_SNDTIMEO" => abi::SOCKCTL_SNDTIMEO as i64,
+            "SOCKCTL_TIMEOUT" => abi::SOCKCTL_TIMEOUT as i64,
 
             "MAP_LAZY" => abi::MAP_LAZY as i64,
             "MAP_JIT" => abi::MAP_JIT as i64,

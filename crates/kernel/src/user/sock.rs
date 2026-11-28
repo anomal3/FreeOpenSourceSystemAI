@@ -15,7 +15,7 @@
 //! таблицы под замком, `Arc` клонируется, и замок отпускается до ожидания —
 //! иначе спящий остановил бы каждого, кто заглянет в таблицу (см. `files.rs`).
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::mm::PageFlags;
 use crate::net::ipv4::Ipv4;
@@ -43,6 +43,15 @@ pub struct Sock {
     /// пользуются и потоки программы, и наследник после `dup`.
     owner: TaskId,
     nonblock: AtomicBool,
+    /// `SO_RCVTIMEO`/`SO_SNDTIMEO` (28.11, `SOCKCTL_RCVTIMEO`/`SNDTIMEO`).
+    timeouts: Timeouts,
+}
+
+/// Wait limits of a socket descriptor, ms; zero - no limit.
+#[derive(Default)]
+struct Timeouts {
+    recv_ms: AtomicU64,
+    send_ms: AtomicU64,
 }
 
 impl Drop for Sock {
@@ -63,7 +72,7 @@ impl Sock {
         let owner = crate::sched::current();
         let index = if tcp { net::stream_open(owner) } else { net::socket_open(owner) }
             .map_err(super::syscall::net_errno)?;
-        Ok(Self { tcp, index, owner, nonblock: AtomicBool::new(nonblock) })
+        Ok(Self { tcp, index, owner, nonblock: AtomicBool::new(nonblock), timeouts: Timeouts::default() })
     }
 
     pub fn set_nonblock(&self, on: bool) {
@@ -72,6 +81,18 @@ impl Sock {
 
     pub fn nonblock(&self) -> bool {
         self.nonblock.load(Ordering::Relaxed)
+    }
+
+    /// Wait limit of receiving (`send == false`: read, accept) or sending
+    /// (write, connect), ms; zero - wait without limit.
+    pub fn set_timeout(&self, send: bool, ms: u64) {
+        let slot = if send { &self.timeouts.send_ms } else { &self.timeouts.recv_ms };
+        slot.store(ms, Ordering::Relaxed);
+    }
+
+    pub fn timeout(&self, send: bool) -> u64 {
+        let slot = if send { &self.timeouts.send_ms } else { &self.timeouts.recv_ms };
+        slot.load(Ordering::Relaxed)
     }
 
     /// `(есть что читать, можно писать, связь кончилась)` — для `SYS_POLL`.
@@ -90,7 +111,11 @@ impl Sock {
     ///
     /// Поколение событий запоминается **до** попытки: событие, пришедшее между
     /// неудачной попыткой и засыпанием, сменило его, и сон не начнётся.
-    fn wait<T>(&self, mut attempt: impl FnMut() -> Option<Result<T, i64>>) -> Result<T, i64> {
+    /// `send` picks the limit (`SO_SNDTIMEO` or `SO_RCVTIMEO`): past it the
+    /// answer is [`ERR_AGAIN`], as `EAGAIN` of Linux.
+    fn wait<T>(&self, send: bool, mut attempt: impl FnMut() -> Option<Result<T, i64>>) -> Result<T, i64> {
+        let limit = self.timeout(send);
+        let deadline = (limit > 0).then(|| time::uptime_ms().saturating_add(limit));
         loop {
             let seen = io_events::generation();
             if let Some(done) = attempt() {
@@ -104,13 +129,20 @@ impl Sock {
             if super::kill_pending() {
                 return Err(ERR_AGAIN);
             }
-            io_events::wait(seen, Some(time::uptime_ms() + SLICE_MS));
+            let mut until = time::uptime_ms() + SLICE_MS;
+            if let Some(deadline) = deadline {
+                if time::uptime_ms() >= deadline {
+                    return Err(ERR_AGAIN);
+                }
+                until = until.min(deadline);
+            }
+            io_events::wait(seen, Some(until));
         }
     }
 
     /// `read`: данные, ноль — конец потока, или ошибка.
     pub fn read(&self, ptr: usize, len: usize) -> Result<usize, i64> {
-        self.wait(|| {
+        self.wait(false, || {
             // Буфер перепроверяется на каждой попытке: пока сокет спал, поток
             // той же программы мог отдать эту память.
             if !space::user_can(ptr, len, PageFlags::WRITE) {
@@ -150,7 +182,7 @@ impl Sock {
     /// `write`: блокирующий отдаёт всё, неблокирующий — сколько влезло.
     pub fn write(&self, ptr: usize, len: usize) -> Result<usize, i64> {
         let mut sent = 0usize;
-        self.wait(|| {
+        self.wait(true, || {
             if !space::user_can(ptr, len, PageFlags::READ) {
                 return Some(Err(ERR_BAD_ADDRESS));
             }
@@ -212,7 +244,7 @@ impl Sock {
         if self.nonblock() {
             return Err(ERR_IN_PROGRESS);
         }
-        self.wait(|| match net::stream_info(self.owner, self.index) {
+        self.wait(true, || match net::stream_info(self.owner, self.index) {
             Ok((_, _, _, _, _, true)) => Some(Err(ERR_CONN_REFUSED)),
             Ok((_, _, _, state, _, _)) if state.is_open() => Some(Ok(())),
             // Попытка кончилась ничем (закрыли, пока ждали) — тоже отказ.
@@ -234,13 +266,13 @@ impl Sock {
         if !self.tcp {
             return Err(ERR_UNSUPPORTED);
         }
-        let index = self.wait(|| match net::stream_accept(self.owner, self.index) {
+        let index = self.wait(false, || match net::stream_accept(self.owner, self.index) {
             Ok(Some(index)) => Some(Ok(index)),
             Ok(None) => None,
             Err(err) => Some(Err(super::syscall::net_errno(err))),
         })?;
         // Принятое соединение стек отдаёт хозяину слушающего — тот же хозяин.
-        Ok(Self { tcp: true, index, owner: self.owner, nonblock: AtomicBool::new(false) })
+        Ok(Self { tcp: true, index, owner: self.owner, nonblock: AtomicBool::new(false), timeouts: Timeouts::default() })
     }
 
     pub fn shutdown(&self) -> Result<(), i64> {
@@ -261,7 +293,7 @@ impl Sock {
     pub fn open_as(tcp: bool, owner: TaskId) -> Result<Self, i64> {
         let index = if tcp { net::stream_open(owner) } else { net::socket_open(owner) }
             .map_err(super::syscall::net_errno)?;
-        Ok(Self { tcp, index, owner, nonblock: AtomicBool::new(true) })
+        Ok(Self { tcp, index, owner, nonblock: AtomicBool::new(true), timeouts: Timeouts::default() })
     }
 
     pub fn is_tcp(&self) -> bool {
@@ -345,7 +377,7 @@ impl Sock {
     /// Принять соединение, если оно есть.
     pub fn accept_now(&self) -> Result<Self, i64> {
         match net::stream_accept(self.owner, self.index) {
-            Ok(Some(index)) => Ok(Self { tcp: true, index, owner: self.owner, nonblock: AtomicBool::new(true) }),
+            Ok(Some(index)) => Ok(Self { tcp: true, index, owner: self.owner, nonblock: AtomicBool::new(true), timeouts: Timeouts::default() }),
             Ok(None) => Err(ERR_AGAIN),
             Err(err) => Err(super::syscall::net_errno(err)),
         }

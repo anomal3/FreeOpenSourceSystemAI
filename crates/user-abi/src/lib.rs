@@ -2755,6 +2755,14 @@ pub const SOCKCTL_SHUTDOWN: usize = 5;
 pub const SOCKCTL_NONBLOCK: usize = 6;
 /// [`SYS_SOCKCTL`]: что известно о сокете. Аргумент — адрес [`SockInfo`].
 pub const SOCKCTL_INFO: usize = 7;
+/// [`SYS_SOCKCTL`] (28.11): wait limit of reading and accepting
+/// (`SO_RCVTIMEO`), ms; zero - wait without limit (as before). A blocking
+/// read that gets nothing within the limit answers [`ERR_AGAIN`].
+pub const SOCKCTL_RCVTIMEO: usize = 8;
+/// [`SYS_SOCKCTL`] (28.11): the same for writing and connecting (`SO_SNDTIMEO`).
+pub const SOCKCTL_SNDTIMEO: usize = 9;
+/// [`SYS_SOCKCTL`] (28.11): the limit now, ms. Argument 0 - reading, 1 - writing.
+pub const SOCKCTL_TIMEOUT: usize = 10;
 
 /// Что известно о сокете-дескрипторе — ответ [`SOCKCTL_INFO`].
 #[repr(C)]

@@ -359,6 +359,23 @@ int getsockopt(int fd, int level, int name, void *value, socklen_t *length) {
             return put_int(value, length, info.tcp ? SOCK_STREAM : SOCK_DGRAM);
         case SO_ACCEPTCONN:
             return put_int(value, length, info.listening);
+        case SO_RCVTIMEO:
+        case SO_SNDTIMEO: {
+            if (value == NULL || length == NULL || *length < sizeof(struct timeval)) {
+                errno = EINVAL;
+                return -1;
+            }
+            long ms = freeos_syscall(SYS_SOCKCTL, fd, FREEOS_SOCKCTL_TIMEOUT, name == SO_SNDTIMEO ? 1 : 0);
+            if (ms < 0) {
+                return freeos_set_errno(ms);
+            }
+            struct timeval limit;
+            limit.tv_sec = ms / 1000;
+            limit.tv_usec = (ms % 1000) * 1000;
+            memcpy(value, &limit, sizeof(limit));
+            *length = sizeof(limit);
+            return 0;
+        }
         case SO_SNDBUF:
         case SO_RCVBUF:
             return put_int(value, length, 8192);
@@ -387,6 +404,24 @@ int setsockopt(int fd, int level, int name, const void *value, socklen_t length)
     struct freeos_sockinfo info;
     if (info_of(fd, &info) != 0) {
         return -1;
+    }
+    /* Wait limits (28.11): the kernel keeps them on the socket, a blocking
+     * read or accept past SO_RCVTIMEO (write, connect past SO_SNDTIMEO)
+     * answers EAGAIN, as on Linux. */
+    if (level == SOL_SOCKET && (name == SO_RCVTIMEO || name == SO_SNDTIMEO)) {
+        struct timeval limit;
+        if (value == NULL || length < sizeof(limit)) {
+            errno = EINVAL;
+            return -1;
+        }
+        memcpy(&limit, value, sizeof(limit));
+        if (limit.tv_sec < 0 || limit.tv_usec < 0 || limit.tv_usec >= 1000000) {
+            errno = EDOM;
+            return -1;
+        }
+        unsigned long long ms = (unsigned long long)limit.tv_sec * 1000ull + ((unsigned long long)limit.tv_usec + 999ull) / 1000ull;
+        long code = freeos_syscall(SYS_SOCKCTL, fd, name == SO_RCVTIMEO ? FREEOS_SOCKCTL_RCVTIMEO : FREEOS_SOCKCTL_SNDTIMEO, (long)ms);
+        return code < 0 ? freeos_set_errno(code) : 0;
     }
     if (level == SOL_SOCKET) {
         switch (name) {

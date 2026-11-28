@@ -1074,6 +1074,11 @@ fn sockctl(fd: usize, op: usize, arg: usize) -> i64 {
             socket.set_nonblock(arg != 0);
             0
         }
+        user_abi::SOCKCTL_RCVTIMEO | user_abi::SOCKCTL_SNDTIMEO => {
+            socket.set_timeout(op == user_abi::SOCKCTL_SNDTIMEO, arg as u64);
+            0
+        }
+        user_abi::SOCKCTL_TIMEOUT => socket.timeout(arg != 0).min(i64::MAX as u64) as i64,
         user_abi::SOCKCTL_INFO => {
             if arg % align_of::<user_abi::SockInfo>() != 0
                 || !space::user_can(arg, size_of::<user_abi::SockInfo>(), PageFlags::WRITE)

@@ -123,6 +123,10 @@
 #define FREEOS_SOCKCTL_SHUTDOWN 5
 #define FREEOS_SOCKCTL_NONBLOCK 6
 #define FREEOS_SOCKCTL_INFO 7
+/* SO_RCVTIMEO / SO_SNDTIMEO in ms, and the limit now (28.11). */
+#define FREEOS_SOCKCTL_RCVTIMEO 8
+#define FREEOS_SOCKCTL_SNDTIMEO 9
+#define FREEOS_SOCKCTL_TIMEOUT 10
 
 /* Действия `SYS_FDCTL` и бит его ответа (фаза 66b). */
 #define FREEOS_FDCTL_NONBLOCK 1
