@@ -14992,13 +14992,15 @@ pub const ALL: &[Scenario] = &[
     // obsos-media: str0m + Opus + H.264): the OBSOS build comes from
     // FOSSAI_OBSOS_DIR (package.rs), e.g.
     //   set "FOSSAI_OBSOS_DIR=E:\BlueGit\FreeOpenSourseSystemAI\build\obsos-webrtc-out"
-    // The page calls itself: the test tone as the microphone both ways, the
-    // screen (SYS_SCREENCAP) A -> B, a data channel; the far side's sound goes
-    // to SYS_SOUND and must be 440 Hz in the WAV. The kernel has no
-    // environment for programs, so the test variables come as `--env`.
+    // The page calls itself: the microphone both ways (28.11: SYS_SOUND
+    // SOUND_MIC_* - the HDA input of an `hda-micro` codec on `-audiodev none`,
+    // silence, but the stream runs and frames are read), the screen
+    // (SYS_SCREENCAP) A -> B, a data channel; speakers stay on virtio-sound.
+    // The kernel has no environment for programs, so the test variables come
+    // as `--env`.
     Scenario {
         name: "obsos-webrtc",
-        about: "OBSOS calls on FossAi (28.11, obsos-media: str0m, Opus, H.264, no GStreamer; OBSOS from FOSSAI_OBSOS_DIR): a host page makes a loopback call - ICE and DTLS connect, Opus packets flow both ways (test tone as the microphone), the screen from getDisplayMedia arrives as decoded H.264 frames in a <video>, the data channel answers, and the far side's 440 Hz tone plays through SYS_SOUND into the WAV.",
+        about: "OBSOS calls on FossAi (28.11, obsos-media: str0m, Opus, H.264, no GStreamer; OBSOS from FOSSAI_OBSOS_DIR): a host page makes a loopback call - ICE and DTLS connect, Opus packets flow both ways (the microphone through SYS_SOUND SOUND_MIC_* - silence from QEMU, but the input runs), the screen from getDisplayMedia arrives as decoded H.264 frames in a <video>, the data channel answers.",
         target: Target::Installed,
         usb_only: false,
         tablet: false,
@@ -15017,7 +15019,10 @@ pub const ALL: &[Scenario] = &[
         big_file: false,
         ssh_key: false,
         memory: "4096M",
-        extra: &["-smp", "4", "-cpu", "max", "-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
+        extra: &[
+            "-smp", "4", "-cpu", "max", "-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0",
+            "-audiodev", "none,id=mic0", "-device", "intel-hda", "-device", "hda-micro,audiodev=mic0",
+        ],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),
@@ -15033,10 +15038,14 @@ pub const ALL: &[Scenario] = &[
             // secure context (127.0.0.1 and https are): the page goes in as a file.
             Step::Line("run /bin/fetch http://10.0.2.2:{site}/webrtc.html /home/roman/webrtc.html"),
             Step::AwaitAny("/bin/fetch: exited with code 0", 60_000),
-            Step::Line("run /opt/obsos/bin/obsos --env OBSOS_MEDIA_AUTOALLOW=null --env OBSOS_MEDIA_TEST_TONE=440 --env OBSOS_MEDIA_STATS=1 file:///home/roman/webrtc.html"),
+            Step::Line("run /opt/obsos/bin/obsos --env OBSOS_MEDIA_AUTOALLOW=null --env OBSOS_MEDIA_STATS=1 file:///home/roman/webrtc.html"),
             Step::Await("desktop     : opened 'OBSOS (BETA) — Браузер' for ", 120_000),
-            Step::AwaitAny("browser: env OBSOS_MEDIA_TEST_TONE", 60_000),
+            Step::AwaitAny("browser: env OBSOS_MEDIA_STATS", 60_000),
             Step::AwaitAny("browser: native media backend (obsos-media)", 60_000),
+            // Both peers open the microphone: two opens of the HDA input.
+            Step::AwaitAny("hda         : capture started: ", 180_000),
+            Step::AwaitAny("records from the microphone, S16_LE 2 ch 48000 Hz (native, handle ", 60_000),
+            Step::AwaitAny("browser: microphone: first ", 60_000),
             Step::AwaitAny("obsos-webrtc: screen 1", 180_000),
             Step::AwaitAny("obsos-webrtc: negotiated", 60_000),
             // ICE: the controlling side (the offerer) reports Completed in str0m.
@@ -15049,10 +15058,10 @@ pub const ALL: &[Scenario] = &[
             // Stats every 5 s: at 50 Opus packets a second both counters grow.
             Step::Wait(12_000),
             Step::AtLeast("received audio ", 200, 30_000),
+            Step::AwaitAny("obsos-media: microphone peak ", 30_000),
             Step::Move(1, 0),
             Step::Painted("obsos-webrtc-call"),
-            Step::Wait(3_000),
-            Step::Tone(440),
+            Step::Absent("browser: microphone read: "),
             Step::Absent("RESULT FAIL"),
             Step::Absent("obsos-webrtc: ERROR"),
             Step::Absent("panicked at"),
