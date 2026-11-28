@@ -19720,14 +19720,53 @@ OpenH264, TURN — свой клиент) — в репозитории OBSOS, �
   `SYS_SOUND` (пик 0.305). Снимок `obsos-webrtc-call`.
 * Причина, по которой ICE сначала не стартовал (исправлено в OBSOS): таймаут
   чтения UDP-сокета (`SO_RCVTIMEO`, `set_read_timeout`) на FossAi не
-  действует — `recv_from` ждёт пакета бесконечно. **TODO ядра**: поддержать
-  таймаут чтения сокетов (программы, которые на него полагаются, зависают).
-* TODO: микрофон для своих программ — вход HDA (bb90997) выведен только в
-  Linux-слой (`hw:0,1`) и `mic`; нужен нативный вызов (например, операции
-  SYS_SOUND «начать запись / прочитать / остановить»), тогда OBSOS подключит
-  его в `obsos-fossai/src/media.rs` (там TODO с описанием).
-* TODO: видео ~7 к/с при 1280×720 (OpenH264 без nasm) — nasm в
-  fossai-builder; звонок Rupor (web.pynop.online) через TURN на FossAi вживую.
+  действовал — `recv_from` ждал пакета бесконечно. **Сделано 28.11
+  (4b85167)**: `SOCKCTL_RCVTIMEO`/`SOCKCTL_SNDTIMEO`/`SOCKCTL_TIMEOUT` у
+  сокета-дескриптора, `Sock::wait` по истечении отвечает `ERR_AGAIN`
+  (EAGAIN), libc `setsockopt/getsockopt(SO_RCVTIMEO/SO_SNDTIMEO)` переводит
+  `timeval` в мс — `std::net::*::set_read_timeout` программ под
+  `x86_64-unknown-freeos` работает. Linux-слой умел это с 22.11. Сценарий
+  `sockfd`: «udp read timed out after 307 ms (limit 300)».
+* **Микрофон для своих программ — сделано 28.11 (424e977)**: `SYS_SOUND`
+  `SOUND_MIC_OPEN` (номер открытия) / `SOUND_MIC_READ` (`SoundMic {buf, len,
+  handle}`, S16 LE стерео 48 кГц, ждёт первый кадр до ~20 мс) /
+  `SOUND_MIC_CLOSE` / `SOUND_MIC_INFO` (имя входа). Тот же вход HDA, что
+  `hw:0,1`; у каждого открытия свой курсор (`hda::CaptureGuard`), открытия
+  живут в `Program::mic` и закрываются с программой. Обёртки:
+  `user_progs::mic_*`, `<freeos/sound.h>` `freeos_mic_*`. Проба
+  `/bin/miccheck [с]`; сценарий `hda-mic`: две копии сразу — у каждой ~96000
+  кадров за 2 с, потерь 0.
+* **OBSOS на микрофоне (OBSOS a668ae2, сценарий a774fd4)**:
+  `obsos-fossai/src/media.rs` открывает вход через `SOUND_MIC_*` (поток
+  `obsos-mic`, 20 мс, стерео → моно). `obsos-webrtc` теперь без тона: кодек
+  `hda-micro` на `-audiodev none` рядом с virtio-sound, ждём «capture started»,
+  «records from the microphone … (native, handle», «browser: microphone:
+  first», пики микрофона в статистике, `RESULT OK`. Пересборка ветки —
+  `work\obsos-webrtc-build.cmd` (fossai-builder → `build\obsos-webrtc-out`).
+* **Видео: nasm в fossai-builder (cd1328b)** — OpenH264 с ассемблером:
+  видео-RTP 6,8 → 10 пакетов/с при экране 1280×720 (QEMU, ≤15 к/с захвата).
+  Старый кэш: один раз удалить `target-servo/<триплет>/release/build/openh264-sys2`
+  и `release/build/openh264-sys2` в томе `fossai-servo`, иначе build.rs не
+  перезапустится. Дальше упирается в захват/перекладку BGRA в `media.rs`
+  (попиксельный цикл) и сам кодер — следующий шаг: меньше размер/частота
+  показа экрана, перекладка без копии.
+* **Браузер со звонками в образе флешки (ae14b5a)** — образ НЕ собирался.
+  Способ: `powershell -File ports\servo\snapshot-obsos.ps1 -Rev
+  feat/freeos-webrtc` (закоммиченное дерево ветки из F:\ObsosBrowser через
+  `git archive`, без чужих незакоммиченных правок) или `-Src
+  F:\ObsosBrowser-wt\freeos-webrtc` (рабочее дерево ветки), затем обычная
+  `build-servoprobe.sh` в fossai-builder → `build/linux/servo-browser-<арх>`
+  → пакет OBSOS как всегда. Без ключей — как раньше (main). Сборка
+  предупредит, что head ≠ `ports/servo/OBSOS_REV`; перед образом перенести
+  OBSOS_REV на коммит ветки (или влить ветку в main OBSOS).
+* **Проверить на железе**: микрофон (Realtek ALC897/ALC1220) — `miccheck 3`
+  даёт пик/rms больше нуля; OBSOS-звонок с `--env OBSOS_MEDIA_STATS=1` —
+  `obsos-media: microphone peak` больше нуля, голос слышен у собеседника
+  (Rupor через TURN); `SO_RCVTIMEO` — программы на Rust std с
+  `set_read_timeout` не зависают.
+* TODO: звонок Rupor (web.pynop.online) через TURN на FossAi вживую; убрать
+  обход в `obsos-media/src/rtc.rs` (поток чтения) не обязательно — он
+  работает и с таймаутом.
 
 ## Микрофон: вход HDA (28.11, Роман: «Рупор запустил, но микрофона нет») — **сделано в коде, проверить на железе**
 
