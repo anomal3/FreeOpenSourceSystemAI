@@ -8,7 +8,7 @@
 //!   sound, folder; «Начать запись» / «Остановить».
 //! * `screenrec --record [--seconds N] [--dir D] [--fps F] [--size H]
 //!   [--format mp4|avi] [--quality high|medium|low] [--sound on|off]
-//!   [--out FILE]` — the recording itself, without a window (Win+Alt+R
+//!   [--faststart on|off] [--out FILE]` — the recording itself, without a window (Win+Alt+R
 //!   starts it; the window too). Stops when asked through the kernel
 //!   (`CAP_REQUEST_STOP`: Win+Alt+R, the red tray indicator, the window) or
 //!   after N seconds.
@@ -113,6 +113,10 @@ struct Settings {
     preset: usize,
     /// Record the system sound (MP4 only).
     sound: bool,
+    /// 28.11: MP4 with `moov` in front («для браузера»: room kept at the
+    /// start, `screencast::mp4::Mp4::with_room`). Off by default: the room
+    /// is a few megabytes of `free` in every file.
+    faststart: bool,
 }
 
 impl Settings {
@@ -127,6 +131,7 @@ impl Settings {
             mp4: MEDIA,
             preset: 1,
             sound: true,
+            faststart: false,
         }
     }
 
@@ -153,6 +158,7 @@ impl Settings {
                 "format" => settings.mp4 = MEDIA && value != "avi",
                 "preset" => settings.preset = PRESET_KEYS.iter().position(|k| *k == value).unwrap_or(1),
                 "sound" => settings.sound = value != "0",
+                "faststart" => settings.faststart = value == "1",
                 "area" => {
                     settings.area = if value == "desktop" {
                         Area::Desktop
@@ -178,7 +184,7 @@ impl Settings {
             Area::Rect(x, y, w, h) => format!("rect:{x},{y},{w},{h}"),
         };
         let text = format!(
-            "# Запись экрана (screenrec)\ndir={}\nfps={}\nsize={}\narea={area}\npointer={}\nquality={}\nformat={}\npreset={}\nsound={}\n",
+            "# Запись экрана (screenrec)\ndir={}\nfps={}\nsize={}\narea={area}\npointer={}\nquality={}\nformat={}\npreset={}\nsound={}\nfaststart={}\n",
             self.dir,
             self.fps,
             self.size,
@@ -186,7 +192,8 @@ impl Settings {
             self.quality,
             if self.mp4 { "mp4" } else { "avi" },
             PRESET_KEYS[self.preset.min(2)],
-            u8::from(self.sound)
+            u8::from(self.sound),
+            u8::from(self.faststart)
         );
         let config = format!("{}/.config", user_progs::filedlg::home_dir());
         let _ = mkdir(&config, 0o755);
@@ -1018,6 +1025,8 @@ enum Action {
     Format(bool),
     Preset(usize),
     Sound(bool),
+    /// 28.11: MP4 `moov` in front.
+    Faststart(bool),
     Folder,
     Start,
     Stop,
@@ -1183,6 +1192,16 @@ impl Recorder {
                 &mut controls,
                 &mut labels,
             );
+            // 28.11: `moov` in front - a site or a browser starts the file
+            // before it is all downloaded.
+            let fast = self.settings.faststart;
+            row(
+                "Для сайтов",
+                alloc::vec![(Action::Faststart(true), String::from("Быстрый старт"), fast), (Action::Faststart(false), String::from("Обычный файл"), !fast)],
+                &mut y,
+                &mut controls,
+                &mut labels,
+            );
         }
         row("Папка", alloc::vec![(Action::Folder, String::from("Изменить…"), false)], &mut y, &mut controls, &mut labels);
         // The folder path goes on the row of «Папка» after the button.
@@ -1235,6 +1254,7 @@ impl Recorder {
             }
             Action::Preset(preset) => self.settings.preset = preset,
             Action::Sound(on) => self.settings.sound = on,
+            Action::Faststart(on) => self.settings.faststart = on,
             Action::Folder => {
                 let options = Options::folder().title("Папка для записей").dir(&self.settings.dir);
                 match Dialog::start_owned(&options, app::window_id(), "screenrec") {
@@ -1488,6 +1508,9 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         }
         if let Some(sound) = value("--sound") {
             settings.sound = sound != "off" && sound != "0";
+        }
+        if let Some(faststart) = value("--faststart") {
+            settings.faststart = faststart != "off" && faststart != "0";
         }
         let seconds = value("--seconds").and_then(|v| v.parse().ok());
         let out = value("--out");

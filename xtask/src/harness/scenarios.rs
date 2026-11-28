@@ -4476,6 +4476,18 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run /bin/screenrec --probe /root/rec-test.mp4"),
             Step::Await("screenrec: probe OK mp4 h264 640x360", 120_000),
             Step::Expect("Opus "),
+            Step::Expect("moov at the end"),
+            // 28.11: «Для сайтов: Быстрый старт» - `moov` written into the
+            // room kept after `ftyp` (no copy of the file at the end). At most
+            // eight words of a command line: no `--size` here.
+            Step::Line("run -b /bin/screenrec --record --seconds 6 --faststart on --out /root/fast.mp4"),
+            Step::Await("screenrec: recording ", 30_000),
+            Step::Await("screenrec: faststart: moov (", 90_000),
+            Step::Expect("in front of the data"),
+            Step::Await("screenrec: saved /root/fast.mp4", 30_000),
+            Step::Line("run /bin/screenrec --probe /root/fast.mp4"),
+            Step::Await("screenrec: probe OK mp4 h264 ", 120_000),
+            Step::Expect("moov in front (faststart)"),
             Step::Absent("screenrec: probe FAILED"),
             Step::Absent("screenrec: FAILED"),
             Step::Absent("KERNEL PANIC"),

@@ -6,9 +6,17 @@
 //! writes video and audio as they come, interleaved by time, and the tables
 //! stay trivial. Plays in browsers (Chrome, Firefox, Safari — files opened
 //! locally or served with range requests), Windows Films & TV / Media
-//! Player, VLC, mpv, ffmpeg, phones. Not "faststart": `moov` is after the
-//! data — moving it in front would copy the whole file at the end, which on
-//! a USB stick means minutes (ROADMAP: TODO, as an option).
+//! Player, VLC, mpv, ffmpeg, phones.
+//!
+//! "Faststart" (28.11, an option: [`Mp4::with_room`]): `moov` in front of the
+//! data, so a browser can start a file served without range requests (or a
+//! site that re-encodes only files with `moov` first) after the first
+//! kilobytes. Moving `moov` in front at the end would copy the whole file —
+//! minutes on a USB stick — so the room is kept from the start instead: a
+//! `free` box right after `ftyp`, and at the end `moov` is written into it
+//! and the rest stays `free` (players skip it). `mdat` never moves, so the
+//! `co64` offsets stay right. A recording that outgrows the room gets `moov`
+//! at the end as before ([`Mp4::moov_in_front`] says which).
 //!
 //! Times come from the capture: a video sample lasts until the next one
 //! (unchanged screens and dropped frames make longer samples — variable frame
@@ -74,6 +82,29 @@ pub struct Mp4<S: Sink> {
     audio: Option<(OpusTrack, Track, u64)>,
     scratch: Vec<u8>,
     failed: bool,
+    /// Faststart: where the reserved `free` box starts and its size (0 - no
+    /// room kept); whether `finish` put `moov` there.
+    room_at: u64,
+    room: u64,
+    moov_in_front: bool,
+}
+
+/// Bytes of `moov` per second of recording, a bound for [`room_for`]:
+/// video `stsz` 4 + `co64` 8 + `stts` up to 8 and `stss`, audio (50 packets
+/// a second) `stsz` 4 + `co64` 8.
+fn moov_bytes_per_second(fps: u32, audio: bool) -> u64 {
+    u64::from(fps.max(1)) * 24 + if audio { 50 * 12 } else { 0 }
+}
+
+/// Room to keep in front for `moov` of a recording of up to `seconds` at
+/// `fps` (with sound or not): the bound above plus 16 KiB of headers and a
+/// tenth more. Without a limit - room for 30 minutes (60 fps with sound:
+/// 3.7 MiB; past it `moov` goes to the end as without the option).
+#[must_use]
+pub fn room_for(seconds: Option<u64>, fps: u32, audio: bool) -> u64 {
+    let seconds = seconds.unwrap_or(30 * 60).max(1);
+    let bytes = 16 * 1024 + seconds * moov_bytes_per_second(fps, audio);
+    (bytes + bytes / 10).next_multiple_of(4096)
 }
 
 /// NAL units of an Annex B stream (without start codes).
@@ -166,7 +197,13 @@ fn scale(value: u64, from: u32, to: u32) -> u64 {
 
 impl<S: Sink> Mp4<S> {
     /// Start the file: `ftyp` and the `mdat` header. `audio` — an Opus track.
-    pub fn new(mut sink: S, width: u32, height: u32, audio: Option<OpusTrack>) -> Option<Self> {
+    pub fn new(sink: S, width: u32, height: u32, audio: Option<OpusTrack>) -> Option<Self> {
+        Self::with_room(sink, width, height, audio, 0)
+    }
+
+    /// [`Self::new`] with `room` bytes kept after `ftyp` for `moov`
+    /// (faststart; [`room_for`] sizes it). 0 - `moov` at the end.
+    pub fn with_room(mut sink: S, width: u32, height: u32, audio: Option<OpusTrack>, room: u64) -> Option<Self> {
         let mut b = Buf(Vec::new());
         let ftyp = b.open(b"ftyp");
         b.bytes(b"isom");
@@ -175,7 +212,29 @@ impl<S: Sink> Mp4<S> {
             b.bytes(brand);
         }
         b.close(ftyp);
-        let mdat = b.0.len() as u64;
+        let room = if room == 0 { 0 } else { room.clamp(64, u64::from(u32::MAX)) };
+        let room_at = b.0.len() as u64;
+        if room > 0 {
+            // A `free` box over the whole room (written in pieces: it may be
+            // megabytes).
+            b.u32(room as u32);
+            b.bytes(b"free");
+            if !sink.write(&b.0) {
+                return None;
+            }
+            let zeros = alloc::vec![0u8; 64 * 1024];
+            let mut left = room - 8;
+            while left > 0 {
+                let n = left.min(zeros.len() as u64) as usize;
+                if !sink.write(&zeros[..n]) {
+                    return None;
+                }
+                left -= n as u64;
+            }
+            b.0.clear();
+        }
+        // `b` holds `ftyp` when no room was kept, nothing after the room.
+        let mdat = room_at + room;
         b.u32(1);
         b.bytes(b"mdat");
         b.u64(0);
@@ -184,8 +243,11 @@ impl<S: Sink> Mp4<S> {
         }
         Some(Self {
             sink,
-            pos: b.0.len() as u64,
+            pos: mdat + 16,
             mdat,
+            room_at,
+            room,
+            moov_in_front: false,
             width,
             height,
             sps: None,
@@ -295,16 +357,40 @@ impl<S: Sink> Mp4<S> {
 
     /// Close the file: `video_end_us` — when the recording ended (the last
     /// frame lasts until then). Answer: the sink and whether all went well.
-    pub fn finish(mut self, video_end_us: u64) -> (S, bool) {
+    pub fn finish(self, video_end_us: u64) -> (S, bool) {
+        let (sink, ok, _) = self.finish_report(video_end_us);
+        (sink, ok)
+    }
+
+    /// [`Self::finish`] that also tells where `moov` went (faststart):
+    /// `(sink, ok, Some((moov in front, moov bytes, room kept)))` - `None`
+    /// when no room was kept.
+    pub fn finish_report(mut self, video_end_us: u64) -> (S, bool, Option<(bool, u64, u64)>) {
         if self.failed || self.video.sizes.is_empty() || self.sps.is_none() || self.pps.is_none() {
-            return (self.sink, false);
+            return (self.sink, false, None);
         }
         let size = self.pos - self.mdat;
         let mut ok = self.sink.write_at(self.mdat + 8, &size.to_be_bytes());
         let video_end = scale(video_end_us, 1_000_000, VIDEO_TIMESCALE).max(self.video.times.last().copied().unwrap_or(0) + 1);
         let moov = self.moov(video_end);
-        ok &= self.sink.write(&moov);
-        (self.sink, ok)
+        let len = moov.len() as u64;
+        // Faststart: `moov` into the room, the rest stays a `free` box (an
+        // exact fit needs no `free` after it; less than its 8-byte header
+        // left - does not fit).
+        if self.room > 0 && (len == self.room || len + 8 <= self.room) {
+            ok &= self.sink.write_at(self.room_at, &moov);
+            if len < self.room {
+                let mut free = Vec::with_capacity(8);
+                free.extend_from_slice(&((self.room - len) as u32).to_be_bytes());
+                free.extend_from_slice(b"free");
+                ok &= self.sink.write_at(self.room_at + len, &free);
+            }
+            self.moov_in_front = ok;
+        } else {
+            ok &= self.sink.write(&moov);
+        }
+        let report = (self.room > 0).then_some((self.moov_in_front, len, self.room));
+        (self.sink, ok, report)
     }
 
     fn moov(&self, video_end: u64) -> Vec<u8> {
@@ -692,5 +778,102 @@ mod tests {
     #[test]
     fn run_lengths() {
         assert_eq!(deltas(&[0, 3000, 6000, 12000], 15000), vec![(2, 3000), (1, 6000), (1, 3000)]);
+    }
+
+    struct VecSink(Vec<u8>);
+
+    impl Sink for VecSink {
+        fn write(&mut self, data: &[u8]) -> bool {
+            self.0.extend_from_slice(data);
+            true
+        }
+        fn write_at(&mut self, offset: u64, data: &[u8]) -> bool {
+            let at = offset as usize;
+            if at + data.len() > self.0.len() {
+                return false;
+            }
+            self.0[at..at + data.len()].copy_from_slice(data);
+            true
+        }
+    }
+
+    /// A tiny recording of `frames` pictures with `room` kept for `moov`.
+    fn record(room: u64, frames: u32) -> (Vec<u8>, Option<(bool, u64, u64)>) {
+        let mut mp4 = Mp4::with_room(VecSink(Vec::new()), 64, 48, None, room).unwrap();
+        let idr = [0, 0, 0, 1, 0x67, 0x4d, 0, 0x1f, 0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80, 0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00];
+        let p = [0, 0, 0, 1, 0x41, 0x9a, 0x00];
+        for i in 0..frames {
+            assert!(mp4.video(if i == 0 { &idr } else { &p }, u64::from(i) * 33_333, i == 0));
+        }
+        let (sink, ok, report) = mp4.finish_report(u64::from(frames) * 33_333);
+        assert!(ok);
+        (sink.0, report)
+    }
+
+    /// Top-level boxes: (tag, start, size), 64-bit sizes too.
+    fn top(file: &[u8]) -> Vec<([u8; 4], usize, usize)> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at + 8 <= file.len() {
+            let mut size = be32(file, at) as usize;
+            if size == 1 {
+                size = u64::from_be_bytes(file[at + 8..at + 16].try_into().unwrap()) as usize;
+            }
+            out.push(([file[at + 4], file[at + 5], file[at + 6], file[at + 7]], at, size));
+            assert!(size >= 8 && at + size <= file.len(), "box runs past the end");
+            at += size;
+        }
+        assert_eq!(at, file.len());
+        out
+    }
+
+    fn probe_file(file: &[u8]) -> Probe {
+        let boxes = top(file);
+        let (_, moov_at, moov_size) = *boxes.iter().find(|b| &b.0 == b"moov").unwrap();
+        let (_, mdat_at, mdat_size) = *boxes.iter().find(|b| &b.0 == b"mdat").unwrap();
+        let read = |offset: u64, buf: &mut [u8]| {
+            let at = offset as usize;
+            buf.copy_from_slice(&file[at..at + buf.len()]);
+            true
+        };
+        probe(&file[moov_at + 8..moov_at + moov_size], ((mdat_at + 16) as u64, (mdat_at + mdat_size) as u64), read).unwrap()
+    }
+
+    #[test]
+    fn faststart_puts_moov_in_the_room() {
+        let (file, report) = record(64 * 1024, 30);
+        let (front, len, room) = report.unwrap();
+        assert!(front && len < room && room == 64 * 1024);
+        let tags: Vec<[u8; 4]> = top(&file).iter().map(|b| b.0).collect();
+        assert_eq!(tags, vec![*b"ftyp", *b"moov", *b"free", *b"mdat"]);
+        assert_eq!(probe_file(&file).video_samples, 30);
+    }
+
+    #[test]
+    fn faststart_room_too_small_keeps_moov_at_the_end() {
+        let (file, report) = record(256, 30);
+        assert_eq!(report.map(|r| r.0), Some(false));
+        let tags: Vec<[u8; 4]> = top(&file).iter().map(|b| b.0).collect();
+        assert_eq!(tags, vec![*b"ftyp", *b"free", *b"mdat", *b"moov"]);
+        assert_eq!(probe_file(&file).video_samples, 30);
+    }
+
+    #[test]
+    fn no_room_is_the_old_layout() {
+        let (file, report) = record(0, 5);
+        assert!(report.is_none());
+        let tags: Vec<[u8; 4]> = top(&file).iter().map(|b| b.0).collect();
+        assert_eq!(tags, vec![*b"ftyp", *b"mdat", *b"moov"]);
+        assert_eq!(probe_file(&file).video_samples, 5);
+    }
+
+    #[test]
+    fn room_covers_a_long_recording() {
+        // An hour at 60 fps with sound: per second 60 * 24 + 600 bytes.
+        let room = room_for(Some(3600), 60, true);
+        assert!(room >= 3600 * (60 * 24 + 600));
+        assert_eq!(room % 4096, 0);
+        // No limit - half an hour.
+        assert!(room_for(None, 30, true) < room);
     }
 }

@@ -530,7 +530,9 @@ pub fn record(settings: &Settings, seconds: Option<u64>, out: Option<String>) ->
         }
         None => None,
     };
-    let Some(mut mp4) = Mp4::new(FileSink(fd), out_w, out_h, audio_track) else {
+    // 28.11: faststart - room for `moov` kept in front (no copy at the end).
+    let room = if settings.faststart { screencast::mp4::room_for(seconds, fps, audio_track.is_some()) } else { 0 };
+    let Some(mut mp4) = Mp4::with_room(FileSink(fd), out_w, out_h, audio_track, room) else {
         stop_all();
         close(fd);
         return give_up(format!("cannot write {path}"));
@@ -649,7 +651,12 @@ pub fn record(settings: &Settings, seconds: Option<u64>, out: Option<String>) ->
     stop_all();
     let samples = mp4.video_samples();
     let packets = mp4.audio_packets();
-    let (sink, ok) = mp4.finish(end_us);
+    let (sink, ok, room_report) = mp4.finish_report(end_us);
+    match room_report {
+        Some((true, len, room)) => println(&format!("screenrec: faststart: moov ({len} bytes) in front of the data, in the {room} bytes kept for it")),
+        Some((false, len, room)) => println(&format!("screenrec: faststart: moov ({len} bytes) outgrew the {room} bytes kept for it - written at the end")),
+        None => {}
+    }
     let fd = sink.0;
     let bytes = user_progs::file_size(fd).max(0) as u64;
     close(fd);
@@ -704,6 +711,8 @@ pub fn probe_fd(fd: i64) -> Result<String, String> {
     let read_at = |offset: u64, buf: &mut [u8]| super::read_exact_at(fd, offset, buf);
     let mut at = 0u64;
     let (mut moov, mut mdat, mut ftyp) = (None, None, false);
+    // 28.11: faststart - `moov` before `mdat`.
+    let mut moov_first = false;
     let mut head = [0u8; 16];
     while at + 8 <= size {
         if !read_at(at, &mut head[..8]) {
@@ -731,6 +740,7 @@ pub fn probe_fd(fd: i64) -> Result<String, String> {
                     return Err(String::from("cannot read moov"));
                 }
                 moov = Some(body);
+                moov_first = mdat.is_none();
             }
             _ => {}
         }
@@ -749,7 +759,7 @@ pub fn probe_fd(fd: i64) -> Result<String, String> {
         String::from(", no sound")
     };
     Ok(format!(
-        "mp4 h264 {}x{} profile {} level {}, {} pictures ({} key) = {}.{} s{sound}, {size} bytes",
+        "mp4 h264 {}x{} profile {} level {}, {} pictures ({} key) = {}.{} s{sound}, {size} bytes, {}",
         p.width,
         p.height,
         p.profile,
@@ -757,7 +767,8 @@ pub fn probe_fd(fd: i64) -> Result<String, String> {
         p.video_samples,
         p.video_keys,
         p.video_ms / 1000,
-        p.video_ms % 1000 / 100
+        p.video_ms % 1000 / 100,
+        if moov_first { "moov in front (faststart)" } else { "moov at the end" }
     ))
 }
 
