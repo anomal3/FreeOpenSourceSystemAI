@@ -36,4 +36,11 @@ RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-too
     && rustup component add rust-src --toolchain ${RUST_NIGHTLY} \
     && rustc -vV
 
+# nasm (28.11): OpenH264 of the OBSOS calls backend (openh264-sys2) builds
+# its x86 assembly only when `nasm` is on PATH - without it the encoder and
+# decoder are plain C (~7 fps of a 1280x720 screen share in QEMU). Its own
+# layer at the end, so the LLVM and Rust layers above stay cached.
+RUN apt-get update && apt-get install -y --no-install-recommends nasm \
+    && rm -rf /var/lib/apt/lists/* && nasm -v
+
 WORKDIR /work
