@@ -19540,7 +19540,8 @@ DejaVu. Добавлен `fonts-noto-color-emoji` 2.042 (`fonts/NotoColorEmoji.t
 `ENOSYS` Chromium получал как ответ avail («Failed querying available frames:
 Function not implemented»), и звук не шёл.
 
-**Микрофон — нет, честно.** Входа HDA в ядре нет; единственный захват —
+**Микрофон — сделан 28.11** (раздел «Микрофон: вход HDA» ниже); прежде было
+так. Входа HDA в ядре нет; единственный захват —
 отвод «Стерео микшер». Отдать его звонку как микрофон нельзя (собеседники
 слышали бы себя), поэтому захват `default` для Chromium не определён:
 getUserMedia → NotReadableError, Rupor показывает «Только прослушивание».
@@ -19576,6 +19577,76 @@ re-raises signal 11 … chromium+0x5e156e8» = `CrashBrowserProcessIntentionally
 **Не сделано / заметки.** Запасные процессы страниц Chromium выходят сразу
 после старта (было и 23.11) — не разбиралось. `chrome_crashpad_handler` в
 пакет не кладётся (дочерний `#GP`/`#BP` при каждом запуске — его FATAL).
+
+## Микрофон: вход HDA (28.11, Роман: «Рупор запустил, но микрофона нет») — **сделано в коде, проверить на железе**
+
+**Ядро, `sound/hda.rs`.** При подъёме в кодеке ищутся входы: разъёмы с
+`PINCAP_IN`, `config default` «Mic in» или «Line in», подключённые, и
+кратчайший путь от АЦП (`audio input`) через смесители/селекторы (список
+соединений виджета расширен с 8 до 16 — у Realtek ALC897/ALC1220 перед АЦП
+10–11 входов). Входы ищутся и в кодеках после выходного (QEMU: `hda-output` +
+`hda-micro`). Вход выбирается при каждом старте записи: штекер в гнезде
+(`pin sense`, с `EXECUTE`, где нужно) → микрофон → линейный вход →
+встроенный микрофон → гнёзда без определения → пустые гнёзда; гнездо, на
+которое идёт вывод, не берётся. Путь: выбор входа в селекторах, в смесителях
+открыт только наш вход (остальные приглушены), 0 дБ, на разъёме микрофона —
+`VRef` 80 % (или 50 %) и подъём ~+20 дБ (как в Linux). Поток — первый входной
+контроллера, номер 2, 48 кГц 16 бит стерео, кольцо 16 × 4096 байт (~340 мс),
+чтение по `LPIB`, без прерываний; не читали дольше ¾ кольца — старое
+теряется (счётчик `lost`). Запись под своим замком (`CAPTURE`): вывод держит
+замок `HDA`, пока ждёт места, и запись его не ждёт. API (у каждого потребителя свой курсор): `capture_start/stop/
+available/read/skip`, `capture_present`, `capture_name`.
+
+**Слой Linux, `linux/snd.rs`.** Новое устройство `pcmC0D1c` (`hw:0,1`) —
+микрофон (только захват; `PCM_NEXT_DEVICE` 0 → 1, `PCM_INFO` «FossAi Mic» /
+«Микрофон (Mic in, rear pink jack)»). Нет входа — открытие `ENODEV` (строка
+`snd: microphone asked for, but the sound card has no input`). Запись идёт от
+`START`/первого чтения до `DROP`/`PREPARE`/`HW_FREE`/закрытия. `pcmC0D0c`
+остаётся «Стерео микшером» — им пишет «Звук рабочего стола» OBS (его
+`default` = `hw:0,0`, не трогали).
+
+**Chromium.** `fossai.conf`: захват `default` = `plug` → `hw:0,1` (раньше —
+несуществующий `fossai_no_microphone`). Без входа getUserMedia честно
+отказывает, как прежде. Вход virtio-snd не поднят.
+
+**Нативная проба.** Команда оболочки `mic [1..30 с] [файл.wav]`: запись с
+входа HDA, строка `mic recorded N frames (…) in M ms, peak P, rms R`, файл —
+WAV 48 кГц 16 бит стерео.
+
+**Проверка в QEMU.** Сценарий `hda-mic` (живой: `hda-output` в WAV +
+`hda-micro` на `-audiodev none` — у `wav` QEMU нет входа): `mic 2` — ровно
+96000 кадров за ~2020 мс, 0 потерь; тон 523 Гц на соседнем кодеке звучит.
+Путь DMA проверен разово: кольцо перед стартом заливалось 0x55 — прочитано
+96000 кадров нулей, т. е. всё прочитанное записал контроллер. `hda` — без
+изменений. `chromium-media` (`install,chromium-media`, два кодека:
+`hda-output` в WAV + `hda-micro`): «fossai-media: mic ok Default»,
+`capture started: Mic in`, `records from the microphone`, список устройств
+Chromium — «Микрофон (Mic in, red jack)» рядом со «Стерео микшером»; за 55 с
+прочитано 2,64 млн кадров (3022 потеряно), после `kill` браузера —
+`capture stopped`; тон 440 Гц слышен. Первый прогон поймал общий курсор
+чтения: после «Restore» две вкладки держали микрофон и отнимали данные друг у
+друга («PcmReadi returning less than expected frames: 234 vs. 480») — теперь у
+каждого потребителя свой курсор (до 8, `capture_start` отдаёт номер), строк
+больше нет. Последний шаг сценария (выход Ctrl+Shift+Q, «bash: exited with
+code 0» за 120 с) 28.11 не проходит — и **без** микрофона тоже (A/B: кодек
+убран, `ENODEV`, страница — `NotReadableError Could not start audio source`,
+выход так же висит): не микрофон; в дереве в это время были чужие правки
+`wayland.rs`/`ui/pointer.rs` — TODO разобрать отдельно.
+
+**Что смотреть на железе (LOG.TXT / `dmesg hda`).**
+- `hda : input: codec 0 10ec0897, Mic in, front pink jack (pin 0x19, config …) -> ADC 0x08, path [08, 23, 19]` — все найденные входы;
+- `hda : capture started: Mic in, rear pink jack (plugged), codec 0 pin 0x18 -> ADC 0x08, stream 2, …` — что выбрано при старте записи
+  (`NOT plugged` — штекера нет, взят лучший из пустых; `no jack sense` — гнездо не умеет);
+- `hda : capture stopped (…): N frames (… s) read in M ms, K frames lost, peak P` — `peak` около 0 при разговоре = тишина (не тот разъём, усиление, VRef);
+- `snd : process N (…) records from the microphone`, `snd : microphone did not start: …`, `no microphone or line input pin`;
+- быстро без браузера: в терминале ядра `mic 3` — `peak`/`rms` при разговоре и в тишине.
+
+**TODO.** Регулятора усиления микрофона нет (фиксированно ~+20 дБ); разъём
+выбирается только при старте записи (unsolicited responses отбрасываются —
+вставленный на ходу штекер подхватится со следующего звонка); квирков
+Realtek (coef) нет — если на ALC897/ALC1220 тишина при `plugged`, сравнить
+путь из журнала с Linux (`/proc/asound/card0/codec#0`). Вход virtio-snd не
+сделан.
 
 ## Регрессия 26.11: smp, chromium, рост кучи — **сделано**
 

@@ -86,14 +86,16 @@ const FONTS_CONF: &str = "<?xml version=\"1.0\"?>\n\
 /// Color emoji font (`fonts-noto-color-emoji`).
 const EMOJI_FONT: &str = "usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
 
-/// ALSA `default` for Chromium: playback to the kernel device, no capture
-/// (see the sound note in [`build`]). Chromium writes S16_LE stereo 48 kHz
+/// ALSA `default` for Chromium: playback to the kernel device, capture from
+/// the microphone - device 1 of the kernel card, the HDA input (28.11; see
+/// the sound note in [`build`]). Chromium writes S16_LE stereo 48 kHz
 /// itself - the kernel device's own format - so `plug` passes `writei`
 /// straight through. Not over `mmap_emul` as VLC: there Chromium's writes
 /// never reached the device and `snd_pcm_avail_update` grew past the buffer
 /// ("ALSA returned 98437 of 4096 frames available", QEMU 27.11).
 const ALSA_CONF: &str = "pcm.fossai_out { type plug slave.pcm \"hw:0,0\" }\n\
-    pcm.!default { type asym playback.pcm \"fossai_out\" capture.pcm \"fossai_no_microphone\" }\n\
+    pcm.fossai_mic { type plug slave.pcm \"hw:0,1\" }\n\
+    pcm.!default { type asym playback.pcm \"fossai_out\" capture.pcm \"fossai_mic\" }\n\
     ctl.!default { type hw card 0 }\n";
 
 /// Пакеты: путь в архиве и SHA-256 из `Packages` bookworm (снимок 20261020).
@@ -285,11 +287,11 @@ pub fn build(arch: Arch) -> Result<()> {
     // VLC, OBS and Proton. Without them Chromium's audio service had no
     // `alsa.conf` (the Debian root has none), never opened /dev/snd and on
     // hw-log20 spun on `openat` - a page played nothing. Playback: `plug`
-    // over `mmap_emul` over the kernel device. Capture: the kernel's only
-    // capture device is the desktop loopback (Stereo mix) - handed to a web
-    // call as a "microphone" it would send the call's own sound back, so
-    // `default` has no capture until the kernel has a real microphone input
-    // (getUserMedia then fails honestly and Rupor says "listen only").
+    // over `mmap_emul` over the kernel device. Capture: not the desktop
+    // loopback (`hw:0,0`, Stereo mix) - handed to a web call as a
+    // "microphone" it would send the call's own sound back - but the HDA
+    // input, `hw:0,1` (28.11). A machine without one has no device 1: the
+    // open fails, getUserMedia fails honestly and Rupor says "listen only".
     for (path, node) in &extra {
         if let Some(rest) = path.strip_prefix("usr/share/alsa/") {
             if matches!(node, Node::File { .. }) {

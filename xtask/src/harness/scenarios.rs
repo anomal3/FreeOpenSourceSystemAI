@@ -5189,6 +5189,55 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("KERNEL PANIC"),
         ],
     },
+    // Microphone (28.11, Roman: "Rupor started, but there is no microphone"):
+    // the HDA input. QEMU's `wav` backend has no input, so the microphone
+    // codec (`hda-micro`, codec 1) records from `none` - silence, but the
+    // stream runs at 48 kHz and the ring fills; the speakers stay on codec 0
+    // (`hda-output` into the WAV) and must still play.
+    Scenario {
+        name: "hda-mic",
+        about: "Микрофон на Intel HDA (28.11): вход кодека (разъём Mic -> АЦП), входной поток контроллера - `mic 2` записывает две секунды (96000 кадров), вывод на соседнем кодеке звучит.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[
+            "-audiodev", "wav,id=snd0,path={wav}", "-audiodev", "none,id=mic0",
+            "-device", "intel-hda", "-device", "hda-output,audiodev=snd0", "-device", "hda-micro,audiodev=mic0",
+        ],
+        steps: &[
+            Step::AwaitAny(", 48000 Hz 16-bit stereo", BOOT),
+            Step::Await("hda         : input: codec 1 ", BOOT),
+            Step::Await(PROMPT, BOOT),
+            Step::Wait(2_000),
+            Step::Line("mic 2"),
+            Step::Await("hda         : capture started: ", 10_000),
+            Step::Await("hda         : capture stopped (", 20_000),
+            // All of it, in about real time (not faster than the device).
+            Step::Await("  mic      recorded 96000 frames (2.0 s) in ", 5_000),
+            Step::Line("beep 523 1000"),
+            Step::AtLeast("  beep     played 523 Hz for 1000 ms in ", 800, 30_000),
+            Step::Wait(1_000),
+            Step::Tone(523),
+            Step::Absent("mic      cannot start"),
+            Step::Absent("beep     failed"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
     Scenario {
         name: "vinput",
         about: "Клавиатура и мышь virtio (фаза 67g): USB выдернуты, команда набирается и меню открывается через virtio-input.",
@@ -12750,7 +12799,10 @@ pub const ALL: &[Scenario] = &[
         memory: "2G",
         extra: &[
             "-cpu", "max", "-smp", "2",
-            "-audiodev", "wav,id=snd0,path={wav}", "-device", "intel-hda", "-device", "hda-output,audiodev=snd0",
+            // Speakers into the WAV (codec 0); a microphone codec (28.11) on
+            // `none` - QEMU's `wav` has no input - silence at 48 kHz.
+            "-audiodev", "wav,id=snd0,path={wav}", "-audiodev", "none,id=mic0", "-device", "intel-hda",
+            "-device", "hda-output,audiodev=snd0", "-device", "hda-micro,audiodev=mic0",
         ],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
@@ -12771,6 +12823,12 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run -b /opt/debian/bin/bash /opt/chromium/bin/chromium --enable-logging=stderr --use-fake-ui-for-media-stream --unsafely-treat-insecure-origin-as-secure=http://10.0.2.2:{site} http://10.0.2.2:{site}/media.html"),
             Step::Capture("started as #", 15_000),
             Step::Await("'FossAi media - Chromium'", 300_000),
+            // Microphone (28.11): getUserMedia opens `default` capture - the
+            // HDA input (`hw:0,1`), not the Stereo mix - and the page keeps
+            // the track, so the recording runs until the browser goes.
+            Step::AwaitAny("fossai-media: mic ok", 240_000),
+            Step::AwaitAny("hda         : capture started: Mic in", 60_000),
+            Step::AwaitAny("records from the microphone", 10_000),
             Step::Await("fossai-media: devices", 240_000),
             Step::Wait(10_000),
             Step::Aim(Aim::Program("FossAi media - Chromium", 600, 450)),
@@ -12807,6 +12865,9 @@ pub const ALL: &[Scenario] = &[
             // under TCG.)
             Step::Line("kill {}"),
             Step::Await(" gone", 120_000),
+            // The browser's end closed the microphone (frames read - in the log).
+            Step::AwaitAny("hda         : capture stopped (", 60_000),
+            Step::Absent("microphone did not start"),
             Step::Wait(20_000),
             // Next start: "Restore pages?" under the app menu; Restore.
             Step::Line("run -b /opt/debian/bin/bash /opt/chromium/bin/chromium --enable-logging=stderr --use-fake-ui-for-media-stream --unsafely-treat-insecure-origin-as-secure=http://10.0.2.2:{site} http://10.0.2.2:{site}/media.html"),

@@ -29,7 +29,17 @@
 //! (S16_LE, 2 канала, 48 кГц), данные — `READI_FRAMES`. Указатель карты идёт
 //! по часам с `START` (или с первого чтения); программа, отставшая больше
 //! буфера, теряет самое старое без XRUN — так же молча, как воспроизведение.
-//! Микрофона пока нет: вход HDA не поднят (ROADMAP).
+//!
+//! # Захват: микрофон (28.11)
+//!
+//! `pcmC0D1c` (`hw:0,1`) — вход HDA ([`crate::sound::hda::capture_start`]):
+//! микрофон или линейный вход, который драйвер выбрал при старте записи.
+//! Устройство есть, только если у карты нашёлся вход; иначе открытие —
+//! `ENODEV`, и программа звонка честно говорит «микрофона нет» (выдавать
+//! «Стерео микшер» за микрофон нельзя: собеседник услышал бы сам себя). Режим
+//! тот же; указатель карты — сколько записано в кольцо HDA и не прочитано
+//! (не больше буфера: отставшая программа теряет самое старое без XRUN).
+//! Запись идёт от `START` (или первого чтения) до `DROP`/закрытия.
 
 use alloc::sync::Arc;
 use alloc::vec;
@@ -50,6 +60,8 @@ const BUFFER_FRAMES: u64 = PERIOD_FRAMES * PERIODS;
 pub const CONTROL_PATH: &str = "/dev/snd/controlC0";
 pub const PCM_PATH: &str = "/dev/snd/pcmC0D0p";
 pub const CAPTURE_PATH: &str = "/dev/snd/pcmC0D0c";
+/// Микрофон (28.11): устройство 1 карты, только захват.
+pub const MIC_PATH: &str = "/dev/snd/pcmC0D1c";
 
 // Состояния потока (`snd_pcm_state_t`).
 const STATE_OPEN: i32 = 0;
@@ -66,7 +78,12 @@ const CTL_VERSION: i32 = (2 << 16) | 7;
 /// Есть ли такой путь (для `stat`/`access`).
 #[must_use]
 pub fn exists(linux: &str) -> bool {
-    matches!(linux, CONTROL_PATH | PCM_PATH | CAPTURE_PATH | "/dev/snd")
+    matches!(linux, CONTROL_PATH | PCM_PATH | CAPTURE_PATH | "/dev/snd") || (linux == MIC_PATH && mic_present())
+}
+
+/// Есть ли микрофон (вход HDA).
+fn mic_present() -> bool {
+    crate::sound::hda::capture_present()
 }
 
 /// Открыть устройство звука; `None` — путь не наш.
@@ -75,10 +92,20 @@ pub fn open(linux: &str, flags: usize) -> Option<i64> {
     const O_CLOEXEC: usize = 0o2_000_000;
     let object: Arc<dyn Object> = match linux {
         CONTROL_PATH => Arc::new(Control),
-        PCM_PATH => Arc::new(Pcm::new(false)),
+        PCM_PATH => Arc::new(Pcm::new(false, false)),
         CAPTURE_PATH => {
             crate::sound::loopback::arm();
-            Arc::new(Pcm::new(true))
+            Arc::new(Pcm::new(true, false))
+        }
+        MIC_PATH => {
+            if !mic_present() {
+                static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    crate::kprintln!("  snd         : microphone asked for, but the sound card has no input (HDA mic/line-in): ENODEV");
+                }
+                return Some(-e::ENODEV);
+            }
+            Arc::new(Pcm::new(true, true))
         }
         _ => return None,
     };
@@ -167,22 +194,30 @@ fn control_ioctl(nr: usize, arg: usize) -> i64 {
             let _ = put(arg, 0i32);
             0
         }
-        // PCM_NEXT_DEVICE: -1 → 0 → -1.
+        // PCM_NEXT_DEVICE: -1 → 0 → (1, если есть микрофон) → -1.
         0x30 => match get::<i32>(arg) {
-            Ok(device) => answer(put(arg, if device < 0 { 0i32 } else { -1 })),
+            Ok(device) => answer(put(arg, match device {
+                ..0 => 0i32,
+                0 if mic_present() => 1,
+                _ => -1,
+            })),
             Err(err) => err,
         },
-        // PCM_INFO: только устройство 0, подустройство 0; воспроизведение и
-        // захват («Стерео микшер», 23.11).
+        // PCM_INFO: подустройство 0; устройство 0 — воспроизведение и захват
+        // («Стерео микшер», 23.11), устройство 1 — захват с микрофона (28.11).
         0x31 => {
             let Ok(head) = read_user(arg, 12) else { return -e::EFAULT };
             let device = u32::from_ne_bytes([head[0], head[1], head[2], head[3]]);
             let subdevice = u32::from_ne_bytes([head[4], head[5], head[6], head[7]]);
             let stream = i32::from_ne_bytes([head[8], head[9], head[10], head[11]]);
-            if device != 0 || !(stream == 0 || stream == 1) || subdevice != 0 {
+            if subdevice != 0 {
                 return -e::ENOENT;
             }
-            answer(write_user(arg, &pcm_info(stream == 1)))
+            match (device, stream) {
+                (0, 0 | 1) => answer(write_user(arg, &pcm_info(stream == 1, false))),
+                (1, 1) if mic_present() => answer(write_user(arg, &pcm_info(true, true))),
+                _ => -e::ENOENT,
+            }
         }
         // PCM_PREFER_SUBDEVICE
         0x32 => 0,
@@ -191,11 +226,16 @@ fn control_ioctl(nr: usize, arg: usize) -> i64 {
 }
 
 /// struct snd_pcm_info, 288 байт. `capture` — устройство захвата (отвод
-/// того, что играет система).
-fn pcm_info(capture: bool) -> alloc::vec::Vec<u8> {
+/// того, что играет система), `mic` — микрофон (устройство 1).
+fn pcm_info(capture: bool, mic: bool) -> alloc::vec::Vec<u8> {
     let mut info = vec![0u8; 288];
+    info[0..4].copy_from_slice(&u32::from(mic).to_ne_bytes()); // device
     info[8..12].copy_from_slice(&i32::from(capture).to_ne_bytes()); // stream
-    if capture {
+    if mic {
+        put_str(&mut info, 16, 64, "FossAi Mic");
+        let name = crate::sound::hda::capture_name();
+        put_str(&mut info, 80, 80, &alloc::format!("Микрофон ({name})"));
+    } else if capture {
         put_str(&mut info, 16, 64, "FossAi Loopback");
         put_str(&mut info, 80, 80, "Стерео микшер (звук системы)");
     } else {
@@ -229,6 +269,10 @@ struct Stream {
     origin: u64,
     /// Захват: сколько кадров отдано программе всего, без `boundary`.
     total: u64,
+    /// Захват с микрофона (28.11): кадры — из кольца HDA, не из отвода.
+    mic: bool,
+    /// Микрофон: номер потребителя записи HDA (`usize::MAX` — не пишет).
+    slot: usize,
 }
 
 impl Default for Stream {
@@ -245,6 +289,8 @@ impl Default for Stream {
             capture: false,
             origin: 0,
             total: 0,
+            mic: false,
+            slot: usize::MAX,
         }
     }
 }
@@ -271,6 +317,19 @@ impl Stream {
     fn update(&mut self) {
         let now = crate::time::uptime_ns();
         if self.state != STATE_RUNNING && self.state != STATE_DRAINING {
+            self.clock = now;
+            return;
+        }
+        if self.mic {
+            // Снято — что записано в кольцо HDA и не прочитано; больше
+            // буфера — самое старое пропускается (без XRUN).
+            let mut ready = (crate::sound::hda::capture_available(self.slot) / FRAME_BYTES as usize) as u64;
+            if ready > BUFFER_FRAMES {
+                crate::sound::hda::capture_skip(self.slot, ((ready - BUFFER_FRAMES) * FRAME_BYTES) as usize);
+                ready = BUFFER_FRAMES;
+            }
+            self.appl = self.wrap(self.total);
+            self.hw = self.wrap(self.total + ready);
             self.clock = now;
             return;
         }
@@ -304,7 +363,11 @@ impl Stream {
         self.state = STATE_RUNNING;
         self.clock = crate::time::uptime_ns();
         self.rest = 0;
-        if self.capture {
+        if self.mic {
+            self.total = 0;
+            self.appl = 0;
+            self.hw = 0;
+        } else if self.capture {
             crate::sound::loopback::arm();
             self.origin = crate::sound::loopback::now_frame();
             self.total = 0;
@@ -329,6 +392,9 @@ struct Pcm {
     written: core::sync::atomic::AtomicU64,
     feed_errors: core::sync::atomic::AtomicU64,
     started: core::sync::atomic::AtomicBool,
+    /// Microphone (28.11): device 1, and whether it holds the HDA recording.
+    mic: bool,
+    mic_slot: core::sync::atomic::AtomicUsize,
 }
 
 /// Playback streams that have written something and are still open. More
@@ -336,13 +402,47 @@ struct Pcm {
 static PLAYING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 impl Pcm {
-    fn new(capture: bool) -> Self {
+    fn new(capture: bool, mic: bool) -> Self {
         Self {
-            state: Mutex::new(Stream { capture, ..Stream::default() }),
+            state: Mutex::new(Stream { capture, mic, ..Stream::default() }),
             capture,
             written: core::sync::atomic::AtomicU64::new(0),
             feed_errors: core::sync::atomic::AtomicU64::new(0),
             started: core::sync::atomic::AtomicBool::new(false),
+            mic,
+            mic_slot: core::sync::atomic::AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    /// Start the stream (`START` or the first read); the microphone starts
+    /// the HDA recording first.
+    fn begin(&self, stream: &mut Stream) -> Result<(), i64> {
+        use core::sync::atomic::Ordering::Relaxed;
+        if self.mic && self.mic_slot.load(Relaxed) == usize::MAX {
+            let slot = match crate::sound::hda::capture_start() {
+                Ok(slot) => slot,
+                Err(err) => {
+                    crate::kprintln!("  snd         : microphone did not start: {err}");
+                    return Err(-e::EIO);
+                }
+            };
+            self.mic_slot.store(slot, Relaxed);
+            let pid = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
+            crate::kprintln!(
+                "  snd         : process {pid} ({}) records from the microphone, S16_LE 2 ch 48000 Hz",
+                crate::sched::current()
+            );
+        }
+        stream.slot = self.mic_slot.load(Relaxed);
+        stream.start();
+        Ok(())
+    }
+
+    /// Stop holding the HDA recording (stop, drop, prepare again, close).
+    fn mic_off(&self) {
+        let slot = self.mic_slot.swap(usize::MAX, core::sync::atomic::Ordering::Relaxed);
+        if self.mic && slot != usize::MAX {
+            crate::sound::hda::capture_stop(slot);
         }
     }
 
@@ -361,6 +461,7 @@ impl Pcm {
 impl Drop for Pcm {
     fn drop(&mut self) {
         use core::sync::atomic::Ordering::Relaxed;
+        self.mic_off();
         if self.capture || !self.started.load(Relaxed) {
             return;
         }
@@ -549,7 +650,7 @@ impl Pcm {
             // PVERSION
             0x00 => answer(put(arg, PCM_VERSION)),
             // INFO
-            0x01 => answer(write_user(arg, &pcm_info(self.capture))),
+            0x01 => answer(write_user(arg, &pcm_info(self.capture, self.mic))),
             // TSTAMP, TTSTAMP, USER_PVERSION
             0x02..=0x04 => 0,
             // HW_REFINE, HW_PARAMS
@@ -559,13 +660,15 @@ impl Pcm {
                     return err;
                 }
                 if nr == 0x11 {
+                    self.mic_off();
                     let mut stream = self.state.lock();
-                    *stream = Stream { state: STATE_SETUP, capture: self.capture, ..Stream::default() };
+                    *stream = Stream { state: STATE_SETUP, capture: self.capture, mic: self.mic, ..Stream::default() };
                 }
                 answer(write_user(arg, &buf))
             }
             // HW_FREE
             0x12 => {
+                self.mic_off();
                 self.state.lock().state = STATE_OPEN;
                 0
             }
@@ -632,10 +735,15 @@ impl Pcm {
                 if stream.state == STATE_OPEN {
                     return -e::EBADFD;
                 }
+                // The microphone starts afresh at the next START.
+                self.mic_off();
                 stream.state = STATE_PREPARED;
                 stream.appl = 0;
                 stream.hw = 0;
                 stream.rest = 0;
+                if stream.mic {
+                    stream.total = 0;
+                }
                 0
             }
             // START
@@ -644,11 +752,11 @@ impl Pcm {
                 if stream.state != STATE_PREPARED {
                     return -e::EBADFD;
                 }
-                stream.start();
-                0
+                answer(self.begin(&mut stream))
             }
             // DROP
             0x43 => {
+                self.mic_off();
                 let mut stream = self.state.lock();
                 if stream.state != STATE_OPEN {
                     stream.state = STATE_SETUP;
@@ -701,6 +809,9 @@ impl Pcm {
             if stream.capture {
                 // Программа сдвинула указатель сама: столько же прочитано.
                 let moved = (appl + stream.boundary - stream.appl) % stream.boundary;
+                if stream.mic && moved > 0 {
+                    crate::sound::hda::capture_skip(stream.slot, (moved * FRAME_BYTES) as usize);
+                }
                 stream.total += moved;
             }
             stream.appl = appl;
@@ -803,7 +914,11 @@ impl Pcm {
         {
             let mut stream = self.state.lock();
             match stream.state {
-                STATE_PREPARED => stream.start(),
+                STATE_PREPARED => {
+                    if let Err(err) = self.begin(&mut stream) {
+                        return err;
+                    }
+                }
                 STATE_RUNNING => {}
                 STATE_OPEN | STATE_SETUP => return -e::EBADFD,
                 _ => return -e::EPIPE,
@@ -839,6 +954,21 @@ impl Pcm {
             Ok(take) => take,
             Err(err) => return err,
         };
+        if self.mic {
+            let mut bytes = vec![0u8; (take * FRAME_BYTES) as usize];
+            let got = crate::sound::hda::capture_read(self.mic_slot.load(core::sync::atomic::Ordering::Relaxed), &mut bytes) / FRAME_BYTES as usize;
+            if got > 0 {
+                if let Err(err) = write_user(data, &bytes[..got * FRAME_BYTES as usize]) {
+                    return err;
+                }
+            }
+            let mut stream = self.state.lock();
+            stream.total += got as u64;
+            stream.appl = stream.wrap(stream.total);
+            drop(stream);
+            let _ = put(arg, got as i64);
+            return 0;
+        }
         let (from, origin) = {
             let stream = self.state.lock();
             (stream.origin + stream.total, stream.origin)
@@ -861,6 +991,7 @@ impl Pcm {
 
     fn drain(&self, nonblock: bool) -> i64 {
         if self.capture {
+            self.mic_off();
             let mut stream = self.state.lock();
             if stream.state != STATE_OPEN {
                 stream.state = STATE_SETUP;

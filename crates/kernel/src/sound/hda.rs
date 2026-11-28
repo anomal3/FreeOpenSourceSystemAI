@@ -28,9 +28,25 @@
 //!   программа не успела, дальше прозвучит тишина, а не старый звук по кругу.
 //!   Где играет устройство, говорит `LPIB` — смещение в кольце.
 //!
+//! # Вход: микрофон (28.11)
+//!
+//! При подъёме в том же кодеке ищутся входы: разъём, способный принимать
+//! (`PINCAP_IN`), с `config default` «микрофон» или «линейный вход» и путь от
+//! АЦП (`audio input`) к нему — через смесители и селекторы. Какой из них
+//! слушать, решается при каждом старте записи: штекер в гнезде (`pin sense`)
+//! важнее, микрофон важнее линейного входа, встроенный микрофон (`fixed`) —
+//! после вставленных. На выбранном пути: выбор входа в селекторах, в
+//! смесителях открыт только наш вход (остальные приглушены — иначе в запись
+//! подмешался бы другой разъём), усиление 0 дБ, у микрофона — подъём около
+//! +20 дБ на самом разъёме и опорное напряжение (`VRef` 80 %/50 %).
+//! Поток — первый входной контроллера, номер 2, тот же формат, кольцо из
+//! шестнадцати периодов (~340 мс). Драйвер читает по `LPIB` (сколько записано
+//! в кольцо); не читали дольше кольца — пропущенное теряется, чтение
+//! догоняет устройство.
+//!
 //! # Чего нет
 //!
-//! Прерываний (поток опрашивается, пока драйвер ждёт места), записи, других
+//! Прерываний (поток опрашивается, пока драйвер ждёт места), других
 //! форматов, громкости, переключения при вставке наушников (unsolicited
 //! responses отбрасываются), HDMI-кодеков как цели (у них нет аналоговых
 //! разъёмов — выход на них драйвер не найдёт и честно скажет).
@@ -129,6 +145,7 @@ const FUNCTION_AUDIO: u32 = 0x01;
 
 // Виды виджетов (`widget caps`, биты 23:20).
 const W_OUTPUT: u8 = 0x0;
+const W_INPUT: u8 = 0x1;
 const W_MIXER: u8 = 0x2;
 const W_SELECTOR: u8 = 0x3;
 const W_PIN: u8 = 0x4;
@@ -139,24 +156,50 @@ const WCAP_AMP_OVERRIDE: u32 = 1 << 3;
 const WCAP_CONN_LIST: u32 = 1 << 8;
 const WCAP_POWER: u32 = 1 << 10;
 
+const PINCAP_TRIGGER: u32 = 1 << 1;
+const PINCAP_PRESENCE: u32 = 1 << 2;
 const PINCAP_HP_DRIVE: u32 = 1 << 3;
 const PINCAP_OUT: u32 = 1 << 4;
+const PINCAP_IN: u32 = 1 << 5;
+const PINCAP_VREF_50: u32 = 1 << 9;
+const PINCAP_VREF_80: u32 = 1 << 12;
 const PINCAP_EAPD: u32 = 1 << 16;
 
 const PIN_OUT_ENABLE: u32 = 0x40;
+const PIN_IN_ENABLE: u32 = 0x20;
 const PIN_HP_ENABLE: u32 = 0x80;
+const PIN_VREF_50: u32 = 0x01;
+const PIN_VREF_80: u32 = 0x04;
 const EAPD_ON: u32 = 0x02;
+
+/// `pin sense`: бит 31 — штекер в гнезде; запуск измерения — у разъёмов,
+/// которым он нужен (`PINCAP_TRIGGER`).
+const GET_PIN_SENSE: u32 = 0xF09;
+const EXECUTE_PIN_SENSE: u32 = 0x709;
 
 const AMP_OUTPUT: u32 = 1 << 15;
 const AMP_INPUT: u32 = 1 << 14;
 const AMP_LEFT_RIGHT: u32 = (1 << 13) | (1 << 12);
+const AMP_MUTE: u32 = 1 << 7;
 
 // Устройство по умолчанию в `config default` (биты 23:20) и подключение
 // (биты 31:30).
 const DEVICE_LINE_OUT: u32 = 0x0;
 const DEVICE_SPEAKER: u32 = 0x1;
 const DEVICE_HP_OUT: u32 = 0x2;
+const DEVICE_LINE_IN: u32 = 0x8;
+const DEVICE_MIC_IN: u32 = 0xA;
 const PORT_NONE: u32 = 0x1;
+const PORT_FIXED: u32 = 0x2;
+/// `config default`, биты 11:8, бит 0: «гнездо без определения штекера».
+const MISC_NO_PRESENCE: u32 = 1 << 8;
+
+/// Номер входного потока у контроллера и АЦП.
+const CAPTURE_TAG: u8 = 2;
+/// Периодов в кольце записи: ~340 мс — запас на программу, которая читает
+/// не каждые 20 мс.
+const CAPTURE_PERIODS: usize = 16;
+const CAPTURE_BYTES: usize = PERIOD_BYTES * CAPTURE_PERIODS;
 
 /// Виджетов в группе не бывает больше — номер узла семибитный в коротких
 /// списках и не больше 127 у всех известных кодеков.
@@ -192,6 +235,10 @@ pub enum HdaError {
     NoOutput,
     /// Поток запущен, а позиция не движется.
     Stalled,
+    /// Нет входа (микрофона, линейного входа) или входного потока.
+    NoInput,
+    /// Все места потребителей записи заняты.
+    Busy,
 }
 
 impl core::fmt::Display for HdaError {
@@ -207,6 +254,8 @@ impl core::fmt::Display for HdaError {
             Self::HighMemory => write!(f, "DMA memory above 4 GiB, controller is 32-bit"),
             Self::NoOutput => write!(f, "no path from a DAC to a connected output"),
             Self::Stalled => write!(f, "stream position does not move"),
+            Self::NoInput => write!(f, "no microphone or line input"),
+            Self::Busy => write!(f, "too many recordings at once"),
         }
     }
 }
@@ -227,6 +276,10 @@ struct Hda {
     dac: u8,
     pins: [u8; 4],
     pin_count: usize,
+    /// Входы (28.11): разъёмы, до которых доходит АЦП.
+    inputs: alloc::vec::Vec<Input>,
+    /// Входных потоков у контроллера.
+    input_streams: usize,
     // --- состояние потока ---
     running: bool,
     /// Период, в котором устройство было при последней проверке.
@@ -242,10 +295,336 @@ struct Hda {
     moved_ms: u64,
 }
 
+/// Вход кодека (28.11): разъём и путь к нему от АЦП.
+#[derive(Clone, Copy)]
+struct Input {
+    codec: u8,
+    pin: u8,
+    pin_caps: u32,
+    config: u32,
+    /// АЦП первым, разъём последним.
+    path: [u8; MAX_PATH],
+    length: usize,
+    /// Виджеты пути (для выбора входов и усилителей при включении).
+    widgets: [Widget; MAX_PATH],
+    afg_in_amp: u32,
+    afg_out_amp: u32,
+}
+
+impl Input {
+    fn adc(&self) -> u8 {
+        self.path[0]
+    }
+
+    fn is_mic(&self) -> bool {
+        (self.config >> 20) & 0xF == DEVICE_MIC_IN
+    }
+
+    /// «Mic in, front pink jack» — для журнала и имени устройства ALSA.
+    fn describe(&self) -> alloc::string::String {
+        let kind = if self.is_mic() { "Mic in" } else { "Line in" };
+        let port = self.config >> 30;
+        if port == PORT_FIXED {
+            return alloc::format!("{kind}, built-in");
+        }
+        let place = match (self.config >> 24) & 0xF {
+            0x1 => "rear ",
+            0x2 => "front ",
+            0x3 => "left ",
+            0x4 => "right ",
+            0x5 => "top ",
+            0x6 => "bottom ",
+            _ => "",
+        };
+        let color = match (self.config >> 12) & 0xF {
+            0x1 => "black ",
+            0x2 => "grey ",
+            0x3 => "blue ",
+            0x4 => "green ",
+            0x5 => "red ",
+            0x6 => "orange ",
+            0x7 => "yellow ",
+            0x8 => "purple ",
+            0x9 => "pink ",
+            0xE => "white ",
+            _ => "",
+        };
+        alloc::format!("{kind}, {place}{color}jack")
+    }
+}
+
+/// Запись с входа (28.11): свой поток, своё кольцо; регистры — те же, что у
+/// [`Hda`], но под отдельным замком: вывод держит свой замок, пока ждёт места
+/// в кольце, и запись не должна ждать его.
+struct Capture {
+    regs: VirtAddr,
+    /// Смещение регистров входного потока.
+    sd: usize,
+    bdl: DmaBuffer,
+    buffer: DmaBuffer,
+    /// Сколько потребителей открыло запись.
+    users: usize,
+    /// Потребители: у каждого свой курсор. С общим две вкладки со звонком
+    /// отнимали данные друг у друга (QEMU 28.11: «PcmReadi returning less
+    /// than expected frames: 234 vs. 480»).
+    readers: [Option<Reader>; READERS],
+    started_ms: u64,
+    /// Отдано потребителям и потеряно (не прочитано вовремя), в байтах.
+    delivered: u64,
+    lost: u64,
+    /// Самый громкий отсчёт с начала записи — в журнал при остановке.
+    peak: u16,
+    /// Какой вход слушается — для журнала и имени устройства.
+    what: alloc::string::String,
+}
+
+/// Курсор одного потребителя записи.
+#[derive(Clone, Copy)]
+struct Reader {
+    /// Смещение в кольце, с которого читать.
+    read: usize,
+    /// Когда позицию смотрели последний раз.
+    checked_ms: u64,
+}
+
+/// Сколько потребителей записи может быть сразу.
+const READERS: usize = 8;
+
+static CAPTURE: crate::sync::Mutex<Option<Capture>> = crate::sync::Mutex::new(None);
+
 /// Есть ли звук.
 #[must_use]
 pub fn present() -> bool {
     HDA.lock().is_some()
+}
+
+/// Есть ли вход (микрофон или линейный вход), с которого можно писать.
+#[must_use]
+pub fn capture_present() -> bool {
+    CAPTURE.lock().is_some()
+}
+
+/// Имя входа, который будет слушаться (для `PCM_INFO`): «Mic in, rear pink
+/// jack». Пусто — входа нет.
+#[must_use]
+pub fn capture_name() -> alloc::string::String {
+    let guard = HDA.lock();
+    let Some(hda) = guard.as_ref() else { return alloc::string::String::new() };
+    hda.inputs.first().map(Input::describe).unwrap_or_default()
+}
+
+/// Начать запись (или прибавить потребителя к идущей). Ответ — номер
+/// потребителя для [`capture_read`] и [`capture_stop`].
+pub fn capture_start() -> Result<usize, HdaError> {
+    let mut guard = CAPTURE.lock();
+    let capture = guard.as_mut().ok_or(HdaError::NoInput)?;
+    let slot = capture.readers.iter().position(Option::is_none).ok_or(HdaError::Busy)?;
+    let now = crate::time::uptime_ms();
+    if capture.users > 0 {
+        // Новый потребитель слушает с того, что записывается сейчас.
+        let read = capture.position();
+        capture.readers[slot] = Some(Reader { read, checked_ms: now });
+        capture.users += 1;
+        return Ok(slot);
+    }
+    // Вход выбирается сейчас: штекер могли вставить после загрузки.
+    let what = {
+        let mut hda = HDA.lock();
+        let hda = hda.as_mut().ok_or(HdaError::NoCodec)?;
+        hda.enable_input()?
+    };
+    capture.program()?;
+    capture.users = 1;
+    capture.readers[slot] = Some(Reader { read: 0, checked_ms: now });
+    capture.delivered = 0;
+    capture.lost = 0;
+    capture.peak = 0;
+    capture.started_ms = now;
+    capture.write8(capture.sd + SD_CTL0, SD_RUN);
+    kprintln!("  hda         : capture started: {what}, stream {CAPTURE_TAG}, 48000 Hz 16-bit stereo");
+    capture.what = what;
+    Ok(slot)
+}
+
+/// Убрать потребителя `slot`; последний останавливает поток.
+pub fn capture_stop(slot: usize) {
+    let mut guard = CAPTURE.lock();
+    let Some(capture) = guard.as_mut() else { return };
+    if capture.readers.get(slot).is_none_or(Option::is_none) {
+        return;
+    }
+    capture.readers[slot] = None;
+    capture.users -= 1;
+    if capture.users > 0 {
+        return;
+    }
+    capture.stop_stream();
+    let frames = capture.delivered / 4;
+    let ms = crate::time::uptime_ms().saturating_sub(capture.started_ms);
+    let position = capture.read32(capture.sd + SD_LPIB);
+    kprintln!(
+        "  hda         : capture stopped ({}): {frames} frames ({}.{} s) read in {ms} ms, {} frames lost, peak {}, position {position}",
+        capture.what,
+        frames / 48_000,
+        frames % 48_000 * 10 / 48_000,
+        capture.lost / 4,
+        capture.peak
+    );
+}
+
+/// Сколько байт записано и не прочитано потребителем `slot` (кратно кадру).
+pub fn capture_available(slot: usize) -> usize {
+    let mut guard = CAPTURE.lock();
+    guard.as_mut().map_or(0, |capture| capture.available(slot))
+}
+
+/// Прочитать записанное потребителем `slot` (не больше `out`, кратно кадру);
+/// не ждёт.
+pub fn capture_read(slot: usize, out: &mut [u8]) -> usize {
+    let mut guard = CAPTURE.lock();
+    let limit = out.len();
+    guard.as_mut().map_or(0, |capture| capture.take(slot, Some(out), limit))
+}
+
+/// Пропустить `bytes` записанного потребителем `slot` (программа отстала или
+/// сдвинула указатель сама). Ответ — сколько пропущено.
+pub fn capture_skip(slot: usize, bytes: usize) -> usize {
+    let mut guard = CAPTURE.lock();
+    guard.as_mut().map_or(0, |capture| {
+        let skipped = capture.take(slot, None, bytes);
+        capture.delivered -= skipped as u64;
+        capture.lost += skipped as u64;
+        skipped
+    })
+}
+
+impl Capture {
+    /// Сбросить поток и записать ему кольцо, длину, формат и номер.
+    fn program(&mut self) -> Result<(), HdaError> {
+        let sd = self.sd;
+        self.stop_stream();
+        self.write8(sd + SD_CTL0, SD_SRST);
+        let _ = wait_regs(|| self.read8(sd + SD_CTL0) & SD_SRST != 0, 10);
+        self.write8(sd + SD_CTL0, 0);
+        wait_regs(|| self.read8(sd + SD_CTL0) & SD_SRST == 0, 100).map_err(|()| HdaError::Timeout("input stream reset"))?;
+        self.write8(sd + SD_STS, SD_STS_CLEAR);
+        self.buffer.zero();
+        let base = self.buffer.phys().as_u64();
+        for period in 0..CAPTURE_PERIODS {
+            // SAFETY: шестнадцать записей по 16 байт — внутри страницы.
+            unsafe {
+                let entry = self.bdl.as_ptr::<u8>().add(period * 16);
+                entry.cast::<u64>().write_volatile(base + (period * PERIOD_BYTES) as u64);
+                entry.add(8).cast::<u32>().write_volatile(PERIOD_BYTES as u32);
+                entry.add(12).cast::<u32>().write_volatile(0);
+            }
+        }
+        fence(Ordering::SeqCst);
+        let bdl = self.bdl.phys().as_u64();
+        self.write32(sd + SD_BDPL, bdl as u32);
+        self.write32(sd + SD_BDPU, (bdl >> 32) as u32);
+        self.write32(sd + SD_CBL, CAPTURE_BYTES as u32);
+        self.write16(sd + SD_LVI, (CAPTURE_PERIODS - 1) as u16);
+        self.write16(sd + SD_FMT, FORMAT_48K_16_STEREO);
+        self.write8(sd + SD_CTL2, CAPTURE_TAG << 4);
+        Ok(())
+    }
+
+    fn stop_stream(&self) {
+        let sd = self.sd;
+        self.write8(sd + SD_CTL0, 0);
+        let _ = wait_regs(|| self.read8(sd + SD_CTL0) & SD_RUN == 0, 100);
+        self.write8(sd + SD_STS, SD_STS_CLEAR);
+    }
+
+    /// Записано и не прочитано, в байтах. Не смотрели дольше трёх четвертей
+    /// кольца — устройство могло обойти его: старое теряется, чтение
+    /// начинается с того, что записано сейчас.
+    fn available(&mut self, slot: usize) -> usize {
+        let position = self.position();
+        let Some(Some(reader)) = self.readers.get_mut(slot) else { return 0 };
+        let now = crate::time::uptime_ms();
+        let ring_ms = (CAPTURE_BYTES / 4) as u64 * 1000 / 48_000;
+        let mut behind = 0;
+        if now.saturating_sub(reader.checked_ms) > ring_ms * 3 / 4 {
+            behind = (position + CAPTURE_BYTES - reader.read) % CAPTURE_BYTES;
+            reader.read = position;
+        }
+        reader.checked_ms = now;
+        let ready = (position + CAPTURE_BYTES - reader.read) % CAPTURE_BYTES;
+        self.lost += behind as u64;
+        ready
+    }
+
+    /// Где пишет устройство: смещение в кольце, кратное кадру.
+    fn position(&self) -> usize {
+        (self.read32(self.sd + SD_LPIB) as usize % CAPTURE_BYTES) & !3
+    }
+
+    /// Снять до `limit` байт из кольца для потребителя `slot` (в `out`, если
+    /// он есть).
+    fn take(&mut self, slot: usize, mut out: Option<&mut [u8]>, limit: usize) -> usize {
+        let count = self.available(slot).min(limit) & !3;
+        let Some(Some(mut reader)) = self.readers.get(slot).copied() else { return 0 };
+        let mut done = 0;
+        while done < count {
+            let run = (count - done).min(CAPTURE_BYTES - reader.read);
+            // SAFETY: `read + run` не выходит за кольцо; устройство пишет
+            // дальше `LPIB`, а не сюда.
+            let data = unsafe { core::slice::from_raw_parts(self.buffer.as_ptr::<u8>().add(reader.read), run) };
+            if let Some(out) = out.as_deref_mut() {
+                out[done..done + run].copy_from_slice(data);
+                for pair in data.chunks_exact(2) {
+                    let sample = i16::from_le_bytes([pair[0], pair[1]]).unsigned_abs();
+                    self.peak = self.peak.max(sample);
+                }
+            }
+            done += run;
+            reader.read = (reader.read + run) % CAPTURE_BYTES;
+        }
+        self.readers[slot] = Some(reader);
+        self.delivered += done as u64;
+        done
+    }
+
+    fn read8(&self, offset: usize) -> u8 {
+        // SAFETY: окно регистров отображено с семантикой устройства.
+        unsafe { ((self.regs.as_usize() + offset) as *const u8).read_volatile() }
+    }
+
+    fn read32(&self, offset: usize) -> u32 {
+        // SAFETY: см. `read8`.
+        unsafe { ((self.regs.as_usize() + offset) as *const u32).read_volatile() }
+    }
+
+    fn write8(&self, offset: usize, value: u8) {
+        // SAFETY: см. `read8`.
+        unsafe { ((self.regs.as_usize() + offset) as *mut u8).write_volatile(value) }
+    }
+
+    fn write16(&self, offset: usize, value: u16) {
+        // SAFETY: см. `read8`.
+        unsafe { ((self.regs.as_usize() + offset) as *mut u16).write_volatile(value) }
+    }
+
+    fn write32(&self, offset: usize, value: u32) {
+        // SAFETY: см. `read8`.
+        unsafe { ((self.regs.as_usize() + offset) as *mut u32).write_volatile(value) }
+    }
+}
+
+/// Ждать условия до `ms` миллисекунд, опросом.
+fn wait_regs(done: impl Fn() -> bool, ms: u64) -> Result<(), ()> {
+    let deadline = crate::time::uptime_ns() + ms * 1_000_000;
+    loop {
+        if done() {
+            return Ok(());
+        }
+        if crate::time::uptime_ns() > deadline {
+            return Err(());
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// Найти контроллер, поднять его и кодек.
@@ -289,7 +668,7 @@ unsafe fn attach_one(device: &pci::Device) -> bool {
     let device = *device;
     // SAFETY: контракт функции.
     match unsafe { Hda::attach(&device) } {
-        Ok(hda) => {
+        Ok(mut hda) => {
             crate::devices::claim(device.address, "hda");
             let mut pins = alloc::string::String::new();
             for pin in &hda.pins[..hda.pin_count] {
@@ -307,7 +686,9 @@ unsafe fn attach_one(device: &pci::Device) -> bool {
                 hda.dac,
                 pins
             );
+            let capture = hda.make_capture();
             *HDA.lock() = Some(hda);
+            *CAPTURE.lock() = capture;
             true
         }
         Err(err) => {
@@ -336,14 +717,16 @@ pub fn drain() -> Result<(), HdaError> {
 struct Widget {
     kind: u8,
     caps: u32,
-    /// Номера узлов из списка соединений (входы этого виджета).
-    inputs: [u8; 8],
+    /// Номера узлов из списка соединений (входы этого виджета). Шестнадцать
+    /// (28.11): у селекторов перед АЦП Realtek (ALC897, ALC1220) их 10–11, и
+    /// разъёмы микрофона стоят не первыми.
+    inputs: [u8; 16],
     input_count: u8,
 }
 
 impl Widget {
     /// Узел, которого в группе нет: вид «никакой», а не ноль — ноль это ЦАП.
-    const ABSENT: Self = Self { kind: 0xFF, caps: 0, inputs: [0; 8], input_count: 0 };
+    const ABSENT: Self = Self { kind: 0xFF, caps: 0, inputs: [0; 16], input_count: 0 };
 }
 
 impl Hda {
@@ -387,6 +770,8 @@ impl Hda {
             dac: 0,
             pins: [0; 4],
             pin_count: 0,
+            inputs: alloc::vec::Vec::new(),
+            input_streams: 0,
             running: false,
             play: 0,
             oldest: 0,
@@ -412,6 +797,11 @@ impl Hda {
             return Err(HdaError::HighMemory);
         }
         hda.stream = STREAMS + inputs * STREAM_STRIDE;
+        hda.input_streams = inputs;
+        if inputs > 0 {
+            // Прошивка могла оставить запись идущей.
+            hda.write8(STREAMS + SD_CTL0, 0);
+        }
 
         let codecs = hda.reset()?;
         hda.start_rings();
@@ -427,6 +817,15 @@ impl Hda {
                 Ok(()) => {
                     hda.codec = codec;
                     hda.program_stream()?;
+                    // Входы бывают и на кодеке без выхода (QEMU: `hda-output`
+                    // и `hda-micro` рядом).
+                    for other in codec + 1..15u8 {
+                        if codecs & (1 << other) != 0 {
+                            if let Err(err) = hda.scan_inputs(other) {
+                                kprintln!("  hda         : codec {other}: inputs: {err}");
+                            }
+                        }
+                    }
                     return Ok(hda);
                 }
                 Err(err) => {
@@ -603,6 +1002,7 @@ impl Hda {
             }
         }
         pins[..pin_count].sort_unstable();
+        self.collect_inputs(codec, &widgets, &pin_info, first, last, afg_in_amp, afg_out_amp);
 
         // Главный выход — первый, от которого есть путь к ЦАП; остальные —
         // если до них доходит тот же ЦАП.
@@ -643,15 +1043,15 @@ impl Hda {
         Ok(())
     }
 
-    /// Список соединений узла (до восьми входов).
-    fn connections(&mut self, codec: u8, node: u8) -> Result<([u8; 8], u8), HdaError> {
+    /// Список соединений узла (до шестнадцати входов).
+    fn connections(&mut self, codec: u8, node: u8) -> Result<([u8; 16], u8), HdaError> {
         let length = self.parameter(codec, node, P_CONN_LEN)?;
         let long = length & 0x80 != 0;
         let total = (length & 0x7F) as usize;
         let (per_word, bits) = if long { (2, 16) } else { (4, 8) };
         let mask = (1u32 << bits) - 1;
         let range_bit = 1u32 << (bits - 1);
-        let mut inputs = [0u8; 8];
+        let mut inputs = [0u8; 16];
         let mut count = 0usize;
         let mut previous = 0u32;
         let mut index = 0;
@@ -682,6 +1082,277 @@ impl Hda {
             index += per_word;
         }
         Ok((inputs, count as u8))
+    }
+
+    /// Запомнить входы кодека (28.11): разъёмы «микрофон»/«линейный вход»,
+    /// способные принимать, и кратчайший путь к каждому от какого-нибудь АЦП.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_inputs(
+        &mut self,
+        codec: u8,
+        widgets: &[Widget; MAX_NODES],
+        pin_info: &[(u32, u32); MAX_NODES],
+        first: usize,
+        last: usize,
+        afg_in_amp: u32,
+        afg_out_amp: u32,
+    ) {
+        for pin in first..last {
+            let (pin_caps, config) = pin_info[pin];
+            let device = (config >> 20) & 0xF;
+            if widgets[pin].kind != W_PIN
+                || pin_caps & PINCAP_IN == 0
+                || config >> 30 == PORT_NONE
+                || !matches!(device, DEVICE_MIC_IN | DEVICE_LINE_IN)
+            {
+                continue;
+            }
+            let mut best: Option<([u8; MAX_PATH], usize)> = None;
+            for adc in first..last {
+                if widgets[adc].kind != W_INPUT {
+                    continue;
+                }
+                let mut path = [0u8; MAX_PATH];
+                if let Some(length) = find_input_path(widgets, adc as u8, pin as u8, &mut path, 0) {
+                    if best.is_none_or(|(_, shortest)| length < shortest) {
+                        best = Some((path, length));
+                    }
+                }
+            }
+            let Some((path, length)) = best else {
+                kprintln!("  hda         : codec {codec}: input pin {pin:#04x} (config {config:08x}) has no ADC path");
+                continue;
+            };
+            let mut on_path = [Widget::ABSENT; MAX_PATH];
+            for (slot, &node) in on_path.iter_mut().zip(&path[..length]) {
+                *slot = widgets[usize::from(node)];
+            }
+            self.inputs.push(Input {
+                codec,
+                pin: pin as u8,
+                pin_caps,
+                config,
+                path,
+                length,
+                widgets: on_path,
+                afg_in_amp,
+                afg_out_amp,
+            });
+        }
+        // Порядок без штекеров: микрофон в гнезде, встроенный, линейный вход.
+        self.inputs.sort_by_key(|input| match (input.is_mic(), input.config >> 30 == PORT_FIXED) {
+            (true, false) => 0,
+            (true, true) => 1,
+            _ => 2,
+        });
+    }
+
+    /// Входы кодека, который выход не дал (его не трогали): группа звука,
+    /// виджеты, разъёмы — и [`Self::collect_inputs`].
+    fn scan_inputs(&mut self, codec: u8) -> Result<(), HdaError> {
+        let count = self.parameter(codec, 0, P_NODE_COUNT)?;
+        let (first, groups) = ((count >> 16) & 0xFF, count & 0xFF);
+        let mut afg = None;
+        for node in first..first + groups {
+            if self.parameter(codec, node as u8, P_FUNCTION_TYPE)? & 0xFF == FUNCTION_AUDIO {
+                afg = Some(node as u8);
+                break;
+            }
+        }
+        let Some(afg) = afg else { return Ok(()) };
+        self.command(codec, afg, SET_POWER_STATE, 0)?;
+        let afg_out_amp = self.parameter(codec, afg, P_OUT_AMP_CAPS)?;
+        let afg_in_amp = self.parameter(codec, afg, P_IN_AMP_CAPS)?;
+        let count = self.parameter(codec, afg, P_NODE_COUNT)?;
+        let first = ((count >> 16) & 0xFF) as usize;
+        let last = (first + (count & 0xFF) as usize).min(MAX_NODES);
+        let mut widgets = [Widget::ABSENT; MAX_NODES];
+        let mut pin_info = [(0u32, 0u32); MAX_NODES];
+        for node in first..last {
+            let caps = self.parameter(codec, node as u8, P_WIDGET_CAPS)?;
+            widgets[node].kind = ((caps >> 20) & 0xF) as u8;
+            widgets[node].caps = caps;
+            if caps & WCAP_CONN_LIST != 0 {
+                let (inputs, count) = self.connections(codec, node as u8)?;
+                widgets[node].inputs = inputs;
+                widgets[node].input_count = count;
+            }
+            if widgets[node].kind == W_PIN {
+                let pin_caps = self.parameter(codec, node as u8, P_PIN_CAPS)?;
+                let config = self.command(codec, node as u8, GET_CONFIG_DEFAULT, 0)?;
+                pin_info[node] = (pin_caps, config);
+            }
+        }
+        self.collect_inputs(codec, &widgets, &pin_info, first, last, afg_in_amp, afg_out_amp);
+        Ok(())
+    }
+
+    /// Кольцо и поток записи, если есть вход; что нашлось — в журнал.
+    fn make_capture(&mut self) -> Option<Capture> {
+        let vendor = self.parameter(self.codec, 0, P_VENDOR_ID).unwrap_or(0);
+        if self.inputs.is_empty() {
+            kprintln!("  hda         : codec {} {vendor:08x}: no microphone or line input pin", self.codec);
+            return None;
+        }
+        for index in 0..self.inputs.len() {
+            let input = self.inputs[index];
+            let vendor = self.parameter(input.codec, 0, P_VENDOR_ID).unwrap_or(0);
+            kprintln!(
+                "  hda         : input: codec {} {vendor:08x}, {} (pin {:#04x}, config {:08x}) -> ADC {:#04x}, path {:02x?}",
+                input.codec,
+                input.describe(),
+                input.pin,
+                input.config,
+                input.adc(),
+                &input.path[..input.length]
+            );
+        }
+        if self.input_streams == 0 {
+            kprintln!("  hda         : the controller has no input stream: no recording");
+            return None;
+        }
+        let (Ok(bdl), Ok(buffer)) = (dma::alloc(PAGE_SIZE), dma::alloc(CAPTURE_BYTES)) else {
+            kprintln!("  hda         : no DMA memory for recording");
+            return None;
+        };
+        let wide = self.read16(GCAP) & 1 != 0;
+        let highest = bdl.phys().as_u64().max(buffer.phys().as_u64() + CAPTURE_BYTES as u64);
+        if !wide && highest > u64::from(u32::MAX) {
+            kprintln!("  hda         : recording memory above 4 GiB, controller is 32-bit");
+            return None;
+        }
+        bdl.zero();
+        buffer.zero();
+        Some(Capture {
+            regs: self.regs,
+            sd: STREAMS,
+            bdl,
+            buffer,
+            users: 0,
+            readers: [None; READERS],
+            started_ms: 0,
+            delivered: 0,
+            lost: 0,
+            peak: 0,
+            what: alloc::string::String::new(),
+        })
+    }
+
+    /// Штекер в гнезде входа: `None` — гнездо этого не знает (встроенный
+    /// микрофон, нет определения).
+    fn sense(&mut self, input: &Input) -> Result<Option<bool>, HdaError> {
+        if input.pin_caps & PINCAP_PRESENCE == 0 || input.config & MISC_NO_PRESENCE != 0 || input.config >> 30 == PORT_FIXED {
+            return Ok(None);
+        }
+        if input.pin_caps & PINCAP_TRIGGER != 0 {
+            self.command(input.codec, input.pin, EXECUTE_PIN_SENSE, 0)?;
+            spin_us(200);
+        }
+        let sense = self.command(input.codec, input.pin, GET_PIN_SENSE, 0)?;
+        Ok(Some(sense & (1 << 31) != 0))
+    }
+
+    /// Выбрать вход (штекер, потом вид) и включить путь до АЦП; ответ —
+    /// описание для журнала.
+    fn enable_input(&mut self) -> Result<alloc::string::String, HdaError> {
+        let mut best: Option<(u8, usize, Option<bool>)> = None;
+        for index in 0..self.inputs.len() {
+            let input = self.inputs[index];
+            // Разъём, на который идёт звук (переназначаемые гнёзда), входом
+            // не делаем.
+            if self.pins[..self.pin_count].contains(&input.pin) {
+                continue;
+            }
+            let plugged = self.sense(&input)?;
+            let fixed = input.config >> 30 == PORT_FIXED;
+            let rank = match (plugged, input.is_mic()) {
+                (Some(true), true) => 0,
+                (Some(true), false) => 1,
+                (None, true) if fixed => 2,
+                (None, true) => 3,
+                (None, false) => 4,
+                (Some(false), true) => 5,
+                (Some(false), false) => 6,
+            };
+            if best.is_none_or(|(top, _, _)| rank < top) {
+                best = Some((rank, index, plugged));
+            }
+        }
+        let (_, index, plugged) = best.ok_or(HdaError::NoInput)?;
+        let input = self.inputs[index];
+        let codec = input.codec;
+        let path = &input.path[..input.length];
+        for (step, &node) in path.iter().enumerate() {
+            let widget = input.widgets[step];
+            if widget.caps & WCAP_POWER != 0 {
+                self.command(codec, node, SET_POWER_STATE, 0)?;
+            }
+            let in_caps = if widget.caps & WCAP_AMP_OVERRIDE != 0 {
+                self.parameter(codec, node, P_IN_AMP_CAPS)?
+            } else {
+                input.afg_in_amp
+            };
+            let next = path.get(step + 1).copied();
+            let choice = next.and_then(|next| {
+                widget.inputs[..usize::from(widget.input_count)].iter().position(|&n| n == next)
+            });
+            if let Some(choice) = choice {
+                if widget.kind != W_MIXER && widget.input_count > 1 {
+                    self.command(codec, node, SET_CONNECTION_SELECT, choice as u32)?;
+                }
+                if widget.caps & WCAP_IN_AMP != 0 {
+                    if widget.kind == W_MIXER {
+                        // Только наш вход: остальные разъёмы не подмешиваются.
+                        for other in 0..usize::from(widget.input_count) {
+                            if other != choice {
+                                self.command(codec, node, SET_AMP, AMP_INPUT | AMP_LEFT_RIGHT | ((other as u32 & 0xF) << 8) | AMP_MUTE)?;
+                            }
+                        }
+                    }
+                    let payload = AMP_INPUT | AMP_LEFT_RIGHT | ((choice as u32 & 0xF) << 8) | zero_db(in_caps);
+                    self.command(codec, node, SET_AMP, payload)?;
+                }
+            }
+            if widget.caps & WCAP_OUT_AMP != 0 && widget.kind != W_PIN {
+                let caps = if widget.caps & WCAP_AMP_OVERRIDE != 0 {
+                    self.parameter(codec, node, P_OUT_AMP_CAPS)?
+                } else {
+                    input.afg_out_amp
+                };
+                self.command(codec, node, SET_AMP, AMP_OUTPUT | AMP_LEFT_RIGHT | zero_db(caps))?;
+            }
+            if widget.kind == W_PIN {
+                let mut control = PIN_IN_ENABLE;
+                if input.is_mic() {
+                    // Опорное напряжение для электретного микрофона.
+                    if input.pin_caps & PINCAP_VREF_80 != 0 {
+                        control |= PIN_VREF_80;
+                    } else if input.pin_caps & PINCAP_VREF_50 != 0 {
+                        control |= PIN_VREF_50;
+                    }
+                }
+                self.command(codec, node, SET_PIN_CONTROL, control)?;
+                if widget.caps & WCAP_IN_AMP != 0 {
+                    // Подъём микрофона на разъёме (~+20 дБ, как ставит Linux);
+                    // линейному входу — 0 дБ.
+                    let gain = boost(in_caps, if input.is_mic() { 20 } else { 0 });
+                    self.command(codec, node, SET_AMP, AMP_INPUT | AMP_LEFT_RIGHT | gain)?;
+                }
+            }
+        }
+        let adc = input.adc();
+        self.command(codec, adc, SET_FORMAT, u32::from(FORMAT_48K_16_STEREO))?;
+        self.command(codec, adc, SET_STREAM_CHANNEL, u32::from(CAPTURE_TAG) << 4)?;
+        let state = match plugged {
+            Some(true) => "plugged",
+            Some(false) => "NOT plugged",
+            None => "no jack sense",
+        };
+        Ok(alloc::format!(
+            "{} ({state}), codec {codec} pin {:#04x} -> ADC {adc:#04x}",
+            input.describe(),
+            input.pin
+        ))
     }
 
     /// Включить путь: разъём → … → ЦАП.
@@ -983,6 +1654,37 @@ fn zero_db(caps: u32) -> u32 {
     let offset = caps & 0x7F;
     let steps = (caps >> 8) & 0x7F;
     offset.min(steps)
+}
+
+/// Шаг усилителя, ближайший снизу к `db` дБ над нулём (шаг — `(size + 1)/4`
+/// дБ, ноль — `offset`), без приглушения.
+fn boost(caps: u32, db: u32) -> u32 {
+    let offset = caps & 0x7F;
+    let steps = (caps >> 8) & 0x7F;
+    let size = ((caps >> 16) & 0x7F) + 1;
+    (offset + db * 4 / size).min(steps)
+}
+
+/// Путь от АЦП `node` до разъёма `pin` через смесители и селекторы, поиском
+/// в глубину. Ответ — длина пути в `path` (АЦП первым).
+fn find_input_path(widgets: &[Widget; MAX_NODES], node: u8, pin: u8, path: &mut [u8; MAX_PATH], depth: usize) -> Option<usize> {
+    if depth >= MAX_PATH || usize::from(node) >= MAX_NODES {
+        return None;
+    }
+    path[depth] = node;
+    if depth > 0 && node == pin {
+        return Some(depth + 1);
+    }
+    let widget = &widgets[usize::from(node)];
+    if depth > 0 && !matches!(widget.kind, W_MIXER | W_SELECTOR) {
+        return None;
+    }
+    for &input in &widget.inputs[..usize::from(widget.input_count)] {
+        if let Some(length) = find_input_path(widgets, input, pin, path, depth + 1) {
+            return Some(length);
+        }
+    }
+    None
 }
 
 /// Путь от узла `node` до ЦАП (если `want` — до этого ЦАП) поиском в глубину

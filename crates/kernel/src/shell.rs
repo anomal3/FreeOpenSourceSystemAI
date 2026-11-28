@@ -1539,6 +1539,7 @@ fn run_builtin(line: &str) -> bool {
         }
         "irq" => interrupt_wakes(argument),
         "beep" => beep(argument),
+        "mic" => mic(argument),
         "clear" => {
             ui::clear_shell();
             if !ui::is_active() {
@@ -2766,6 +2767,97 @@ fn beep(argument: &str) {
             crate::time::uptime_ms().saturating_sub(started)
         ),
         Err(err) => sprintln!("  beep     failed: {err}"),
+    }
+}
+
+/// Записать с микрофона (28.11): `mic [1..30 с] [файл.wav]` — вход HDA, по
+/// умолчанию три секунды; в журнал — сколько кадров пришло, пик и RMS, файл —
+/// WAV 48 кГц 16 бит стерео.
+fn mic(argument: &str) {
+    let mut words = argument.split_whitespace();
+    let seconds = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(3);
+    let target = words.next();
+    if !(1..=30).contains(&seconds) {
+        sprintln!("  mic      usage: mic [1..30 s] [file.wav]");
+        return;
+    }
+    if !crate::sound::hda::capture_present() {
+        sprintln!("  mic      no microphone or line input on this machine");
+        return;
+    }
+    let want = seconds as usize * 48_000 * 4;
+    let mut data = alloc::vec::Vec::new();
+    if data.try_reserve_exact(want).is_err() {
+        sprintln!("  mic      no memory for {seconds} s");
+        return;
+    }
+    let slot = match crate::sound::hda::capture_start() {
+        Ok(slot) => slot,
+        Err(err) => {
+            sprintln!("  mic      cannot start: {err}");
+            return;
+        }
+    };
+    let started = crate::time::uptime_ms();
+    let deadline = started + u64::from(seconds) * 1000 + 2000;
+    let mut chunk = [0u8; 4096];
+    while data.len() < want && crate::time::uptime_ms() < deadline {
+        let room = (want - data.len()).min(chunk.len());
+        let got = crate::sound::hda::capture_read(slot, &mut chunk[..room]);
+        if got == 0 {
+            crate::sched::sleep_ms(10);
+            continue;
+        }
+        data.extend_from_slice(&chunk[..got]);
+    }
+    crate::sound::hda::capture_stop(slot);
+    let ms = crate::time::uptime_ms().saturating_sub(started);
+    let frames = data.len() / 4;
+    let (mut peak, mut squares) = (0u16, 0u64);
+    for pair in data.chunks_exact(2) {
+        let sample = i16::from_le_bytes([pair[0], pair[1]]);
+        peak = peak.max(sample.unsigned_abs());
+        squares += (i64::from(sample) * i64::from(sample)) as u64;
+    }
+    let rms = (squares / (frames as u64 * 2).max(1)).isqrt();
+    sprintln!(
+        "  mic      recorded {frames} frames ({}.{} s) in {ms} ms, peak {peak}, rms {rms}",
+        frames / 48_000,
+        frames % 48_000 * 10 / 48_000
+    );
+    let Some(target) = target else { return };
+    let Some(path) = human_path(target) else { return };
+    let mut wav = alloc::vec::Vec::with_capacity(44 + data.len());
+    let size = data.len() as u32;
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + size).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&2u16.to_le_bytes()); // channels
+    wav.extend_from_slice(&48_000u32.to_le_bytes());
+    wav.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+    wav.extend_from_slice(&4u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&size.to_le_bytes());
+    wav.extend_from_slice(&data);
+    let cred = user::session::credentials();
+    let node = match fs::resolve_as(cred, &path, Access::WRITE) {
+        Some(Ok(node)) => node.truncate(0).map(|()| node),
+        Some(Err(VfsError::NotFound)) => match fs::create_as(cred, &path, 0o644) {
+            Some(result) => result,
+            None => return sprintln!("  no filesystem is mounted"),
+        },
+        Some(Err(err)) => Err(err),
+        None => return sprintln!("  no filesystem is mounted"),
+    };
+    match node.and_then(|node| node.write_at(0, &wav).map(|_| ())) {
+        Ok(()) => {
+            fs::writeback_all();
+            sprintln!("  mic      {} bytes of WAV written to {path}", wav.len());
+        }
+        Err(err) => sprintln!("  {path}: {err}"),
     }
 }
 
