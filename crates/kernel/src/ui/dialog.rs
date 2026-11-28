@@ -55,6 +55,9 @@ pub enum Dialog {
     /// «Удалить «имя»?» (макет 18) — в корзину; `forever` — безвозвратно
     /// («Очистить корзину?», 21.11: тем же окном, а не строкой в меню).
     Delete { question: String, forever: bool },
+    /// «Что показать?» (28.11, демонстрация экрана): мониторы и окна
+    /// карточками с миниатюрами, флажок указателя ([`super::sharepick`]).
+    SharePick(super::sharepick::SharePick),
 }
 
 /// Выбор программы для файла.
@@ -135,7 +138,7 @@ impl DialogView {
         let focus = match dialog {
             // «Подождать» — по умолчанию: Enter по привычке не убивает программу.
             Dialog::Power { .. } | Dialog::NotResponding { .. } => 1,
-            Dialog::About(_) | Dialog::OpenWith(_) | Dialog::Delete { .. } => 0,
+            Dialog::About(_) | Dialog::OpenWith(_) | Dialog::Delete { .. } | Dialog::SharePick(_) => 0,
         };
         Self { dialog, focus, answer: None }
     }
@@ -144,14 +147,14 @@ impl DialogView {
     const fn count(&self) -> usize {
         match self.dialog {
             Dialog::About(_) => 1,
-            Dialog::Power { .. } | Dialog::OpenWith(_) | Dialog::NotResponding { .. } | Dialog::Delete { .. } => 2,
+            Dialog::Power { .. } | Dialog::OpenWith(_) | Dialog::NotResponding { .. } | Dialog::Delete { .. } | Dialog::SharePick(_) => 2,
         }
     }
 
     /// Ответ кнопки с этим номером.
     const fn answer_at(&self, index: usize) -> Answer {
         match (&self.dialog, index) {
-            (Dialog::Power { .. } | Dialog::NotResponding { .. } | Dialog::Delete { .. }, 0) => Answer::Confirm,
+            (Dialog::Power { .. } | Dialog::NotResponding { .. } | Dialog::Delete { .. } | Dialog::SharePick(_), 0) => Answer::Confirm,
             (Dialog::OpenWith(_), 0) => Answer::Open,
             _ => Answer::Close,
         }
@@ -188,6 +191,10 @@ impl DialogView {
                 Some((Answer::Confirm, Weight::Danger, "Удалить навсегда")),
                 Some((Answer::Close, Weight::Normal, "Отмена")),
             ],
+            Dialog::SharePick(_) => [
+                Some((Answer::Confirm, Weight::Primary, "Поделиться")),
+                Some((Answer::Close, Weight::Normal, "Отмена")),
+            ],
         };
         let pad = ctx.px(PAD);
         let h = ctx.px(BUTTON_H);
@@ -209,6 +216,53 @@ impl DialogView {
             }
         }
         out
+    }
+
+    /// Разобрать клавишу, зная область содержимого (выбору источника она
+    /// нужна для сетки карточек). `true` — окно ею воспользовалось.
+    pub fn handle_in(&mut self, code: KeyCode, area: Rect, ctx: Ctx) -> bool {
+        if let Dialog::SharePick(pick) = &mut self.dialog {
+            if pick.key(code, area, ctx) {
+                return true;
+            }
+        }
+        self.handle(code)
+    }
+
+    /// Колесо мыши (выбор источника листает окна). `true` — сдвинулось.
+    pub fn wheel(&mut self, clicks: i32, area: Rect, ctx: Ctx) -> bool {
+        match &mut self.dialog {
+            Dialog::SharePick(pick) => pick.wheel(clicks, area, ctx),
+            _ => false,
+        }
+    }
+
+    /// Выбор источника: что выбрано.
+    #[must_use]
+    pub fn share_choice(&self) -> Option<super::sharepick::Choice> {
+        match &self.dialog {
+            Dialog::SharePick(pick) => pick.choice(),
+            _ => None,
+        }
+    }
+
+    /// Выбор источника: места карточек (координаты поверхности окна).
+    #[must_use]
+    pub fn share_spots(&self, area: Rect, ctx: Ctx) -> Vec<(String, Rect)> {
+        match &self.dialog {
+            Dialog::SharePick(pick) => pick.spots(area, ctx),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Места кнопок по-латински (`share`, `cancel`) — для журнала стенда.
+    #[must_use]
+    pub fn button_spots(&self, area: Rect, ctx: Ctx) -> Vec<(String, Rect)> {
+        self.layout(area, ctx)
+            .iter()
+            .flatten()
+            .map(|button| (String::from(if button.answer == Answer::Close { "cancel" } else { "share" }), button.rect))
+            .collect()
     }
 
     /// Разобрать клавишу. `true` — окно ею воспользовалось.
@@ -246,6 +300,11 @@ impl DialogView {
 
     /// Разобрать щелчок в координатах поверхности окна.
     pub fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        if let Dialog::SharePick(pick) = &mut self.dialog {
+            if pick.click(area, ctx, x, y) {
+                return true;
+            }
+        }
         if let Dialog::OpenWith(choice) = &mut self.dialog {
             let (rows, check) = choice_layout(area, ctx, choice.choices.len());
             if let Some(index) = rows.iter().position(|row| row.contains(x, y)) {
@@ -293,8 +352,13 @@ impl DialogView {
             self.draw_buttons(s, area, ctx);
             return;
         }
+        if let Dialog::SharePick(pick) = &self.dialog {
+            pick.draw(s, area, ctx);
+            self.draw_buttons(s, area, ctx);
+            return;
+        }
         let (icon, tone) = match self.dialog {
-            Dialog::About(_) | Dialog::OpenWith(_) => (Icon::Info, Tone::Accent),
+            Dialog::About(_) | Dialog::OpenWith(_) | Dialog::SharePick(_) => (Icon::Info, Tone::Accent),
             Dialog::Power { .. } => (Icon::Power, Tone::Bad),
             Dialog::NotResponding { .. } => (Icon::Info, Tone::Warn),
             Dialog::Delete { forever: false, .. } => (Icon::Close, Tone::Accent),
@@ -304,7 +368,7 @@ impl DialogView {
         // «О системе» — логотип FossAi на плитке (фаза 72a).
         // Значки диалогов — из темы значков (22.11), плитка — если нет.
         let themed = match self.dialog {
-            Dialog::About(_) | Dialog::OpenWith(_) => "dlg-info",
+            Dialog::About(_) | Dialog::OpenWith(_) | Dialog::SharePick(_) => "dlg-info",
             Dialog::Power { .. } => "power",
             Dialog::NotResponding { .. } => "dlg-warning",
             Dialog::Delete { forever: false, .. } => "dlg-question",
@@ -324,7 +388,7 @@ impl DialogView {
         match &self.dialog {
             Dialog::About(facts) => draw_about(ctx, s, x, &mut y, width, facts),
             Dialog::Power { restart } => draw_power(ctx, s, x, &mut y, width, *restart),
-            Dialog::OpenWith(_) => {}
+            Dialog::OpenWith(_) | Dialog::SharePick(_) => {}
             Dialog::Delete { question, forever } => {
                 let p = ctx.palette;
                 paint::text_clipped(ctx, s, Role::Heading, x, y, width, question, p.ink);

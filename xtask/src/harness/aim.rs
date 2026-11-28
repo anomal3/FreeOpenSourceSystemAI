@@ -585,9 +585,12 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         Aim::Point(x, y) => (x, y),
         Aim::Spot(name) => {
             // `snap:L.C` — зона макета прилипания (20.11).
-            let key = match name.strip_prefix("snap:") {
-                Some(zone) => format!("snap spot {zone} at "),
-                None => format!("start spot {name} at "),
+            // `share:` - the picker «Демонстрация экрана» (28.11): its
+            // cards `monitor-N` / `window-N`, `pointer`, `share`, `cancel`.
+            let key = match (name.strip_prefix("snap:"), name.strip_prefix("share:")) {
+                (Some(zone), _) => format!("snap spot {zone} at "),
+                (_, Some(spot)) => format!("share spot {spot} at "),
+                _ => format!("start spot {name} at "),
             };
             let rect = log
                 .lines()

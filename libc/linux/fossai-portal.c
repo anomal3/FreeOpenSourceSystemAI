@@ -38,6 +38,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -57,8 +58,19 @@
 #define CAP_GRAB CAP_IOC(3)
 #define CAP_STOP CAP_IOC(4)
 #define CAP_STATUS CAP_IOC(5)
+#define CAP_WINDOWS CAP_IOC(6)
+// 28.11: the desktop's picker «Демонстрация экрана» (kernel ui/sharepick.rs).
+#define CAP_PICK CAP_IOC(11)
+#define CAP_PICK_POLL CAP_IOC(12)
+#define CAP_PICK_CANCEL CAP_IOC(13)
 #define CAP_POINTER 1u
 #define PIXEL_RGB 1u
+#define PICK_POINTER 1u
+#define PICK_WAITING 0u
+#define PICK_CHOSEN 1u
+#define PICK_CANCELLED 2u
+#define TYPE_MONITOR 1u
+#define TYPE_WINDOW 2u
 
 struct cap_info {
 	uint32_t count;
@@ -73,6 +85,19 @@ struct cap_spec {
 	uint32_t w, h;
 	uint32_t flags;
 	uint32_t fps;
+};
+
+struct cap_pick {
+	uint32_t types; // in: TYPE_* allowed
+	uint32_t flags; // in: pointer on at first; out: pointer chosen
+	uint32_t state; // out: PICK_*
+	uint32_t kind; // out: TYPE_MONITOR / TYPE_WINDOW
+	int32_t x, y; // out: the chosen rectangle
+	uint32_t w, h;
+	uint32_t monitor; // out: monitor number from 1
+	uint32_t id;
+	char title[64]; // in: who asks
+	char name[96]; // out: what was chosen
 };
 
 struct cap_status {
@@ -120,6 +145,23 @@ static long cap_ioctl(int fd, unsigned long request, void *arg)
 		st->seq = test_seq();
 		return 0;
 	}
+	if (request == CAP_PICK)
+		return 0;
+	if (request == CAP_PICK_POLL) {
+		// FOSSAI_PORTAL_TEST_PICK=cancel - the person cancels; else the
+		// test monitor is chosen.
+		struct cap_pick *p = arg;
+		const char *how = getenv("FOSSAI_PORTAL_TEST_PICK");
+		memset(p, 0, sizeof(*p));
+		p->state = how && strcmp(how, "cancel") == 0 ? PICK_CANCELLED : PICK_CHOSEN;
+		p->kind = TYPE_MONITOR;
+		p->w = g_test_w;
+		p->h = g_test_h;
+		p->monitor = 1;
+		p->flags = PICK_POINTER;
+		snprintf(p->name, sizeof(p->name), "Экран 1");
+		return 0;
+	}
 	if (request == CAP_GRAB) {
 		uint64_t *pair = arg;
 		uint32_t *px = (uint32_t *)(uintptr_t)pair[0];
@@ -130,6 +172,18 @@ static long cap_ioctl(int fd, unsigned long request, void *arg)
 		return (long)seq;
 	}
 	return 0;
+}
+
+// CAP_INFO answers EAGAIN while the desktop is busy (its lock is held, e.g.
+// right after the picker closed): ask again for up to two seconds.
+static long cap_info(int fd, struct cap_info *info)
+{
+	for (int i = 0;; i++) {
+		long r = cap_ioctl(fd, CAP_INFO, info);
+		if (r == 0 || errno != EAGAIN || i >= 100)
+			return r;
+		usleep(20000);
+	}
 }
 
 // ---- log --------------------------------------------------------------------
@@ -174,6 +228,7 @@ struct cast {
 	struct spa_source *timer;
 	int fd; // /dev/fossai-capture with this cast's kernel capture
 	struct cap_spec spec;
+	uint32_t kind; // TYPE_MONITOR / TYPE_WINDOW (the stream's source_type)
 	uint32_t format; // SPA_VIDEO_FORMAT_*
 	uint32_t node_id;
 	uint32_t out_port;
@@ -194,9 +249,27 @@ struct session {
 	char path[256];
 	char sender[64];
 	uint32_t cursor_mode;
-	int monitor; // index into cap_info.outputs
+	uint32_t types; // SelectSources: TYPE_* the program allows
+	uint32_t persist; // SelectSources: persist_mode (0 no, 1 while running, 2 kept)
+	char restore[64]; // SelectSources: restore_token
+	int monitor; // index into cap_info.outputs (FOSSAI_SCREENCAST_MONITOR)
+	bool fixed_monitor; // the monitor was set by the variable: no picker
+	int pick_fd; // the desktop's picker is open (Start waits for it)
+	char pick_request[256]; // the Start request it answers
 	struct cast *cast;
 };
+
+// What a restore token brings back (persist_mode 1 and 2).
+#define MAX_TOKENS 16
+struct token {
+	char token[40];
+	uint32_t kind;
+	uint32_t monitor; // number from 1
+	uint32_t pointer;
+	uint32_t persist;
+	char name[96]; // a window's title (found again by it)
+};
+static struct token g_tokens[MAX_TOKENS];
 
 // Registry objects the producer links (nodes and ports of other clients).
 struct object {
@@ -392,7 +465,8 @@ static void cast_state(void *data, enum pw_stream_state old, enum pw_stream_stat
 	say("stream %u: %s%s%s", c->node_id, pw_stream_state_as_string(state), error ? " - " : "", error ? error : "");
 	if (!c->node_id && state >= PW_STREAM_STATE_PAUSED) {
 		c->node_id = pw_stream_get_node_id(c->stream);
-		say("stream node %u for monitor %ux%u at %d,%d", c->node_id, c->spec.w, c->spec.h, c->spec.x, c->spec.y);
+		say("stream node %u for %s %ux%u at %d,%d", c->node_id, c->kind == TYPE_WINDOW ? "window" : "monitor", c->spec.w,
+		    c->spec.h, c->spec.x, c->spec.y);
 		pw_thread_loop_signal(g_loop, false);
 	}
 	if (state == PW_STREAM_STATE_ERROR) {
@@ -563,8 +637,10 @@ static void cast_tick(void *data, uint64_t expirations)
 	pw_stream_trigger_process(c->stream);
 }
 
-// Make the stream of a session; loop locked. NULL - no capture.
-static struct cast *cast_new(int monitor, uint32_t cursor_mode)
+// Make the stream of a session; loop locked. NULL - no capture. `want` -
+// the rectangle the desktop's picker answered (pointer in its flags);
+// NULL - monitor `monitor`.
+static struct cast *cast_new(int monitor, uint32_t cursor_mode, const struct cap_spec *want, uint32_t kind)
 {
 	struct cap_info info;
 	memset(&info, 0, sizeof(info));
@@ -573,7 +649,7 @@ static struct cast *cast_new(int monitor, uint32_t cursor_mode)
 		say("%s: %s", CAP_DEVICE, strerror(errno));
 		return NULL;
 	}
-	if (cap_ioctl(fd, CAP_INFO, &info) != 0 || info.count == 0) {
+	if (cap_info(fd, &info) != 0 || info.count == 0) {
 		say("no monitors (%s)", strerror(errno));
 		close(fd);
 		return NULL;
@@ -582,18 +658,23 @@ static struct cast *cast_new(int monitor, uint32_t cursor_mode)
 		monitor = 0;
 	struct cast *c = calloc(1, sizeof(*c));
 	c->fd = fd;
-	c->spec.x = info.outputs[monitor][0];
-	c->spec.y = info.outputs[monitor][1];
-	c->spec.w = (uint32_t)info.outputs[monitor][2];
-	c->spec.h = (uint32_t)info.outputs[monitor][3];
-	// Hidden only when asked (1); embedded when asked (2) or when the caller
-	// says nothing - Chromium sends no cursor_mode, and a shared screen
-	// without the pointer is hard to follow.
-	c->spec.flags = cursor_mode == 1 ? 0 : CAP_POINTER;
+	c->kind = kind ? kind : TYPE_MONITOR;
+	if (want) {
+		c->spec = *want;
+	} else {
+		c->spec.x = info.outputs[monitor][0];
+		c->spec.y = info.outputs[monitor][1];
+		c->spec.w = (uint32_t)info.outputs[monitor][2];
+		c->spec.h = (uint32_t)info.outputs[monitor][3];
+		// Hidden only when asked (1); embedded when asked (2) or when the
+		// caller says nothing - Chromium sends no cursor_mode, and a shared
+		// screen without the pointer is hard to follow.
+		c->spec.flags = cursor_mode == 1 ? 0 : CAP_POINTER;
+	}
 	c->spec.fps = FPS;
 	c->format = info.format == PIXEL_RGB ? SPA_VIDEO_FORMAT_RGBx : SPA_VIDEO_FORMAT_BGRx;
 	if (cap_ioctl(fd, CAP_START, &c->spec) != 0) {
-		say("capture of monitor %d did not start: %s", monitor + 1, strerror(errno));
+		say("capture of %ux%u at %d,%d did not start: %s", c->spec.w, c->spec.h, c->spec.x, c->spec.y, strerror(errno));
 		close(fd);
 		free(c);
 		return NULL;
@@ -691,7 +772,7 @@ static int pipewire_start(void)
 #define PROPS "org.freedesktop.DBus.Properties"
 
 // Source types: monitor. Cursor modes: hidden, embedded.
-#define SOURCE_TYPES 1u
+#define SOURCE_TYPES (TYPE_MONITOR | TYPE_WINDOW)
 #define CURSOR_MODES 3u
 #define VERSION 4u
 
@@ -719,8 +800,10 @@ static const char INTROSPECT[] =
 struct options {
 	char handle_token[64];
 	char session_token[64];
+	char restore_token[64];
 	uint32_t types;
 	uint32_t cursor_mode;
+	uint32_t persist_mode;
 };
 
 static void read_options(DBusMessageIter *array, struct options *o)
@@ -744,6 +827,8 @@ static void read_options(DBusMessageIter *array, struct options *o)
 				snprintf(o->handle_token, sizeof(o->handle_token), "%s", s);
 			else if (strcmp(key, "session_handle_token") == 0)
 				snprintf(o->session_token, sizeof(o->session_token), "%s", s);
+			else if (strcmp(key, "restore_token") == 0)
+				snprintf(o->restore_token, sizeof(o->restore_token), "%s", s);
 		} else if (type == DBUS_TYPE_UINT32) {
 			uint32_t u = 0;
 			dbus_message_iter_get_basic(&value, &u);
@@ -751,6 +836,8 @@ static void read_options(DBusMessageIter *array, struct options *o)
 				o->types = u;
 			else if (strcmp(key, "cursor_mode") == 0)
 				o->cursor_mode = u;
+			else if (strcmp(key, "persist_mode") == 0)
+				o->persist_mode = u;
 		}
 		dbus_message_iter_next(&entries);
 	}
@@ -832,7 +919,8 @@ static void dict_pair(DBusMessageIter *dict, const char *key, int32_t a, int32_t
 
 // Request.Response(u response, a{sv} results) to the caller; `cast` adds
 // "streams", `session` adds "session_handle".
-static void respond(const char *request, const char *sender, uint32_t code, const char *session, struct cast *cast)
+static void respond(const char *request, const char *sender, uint32_t code, const char *session, struct cast *cast,
+		    const char *restore)
 {
 	DBusMessage *signal = dbus_message_new_signal(request, REQUEST, "Response");
 	dbus_message_set_destination(signal, sender);
@@ -854,13 +942,15 @@ static void respond(const char *request, const char *sender, uint32_t code, cons
 		dbus_message_iter_open_container(&stream, DBUS_TYPE_ARRAY, "{sv}", &props);
 		dict_pair(&props, "position", cast->spec.x, cast->spec.y);
 		dict_pair(&props, "size", (int32_t)cast->spec.w, (int32_t)cast->spec.h);
-		dict_uint(&props, "source_type", 1);
+		dict_uint(&props, "source_type", cast->kind);
 		dbus_message_iter_close_container(&stream, &props);
 		dbus_message_iter_close_container(&streams, &stream);
 		dbus_message_iter_close_container(&variant, &streams);
 		dbus_message_iter_close_container(&entry, &variant);
 		dbus_message_iter_close_container(&dict, &entry);
 	}
+	if (restore && restore[0])
+		dict_string(&dict, "restore_token", restore);
 	dbus_message_iter_close_container(&it, &dict);
 	dbus_connection_send(g_bus, signal, NULL);
 	dbus_message_unref(signal);
@@ -877,6 +967,11 @@ static struct session *session_find(const char *path, const char *sender)
 static void session_close(struct session *s, const char *why)
 {
 	say("session %s closed (%s)", s->path, why);
+	if (s->pick_fd >= 0) {
+		cap_ioctl(s->pick_fd, CAP_PICK_CANCEL, NULL);
+		close(s->pick_fd);
+		s->pick_fd = -1;
+	}
 	pw_thread_loop_lock(g_loop);
 	cast_free(s->cast);
 	s->cast = NULL;
@@ -889,6 +984,240 @@ static int chosen_monitor(void)
 	const char *env = getenv("FOSSAI_SCREENCAST_MONITOR");
 	int n = env ? atoi(env) : 1;
 	return n >= 1 ? n - 1 : 0;
+}
+
+// ---- restore tokens (persist_mode) ---------------------------------------------
+
+// persist_mode 2 survives the portal: $HOME/.local/state/fossai-portal/tokens,
+// one line per token "token kind monitor pointer name".
+static void tokens_file(char *out, size_t len)
+{
+	const char *home = getenv("HOME");
+	snprintf(out, len, "%s/.local/state/fossai-portal/tokens", home && home[0] ? home : "/tmp");
+}
+
+static void tokens_save(void)
+{
+	char path[512], dir[512];
+	tokens_file(path, sizeof(path));
+	snprintf(dir, sizeof(dir), "%s", path);
+	for (char *p = dir + 1; *p; p++) {
+		if (*p == '/') {
+			*p = 0;
+			mkdir(dir, 0700);
+			*p = '/';
+		}
+	}
+	char tmp[540];
+	snprintf(tmp, sizeof(tmp), "%s.new", path);
+	FILE *f = fopen(tmp, "w");
+	if (!f) {
+		say("restore tokens: %s: %s", tmp, strerror(errno));
+		return;
+	}
+	for (int i = 0; i < MAX_TOKENS; i++)
+		if (g_tokens[i].token[0] && g_tokens[i].persist == 2)
+			fprintf(f, "%s %u %u %u %s\n", g_tokens[i].token, g_tokens[i].kind, g_tokens[i].monitor, g_tokens[i].pointer,
+				g_tokens[i].name);
+	fclose(f);
+	rename(tmp, path);
+}
+
+static void tokens_load(void)
+{
+	char path[512], line[256];
+	tokens_file(path, sizeof(path));
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return;
+	int n = 0;
+	while (n < MAX_TOKENS && fgets(line, sizeof(line), f)) {
+		struct token *t = &g_tokens[n];
+		int used = 0;
+		if (sscanf(line, "%39s %u %u %u %n", t->token, &t->kind, &t->monitor, &t->pointer, &used) < 4) {
+			memset(t, 0, sizeof(*t));
+			continue;
+		}
+		snprintf(t->name, sizeof(t->name), "%s", line + used);
+		t->name[strcspn(t->name, "\n")] = 0;
+		t->persist = 2;
+		n++;
+	}
+	fclose(f);
+	if (n)
+		say("restore tokens: %d kept from %s", n, path);
+}
+
+// A new token for what was just shared (tokens are used once).
+static const char *token_issue(const struct session *s, const struct cast *c, uint32_t monitor, const char *name)
+{
+	static unsigned counter;
+	int slot = 0;
+	for (int i = 0; i < MAX_TOKENS; i++)
+		if (!g_tokens[i].token[0]) {
+			slot = i;
+			break;
+		} else if (i == MAX_TOKENS - 1) {
+			slot = (int)(counter % MAX_TOKENS);
+		}
+	struct token *t = &g_tokens[slot];
+	memset(t, 0, sizeof(*t));
+	unsigned char raw[8] = {0};
+	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		if (read(fd, raw, sizeof(raw)) != (ssize_t)sizeof(raw))
+			memset(raw, 0, sizeof(raw));
+		close(fd);
+	}
+	uint64_t r;
+	memcpy(&r, raw, sizeof(r));
+	r ^= now_ms() * 2654435761u + ++counter;
+	snprintf(t->token, sizeof(t->token), "fossai-%016llx", (unsigned long long)r);
+	t->kind = c->kind;
+	t->monitor = monitor;
+	t->pointer = (c->spec.flags & CAP_POINTER) != 0;
+	t->persist = s->persist;
+	snprintf(t->name, sizeof(t->name), "%s", name ? name : "");
+	for (char *p = t->name; *p; p++)
+		if (*p == '\n')
+			*p = ' ';
+	if (s->persist == 2)
+		tokens_save();
+	return t->token;
+}
+
+// What `token` brought back, found on the desktop now: a monitor by its
+// number, a window by its title. False - gone or no such token (the token
+// is used up either way).
+static bool token_take(const char *token, struct cap_spec *spec, uint32_t *kind, uint32_t *monitor, char *name, size_t len)
+{
+	struct token *t = NULL;
+	for (int i = 0; i < MAX_TOKENS && !t; i++)
+		if (g_tokens[i].token[0] && strcmp(g_tokens[i].token, token) == 0)
+			t = &g_tokens[i];
+	if (!t)
+		return false;
+	struct token keep = *t;
+	bool kept = t->persist == 2;
+	memset(t, 0, sizeof(*t));
+	if (kept)
+		tokens_save();
+	int fd = open(g_test ? "/dev/null" : CAP_DEVICE, O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+	bool found = false;
+	memset(spec, 0, sizeof(*spec));
+	if (keep.kind == TYPE_WINDOW) {
+		static char text[16384];
+		uint64_t arg[2] = {(uint64_t)(uintptr_t)text, sizeof(text) - 1};
+		long n = g_test ? -1 : ioctl(fd, CAP_WINDOWS, arg);
+		if (n > 0) {
+			text[n] = 0;
+			for (char *line = strtok(text, "\n"); line && !found; line = strtok(NULL, "\n")) {
+				int x, y;
+				unsigned w, h;
+				int used = 0;
+				if (sscanf(line, "%d\t%d\t%u\t%u\t%n", &x, &y, &w, &h, &used) == 4 && strcmp(line + used, keep.name) == 0) {
+					spec->x = x;
+					spec->y = y;
+					spec->w = w & ~1u;
+					spec->h = h & ~1u;
+					found = spec->w >= 16 && spec->h >= 16;
+				}
+			}
+		}
+	} else {
+		struct cap_info info;
+		memset(&info, 0, sizeof(info));
+		if (cap_info(fd, &info) == 0 && keep.monitor >= 1 && keep.monitor <= info.count && keep.monitor <= 8) {
+			int m = (int)keep.monitor - 1;
+			spec->x = info.outputs[m][0];
+			spec->y = info.outputs[m][1];
+			spec->w = (uint32_t)info.outputs[m][2];
+			spec->h = (uint32_t)info.outputs[m][3];
+			found = true;
+		}
+	}
+	close(fd);
+	spec->flags = keep.pointer ? CAP_POINTER : 0;
+	*kind = keep.kind ? keep.kind : TYPE_MONITOR;
+	*monitor = keep.monitor;
+	snprintf(name, len, "%s", keep.name);
+	return found;
+}
+
+// ---- who asks -------------------------------------------------------------------
+
+// The last host.portal.Registry.Register: its application id.
+static char g_app_id[96];
+
+// "org.chromium.Chromium" / "chromium" -> "Chromium".
+static void pretty_name(const char *raw, char *out, size_t len)
+{
+	const char *dot = strrchr(raw, '.');
+	const char *base = dot && dot[1] ? dot + 1 : raw;
+	if (strncmp(base, "chrom", 5) == 0 || strncmp(base, "Chrom", 5) == 0)
+		snprintf(out, len, "Chromium");
+	else if (strncmp(base, "firefox", 7) == 0)
+		snprintf(out, len, "Firefox");
+	else {
+		snprintf(out, len, "%s", base);
+		if (out[0] >= 'a' && out[0] <= 'z')
+			out[0] = (char)(out[0] - 'a' + 'A');
+	}
+}
+
+static void app_name_of_process(const char *sender, char *out, size_t len)
+{
+	snprintf(out, len, "%s", "");
+	DBusMessage *call = dbus_message_new_method_call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+							 "GetConnectionUnixProcessID");
+	if (!call)
+		return;
+	dbus_message_append_args(call, DBUS_TYPE_STRING, &sender, DBUS_TYPE_INVALID);
+	DBusError err;
+	dbus_error_init(&err);
+	DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_bus, call, 2000, &err);
+	dbus_message_unref(call);
+	uint32_t pid = 0;
+	static bool told;
+	if (!reply) {
+		if (!told)
+			say("GetConnectionUnixProcessID %s: %s", sender, err.message ? err.message : "no answer");
+		told = true;
+		dbus_error_free(&err);
+		return;
+	}
+	if (!dbus_message_get_args(reply, &err, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INVALID))
+		dbus_error_free(&err);
+	dbus_message_unref(reply);
+	char path[64], comm[64] = {0};
+	snprintf(path, sizeof(path), "/proc/%u/comm", pid);
+	int fd = pid ? open(path, O_RDONLY | O_CLOEXEC) : -1;
+	ssize_t n = fd >= 0 ? read(fd, comm, sizeof(comm) - 1) : -1;
+	if (fd >= 0)
+		close(fd);
+	if (n <= 0) {
+		if (!told)
+			say("%s is process %u, %s unreadable (%s)", sender, pid, path, strerror(errno));
+		told = true;
+		return;
+	}
+	comm[n] = 0;
+	comm[strcspn(comm, "\n")] = 0;
+	pretty_name(comm, out, len);
+}
+
+// The asking program's name for the picker: its process (bus
+// GetConnectionUnixProcessID, /proc/<pid>/comm), else the application id of
+// the last host.portal.Registry.Register (Chromium registers on its main
+// connection and casts on another one - one desktop session, no check of
+// the sender).
+static void app_name(const char *sender, char *out, size_t len)
+{
+	app_name_of_process(sender, out, len);
+	if (!out[0] && g_app_id[0])
+		pretty_name(g_app_id, out, len);
 }
 
 static void create_session(DBusMessage *call, const char *sender)
@@ -906,7 +1235,7 @@ static void create_session(DBusMessage *call, const char *sender)
 			s = &g_sessions[i];
 	reply_path(call, request);
 	if (!s) {
-		respond(request, sender, 2, NULL, NULL);
+		respond(request, sender, 2, NULL, NULL, NULL);
 		return;
 	}
 	memset(s, 0, sizeof(*s));
@@ -914,8 +1243,11 @@ static void create_session(DBusMessage *call, const char *sender)
 	snprintf(s->path, sizeof(s->path), "%s", path);
 	snprintf(s->sender, sizeof(s->sender), "%s", sender);
 	s->monitor = chosen_monitor();
+	s->fixed_monitor = getenv("FOSSAI_SCREENCAST_MONITOR") != NULL;
+	s->pick_fd = -1;
+	s->types = TYPE_MONITOR;
 	say("CreateSession from %s: %s", sender, path);
-	respond(request, sender, 0, path, NULL);
+	respond(request, sender, 0, path, NULL, NULL);
 }
 
 static void select_sources(DBusMessage *call, const char *sender)
@@ -935,13 +1267,21 @@ static void select_sources(DBusMessage *call, const char *sender)
 	struct session *s = session_find(path, sender);
 	reply_path(call, request);
 	if (!s) {
-		respond(request, sender, 2, NULL, NULL);
+		respond(request, sender, 2, NULL, NULL, NULL);
 		return;
 	}
 	s->cursor_mode = o.cursor_mode;
-	say("SelectSources %s: types %u, cursor mode %u -> monitor %d", path, o.types, o.cursor_mode, s->monitor + 1);
-	respond(request, sender, 0, NULL, NULL);
+	s->types = o.types & SOURCE_TYPES ? o.types & SOURCE_TYPES : TYPE_MONITOR;
+	s->persist = o.persist_mode <= 2 ? o.persist_mode : 0;
+	snprintf(s->restore, sizeof(s->restore), "%s", o.restore_token);
+	say("SelectSources %s: types %u, cursor mode %u, persist %u%s%s", path, o.types, o.cursor_mode, o.persist_mode,
+	    o.restore_token[0] ? ", restore token " : "", o.restore_token);
+	respond(request, sender, 0, NULL, NULL, NULL);
 }
+
+static void start_stream(struct session *s, const char *request, const struct cap_spec *want, uint32_t kind, uint32_t monitor,
+			 const char *name);
+static int ask_picker(struct session *s, const char *request, const char *sender);
 
 static void start(DBusMessage *call, const char *sender)
 {
@@ -963,12 +1303,52 @@ static void start(DBusMessage *call, const char *sender)
 	struct session *s = session_find(path, sender);
 	reply_path(call, request);
 	if (!s) {
-		respond(request, sender, 2, NULL, NULL);
+		respond(request, sender, 2, NULL, NULL, NULL);
 		return;
 	}
+	if (s->pick_fd >= 0) {
+		say("Start %s: the picker is open already", path);
+		respond(request, sender, 2, NULL, NULL, NULL);
+		return;
+	}
+	if (!s->cast) {
+		// A restore token from an earlier share: the same monitor or
+		// window again, no picker (persist_mode).
+		if (s->restore[0]) {
+			struct cap_spec spec;
+			uint32_t kind = 0, monitor = 0;
+			char name[96];
+			bool found = token_take(s->restore, &spec, &kind, &monitor, name, sizeof(name));
+			say("Start %s: restore token %s - %s", path, s->restore, found ? name : "gone, asking again");
+			s->restore[0] = 0;
+			if (found) {
+				start_stream(s, request, &spec, kind, monitor, name);
+				return;
+			}
+		}
+		if (!s->fixed_monitor && !getenv("FOSSAI_PORTAL_NOPICK")) {
+			int asked = ask_picker(s, request, sender);
+			if (asked == 0)
+				return; // answered when the person chooses (poll_picks)
+			if (asked < 0) {
+				respond(request, sender, 2, NULL, NULL, NULL);
+				return;
+			}
+			// asked > 0: a kernel without the picker - the monitor as before
+		}
+	}
+	start_stream(s, request, NULL, TYPE_MONITOR, (uint32_t)s->monitor + 1, NULL);
+}
+
+// The stream of a session and the answer to its Start. `want` - the
+// rectangle chosen (NULL - the session's monitor).
+static void start_stream(struct session *s, const char *request, const struct cap_spec *want, uint32_t kind, uint32_t monitor,
+			 const char *name)
+{
+	const char *path = s->path, *sender = s->sender;
 	pw_thread_loop_lock(g_loop);
 	if (!s->cast)
-		s->cast = cast_new(s->monitor, s->cursor_mode);
+		s->cast = cast_new(s->monitor, s->cursor_mode, want, kind);
 	struct cast *c = s->cast;
 	uint64_t until = now_ms() + 10000;
 	// The loop thread does the stream's work while the lock is free.
@@ -981,11 +1361,89 @@ static void start(DBusMessage *call, const char *sender)
 	pw_thread_loop_unlock(g_loop);
 	if (!ok) {
 		say("Start %s: no stream", path);
-		respond(request, sender, 2, NULL, NULL);
+		respond(request, sender, 2, NULL, NULL, NULL);
 		return;
 	}
-	say("Start %s: stream node %u, monitor %d (%ux%u)", path, c->node_id, s->monitor + 1, c->spec.w, c->spec.h);
-	respond(request, sender, 0, NULL, c);
+	char label[96];
+	if (name && name[0])
+		snprintf(label, sizeof(label), "%s", name);
+	else
+		snprintf(label, sizeof(label), "monitor %u", monitor);
+	say("Start %s: stream node %u, %s '%s' %ux%u at %d,%d, pointer %s", path, c->node_id, c->kind == TYPE_WINDOW ? "window" : "monitor",
+	    label, c->spec.w, c->spec.h, c->spec.x, c->spec.y, c->spec.flags & CAP_POINTER ? "on" : "off");
+	const char *token = s->persist ? token_issue(s, c, monitor, name) : NULL;
+	respond(request, sender, 0, NULL, c, token);
+}
+
+// Ask the desktop to show its picker for a Start. 0 - shown, the answer
+// comes later; 1 - this kernel has no picker; -1 - failed.
+static int ask_picker(struct session *s, const char *request, const char *sender)
+{
+	int fd = open(g_test ? "/dev/null" : CAP_DEVICE, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		say("%s: %s", CAP_DEVICE, strerror(errno));
+		return -1;
+	}
+	struct cap_pick p;
+	memset(&p, 0, sizeof(p));
+	p.types = s->types;
+	p.flags = s->cursor_mode == 1 ? 0 : PICK_POINTER;
+	app_name(sender, p.title, sizeof(p.title));
+	if (cap_ioctl(fd, CAP_PICK, &p) != 0) {
+		int why = errno;
+		close(fd);
+		if (why == ENOTTY || why == EINVAL) {
+			say("Start %s: no picker in this kernel - monitor %d", s->path, s->monitor + 1);
+			return 1;
+		}
+		say("Start %s: the picker did not open: %s", s->path, strerror(why));
+		return -1;
+	}
+	s->pick_fd = fd;
+	snprintf(s->pick_request, sizeof(s->pick_request), "%s", request);
+	say("Start %s: the desktop asks what to share (types %u, '%s', request %u)", s->path, s->types, p.title, p.id);
+	return 0;
+}
+
+// Answers of open pickers (main loop, between bus messages).
+static bool picks_open(void)
+{
+	for (int i = 0; i < MAX_SESSIONS; i++)
+		if (g_sessions[i].used && g_sessions[i].pick_fd >= 0)
+			return true;
+	return false;
+}
+
+static void poll_picks(void)
+{
+	for (int i = 0; i < MAX_SESSIONS; i++) {
+		struct session *s = &g_sessions[i];
+		if (!s->used || s->pick_fd < 0)
+			continue;
+		struct cap_pick p;
+		memset(&p, 0, sizeof(p));
+		if (cap_ioctl(s->pick_fd, CAP_PICK_POLL, &p) != 0) {
+			say("picker of %s: %s", s->path, strerror(errno));
+			p.state = PICK_CANCELLED;
+		}
+		if (p.state == PICK_WAITING)
+			continue;
+		close(s->pick_fd);
+		s->pick_fd = -1;
+		char request[256];
+		snprintf(request, sizeof(request), "%s", s->pick_request);
+		s->pick_request[0] = 0;
+		if (p.state != PICK_CHOSEN) {
+			say("Start %s: cancelled in the picker", s->path);
+			respond(request, s->sender, 1, NULL, NULL, NULL);
+			continue;
+		}
+		p.name[sizeof(p.name) - 1] = 0;
+		struct cap_spec spec = {p.x, p.y, p.w, p.h, p.flags & PICK_POINTER ? CAP_POINTER : 0, FPS};
+		say("Start %s: chosen %s '%s' %ux%u at %d,%d (monitor %u), pointer %s", s->path, p.kind == TYPE_WINDOW ? "window" : "monitor",
+		    p.name, p.w, p.h, p.x, p.y, p.monitor, spec.flags ? "on" : "off");
+		start_stream(s, request, &spec, p.kind, p.monitor, p.name);
+	}
 }
 
 static void open_remote(DBusMessage *call, const char *sender)
@@ -1105,8 +1563,14 @@ static DBusHandlerResult on_message(DBusConnection *bus, DBusMessage *msg, void 
 	if (type != DBUS_MESSAGE_TYPE_METHOD_CALL || !member || !path || !sender)
 		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
 	// Chromium registers its application id with the host portal registry
-	// (xdg-desktop-portal 1.19): nothing to keep, a plain success.
+	// (xdg-desktop-portal 1.19): kept as the name the picker shows when the
+	// process is not known (app_name).
 	if (iface && strcmp(iface, "org.freedesktop.host.portal.Registry") == 0 && strcmp(member, "Register") == 0) {
+		const char *id = NULL;
+		if (dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &id, DBUS_TYPE_INVALID) && id) {
+			snprintf(g_app_id, sizeof(g_app_id), "%s", id);
+			say("Register %s as '%s'", sender, id);
+		}
 		DBusMessage *reply = dbus_message_new_method_return(msg);
 		dbus_connection_send(g_bus, reply, NULL);
 		dbus_message_unref(reply);
@@ -1148,7 +1612,18 @@ static DBusHandlerResult on_message(DBusConnection *bus, DBusMessage *msg, void 
 		return DBUS_HANDLER_RESULT_HANDLED;
 	}
 	if (strncmp(path, PORTAL_PATH "/request/", strlen(PORTAL_PATH "/request/")) == 0 && strcmp(member, "Close") == 0) {
-		// Requests answer at once: nothing to cancel.
+		// Requests answer at once, except a Start waiting for the picker:
+		// the program gave up - take the picker away, no Response.
+		for (int i = 0; i < MAX_SESSIONS; i++) {
+			struct session *s = &g_sessions[i];
+			if (s->used && s->pick_fd >= 0 && strcmp(s->pick_request, path) == 0 && strcmp(s->sender, sender) == 0) {
+				say("Start %s: the program closed its request, picker taken away", s->path);
+				cap_ioctl(s->pick_fd, CAP_PICK_CANCEL, NULL);
+				close(s->pick_fd);
+				s->pick_fd = -1;
+				s->pick_request[0] = 0;
+			}
+		}
 		DBusMessage *reply = dbus_message_new_method_return(msg);
 		dbus_connection_send(g_bus, reply, NULL);
 		dbus_message_unref(reply);
@@ -1169,6 +1644,7 @@ int main(int argc, char **argv)
 		g_kmsg = -1;
 	}
 	setvbuf(stderr, NULL, _IOLBF, 0);
+	tokens_load();
 	if (pipewire_start() != 0)
 		return 1;
 	DBusError err;
@@ -1195,8 +1671,9 @@ int main(int argc, char **argv)
 		if (f >= 0)
 			close(f);
 	}
-	while (dbus_connection_read_write_dispatch(g_bus, -1)) {
-	}
+	// An open picker is polled every 100 ms between bus messages.
+	while (dbus_connection_read_write_dispatch(g_bus, picks_open() ? 100 : -1))
+		poll_picks();
 	say("session bus gone");
 	return 0;
 }

@@ -80,6 +80,9 @@ pub enum App {
     Hung,
     /// «Удаление файла» (02.11, макет 18): в корзину или отмена.
     DeleteAsk,
+    /// «Демонстрация экрана» (28.11): что показать программе, которая
+    /// просит экран (портал ScreenCast, [`super::sharepick`]).
+    SharePick,
     /// Окно пользовательской программы (фаза 47a).
     ///
     /// Внутри — номер задачи, а **не** имя. Имя у такого окна своё, приезжает
@@ -151,6 +154,7 @@ impl App {
             App::OpenWith => "Открыть с помощью",
             App::Hung => "Программа не отвечает",
             App::DeleteAsk => "Удаление файла",
+            App::SharePick => "Демонстрация экрана",
             // Запас, а не подпись: у окна программы есть собственное имя, и
             // берут его из окна ([`Window::caption`]), а не отсюда. Сюда
             // попадают, когда окна уже нет, — например, печатая в журнал о
@@ -208,6 +212,7 @@ impl App {
             App::OpenWith => Icon::File,
             App::Hung => Icon::Info,
             App::DeleteAsk => Icon::Close,
+            App::SharePick => Icon::Display,
             App::Program(..) => Icon::Package,
         }
     }
@@ -226,6 +231,7 @@ impl App {
             App::OpenWith => "Open with",
             App::Hung => "Not responding",
             App::DeleteAsk => "Delete",
+            App::SharePick => "Share screen",
             // Имя программы в журнал печатает не это: оно приезжает из окна, а
             // здесь стоит родовое слово — на случай, когда окна уже нет.
             App::Program(..) => "Program",
@@ -244,6 +250,7 @@ impl App {
             App::OpenWith => "выбрать программу для файла",
             App::Hung => "программа не отвечает",
             App::DeleteAsk => "удалить в корзину",
+            App::SharePick => "выбрать экран или окно для показа",
             // В меню запуска окна программ не попадают: их открывает сама
             // программа, а не человек со стола. Строка здесь затем, что разбор
             // обязан быть полным.
@@ -2565,6 +2572,8 @@ impl Window {
     /// текущей раскладке: «Параметрам» он нужен для поля поиска (фаза 69b).
     /// `ctrl` — зажат ли Ctrl: Ctrl+стрелки двигают монитор в «Дисплее».
     pub fn handle_typed(&mut self, code: KeyCode, ch: Option<char>, ctrl: bool) -> bool {
+        let area = content_area(&self.surface, self.bar(), self.frame());
+        let ctx = self.ctx();
         match &mut self.content {
             Content::Settings(view) => {
                 if !view.handle(code, ch, ctrl) {
@@ -2574,7 +2583,7 @@ impl Window {
                 true
             }
             Content::Dialog(view) => {
-                if !view.handle(code) {
+                if !view.handle_in(code, area, ctx) {
                     return false;
                 }
                 self.redraw_content();
@@ -2741,11 +2750,15 @@ impl Window {
     /// Колесо мыши над окном ядра. `true` — содержимое сдвинулось и
     /// перерисовано.
     pub fn wheel(&mut self, clicks: i32) -> bool {
+        let area = content_area(&self.surface, self.bar(), self.frame());
+        let ctx = self.ctx();
         let moved = match &mut self.content {
             Content::Settings(view) => view.wheel(clicks),
             // Терминал: три строки на щелчок колеса, как у Windows Terminal.
             Content::Text(_) => return self.term_scroll(clicks * 3),
-            Content::Dialog(_) | Content::Program(_) => false,
+            // Выбор источника демонстрации листает окна (28.11).
+            Content::Dialog(view) => view.wheel(clicks, area, ctx),
+            Content::Program(_) => false,
         };
         if moved {
             self.redraw_content();
@@ -2887,6 +2900,36 @@ impl Window {
         match &mut self.content {
             Content::Dialog(view) => view.take_answer(),
             Content::Text(_) | Content::Settings(_) | Content::Program(_) => None,
+        }
+    }
+
+    /// Что выбрано в окне «Демонстрация экрана» (28.11).
+    #[must_use]
+    pub fn share_choice(&self) -> Option<super::sharepick::Choice> {
+        match &self.content {
+            Content::Dialog(view) => view.share_choice(),
+            _ => None,
+        }
+    }
+
+    /// Места карточек и флажка окна «Демонстрация экрана» в координатах
+    /// экрана — строки журнала, по которым целится стенд.
+    #[must_use]
+    pub fn share_spots(&self) -> Vec<(String, Rect)> {
+        let area = content_area(&self.surface, self.bar(), self.frame());
+        match &self.content {
+            Content::Dialog(view) => view.share_spots(area, self.ctx()).into_iter().map(|(name, r)| (name, r.translate(self.rect.x, self.rect.y))).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Места кнопок диалога в координатах экрана (`share`, `cancel`).
+    #[must_use]
+    pub fn dialog_buttons(&self) -> Vec<(String, Rect)> {
+        let area = content_area(&self.surface, self.bar(), self.frame());
+        match &self.content {
+            Content::Dialog(view) => view.button_spots(area, self.ctx()).into_iter().map(|(name, r)| (name, r.translate(self.rect.x, self.rect.y))).collect(),
+            _ => Vec::new(),
         }
     }
 

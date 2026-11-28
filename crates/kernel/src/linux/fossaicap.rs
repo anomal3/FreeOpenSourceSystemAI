@@ -20,6 +20,17 @@
 //! | `FOSSAI_CAP_DMABUF` (`F`,8) | `CapDmabuf` out — the dma-buf ring       | 0 / `ENODEV`|
 //! | `FOSSAI_CAP_FRAME` (`F`,9)  | `CapFrame` in/out — the newest frame     | 0           |
 //! | `FOSSAI_CAP_CURSOR` (`F`,10)| `CapCursor` in/out — the pointer         | 0           |
+//! | `FOSSAI_CAP_PICK` (`F`,11)  | `CapPick` in/out — show the share picker | 0 / `EBUSY` |
+//! | `FOSSAI_CAP_PICK_POLL` (12) | `CapPick` out — its answer (`state`)     | 0 / `ENODATA`|
+//! | `FOSSAI_CAP_PICK_CANCEL`(13)| — take the picker away                   | 0           |
+//!
+//! # «Демонстрация экрана» (28.11)
+//!
+//! `PICK` asks the desktop to show its picker of a monitor or a window
+//! (`ui::sharepick`; the ScreenCast portal on `Start`); the answer is polled
+//! with `PICK_POLL` (state 0 waiting, 1 chosen — rectangle, monitor, name,
+//! pointer switch — 2 cancelled). One request per open; closing the open or
+//! `PICK_CANCEL` takes an unanswered picker away.
 //!
 //! # One capture per open, per rectangle (26.11)
 //!
@@ -111,6 +122,10 @@ const DMABUF: usize = 8;
 const FRAME: usize = 9;
 /// 26.11: the pointer over the capture.
 const CURSOR: usize = 10;
+/// 28.11: the share picker (`ui::sharepick`).
+const PICK: usize = 11;
+const PICK_POLL: usize = 12;
+const PICK_CANCEL: usize = 13;
 
 /// Buffers in the dma-buf ring.
 const RING: usize = 3;
@@ -192,6 +207,8 @@ struct Device {
     text: Mutex<Option<(Vec<u8>, usize)>>,
     /// 25.11: the dma-buf ring (`FOSSAI_CAP_DMABUF`).
     ring: Mutex<Option<Ring>>,
+    /// 28.11: the share picker this open asked for (`FOSSAI_CAP_PICK`).
+    pick: Mutex<Option<u32>>,
 }
 
 /// A ring slot as a grab target: rows at `stride`, through the kernel's
@@ -264,6 +281,9 @@ impl Object for Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
+        if let Some(id) = self.pick.lock().take() {
+            crate::ui::sharepick::cancel(id);
+        }
         if self.session.lock().is_some() {
             stop(self, "/dev/fossai-capture closed");
         }
@@ -315,7 +335,7 @@ pub fn open(linux: &str, flags: usize) -> Option<i64> {
     if linux != PATH {
         return None;
     }
-    let object: Arc<dyn Object> = Arc::new(Device { session: Mutex::new(None), text: Mutex::new(None), ring: Mutex::new(None) });
+    let object: Arc<dyn Object> = Arc::new(Device { session: Mutex::new(None), text: Mutex::new(None), ring: Mutex::new(None), pick: Mutex::new(None) });
     Some(match crate::user::with_current(|program| {
         let fd = program.files.install_object(object, false)?;
         program.files.set_cloexec(fd, flags & O_CLOEXEC != 0);
@@ -375,8 +395,51 @@ pub fn ioctl(fd: usize, request: usize, arg: usize) -> Option<i64> {
         DMABUF => dmabuf(device, arg),
         FRAME => frame(device, arg),
         CURSOR => cursor(device, arg),
+        PICK => pick(device, arg),
+        PICK_POLL => match *device.pick.lock() {
+            Some(id) => match crate::ui::sharepick::poll(id) {
+                Some(answer) => {
+                    if super::ipc::put(arg, answer).is_err() {
+                        -e::EFAULT
+                    } else {
+                        0
+                    }
+                }
+                None => -ENODATA,
+            },
+            None => -ENODATA,
+        },
+        PICK_CANCEL => {
+            if let Some(id) = device.pick.lock().take() {
+                crate::ui::sharepick::cancel(id);
+            }
+            0
+        }
         _ => -e::ENOTTY,
     })
+}
+
+/// `FOSSAI_CAP_PICK`: show the share picker (one request per open; a new one
+/// replaces an answered one).
+fn pick(device: &Device, arg: usize) -> i64 {
+    let Ok(mut request) = get::<crate::ui::sharepick::CapPick>(arg) else { return -e::EFAULT };
+    let mut held = device.pick.lock();
+    if let Some(old) = held.take() {
+        crate::ui::sharepick::cancel(old);
+    }
+    let end = request.title.iter().position(|&b| b == 0).unwrap_or(request.title.len());
+    let title = core::str::from_utf8(&request.title[..end]).unwrap_or("");
+    let pointer = request.flags & crate::ui::sharepick::PICK_POINTER != 0;
+    match crate::ui::sharepick::ask(request.types, pointer, title) {
+        Ok(id) => {
+            crate::kprintln!("  share       : '{title}' asks to choose (types {}, pointer {}), request {id}", request.types, if pointer { "on" } else { "off" });
+            *held = Some(id);
+            request.id = id;
+            request.state = crate::ui::sharepick::STATE_WAITING;
+            if super::ipc::put(arg, request).is_err() { -e::EFAULT } else { 0 }
+        }
+        Err(err) => errno(err),
+    }
 }
 
 /// `FOSSAI_CAP_START`: the open's capture (one per open).

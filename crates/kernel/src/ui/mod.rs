@@ -61,6 +61,7 @@ pub mod pointer;
 pub mod prefs;
 pub mod saver;
 pub mod settings;
+pub mod sharepick;
 pub mod flight;
 pub mod framegap;
 pub mod gesture;
@@ -1281,7 +1282,7 @@ fn layout_local(desktop: &Compositor, app: App, area: Rect) -> Rect {
         // с двумя кнопками, и окно размером с терминал выглядело бы как ещё одна
         // программа, а не как «система ждёт от вас ответа».
         // «Программа не отвечает» и «Удаление файла» — по макету 18.
-        App::Hung | App::DeleteAsk => {
+        App::Hung | App::DeleteAsk | App::SharePick => {
             let scale = desktop.scale();
             let w = (480u32 * scale).min(width);
             let h = (230u32 * scale).min(work);
@@ -1342,7 +1343,8 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
             Window::dialog(app, rect, scale, Dialog::Power { restart: app == App::Restart })
         }
         // Окну выбора программы нужен файл — его строит [`choose_program`].
-        App::OpenWith | App::Hung | App::DeleteAsk => None,
+        // «Демонстрация экрана» строит [`sharepick`] по просьбе портала.
+        App::OpenWith | App::Hung | App::DeleteAsk | App::SharePick => None,
         // Окно программы строится не здесь, и построить его столу нечем: ему
         // нужны кадры, которые выдаёт [`crate::user`]. Сюда приходят с меню и с
         // панели задач, а там окно программы к этому времени уже существует —
@@ -2468,6 +2470,8 @@ pub fn tick() {
         desktop.expire_identify();
         // Screen recorder (22.11): «Запись сохранена», a capture left behind.
         framegap::step(&"capture", || capture::tick(desktop));
+        // «Демонстрация экрана» (28.11): the picker the ScreenCast portal asked for.
+        framegap::step(&"share picker", || sharepick::tick(desktop));
         // A btrfs commit failed (24.11): the batch of changes is lost - say so.
         if let Some(text) = crate::fs::btrfsfs::take_commit_failure() {
             let art = appicon::tool_art("eventlog").unwrap_or(appicon::Art::Glyph(mini_ui::glyphicon::Icon::Log, mini_ui::paint::Tone::Bad, true));
@@ -4610,6 +4614,11 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
 /// этом состоянии не будет. Поэтому здесь поднимается просьба, а гасит систему
 /// задача (см. [`crate::power`]).
 fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
+    // «Демонстрация экрана» (28.11): ответ ждёт портал ScreenCast.
+    if app == App::SharePick {
+        sharepick::answer(desktop, answer == Answer::Confirm);
+        return;
+    }
     if app == App::DeleteAsk {
         if desktop.close(app) {
             kprintln!("  desktop     : closed '{}'", app.title());
@@ -4965,7 +4974,7 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
     // Диалог разбирает клавиши раньше остальных окон: набирать в нём нечего, а
     // ответ закрывает окно, и закрыть его может только стол.
     if let Some(app) = desktop.focused_app() {
-        if app == App::About || app == App::OpenWith || app == App::Hung || app == App::DeleteAsk || app.confirms_power().is_some() {
+        if app == App::About || app == App::OpenWith || app == App::Hung || app == App::DeleteAsk || app == App::SharePick || app.confirms_power().is_some() {
             if event.pressed {
                 // `Y` и `N` у вопроса о питании остались с тех пор, когда кнопок
                 // не было: на них стоит стенд, а человеку они не мешают.

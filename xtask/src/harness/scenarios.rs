@@ -13039,11 +13039,21 @@ pub const ALL: &[Scenario] = &[
             Step::Await("'FossAi screen - Chromium'", 300_000),
             // The portal calls, the stream and the link to Chromium's stream.
             Step::AwaitAny("fossai-portal: CreateSession from ", 240_000),
+            // 28.11: Start opens the desktop's picker «Демонстрация экрана»
+            // (one monitor here): «Поделиться».
+            Step::AwaitAny("share spot share at ", 120_000),
+            Step::Wait(1_000),
+            Step::Shot("chromium-screenshare-picker"),
+            Step::Aim(Aim::Spot("share:share")),
+            Step::Click,
+            Step::AwaitAny("share       : chosen monitor ", 30_000),
             Step::AwaitAny("fossai-portal: Start ", 120_000),
             Step::AwaitAny("fossai-portal: OpenPipeWireRemote ", 120_000),
             Step::AwaitAny("fossai-portal: link node ", 120_000),
             Step::AwaitAny("fossai-screen: ok ", 120_000),
             Step::AwaitAny("fossai-screen: frames 30 ", 240_000),
+            // The frame shows the browser's own monitor (its pink plate).
+            Step::AwaitAny("fossai-screen: look own-screen", 240_000),
             Step::Wait(10_000),
             Step::Move(1, 0),
             Step::Shot("chromium-screenshare"),

@@ -4095,6 +4095,7 @@ impl Compositor {
                     App::OpenWith => alloc::string::String::from("выбор программы"),
                     App::Hung => alloc::string::String::from("программа не отвечает"),
                     App::DeleteAsk => alloc::string::String::from("удаление"),
+                    App::SharePick => alloc::string::String::from("демонстрация экрана"),
                     App::Program(task, _) => alloc::format!("задача #{task}"),
                 },
                 age: tray::age_text(now.saturating_sub(window.minimized_at_ms)),
@@ -5002,6 +5003,87 @@ impl Compositor {
                 }
             }
         }
+    }
+
+    /// A picture of `area` of the desktop shrunk to `w`x`h` by averaging
+    /// (28.11, the miniatures of «Демонстрация экрана», `ui::sharepick`):
+    /// drawn in bands of [`PEEK_STRIP`] rows like the peek backdrop, each band
+    /// folded into the picture at once. `only` — just that window over a
+    /// plain fill (its miniature without what covers it); `None` — the
+    /// desktop as it is (wallpaper, icons, windows).
+    #[must_use]
+    pub fn snapshot(&self, area: Rect, only: Option<App>, w: u32, h: u32) -> Option<Surface> {
+        let bounds = self.union;
+        let area = area.intersect(&bounds);
+        if area.is_empty() || w == 0 || h == 0 {
+            return None;
+        }
+        let (w, h) = (w.min(area.w), h.min(area.h));
+        let mut out = Surface::new(w, h, Color::rgb(0, 0, 0))?;
+        let mut strip = Surface::new(bounds.w, PEEK_STRIP, theme::palette().wall_top)?;
+        let mut acc: Vec<[u32; 5]> = Vec::new();
+        acc.try_reserve_exact(w as usize).ok()?;
+        acc.resize(w as usize, [0; 5]);
+        let radius = super::look::corner(theme::R_WINDOW * self.scale);
+        let window = only.and_then(|app| self.windows.iter().find(|window| window.app == app));
+        let plain = theme::window_bg();
+        let mut row_out = 0u32;
+        let flush = |acc: &mut Vec<[u32; 5]>, out: &mut Surface, row: u32| {
+            if row >= out.height() {
+                return;
+            }
+            let line = out.row_mut(row);
+            for (pixel, cell) in line.iter_mut().zip(acc.iter_mut()) {
+                let n = cell[4].max(1);
+                *pixel = (cell[0] / n) | (cell[1] / n) << 8 | (cell[2] / n) << 16 | (cell[3] / n) << 24;
+                *cell = [0; 5];
+            }
+        };
+        let mut top = area.y;
+        while top < area.bottom() {
+            let rows = PEEK_STRIP.min((area.bottom() - top) as u32);
+            let band = Rect::new(area.x, top, area.w, rows);
+            let dy = -top;
+            match (only, window) {
+                (None, _) => {
+                    self.draw_background(&mut strip, band, dy);
+                    super::statusbar::draw(&mut strip, band, dy, self.primary.w, self.scale);
+                    self.icons.draw(&mut strip, band, dy);
+                    for window in self.windows.iter().filter(|window| !window.minimized && !window.popup) {
+                        if !window.shaped {
+                            self.drop_shadow(&mut strip, window.rect, band, dy, radius);
+                        }
+                        self.stack_window(&mut strip, window, band, dy, radius);
+                    }
+                }
+                (Some(_), Some(window)) => {
+                    strip.fill(Rect::new(band.x, 0, band.w, rows), plain);
+                    self.stack_window(&mut strip, window, band, dy, radius);
+                }
+                (Some(_), None) => return None,
+            }
+            for r in 0..rows {
+                let y = (top - area.y) as u32 + r;
+                let target = (u64::from(y) * u64::from(h) / u64::from(area.h)) as u32;
+                if target != row_out {
+                    flush(&mut acc, &mut out, row_out);
+                    row_out = target;
+                }
+                let line = strip.row(r);
+                for x in 0..area.w {
+                    let Some(&pixel) = line.get((area.x + x as i32 - bounds.x) as usize) else { continue };
+                    let cell = &mut acc[(u64::from(x) * u64::from(w) / u64::from(area.w)) as usize];
+                    cell[0] += pixel & 0xFF;
+                    cell[1] += (pixel >> 8) & 0xFF;
+                    cell[2] += (pixel >> 16) & 0xFF;
+                    cell[3] += pixel >> 24;
+                    cell[4] += 1;
+                }
+            }
+            top += rows as i32;
+        }
+        flush(&mut acc, &mut out, row_out);
+        Some(out)
     }
 
     /// Собрать подложку подсмотра ([`Self::peek_back`]): стол полосами по
@@ -7337,7 +7419,7 @@ fn uncovered(from: Rect, to: Rect) -> impl Iterator<Item = Rect> {
 
 /// Затемняет ли окно стол под собой: диалоги, которые ждут ответа (макет 18).
 fn dims(app: App) -> bool {
-    matches!(app, App::OpenWith | App::Hung | App::DeleteAsk | App::Shutdown | App::Restart)
+    matches!(app, App::OpenWith | App::Hung | App::DeleteAsk | App::SharePick | App::Shutdown | App::Restart)
 }
 
 /// Во сколько раз подложка подсмотра меньше стола (20.11).

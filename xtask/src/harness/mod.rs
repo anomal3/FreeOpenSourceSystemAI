@@ -2877,17 +2877,27 @@ fn start_host_site() -> Result<(HostServer, u16)> {
             // the screen without the picker), the stream in a <video>, frames
             // counted by requestVideoFrameCallback; results in console.log
             // (`fossai-screen: ...` lines with `--enable-logging=stderr`).
+            // The pink plate (#ff00c8) is the page's own mark: at frame 60
+            // the frame is shrunk to 64x36 on a canvas and its pink share
+            // tells whether the stream shows the browser's own screen
+            // (`look own-screen`, the monitor Chromium is on) or another one
+            // (`look other-screen`, `chromium-screenshare-pick`: monitor 2).
             "/screen.html" => {
                 let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>FossAi screen</title>\
                     <style>body{margin:0;padding:16px;background:#20262e;color:#fff;font:20px sans-serif}\
-                    video{width:640px;height:360px;background:#000;border:3px solid #6cf}</style></head>\
-                    <body><p>getDisplayMedia</p><video id=\"v\" autoplay muted playsinline></video><p id=\"out\"></p><script>\
+                    video{width:640px;height:360px;background:#000;border:3px solid #6cf}\
+                    #mark{width:560px;height:120px;background:#ff00c8}</style></head>\
+                    <body><p>getDisplayMedia</p><div id=\"mark\"></div><video id=\"v\" autoplay muted playsinline></video><p id=\"out\"></p><script>\
                     function t(s){console.log('fossai-screen: '+s);document.getElementById('out').textContent+=s+' | ';}\
                     var v=document.getElementById('v'),n=0;\
                     if(!navigator.mediaDevices||!navigator.mediaDevices.getDisplayMedia){t('error no getDisplayMedia');}else{\
                     navigator.mediaDevices.getDisplayMedia({video:true}).then(function(s){var k=s.getVideoTracks()[0],st=k.getSettings();\
                     t('ok '+st.width+'x'+st.height+' '+(k.label||'-')+' '+(st.displaySurface||'-'));v.srcObject=s;\
-                    function f(){n++;if(n==1||(n%30==0&&n<=300))t('frames '+n+' '+v.videoWidth+'x'+v.videoHeight);v.requestVideoFrameCallback(f);}\
+                    function look(){var c=document.createElement('canvas');c.width=64;c.height=36;var g=c.getContext('2d');g.drawImage(v,0,0,64,36);\
+                    var d=g.getImageData(0,0,64,36).data,own=0,sum=0;for(var i=0;i<d.length;i+=4){sum+=d[i]+d[i+1]+d[i+2];\
+                    if(d[i]>200&&d[i+1]<70&&d[i+2]>150)own++;}var p=Math.round(own*1000/2304)/10;\
+                    t('look '+(p>=1.5?'own-screen':'other-screen')+' self='+p+'% mean='+Math.round(sum/6912));}\
+                    function f(){n++;if(n==1||(n%30==0&&n<=300))t('frames '+n+' '+v.videoWidth+'x'+v.videoHeight);if(n==60)look();v.requestVideoFrameCallback(f);}\
                     v.requestVideoFrameCallback(f);k.onended=function(){t('ended');};},\
                     function(e){t('error '+e.name+' '+e.message);});}\
                     </script></body></html>\n";
