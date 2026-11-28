@@ -2957,24 +2957,9 @@ fn amd(argument: &str) {
     // видеопамять; нужны SMC, микрокод и апертура MC: `amd smc start`, `amd ucode`).
     // `amd gart` — включить GART для VMID0 и проверить доступ GPU к системной
     // памяти (ПИШЕТ в регистры MC/VM и видеопамять; нужно работающее кольцо).
-    // `amd cs` — fence, IB и пользовательское адресное пространство GPU (VMID 1);
-    // нужно работающее кольцо (`amd ring`).
-    // `amd shader` — golden registers и первый compute-шейдер на кольце GFX;
-    // нужно работающее кольцо (`amd ring`).
-    if argument.trim() == "shader" {
-        for line in crate::display::amd::polaris_shader() {
-            sprintln!("  amd: {line}");
-        }
-        return;
-    }
+    // `amd hw` — самопроверка бэкенда DRM: IB и compute-шейдер в VMID 1, видеопамять, очередь отправок.
     if argument.trim() == "hw" {
         for line in crate::display::amd::hw::selftest() {
-            sprintln!("  amd: {line}");
-        }
-        return;
-    }
-    if argument.trim() == "cs" {
-        for line in crate::display::amd::polaris_cs() {
             sprintln!("  amd: {line}");
         }
         return;

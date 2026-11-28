@@ -400,6 +400,14 @@ fn hw() -> bool {
     HW.load(Ordering::Relaxed)
 }
 
+/// Писать ли строки `amdgpu perf:` - только в тестовом прогоне (маркеры `HW.TXT`/`RADV.TXT`).
+static PERF_LOG: AtomicBool = AtomicBool::new(false);
+
+/// Включить строки `amdgpu perf:` в журнале.
+pub fn set_perf_log(on: bool) {
+    PERF_LOG.store(on, Ordering::Relaxed);
+}
+
 /// Не ждать GPU в `CS` (по умолчанию); `false` - ждать конец каждой отправки, как до 26.11.
 static ASYNC: AtomicBool = AtomicBool::new(true);
 
@@ -916,7 +924,12 @@ fn info_ioctl(file: &AmdFile, arg: usize) -> i64 {
         INFO_VRAM_LOST_COUNTER => reply(&request, &0u32.to_le_bytes()),
         // Остальное (датчики, VBIOS, видео-возможности, MAX_IBS…) RADV терпит как ошибку.
         other => {
-            crate::kprintln!("amdgpu: INFO query {other:#x} is not supported");
+            // Каждый запрос - в журнал один раз: RADV повторяет их при каждом открытии.
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let bit = 1u64 << (other.min(63));
+            if SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                crate::kprintln!("amdgpu: INFO query {other:#x} is not supported");
+            }
             -e::EINVAL
         }
     }
@@ -1615,6 +1628,9 @@ static PERF_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 /// Раз в 5 с отправок - строка в журнал: сколько их, сколько раз GPU к постановке уже простаивал (тогда
 /// тормозит процессор, а не карта), сколько ждали места в кольце и простоя и сколько писали таблицы.
 fn perf_report() {
+    if !PERF_LOG.load(Ordering::Relaxed) {
+        return;
+    }
     let now = crate::time::uptime_ms();
     let since = PERF_SINCE_MS.load(Ordering::Relaxed);
     if since == 0 {

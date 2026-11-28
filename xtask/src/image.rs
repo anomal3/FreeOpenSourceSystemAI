@@ -723,8 +723,11 @@ fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
         // переписывает их на месте (`usb::stick_settings`). Пробелы — «снимка
         // ещё нет».
         // Снимки экрана AMD-теста (25.11): ядро пишет в этот файл кадры с монитора (`display::amd::shots`).
-        logs.write_file_path(&mut dev, "FREEOS/SHOTS.BIN", &vec![0u8; 24 * 1024 * 1024])
-            .map_err(|err| anyhow::anyhow!("не удалось записать файл снимков: {err}"))?;
+        // Только в тестовом образе (`FOSSAI_AMD_RADV`): в обычном это 24 МиБ впустую.
+        if std::env::var("FOSSAI_AMD_RADV").is_ok_and(|v| v == "1" || v == "2") {
+            logs.write_file_path(&mut dev, "FREEOS/SHOTS.BIN", &vec![0u8; 24 * 1024 * 1024])
+                .map_err(|err| anyhow::anyhow!("не удалось записать файл снимков: {err}"))?;
+        }
         logs.write_file_path(&mut dev, "FREEOS/SETTINGS.DAT", &vec![b' '; 256 * 1024])
             .map_err(|err| anyhow::anyhow!("не удалось записать файл настроек: {err}"))?;
         logs.finish(&mut dev)
