@@ -62,6 +62,21 @@ eval "export BINDGEN_EXTRA_CLANG_ARGS_$KEY=\"--target=$CLANG_TRIPLE -D__freeos__
 export PYTHON3=python3
 
 cd "$OBSOS"
+# getrandom 0.3.4 (rand 0.9 у str0m/dimpl/sctp-proto — звонки obsos-media,
+# ветка feat/freeos-webrtc): в общих подменах xtask его нет. Как у Vita —
+# getentropy(), та же правка, что like_os в ports/craft/builder/patch-craft-crates.sh.
+if grep -B1 '^version = "0.3.4"' Cargo.lock | grep -q '^name = "getrandom"'; then
+    GR=/cache/src/getrandom-0.3.4
+    if ! grep -rqs 'target_os = "freeos"' "$GR/src"; then
+        rm -rf "$GR"; mkdir -p /cache/src
+        curl -sSfL https://static.crates.io/crates/getrandom/getrandom-0.3.4.crate | tar -xz -C /cache/src
+        find "$GR" \( -name '*.rs' -o -name Cargo.toml \) -exec \
+            sed -i 's/target_os = "vita"/target_os = "vita", target_os = "freeos"/g' {} +
+        grep -rqs 'target_os = "freeos"' "$GR/src" || { echo "getrandom 0.3.4: правка не легла"; exit 1; }
+    fi
+    echo "getrandom-0-3-4 = { path = \"$GR\", package = \"getrandom\" }" >> /tmp/patches.toml
+    echo "getrandom 0.3.4: как vita (getentropy)"
+fi
 # Cargo.lock OBSOS собран для Windows/Linux: там libc/mio новее наших копий с
 # правками FreeOS (patches.toml), и подмены остались бы неиспользованными
 # (26.11.2026: libc 0.2.191 вместо 0.2.189 — нет clock_t/wchar_t у freeos).
