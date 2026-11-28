@@ -873,6 +873,50 @@ fn dump_unhandled(frame: &crate::arch::TrapFrame, vector: u8, addr: usize, why: 
         }
     }
     crate::kprintln!("  linux       : stack at {:#x}:{line}", f.rsp);
+    dump_pointed_pages(f);
+}
+
+/// 28.11 (OBS exit, glibc `unlink_chunk`: the free chunk's `fd_nextsize` -
+/// the first word of the next page - read 1): the pages the registers point
+/// into and the page after each - frame, whether another owner shares it, the
+/// first qwords and the region. A stale or aliased frame (freed while still
+/// mapped, reused) shows as a frame shared where it should not be, a page
+/// whose words belong to another structure, or a region of the wrong kind.
+fn dump_pointed_pages(f: &crate::arch::TrapFrame) {
+    use core::fmt::Write;
+    let Some(root) = crate::user::current_space_root() else { return };
+    let mut pages: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for value in [f.rdi, f.rsi, f.rax, f.rbx, f.rcx, f.rdx, f.r12, f.r13, f.r14, f.r15] {
+        let page = value & !0xfff;
+        if (0x10000..1 << 47).contains(&value) && !pages.contains(&page) && pages.len() < 6 {
+            pages.push(page);
+        }
+    }
+    for page in pages {
+        let mut line = alloc::string::String::new();
+        for at in [page, page + 4096] {
+            match crate::arch::translate(root, crate::mm::VirtAddr::new(at as usize)) {
+                Some((phys, flags)) => {
+                    let shared = crate::mm::frame::with(|frames| frames.is_shared(phys)).unwrap_or(false);
+                    let _ = write!(line, " [{at:#x} -> {:#x} {flags:?}{}:", phys.as_u64(), if shared { " SHARED" } else { "" });
+                    for i in 0..4u64 {
+                        match user_qword(at + i * 8) {
+                            Some(word) => {
+                                let _ = write!(line, " {word:#x}");
+                            }
+                            None => line.push_str(" ?"),
+                        }
+                    }
+                    line.push(']');
+                }
+                None => {
+                    let _ = write!(line, " [{at:#x} not present]");
+                }
+            }
+        }
+        let region = crate::user::with_current(|program| program.describe_region(page as usize)).unwrap_or_default();
+        crate::kprintln!("  linux       : page{line}; {region}");
+    }
 }
 
 /// Область `FXSAVE` в кадре сигнала — `uc_mcontext.fpregs` у Linux.
