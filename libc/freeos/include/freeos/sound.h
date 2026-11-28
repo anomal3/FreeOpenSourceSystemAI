@@ -30,6 +30,23 @@ ssize_t freeos_sound_write(const void *samples, size_t bytes);
 /* Доиграть всё и остановить поток. */
 int freeos_sound_drain(void);
 
+/* Microphone (28.11): open the HDA input (the one the Linux layer calls
+ * hw:0,1) with a cursor of its own - other opens and programs do not take
+ * frames from it. Answer - a handle; -1 and errno ENOSYS - no microphone or
+ * line input. The end of the program closes its opens. */
+int freeos_mic_open(void);
+
+/* Whole frames (same format) of the open `handle` into `buf`. Answer - bytes
+ * read, 0 - nothing within ~20 ms. */
+ssize_t freeos_mic_read(int handle, void *buf, size_t bytes);
+
+/* Close the open `handle`. */
+int freeos_mic_close(int handle);
+
+/* Name of the input ("Mic in, rear pink jack") into `buf` (not terminated
+ * when cut); answer - its whole length, -1 - no input. */
+ssize_t freeos_mic_name(char *buf, size_t size);
+
 #ifdef __cplusplus
 }
 #endif

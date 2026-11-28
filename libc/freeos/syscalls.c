@@ -743,3 +743,28 @@ int freeos_sound_drain(void) {
     long code = freeos_syscall(SYS_SOUND, FREEOS_SOUND_DRAIN, 0, 0);
     return code < 0 ? freeos_set_errno(code) : 0;
 }
+
+int freeos_mic_open(void) {
+    long handle = freeos_syscall(SYS_SOUND, FREEOS_SOUND_MIC_OPEN, 0, 0);
+    return handle < 0 ? freeos_set_errno(handle) : (int)handle;
+}
+
+ssize_t freeos_mic_read(int handle, void *buf, size_t bytes) {
+    /* user-abi SoundMic */
+    struct { unsigned long long buf; unsigned int len; unsigned int handle; } request;
+    request.buf = (unsigned long long)(unsigned long)buf;
+    request.len = bytes > 0xffffffffu ? 0xffffffffu : (unsigned int)bytes;
+    request.handle = (unsigned int)handle;
+    long done = freeos_syscall(SYS_SOUND, FREEOS_SOUND_MIC_READ, (long)&request, 0);
+    return done < 0 ? freeos_set_errno(done) : (ssize_t)done;
+}
+
+int freeos_mic_close(int handle) {
+    long code = freeos_syscall(SYS_SOUND, FREEOS_SOUND_MIC_CLOSE, (long)handle, 0);
+    return code < 0 ? freeos_set_errno(code) : 0;
+}
+
+ssize_t freeos_mic_name(char *buf, size_t size) {
+    long len = freeos_syscall(SYS_SOUND, FREEOS_SOUND_MIC_INFO, (long)buf, (long)size);
+    return len < 0 ? freeos_set_errno(len) : (ssize_t)len;
+}

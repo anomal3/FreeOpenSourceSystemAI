@@ -898,6 +898,10 @@ pub struct Program {
     /// `/proc/self/maps`: по ней glibc узнаёт границы стека главного потока
     /// (`pthread_getattr_np`).
     pub linux_stack: (usize, usize),
+    /// Opens of the microphone by this native program (`SOUND_MIC_OPEN`,
+    /// 28.11): each its own cursor in the HDA input; they go with the
+    /// program. `fork` does not inherit them.
+    pub mic: Vec<crate::sound::hda::CaptureGuard>,
 }
 
 /// Обработчик сигнала программы Linux (фаза 71c).
@@ -4216,6 +4220,7 @@ fn run(
             linux_actions: [LinuxAction::default(); 65],
             linux_exit: None,
             linux_stack: (layout.stack_top - MAIN_STACK_PAGES * PAGE_SIZE, layout.stack_top),
+            mic: Vec::new(),
         })));
     }
     note_linux(slot, linux);
@@ -5000,6 +5005,7 @@ impl Program {
             linux_actions: self.linux_actions,
             linux_exit: None,
             linux_stack: self.linux_stack,
+            mic: Vec::new(),
         })
     }
 }

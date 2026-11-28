@@ -5229,6 +5229,21 @@ pub const ALL: &[Scenario] = &[
             Step::Await("hda         : capture stopped (", 20_000),
             // All of it, in about real time (not faster than the device).
             Step::Await("  mic      recorded 96000 frames (2.0 s) in ", 5_000),
+            // Native programs (28.11, SYS_SOUND SOUND_MIC_READ): two copies of
+            // /bin/miccheck at once, each with its own cursor in the input -
+            // both must get (nearly) every frame of their two seconds.
+            Step::Line("run -b /bin/miccheck 2"),
+            Step::Wait(300),
+            Step::Line("run /bin/miccheck 2"),
+            Step::AwaitAny("records from the microphone, S16_LE 2 ch 48000 Hz (native, handle ", 10_000),
+            Step::AwaitAny("miccheck: input ", 10_000),
+            Step::Await("miccheck: OK", 20_000),
+            Step::Await("miccheck: OK", 20_000),
+            // The last close stops the stream - its line may come before the
+            // second OK (the kernel prints it inside SOUND_MIC_CLOSE).
+            Step::AwaitAny("hda         : capture stopped (", 10_000),
+            Step::Absent("miccheck: FAILED"),
+            Step::Absent("miccheck: no microphone"),
             Step::Line("beep 523 1000"),
             Step::AtLeast("  beep     played 523 Hz for 1000 ms in ", 800, 30_000),
             Step::Wait(1_000),

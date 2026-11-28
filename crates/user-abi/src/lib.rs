@@ -1579,6 +1579,39 @@ pub struct SoundLoop {
     /// Out: the frame playing now.
     pub now: u64,
 }
+
+/// [`SYS_SOUND`] (28.11): open the microphone (the HDA input - the same one
+/// the Linux layer gives as `hw:0,1`). Answer - a handle for
+/// [`SOUND_MIC_READ`]/[`SOUND_MIC_CLOSE`]. Every open is a consumer with its
+/// own cursor: other opens, programs and the Linux layer read the same input
+/// without taking frames from each other. The end of the program closes its
+/// opens. [`ERR_UNSUPPORTED`] - no microphone or line input, [`ERR_LIMIT`] -
+/// too many recordings at once (8 in the system).
+pub const SOUND_MIC_OPEN: usize = 4;
+/// [`SYS_SOUND`] (28.11): read an open microphone. `a1` = [`SoundMic`].
+/// Frames as everywhere in `SYS_SOUND` (S16 LE stereo, [`SOUND_RATE`]).
+/// Answer - bytes read (whole frames); waits up to ~20 ms for the first
+/// frame, zero - nothing yet. Frames not read in time (~0.3 s, the input
+/// ring) are lost. [`ERR_BAD_FD`] - not an open of this program.
+pub const SOUND_MIC_READ: usize = 5;
+/// [`SYS_SOUND`] (28.11): close an open (`a1` = handle). Answer zero.
+pub const SOUND_MIC_CLOSE: usize = 6;
+/// [`SYS_SOUND`] (28.11): the name of the input that is (or will be)
+/// recorded - "Mic in, rear pink jack" - into `a1`/`a2` (UTF-8). Answer - the
+/// whole length (buffer shorter - cut); [`ERR_UNSUPPORTED`] - no input.
+pub const SOUND_MIC_INFO: usize = 7;
+
+/// Argument of [`SOUND_MIC_READ`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SoundMic {
+    /// Buffer address.
+    pub buf: u64,
+    /// Its length in bytes.
+    pub len: u32,
+    /// What [`SOUND_MIC_OPEN`] answered.
+    pub handle: u32,
+}
 /// Ключи SSH живой системы: `(адрес, длина) -> сколько байт` (фаза 68o).
 ///
 /// `authorized_keys`, который загрузчик нашёл в `\FREEOS\authorized_keys` на

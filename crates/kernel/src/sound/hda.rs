@@ -498,6 +498,30 @@ pub fn capture_skip(slot: usize, bytes: usize) -> usize {
     })
 }
 
+/// Запись программы (`SOUND_MIC_READ`, 28.11): потребитель входа, которого
+/// держит программа; снимается вместе с ней (поле `Program::mic`) или по
+/// `SOUND_MIC_CLOSE`.
+pub struct CaptureGuard(usize);
+
+impl CaptureGuard {
+    /// Начать запись или прибавить потребителя (см. [`capture_start`]).
+    pub fn start() -> Result<Self, HdaError> {
+        capture_start().map(Self)
+    }
+
+    /// Номер потребителя для [`capture_read`].
+    #[must_use]
+    pub const fn slot(&self) -> usize {
+        self.0
+    }
+}
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        capture_stop(self.0);
+    }
+}
+
 impl Capture {
     /// Сбросить поток и записать ему кольцо, длину, формат и номер.
     fn program(&mut self) -> Result<(), HdaError> {

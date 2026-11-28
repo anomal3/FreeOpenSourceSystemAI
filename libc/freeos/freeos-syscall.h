@@ -153,6 +153,11 @@
 /* Действия `SYS_SOUND` и его формат (фаза 67f). */
 #define FREEOS_SOUND_WRITE 1
 #define FREEOS_SOUND_DRAIN 2
+/* Microphone (28.11): the HDA input, a cursor per open. */
+#define FREEOS_SOUND_MIC_OPEN 4
+#define FREEOS_SOUND_MIC_READ 5
+#define FREEOS_SOUND_MIC_CLOSE 6
+#define FREEOS_SOUND_MIC_INFO 7
 #define FREEOS_SOUND_RATE 48000
 #define FREEOS_SOUND_CHANNELS 2
 

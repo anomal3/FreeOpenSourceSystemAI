@@ -323,7 +323,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 85] = [
+const PROGRAMS: [(&CStr16, &str); 86] = [
     // vDSO программ Linux (01.11.2026): время без входа в ядро. Не программа,
     // но едет тем же путём — так он есть и на установленной системе.
     (cstr16!("\\FREEOS\\BIN\\VDSO"), "vdso"),
@@ -404,6 +404,8 @@ const PROGRAMS: [(&CStr16, &str); 85] = [
     (cstr16!("\\FREEOS\\BIN\\PHOTOS"), "photos"),
     // Network Connections (ncpa.cpl, 25.11).
     (cstr16!("\\FREEOS\\BIN\\NCPA"), "ncpa"),
+    // Microphone check for native programs, SOUND_MIC_* (28.11).
+    (cstr16!("\\FREEOS\\BIN\\MICCHECK"), "miccheck"),
     // Окно «Открыть» / «Сохранить как» / «Выбор папки» для всех программ (20.11).
     (cstr16!("\\FREEOS\\BIN\\FILEDLG"), "filedlg"),
     // Системные инструменты (фаза П1/П2, 20.11) и «Администрирование» (П3):

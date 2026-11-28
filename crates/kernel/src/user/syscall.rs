@@ -3576,6 +3576,9 @@ fn sound(op: usize, ptr: usize, len: usize) -> i64 {
     if op == user_abi::SOUND_LOOP_READ {
         return sound_loop_read(ptr);
     }
+    if matches!(op, user_abi::SOUND_MIC_OPEN | user_abi::SOUND_MIC_READ | user_abi::SOUND_MIC_CLOSE | user_abi::SOUND_MIC_INFO) {
+        return sound_mic(op, ptr, len);
+    }
     if !crate::sound::present() {
         return ERR_UNSUPPORTED;
     }
@@ -3607,6 +3610,102 @@ fn sound(op: usize, ptr: usize, len: usize) -> i64 {
         },
         _ => ERR_UNSUPPORTED,
     }
+}
+
+/// `SOUND_MIC_*` (28.11): the HDA input for native programs - each open is a
+/// consumer of the recording with its own cursor (as each Linux `hw:0,1`
+/// reader has: two tabs of one browser do not take frames from each other),
+/// held by the program and dropped with it.
+fn sound_mic(op: usize, a1: usize, a2: usize) -> i64 {
+    match op {
+        user_abi::SOUND_MIC_INFO => {
+            if !crate::sound::hda::capture_present() {
+                return ERR_UNSUPPORTED;
+            }
+            let name = crate::sound::hda::capture_name();
+            let take = name.len().min(a2);
+            if take > 0 {
+                if !space::user_can(a1, take, PageFlags::WRITE) {
+                    return ERR_BAD_ADDRESS;
+                }
+                // SAFETY: the range was just checked for writing.
+                unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), a1 as *mut u8, take) };
+            }
+            name.len() as i64
+        }
+        user_abi::SOUND_MIC_OPEN => {
+            let guard = match crate::sound::hda::CaptureGuard::start() {
+                Ok(guard) => guard,
+                Err(crate::sound::hda::HdaError::Busy) => return ERR_LIMIT,
+                Err(err) => {
+                    crate::kprintln!("  sound       : microphone did not start for {}: {err}", crate::sched::current());
+                    return ERR_UNSUPPORTED;
+                }
+            };
+            let handle = guard.slot();
+            let path = super::with_current(move |program| {
+                program.mic.push(guard);
+                program.path.clone()
+            });
+            let Some(path) = path else { return ERR_UNSUPPORTED };
+            crate::kprintln!(
+                "  sound       : {} ({path}) records from the microphone, S16_LE 2 ch 48000 Hz (native, handle {handle})",
+                crate::sched::current()
+            );
+            handle as i64
+        }
+        user_abi::SOUND_MIC_CLOSE => {
+            // Stopped outside the program lock (the guard takes the capture lock).
+            let held = super::with_current(|program| {
+                let at = program.mic.iter().position(|guard| guard.slot() == a1)?;
+                Some(program.mic.swap_remove(at))
+            })
+            .flatten();
+            let Some(held) = held else { return ERR_BAD_FD };
+            drop(held);
+            crate::kprintln!("  sound       : {} stopped recording from the microphone (handle {a1})", crate::sched::current());
+            0
+        }
+        _ => sound_mic_read(a1),
+    }
+}
+
+/// `SOUND_MIC_READ`: what the cursor of an open of this program has (waits
+/// up to ~20 ms for the first frame).
+fn sound_mic_read(arg: usize) -> i64 {
+    let size = core::mem::size_of::<user_abi::SoundMic>();
+    if !space::user_can(arg, size, PageFlags::READ) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: the range was just checked for reading.
+    let request = unsafe { core::ptr::read_unaligned(arg as *const user_abi::SoundMic) };
+    let slot = request.handle as usize;
+    let mine = super::with_current(|program| program.mic.iter().any(|guard| guard.slot() == slot)).unwrap_or(false);
+    if !mine {
+        return ERR_BAD_FD;
+    }
+    let want = (request.len as usize / 4 * 4).min(64 * 1024);
+    if want == 0 {
+        return 0;
+    }
+    let ptr = request.buf as usize;
+    let mut copy = alloc::vec![0u8; want];
+    let deadline = crate::time::uptime_ms() + 20;
+    let got = loop {
+        let got = crate::sound::hda::capture_read(slot, &mut copy);
+        if got > 0 || super::kill_pending() || crate::time::uptime_ms() >= deadline {
+            break got;
+        }
+        crate::sched::sleep_ms(5);
+    };
+    if got > 0 {
+        if !space::user_can(ptr, got, PageFlags::WRITE) {
+            return ERR_BAD_ADDRESS;
+        }
+        // SAFETY: the range was just checked for writing.
+        unsafe { core::ptr::copy_nonoverlapping(copy.as_ptr(), ptr as *mut u8, got) };
+    }
+    got as i64
 }
 
 /// `SOUND_LOOP_READ` (23.11): the system sound loopback for the recorder.

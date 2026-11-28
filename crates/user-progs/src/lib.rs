@@ -2062,6 +2062,42 @@ pub fn sound_loop_read(request: &mut user_abi::SoundLoop, out: &mut [u8]) -> i64
     if r < 0 { r } else { i64::from(request.got) }
 }
 
+/// Microphone (28.11, [`user_abi::SOUND_MIC_OPEN`]): open the HDA input with
+/// a cursor of its own. Answer - a handle, negative - error
+/// (`ERR_UNSUPPORTED`: no input, `ERR_LIMIT`: too many recordings).
+pub fn mic_open() -> i64 {
+    // SAFETY: no program memory.
+    unsafe { syscall(user_abi::SYS_SOUND, user_abi::SOUND_MIC_OPEN, 0, 0) }
+}
+
+/// Whole S16 LE stereo 48 kHz frames of the open `handle` into `out`
+/// ([`user_abi::SOUND_MIC_READ`]). Answer - bytes read, zero - nothing
+/// within ~20 ms, negative - error.
+pub fn mic_read(handle: i64, out: &mut [u8]) -> i64 {
+    let request = user_abi::SoundMic {
+        buf: out.as_mut_ptr() as u64,
+        len: out.len().min(u32::MAX as usize) as u32,
+        handle: handle as u32,
+    };
+    // SAFETY: the structure and the buffer live in this program; the kernel
+    // writes at most `len` bytes.
+    unsafe { syscall(user_abi::SYS_SOUND, user_abi::SOUND_MIC_READ, core::ptr::from_ref(&request) as usize, 0) }
+}
+
+/// Close the open `handle` ([`user_abi::SOUND_MIC_CLOSE`]); the end of the
+/// program closes its opens too.
+pub fn mic_close(handle: i64) -> i64 {
+    // SAFETY: no program memory.
+    unsafe { syscall(user_abi::SYS_SOUND, user_abi::SOUND_MIC_CLOSE, handle as usize, 0) }
+}
+
+/// Name of the microphone input ([`user_abi::SOUND_MIC_INFO`]) into `out`;
+/// answer - its whole length, negative - no input.
+pub fn mic_info(out: &mut [u8]) -> i64 {
+    // SAFETY: the buffer lives in this program; the kernel writes at most its length.
+    unsafe { syscall(user_abi::SYS_SOUND, user_abi::SOUND_MIC_INFO, out.as_mut_ptr() as usize, out.len()) }
+}
+
 /// Исполнить команду оболочки ядра (фаза 68o). `out` — не короче
 /// [`user_abi::KERNEL_COMMAND_OUT`]; ответ — сколько байт вывода или ошибка.
 pub fn kernel_command(line: &str, out: &mut [u8]) -> i64 {
