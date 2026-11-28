@@ -11366,6 +11366,83 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("KERNEL PANIC"),
         ],
     },
+    // 28.11 (ROADMAP: on the live stick the prefix registry and programs in
+    // C: were lost - exFAT holds no `dosdevices` links): the prefix stays in
+    // RAM, its registry and the folders of C: go to the persistent place
+    // (`fossai-proton` keep_restore/keep_save). The store is forced onto an
+    // external exFAT disk (as /usb1 on the stick); "reboot" = the RAM prefix
+    // removed. A registry value and C:\Games\Kept must come back.
+    Scenario {
+        name: "proton-keep",
+        about: "Proton на живой флешке (28.11): префикс в RAM, реестр и папки корня C: - на постоянном месте (внешний диск exFAT): после удаления префикса (как перезагрузка) значение реестра и C:\\Games\\Kept возвращаются.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "8G",
+        extra: &[
+            "-cpu", "max", "-smp", "4",
+            "-drive", "if=none,id=ssd,format=raw,file={exfat}",
+            "-device", "usb-storage,bus=xhci.0,drive=ssd,id=ssddev",
+        ],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::AwaitAny("exFAT volume 'Z7S' (GPT, LBA 2048) mounted read-write at /usb", 60_000),
+            Step::Line("pkg install proton"),
+            Step::AwaitOneOf(&["pkg: installed proton 11, ", "is already installed"], 2_400_000),
+            Step::Wait(10_000),
+            // First run: a fresh prefix from the template, nothing kept yet.
+            Step::Line("run /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=FOSSAI_PROTON_STORE=/usb/FossAi/proton --env=WINEPREFIX=/tmp/keep reg add HKCU\\Software\\FossAiKeep /v Kept /d yes /f"),
+            Step::Await("fossai-proton: live system - game saves and shader caches kept in /usb/FossAi/proton", 120_000),
+            Step::Await("fossai-proton: live system - prefix /tmp/keep kept in /usb/FossAi/proton/prefixes/keep: registry restored (0 files)", 300_000),
+            Step::Await("fossai-proton: live system - registry (", 900_000),
+            Step::Expect("new C: folder(s) of /tmp/keep kept in /usb/FossAi/proton/prefixes/keep"),
+            // Something installed into the root of C:.
+            // The prompt first: typed earlier, the line was mangled by the redraw.
+            Step::Await(PROMPT, 120_000),
+            Step::Wait(3_000),
+            Step::Line("run /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=FOSSAI_PROTON_STORE=/usb/FossAi/proton --env=WINEPREFIX=/tmp/keep cmd /c mkdir C:\\Games\\Kept"),
+            // Every line comes twice (stdout and the kernel log): the exact one.
+            Step::Await("and 1 new C: folder(s) of /tmp/keep kept in", 900_000),
+            // "Reboot": the RAM prefix is gone.
+            // The prompt first: typed earlier, the line was mangled by the redraw.
+            Step::Await(PROMPT, 120_000),
+            Step::Wait(3_000),
+            Step::Line("run /opt/debian/bin/rm -rf /tmp/keep"),
+            Step::Wait(5_000),
+            // The prompt first: typed earlier, the line was mangled by the redraw.
+            Step::Await(PROMPT, 120_000),
+            Step::Wait(3_000),
+            Step::Line("run /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=FOSSAI_PROTON_STORE=/usb/FossAi/proton --env=WINEPREFIX=/tmp/keep reg query HKCU\\Software\\FossAiKeep /v Kept"),
+            Step::Await("fossai-proton: prefix from template", 300_000),
+            Step::Await("kept in /usb/FossAi/proton/prefixes/keep: registry restored (", 120_000),
+            Step::Await("REG_SZ", 600_000),
+            Step::Expect("yes"),
+            Step::Await("of /tmp/keep kept in", 900_000),
+            // The prompt first: typed earlier, the line was mangled by the redraw.
+            Step::Await(PROMPT, 120_000),
+            Step::Wait(3_000),
+            Step::Line("run /opt/debian/bin/bash /opt/proton/bin/fossai-proton --env=FOSSAI_PROTON_STORE=/usb/FossAi/proton --env=WINEPREFIX=/tmp/keep cmd /c if exist C:\\Games\\Kept echo games-kept-ok"),
+            Step::Await("games-kept-ok", 600_000),
+            Step::Await("of /tmp/keep kept in", 900_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
     Scenario {
         name: "hrsleep",
         about: "Сон короче тика (hw-log15, 22.11): `hrbench` - сколько на деле длятся сны 100/400/1000 мкс и ожидания забора, сигнального через 300/700/1500 мкс, с одноразовым таймером APIC (hrsleep) и по-старому тиками; числа - в журнал.",

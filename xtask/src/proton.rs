@@ -909,8 +909,11 @@ esac
         # `--run=ПРОГРАММА` - проба из bin/ пакета (es2gears_wayland, vkcube) с\n\
         # тем же окружением.\n\
         case \"$1\" in --run=*) n=\"${1#--run=}\"; shift; exec \"$P/bin/$n\" \"$@\" ;; esac\n\
-        # `--fresh` - начать с нового префикса (у `rm` оболочки FossAi нет `-r`).\n\
-        case \"$1\" in --fresh) shift; LD_LIBRARY_PATH= rm -rf \"$WINEPREFIX\" ;; esac\n\
+        # Сохранённое префикса на постоянном месте (28.11, см. keep_restore).\n\
+        n=${WINEPREFIX%/}; n=${n##*/}; n=${n#.}; K=; [ -n \"$S\" ] && K=$S/prefixes/${n:-proton}\n\
+        # `--fresh` - начать с нового префикса (у `rm` оболочки FossAi нет `-r`);\n\
+        # на живой флешке - и без его сохранённого реестра и папок C:.\n\
+        case \"$1\" in --fresh) shift; LD_LIBRARY_PATH= rm -rf \"$WINEPREFIX\"; [ -n \"$K\" ] && LD_LIBRARY_PATH= rm -rf \"$K\" ;; esac\n\
         case \"$1\" in --server-debug=*) LD_LIBRARY_PATH= mkdir -p \"$WINEPREFIX\"; $P/bin/wineserver -d\"${1#--server-debug=}\"; shift ;; esac\n\
         # `--dxvk` - Direct3D 8-11 через DXVK (Vulkan), как в Proton: DLL DXVK\n\
         # кладутся в префикс поверх wined3d и включаются как native.\n\
@@ -944,6 +947,71 @@ esac
                     $P/bin/wineserver -w\n\
                 fi\n\
             fi ;; esac\n", r#"
+# Живая флешка (28.11, ROADMAP «реестр префикса и программы в C: не
+# сохраняются»): префикс остаётся в RAM - из шаблона пакета, со ссылками
+# `dosdevices`, которых exFAT не держит (образ ext2 на флешке ядро не
+# смонтирует: loop-устройства нет). Сохраняется то, что меняют установщики
+# и программы, - на постоянном месте `$K` ($S/prefixes/ИМЯ_ПРЕФИКСА):
+#  - registry/*.reg - реестр (system.reg, user.reg, userdef.reg): кладётся
+#    туда после выхода программ префикса (keep_save, `wineserver -w`) и
+#    возвращается в свежий префикс этой загрузки до первого запуска Wine;
+#  - c/ПАПКА - папки корня C: (Program Files, Program Files (x86),
+#    ProgramData и всё, что поставили в корень C:, - C:\Games, ярлыки
+#    proton_shortcuts), кроме windows и users (профиль - ниже); в префиксе
+#    на их месте ссылки.
+# C:\windows (system32) - из пакета и не сохраняется: DLL, которые
+# установщик кладёт туда (рантаймы VC++), после перезагрузки - снова Wine.
+keep_dir() {
+    local s=$WINEPREFIX/drive_c/$1 t=$K/c/$1
+    [ -L "$s" ] && [ "$(LD_LIBRARY_PATH= readlink "$s")" = "$t" ] && return 0
+    LD_LIBRARY_PATH= mkdir -p "$t" || return 1
+    if [ -d "$s" ] && [ ! -L "$s" ]; then
+        LD_LIBRARY_PATH= cp -rLn "$s/." "$t/" && LD_LIBRARY_PATH= rm -rf "$s" || return 1
+    else
+        LD_LIBRARY_PATH= rm -f "$s"
+    fi
+    LD_LIBRARY_PATH= ln -s "$t" "$s"
+}
+keep_restore() {
+    local r=$K/registry f n=0 d
+    LD_LIBRARY_PATH= mkdir -p "$K/c" "$r" || return 0
+    if [ ! -e "$WINEPREFIX/.fossai-kept" ]; then
+        for f in system.reg user.reg userdef.reg; do
+            [ -s "$r/$f" ] && LD_LIBRARY_PATH= cp -f "$r/$f" "$WINEPREFIX/$f" && n=$((n + 1))
+        done
+        : > "$WINEPREFIX/.fossai-kept"
+        klog "fossai-proton: live system - prefix $WINEPREFIX kept in $K: registry restored ($n files)"
+    fi
+    for d in "Program Files" "Program Files (x86)" ProgramData "$K"/c/*; do
+        d=${d##*/}
+        [ -n "$d" ] && [ "$d" != "*" ] || continue
+        [ -e "$WINEPREFIX/drive_c/$d" ] || [ -d "$K/c/$d" ] || continue
+        keep_dir "$d"
+    done
+}
+keep_save() {
+    local r=$K/registry f n=0 d m=0
+    $P/bin/wineserver -w 2>/dev/null
+    LD_LIBRARY_PATH= mkdir -p "$r" || return 0
+    for f in system.reg user.reg userdef.reg; do
+        [ -s "$WINEPREFIX/$f" ] || continue
+        if LD_LIBRARY_PATH= cp -f "$WINEPREFIX/$f" "$r/$f.new"; then
+            LD_LIBRARY_PATH= mv -f "$r/$f.new" "$r/$f" || LD_LIBRARY_PATH= cp -f "$WINEPREFIX/$f" "$r/$f"
+            n=$((n + 1))
+        fi
+    done
+    for d in "$WINEPREFIX"/drive_c/*; do
+        [ -d "$d" ] && [ ! -L "$d" ] || continue
+        d=${d##*/}
+        case ${d,,} in windows|users) continue ;; esac
+        keep_dir "$d" && m=$((m + 1))
+    done
+    LD_LIBRARY_PATH= sync 2>/dev/null
+    klog "fossai-proton: live system - registry ($n files) and $m new C: folder(s) of $WINEPREFIX kept in $K"
+}
+if [ -n "$K" ] && [ -d "$WINEPREFIX/drive_c" ]; then
+    keep_restore
+fi
 # Живая флешка (25.11): папки профиля, куда игры пишут сохранения и
 # настройки, - ссылки в постоянное место `$S` (выбрано выше). Что уже есть в
 # RAM-папке, сначала копируется туда (не затирая сохранённое).
@@ -1103,6 +1171,9 @@ if [ -z "$B" ]; then
     }
     rc=${PIPESTATUS[0]}
     unity_log
+    # Живая флешка (28.11): реестр и новые папки C: - на постоянное место,
+    # когда выйдут все программы префикса (`wineserver -w`).
+    [ -n "$K" ] && keep_save
     exit $rc
 fi
 # Замер (`--bench`): вывод Wine идёт через этот цикл и дальше в stderr как
