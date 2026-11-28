@@ -2969,6 +2969,51 @@ fn start_host_site() -> Result<(HostServer, u16)> {
                 )
                 .into_bytes()
             }
+            // OBSOS calls (28.11, `obsos-webrtc`, OBSOS branch feat/freeos-webrtc):
+            // two RTCPeerConnection on one page - microphone (the test tone of
+            // `--env OBSOS_MEDIA_TEST_TONE`) both ways, the screen
+            // (getDisplayMedia) A -> B into a <video>, a data channel ping/pong.
+            // Progress goes to console.warn (OBSOS copies it into the kernel log),
+            // `#relay` adds iceTransportPolicy 'relay' with the TURN server from
+            // the query (`turn=host:port&u=..&p=..`).
+            "/webrtc.html" => {
+                let body = r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>OBSOS WebRTC</title>
+<style>body{font-family:sans-serif;margin:16px;background:#eef2fb}video{width:480px;height:270px;background:#222}#r{font-size:22px}</style></head>
+<body><h2>OBSOS: звонок на одной странице</h2><p id="r">...</p><video id="v" autoplay muted></video><audio id="a" autoplay></audio><script>
+var st={dcAB:false,dcBA:false,trackA:[],trackB:[],video:"",err:""};
+function w(s){console.warn("obsos-webrtc: "+s);}
+function ok(){return st.dcAB&&st.dcBA&&st.trackA.indexOf("audio")>=0&&st.trackB.indexOf("audio")>=0&&st.trackB.indexOf("video")>=0&&st.video!="";}
+function rep(){document.getElementById("r").textContent=(ok()?"WEBRTC OK ":"WEBRTC ... ")+JSON.stringify(st);}
+var q=new URLSearchParams(location.search),cfg={iceServers:[]};
+if(location.hash=="#relay"){cfg.iceServers=[{urls:"turn:"+q.get("turn"),username:q.get("u"),credential:q.get("p")}];cfg.iceTransportPolicy="relay";}
+async function run(){try{
+var A=new RTCPeerConnection(cfg),B=new RTCPeerConnection(cfg);
+A.onicecandidate=function(e){if(e.candidate){w("A cand "+e.candidate.candidate.split(" ")[7]);B.addIceCandidate(e.candidate);}};
+B.onicecandidate=function(e){if(e.candidate){A.addIceCandidate(e.candidate);}};
+A.oniceconnectionstatechange=function(){w("A ice "+A.iceConnectionState);};
+A.ontrack=function(e){st.trackA.push(e.track.kind);rep();};
+B.ontrack=function(e){st.trackB.push(e.track.kind);w("B track "+e.track.kind);var m=new MediaStream([e.track]);
+if(e.track.kind=="video"){var v=document.getElementById("v");v.srcObject=m;v.onloadedmetadata=function(){st.video=v.videoWidth+"x"+v.videoHeight;w("video "+st.video);rep();};}
+else{var a=document.getElementById("a");a.srcObject=m;a.play().catch(function(x){w("audio play "+x);});}rep();};
+var dc=A.createDataChannel("test");dc.onopen=function(){w("dc open");dc.send("ping");};
+dc.onmessage=function(e){if(e.data=="pong"){st.dcBA=true;w("dc pong");rep();}};
+B.ondatachannel=function(e){var c=e.channel;c.onmessage=function(x){if(x.data=="ping"){st.dcAB=true;c.send("pong");rep();}};};
+var mic=await navigator.mediaDevices.getUserMedia({audio:true});A.addStream(mic);
+var scr=await navigator.mediaDevices.getDisplayMedia({video:true});w("screen "+scr.getVideoTracks().length);A.addTrack(scr.getVideoTracks()[0],scr);
+var mic2=await navigator.mediaDevices.getUserMedia({audio:true});B.addStream(mic2);
+var o=await A.createOffer();await A.setLocalDescription(o);await B.setRemoteDescription(o);
+var an=await B.createAnswer();await B.setLocalDescription(an);await A.setRemoteDescription(an);w("negotiated");
+}catch(x){st.err=String(x);w("ERROR "+x);}rep();
+var n=0,t=setInterval(function(){n++;if(ok()){clearInterval(t);w("RESULT OK "+JSON.stringify(st));}else if(n>=90){clearInterval(t);w("RESULT FAIL "+JSON.stringify(st));}},1000);}
+run();
+</script></body></html>
+"##;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
             "/stream.bin" => {
                 let length = scenarios::SITE_STREAM_BYTES;
                 let mut answer = format!(

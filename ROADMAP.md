@@ -19690,6 +19690,45 @@ re-raises signal 11 … chromium+0x5e156e8» = `CrashBrowserProcessIntentionally
 после старта (было и 23.11) — не разбиралось. `chrome_crashpad_handler` в
 пакет не кладётся (дочерний `#GP`/`#BP` при каждом запуске — его FATAL).
 
+## OBSOS: звонки без GStreamer на FossAi (28.11, ветка OBSOS feat/freeos-webrtc) — **работает в QEMU**
+
+Свой бэкенд servo-media `obsos-media` (str0m + Opus на чистом Rust + H.264
+OpenH264, TURN — свой клиент) — в репозитории OBSOS, ветка
+`feat/freeos-webrtc` (рабочая копия `F:\ObsosBrowser-wt\freeos-webrtc`,
+подробно — её `docs/WEBRTC-FREEOS.md`). Здесь — только проверка.
+
+* Сборка ветки: `work\obsos-webrtc-build.cmd` (снимок в
+  `build\obsos-src-webrtc`, fossai-builder, вывод —
+  `build\obsos-webrtc-out\servo-browser-x86_64`; общий `build\linux` не
+  трогается).
+* Пакет OBSOS для теста из другой сборки: `FOSSAI_OBSOS_DIR=<папка>` (в ней
+  `servo-browser-<арх>`), `xtask/src/package.rs`; без переменной — как
+  всегда. Пакеты собираются на каждый прогон, но Installed-сценарии берут
+  пакет с диска, записанного при `install`: запускать
+  `set "FOSSAI_OBSOS_DIR=…\build\obsos-webrtc-out"` + `-s install,obsos-webrtc`.
+* Сценарий `obsos-webrtc` (QEMU с virtio-sound в WAV): страница харнесса
+  `/webrtc.html` — звонок самой себе (два RTCPeerConnection): тон
+  `--env OBSOS_MEDIA_TEST_TONE=440` вместо микрофона в обе стороны,
+  `getDisplayMedia` (SYS_SCREENCAP) A → B в `<video>`, канал данных. Страница
+  скачивается в гостя `/bin/fetch` и открывается как `file://`:
+  `MediaDevices` в Servo `[SecureContext]`, `http://10.0.2.2` таким не
+  считается. Ядро окружения программам не передаёт — переменные OBSOS ключом
+  `--env`.
+* Итог 28.11: ICE Completed, «DTLS and SRTP up», ping/pong в канале, Opus
+  ~50 пакетов/с каждой стороной, первый кадр H.264 1280×720 декодирован и
+  показан (`video 1280x720`), `RESULT OK`, тон 440 Гц от собеседника в
+  `SYS_SOUND` (пик 0.305). Снимок `obsos-webrtc-call`.
+* Причина, по которой ICE сначала не стартовал (исправлено в OBSOS): таймаут
+  чтения UDP-сокета (`SO_RCVTIMEO`, `set_read_timeout`) на FossAi не
+  действует — `recv_from` ждёт пакета бесконечно. **TODO ядра**: поддержать
+  таймаут чтения сокетов (программы, которые на него полагаются, зависают).
+* TODO: микрофон для своих программ — вход HDA (bb90997) выведен только в
+  Linux-слой (`hw:0,1`) и `mic`; нужен нативный вызов (например, операции
+  SYS_SOUND «начать запись / прочитать / остановить»), тогда OBSOS подключит
+  его в `obsos-fossai/src/media.rs` (там TODO с описанием).
+* TODO: видео ~7 к/с при 1280×720 (OpenH264 без nasm) — nasm в
+  fossai-builder; звонок Rupor (web.pynop.online) через TURN на FossAi вживую.
+
 ## Микрофон: вход HDA (28.11, Роман: «Рупор запустил, но микрофона нет») — **сделано в коде, проверить на железе**
 
 **Ядро, `sound/hda.rs`.** При подъёме в кодеке ищутся входы: разъёмы с

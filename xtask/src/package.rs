@@ -287,13 +287,30 @@ pub fn servo_live(arch: Arch) -> Result<Option<Vec<u8>>> {
     servo_package(arch, false)
 }
 
+/// The OBSOS browser for the package: `build/linux/servo-browser-<arch>`, or
+/// from `FOSSAI_OBSOS_DIR=<dir>` (`<dir>/servo-browser-<arch>`) - another OBSOS
+/// build for a test run without replacing the shared one, e.g. the calls branch
+/// feat/freeos-webrtc built into build/obsos-webrtc-out (scenario `obsos-webrtc`).
+/// Packages are rebuilt on every run, so the variable affects only that run.
+fn obsos_browser(arch: Arch) -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("FOSSAI_OBSOS_DIR").filter(|d| !d.is_empty()) {
+        let path = std::path::PathBuf::from(dir).join(format!("servo-browser-{}", arch.name()));
+        if path.is_file() {
+            say!("OBSOS from FOSSAI_OBSOS_DIR: {}", path.display());
+            return Some(path);
+        }
+        say!("FOSSAI_OBSOS_DIR: no {} - using build/linux", path.display());
+    }
+    crate::ruststd::linux_host_program("servo-browser", arch)
+}
+
 fn servo_package(arch: Arch, probes: bool) -> Result<Option<Vec<u8>>> {
     let jsprobe = crate::ruststd::linux_host_program("jsprobe", arch);
     if probes && jsprobe.is_none() {
         say!("пакет servo пропущен: нет build/linux/jsprobe-{} — собрать: ports/servo/builder/build-jsprobe.sh", arch.name());
         return Ok(None);
     }
-    if !probes && crate::ruststd::linux_host_program("servo-browser", arch).is_none() {
+    if !probes && obsos_browser(arch).is_none() {
         say!("браузер OBSOS пропущен: нет build/linux/servo-browser-{} — собрать: ports/servo/builder/build-servoprobe.sh", arch.name());
         return Ok(None);
     }
@@ -323,7 +340,7 @@ fn servo_package(arch: Arch, probes: bool) -> Result<Option<Vec<u8>>> {
         servo.file(&Entry { path: String::from("bin/servoprobe"), mode: 0o755, uid: 0, gid: 0, data });
     }
     // Servo в окне (N7, первая видимая версия): программа «Servo» в меню.
-    if let Some(browser) = crate::ruststd::linux_host_program("servo-browser", arch) {
+    if let Some(browser) = obsos_browser(arch) {
         let data = fs::read(&browser).with_context(|| format!("не удалось прочитать {}", browser.display()))?;
         servo.file(&Entry { path: String::from("bin/obsos"), mode: 0o755, uid: 0, gid: 0, data });
         // Имя с пояснением — по одному «OBSOS» непонятно, что это (Роман).
